@@ -13,7 +13,7 @@ use crate::storage_namespace::{
 };
 use crate::{
     AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan,
-    DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, IntoPlanColumnSpec, PlanColumnSpec,
+    DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, PlanColumnSpec,
     PlanOperation, PlanValue, RenameTablePlan, RuntimeContext, RuntimeStatementResult,
     RuntimeTransactionContext, SelectExecution, SelectPlan, SelectProjection, TransactionContext,
     TransactionKind, TransactionResult, TransactionSession, UpdatePlan,

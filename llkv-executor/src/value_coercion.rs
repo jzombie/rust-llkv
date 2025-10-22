@@ -1,4 +1,4 @@
-//! Helper functions for insert planning and data preparation.
+//! Helper functions for value coercion and data preparation used during inserts.
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,

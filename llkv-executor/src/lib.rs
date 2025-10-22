@@ -25,15 +25,17 @@ use std::sync::{Arc, RwLock};
 
 pub type ExecutorResult<T> = Result<T, Error>;
 
-mod ingest;
+mod expression;
+mod value_coercion;
 mod projections;
 mod schema;
-pub use ingest::{
+pub use value_coercion::{
     build_array_for_column, normalize_insert_value_for_column, parse_date32_literal,
     resolve_insert_columns,
 };
 pub use projections::{build_projected_columns, build_wildcard_projections};
 pub use schema::schema_for_projections;
+pub use expression::resolve_field_id_from_schema;
 
 /// Trait for providing table access to the executor.
 pub trait TableProvider<P>
@@ -1404,6 +1406,7 @@ where
 // Executor types are public `ExecutorColumn`, `ExecutorSchema`, `ExecutorTable`.
 // No short `Exec*` aliases to avoid confusion.
 
+// TODO: Dedupe!!!
 pub struct RowBatch {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<PlanValue>>,
@@ -1681,11 +1684,15 @@ fn sort_record_batch_with_order(
         .map_err(|err| Error::Internal(format!("failed to build reordered ORDER BY batch: {err}")))
 }
 
+// TODO: Dedupe!!!
 // Translate predicate from column names to field IDs
 fn translate_predicate(
     expr: llkv_expr::expr::Expr<'static, String>,
     schema: &ExecutorSchema,
 ) -> ExecutorResult<llkv_expr::expr::Expr<'static, FieldId>> {
+    let unknown_column = |name: &str| {
+        Error::InvalidArgumentError(format!("unknown column '{}'", name))
+    };
     use llkv_expr::expr::Expr;
     match expr {
         Expr::And(exprs) => {
@@ -1716,73 +1723,9 @@ fn translate_predicate(
             }))
         }
         Expr::Compare { left, op, right } => Ok(Expr::Compare {
-            left: translate_scalar(&left, schema)?,
+            left: crate::expression::translate_scalar(&left, schema, unknown_column)?,
             op,
-            right: translate_scalar(&right, schema)?,
-        }),
-    }
-}
-
-// TODO: Dedupe!!!
-// Translate scalar expressions
-fn translate_scalar(
-    expr: &ScalarExpr<String>,
-    schema: &ExecutorSchema,
-) -> ExecutorResult<ScalarExpr<FieldId>> {
-    match expr {
-        ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit.clone())),
-        ScalarExpr::Column(name) => {
-            let column = schema
-                .resolve(name)
-                .ok_or_else(|| Error::InvalidArgumentError(format!("unknown column '{}'", name)))?;
-            Ok(ScalarExpr::Column(column.field_id))
-        }
-        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
-            left: Box::new(translate_scalar(left, schema)?),
-            op: *op,
-            right: Box::new(translate_scalar(right, schema)?),
-        }),
-        ScalarExpr::Aggregate(agg) => {
-            // Translate column names in aggregate calls to field IDs
-            use llkv_expr::expr::AggregateCall;
-            let translated_agg = match agg {
-                AggregateCall::CountStar => AggregateCall::CountStar,
-                AggregateCall::Count(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Count(column.field_id)
-                }
-                AggregateCall::Sum(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Sum(column.field_id)
-                }
-                AggregateCall::Min(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Min(column.field_id)
-                }
-                AggregateCall::Max(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::Max(column.field_id)
-                }
-                AggregateCall::CountNulls(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", name))
-                    })?;
-                    AggregateCall::CountNulls(column.field_id)
-                }
-            };
-            Ok(ScalarExpr::Aggregate(translated_agg))
-        }
-        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
-            base: Box::new(translate_scalar(base, schema)?),
-            field_name: field_name.clone(),
+            right: crate::expression::translate_scalar(&right, schema, unknown_column)?,
         }),
     }
 }

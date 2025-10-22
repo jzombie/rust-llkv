@@ -18,7 +18,7 @@ use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, IntoPlanColumnSpec, MultiColumnUniqueSpec, OrderByPlan, OrderSortType,
+    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType,
     OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, RenameTablePlan, RuntimeContext,
     RuntimeEngine, RuntimeSession,
     RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,

@@ -65,6 +65,7 @@ use llkv_executor::SelectExecution;
 // Type Definitions
 // ============================================================================
 
+// TODO: Dedupe!!! (call it `TransactionRowBatch`?)
 /// Simplified row batch for export/import
 pub struct RowBatch {
     pub columns: Vec<String>,

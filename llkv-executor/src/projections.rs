@@ -1,6 +1,5 @@
 use super::{
-    ExecutorResult, ExecutorSchema, ExecutorTable, FieldId, LogicalFieldId, ScanProjection,
-    StoreProjection,
+    ExecutorResult, ExecutorTable, LogicalFieldId, ScanProjection, StoreProjection,
 };
 use llkv_plan::SelectProjection;
 use llkv_result::Error;
@@ -66,7 +65,16 @@ where
                 )));
             }
             SelectProjection::Computed { expr, alias } => {
-                let scalar = translate_scalar(expr, table.schema.as_ref())?;
+                let scalar = crate::expression::translate_scalar(
+                    expr,
+                    table.schema.as_ref(),
+                    |name| {
+                        Error::InvalidArgumentError(format!(
+                            "Binder Error: does not have a column named '{}'",
+                            name
+                        ))
+                    },
+                )?;
                 result.push(ScanProjection::computed(scalar, alias.clone()));
             }
         }
@@ -77,86 +85,4 @@ where
         ));
     }
     Ok(result)
-}
-
-// TODO: Dedupe!!!
-fn translate_scalar(
-    expr: &llkv_expr::expr::ScalarExpr<String>,
-    schema: &ExecutorSchema,
-) -> ExecutorResult<llkv_expr::expr::ScalarExpr<FieldId>> {
-    use llkv_expr::expr::ScalarExpr;
-    match expr {
-        ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit.clone())),
-        ScalarExpr::Column(name) => {
-            let column = schema.resolve(name).ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "Binder Error: does not have a column named '{}'",
-                    name
-                ))
-            })?;
-            Ok(ScalarExpr::Column(column.field_id))
-        }
-        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
-            left: Box::new(translate_scalar(left, schema)?),
-            op: *op,
-            right: Box::new(translate_scalar(right, schema)?),
-        }),
-        ScalarExpr::Aggregate(agg) => {
-            // Translate column names in aggregate calls to field IDs
-            use llkv_expr::expr::AggregateCall;
-            let translated_agg = match agg {
-                AggregateCall::CountStar => AggregateCall::CountStar,
-                AggregateCall::Count(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Binder Error: does not have a column named '{}'",
-                            name
-                        ))
-                    })?;
-                    AggregateCall::Count(column.field_id)
-                }
-                AggregateCall::Sum(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Binder Error: does not have a column named '{}'",
-                            name
-                        ))
-                    })?;
-                    AggregateCall::Sum(column.field_id)
-                }
-                AggregateCall::Min(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Binder Error: does not have a column named '{}'",
-                            name
-                        ))
-                    })?;
-                    AggregateCall::Min(column.field_id)
-                }
-                AggregateCall::Max(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Binder Error: does not have a column named '{}'",
-                            name
-                        ))
-                    })?;
-                    AggregateCall::Max(column.field_id)
-                }
-                AggregateCall::CountNulls(name) => {
-                    let column = schema.resolve(name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "Binder Error: does not have a column named '{}'",
-                            name
-                        ))
-                    })?;
-                    AggregateCall::CountNulls(column.field_id)
-                }
-            };
-            Ok(ScalarExpr::Aggregate(translated_agg))
-        }
-        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
-            base: Box::new(translate_scalar(base, schema)?),
-            field_name: field_name.clone(),
-        }),
-    }
 }
