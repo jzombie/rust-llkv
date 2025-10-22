@@ -187,17 +187,19 @@ where
 /// Macro to implement `IntoInsertRow` for tuples of various sizes.
 ///
 /// This enables ergonomic tuple-based row insertion syntax:
-/// ```
+/// ```no_run
 /// # use llkv_runtime::*;
-/// # let table: RuntimeTableHandle<_> = todo!();
+/// # use llkv_storage::pager::mem_pager::MemPager;
+/// # let table: RuntimeTableHandle<MemPager> = todo!();
 /// table.insert_rows([(1_i64, "alice"), (2_i64, "bob")])?;
 /// # Ok::<(), llkv_result::Error>(())
 /// ```
 ///
 /// Without this, users would need to use the more verbose `RuntimeRow` builder:
-/// ```
+/// ```no_run
 /// # use llkv_runtime::*;
-/// # let table: RuntimeTableHandle<_> = todo!();
+/// # use llkv_storage::pager::mem_pager::MemPager;
+/// # let table: RuntimeTableHandle<MemPager> = todo!();
 /// table.insert_rows([
 ///     row().with("id", 1_i64).with("name", "alice"),
 ///     row().with("id", 2_i64).with("name", "bob"),
