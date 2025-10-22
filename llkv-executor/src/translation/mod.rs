@@ -7,6 +7,7 @@
 pub mod expression;
 pub mod projection;
 pub mod schema;
+pub mod types;
 
 pub use expression::{
     full_table_scan_filter, resolve_field_id_from_schema, translate_predicate,
@@ -14,3 +15,4 @@ pub use expression::{
 };
 pub use projection::{build_projected_columns, build_wildcard_projections};
 pub use schema::schema_for_projections;
+pub use types::sql_type_to_arrow;

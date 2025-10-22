@@ -1240,6 +1240,7 @@ dependencies = [
  "llkv-test-utils",
  "serde",
  "serde_json",
+ "sqlparser",
  "thiserror",
 ]
 

@@ -14,6 +14,7 @@ llkv-expr.workspace = true
 llkv-result.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlparser.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

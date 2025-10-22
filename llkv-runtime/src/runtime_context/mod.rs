@@ -9,7 +9,7 @@
 use crate::{
     RuntimeCreateTableBuilder, RuntimeSession, RuntimeStatementResult, RuntimeTableHandle,
     RuntimeTransactionContext, SelectExecution, TXN_ID_AUTO_COMMIT, TXN_ID_NONE,
-    canonical_table_name, is_table_missing_error, sql_type_to_arrow,
+    canonical_table_name, is_table_missing_error,
 };
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -22,6 +22,7 @@ use llkv_executor::{
     resolve_insert_columns, translation, ExecutorColumn, ExecutorMultiColumnUnique,
     ExecutorSchema, ExecutorTable, QueryExecutor, ExecutorRowBatch, ExecutorTableProvider,
 };
+use llkv_executor::translation::sql_type_to_arrow;
 use llkv_executor::utils::parse_date32_literal;
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
