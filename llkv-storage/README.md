@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-General-purpose storage adapters for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+General-purpose storage adapters for the [LLKV](../) toolkit.
 
 ## Purpose
 

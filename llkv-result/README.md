@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-result` provides lightweight result and error types and serves as the base set of result types for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-result` provides lightweight result and error types and serves as the base set of result types for the [LLKV](../) toolkit.
 
 ## Purpose
 

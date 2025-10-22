@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-transaction` provides transaction management and MVCC (Multi-Version Concurrency Control) for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-transaction` provides transaction management and MVCC (Multi-Version Concurrency Control) for the [LLKV](../) toolkit.
 
 ## Purpose
 

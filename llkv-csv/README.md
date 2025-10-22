@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-csv` is a small frontend and ingestion helper for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-csv` is a small frontend and ingestion helper for the [LLKV](../) toolkit.
 
 ## Purpose
 

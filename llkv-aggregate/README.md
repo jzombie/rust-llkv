@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-aggregate` provides aggregate computation functions for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-aggregate` provides aggregate computation functions for the [LLKV](../) toolkit.
 
 ## Purpose
 

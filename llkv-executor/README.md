@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-`llkv-executor` is the query execution engine for the [LLKV](https://github.com/jzombie/rust-llkv) toolkit.
+`llkv-executor` is the query execution engine for the [LLKV](../) toolkit.
 
 ## Purpose
 
