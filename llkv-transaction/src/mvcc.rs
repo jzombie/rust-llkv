@@ -319,6 +319,73 @@ impl RowVersion {
             }
         }
     }
+
+    /// Visibility check for foreign key validation.
+    ///
+    /// For FK checks, we want different semantics:
+    /// - Rows created by current txn are visible (so FK checks see new parent rows)
+    /// - Rows deleted by current txn are STILL VISIBLE for FK purposes
+    ///   (uncommitted deletes shouldn't affect FK validation)
+    ///
+    /// This implements the SQL standard behavior where FK constraints are checked
+    /// against the committed state plus uncommitted inserts, but ignoring uncommitted deletes.
+    pub fn is_visible_for_fk_check(
+        &self,
+        manager: &TxnIdManager,
+        snapshot: TransactionSnapshot,
+    ) -> bool {
+        tracing::trace!(
+            "[MVCC-FK] is_visible_for_fk_check: created_by={}, deleted_by={}, snapshot.txn_id={}, snapshot.snapshot_id={}",
+            self.created_by,
+            self.deleted_by,
+            snapshot.txn_id,
+            snapshot.snapshot_id
+        );
+
+        // Rows created inside the current transaction are visible.
+        // IMPORTANT: TXN_ID_AUTO_COMMIT is never treated as "current transaction"
+        if self.created_by == snapshot.txn_id && snapshot.txn_id != TXN_ID_AUTO_COMMIT {
+            tracing::trace!("[MVCC-FK] created by current txn, visible");
+            return true;
+        }
+
+        // Ignore rows whose creator has not committed yet.
+        let creator_status = manager.status(self.created_by);
+        tracing::trace!("[MVCC-FK] creator_status={:?}", creator_status);
+        if !creator_status.is_committed() {
+            tracing::trace!("[MVCC-FK] creator not committed, invisible");
+            return false;
+        }
+
+        if self.created_by > snapshot.snapshot_id {
+            tracing::trace!("[MVCC-FK] created_by > snapshot_id, invisible");
+            return false;
+        }
+
+        // For FK checks, treat rows deleted by the current transaction as still visible
+        if self.deleted_by == snapshot.txn_id && snapshot.txn_id != TXN_ID_AUTO_COMMIT {
+            tracing::trace!("[MVCC-FK] deleted by current txn, but still visible for FK check");
+            return true;
+        }
+
+        match self.deleted_by {
+            TXN_ID_NONE => {
+                tracing::trace!("[MVCC-FK] not deleted, visible");
+                true
+            }
+            tx => {
+                if !manager.status(tx).is_committed() {
+                    // A different transaction marked the row deleted but has not
+                    // committed; the row remains visible to others.
+                    tracing::trace!("[MVCC-FK] deleter not committed, visible");
+                    return true;
+                }
+                let visible = tx > snapshot.snapshot_id;
+                tracing::trace!("[MVCC-FK] deleter committed, visible={}", visible);
+                visible
+            }
+        }
+    }
 }
 
 /// Transaction metadata captured when a transaction begins.

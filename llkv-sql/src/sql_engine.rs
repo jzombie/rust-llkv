@@ -20,7 +20,8 @@ use llkv_runtime::{
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
     InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec,
     PlanStatement, PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, UpdatePlan, extract_rows_from_range,
+    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
+    extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;
@@ -495,6 +496,24 @@ where
             Statement::Delete(delete) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Delete");
                 self.handle_delete(delete)
+            }
+            Statement::Truncate {
+                ref table_names,
+                ref partitions,
+                table,
+                ref identity,
+                cascade,
+                ref on_cluster,
+            } => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Truncate");
+                self.handle_truncate(
+                    table_names,
+                    partitions,
+                    table,
+                    identity,
+                    cascade,
+                    on_cluster,
+                )
             }
             Statement::Drop {
                 object_type,
@@ -2426,6 +2445,75 @@ where
             filter,
         };
         self.execute_plan_statement(PlanStatement::Delete(plan))
+    }
+
+    fn handle_truncate(
+        &self,
+        table_names: &[sqlparser::ast::TruncateTableTarget],
+        partitions: &Option<Vec<SqlExpr>>,
+        _table: bool, // boolean field in sqlparser, not the table name
+        identity: &Option<sqlparser::ast::TruncateIdentityOption>,
+        cascade: Option<sqlparser::ast::CascadeOption>,
+        on_cluster: &Option<Ident>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        // Validate unsupported features
+        if table_names.len() > 1 {
+            return Err(Error::InvalidArgumentError(
+                "TRUNCATE with multiple tables is not supported yet".into(),
+            ));
+        }
+        if partitions.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "TRUNCATE ... PARTITION is not supported".into(),
+            ));
+        }
+        if identity.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "TRUNCATE ... RESTART/CONTINUE IDENTITY is not supported".into(),
+            ));
+        }
+        use sqlparser::ast::CascadeOption;
+        if matches!(cascade, Some(CascadeOption::Cascade)) {
+            return Err(Error::InvalidArgumentError(
+                "TRUNCATE ... CASCADE is not supported".into(),
+            ));
+        }
+        if on_cluster.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "TRUNCATE ... ON CLUSTER is not supported".into(),
+            ));
+        }
+
+        // Extract table name from table_names
+        let table_name = if let Some(target) = table_names.first() {
+            // TruncateTableTarget has a name field
+            let table_obj = &target.name;
+            let display_name = table_obj.to_string();
+            let canonical_name = display_name.to_ascii_lowercase();
+
+            // Check if table is dropped in transaction
+            if !self.engine.session().has_active_transaction()
+                && self
+                    .engine
+                    .context()
+                    .is_table_marked_dropped(&canonical_name)
+            {
+                return Err(Error::TransactionContextError(
+                    DROPPED_TABLE_TRANSACTION_ERR.into(),
+                ));
+            }
+
+            display_name
+        } else {
+            return Err(Error::InvalidArgumentError(
+                "TRUNCATE requires a table name".into(),
+            ));
+        };
+
+        let plan = TruncatePlan {
+            table: table_name.clone(),
+        };
+        self.execute_plan_statement(PlanStatement::Truncate(plan))
     }
 
     #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors SQL grammar; keep grouped until command builder is introduced.

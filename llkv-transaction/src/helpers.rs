@@ -67,6 +67,28 @@ impl MvccColumnBuilder for TransactionMvccBuilder {
 ///
 /// # Returns
 ///
+/// Filter row IDs for foreign key validation with special FK-aware visibility semantics.
+///
+/// For FK checks, rows deleted by the current transaction are treated as still visible,
+/// matching SQL standard behavior where FK constraints check against committed state
+/// plus uncommitted inserts, but ignoring uncommitted deletes.
+///
+/// # Errors
+///
+/// Returns an error if MVCC column gathering fails (excluding NotFound, which
+/// is treated as all rows being visible).
+pub fn filter_row_ids_for_fk_check<P>(
+    table: &Table<P>,
+    row_ids: Vec<RowId>,
+    txn_manager: &TxnIdManager,
+    snapshot: TransactionSnapshot,
+) -> Result<Vec<RowId>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    filter_row_ids_impl(table, row_ids, txn_manager, snapshot, true)
+}
+
 /// A filtered vector of row IDs that are visible to the snapshot.
 ///
 /// # Errors
@@ -82,8 +104,25 @@ pub fn filter_row_ids_for_snapshot<P>(
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
+    filter_row_ids_impl(table, row_ids, txn_manager, snapshot, false)
+}
+
+/// Internal implementation for filtering row IDs with optional FK-aware visibility.
+fn filter_row_ids_impl<P>(
+    table: &Table<P>,
+    row_ids: Vec<RowId>,
+    txn_manager: &TxnIdManager,
+    snapshot: TransactionSnapshot,
+    for_fk_check: bool,
+) -> Result<Vec<RowId>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let filter_type = if for_fk_check { "FK-CHECK" } else { "SNAPSHOT" };
+
     tracing::debug!(
-        "[FILTER_ROWS] Filtering {} row IDs for snapshot txn_id={}, snapshot_id={}",
+        "[FILTER_ROWS-{}] Filtering {} row IDs for snapshot txn_id={}, snapshot_id={}",
+        filter_type,
         row_ids.len(),
         snapshot.txn_id,
         snapshot.snapshot_id
@@ -179,7 +218,11 @@ where
                 created_by,
                 deleted_by,
             };
-            let is_visible = version.is_visible_for(txn_manager, snapshot);
+            let is_visible = if for_fk_check {
+                version.is_visible_for_fk_check(txn_manager, snapshot)
+            } else {
+                version.is_visible_for(txn_manager, snapshot)
+            };
             tracing::trace!(
                 "[FILTER_ROWS] row_id={}: created_by={}, deleted_by={}, is_visible={}",
                 row_id,

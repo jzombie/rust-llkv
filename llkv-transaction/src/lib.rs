@@ -54,7 +54,10 @@ pub use context::{
     SessionTransaction, TransactionContext, TransactionManager, TransactionSession,
     TransactionSessionId,
 };
-pub use helpers::{MvccRowIdFilter, TransactionMvccBuilder, filter_row_ids_for_snapshot};
+pub use helpers::{
+    MvccRowIdFilter, TransactionMvccBuilder, filter_row_ids_for_fk_check,
+    filter_row_ids_for_snapshot,
+};
 pub use mvcc::{
     RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionSnapshot, TxnId, TxnIdManager,
 };

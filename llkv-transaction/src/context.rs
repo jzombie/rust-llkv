@@ -16,7 +16,7 @@ use llkv_executor::{ExecutorRowBatch, SelectExecution};
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropTablePlan, InsertPlan, PlanColumnSpec,
-    PlanOperation, SelectPlan, UpdatePlan,
+    PlanOperation, SelectPlan, TruncatePlan, UpdatePlan,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -91,6 +91,9 @@ pub trait TransactionContext: CatalogDdl + Send + Sync {
 
     /// Delete rows
     fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<Self::Pager>>;
+
+    /// Truncate table (delete all rows)
+    fn truncate(&self, plan: TruncatePlan) -> LlkvResult<TransactionResult<Self::Pager>>;
 
     /// Create an index
     fn create_index(&self, plan: CreateIndexPlan) -> LlkvResult<TransactionResult<Self::Pager>>;
@@ -601,6 +604,63 @@ where
                         } else {
                             tracing::trace!(
                                 "[TX] DELETE from existing table - already in BASE, no replay needed"
+                            );
+                        }
+                        result
+                    }
+                    Err(e) => {
+                        self.is_aborted = true;
+                        return Err(e);
+                    }
+                }
+            }
+            PlanOperation::Truncate(ref plan) => {
+                tracing::debug!("[TRUNCATE] Starting truncate for table '{}'", plan.table);
+                if let Err(e) = self.ensure_table_exists(&plan.table) {
+                    tracing::debug!("[TRUNCATE] ensure_table_exists failed: {}", e);
+                    self.is_aborted = true;
+                    return Err(e);
+                }
+
+                // TRUNCATE is like DELETE without WHERE - same transaction handling
+                let is_new_table = self.new_tables.contains(&plan.table);
+                tracing::debug!("[TRUNCATE] is_new_table={}", is_new_table);
+                // Track access to existing table for conflict detection
+                if !is_new_table {
+                    tracing::debug!(
+                        "[TRUNCATE] Tracking access to existing table '{}'",
+                        plan.table
+                    );
+                    self.accessed_tables.insert(plan.table.clone());
+                }
+                let result = if is_new_table {
+                    tracing::debug!("[TRUNCATE] Truncating staging for new table");
+                    self.staging.truncate(plan.clone())
+                } else {
+                    tracing::debug!(
+                        "[TRUNCATE] Truncating BASE with txn_id={}",
+                        self.snapshot.txn_id
+                    );
+                    self.base_context
+                        .truncate(plan.clone())
+                        .and_then(|r| r.convert_pager_type())
+                };
+
+                tracing::debug!(
+                    "[TRUNCATE] Result: {:?}",
+                    result.as_ref().map(|_| "Ok").map_err(|e| format!("{}", e))
+                );
+                match result {
+                    Ok(result) => {
+                        // Only track operations for NEW tables - they need replay on commit
+                        if is_new_table {
+                            tracing::trace!(
+                                "[TX] TRUNCATE on new table - tracking for commit replay"
+                            );
+                            self.operations.push(PlanOperation::Truncate(plan.clone()));
+                        } else {
+                            tracing::trace!(
+                                "[TX] TRUNCATE on existing table - already in BASE, no replay needed"
                             );
                         }
                         result

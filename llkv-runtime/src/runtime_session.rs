@@ -22,6 +22,7 @@ use crate::{
     RuntimeStorageNamespace, RuntimeStorageNamespaceRegistry, TEMPORARY_NAMESPACE_ID,
     TemporaryRuntimeNamespace,
 };
+use llkv_plan::TruncatePlan;
 
 pub(crate) struct SessionNamespaces<P>
 where
@@ -226,6 +227,10 @@ where
 
     fn run_autocommit_delete(&self, plan: DeletePlan) -> Result<TransactionResult<P>> {
         self.with_autocommit_transaction_context(|ctx| TransactionContext::delete(ctx, plan))
+    }
+
+    fn run_autocommit_truncate(&self, plan: TruncatePlan) -> Result<TransactionResult<P>> {
+        self.with_autocommit_transaction_context(|ctx| TransactionContext::truncate(ctx, plan))
     }
 
     fn run_autocommit_create_table(
@@ -821,6 +826,71 @@ where
                 } else {
                     let table_name = plan.table.clone();
                     let result = self.run_autocommit_delete(plan)?;
+                    match result {
+                        TransactionResult::Delete { rows_deleted } => {
+                            Ok(RuntimeStatementResult::Delete {
+                                rows_deleted,
+                                table_name,
+                            })
+                        }
+                        _ => Err(Error::Internal("expected Delete result".into())),
+                    }
+                }
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    pub fn execute_truncate_plan(&self, plan: TruncatePlan) -> Result<RuntimeStatementResult<P>> {
+        let (_, canonical_table) = canonical_table_name(&plan.table)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                let temp_context = temp_namespace.context();
+                let table_name = plan.table.clone();
+                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                match TransactionContext::truncate(&temp_tx_context, plan)? {
+                    TransactionResult::Delete { rows_deleted } => {
+                        Ok(RuntimeStatementResult::Delete {
+                            rows_deleted,
+                            table_name,
+                        })
+                    }
+                    _ => Err(Error::Internal(
+                        "unexpected transaction result for temporary TRUNCATE".into(),
+                    )),
+                }
+            }
+            PERSISTENT_NAMESPACE_ID => {
+                if self.has_active_transaction() {
+                    let table_name = plan.table.clone();
+                    let result = match self.inner.execute_operation(PlanOperation::Truncate(plan)) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            // If an error occurs during a transaction, abort it
+                            self.abort_transaction();
+                            return Err(e);
+                        }
+                    };
+                    match result {
+                        TransactionResult::Delete { rows_deleted } => {
+                            Ok(RuntimeStatementResult::Delete {
+                                rows_deleted,
+                                table_name,
+                            })
+                        }
+                        _ => Err(Error::Internal("expected Delete result".into())),
+                    }
+                } else {
+                    let table_name = plan.table.clone();
+                    let result = self.run_autocommit_truncate(plan)?;
                     match result {
                         TransactionResult::Delete { rows_deleted } => {
                             Ok(RuntimeStatementResult::Delete {

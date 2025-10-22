@@ -513,6 +513,16 @@ pub struct DeletePlan {
 }
 
 // ============================================================================
+// TRUNCATE Plan
+// ============================================================================
+
+/// Plan for TRUNCATE TABLE operation (removes all rows).
+#[derive(Clone, Debug)]
+pub struct TruncatePlan {
+    pub table: String,
+}
+
+// ============================================================================
 // SELECT Plan
 // ============================================================================
 
@@ -812,6 +822,7 @@ pub enum PlanOperation {
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
+    Truncate(TruncatePlan),
     Select(SelectPlan),
 }
 
@@ -829,5 +840,6 @@ pub enum PlanStatement {
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
+    Truncate(TruncatePlan),
     Select(SelectPlan),
 }
