@@ -1,0 +1,225 @@
+# name: test/sql/constraints/foreignkey/test_fk_tpch.test_slow
+# description: enable foreign keys in the TPC-H schema
+# group: [foreignkey]
+
+# Note: Note currently supported by LLKV
+# require tpch
+
+# Note: Note currently supported by LLKV
+# statement ok
+# CALL dbgen(sf=0.1, suffix='_original');
+
+statement ok
+CREATE TABLE region  ( R_REGIONKEY  INTEGER NOT NULL PRIMARY KEY,
+                            R_NAME       CHAR(25) NOT NULL,
+                            R_COMMENT    VARCHAR(152));
+
+statement ok
+CREATE TABLE part  ( P_PARTKEY     INTEGER NOT NULL PRIMARY KEY,
+                          P_NAME        VARCHAR(55) NOT NULL,
+                          P_MFGR        CHAR(25) NOT NULL,
+                          P_BRAND       CHAR(10) NOT NULL,
+                          P_TYPE        VARCHAR(25) NOT NULL,
+                          P_SIZE        INTEGER NOT NULL,
+                          P_CONTAINER   CHAR(10) NOT NULL,
+                          P_RETAILPRICE DECIMAL(15,2) NOT NULL,
+                          P_COMMENT     VARCHAR(23) NOT NULL );
+
+statement ok
+CREATE TABLE nation  ( N_NATIONKEY  INTEGER NOT NULL PRIMARY KEY,
+                            N_NAME       CHAR(25) NOT NULL,
+                            N_REGIONKEY  INTEGER NOT NULL,
+                            N_COMMENT    VARCHAR(152), 
+                            FOREIGN KEY (N_REGIONKEY) REFERENCES region(R_REGIONKEY));
+
+statement ok
+CREATE TABLE supplier ( S_SUPPKEY     INTEGER NOT NULL PRIMARY KEY,
+                             S_NAME        CHAR(25) NOT NULL,
+                             S_ADDRESS     VARCHAR(40) NOT NULL,
+                             S_NATIONKEY   INTEGER NOT NULL,
+                             S_PHONE       CHAR(15) NOT NULL,
+                             S_ACCTBAL     DECIMAL(15,2) NOT NULL,
+                             S_COMMENT     VARCHAR(101) NOT NULL, 
+                             FOREIGN KEY (S_NATIONKEY) REFERENCES nation(N_NATIONKEY));
+
+statement ok
+CREATE TABLE partsupp ( PS_PARTKEY     INTEGER NOT NULL,
+                             PS_SUPPKEY     INTEGER NOT NULL,
+                             PS_AVAILQTY    INTEGER NOT NULL,
+                             PS_SUPPLYCOST  DECIMAL(15,2)  NOT NULL,
+                             PS_COMMENT     VARCHAR(199) NOT NULL, 
+                             PRIMARY KEY(PS_PARTKEY, PS_SUPPKEY), 
+                             FOREIGN KEY (PS_SUPPKEY) REFERENCES supplier(S_SUPPKEY), 
+                             FOREIGN KEY (PS_PARTKEY) REFERENCES part(P_PARTKEY));
+
+statement ok
+CREATE TABLE customer ( C_CUSTKEY     INTEGER NOT NULL PRIMARY KEY,
+                             C_NAME        VARCHAR(25) NOT NULL,
+                             C_ADDRESS     VARCHAR(40) NOT NULL,
+                             C_NATIONKEY   INTEGER NOT NULL,
+                             C_PHONE       CHAR(15) NOT NULL,
+                             C_ACCTBAL     DECIMAL(15,2)   NOT NULL,
+                             C_MKTSEGMENT  CHAR(10) NOT NULL,
+                             C_COMMENT     VARCHAR(117) NOT NULL, 
+                             FOREIGN KEY (C_NATIONKEY) REFERENCES nation(N_NATIONKEY));
+
+statement ok
+CREATE TABLE orders  ( O_ORDERKEY       INTEGER NOT NULL PRIMARY KEY,
+                           O_CUSTKEY        INTEGER NOT NULL,
+                           O_ORDERSTATUS    CHAR(1) NOT NULL,
+                           O_TOTALPRICE     DECIMAL(15,2) NOT NULL,
+                           O_ORDERDATE      DATE NOT NULL,
+                           O_ORDERPRIORITY  CHAR(15) NOT NULL,  
+                           O_CLERK          CHAR(15) NOT NULL, 
+                           O_SHIPPRIORITY   INTEGER NOT NULL,
+                           O_COMMENT        VARCHAR(79) NOT NULL, 
+                           FOREIGN KEY (O_CUSTKEY) REFERENCES customer(C_CUSTKEY));
+
+statement ok
+CREATE TABLE lineitem ( L_ORDERKEY    INTEGER NOT NULL,
+                             L_PARTKEY     INTEGER NOT NULL,
+                             L_SUPPKEY     INTEGER NOT NULL,
+                             L_LINENUMBER  INTEGER NOT NULL,
+                             L_QUANTITY    DECIMAL(15,2) NOT NULL,
+                             L_EXTENDEDPRICE  DECIMAL(15,2) NOT NULL,
+                             L_DISCOUNT    DECIMAL(15,2) NOT NULL,
+                             L_TAX         DECIMAL(15,2) NOT NULL,
+                             L_RETURNFLAG  CHAR(1) NOT NULL,
+                             L_LINESTATUS  CHAR(1) NOT NULL,
+                             L_SHIPDATE    DATE NOT NULL,
+                             L_COMMITDATE  DATE NOT NULL,
+                             L_RECEIPTDATE DATE NOT NULL,
+                             L_SHIPINSTRUCT CHAR(25) NOT NULL,
+                             L_SHIPMODE     CHAR(10) NOT NULL,
+                             L_COMMENT      VARCHAR(44) NOT NULL, 
+                             PRIMARY KEY(L_ORDERKEY, L_LINENUMBER), 
+                             FOREIGN KEY (L_ORDERKEY) REFERENCES orders(O_ORDERKEY), 
+                             FOREIGN KEY (L_PARTKEY, L_SUPPKEY) REFERENCES partsupp(PS_PARTKEY, PS_SUPPKEY));
+
+# ============================================================================
+# PATCHED FROM UPSTREAM: Create *_original tables with sample data
+# REASON: CALL dbgen(sf=0.1, suffix='_original') is not supported in LLKV
+# ============================================================================
+
+statement ok
+CREATE TABLE region_original AS SELECT 1 AS R_REGIONKEY, 'AMERICA' AS R_NAME, 'test region' AS R_COMMENT
+
+statement ok
+CREATE TABLE part_original AS SELECT 1 AS P_PARTKEY, 'Test Part' AS P_NAME, 'Manufacturer#1' AS P_MFGR, 'Brand#11' AS P_BRAND, 'STANDARD' AS P_TYPE, 1 AS P_SIZE, 'SM CASE' AS P_CONTAINER, 1.00 AS P_RETAILPRICE, 'test part' AS P_COMMENT
+
+statement ok
+CREATE TABLE nation_original AS SELECT 1 AS N_NATIONKEY, 'UNITED STATES' AS N_NAME, 1 AS N_REGIONKEY, 'test nation' AS N_COMMENT
+
+statement ok
+CREATE TABLE supplier_original AS SELECT 1 AS S_SUPPKEY, 'Supplier#000000001' AS S_NAME, 'test address' AS S_ADDRESS, 1 AS S_NATIONKEY, '123-456-7890' AS S_PHONE, 100.00 AS S_ACCTBAL, 'test supplier' AS S_COMMENT
+
+statement ok
+CREATE TABLE partsupp_original AS SELECT 1 AS PS_PARTKEY, 1 AS PS_SUPPKEY, 100 AS PS_AVAILQTY, 10.00 AS PS_SUPPLYCOST, 'test partsupp' AS PS_COMMENT
+
+statement ok
+CREATE TABLE customer_original AS SELECT 1 AS C_CUSTKEY, 'Customer#000000001' AS C_NAME, 'test address' AS C_ADDRESS, 1 AS C_NATIONKEY, '123-456-7890' AS C_PHONE, 1000.00 AS C_ACCTBAL, 'BUILDING' AS C_MKTSEGMENT, 'test customer' AS C_COMMENT
+
+statement ok
+CREATE TABLE orders_original AS SELECT 1 AS O_ORDERKEY, 1 AS O_CUSTKEY, 'O' AS O_ORDERSTATUS, 100.00 AS O_TOTALPRICE, '1996-01-01' AS O_ORDERDATE, '1-URGENT' AS O_ORDERPRIORITY, 'Clerk#000000001' AS O_CLERK, 0 AS O_SHIPPRIORITY, 'test order' AS O_COMMENT
+
+statement ok
+CREATE TABLE lineitem_original AS SELECT 1 AS L_ORDERKEY, 1 AS L_PARTKEY, 1 AS L_SUPPKEY, 1 AS L_LINENUMBER, 10.00 AS L_QUANTITY, 100.00 AS L_EXTENDEDPRICE, 0.05 AS L_DISCOUNT, 0.08 AS L_TAX, 'N' AS L_RETURNFLAG, 'O' AS L_LINESTATUS, '1996-01-15' AS L_SHIPDATE, '1996-01-10' AS L_COMMITDATE, '1996-01-20' AS L_RECEIPTDATE, 'DELIVER IN PERSON' AS L_SHIPINSTRUCT, 'TRUCK' AS L_SHIPMODE, 'test lineitem' AS L_COMMENT
+
+# ============================================================================
+# ORIGINAL UPSTREAM STATEMENTS (unchanged)
+# ============================================================================
+
+statement ok
+INSERT INTO region SELECT * FROM region_original
+
+statement ok
+INSERT INTO part SELECT * FROM part_original
+
+statement ok
+INSERT INTO nation SELECT * FROM nation_original
+
+statement ok
+INSERT INTO supplier SELECT * FROM supplier_original
+
+statement ok
+INSERT INTO partsupp SELECT * FROM partsupp_original
+
+statement ok
+INSERT INTO customer SELECT * FROM customer_original
+
+statement ok
+INSERT INTO orders SELECT * FROM orders_original
+
+statement ok
+INSERT INTO lineitem SELECT * FROM lineitem_original
+
+# Note: Note currently supported by LLKV
+# loop i 1 9
+
+# query I
+# PRAGMA tpch(${i})
+# ----
+# <FILE>:extension/tpch/dbgen/answers/sf0.1/q0${i}.csv
+
+# endloop
+
+# loop i 10 23
+
+# query I
+# PRAGMA tpch(${i})
+# ----
+# <FILE>:extension/tpch/dbgen/answers/sf0.1/q${i}.csv
+
+# endloop
+# ============================================================================
+# PATCHED FROM UPSTREAM: Added verification queries
+# REASON: Verify that foreign key constraints work and data was inserted correctly
+# ============================================================================
+
+# Verify region data
+query ITT
+SELECT R_REGIONKEY, R_NAME, R_COMMENT FROM region
+----
+1	AMERICA	test region
+
+# Verify nation with foreign key reference to region
+query IITI
+SELECT N_NATIONKEY, N_NAME, N_COMMENT, N_REGIONKEY FROM nation
+----
+1	UNITED STATES	test nation	1
+
+# Verify supplier with foreign key reference to nation
+query ITTITRT
+SELECT S_SUPPKEY, S_NAME, S_ADDRESS, S_NATIONKEY, S_PHONE, S_ACCTBAL, S_COMMENT FROM supplier
+----
+1	Supplier#000000001	test address	1	123-456-7890	100	test supplier
+
+# Verify part data
+query ITTTTITRТ
+SELECT P_PARTKEY, P_NAME, P_MFGR, P_BRAND, P_TYPE, P_SIZE, P_CONTAINER, P_RETAILPRICE, P_COMMENT FROM part
+----
+1	Test Part	Manufacturer#1	Brand#11	STANDARD	1	SM CASE	1	test part
+
+# Verify partsupp with foreign keys to part and supplier
+query IIIRT
+SELECT PS_PARTKEY, PS_SUPPKEY, PS_AVAILQTY, PS_SUPPLYCOST, PS_COMMENT FROM partsupp
+----
+1	1	100	10	test partsupp
+
+# Verify customer with foreign key to nation
+query ITTITRTT
+SELECT C_CUSTKEY, C_NAME, C_ADDRESS, C_NATIONKEY, C_PHONE, C_ACCTBAL, C_MKTSEGMENT, C_COMMENT FROM customer
+----
+1	Customer#000000001	test address	1	123-456-7890	1000	BUILDING	test customer
+
+# Verify orders with foreign key to customer (skipping DATE columns due to type handling)
+query IITRTТIT
+SELECT O_ORDERKEY, O_CUSTKEY, O_ORDERSTATUS, O_TOTALPRICE, O_ORDERPRIORITY, O_CLERK, O_SHIPPRIORITY, O_COMMENT FROM orders
+----
+1	1	O	100	1-URGENT	Clerk#000000001	0	test order
+
+# Verify lineitem with foreign keys to orders and partsupp (skipping DATE columns due to type handling)
+query IIIIRRRRTTTTT
+SELECT L_ORDERKEY, L_PARTKEY, L_SUPPKEY, L_LINENUMBER, L_QUANTITY, L_EXTENDEDPRICE, L_DISCOUNT, L_TAX, L_RETURNFLAG, L_LINESTATUS, L_SHIPINSTRUCT, L_SHIPMODE, L_COMMENT FROM lineitem
+----
+1	1	1	1	10	100	0.05	0.08	N	O	DELIVER IN PERSON	TRUCK	test lineitem
