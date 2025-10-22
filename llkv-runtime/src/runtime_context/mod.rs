@@ -704,8 +704,9 @@ where
         self.catalog_service.foreign_key_views(&canonical_name)
     }
 
-    /// Exports all rows from a table as a `RowBatch`, useful for data migration or inspection.
-    pub fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
+    /// Exports all rows from a table as a `RowBatch` - internal storage API.
+    /// Use through RuntimeSession or RuntimeTableHandle instead.
+    pub(crate) fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<RowBatch> {
         let handle = RuntimeTableHandle::new(Arc::clone(self), name)?;
         handle.lazy()?.collect_rows()
     }
@@ -741,7 +742,8 @@ where
         }
     }
 
-    pub fn insert(
+    /// Insert operation - internal storage API. Use RuntimeSession::execute_insert_plan() instead.
+    pub(crate) fn insert(
         &self,
         plan: InsertPlan,
         snapshot: TransactionSnapshot,
@@ -814,9 +816,10 @@ where
         result
     }
 
-    /// Get raw batches from a table including row_ids, optionally filtered.
+    /// Get raw batches from a table including row_ids - internal storage API.
     /// This is used for transaction seeding where we need to preserve existing row_ids.
-    pub fn get_batches_with_row_ids(
+    /// Use through RuntimeSession or transaction context instead.
+    pub(crate) fn get_batches_with_row_ids(
         &self,
         table_name: &str,
         filter: Option<LlkvExpr<'static, String>>,
@@ -910,9 +913,10 @@ where
         Ok(batches)
     }
 
-    /// Append batches directly to a table, preserving row_ids from the batches.
+    /// Append batches directly to a table, preserving row_ids - internal storage API.
     /// This is used for transaction seeding where we need to preserve existing row_ids.
-    pub fn append_batches_with_row_ids(
+    /// Use through RuntimeSession or transaction context instead.
+    pub(crate) fn append_batches_with_row_ids(
         &self,
         table_name: &str,
         batches: Vec<RecordBatch>,
@@ -941,7 +945,8 @@ where
         Ok(total_rows)
     }
 
-    pub fn update(
+    /// Update operation - internal storage API. Use RuntimeSession::execute_update_plan() instead.
+    pub(crate) fn update(
         &self,
         plan: UpdatePlan,
         snapshot: TransactionSnapshot,
@@ -973,7 +978,8 @@ where
         }
     }
 
-    pub fn delete(
+    /// Delete operation - internal storage API. Use RuntimeSession::execute_delete_plan() instead.
+    pub(crate) fn delete(
         &self,
         plan: DeletePlan,
         snapshot: TransactionSnapshot,
@@ -1000,7 +1006,8 @@ where
         RuntimeTableHandle::new(Arc::clone(self), name)
     }
 
-    pub fn execute_select(
+    /// Select operation - internal storage API. Use RuntimeSession::execute_select_plan() instead.
+    pub(crate) fn execute_select(
         self: &Arc<Self>,
         plan: SelectPlan,
         snapshot: TransactionSnapshot,
