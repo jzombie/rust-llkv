@@ -4,12 +4,22 @@
 //! operates with a consistent snapshot of the database, determined by its transaction
 //! ID and snapshot timestamp.
 //!
+//! # Module Organization
+//!
+//! - [`core`]: Core MVCC primitives (TxnIdManager, TransactionSnapshot, RowVersion) - *currently `mvcc` module*
+//! - [`table`]: Table-level MVCC integration (row filtering, builders) - *currently `helpers` module*
+//! - [`types`]: Type definitions (TransactionResult, TransactionCatalogSnapshot)
+//!
+//! The main transaction context types (`SessionTransaction`, `TransactionSession`, `TransactionManager`)
+//! are currently defined inline in this module but should be extracted to a dedicated
+//! `context` module in a future refactoring.
+//!
 //! # Key Concepts
 //!
 //! - **Transaction ID ([`TxnId`])**: Unique 64-bit identifier for each transaction
 //! - **Snapshot Isolation**: Transactions see a consistent view of data as of their start time
 //! - **Row Versioning**: Each row tracks when it was created and deleted via `created_by` and `deleted_by` columns
-//! - **Transaction Snapshot ([`TransactionSnapshot`])**: Captures transaction ID and snapshot timestamp
+//! - **[`TransactionSnapshot`]**: Captures transaction ID and snapshot timestamp
 //!
 //! # Reserved Transaction IDs
 //!
@@ -29,8 +39,15 @@
 //! - **[`TransactionSnapshot`]**: Immutable view of transaction state for visibility checks
 //! - **[`TransactionContext`]**: Main interface for executing operations within a transaction
 //! - **[`RowVersion`]**: Metadata tracking which transaction created/deleted a row
-pub mod helpers;
-pub mod mvcc;
+//! - **[`TransactionCatalogSnapshot`]**: Catalog snapshot interface for table lookups
+
+// ============================================================================
+// Module Declarations
+// ============================================================================
+
+pub mod helpers;  // TODO: Rename to `table`
+pub mod mvcc;     // TODO: Rename to `core`
+pub mod types;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
