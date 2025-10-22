@@ -66,6 +66,7 @@ where
             PlanStatement::Insert(plan) => self.session.execute_insert_plan(plan),
             PlanStatement::Update(plan) => self.session.execute_update_plan(plan),
             PlanStatement::Delete(plan) => self.session.execute_delete_plan(plan),
+            PlanStatement::Truncate(plan) => self.session.execute_truncate_plan(plan),
             PlanStatement::Select(plan) => self.session.execute_select_plan(plan),
         }
     }

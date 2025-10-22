@@ -14,6 +14,7 @@ use crate::{
     InsertPlan, PlanColumnSpec, RenameTablePlan, RuntimeContext, RuntimeStatementResult,
     SelectExecution, SelectPlan, UpdatePlan,
 };
+use llkv_plan::TruncatePlan;
 
 /// Transaction-scoped façade over [`RuntimeContext`].
 ///
@@ -170,6 +171,12 @@ where
     fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<P>> {
         let snapshot = self.current_snapshot();
         let result = self.ctx().delete(plan, snapshot)?;
+        Ok(convert_statement_result(result))
+    }
+
+    fn truncate(&self, plan: TruncatePlan) -> LlkvResult<TransactionResult<P>> {
+        let snapshot = self.current_snapshot();
+        let result = self.ctx().truncate(plan, snapshot)?;
         Ok(convert_statement_result(result))
     }
 

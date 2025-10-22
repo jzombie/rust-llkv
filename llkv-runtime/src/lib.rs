@@ -63,7 +63,7 @@ pub use llkv_plan::{
     CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction,
     ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoPlanColumnSpec,
     MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanOperation,
-    PlanStatement, PlanValue, RenameTablePlan, SelectPlan, SelectProjection, UpdatePlan,
+    PlanStatement, PlanValue, RenameTablePlan, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
 };
 use llkv_result::{Error, Result};
 use llkv_table::{CatalogDdl, canonical_table_name};
@@ -90,6 +90,7 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
         PlanStatement::Insert(plan) => Some(plan.table.as_str()),
         PlanStatement::Update(plan) => Some(plan.table.as_str()),
         PlanStatement::Delete(plan) => Some(plan.table.as_str()),
+        PlanStatement::Truncate(plan) => Some(plan.table.as_str()),
         PlanStatement::Select(plan) => plan
             .tables
             .first()

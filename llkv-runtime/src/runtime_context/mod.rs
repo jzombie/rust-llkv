@@ -36,6 +36,7 @@ mod provider;
 mod query;
 mod table_access;
 mod table_creation;
+mod truncate;
 mod types;
 mod update;
 mod utils;
