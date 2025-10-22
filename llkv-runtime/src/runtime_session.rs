@@ -1,3 +1,5 @@
+// TODO: Implement a common trait (similar to CataglogDdl) for runtime sessions and llkv-transaction sessions
+
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
@@ -12,9 +14,9 @@ use crate::storage_namespace::{
 use crate::{
     AlterTablePlan, CatalogDdl, ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource,
     DeletePlan, DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, PlanOperation, PlanValue,
-    RenameTablePlan, RuntimeContext, RuntimeContextWrapper, RuntimeStatementResult, SelectExecution,
-    SelectPlan, SelectProjection, TransactionContext, TransactionKind, TransactionResult,
-    TransactionSession, UpdatePlan,
+    RenameTablePlan, RuntimeContext, RuntimeStatementResult, RuntimeTransactionContext,
+    SelectExecution, SelectPlan, SelectProjection, TransactionContext, TransactionKind,
+    TransactionResult, TransactionSession, UpdatePlan,
 };
 
 pub(crate) struct SessionNamespaces<P>
@@ -98,7 +100,7 @@ where
     // TODO: Allow generic pager type for the secondary pager context
     // NOTE: Sessions always embed a `MemPager` for temporary namespaces; extend the
     // wrapper when pluggable temp storage is supported.
-    inner: TransactionSession<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
+    inner: TransactionSession<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
     namespaces: Arc<SessionNamespaces<P>>,
 }
 
@@ -107,7 +109,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     pub(crate) fn from_parts(
-        inner: TransactionSession<RuntimeContextWrapper<P>, RuntimeContextWrapper<MemPager>>,
+    inner: TransactionSession<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
         namespaces: Arc<SessionNamespaces<P>>,
     ) -> Self {
         Self { inner, namespaces }
@@ -204,7 +206,7 @@ where
         // Existing tables are read from base context with MVCC visibility filtering.
         // No data copying occurs at BEGIN - this is pure MVCC.
 
-        let staging_wrapper = Arc::new(RuntimeContextWrapper::new(staging_ctx));
+    let staging_wrapper = Arc::new(RuntimeTransactionContext::new(staging_ctx));
 
         self.inner.begin_transaction(staging_wrapper)?;
         Ok(RuntimeStatementResult::Transaction {

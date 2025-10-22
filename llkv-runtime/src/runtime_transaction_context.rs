@@ -16,9 +16,14 @@ use crate::{
     SelectExecution, SelectPlan, UpdatePlan,
 };
 
-// TODO: Rename to `RuntimeTransactionContext`?
-/// Wrapper for Context that implements TransactionContext.
-pub struct RuntimeContextWrapper<P>
+/// Transaction-scoped façade over [`RuntimeContext`].
+///
+/// This type implements [`TransactionContext`] so the runtime can participate in
+/// the `llkv-transaction` engine without exposing transactional methods on the
+/// shared [`RuntimeContext`] itself. Each instance keeps track of the active
+/// snapshot and delegates operations to the underlying context, applying MVCC
+/// filtering and conversion of statement results into transaction results.
+pub struct RuntimeTransactionContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -26,7 +31,7 @@ where
     snapshot: RwLock<TransactionSnapshot>,
 }
 
-impl<P> RuntimeContextWrapper<P>
+impl<P> RuntimeTransactionContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -56,7 +61,7 @@ where
     }
 }
 
-impl<P> CatalogDdl for RuntimeContextWrapper<P>
+impl<P> CatalogDdl for RuntimeTransactionContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
@@ -98,8 +103,8 @@ where
     }
 }
 
-// Implement TransactionContext for ContextWrapper to enable llkv-transaction integration
-impl<P> TransactionContext for RuntimeContextWrapper<P>
+// Implement TransactionContext to integrate with llkv-transaction.
+impl<P> TransactionContext for RuntimeTransactionContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
@@ -159,7 +164,7 @@ where
 
     fn insert(&self, plan: InsertPlan) -> LlkvResult<TransactionResult<P>> {
         tracing::trace!(
-            "[WRAPPER] TransactionContext::insert called - plan.table='{}', wrapper_context_pager={:p}",
+            "[TX_RUNTIME] TransactionContext::insert plan.table='{}', context_pager={:p}",
             plan.table,
             &*self.ctx.pager
         );
@@ -211,8 +216,6 @@ where
     }
 
     fn table_id(&self, table_name: &str) -> LlkvResult<TableId> {
-        // Check CURRENT state: if table is marked as dropped, return error
-        // This is used by conflict detection to detect if a table was dropped
         let ctx = self.context();
         if ctx.is_table_marked_dropped(table_name) {
             return Err(Error::InvalidArgumentError(format!(

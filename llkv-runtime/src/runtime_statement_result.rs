@@ -6,7 +6,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{PlanValue, SelectExecution, TransactionKind};
+use crate::{SelectExecution, TransactionKind};
 
 #[derive(Clone)]
 pub enum RuntimeStatementResult<P>
