@@ -14,7 +14,7 @@ use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
 };
 use llkv_result::Error;
-use llkv_runtime::storage_namespace::TEMPORARY_NAMESPACE_ID;
+use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,

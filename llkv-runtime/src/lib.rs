@@ -28,7 +28,13 @@
 
 #![forbid(unsafe_code)]
 
-pub mod storage_namespace;
+pub mod runtime_storage_namespace;
+
+pub use runtime_storage_namespace::{
+    PersistentRuntimeNamespace, RuntimeNamespaceId, RuntimeStorageNamespace,
+    RuntimeStorageNamespaceOps, RuntimeStorageNamespaceRegistry, TemporaryRuntimeNamespace,
+    PERSISTENT_NAMESPACE_ID, TEMPORARY_NAMESPACE_ID,
+};
 
 mod runtime_statement_result;
 pub use runtime_statement_result::RuntimeStatementResult;

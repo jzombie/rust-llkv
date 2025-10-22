@@ -64,7 +64,7 @@ llkv-table (catalog, metadata, column store)
 - **Column mutations**: keep table-ID resolution in the runtime but delegate rename/alter/drop logic to the catalog manager.
 
 ## Non-Negotiables
-- `storage_namespace.rs` remains the namespace routing layer. Goal: keep it slim, but **do not delete**—it prevents Persistent/Temporary duplication from leaking back into the session layer.
+- `runtime_storage_namespace` remains the namespace routing layer. Goal: keep it slim, but **do not delete**—it prevents Persistent/Temporary duplication from leaking back into the session layer.
 - MVCC snapshot handling, table caching, and transaction replay stay in `RuntimeContext` + `RuntimeTransactionContext`; moving them would entangle `llkv-table` with transaction specifics.
 
 ## Risks & Mitigations

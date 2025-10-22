@@ -8,9 +8,6 @@ use llkv_storage::pager::{BoxedPager, MemPager, Pager};
 use llkv_table::{SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::storage_namespace::{
-    self, PersistentNamespace, StorageNamespace, StorageNamespaceRegistry, TemporaryNamespace,
-};
 use crate::{
     AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan,
     DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, PlanColumnSpec,
@@ -18,14 +15,19 @@ use crate::{
     RuntimeTransactionContext, SelectExecution, SelectPlan, SelectProjection, TransactionContext,
     TransactionKind, TransactionResult, TransactionSession, UpdatePlan,
 };
+use crate::{
+    PersistentRuntimeNamespace, RuntimeNamespaceId, RuntimeStorageNamespace,
+    RuntimeStorageNamespaceRegistry, TemporaryRuntimeNamespace, PERSISTENT_NAMESPACE_ID,
+    TEMPORARY_NAMESPACE_ID,
+};
 
 pub(crate) struct SessionNamespaces<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    persistent: Arc<PersistentNamespace<P>>,
-    temporary: Option<Arc<TemporaryNamespace<BoxedPager>>>,
-    registry: Arc<RwLock<StorageNamespaceRegistry>>,
+    persistent: Arc<PersistentRuntimeNamespace<P>>,
+    temporary: Option<Arc<TemporaryRuntimeNamespace<BoxedPager>>>,
+    registry: Arc<RwLock<RuntimeStorageNamespaceRegistry>>,
 }
 
 impl<P> SessionNamespaces<P>
@@ -33,26 +35,26 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     pub(crate) fn new(base_context: Arc<RuntimeContext<P>>) -> Self {
-        let persistent = Arc::new(PersistentNamespace::new(
-            storage_namespace::PERSISTENT_NAMESPACE_ID.to_string(),
+        let persistent = Arc::new(PersistentRuntimeNamespace::new(
+            PERSISTENT_NAMESPACE_ID.to_string(),
             Arc::clone(&base_context),
         ));
 
-        let mut registry = StorageNamespaceRegistry::new(
-            StorageNamespace::namespace_id(persistent.as_ref()).clone(),
+        let mut registry = RuntimeStorageNamespaceRegistry::new(
+            RuntimeStorageNamespace::namespace_id(persistent.as_ref()).clone(),
         );
         registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
         let temporary = {
             let temp_pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
             let temp_context = Arc::new(RuntimeContext::new(temp_pager));
-            let namespace = Arc::new(TemporaryNamespace::new(
-                storage_namespace::TEMPORARY_NAMESPACE_ID.to_string(),
+            let namespace = Arc::new(TemporaryRuntimeNamespace::new(
+                TEMPORARY_NAMESPACE_ID.to_string(),
                 temp_context,
             ));
             registry.register_namespace(
                 Arc::clone(&namespace),
-                vec![storage_namespace::TEMPORARY_NAMESPACE_ID.to_string()],
+                vec![TEMPORARY_NAMESPACE_ID.to_string()],
                 true,
             );
             namespace
@@ -65,15 +67,15 @@ where
         }
     }
 
-    pub(crate) fn persistent(&self) -> Arc<PersistentNamespace<P>> {
+    pub(crate) fn persistent(&self) -> Arc<PersistentRuntimeNamespace<P>> {
         Arc::clone(&self.persistent)
     }
 
-    pub(crate) fn temporary(&self) -> Option<Arc<TemporaryNamespace<BoxedPager>>> {
+    pub(crate) fn temporary(&self) -> Option<Arc<TemporaryRuntimeNamespace<BoxedPager>>> {
         self.temporary.as_ref().map(Arc::clone)
     }
 
-    pub(crate) fn registry(&self) -> Arc<RwLock<StorageNamespaceRegistry>> {
+    pub(crate) fn registry(&self) -> Arc<RwLock<RuntimeStorageNamespaceRegistry>> {
         Arc::clone(&self.registry)
     }
 }
@@ -135,11 +137,11 @@ where
         }
     }
 
-    pub fn namespace_registry(&self) -> Arc<RwLock<StorageNamespaceRegistry>> {
+    pub fn namespace_registry(&self) -> Arc<RwLock<RuntimeStorageNamespaceRegistry>> {
         self.namespaces.registry()
     }
 
-    fn resolve_namespace_for_table(&self, canonical: &str) -> storage_namespace::NamespaceId {
+    fn resolve_namespace_for_table(&self, canonical: &str) -> RuntimeNamespaceId {
         self.namespace_registry()
             .read()
             .expect("namespace registry poisoned")
@@ -149,7 +151,7 @@ where
     fn namespace_for_select_plan(
         &self,
         plan: &SelectPlan,
-    ) -> Option<storage_namespace::NamespaceId> {
+    ) -> Option<RuntimeNamespaceId> {
         if plan.tables.len() != 1 {
             return None;
         }
@@ -195,12 +197,12 @@ where
         })
     }
 
-    fn persistent_namespace(&self) -> Arc<PersistentNamespace<P>> {
+    fn persistent_namespace(&self) -> Arc<PersistentRuntimeNamespace<P>> {
         self.namespaces.persistent()
     }
 
     #[allow(dead_code)]
-    fn temporary_namespace(&self) -> Option<Arc<TemporaryNamespace<BoxedPager>>> {
+    fn temporary_namespace(&self) -> Option<Arc<TemporaryRuntimeNamespace<BoxedPager>>> {
         self.namespaces.temporary()
     }
 
@@ -560,7 +562,7 @@ where
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -579,7 +581,7 @@ where
                     table_name,
                 })
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     match self.inner.execute_operation(PlanOperation::Insert(plan)) {
                         Ok(_) => {
@@ -625,7 +627,7 @@ where
     /// Select rows (outside or inside transaction).
     pub fn execute_select_plan(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
         if let Some(namespace_id) = self.namespace_for_select_plan(&plan)
-            && namespace_id == storage_namespace::TEMPORARY_NAMESPACE_ID
+            && namespace_id == TEMPORARY_NAMESPACE_ID
         {
             return self.select_from_temporary(plan);
         }
@@ -714,7 +716,7 @@ where
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -733,7 +735,7 @@ where
                     )),
                 }
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     let table_name = plan.table.clone();
                     let result = match self.inner.execute_operation(PlanOperation::Update(plan)) {
@@ -781,7 +783,7 @@ where
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -800,7 +802,7 @@ where
                     )),
                 }
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     let table_name = plan.table.clone();
                     let result = match self.inner.execute_operation(PlanOperation::Delete(plan)) {
@@ -860,13 +862,13 @@ where
         let target_namespace = plan
             .namespace
             .clone()
-            .unwrap_or_else(|| storage_namespace::PERSISTENT_NAMESPACE_ID.to_string())
+            .unwrap_or_else(|| PERSISTENT_NAMESPACE_ID.to_string())
             .to_ascii_lowercase();
 
         let plan = self.materialize_ctas_plan(plan)?;
 
         match target_namespace.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -882,7 +884,7 @@ where
                 }
                 result.convert_pager_type::<P>()
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     match self
                         .inner
@@ -922,7 +924,7 @@ where
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -934,7 +936,7 @@ where
                     .unregister_table(&canonical_table);
                 Ok(RuntimeStatementResult::NoOp)
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     let referencing_tables = self.tables_referencing_in_transaction(&plan.name);
                     if !referencing_tables.is_empty() {
@@ -989,7 +991,7 @@ where
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -1007,7 +1009,7 @@ where
                     Err(err) => Err(err),
                 }
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 match self.run_autocommit_rename_table(plan.clone()) {
                     Ok(()) => Ok(()),
                     Err(err) if plan.if_exists && super::is_table_missing_error(&err) => Ok(()),
@@ -1026,7 +1028,7 @@ where
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -1055,7 +1057,7 @@ where
 
                 temp_namespace.alter_table(plan)?.convert_pager_type::<P>()
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 let persistent = self.persistent_namespace();
                 let context = persistent.context();
                 let catalog_service = &context.catalog_service;
@@ -1107,13 +1109,13 @@ where
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+            TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 temp_namespace.create_index(plan)?.convert_pager_type::<P>()
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+            PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     return Err(Error::InvalidArgumentError(
                         "CREATE INDEX is not supported inside an active transaction".into(),
