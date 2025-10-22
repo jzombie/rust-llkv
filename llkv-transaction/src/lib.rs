@@ -44,6 +44,7 @@ pub use mvcc::{
     RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TransactionSnapshot, TxnId, TxnIdManager,
 };
 
+// TODO: Rename to `TransactionSessionId`?
 /// Session identifier type.
 ///
 /// Session IDs track client sessions that may spawn multiple transactions.
