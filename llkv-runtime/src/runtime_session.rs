@@ -159,7 +159,9 @@ where
             String::new()
         };
 
-        let execution = temp_namespace.context().execute_select(plan.clone())?;
+        let temp_context = temp_namespace.context();
+        let snapshot = temp_context.default_snapshot();
+        let execution = temp_context.execute_select(plan.clone(), snapshot)?;
         let schema = execution.schema();
         let batches = execution.collect()?;
 
@@ -444,9 +446,10 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace
-                    .context()
-                    .insert(plan)?
+                let temp_context = temp_namespace.context();
+                let snapshot = temp_context.default_snapshot();
+                temp_context
+                    .insert(plan, snapshot)?
                     .convert_pager_type::<P>()?;
                 Ok(RuntimeStatementResult::Insert {
                     rows_inserted,
@@ -592,9 +595,10 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace
-                    .context()
-                    .update(plan)?
+                let temp_context = temp_namespace.context();
+                let snapshot = temp_context.default_snapshot();
+                temp_context
+                    .update(plan, snapshot)?
                     .convert_pager_type::<P>()
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
@@ -653,9 +657,10 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace
-                    .context()
-                    .delete(plan)?
+                let temp_context = temp_namespace.context();
+                let snapshot = temp_context.default_snapshot();
+                temp_context
+                    .delete(plan, snapshot)?
                     .convert_pager_type::<P>()
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {

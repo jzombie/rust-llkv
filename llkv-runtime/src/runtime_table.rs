@@ -371,7 +371,8 @@ where
             columns: batch.columns,
             source: InsertSource::Rows(batch.rows),
         };
-        self.context.insert(plan)
+        let snapshot = self.context.default_snapshot();
+        self.context.insert(plan, snapshot)
     }
 
     pub fn insert_batches(&self, batches: Vec<RecordBatch>) -> Result<RuntimeStatementResult<P>> {
@@ -380,7 +381,8 @@ where
             columns: Vec::new(),
             source: InsertSource::Batches(batches),
         };
-        self.context.insert(plan)
+        let snapshot = self.context.default_snapshot();
+        self.context.insert(plan, snapshot)
     }
 
     pub fn insert_lazy(&self, frame: RuntimeLazyFrame<P>) -> Result<RuntimeStatementResult<P>> {

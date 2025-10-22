@@ -533,12 +533,6 @@ where
         RuntimeTableHandle::new(Arc::clone(self), name)
     }
 
-    /// Check if there's an active transaction (checks if ANY session has a transaction).
-    #[deprecated(note = "Use session-based transactions instead")]
-    pub fn has_active_transaction(&self) -> bool {
-        self.transaction_manager.has_active_transaction()
-    }
-
     /// Create a table with explicit column definitions - Programmatic API.
     ///
     /// This is a **convenience method** for programmatically creating tables with explicit
@@ -747,17 +741,7 @@ where
         }
     }
 
-    pub fn insert(&self, plan: InsertPlan) -> Result<RuntimeStatementResult<P>> {
-        // For non-transactional inserts, use TXN_ID_AUTO_COMMIT directly
-        // instead of creating a temporary transaction
-        let snapshot = TransactionSnapshot {
-            txn_id: TXN_ID_AUTO_COMMIT,
-            snapshot_id: self.txn_manager.last_committed(),
-        };
-        self.insert_with_snapshot(plan, snapshot)
-    }
-
-    pub fn insert_with_snapshot(
+    pub fn insert(
         &self,
         plan: InsertPlan,
         snapshot: TransactionSnapshot,
@@ -833,14 +817,6 @@ where
     /// Get raw batches from a table including row_ids, optionally filtered.
     /// This is used for transaction seeding where we need to preserve existing row_ids.
     pub fn get_batches_with_row_ids(
-        &self,
-        table_name: &str,
-        filter: Option<LlkvExpr<'static, String>>,
-    ) -> Result<Vec<RecordBatch>> {
-        self.get_batches_with_row_ids_with_snapshot(table_name, filter, self.default_snapshot())
-    }
-
-    pub fn get_batches_with_row_ids_with_snapshot(
         &self,
         table_name: &str,
         filter: Option<LlkvExpr<'static, String>>,
@@ -965,21 +941,7 @@ where
         Ok(total_rows)
     }
 
-    pub fn update(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
-        let snapshot = self.txn_manager.begin_transaction();
-        match self.update_with_snapshot(plan, snapshot) {
-            Ok(result) => {
-                self.txn_manager.mark_committed(snapshot.txn_id);
-                Ok(result)
-            }
-            Err(err) => {
-                self.txn_manager.mark_aborted(snapshot.txn_id);
-                Err(err)
-            }
-        }
-    }
-
-    pub fn update_with_snapshot(
+    pub fn update(
         &self,
         plan: UpdatePlan,
         snapshot: TransactionSnapshot,
@@ -1011,21 +973,7 @@ where
         }
     }
 
-    pub fn delete(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
-        let snapshot = self.txn_manager.begin_transaction();
-        match self.delete_with_snapshot(plan, snapshot) {
-            Ok(result) => {
-                self.txn_manager.mark_committed(snapshot.txn_id);
-                Ok(result)
-            }
-            Err(err) => {
-                self.txn_manager.mark_aborted(snapshot.txn_id);
-                Err(err)
-            }
-        }
-    }
-
-    pub fn delete_with_snapshot(
+    pub fn delete(
         &self,
         plan: DeletePlan,
         snapshot: TransactionSnapshot,
@@ -1052,12 +1000,7 @@ where
         RuntimeTableHandle::new(Arc::clone(self), name)
     }
 
-    pub fn execute_select(self: &Arc<Self>, plan: SelectPlan) -> Result<SelectExecution<P>> {
-        let snapshot = self.default_snapshot();
-        self.execute_select_with_snapshot(plan, snapshot)
-    }
-
-    pub fn execute_select_with_snapshot(
+    pub fn execute_select(
         self: &Arc<Self>,
         plan: SelectPlan,
         snapshot: TransactionSnapshot,
@@ -2493,11 +2436,68 @@ where
             .map(|column| column.name.clone())
             .collect();
         let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
+        
+        // Validate row-level constraints (NOT NULL, CHECK)
         self.constraint_service.validate_row_level_constraints(
             &constraint_ctx.schema_field_ids,
             &constraint_ctx.column_constraints,
             &column_order,
             &new_rows,
+        )?;
+
+        // For UPDATE, validate UNIQUE constraints against existing rows EXCLUDING
+        // the rows being updated (since they'll be deleted before new values are inserted).
+        // This prevents false duplicate detection when primary key values don't change.
+        let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
+        let all_visible_row_ids = {
+            let first_field = table.schema.first_field_id().ok_or_else(|| {
+                Error::Internal("table has no columns for validation".into())
+            })?;
+            let filter_expr = full_table_scan_filter(first_field);
+            let all_ids = table.table.filter_row_ids(&filter_expr)?;
+            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
+        };
+        
+        self.constraint_service.validate_insert_constraints(
+            &constraint_ctx.schema_field_ids,
+            &constraint_ctx.column_constraints,
+            &constraint_ctx.unique_columns,
+            &constraint_ctx.multi_column_uniques,
+            primary_key_spec,
+            &column_order,
+            &new_rows,
+            |field_id| {
+                // Get all values and filter out rows being updated
+                let all_vals = self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
+                let filtered: Vec<PlanValue> = all_vals
+                    .into_iter()
+                    .zip(&all_visible_row_ids)
+                    .filter_map(|(row, &row_id)| {
+                        if !row_ids_set.contains(&row_id) {
+                            row.into_iter().next()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(filtered)
+            },
+            |field_ids| {
+                // Get all multi-column values and filter out rows being updated
+                let all_rows = self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
+                let filtered: Vec<Vec<PlanValue>> = all_rows
+                    .into_iter()
+                    .zip(&all_visible_row_ids)
+                    .filter_map(|(row, &row_id)| {
+                        if !row_ids_set.contains(&row_id) {
+                            Some(row)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(filtered)
+            },
         )?;
 
         if let Some(pk) = primary_key_spec {
@@ -2520,6 +2520,10 @@ where
             &updated_field_ids,
             snapshot,
         )?;
+
+        // Also validate foreign keys for the new rows BEFORE deleting old rows
+        // This prevents data loss if the new values violate FK constraints
+        self.check_foreign_keys_on_insert(table, &display_name, &new_rows, &column_order, snapshot)?;
 
         let _ = self.apply_delete(
             table,
@@ -2743,11 +2747,64 @@ where
             .map(|column| column.name.clone())
             .collect();
         let column_order = resolve_insert_columns(&column_names, table.schema.as_ref())?;
+        
+        // Validate row-level constraints (NOT NULL, CHECK)
         self.constraint_service.validate_row_level_constraints(
             &constraint_ctx.schema_field_ids,
             &constraint_ctx.column_constraints,
             &column_order,
             &new_rows,
+        )?;
+
+        // For UPDATE, validate UNIQUE constraints excluding rows being updated
+        let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
+        let all_visible_row_ids = {
+            let first_field = table.schema.first_field_id().ok_or_else(|| {
+                Error::Internal("table has no columns for validation".into())
+            })?;
+            let filter_expr = full_table_scan_filter(first_field);
+            let all_ids = table.table.filter_row_ids(&filter_expr)?;
+            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
+        };
+        
+        self.constraint_service.validate_insert_constraints(
+            &constraint_ctx.schema_field_ids,
+            &constraint_ctx.column_constraints,
+            &constraint_ctx.unique_columns,
+            &constraint_ctx.multi_column_uniques,
+            primary_key_spec,
+            &column_order,
+            &new_rows,
+            |field_id| {
+                let all_vals = self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
+                let filtered: Vec<PlanValue> = all_vals
+                    .into_iter()
+                    .zip(&all_visible_row_ids)
+                    .filter_map(|(row, &row_id)| {
+                        if !row_ids_set.contains(&row_id) {
+                            row.into_iter().next()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(filtered)
+            },
+            |field_ids| {
+                let all_rows = self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
+                let filtered: Vec<Vec<PlanValue>> = all_rows
+                    .into_iter()
+                    .zip(&all_visible_row_ids)
+                    .filter_map(|(row, &row_id)| {
+                        if !row_ids_set.contains(&row_id) {
+                            Some(row)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(filtered)
+            },
         )?;
 
         if let Some(pk) = primary_key_spec {
@@ -2770,6 +2827,9 @@ where
             &updated_field_ids,
             snapshot,
         )?;
+
+        // Also validate foreign keys for the new rows BEFORE deleting old rows
+        self.check_foreign_keys_on_insert(table, &display_name, &new_rows, &column_order, snapshot)?;
 
         let _ = self.apply_delete(
             table,

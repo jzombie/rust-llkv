@@ -6,7 +6,7 @@ use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor, TableId};
 use llkv_transaction::{
-    TransactionContext, TransactionResult, TransactionSnapshot, TxnId, TXN_ID_AUTO_COMMIT,
+    TransactionContext, TransactionResult, TransactionSnapshot, TxnId,
 };
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -137,8 +137,7 @@ where
         table_name: &str,
         filter: Option<LlkvExpr<'static, String>>,
     ) -> LlkvResult<Vec<RecordBatch>> {
-        RuntimeContext::get_batches_with_row_ids_with_snapshot(
-            self.context(),
+        self.context().get_batches_with_row_ids(
             table_name,
             filter,
             self.snapshot(),
@@ -146,7 +145,7 @@ where
     }
 
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>> {
-        RuntimeContext::execute_select_with_snapshot(self.context(), plan, self.snapshot())
+        self.context().execute_select(plan, self.snapshot())
     }
 
     fn apply_create_table_plan(
@@ -169,31 +168,19 @@ where
             &*self.ctx.pager
         );
         let snapshot = self.current_snapshot();
-        let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
-            self.ctx().insert(plan)?
-        } else {
-            RuntimeContext::insert_with_snapshot(self.context(), plan, snapshot)?
-        };
+        let result = self.ctx().insert(plan, snapshot)?;
         Ok(convert_statement_result(result))
     }
 
     fn update(&self, plan: UpdatePlan) -> LlkvResult<TransactionResult<P>> {
         let snapshot = self.current_snapshot();
-        let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
-            self.ctx().update(plan)?
-        } else {
-            RuntimeContext::update_with_snapshot(self.context(), plan, snapshot)?
-        };
+        let result = self.ctx().update(plan, snapshot)?;
         Ok(convert_statement_result(result))
     }
 
     fn delete(&self, plan: DeletePlan) -> LlkvResult<TransactionResult<P>> {
         let snapshot = self.current_snapshot();
-        let result = if snapshot.txn_id == TXN_ID_AUTO_COMMIT {
-            self.ctx().delete(plan)?
-        } else {
-            RuntimeContext::delete_with_snapshot(self.context(), plan, snapshot)?
-        };
+        let result = self.ctx().delete(plan, snapshot)?;
         Ok(convert_statement_result(result))
     }
 

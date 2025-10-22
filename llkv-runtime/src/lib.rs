@@ -560,7 +560,8 @@ mod tests {
 
         let plan =
             SelectPlan::new("ints").with_aggregates(vec![AggregateExpr::count_nulls("i", "nulls")]);
-        let execution = context.execute_select(plan).expect("select");
+        let snapshot = context.default_snapshot();
+        let execution = context.execute_select(plan, snapshot).expect("select");
         let batches = execution.collect().expect("collect batches");
         let column = batches[0]
             .column(0)

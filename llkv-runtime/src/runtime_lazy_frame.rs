@@ -66,11 +66,13 @@ where
     }
 
     pub fn collect(self) -> Result<SelectExecution<P>> {
-        self.context.execute_select(self.plan)
+        let snapshot = self.context.default_snapshot();
+        self.context.execute_select(self.plan, snapshot)
     }
 
     pub fn collect_rows(self) -> Result<RowBatch> {
-        let execution = self.context.execute_select(self.plan)?;
+        let snapshot = self.context.default_snapshot();
+        let execution = self.context.execute_select(self.plan, snapshot)?;
         execution.collect_rows()
     }
 
