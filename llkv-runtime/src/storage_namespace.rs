@@ -7,7 +7,10 @@ use std::any::Any;
 use std::sync::{Arc, RwLock};
 
 use llkv_executor::ExecutorTable;
-use llkv_plan::{CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan, PlanOperation};
+use llkv_plan::{
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan,
+    PlanOperation, RenameTablePlan,
+};
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_transaction::TransactionResult;
@@ -53,7 +56,10 @@ pub trait StorageNamespace: Send + Sync + 'static {
     fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()>;
 
     /// Rename a table within this namespace.
-    fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()>;
+    fn rename_table(&self, plan: RenameTablePlan) -> crate::Result<()>;
+
+    /// Alter a table within this namespace.
+    fn alter_table(&self, plan: AlterTablePlan) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
 
     /// Create an index within this namespace.
     fn create_index(
@@ -163,8 +169,12 @@ where
         CatalogDdl::drop_table(self.context.as_ref(), plan)
     }
 
-    fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()> {
-        CatalogDdl::rename_table(self.context.as_ref(), current_name, new_name)
+    fn rename_table(&self, plan: RenameTablePlan) -> crate::Result<()> {
+        CatalogDdl::rename_table(self.context.as_ref(), plan)
+    }
+
+    fn alter_table(&self, plan: AlterTablePlan) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+        CatalogDdl::alter_table(self.context.as_ref(), plan)
     }
 
     fn create_index(
@@ -312,14 +322,19 @@ where
         Ok(())
     }
 
-    fn rename_table(&self, current_name: &str, new_name: &str) -> crate::Result<()> {
-        let (_, current_canonical) = canonical_table_name(current_name)?;
-        let (_, new_canonical) = canonical_table_name(new_name)?;
+    fn rename_table(&self, plan: RenameTablePlan) -> crate::Result<()> {
+        let (_, current_canonical) = canonical_table_name(&plan.current_name)?;
+        let (_, new_canonical) = canonical_table_name(&plan.new_name)?;
         let context = self.context();
-        CatalogDdl::rename_table(context.as_ref(), current_name, new_name)?;
+        CatalogDdl::rename_table(context.as_ref(), plan)?;
         self.unregister_table(&current_canonical);
         self.register_table(new_canonical);
         Ok(())
+    }
+
+    fn alter_table(&self, plan: AlterTablePlan) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+        let context = self.context();
+        CatalogDdl::alter_table(context.as_ref(), plan)
     }
 
     fn create_index(

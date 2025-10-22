@@ -50,101 +50,50 @@ use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, Filter, Operator, ScalarExpr};
-use llkv_result::Error;
+use llkv_executor::{
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable, QueryExecutor,
+    RowBatch, TableProvider,
+};
+pub use llkv_executor::SelectExecution;
+pub use llkv_plan::{
+    AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, ColumnSpec, CreateIndexPlan,
+    CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction,
+    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoColumnSpec,
+    MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanOperation, PlanStatement,
+    PlanValue, RenameTablePlan, SelectPlan, SelectProjection, UpdatePlan,
+};
+use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager, Pager};
-use llkv_table::catalog::{FieldConstraints, FieldDefinition, MvccColumnBuilder, TableCatalog};
-use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
-use llkv_table::types::{FieldId, ROW_ID_FIELD_ID, RowId};
 use llkv_table::{
-    CatalogDdl, CatalogManager, ConstraintColumnInfo, ConstraintService, CreateTableResult,
+    build_composite_unique_key, canonical_table_name, CatalogDdl, CatalogManager,
+    ConstraintColumnInfo, ConstraintKind, ConstraintService, CreateTableResult, FieldId,
     ForeignKeyColumn, ForeignKeyTableInfo, ForeignKeyView, InsertColumnConstraint,
     InsertMultiColumnUnique, InsertUniqueColumn, MetadataManager, MultiColumnUniqueEntryMeta,
-    MultiColumnUniqueRegistration, SingleColumnIndexDescriptor, SingleColumnIndexRegistration,
-    SysCatalog, TableConstraintSummaryView, TableView, UniqueKey, build_composite_unique_key,
-    canonical_table_name, constraints::ConstraintKind, ensure_multi_column_unique,
-    ensure_single_column_unique,
+    MultiColumnUniqueRegistration, RowId, SingleColumnIndexDescriptor, SingleColumnIndexRegistration,
+    SysCatalog, Table, TableConstraintSummaryView, TableId, TableView, UniqueKey, ROW_ID_FIELD_ID,
 };
-use simd_r_drive_entry_handle::EntryHandle;
+use llkv_table::catalog::{MvccColumnBuilder, TableCatalog};
+use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
+use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions};
+use llkv_table::{ensure_multi_column_unique, ensure_single_column_unique};
+pub use llkv_transaction::{
+    TransactionContext, TransactionKind, TransactionManager, TransactionResult,
+    TransactionSession, TransactionSnapshot, TxnId, TxnIdManager, TXN_ID_AUTO_COMMIT,
+    TXN_ID_NONE,
+};
+use llkv_transaction::mvcc::{self, RowVersion};
 use sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator, Value,
-    ValueWithSpan,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator,
+    Value, ValueWithSpan,
 };
 use time::{Date, Month};
-
-pub type Result<T> = llkv_result::Result<T>;
-
-// Re-export plan structures from llkv-plan
-pub use llkv_plan::{
-    AggregateExpr, AggregateFunction, AlterTablePlan, AssignmentValue, ColumnAssignment,
-    ColumnNullability, ColumnSpec, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan,
-    DropIndexPlan, DropTablePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, IntoColumnSpec, MultiColumnUniqueSpec, NotNull, Nullable, OrderByPlan,
-    OrderSortType, OrderTarget, PlanOperation, PlanStatement, PlanValue, SelectPlan,
-    SelectProjection, UpdatePlan,
-};
-
-// Execution structures from llkv-executor
-use llkv_executor::{ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable};
-pub use llkv_executor::{QueryExecutor, RowBatch, SelectExecution, TableProvider};
+use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::storage_namespace::{
     PersistentNamespace, StorageNamespace, StorageNamespaceRegistry, TemporaryNamespace,
 };
 
-// Import transaction structures from llkv-transaction for internal use.
-pub use llkv_transaction::TransactionKind;
-use llkv_transaction::{
-    RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE, TableId, TransactionContext, TransactionManager,
-    TransactionResult, TxnId, TxnIdManager, mvcc::TransactionSnapshot,
-};
-
-// Internal low-level transaction session type (from llkv-transaction)
-use llkv_transaction::TransactionSession;
-
-// Note: RuntimeSession is the high-level wrapper that users should use instead of the lower-level TransactionSession API
-
-use llkv_transaction::mvcc;
-
-struct TableConstraintContext {
-    schema_field_ids: Vec<FieldId>,
-    column_constraints: Vec<InsertColumnConstraint>,
-    unique_columns: Vec<InsertUniqueColumn>,
-    multi_column_uniques: Vec<InsertMultiColumnUnique>,
-    primary_key: Option<InsertMultiColumnUnique>,
-}
-
-// TODO: This should be moved to `llkv-transaction`
-struct TransactionMvccBuilder;
-
-impl MvccColumnBuilder for TransactionMvccBuilder {
-    fn build_insert_columns(
-        &self,
-        row_count: usize,
-        start_row_id: RowId,
-        creator_txn_id: u64,
-        deleted_marker: u64,
-    ) -> (ArrayRef, ArrayRef, ArrayRef) {
-        mvcc::build_insert_mvcc_columns(row_count, start_row_id, creator_txn_id, deleted_marker)
-    }
-
-    fn mvcc_fields(&self) -> Vec<Field> {
-        mvcc::build_mvcc_fields()
-    }
-
-    fn field_with_metadata(
-        &self,
-        name: &str,
-        data_type: DataType,
-        nullable: bool,
-        field_id: FieldId,
-    ) -> Field {
-        mvcc::build_field_with_metadata(name, data_type, nullable, field_id)
-    }
-}
-
-/// Result of running a plan statement.
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum RuntimeStatementResult<P>
 where
@@ -297,38 +246,239 @@ where
     }
 }
 
-/// Return the table name referenced by a plan statement, if any.
-///
-/// This is a small helper used by higher-level engines (for example the
-/// SQL front-end) to provide better error messages when a statement fails
-/// with a table-related error. It intentionally returns an `Option<&str>` so
-/// callers can decide how to report missing table context.
+fn is_index_not_found_error(err: &Error) -> bool {
+    matches!(err, Error::CatalogError(message) if message.contains("does not exist"))
+}
+
+fn is_table_missing_error(err: &Error) -> bool {
+    matches!(err, Error::CatalogError(message) if message.contains("does not exist"))
+}
+
 pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
     match statement {
-        PlanStatement::CreateTable(plan) => Some(&plan.name),
-        PlanStatement::DropTable(plan) => Some(&plan.name),
-        PlanStatement::AlterTable(plan) => Some(&plan.table_name),
-        PlanStatement::CreateIndex(plan) => Some(&plan.table),
-        PlanStatement::DropIndex(_plan) => None,
-        PlanStatement::Insert(plan) => Some(&plan.table),
-        PlanStatement::Update(plan) => Some(&plan.table),
-        PlanStatement::Delete(plan) => Some(&plan.table),
-        PlanStatement::Select(plan) => {
-            // Return Some only for single-table queries
-            if plan.tables.len() == 1 {
-                Some(&plan.tables[0].table)
-            } else {
-                None
-            }
-        }
+        PlanStatement::CreateTable(plan) => Some(plan.name.as_str()),
+        PlanStatement::DropTable(plan) => Some(plan.name.as_str()),
+        PlanStatement::AlterTable(plan) => Some(plan.table_name.as_str()),
+        PlanStatement::CreateIndex(plan) => Some(plan.table.as_str()),
+        PlanStatement::Insert(plan) => Some(plan.table.as_str()),
+        PlanStatement::Update(plan) => Some(plan.table.as_str()),
+        PlanStatement::Delete(plan) => Some(plan.table.as_str()),
+        PlanStatement::Select(plan) => plan
+            .tables
+            .first()
+            .map(|table_ref| table_ref.table.as_str()),
+        PlanStatement::DropIndex(_) => None,
         PlanStatement::BeginTransaction
         | PlanStatement::CommitTransaction
         | PlanStatement::RollbackTransaction => None,
     }
 }
 
-fn is_index_not_found_error(err: &Error) -> bool {
-    matches!(err, Error::CatalogError(message) if message.contains("does not exist"))
+struct TransactionMvccBuilder;
+
+impl MvccColumnBuilder for TransactionMvccBuilder {
+    fn build_insert_columns(
+        &self,
+        row_count: usize,
+        start_row_id: RowId,
+        creator_txn_id: u64,
+        deleted_marker: u64,
+    ) -> (ArrayRef, ArrayRef, ArrayRef) {
+        mvcc::build_insert_mvcc_columns(row_count, start_row_id, creator_txn_id, deleted_marker)
+    }
+
+    fn mvcc_fields(&self) -> Vec<Field> {
+        mvcc::build_mvcc_fields()
+    }
+
+    fn field_with_metadata(
+        &self,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        field_id: FieldId,
+    ) -> Field {
+        mvcc::build_field_with_metadata(name, data_type, nullable, field_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TableConstraintContext {
+    schema_field_ids: Vec<FieldId>,
+    column_constraints: Vec<InsertColumnConstraint>,
+    unique_columns: Vec<InsertUniqueColumn>,
+    multi_column_uniques: Vec<InsertMultiColumnUnique>,
+    primary_key: Option<InsertMultiColumnUnique>,
+}
+
+fn column_in_primary_or_unique(view: &TableView, field_id: FieldId) -> bool {
+    view.constraint_records
+        .iter()
+        .filter(|record| record.is_active())
+        .any(|record| match &record.kind {
+            ConstraintKind::PrimaryKey(payload) => payload.field_ids.contains(&field_id),
+            ConstraintKind::Unique(payload) => payload.field_ids.contains(&field_id),
+            _ => false,
+        })
+}
+
+fn column_in_multi_column_unique(view: &TableView, field_id: FieldId) -> bool {
+    view.multi_column_uniques
+        .iter()
+        .any(|entry| entry.column_ids.iter().any(|id| *id == field_id))
+}
+
+fn column_in_foreign_keys<PagerType>(
+    view: &TableView,
+    field_id: FieldId,
+    table_id: TableId,
+    catalog_service: &CatalogManager<PagerType>,
+) -> Result<Option<String>>
+where
+    PagerType: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    if let Some(fk) = view
+        .foreign_keys
+        .iter()
+        .find(|fk| fk.referencing_field_ids.contains(&field_id))
+    {
+        return Ok(Some(
+            fk.constraint_name
+                .as_deref()
+                .unwrap_or("unnamed")
+                .to_string(),
+        ));
+    }
+
+    let mut visited: FxHashSet<TableId> = FxHashSet::default();
+    for (referencing_table_id, _) in catalog_service.foreign_keys_referencing(table_id)? {
+        if !visited.insert(referencing_table_id) {
+            continue;
+        }
+
+        for fk in catalog_service.foreign_key_views_for_table(referencing_table_id)? {
+            if fk.referenced_table_id == table_id
+                && fk.referenced_field_ids.contains(&field_id)
+            {
+                return Ok(Some(
+                    fk.constraint_name
+                        .as_deref()
+                        .unwrap_or("unnamed")
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn validate_alter_table_operation<PagerType>(
+    operation: &llkv_plan::AlterTableOperation,
+    view: &TableView,
+    table_id: TableId,
+    catalog_service: &CatalogManager<PagerType>,
+) -> Result<()>
+where
+    PagerType: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    let resolver = catalog_service
+        .field_resolver(table_id)
+        .ok_or_else(|| Error::Internal("missing field resolver for table".into()))?;
+
+    match operation {
+        llkv_plan::AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => {
+            let field_id = resolver.field_id(old_column_name).ok_or_else(|| {
+                Error::CatalogError(format!(
+                    "Catalog Error: column '{}' does not exist",
+                    old_column_name
+                ))
+            })?;
+
+            if resolver.field_id(new_column_name).is_some() {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: column '{}' already exists",
+                    new_column_name
+                )));
+            }
+
+            if let Some(constraint) =
+                column_in_foreign_keys(view, field_id, table_id, catalog_service)?
+            {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
+                    old_column_name, constraint
+                )));
+            }
+
+            Ok(())
+        }
+        llkv_plan::AlterTableOperation::SetColumnDataType { column_name, .. } => {
+            let field_id = resolver.field_id(column_name).ok_or_else(|| {
+                Error::CatalogError(format!(
+                    "Catalog Error: column '{}' does not exist",
+                    column_name
+                ))
+            })?;
+
+            if column_in_primary_or_unique(view, field_id)
+                || column_in_multi_column_unique(view, field_id)
+            {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Binder Error: Cannot change the type of a column that has a UNIQUE or PRIMARY KEY constraint specified (column '{}')",
+                    column_name
+                )));
+            }
+
+            if let Some(constraint) =
+                column_in_foreign_keys(view, field_id, table_id, catalog_service)?
+            {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
+                    column_name, constraint
+                )));
+            }
+
+            Ok(())
+        }
+        llkv_plan::AlterTableOperation::DropColumn {
+            column_name,
+            if_exists,
+            ..
+        } => {
+            let field_id = match resolver.field_id(column_name) {
+                Some(id) => id,
+                None if *if_exists => return Ok(()),
+                None => {
+                    return Err(Error::CatalogError(format!(
+                        "Catalog Error: column '{}' does not exist",
+                        column_name
+                    )))
+                }
+            };
+
+            if column_in_primary_or_unique(view, field_id)
+                || column_in_multi_column_unique(view, field_id)
+            {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: there is a UNIQUE constraint that depends on it (column '{}')",
+                    column_name
+                )));
+            }
+
+            if column_in_foreign_keys(view, field_id, table_id, catalog_service)?.is_some() {
+                return Err(Error::CatalogError(format!(
+                    "Catalog Error: there is a FOREIGN KEY constraint that depends on it (column '{}')",
+                    column_name
+                )));
+            }
+
+            Ok(())
+        }
+    }
 }
 
 // ============================================================================
@@ -395,6 +545,7 @@ where
     type CreateTableOutput = TransactionResult<P>;
     type DropTableOutput = ();
     type RenameTableOutput = ();
+    type AlterTableOutput = TransactionResult<P>;
     type CreateIndexOutput = TransactionResult<P>;
     type DropIndexOutput = Option<SingleColumnIndexDescriptor>;
 
@@ -410,10 +561,18 @@ where
 
     fn rename_table(
         &self,
-        current_name: &str,
-        new_name: &str,
+        plan: RenameTablePlan,
     ) -> llkv_result::Result<Self::RenameTableOutput> {
-        CatalogDdl::rename_table(self.ctx.as_ref(), current_name, new_name)
+        CatalogDdl::rename_table(self.ctx.as_ref(), plan)
+    }
+
+    fn alter_table(
+        &self,
+        plan: AlterTablePlan,
+    ) -> llkv_result::Result<Self::AlterTableOutput> {
+        let ctx = self.context();
+        let result = CatalogDdl::alter_table(ctx.as_ref(), plan)?;
+        Ok(convert_statement_result(result))
     }
 
     fn create_index(&self, plan: CreateIndexPlan) -> llkv_result::Result<Self::CreateIndexOutput> {
@@ -446,7 +605,9 @@ where
             Arc::clone(&base_context),
         ));
 
-        let mut registry = StorageNamespaceRegistry::new(persistent.namespace_id().clone());
+        let mut registry = StorageNamespaceRegistry::new(
+            StorageNamespace::namespace_id(persistent.as_ref()).clone(),
+        );
         registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
         let temporary = {
@@ -752,6 +913,7 @@ where
         })
     }
 
+    // TODO: Migrate to DDL as `create_table`
     /// Materialize CREATE TABLE AS SELECT by executing the SELECT and converting to batches.
     ///
     /// This method handles the preprocessing step for CREATE TABLE AS SELECT statements:
@@ -790,327 +952,6 @@ where
         Ok(plan)
     }
 
-    pub fn execute_alter_table_plan(
-        &self,
-        plan: AlterTablePlan,
-    ) -> Result<RuntimeStatementResult<P>> {
-        let (_, canonical_table) = canonical_table_name(&plan.table_name)?;
-
-        // Determine which namespace contains this table
-        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
-
-        match namespace_id.as_str() {
-            storage_namespace::TEMPORARY_NAMESPACE_ID => {
-                let temp_namespace = self
-                    .temporary_namespace()
-                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-
-                let catalog_service = &temp_namespace.context().catalog_service;
-                let view = catalog_service.table_view(&canonical_table)?;
-                let table_id = view
-                    .table_meta
-                    .as_ref()
-                    .ok_or_else(|| Error::Internal("table metadata missing".into()))?
-                    .table_id;
-
-                // Perform validation
-                Self::validate_alter_table_operation(
-                    &plan.operation,
-                    &view,
-                    table_id,
-                    catalog_service,
-                )?;
-
-                // Execute the ALTER TABLE operation
-                match &plan.operation {
-                    llkv_plan::AlterTableOperation::RenameColumn {
-                        old_column_name,
-                        new_column_name,
-                    } => {
-                        temp_namespace.context().rename_column(
-                            &plan.table_name,
-                            old_column_name,
-                            new_column_name,
-                        )?;
-                        Ok(RuntimeStatementResult::NoOp)
-                    }
-                    llkv_plan::AlterTableOperation::SetColumnDataType {
-                        column_name,
-                        new_data_type,
-                    } => {
-                        temp_namespace.context().alter_column_type(
-                            &plan.table_name,
-                            column_name,
-                            new_data_type,
-                        )?;
-                        Ok(RuntimeStatementResult::NoOp)
-                    }
-                    llkv_plan::AlterTableOperation::DropColumn {
-                        column_name,
-                        if_exists: _,
-                        cascade: _,
-                    } => {
-                        temp_namespace
-                            .context()
-                            .drop_column(&plan.table_name, column_name)?;
-                        Ok(RuntimeStatementResult::NoOp)
-                    }
-                }
-            }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => {
-                let catalog_service = &self.persistent_namespace().context().catalog_service;
-                let view = catalog_service.table_view(&canonical_table)?;
-                let table_id = view
-                    .table_meta
-                    .as_ref()
-                    .ok_or_else(|| Error::Internal("table metadata missing".into()))?
-                    .table_id;
-
-                // Perform validation
-                Self::validate_alter_table_operation(
-                    &plan.operation,
-                    &view,
-                    table_id,
-                    catalog_service,
-                )?;
-
-                // Execute the ALTER TABLE operation
-                match &plan.operation {
-                    llkv_plan::AlterTableOperation::RenameColumn {
-                        old_column_name,
-                        new_column_name,
-                    } => {
-                        self.persistent_namespace().context().rename_column(
-                            &plan.table_name,
-                            old_column_name,
-                            new_column_name,
-                        )?;
-                        Ok(RuntimeStatementResult::NoOp)
-                    }
-                    llkv_plan::AlterTableOperation::SetColumnDataType {
-                        column_name,
-                        new_data_type,
-                    } => {
-                        self.persistent_namespace().context().alter_column_type(
-                            &plan.table_name,
-                            column_name,
-                            new_data_type,
-                        )?;
-                        Ok(RuntimeStatementResult::NoOp)
-                    }
-                    llkv_plan::AlterTableOperation::DropColumn {
-                        column_name,
-                        if_exists: _,
-                        cascade: _,
-                    } => {
-                        self.persistent_namespace()
-                            .context()
-                            .drop_column(&plan.table_name, column_name)?;
-                        Ok(RuntimeStatementResult::NoOp)
-                    }
-                }
-            }
-            other => Err(Error::InvalidArgumentError(format!(
-                "Unknown storage namespace '{}'",
-                other
-            ))),
-        }
-    }
-
-    /// Helper method to validate ALTER TABLE operations against foreign key constraints.
-    /// This is generic over the pager type to work with both temporary and persistent namespaces.
-    fn validate_alter_table_operation<PagerType>(
-        operation: &llkv_plan::AlterTableOperation,
-        view: &TableView,
-        table_id: TableId,
-        catalog_service: &llkv_table::CatalogManager<PagerType>,
-    ) -> Result<()>
-    where
-        PagerType: Pager<Blob = EntryHandle> + Send + Sync,
-    {
-        match operation {
-            llkv_plan::AlterTableOperation::RenameColumn {
-                old_column_name,
-                new_column_name: _,
-            } => {
-                // Check if column is involved in any foreign key constraint
-                let old_col_lower = old_column_name.to_ascii_lowercase();
-
-                // Check foreign keys defined on this table (where this table is the referencing table)
-                for fk in &view.foreign_keys {
-                    // Check if column is a referencing column (in this table)
-                    for ref_col in &fk.referencing_column_names {
-                        if ref_col.to_ascii_lowercase() == old_col_lower {
-                            return Err(Error::CatalogError(format!(
-                                "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
-                                old_column_name,
-                                fk.constraint_name
-                                    .as_ref()
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("unnamed")
-                            )));
-                        }
-                    }
-                }
-
-                // Check foreign keys that reference this table (where this table is the referenced table)
-                let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
-                for (referencing_table_id, _constraint_id) in referencing_fks {
-                    // Get the foreign key details for this referencing table
-                    let referencing_table_fks =
-                        catalog_service.foreign_key_views_for_table(referencing_table_id)?;
-
-                    for fk in referencing_table_fks {
-                        if fk.referenced_table_id == table_id {
-                            // Check if the column being renamed is referenced by this FK
-                            for ref_col in &fk.referenced_column_names {
-                                if ref_col.to_ascii_lowercase() == old_col_lower {
-                                    return Err(Error::CatalogError(format!(
-                                        "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
-                                        old_column_name,
-                                        fk.constraint_name
-                                            .as_ref()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("unnamed")
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-            llkv_plan::AlterTableOperation::SetColumnDataType {
-                column_name,
-                new_data_type: _,
-            } => {
-                let col_lower = column_name.to_ascii_lowercase();
-
-                // Resolve the column's field id so constraint metadata can be inspected precisely.
-                let mut column_field_id: Option<FieldId> = None;
-                for meta_opt in &view.column_metas {
-                    if let Some(meta) = meta_opt {
-                        if meta
-                            .name
-                            .as_ref()
-                            .map(|name| name.eq_ignore_ascii_case(column_name))
-                            .unwrap_or(false)
-                        {
-                            column_field_id = Some(meta.col_id);
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(field_id) = column_field_id {
-                    let violates_key_constraint = view
-                        .constraint_records
-                        .iter()
-                        .filter(|record| record.is_active())
-                        .any(|record| match &record.kind {
-                            ConstraintKind::PrimaryKey(payload) => {
-                                payload.field_ids.contains(&field_id)
-                            }
-                            ConstraintKind::Unique(payload) => {
-                                payload.field_ids.contains(&field_id)
-                            }
-                            _ => false,
-                        });
-
-                    if violates_key_constraint {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "Binder Error: Cannot change the type of a column that has a UNIQUE or PRIMARY KEY constraint specified (column '{}')",
-                            column_name
-                        )));
-                    }
-                }
-
-                // Check if column is involved in any foreign key constraint
-                // Check foreign keys defined on this table (where this table is the referencing table)
-                for fk in &view.foreign_keys {
-                    for ref_col in &fk.referencing_column_names {
-                        if ref_col.to_ascii_lowercase() == col_lower {
-                            return Err(Error::CatalogError(format!(
-                                "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
-                                column_name,
-                                fk.constraint_name
-                                    .as_ref()
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("unnamed")
-                            )));
-                        }
-                    }
-                }
-
-                // Check foreign keys that reference this table (where this table is the referenced table)
-                let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
-                for (referencing_table_id, _constraint_id) in referencing_fks {
-                    let referencing_table_fks =
-                        catalog_service.foreign_key_views_for_table(referencing_table_id)?;
-
-                    for fk in referencing_table_fks {
-                        if fk.referenced_table_id == table_id {
-                            for ref_col in &fk.referenced_column_names {
-                                if ref_col.to_ascii_lowercase() == col_lower {
-                                    return Err(Error::CatalogError(format!(
-                                        "Catalog Error: column '{}' is involved in the foreign key constraint '{}'",
-                                        column_name,
-                                        fk.constraint_name
-                                            .as_ref()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("unnamed")
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Ok(())
-            }
-            llkv_plan::AlterTableOperation::DropColumn {
-                column_name,
-                if_exists: _,
-                cascade: _,
-            } => {
-                // Check if column is involved in any constraint
-                let col_lower = column_name.to_ascii_lowercase();
-
-                // Check FK constraints defined on this table (where this table is the referencing table)
-                for fk in &view.foreign_keys {
-                    for ref_col in &fk.referencing_column_names {
-                        if ref_col.to_ascii_lowercase() == col_lower {
-                            return Err(Error::CatalogError(format!(
-                                "Catalog Error: there is a FOREIGN KEY constraint that depends on it (column '{}')",
-                                column_name
-                            )));
-                        }
-                    }
-                }
-
-                // Check foreign keys that reference this table (where this table is the referenced table)
-                let referencing_fks = catalog_service.foreign_keys_referencing(table_id)?;
-                for (referencing_table_id, _constraint_id) in referencing_fks {
-                    let referencing_table_fks =
-                        catalog_service.foreign_key_views_for_table(referencing_table_id)?;
-
-                    for fk in referencing_table_fks {
-                        if fk.referenced_table_id == table_id {
-                            for ref_col in &fk.referenced_column_names {
-                                if ref_col.to_ascii_lowercase() == col_lower {
-                                    return Err(Error::CatalogError(format!(
-                                        "Catalog Error: there is a UNIQUE constraint that depends on it (column '{}')",
-                                        column_name
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
 
     fn normalize_insert_plan(&self, plan: InsertPlan) -> Result<(InsertPlan, usize)> {
         let InsertPlan {
@@ -1316,6 +1157,7 @@ where
         }
     }
 
+    // TODO: Move to DDL
     /// Update rows (outside or inside transaction).
     pub fn execute_update_plan(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
@@ -1378,6 +1220,7 @@ where
         }
     }
 
+    // TODO: Move to DDL
     /// Delete rows (outside or inside transaction).
     pub fn execute_delete_plan(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
@@ -1449,39 +1292,48 @@ where
     type CreateTableOutput = RuntimeStatementResult<P>;
     type DropTableOutput = RuntimeStatementResult<P>;
     type RenameTableOutput = ();
+    type AlterTableOutput = RuntimeStatementResult<P>;
     type CreateIndexOutput = RuntimeStatementResult<P>;
     type DropIndexOutput = RuntimeStatementResult<P>;
 
     fn create_table(&self, plan: CreateTablePlan) -> Result<Self::CreateTableOutput> {
-        let mut plan = self.materialize_ctas_plan(plan)?;
-        let namespace_id = plan
+        let target_namespace = plan
             .namespace
             .clone()
-            .unwrap_or_else(|| storage_namespace::PERSISTENT_NAMESPACE_ID.to_string());
-        plan.namespace = Some(namespace_id.clone());
+            .unwrap_or_else(|| storage_namespace::PERSISTENT_NAMESPACE_ID.to_string())
+            .to_ascii_lowercase();
 
-        match namespace_id.as_str() {
+        let plan = self.materialize_ctas_plan(plan)?;
+
+        match target_namespace.as_str() {
             storage_namespace::TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.create_table(plan)?.convert_pager_type::<P>()
+                let result = temp_namespace.create_table(plan)?;
+                result.convert_pager_type::<P>()
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
-                    let table_name = plan.name.clone();
-                    match self
-                        .inner
-                        .execute_operation(PlanOperation::CreateTable(plan))
-                    {
-                        Ok(_) => Ok(RuntimeStatementResult::CreateTable { table_name }),
-                        Err(e) => {
+                    match self.inner.execute_operation(PlanOperation::CreateTable(plan)) {
+                        Ok(TransactionResult::CreateTable { table_name }) => {
+                            Ok(RuntimeStatementResult::CreateTable { table_name })
+                        }
+                        Ok(TransactionResult::NoOp) => Ok(RuntimeStatementResult::NoOp),
+                        Ok(_) => Err(Error::Internal(
+                            "expected CreateTable result during transactional CREATE TABLE"
+                                .into(),
+                        )),
+                        Err(err) => {
                             self.abort_transaction();
-                            Err(e)
+                            Err(err)
                         }
                     }
                 } else {
-                    if self.inner.has_table_locked_by_other_session(&plan.name) {
+                    if self
+                        .inner
+                        .has_table_locked_by_other_session(&plan.name)
+                    {
                         return Err(Error::TransactionContextError(format!(
                             "table '{}' is locked by another active transaction",
                             plan.name
@@ -1506,12 +1358,13 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.drop_table(plan.clone())?;
+                temp_namespace.drop_table(plan)?;
                 Ok(RuntimeStatementResult::NoOp)
             }
             storage_namespace::PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
-                    let referencing_tables = self.tables_referencing_in_transaction(&plan.name);
+                    let referencing_tables =
+                        self.tables_referencing_in_transaction(&plan.name);
                     if !referencing_tables.is_empty() {
                         let referencing_table = &referencing_tables[0];
                         self.abort_transaction();
@@ -1525,14 +1378,21 @@ where
                         .inner
                         .execute_operation(PlanOperation::DropTable(plan.clone()))
                     {
-                        Ok(_) => Ok(RuntimeStatementResult::NoOp),
-                        Err(e) => {
+                        Ok(TransactionResult::NoOp) => Ok(RuntimeStatementResult::NoOp),
+                        Ok(_) => Err(Error::Internal(
+                            "expected NoOp result for DROP TABLE during transactional execution"
+                                .into(),
+                        )),
+                        Err(err) => {
                             self.abort_transaction();
-                            Err(e)
+                            Err(err)
                         }
                     }
                 } else {
-                    if self.inner.has_table_locked_by_other_session(&plan.name) {
+                    if self
+                        .inner
+                        .has_table_locked_by_other_session(&plan.name)
+                    {
                         return Err(Error::TransactionContextError(format!(
                             "table '{}' is locked by another active transaction",
                             plan.name
@@ -1549,14 +1409,14 @@ where
         }
     }
 
-    fn rename_table(&self, current_name: &str, new_name: &str) -> Result<Self::RenameTableOutput> {
+    fn rename_table(&self, plan: RenameTablePlan) -> Result<Self::RenameTableOutput> {
         if self.has_active_transaction() {
             return Err(Error::InvalidArgumentError(
                 "ALTER TABLE RENAME is not supported inside an active transaction".into(),
             ));
         }
 
-        let (_, canonical_table) = canonical_table_name(current_name)?;
+        let (_, canonical_table) = canonical_table_name(&plan.current_name)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
         match namespace_id.as_str() {
@@ -1564,11 +1424,88 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.rename_table(current_name, new_name)
+                match temp_namespace.rename_table(plan.clone()) {
+                    Ok(()) => Ok(()),
+                    Err(err) if plan.if_exists && is_table_missing_error(&err) => Ok(()),
+                    Err(err) => Err(err),
+                }
             }
-            storage_namespace::PERSISTENT_NAMESPACE_ID => self
-                .persistent_namespace()
-                .rename_table(current_name, new_name),
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                match self.persistent_namespace().rename_table(plan.clone()) {
+                    Ok(()) => Ok(()),
+                    Err(err) if plan.if_exists && is_table_missing_error(&err) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn alter_table(&self, plan: AlterTablePlan) -> Result<Self::AlterTableOutput> {
+        let (_, canonical_table) = canonical_table_name(&plan.table_name)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_table);
+
+        match namespace_id.as_str() {
+            storage_namespace::TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+
+                let context = temp_namespace.context();
+                let catalog_service = &context.catalog_service;
+                let view = match catalog_service.table_view(&canonical_table) {
+                    Ok(view) => view,
+                    Err(err) if plan.if_exists && is_table_missing_error(&err) => {
+                        return Ok(RuntimeStatementResult::NoOp)
+                    }
+                    Err(err) => return Err(err),
+                };
+                let table_id = view
+                    .table_meta
+                    .as_ref()
+                    .ok_or_else(|| Error::Internal("table metadata missing".into()))?
+                    .table_id;
+
+                validate_alter_table_operation(
+                    &plan.operation,
+                    &view,
+                    table_id,
+                    catalog_service,
+                )?;
+
+                temp_namespace
+                    .alter_table(plan)?
+                    .convert_pager_type::<P>()
+            }
+            storage_namespace::PERSISTENT_NAMESPACE_ID => {
+                let persistent = self.persistent_namespace();
+                let context = persistent.context();
+                let catalog_service = &context.catalog_service;
+                let view = match catalog_service.table_view(&canonical_table) {
+                    Ok(view) => view,
+                    Err(err) if plan.if_exists && is_table_missing_error(&err) => {
+                        return Ok(RuntimeStatementResult::NoOp)
+                    }
+                    Err(err) => return Err(err),
+                };
+                let table_id = view
+                    .table_meta
+                    .as_ref()
+                    .ok_or_else(|| Error::Internal("table metadata missing".into()))?
+                    .table_id;
+
+                validate_alter_table_operation(
+                    &plan.operation,
+                    &view,
+                    table_id,
+                    catalog_service,
+                )?;
+
+                persistent.alter_table(plan)
+            }
             other => Err(Error::InvalidArgumentError(format!(
                 "Unknown storage namespace '{}'",
                 other
@@ -1577,6 +1514,20 @@ where
     }
 
     fn create_index(&self, plan: CreateIndexPlan) -> Result<Self::CreateIndexOutput> {
+        if plan.columns.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE INDEX requires at least one column".into(),
+            ));
+        }
+
+        for column_plan in &plan.columns {
+            if !column_plan.ascending || column_plan.nulls_first {
+                return Err(Error::InvalidArgumentError(
+                    "only ASC indexes with NULLS LAST are supported".into(),
+                ));
+            }
+        }
+
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -1706,7 +1657,7 @@ where
             PlanStatement::CreateTable(plan) => CatalogDdl::create_table(&self.session, plan),
             PlanStatement::DropTable(plan) => CatalogDdl::drop_table(&self.session, plan),
             PlanStatement::DropIndex(plan) => CatalogDdl::drop_index(&self.session, plan),
-            PlanStatement::AlterTable(plan) => self.session.execute_alter_table_plan(plan),
+            PlanStatement::AlterTable(plan) => CatalogDdl::alter_table(&self.session, plan),
             PlanStatement::CreateIndex(plan) => CatalogDdl::create_index(&self.session, plan),
             PlanStatement::Insert(plan) => self.session.execute_insert_plan(plan),
             PlanStatement::Update(plan) => self.session.execute_update_plan(plan),
@@ -2288,7 +2239,8 @@ where
         self.catalog_service
             .rename_column(table_id, old_column_name, new_column_name)?;
 
-        // Table will be lazily reloaded on next access with updated metadata
+        // Invalidate cached executor table so subsequent operations see updated schema.
+        self.remove_table_entry(&canonical_table);
 
         Ok(())
     }
@@ -2315,7 +2267,8 @@ where
         self.catalog_service
             .alter_column_type(table_id, column_name, &arrow_type)?;
 
-        // Table will be lazily reloaded on next access with updated metadata
+        // Invalidate cached executor table so subsequent operations see updated schema.
+        self.remove_table_entry(&canonical_table);
 
         Ok(())
     }
@@ -2333,7 +2286,8 @@ where
         // Delegate to catalog layer
         self.catalog_service.drop_column(table_id, column_name)?;
 
-        // Table will be lazily reloaded on next access with updated metadata
+        // Invalidate cached executor table so subsequent operations see updated schema.
+        self.remove_table_entry(&canonical_table);
 
         Ok(())
     }
@@ -5039,6 +4993,7 @@ where
     type CreateTableOutput = RuntimeStatementResult<P>;
     type DropTableOutput = ();
     type RenameTableOutput = ();
+    type AlterTableOutput = RuntimeStatementResult<P>;
     type CreateIndexOutput = RuntimeStatementResult<P>;
     type DropIndexOutput = Option<SingleColumnIndexDescriptor>;
 
@@ -5236,32 +5191,46 @@ where
         Ok(())
     }
 
-    fn rename_table(&self, current_name: &str, new_name: &str) -> Result<Self::RenameTableOutput> {
-        let (current_display, current_canonical) = canonical_table_name(current_name)?;
-        let (new_display, new_canonical) = canonical_table_name(new_name)?;
+    fn rename_table(&self, plan: RenameTablePlan) -> Result<Self::RenameTableOutput> {
+        let RenameTablePlan {
+            current_name,
+            new_name,
+            if_exists,
+        } = plan;
+
+        let (current_display, current_canonical) = canonical_table_name(&current_name)?;
+        let (new_display, new_canonical) = canonical_table_name(&new_name)?;
 
         if current_canonical == new_canonical && current_display == new_display {
             return Ok(());
         }
 
         if self.is_table_marked_dropped(&current_canonical) {
+            if if_exists {
+                return Ok(());
+            }
             return Err(Error::CatalogError(format!(
                 "Catalog Error: Table '{}' does not exist",
                 current_display
             )));
         }
 
-        // Ensure the source table exists
-        let table_id = self
+        let table_id = match self
             .catalog
             .table_id(&current_canonical)
             .or_else(|| self.catalog.table_id(&current_display))
-            .ok_or_else(|| {
-                Error::CatalogError(format!(
+        {
+            Some(id) => id,
+            None => {
+                if if_exists {
+                    return Ok(());
+                }
+                return Err(Error::CatalogError(format!(
                     "Catalog Error: Table '{}' does not exist",
                     current_display
-                ))
-            })?;
+                )));
+            }
+        };
 
         if !current_display.eq_ignore_ascii_case(&new_display)
             && (self.catalog.table_id(&new_canonical).is_some()
@@ -5294,6 +5263,57 @@ where
         dropped.remove(&new_canonical);
 
         Ok(())
+    }
+
+    fn alter_table(&self, plan: AlterTablePlan) -> Result<Self::AlterTableOutput> {
+        let (_, canonical_table) = canonical_table_name(&plan.table_name)?;
+
+        let view = match self.catalog_service.table_view(&canonical_table) {
+            Ok(view) => view,
+            Err(err) if plan.if_exists && is_table_missing_error(&err) => {
+                return Ok(RuntimeStatementResult::NoOp)
+            }
+            Err(err) => return Err(err),
+        };
+
+        let table_meta = match view.table_meta.as_ref() {
+            Some(meta) => meta,
+            None => {
+                if plan.if_exists {
+                    return Ok(RuntimeStatementResult::NoOp);
+                }
+                return Err(Error::Internal("table metadata missing".into()));
+            }
+        };
+
+        let table_id = table_meta.table_id;
+
+        validate_alter_table_operation(
+            &plan.operation,
+            &view,
+            table_id,
+            &self.catalog_service,
+        )?;
+
+        match &plan.operation {
+            llkv_plan::AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => {
+                self.rename_column(&plan.table_name, old_column_name, new_column_name)?;
+            }
+            llkv_plan::AlterTableOperation::SetColumnDataType {
+                column_name,
+                new_data_type,
+            } => {
+                self.alter_column_type(&plan.table_name, column_name, new_data_type)?;
+            }
+            llkv_plan::AlterTableOperation::DropColumn { column_name, .. } => {
+                self.drop_column(&plan.table_name, column_name)?;
+            }
+        }
+
+        Ok(RuntimeStatementResult::NoOp)
     }
 
     fn create_index(&self, plan: CreateIndexPlan) -> Result<Self::CreateIndexOutput> {
@@ -7088,6 +7108,7 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int64Array, StringArray};
     use llkv_storage::pager::MemPager;
+    use llkv_plan::{NotNull, Nullable};
     use std::sync::Arc;
 
     #[test]

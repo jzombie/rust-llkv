@@ -215,6 +215,43 @@ impl FieldResolver {
         Ok(())
     }
 
+    pub fn rename_field(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let old_canonical = old_name.to_ascii_lowercase();
+        let new_canonical = new_name.to_ascii_lowercase();
+
+        let mut inner = self.inner.write().map_err(|_| {
+            Error::Internal("Failed to acquire field resolver write lock".to_string())
+        })?;
+
+        let field_id = *inner.field_name_to_id.get(&old_canonical).ok_or_else(|| {
+            Error::CatalogError(format!("Field '{}' does not exist in table", old_name))
+        })?;
+
+        if inner.field_name_to_id.contains_key(&new_canonical) {
+            return Err(Error::CatalogError(format!(
+                "Field '{}' already exists in table",
+                new_name
+            )));
+        }
+
+        inner.field_name_to_id.remove(&old_canonical);
+        inner
+            .field_name_to_id
+            .insert(new_canonical.clone(), field_id);
+
+        let metadata = inner.field_id_to_meta.get_mut(&field_id).ok_or_else(|| {
+            Error::CatalogError(format!(
+                "Field '{}' metadata is missing from catalog",
+                old_name
+            ))
+        })?;
+
+        metadata.display_name = new_name.to_string();
+        metadata.canonical_name = new_canonical;
+
+        Ok(())
+    }
+
     pub fn field_info(&self, id: FieldId) -> Option<FieldInfo> {
         let inner = self.inner.read().ok()?;
         inner.field_id_to_meta.get(&id).map(|meta| FieldInfo {
@@ -351,6 +388,16 @@ mod tests {
         assert!(resolver.field_constraints_by_name("email").unwrap().unique);
         resolver.set_field_unique("email", false).unwrap();
         assert!(!resolver.field_constraints_by_name("email").unwrap().unique);
+    }
+
+    #[test]
+    fn field_resolver_rename_field() {
+        let resolver = FieldResolver::new();
+        let fid = resolver.register_field("name").unwrap();
+        resolver.rename_field("name", "name_new").unwrap();
+        assert_eq!(resolver.field_id("name"), None);
+        assert_eq!(resolver.field_id("name_new"), Some(fid));
+        assert_eq!(resolver.field_name(fid), Some("name_new".to_string()));
     }
 
     #[test]

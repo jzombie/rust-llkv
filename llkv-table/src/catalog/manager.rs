@@ -369,6 +369,13 @@ where
         // Update metadata manager cache
         self.metadata.set_column_meta(table_id, col_meta)?;
 
+        // Update field resolver mapping for this column name change.
+        if let Some(resolver) = self.catalog.field_resolver(table_id) {
+            resolver.rename_field(old_column_name, new_column_name)?;
+        }
+
+        self.metadata.flush_table(table_id)?;
+
         Ok(())
     }
 

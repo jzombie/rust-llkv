@@ -135,6 +135,33 @@ impl DropTablePlan {
     }
 }
 
+// ============================================================================
+// RENAME TABLE Plan
+// ============================================================================
+
+/// Plan for renaming a table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenameTablePlan {
+    pub current_name: String,
+    pub new_name: String,
+    pub if_exists: bool,
+}
+
+impl RenameTablePlan {
+    pub fn new(current_name: impl Into<String>, new_name: impl Into<String>) -> Self {
+        Self {
+            current_name: current_name.into(),
+            new_name: new_name.into(),
+            if_exists: false,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
 /// Plan for dropping an index.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropIndexPlan {

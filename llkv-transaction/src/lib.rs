@@ -202,6 +202,7 @@ where
 // Transaction Management Types
 // ============================================================================
 
+// TODO: This should extend `CatalogDDL`
 /// A trait for transaction context operations.
 /// This allows SessionTransaction to work with any context that implements these operations.
 /// The associated type P specifies the pager type this context uses.

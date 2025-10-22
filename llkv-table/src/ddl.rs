@@ -5,7 +5,10 @@
 //! the common plan-driven schema mutations (create/drop table, rename table, create/drop
 //! index) while letting each layer choose its own return types via associated outputs.
 
-use llkv_plan::{CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan};
+use llkv_plan::{
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan,
+    RenameTablePlan,
+};
 use llkv_result::Result;
 
 /// Common DDL operations that operate on catalog-backed tables and indexes.
@@ -22,6 +25,8 @@ pub trait CatalogDdl {
     type DropTableOutput;
     /// Output of executing a table rename.
     type RenameTableOutput;
+    /// Output of executing an ALTER TABLE plan.
+    type AlterTableOutput;
     /// Output of executing a CREATE INDEX plan.
     type CreateIndexOutput;
     /// Output of executing a DROP INDEX plan.
@@ -33,9 +38,11 @@ pub trait CatalogDdl {
     /// Drops a table identified by the given plan.
     fn drop_table(&self, plan: DropTablePlan) -> Result<Self::DropTableOutput>;
 
-    // TODO: Add `RenameTablePlan`?
-    /// Renames a table from `current_name` to `new_name`.
-    fn rename_table(&self, current_name: &str, new_name: &str) -> Result<Self::RenameTableOutput>;
+    /// Renames a table using the provided plan.
+    fn rename_table(&self, plan: RenameTablePlan) -> Result<Self::RenameTableOutput>;
+
+    /// Alters a table using the provided plan.
+    fn alter_table(&self, plan: AlterTablePlan) -> Result<Self::AlterTableOutput>;
 
     /// Creates an index described by the given plan.
     fn create_index(&self, plan: CreateIndexPlan) -> Result<Self::CreateIndexOutput>;
