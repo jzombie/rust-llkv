@@ -16,8 +16,9 @@ fn main() {
         -- BEGIN TRANSACTION;
         -- INSERT INTO users (id, name) VALUES (3, 'Bob');
         -- ROLLBACK;
-        -- INSERT INTO users (id, name) VALUES (3, 'Bob');
         -- COMMIT;
+
+        INSERT INTO users (id, name) VALUES (3, 'Alice');
     "#;
 
     // Execute setup statements
