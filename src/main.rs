@@ -1,10 +1,10 @@
-use std::io::{self, Read, Write, IsTerminal};
+use std::io::{self, IsTerminal, Read, Write};
 use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
+use llkv_runtime::RuntimeStatementResult;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
-use llkv_runtime::RuntimeStatementResult;
 
 fn print_banner() {
     // Use Cargo package metadata baked into the binary at compile time
@@ -34,7 +34,7 @@ fn repl() -> io::Result<()> {
         stdout.flush()?;
         if stdin.read_line(&mut line)? == 0 {
             // EOF
-            println!("");
+            println!();
             break;
         }
         let input = line.trim_end().trim();
@@ -81,23 +81,24 @@ fn process_stream<R: std::io::Read>(reader: R) -> io::Result<()> {
         Ok(results) => {
             for res in results {
                 match res {
-                    RuntimeStatementResult::Select { execution, .. } => {
-                        match execution.collect() {
-                            Ok(batches) => {
-                                if batches.is_empty() {
-                                    println!("No batches returned");
-                                } else {
-                                    match pretty_format_batches(&batches) {
-                                        Ok(s) => println!("{}", s),
-                                        Err(e) => eprintln!("Query executed but failed to format batches: {:?}", e),
-                                    }
+                    RuntimeStatementResult::Select { execution, .. } => match execution.collect() {
+                        Ok(batches) => {
+                            if batches.is_empty() {
+                                println!("No batches returned");
+                            } else {
+                                match pretty_format_batches(&batches) {
+                                    Ok(s) => println!("{}", s),
+                                    Err(e) => eprintln!(
+                                        "Query executed but failed to format batches: {:?}",
+                                        e
+                                    ),
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("Failed to collect SELECT results: {:?}", e);
-                            }
                         }
-                    }
+                        Err(e) => {
+                            eprintln!("Failed to collect SELECT results: {:?}", e);
+                        }
+                    },
                     other => {
                         println!("OK: {:?}", other);
                     }
