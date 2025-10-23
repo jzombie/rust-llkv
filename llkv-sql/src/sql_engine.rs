@@ -41,6 +41,15 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+// TODO: Extract to constants.rs
+// TODO: Rename to SQL_PARSER_RECURSION_LIMIT
+/// Maximum recursion depth for SQL parser.
+///
+/// The default in sqlparser is 50, which can be exceeded by deeply nested queries
+/// (e.g., SQLite test suite). This value allows for more complex expressions while
+/// still preventing stack overflows.
+const PARSER_RECURSION_LIMIT: usize = 200;
+
 /// SQL execution engine built on top of the LLKV runtime.
 ///
 /// # Examples
@@ -281,7 +290,7 @@ where
         let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
 
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, &processed_sql)
+        let statements = parse_sql_with_recursion_limit(&dialect, &processed_sql)
             .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
         tracing::trace!("DEBUG SQL execute: parsed {} statements", statements.len());
 
@@ -4781,6 +4790,29 @@ fn resolve_row_field_types(
     Ok(fields)
 }
 
+/// Parse SQL string into statements with increased recursion limit.
+///
+/// This helper wraps sqlparser's `Parser` with a custom recursion limit to handle
+/// deeply nested queries that exceed the default limit of 50.
+///
+/// # Arguments
+///
+/// * `dialect` - SQL dialect to use for parsing
+/// * `sql` - SQL string to parse
+///
+/// # Returns
+///
+/// Parsed statements or parser error
+fn parse_sql_with_recursion_limit(
+    dialect: &GenericDialect,
+    sql: &str,
+) -> Result<Vec<Statement>, sqlparser::parser::ParserError> {
+    Parser::new(dialect)
+        .with_recursion_limit(PARSER_RECURSION_LIMIT)
+        .try_with_sql(sql)?
+        .parse_statements()
+}
+
 fn normalize_row_field_name(raw: &str) -> SqlResult<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -4803,7 +4835,7 @@ fn normalize_row_field_name(raw: &str) -> SqlResult<String> {
 fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<SqlDataType> {
     let trimmed = type_str.trim();
     let sql = format!("CREATE TABLE __row(__field {trimmed});");
-    let statements = Parser::parse_sql(dialect, &sql).map_err(|err| {
+    let statements = parse_sql_with_recursion_limit(dialect, &sql).map_err(|err| {
         Error::InvalidArgumentError(format!("failed to parse ROW field type '{trimmed}': {err}"))
     })?;
 
@@ -5284,7 +5316,7 @@ mod tests {
     #[test]
     fn arrow_type_from_row_returns_struct_fields() {
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(
+        let statements = parse_sql_with_recursion_limit(
             &dialect,
             "CREATE TABLE row_types(payload ROW(a INTEGER, b VARCHAR));",
         )
