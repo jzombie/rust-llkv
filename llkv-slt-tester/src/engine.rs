@@ -30,6 +30,12 @@ pub struct SharedContext {
     context: Arc<RuntimeContext<MemPager>>,
 }
 
+impl Default for SharedContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedContext {
     pub fn new() -> Self {
         let pager = Arc::new(MemPager::default());

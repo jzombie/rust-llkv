@@ -46,5 +46,8 @@ fn run_script_from_reader() {
 #[test]
 fn run_script_bad_fails() {
     let res = LlkvSltRunner::in_memory().run_script("bad-test.slt", SIMPLE_SLT_BAD);
-    assert!(res.is_err(), "expected the bad SLT to fail but it succeeded");
+    assert!(
+        res.is_err(),
+        "expected the bad SLT to fail but it succeeded"
+    );
 }
