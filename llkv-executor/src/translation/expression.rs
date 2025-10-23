@@ -36,57 +36,84 @@ where
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
 {
-    match expr {
-        LlkvExpr::And(exprs) => {
-            let mut translated = Vec::with_capacity(exprs.len());
-            for expr in exprs {
-                translated.push(translate_predicate_with(
-                    expr,
-                    schema,
-                    unknown_column,
-                    unknown_aggregate,
-                )?);
-            }
-            Ok(LlkvExpr::And(translated))
-        }
-        LlkvExpr::Or(exprs) => {
-            let mut translated = Vec::with_capacity(exprs.len());
-            for expr in exprs {
-                translated.push(translate_predicate_with(
-                    expr,
-                    schema,
-                    unknown_column,
-                    unknown_aggregate,
-                )?);
-            }
-            Ok(LlkvExpr::Or(translated))
-        }
-        LlkvExpr::Not(inner) => Ok(LlkvExpr::Not(Box::new(translate_predicate_with(
-            *inner,
-            schema,
-            unknown_column,
-            unknown_aggregate,
-        )?))),
-        LlkvExpr::Pred(filter) => {
-            let field_id = resolve_field_id(schema, &filter.field_id, unknown_column)?;
-            Ok(LlkvExpr::Pred(Filter {
-                field_id,
-                op: filter.op,
-            }))
-        }
-        LlkvExpr::Compare { left, op, right } => {
-            let left_expr =
-                translate_scalar_with(&left, schema, unknown_column, unknown_aggregate)?;
-            let right_expr =
-                translate_scalar_with(&right, schema, unknown_column, unknown_aggregate)?;
-            Ok(LlkvExpr::Compare {
-                left: left_expr,
-                op,
-                right: right_expr,
-            })
-        }
-        LlkvExpr::Literal(value) => Ok(LlkvExpr::Literal(value)),
+    // Use iterative postorder traversal to avoid stack overflow on deeply nested expressions
+    enum Frame {
+        Enter(LlkvExpr<'static, String>),
+        ExitAnd(usize), // child count
+        ExitOr(usize),  // child count
+        ExitNot,
+        ExitLeaf(LlkvExpr<'static, FieldId>),
     }
+    
+    let mut work_stack: Vec<Frame> = vec![Frame::Enter(expr)];
+    let mut result_stack: Vec<LlkvExpr<'static, FieldId>> = Vec::new();
+    
+    while let Some(frame) = work_stack.pop() {
+        match frame {
+            Frame::Enter(node) => match node {
+                LlkvExpr::And(children) => {
+                    let count = children.len();
+                    work_stack.push(Frame::ExitAnd(count));
+                    for child in children.into_iter().rev() {
+                        work_stack.push(Frame::Enter(child));
+                    }
+                }
+                LlkvExpr::Or(children) => {
+                    let count = children.len();
+                    work_stack.push(Frame::ExitOr(count));
+                    for child in children.into_iter().rev() {
+                        work_stack.push(Frame::Enter(child));
+                    }
+                }
+                LlkvExpr::Not(inner) => {
+                    work_stack.push(Frame::ExitNot);
+                    work_stack.push(Frame::Enter(*inner));
+                }
+                LlkvExpr::Pred(filter) => {
+                    let field_id = resolve_field_id(schema, &filter.field_id, unknown_column)?;
+                    work_stack.push(Frame::ExitLeaf(LlkvExpr::Pred(Filter {
+                        field_id,
+                        op: filter.op,
+                    })));
+                }
+                LlkvExpr::Compare { left, op, right } => {
+                    let left_expr =
+                        translate_scalar_with(&left, schema, unknown_column, unknown_aggregate)?;
+                    let right_expr =
+                        translate_scalar_with(&right, schema, unknown_column, unknown_aggregate)?;
+                    work_stack.push(Frame::ExitLeaf(LlkvExpr::Compare {
+                        left: left_expr,
+                        op,
+                        right: right_expr,
+                    }));
+                }
+                LlkvExpr::Literal(value) => {
+                    work_stack.push(Frame::ExitLeaf(LlkvExpr::Literal(value)));
+                }
+            },
+            Frame::ExitLeaf(translated) => {
+                result_stack.push(translated);
+            }
+            Frame::ExitAnd(count) => {
+                let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
+                result_stack.push(LlkvExpr::And(translated));
+            }
+            Frame::ExitOr(count) => {
+                let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
+                result_stack.push(LlkvExpr::Or(translated));
+            }
+            Frame::ExitNot => {
+                let inner = result_stack.pop().ok_or_else(|| {
+                    Error::Internal("translate_predicate_with: result stack underflow for Not".into())
+                })?;
+                result_stack.push(LlkvExpr::Not(Box::new(inner)));
+            }
+        }
+    }
+    
+    result_stack.pop().ok_or_else(|| {
+        Error::Internal("translate_predicate_with: empty result stack".into())
+    })
 }
 
 pub fn translate_scalar<F>(

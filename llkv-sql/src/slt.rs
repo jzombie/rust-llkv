@@ -168,15 +168,24 @@ where
         let factory_factory_clone = factory_factory.clone();
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
-            // Call the factory_factory to get a fresh factory for this test file
             let fac = factory_factory_clone();
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| Failed::from(format!("failed to build tokio runtime: {e}")))?;
-            let res: Result<(), Error> =
-                rt.block_on(async move { run_slt_file_with_factory(&p, fac).await });
-            res.map_err(|e| Failed::from(format!("slt runner error: {e}")))
+            
+            // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
+            // Default thread stack is ~2MB which is insufficient for complex SLT test queries
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| Failed::from(format!("failed to build tokio runtime: {e}")))?;
+                    let res: Result<(), Error> =
+                        rt.block_on(async move { run_slt_file_with_factory(&p, fac).await });
+                    res.map_err(|e| Failed::from(format!("slt runner error: {e}")))
+                })
+                .map_err(|e| Failed::from(format!("failed to spawn test thread: {e}")))?
+                .join()
+                .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?
         }));
     }
 
