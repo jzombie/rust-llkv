@@ -710,14 +710,6 @@ where
             ));
         }
 
-        for column_plan in &plan.columns {
-            if !column_plan.ascending || column_plan.nulls_first {
-                return Err(Error::InvalidArgumentError(
-                    "only ASC indexes with NULLS LAST are supported".into(),
-                ));
-            }
-        }
-
         let mut index_name = plan.name.clone();
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
@@ -756,6 +748,7 @@ where
         if plan.columns.len() == 1 {
             let field_id = field_ids[0];
             let column_name = column_names[0].clone();
+            let column_plan = &plan.columns[0];
 
             if plan.unique {
                 let snapshot = self.default_snapshot();
@@ -772,6 +765,8 @@ where
                 &column_name,
                 plan.name.clone(),
                 plan.unique,
+                column_plan.ascending,
+                column_plan.nulls_first,
                 plan.if_not_exists,
             )?;
 
@@ -807,43 +802,61 @@ where
             });
         }
 
-        if !plan.unique {
-            return Err(Error::InvalidArgumentError(
-                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
-            ));
-        }
-
         let table_id = table.table.table_id();
 
-        let snapshot = self.default_snapshot();
-        let existing_rows = self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
-        ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
+        if plan.unique {
+            // For unique multi-column indexes, validate uniqueness and register
+            let snapshot = self.default_snapshot();
+            let existing_rows =
+                self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
+            ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
 
-        let executor_entry = ExecutorMultiColumnUnique {
-            index_name: index_name.clone(),
-            column_indices: column_indices.clone(),
-        };
+            let executor_entry = ExecutorMultiColumnUnique {
+                index_name: index_name.clone(),
+                column_indices: column_indices.clone(),
+            };
 
-        let registration = self.catalog_service.register_multi_column_unique_index(
-            table_id,
-            &field_ids,
-            index_name.clone(),
-        )?;
+            let registration = self.catalog_service.register_multi_column_unique_index(
+                table_id,
+                &field_ids,
+                index_name.clone(),
+            )?;
 
-        match registration {
-            MultiColumnUniqueRegistration::Created => {
-                table.add_multi_column_unique(executor_entry);
-            }
-            MultiColumnUniqueRegistration::AlreadyExists {
-                index_name: existing,
-            } => {
-                if plan.if_not_exists {
-                    drop(table);
-                    return Ok(RuntimeStatementResult::CreateIndex {
-                        table_name: display_name,
-                        index_name: existing,
-                    });
+            match registration {
+                MultiColumnUniqueRegistration::Created => {
+                    table.add_multi_column_unique(executor_entry);
                 }
+                MultiColumnUniqueRegistration::AlreadyExists {
+                    index_name: existing,
+                } => {
+                    if plan.if_not_exists {
+                        drop(table);
+                        return Ok(RuntimeStatementResult::CreateIndex {
+                            table_name: display_name,
+                            index_name: existing,
+                        });
+                    }
+                    return Err(Error::CatalogError(format!(
+                        "Index already exists on columns '{}'",
+                        column_names.join(", ")
+                    )));
+                }
+            }
+        } else {
+            // For non-unique multi-column indexes, register in catalog but no runtime enforcement yet
+            let name = index_name.clone().ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "Multi-column CREATE INDEX requires an explicit index name".into(),
+                )
+            })?;
+            let created = self.catalog_service.register_multi_column_index(
+                table_id,
+                &field_ids,
+                name,
+                false, // unique = false
+            )?;
+
+            if !created && !plan.if_not_exists {
                 return Err(Error::CatalogError(format!(
                     "Index already exists on columns '{}'",
                     column_names.join(", ")

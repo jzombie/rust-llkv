@@ -1236,11 +1236,7 @@ where
             index_columns.push(column_plan);
         }
 
-        if index_columns.len() > 1 && !unique {
-            return Err(Error::InvalidArgumentError(
-                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
-            ));
-        }
+
 
         let plan = CreateIndexPlan::new(display_table_name)
             .with_name(index_name)
@@ -3693,22 +3689,10 @@ fn extract_index_column_name(
 
     // Validate sort options
     if allow_sort_options {
-        // For CREATE INDEX: validate specific values are supported
-        let ascending = order_expr.options.asc.unwrap_or(true);
-        let nulls_first = order_expr.options.nulls_first.unwrap_or(false);
-
-        if !ascending {
-            return Err(Error::InvalidArgumentError(format!(
-                "{} DESC ordering is not supported",
-                context
-            )));
-        }
-        if nulls_first {
-            return Err(Error::InvalidArgumentError(format!(
-                "{} NULLS FIRST ordering is not supported",
-                context
-            )));
-        }
+        // For CREATE INDEX: extract and validate sort options
+        let _ascending = order_expr.options.asc.unwrap_or(true);
+        let _nulls_first = order_expr.options.nulls_first.unwrap_or(false);
+        // DESC and NULLS FIRST are now supported
     } else {
         // For constraints: no sort options allowed
         if order_expr.options.asc.is_some()

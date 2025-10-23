@@ -290,13 +290,19 @@ pub struct CustomTypeMeta {
     pub created_at_micros: u64,
 }
 
-/// Metadata describing a single multi-column UNIQUE index.
+/// Metadata describing a single multi-column index (unique or non-unique).
+///
+/// Used to track both named CREATE INDEX statements and UNIQUE constraints over multiple columns.
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
-pub struct MultiColumnUniqueEntryMeta {
-    /// Optional human-readable index name.
+pub struct MultiColumnIndexEntryMeta {
+    /// Optional human-readable index name (None for unnamed UNIQUE constraints).
     pub index_name: Option<String>,
-    /// Field IDs participating in this UNIQUE constraint.
-    pub column_ids: Vec<u32>,
+    /// Normalized lowercase name used as map key.
+    pub canonical_name: String,
+    /// Field IDs participating in this index.
+    pub column_ids: Vec<FieldId>,
+    /// Whether this index enforces uniqueness.
+    pub unique: bool,
 }
 
 /// Metadata describing a single named single-column index.
@@ -312,6 +318,10 @@ pub struct SingleColumnIndexEntryMeta {
     pub column_name: String,
     /// Whether this index enforces uniqueness for the column.
     pub unique: bool,
+    /// Whether the index is sorted in ascending order (true) or descending (false).
+    pub ascending: bool,
+    /// Whether NULL values appear first (true) or last (false) in the index.
+    pub nulls_first: bool,
 }
 
 /// Metadata describing all single-column indexes registered for a table.
@@ -323,13 +333,13 @@ pub struct TableSingleColumnIndexMeta {
     pub indexes: Vec<SingleColumnIndexEntryMeta>,
 }
 
-/// Metadata describing all multi-column UNIQUE indexes for a table.
+/// Metadata describing all multi-column indexes (unique and non-unique) for a table.
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
-pub struct TableMultiColumnUniqueMeta {
-    /// Table identifier these UNIQUE entries belong to.
+pub struct TableMultiColumnIndexMeta {
+    /// Table identifier these indexes belong to.
     pub table_id: TableId,
-    /// Definitions of each persisted multi-column UNIQUE.
-    pub uniques: Vec<MultiColumnUniqueEntryMeta>,
+    /// Definitions of each persisted multi-column index.
+    pub indexes: Vec<MultiColumnIndexEntryMeta>,
 }
 
 // ----- SysCatalog -----
@@ -550,8 +560,8 @@ where
         self.write_null_entries(lfid, &row_ids)
     }
 
-    /// Delete the multi-column UNIQUE metadata record for a table, if any.
-    pub fn delete_multi_column_uniques(&self, table_id: TableId) -> LlkvResult<()> {
+    /// Delete the multi-column index metadata record for a table, if any.
+    pub fn delete_multi_column_indexes(&self, table_id: TableId) -> LlkvResult<()> {
         let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID);
         let row_id = rid_table(table_id);
         self.write_null_entries(meta_field, &[row_id])
@@ -564,11 +574,11 @@ where
         self.write_null_entries(meta_field, &[row_id])
     }
 
-    /// Persist the complete set of multi-column UNIQUE definitions for a table.
-    pub fn put_multi_column_uniques(
+    /// Persist the complete set of multi-column index definitions for a table.
+    pub fn put_multi_column_indexes(
         &self,
         table_id: TableId,
-        uniques: &[MultiColumnUniqueEntryMeta],
+        indexes: &[MultiColumnIndexEntryMeta],
     ) -> LlkvResult<()> {
         let lfid_val: u64 =
             lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID).into();
@@ -581,9 +591,9 @@ where
         ]));
 
         let row_id = Arc::new(UInt64Array::from(vec![rid_table(table_id)]));
-        let meta = TableMultiColumnUniqueMeta {
+        let meta = TableMultiColumnIndexMeta {
             table_id,
-            uniques: uniques.to_vec(),
+            indexes: indexes.to_vec(),
         };
         let encoded = bitcode::encode(&meta);
         let meta_bytes = Arc::new(BinaryArray::from(vec![encoded.as_slice()]));
@@ -622,11 +632,11 @@ where
         Ok(())
     }
 
-    /// Retrieve all persisted multi-column UNIQUE definitions for a table.
-    pub fn get_multi_column_uniques(
+    /// Retrieve all persisted multi-column index definitions for a table.
+    pub fn get_multi_column_indexes(
         &self,
         table_id: TableId,
-    ) -> LlkvResult<Vec<MultiColumnUniqueEntryMeta>> {
+    ) -> LlkvResult<Vec<MultiColumnIndexEntryMeta>> {
         let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID);
         let row_id = rid_table(table_id);
         let batch = match self
@@ -648,7 +658,7 @@ where
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
                 llkv_result::Error::Internal(
-                    "catalog multi-column unique column stored unexpected type".into(),
+                    "catalog multi-column index column stored unexpected type".into(),
                 )
             })?;
 
@@ -656,13 +666,13 @@ where
             return Ok(Vec::new());
         }
 
-        let meta: TableMultiColumnUniqueMeta = bitcode::decode(array.value(0)).map_err(|err| {
+        let meta: TableMultiColumnIndexMeta = bitcode::decode(array.value(0)).map_err(|err| {
             llkv_result::Error::Internal(format!(
-                "failed to decode multi-column unique metadata: {err}"
+                "failed to decode multi-column index metadata: {err}"
             ))
         })?;
 
-        Ok(meta.uniques)
+        Ok(meta.indexes)
     }
 
     /// Retrieve all persisted single-column index definitions for a table.
@@ -708,8 +718,8 @@ where
         Ok(meta.indexes)
     }
 
-    /// Retrieve all persisted multi-column UNIQUE definitions across tables.
-    pub fn all_multi_column_unique_metas(&self) -> LlkvResult<Vec<TableMultiColumnUniqueMeta>> {
+    /// Retrieve all persisted multi-column index definitions across tables.
+    pub fn all_multi_column_index_metas(&self) -> LlkvResult<Vec<TableMultiColumnIndexMeta>> {
         let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_MULTI_COLUMN_UNIQUE_META_ID);
         let row_field = rowid_fid(meta_field);
 
@@ -764,7 +774,7 @@ where
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
                 llkv_result::Error::Internal(
-                    "catalog multi-column unique column stored unexpected type".into(),
+                    "catalog multi-column index column stored unexpected type".into(),
                 )
             })?;
 
@@ -773,10 +783,10 @@ where
             if array.is_null(idx) {
                 continue;
             }
-            let meta: TableMultiColumnUniqueMeta =
+            let meta: TableMultiColumnIndexMeta =
                 bitcode::decode(array.value(idx)).map_err(|err| {
                     llkv_result::Error::Internal(format!(
-                        "failed to decode multi-column unique metadata: {err}"
+                        "failed to decode multi-column index metadata: {err}"
                     ))
                 })?;
             metas.push(meta);
