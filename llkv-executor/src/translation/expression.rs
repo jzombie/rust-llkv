@@ -36,7 +36,11 @@ where
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
 {
-    // Use iterative postorder traversal to avoid stack overflow on deeply nested expressions
+    // Iterative postorder traversal using the Frame pattern.
+    // See llkv-plan::traversal module documentation for pattern details.
+    //
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
+    // explicit work_stack and result_stack instead of recursion.
     enum Frame {
         Enter(LlkvExpr<'static, String>),
         ExitAnd(usize), // child count

@@ -512,7 +512,10 @@ impl PredicateFusionCache {
     }
 
     fn record_expr(&mut self, expr: &Expr<'_, FieldId>) {
-        // Use explicit stack to avoid recursion with deeply nested expressions
+        // Iterative traversal using work stack pattern.
+        // See llkv-plan::traversal module documentation for pattern details.
+        //
+        // This avoids stack overflow on deeply nested expressions (50k+ nodes).
         let mut stack = vec![expr];
         
         while let Some(node) = stack.pop() {
@@ -2666,6 +2669,11 @@ fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
 fn format_expr(expr: &Expr<'_, FieldId>) -> String {
     use Expr::*;
 
+    // Iterative postorder traversal using work/result stack pattern.
+    // See llkv-plan::traversal module documentation for pattern details.
+    //
+    // This uses a two-pass approach: first collect nodes in postorder, then format them.
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes).
     let mut traverse_stack = Vec::new();
     let mut postorder = Vec::new();
     traverse_stack.push(expr);
@@ -2802,6 +2810,11 @@ fn format_range_bound_upper(bound: &Bound<Literal>) -> String {
 fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
     use ScalarExpr::*;
 
+    // Iterative postorder traversal using work/result stack pattern.
+    // See llkv-plan::traversal module documentation for pattern details.
+    //
+    // This uses a two-pass approach: first collect nodes in postorder, then format them.
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes).
     let mut traverse_stack = Vec::new();
     let mut postorder = Vec::new();
     traverse_stack.push(expr);

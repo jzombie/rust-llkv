@@ -4446,7 +4446,11 @@ fn translate_condition_with_context(
     context: IdentifierContext,
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    // Use iterative postorder traversal to avoid stack overflow on deeply nested expressions
+    // Iterative postorder traversal using the Frame pattern.
+    // See llkv-plan::traversal module documentation for pattern details.
+    //
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
+    // explicit work_stack and result_stack instead of recursion.
     enum Frame<'a> {
         Enter(&'a SqlExpr),
         ExitAnd,
@@ -4813,9 +4817,13 @@ fn translate_scalar_with_context(
     }
 }
 
-// TODO: Rename?  Already many `translate_scaler` functions... be more sepcific?
+// TODO: Rename?  Already many `translate_scaler` functions... be more specific?
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    // Use iterative postorder traversal to avoid stack overflow on deeply nested expressions
+    // Iterative postorder traversal using the Frame pattern.
+    // See llkv-plan::traversal module documentation for pattern details.
+    //
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
+    // explicit work_stack and result_stack instead of recursion.
     enum Frame<'a> {
         Enter(&'a SqlExpr),
         ExitBinaryOp { op: BinaryOperator },
@@ -4921,11 +4929,11 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                 result_stack.push(translated);
             }
             Frame::ExitBinaryOp { op } => {
-                let left_expr = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_scalar: result stack underflow for BinaryOp left".into())
-                })?;
                 let right_expr = result_stack.pop().ok_or_else(|| {
                     Error::Internal("translate_scalar: result stack underflow for BinaryOp right".into())
+                })?;
+                let left_expr = result_stack.pop().ok_or_else(|| {
+                    Error::Internal("translate_scalar: result stack underflow for BinaryOp left".into())
                 })?;
                 let binary_op = match op {
                     BinaryOperator::Plus => llkv_expr::expr::BinaryOp::Add,
