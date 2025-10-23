@@ -85,6 +85,7 @@ where
                 right: right_expr,
             })
         }
+        LlkvExpr::Literal(value) => Ok(LlkvExpr::Literal(value)),
     }
 }
 

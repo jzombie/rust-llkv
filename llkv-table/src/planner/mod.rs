@@ -31,7 +31,7 @@ use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
-use llkv_column_map::{llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric};
+use llkv_column_map::{llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -524,6 +524,7 @@ impl PredicateFusionCache {
             }
             Expr::Not(inner) => self.record_expr(inner),
             Expr::Compare { .. } => {}
+            Expr::Literal(_) => {}
         }
     }
 
@@ -1584,6 +1585,23 @@ where
                 let matched = self.collect_row_ids_for_expr(inner, fusion_cache, all_rows_cache)?;
                 Ok(difference_sorted(domain, matched))
             }
+            Expr::Literal(value) => {
+                // Literal boolean expressions: true matches all rows, false matches none
+                if *value {
+                    // Return all row IDs in the table by scanning the ROW_ID field
+                    let filter = Filter {
+                        field_id: ROW_ID_FIELD_ID,
+                        op: Operator::Range {
+                            lower: Bound::Unbounded,
+                            upper: Bound::Unbounded,
+                        },
+                    };
+                    self.collect_row_ids_for_filter(&filter)
+                } else {
+                    // Return empty set
+                    Ok(Vec::new())
+                }
+            }
         }
     }
 
@@ -1888,6 +1906,17 @@ where
                 Ok(acc)
             }
             Expr::Not(inner) => self.collect_row_ids_domain(inner, all_rows_cache),
+            Expr::Literal(value) => {
+                // For literal expressions in domain collection:
+                // - true: return all rows (domain is entire table)
+                // - false: return empty (no rows satisfy this)
+                if *value {
+                    // Use ROW_ID_FIELD_ID to get all rows
+                    self.collect_all_row_ids_for_field(ROW_ID_FIELD_ID, all_rows_cache)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
         }
     }
 
@@ -2471,6 +2500,13 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
             format_compare_op(*op),
             format_scalar_expr(right)
         ),
+        Expr::Literal(value) => {
+            if *value {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
     }
 }
 
@@ -3008,21 +3044,25 @@ impl RowIdScanCollector {
 impl llkv_column_map::scan::PrimitiveVisitor for RowIdScanCollector {
     llkv_for_each_arrow_numeric!(impl_row_id_ignore_chunk);
     llkv_for_each_arrow_boolean!(impl_row_id_ignore_chunk);
+    llkv_for_each_arrow_string!(impl_row_id_ignore_chunk);
 }
 
 impl llkv_column_map::scan::PrimitiveSortedVisitor for RowIdScanCollector {
     llkv_for_each_arrow_numeric!(impl_row_id_ignore_sorted_run);
     llkv_for_each_arrow_boolean!(impl_row_id_ignore_sorted_run);
+    llkv_for_each_arrow_string!(impl_row_id_ignore_sorted_run);
 }
 
 impl llkv_column_map::scan::PrimitiveWithRowIdsVisitor for RowIdScanCollector {
     llkv_for_each_arrow_numeric!(impl_row_id_collect_chunk_with_rids);
     llkv_for_each_arrow_boolean!(impl_row_id_collect_chunk_with_rids);
+    llkv_for_each_arrow_string!(impl_row_id_collect_chunk_with_rids);
 }
 
 impl llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdScanCollector {
     llkv_for_each_arrow_numeric!(impl_row_id_collect_sorted_run_with_rids);
     llkv_for_each_arrow_boolean!(impl_row_id_collect_sorted_run_with_rids);
+    llkv_for_each_arrow_string!(impl_row_id_collect_sorted_run_with_rids);
 
     fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
         self.extend_from_slice(row_ids, start, len);

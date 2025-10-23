@@ -22,6 +22,9 @@ pub enum Expr<'a, F> {
         op: CompareOp,
         right: ScalarExpr<F>,
     },
+    /// A literal boolean value (true/false).
+    /// Used for conditions that are always true or always false (e.g., empty IN lists).
+    Literal(bool),
 }
 
 impl<'a, F> Expr<'a, F> {

@@ -87,6 +87,7 @@ impl GatherNullPolicy {
 
 pub struct MultiGatherContext {
     field_infos: Vec<(LogicalFieldId, DataType)>,
+    fields: Vec<Field>,
     plans: Vec<FieldPlan>,
     chunk_cache: FxHashMap<PhysicalKey, ArrayRef>,
     row_index: FxHashMap<u64, usize>,
@@ -96,12 +97,23 @@ pub struct MultiGatherContext {
 
 impl MultiGatherContext {
     fn new(field_infos: Vec<(LogicalFieldId, DataType)>, plans: Vec<FieldPlan>) -> Self {
+        // Build Field objects from field_infos with default nullable=true
+        // This is for backward compatibility when no expected schema is provided
+        let fields: Vec<Field> = field_infos
+            .iter()
+            .map(|(fid, dtype)| {
+                let field_name = format!("field_{}", u64::from(*fid));
+                Field::new(field_name, dtype.clone(), true)
+            })
+            .collect();
+
         Self {
             chunk_cache: FxHashMap::default(),
             row_index: FxHashMap::default(),
             row_scratch: Vec::new(),
             chunk_keys: Vec::new(),
             field_infos,
+            fields,
             plans,
         }
     }
@@ -114,6 +126,11 @@ impl MultiGatherContext {
     #[inline]
     fn field_infos(&self) -> &[(LogicalFieldId, DataType)] {
         &self.field_infos
+    }
+
+    #[inline]
+    fn fields(&self) -> &[Field] {
+        &self.fields
     }
 
     #[inline]
@@ -221,8 +238,23 @@ where
         row_ids: &[u64],
         policy: GatherNullPolicy,
     ) -> Result<RecordBatch> {
+        self.gather_rows_with_schema(field_ids, row_ids, policy, None)
+    }
+
+    /// Gather rows with an optional expected schema for empty result sets.
+    ///
+    /// When `expected_schema` is provided and `row_ids` is empty, the returned
+    /// RecordBatch will use that schema instead of synthesizing one with all nullable fields.
+    /// This ensures that non-nullable columns (e.g., PRIMARY KEYs) are correctly represented.
+    pub fn gather_rows_with_schema(
+        &self,
+        field_ids: &[LogicalFieldId],
+        row_ids: &[u64],
+        policy: GatherNullPolicy,
+        expected_schema: Option<Arc<Schema>>,
+    ) -> Result<RecordBatch> {
         let mut ctx = self.prepare_gather_context(field_ids)?;
-        self.execute_gather_single_pass(&mut ctx, row_ids, policy)
+        self.execute_gather_single_pass_with_schema(&mut ctx, row_ids, policy, expected_schema)
     }
 
     /// Executes a one-off gather using a freshly prepared context.
@@ -236,6 +268,17 @@ where
         row_ids: &[u64],
         policy: GatherNullPolicy,
     ) -> Result<RecordBatch> {
+        self.execute_gather_single_pass_with_schema(ctx, row_ids, policy, None)
+    }
+
+    /// Executes a one-off gather with optional schema for empty result sets.
+    fn execute_gather_single_pass_with_schema(
+        &self,
+        ctx: &mut MultiGatherContext,
+        row_ids: &[u64],
+        policy: GatherNullPolicy,
+        expected_schema: Option<Arc<Schema>>,
+    ) -> Result<RecordBatch> {
         if ctx.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
         }
@@ -243,14 +286,23 @@ where
         let field_infos = ctx.field_infos().to_vec();
 
         if row_ids.is_empty() {
-            let mut arrays = Vec::with_capacity(field_infos.len());
-            let mut fields = Vec::with_capacity(field_infos.len());
-            for (fid, dtype) in &field_infos {
-                arrays.push(new_empty_array(dtype));
-                let field_name = format!("field_{}", u64::from(*fid));
-                fields.push(Field::new(field_name, dtype.clone(), true));
-            }
-            let schema = Arc::new(Schema::new(fields));
+            // Use expected_schema if provided to preserve nullability
+            let (schema, arrays) = if let Some(expected_schema) = expected_schema {
+                let mut arrays = Vec::with_capacity(expected_schema.fields().len());
+                for field in expected_schema.fields() {
+                    arrays.push(new_empty_array(field.data_type()));
+                }
+                (expected_schema, arrays)
+            } else {
+                // Fallback: Use fields from context which have nullable=true by default
+                // This is safe because nullable=true is always compatible
+                let fields = ctx.fields();
+                let mut arrays = Vec::with_capacity(fields.len());
+                for field in fields {
+                    arrays.push(new_empty_array(field.data_type()));
+                }
+                (Arc::new(Schema::new(fields.to_vec())), arrays)
+            };
             return RecordBatch::try_new(schema, arrays)
                 .map_err(|e| Error::Internal(format!("gather_rows_multi empty batch: {e}")));
         }
