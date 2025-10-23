@@ -1215,6 +1215,11 @@ where
         let fusion_cache = PredicateFusionCache::from_expr(&filter_expr);
         let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
 
+        tracing::debug!(
+            expr = %format_expr(&filter_expr),
+            "collect_row_ids_for_expr root"
+        );
+
         // When we have a trivial filter (no predicates), enumerate ALL row IDs.
         // This is necessary for:
         // 1. MVCC filtering to check visibility of all rows including NULL rows
@@ -1457,149 +1462,229 @@ where
         }
     }
 
+    fn try_collect_and_fused(
+        &self,
+        children: &[Expr<'_, FieldId>],
+        fusion_cache: &PredicateFusionCache,
+    ) -> LlkvResult<Option<Vec<RowId>>> {
+        let mut same_field: Option<FieldId> = None;
+        for child in children {
+            match child {
+                Expr::Pred(filter) => match same_field {
+                    Some(existing) if existing != filter.field_id => return Ok(None),
+                    None => same_field = Some(filter.field_id),
+                    _ => {}
+                },
+                _ => return Ok(None),
+            }
+        }
+
+        let Some(fid) = same_field else {
+            return Ok(None);
+        };
+
+        let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
+        let dtype = self.table.store().data_type(filter_lfid)?;
+
+        let ops: Vec<Operator<'_>> = children
+            .iter()
+            .map(|child| match child {
+                Expr::Pred(filter) => filter.op.clone(),
+                _ => unreachable!("non-predicate child filtered earlier"),
+            })
+            .collect();
+
+        if !ops
+            .iter()
+            .all(|op| !matches!(op, Operator::IsNull | Operator::IsNotNull))
+        {
+            return Ok(None);
+        }
+
+        if !fusion_cache.should_fuse(fid, &dtype) {
+            return Ok(None);
+        }
+
+        let row_ids = match &dtype {
+            DataType::Utf8 => self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops),
+            DataType::LargeUtf8 => {
+                self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
+            }
+            DataType::Boolean => self.collect_matching_row_ids_bool_fused(filter_lfid, &ops),
+            other => llkv_column_map::with_integer_arrow_type!(
+                other.clone(),
+                |ArrowTy| self.collect_matching_row_ids_fused::<ArrowTy>(filter_lfid, &ops),
+                Err(Error::Internal(format!(
+                    "Filtering on type {:?} is not supported",
+                    other
+                ))),
+            ),
+        }?;
+
+        Ok(Some(normalize_row_ids(row_ids)))
+    }
+
     fn collect_row_ids_for_expr(
         &self,
         expr: &Expr<'_, FieldId>,
         fusion_cache: &PredicateFusionCache,
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
     ) -> LlkvResult<Vec<RowId>> {
-        match expr {
-            Expr::Pred(filter) => self.collect_row_ids_for_filter(filter),
-            Expr::Compare { left, op, right } => {
-                self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)
-            }
-            Expr::And(children) => {
-                if children.is_empty() {
-                    return Err(Error::InvalidArgumentError(
-                        "AND expression requires at least one predicate".into(),
-                    ));
-                }
-                // Fast-path fusion: if this AND is composed solely of Pred nodes on the
-                // same field, build typed predicates and call the storage fused runtime
-                // entrypoint. This avoids multiple scans over the same column.
-                let mut same_field: Option<FieldId> = None;
-                let mut all_preds_same_field = true;
-                for child in children.iter() {
-                    if let Expr::Pred(f) = child {
-                        if let Some(sf) = same_field {
-                            if f.field_id != sf {
-                                all_preds_same_field = false;
-                                break;
-                            }
-                        } else {
-                            same_field = Some(f.field_id);
+        enum EvalFrame<'a> {
+            And {
+                children: &'a [Expr<'a, FieldId>],
+                next_child: usize,
+                acc: Option<Vec<RowId>>,
+            },
+            Or {
+                children: &'a [Expr<'a, FieldId>],
+                next_child: usize,
+                acc: Vec<RowId>,
+            },
+            Not { domain: Vec<RowId> },
+        }
+
+        let mut frames: Vec<EvalFrame<'_>> = Vec::new();
+        let mut current: Option<&Expr<'_, FieldId>> = Some(expr);
+        let mut last_result: Vec<RowId> = Vec::new();
+
+        'outer: loop {
+            if let Some(node) = current.take() {
+                match node {
+                    Expr::Pred(filter) => {
+                        last_result = self.collect_row_ids_for_filter(filter)?;
+                    }
+                    Expr::Compare { left, op, right } => {
+                        last_result =
+                            self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)?;
+                    }
+                    Expr::And(children) => {
+                        if children.is_empty() {
+                            return Err(Error::InvalidArgumentError(
+                                "AND expression requires at least one predicate".into(),
+                            ));
                         }
-                    } else {
-                        all_preds_same_field = false;
-                        break;
+
+                        if let Some(fused) =
+                            self.try_collect_and_fused(children, fusion_cache)?
+                        {
+                            last_result = fused;
+                        } else {
+                            frames.push(EvalFrame::And {
+                                children,
+                                next_child: 0,
+                                acc: None,
+                            });
+                            current = Some(&children[0]);
+                            continue 'outer;
+                        }
+                    }
+                    Expr::Or(children) => {
+                        if children.is_empty() {
+                            return Err(Error::InvalidArgumentError(
+                                "OR expression requires at least one predicate".into(),
+                            ));
+                        }
+                        frames.push(EvalFrame::Or {
+                            children,
+                            next_child: 0,
+                            acc: Vec::new(),
+                        });
+                        current = Some(&children[0]);
+                        continue 'outer;
+                    }
+                    Expr::Not(inner) => {
+                        let domain = self.collect_row_ids_domain(inner, all_rows_cache)?;
+                        if domain.is_empty() {
+                            last_result = Vec::new();
+                        } else {
+                            frames.push(EvalFrame::Not { domain });
+                            current = Some(inner);
+                            continue 'outer;
+                        }
+                    }
+                    Expr::Literal(value) => {
+                        if *value {
+                            last_result = self.collect_all_row_ids(all_rows_cache)?;
+                        } else {
+                            last_result.clear();
+                        }
                     }
                 }
-
-                if all_preds_same_field {
-                    let fid = same_field.expect("non-empty children checked");
-                    let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                    let dtype = self.table.store().data_type(filter_lfid)?;
-
-                    // Collect operator list once so we can inspect support for fusion
-                    let ops: Vec<Operator<'_>> = children
-                        .iter()
-                        .map(|c| match c {
-                            Expr::Pred(f) => f.op.clone(),
-                            _ => unreachable!(),
-                        })
-                        .collect();
-
-                    let supports_fused = ops
-                        .iter()
-                        .all(|op| !matches!(op, Operator::IsNull | Operator::IsNotNull));
-
-                    if supports_fused && fusion_cache.should_fuse(fid, &dtype) {
-                        let row_ids = match &dtype {
-                            DataType::Utf8 => {
-                                self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
-                            }
-                            DataType::LargeUtf8 => {
-                                self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
-                            }
-                            DataType::Boolean => {
-                                self.collect_matching_row_ids_bool_fused(filter_lfid, &ops)
-                            }
-                            other => llkv_column_map::with_integer_arrow_type!(
-                                other.clone(),
-                                |ArrowTy| self
-                                    .collect_matching_row_ids_fused::<ArrowTy>(filter_lfid, &ops,),
-                                Err(Error::Internal(format!(
-                                    "Filtering on type {:?} is not supported",
-                                    other
-                                ))),
-                            ),
-                        }?;
-
-                        return Ok(normalize_row_ids(row_ids));
-                    }
-                }
-
-                // Fallback to existing iterative intersection for mixed expressions.
-                let mut iter = children.iter();
-                let mut acc = self.collect_row_ids_for_expr(
-                    iter.next().unwrap(),
-                    fusion_cache,
-                    all_rows_cache,
-                )?;
-                for child in iter {
-                    let next_ids =
-                        self.collect_row_ids_for_expr(child, fusion_cache, all_rows_cache)?;
-                    if acc.is_empty() || next_ids.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    acc = intersect_sorted(acc, next_ids);
-                    if acc.is_empty() {
-                        break;
-                    }
-                }
-                Ok(acc)
             }
-            Expr::Or(children) => {
-                if children.is_empty() {
-                    return Err(Error::InvalidArgumentError(
-                        "OR expression requires at least one predicate".into(),
-                    ));
-                }
-                let mut acc = Vec::new();
-                for child in children {
-                    let next_ids =
-                        self.collect_row_ids_for_expr(child, fusion_cache, all_rows_cache)?;
-                    if acc.is_empty() {
-                        acc = next_ids;
-                    } else if !next_ids.is_empty() {
-                        acc = union_sorted(acc, next_ids);
+
+            loop {
+                match frames.last_mut() {
+                    Some(EvalFrame::And {
+                        children,
+                        next_child,
+                        acc,
+                    }) => {
+                        let child_result = mem::take(&mut last_result);
+                        if *next_child == 0 {
+                            *acc = Some(child_result);
+                        } else {
+                            let previous = acc.take().expect("AND accumulator must be set");
+                            if previous.is_empty() || child_result.is_empty() {
+                                *acc = Some(Vec::new());
+                            } else {
+                                *acc = Some(intersect_sorted(previous, child_result));
+                            }
+                        }
+
+                        *next_child += 1;
+
+                        let acc_ref = acc.as_ref().expect("AND accumulator initialized");
+                        if acc_ref.is_empty() {
+                            last_result.clear();
+                            frames.pop();
+                            continue;
+                        }
+
+                        if *next_child < children.len() {
+                            current = Some(&children[*next_child]);
+                            continue 'outer;
+                        } else {
+                            last_result = acc.take().unwrap();
+                            frames.pop();
+                            continue;
+                        }
                     }
-                }
-                Ok(acc)
-            }
-            Expr::Not(inner) => {
-                let domain = self.collect_row_ids_domain(inner, all_rows_cache)?;
-                if domain.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let matched = self.collect_row_ids_for_expr(inner, fusion_cache, all_rows_cache)?;
-                Ok(difference_sorted(domain, matched))
-            }
-            Expr::Literal(value) => {
-                // Literal boolean expressions: true matches all rows, false matches none
-                if *value {
-                    // Return all row IDs in the table by scanning the ROW_ID field
-                    let filter = Filter {
-                        field_id: ROW_ID_FIELD_ID,
-                        op: Operator::Range {
-                            lower: Bound::Unbounded,
-                            upper: Bound::Unbounded,
-                        },
-                    };
-                    self.collect_row_ids_for_filter(&filter)
-                } else {
-                    // Return empty set
-                    Ok(Vec::new())
+                    Some(EvalFrame::Or {
+                        children,
+                        next_child,
+                        acc,
+                    }) => {
+                        let child_result = mem::take(&mut last_result);
+                        if *next_child == 0 {
+                            *acc = child_result;
+                        } else if !child_result.is_empty() {
+                            if acc.is_empty() {
+                                *acc = child_result;
+                            } else {
+                                *acc = union_sorted(mem::take(acc), child_result);
+                            }
+                        }
+
+                        *next_child += 1;
+
+                        if *next_child < children.len() {
+                            current = Some(&children[*next_child]);
+                            continue 'outer;
+                        } else {
+                            last_result = mem::take(acc);
+                            frames.pop();
+                            continue;
+                        }
+                    }
+                    Some(EvalFrame::Not { domain }) => {
+                        let matched = mem::take(&mut last_result);
+                        let domain_vec = mem::take(domain);
+                        frames.pop();
+                        last_result = difference_sorted(domain_vec, matched);
+                        continue;
+                    }
+                    None => return Ok(last_result),
                 }
             }
         }
@@ -1687,6 +1772,80 @@ where
         Ok(normalize_row_ids(row_ids))
     }
 
+    /// Evaluate a constant-only comparison expression.
+    ///
+    /// Used for comparisons with no column references, such as those produced
+    /// by materializing IN (SELECT ...) subqueries.
+    fn evaluate_constant_compare(
+        left: &ScalarExpr<FieldId>,
+        op: CompareOp,
+        right: &ScalarExpr<FieldId>,
+    ) -> LlkvResult<bool> {
+        use llkv_expr::literal::Literal;
+        
+        // Extract literal values
+        let left_lit = match left {
+            ScalarExpr::Literal(lit) => lit,
+            _ => return Err(Error::InvalidArgumentError(
+                "constant comparison requires literal expressions".into(),
+            )),
+        };
+        let right_lit = match right {
+            ScalarExpr::Literal(lit) => lit,
+            _ => return Err(Error::InvalidArgumentError(
+                "constant comparison requires literal expressions".into(),
+            )),
+        };
+
+        // Helper to compare literals
+        fn compare_literals(left: &Literal, right: &Literal) -> Option<std::cmp::Ordering> {
+            match (left, right) {
+                (Literal::Null, _) | (_, Literal::Null) => None,
+                (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
+                (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
+                (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
+                (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
+                (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r),
+                (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64)),
+                _ => None,
+            }
+        }
+
+        // Evaluate based on operation
+        let result = match op {
+            CompareOp::Eq => left_lit == right_lit,
+            CompareOp::NotEq => left_lit != right_lit,
+            CompareOp::Lt => {
+                compare_literals(left_lit, right_lit) == Some(std::cmp::Ordering::Less)
+            }
+            CompareOp::LtEq => matches!(
+                compare_literals(left_lit, right_lit),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ),
+            CompareOp::Gt => {
+                compare_literals(left_lit, right_lit) == Some(std::cmp::Ordering::Greater)
+            }
+            CompareOp::GtEq => matches!(
+                compare_literals(left_lit, right_lit),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            ),
+        };
+
+        Ok(result)
+    }
+
+    /// Collect all row IDs from the table.
+    ///
+    /// Used when a constant-only comparison evaluates to true and we need
+    /// to return all rows.
+    fn collect_all_row_ids(
+        &self,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
+        // Use ROW_ID_FIELD_ID to get all row IDs from the table
+        self.collect_all_row_ids_for_field(ROW_ID_FIELD_ID, all_rows_cache)
+    }
+
     fn collect_row_ids_for_compare(
         &self,
         left: &ScalarExpr<FieldId>,
@@ -1697,11 +1856,21 @@ where
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(left, &mut fields);
         NumericKernels::collect_fields(right, &mut fields);
+        
+        // Handle constant-only comparisons (e.g., from materialized IN subqueries)
+        // These are comparisons like "5 IN (1,2,3)" with no column references
         if fields.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "Comparison expression must reference at least one column".into(),
-            ));
+            // Evaluate the constant comparison
+            let result = Self::evaluate_constant_compare(left, op, right)?;
+            
+            // If true, return all rows; if false, return empty
+            return if result {
+                self.collect_all_row_ids(all_rows_cache)
+            } else {
+                Ok(Vec::new())
+            };
         }
+        
         let mut domain: Option<Vec<RowId>> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
@@ -1717,11 +1886,29 @@ where
                 return Ok(Vec::new());
             }
         }
+        if let Some(ref domain_rows) = domain {
+            tracing::debug!(
+                ?ordered_fields,
+                domain_len = domain_rows.len(),
+                "collect_row_ids_for_compare domain"
+            );
+        } else {
+            tracing::debug!(
+                ?ordered_fields,
+                "collect_row_ids_for_compare domain empty"
+            );
+        }
         let domain = domain.unwrap_or_default();
         if domain.is_empty() {
             return Ok(domain);
         }
-        self.evaluate_compare_over_rows(&domain, &ordered_fields, left, op, right)
+        let result = self.evaluate_compare_over_rows(&domain, &ordered_fields, left, op, right)?;
+        tracing::debug!(
+            ?ordered_fields,
+            result_len = result.len(),
+            "collect_row_ids_for_compare result"
+        );
+        Ok(result)
     }
 
     fn evaluate_compare_over_rows(
@@ -1863,61 +2050,102 @@ where
         expr: &Expr<'_, FieldId>,
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
     ) -> LlkvResult<Vec<RowId>> {
-        match expr {
-            Expr::Pred(filter) => {
-                self.collect_all_row_ids_for_field(filter.field_id, all_rows_cache)
-            }
-            Expr::Compare { left, right, .. } => {
-                let mut fields = FxHashSet::default();
-                NumericKernels::collect_fields(left, &mut fields);
-                NumericKernels::collect_fields(right, &mut fields);
-                if fields.is_empty() {
-                    return Err(Error::InvalidArgumentError(
-                        "Comparison expression must reference at least one column".into(),
-                    ));
-                }
-                let mut domain: Option<Vec<RowId>> = None;
-                let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
-                ordered_fields.sort_unstable();
-                for fid in ordered_fields {
-                    let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
-                    domain = Some(match domain {
-                        Some(existing) => intersect_sorted(existing, rows),
-                        None => rows,
-                    });
-                    if let Some(ref d) = domain
-                        && d.is_empty()
-                    {
-                        return Ok(Vec::new());
+        let mut stack: Vec<&Expr<'_, FieldId>> = vec![expr];
+        let mut domain: Option<Vec<RowId>> = None;
+
+        while let Some(node) = stack.pop() {
+            match node {
+                Expr::Pred(filter) => {
+                    let rows =
+                        self.collect_all_row_ids_for_field(filter.field_id, all_rows_cache)?;
+                    if !rows.is_empty() {
+                        let previous = domain.take();
+                        domain = Some(match previous {
+                            Some(existing) if existing.is_empty() => rows,
+                            Some(existing) => union_sorted(existing, rows),
+                            None => rows,
+                        });
                     }
                 }
-                Ok(domain.unwrap_or_default())
-            }
-            Expr::And(children) | Expr::Or(children) => {
-                let mut acc = Vec::new();
-                for child in children {
-                    let next_ids = self.collect_row_ids_domain(child, all_rows_cache)?;
-                    if acc.is_empty() {
-                        acc = next_ids;
-                    } else if !next_ids.is_empty() {
-                        acc = union_sorted(acc, next_ids);
+                Expr::Compare { left, right, op } => {
+                    let mut fields = FxHashSet::default();
+                    NumericKernels::collect_fields(left, &mut fields);
+                    NumericKernels::collect_fields(right, &mut fields);
+
+                    if fields.is_empty() {
+                        if Self::evaluate_constant_compare(left, *op, right)? {
+                            let rows = self.collect_all_row_ids(all_rows_cache)?;
+                            if !rows.is_empty() {
+                                let previous = domain.take();
+                                domain = Some(match previous {
+                                    Some(existing) if existing.is_empty() => rows,
+                                    Some(existing) => union_sorted(existing, rows),
+                                    None => rows,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    let mut compare_domain: Option<Vec<RowId>> = None;
+                    let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
+                    ordered_fields.sort_unstable();
+                    for fid in ordered_fields.iter().copied() {
+                        let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
+                        compare_domain = Some(match compare_domain {
+                            Some(existing) => intersect_sorted(existing, rows),
+                            None => rows,
+                        });
+                        if let Some(ref d) = compare_domain
+                            && d.is_empty()
+                        {
+                            break;
+                        }
+                    }
+
+                    if let Some(ref domain_rows) = compare_domain {
+                        tracing::debug!(
+                            domain_len = domain_rows.len(),
+                            "collect_row_ids_domain compare"
+                        );
+                    } else {
+                        tracing::debug!("collect_row_ids_domain compare empty");
+                    }
+
+                    if let Some(rows) = compare_domain {
+                        if !rows.is_empty() {
+                            let previous = domain.take();
+                            domain = Some(match previous {
+                                Some(existing) if existing.is_empty() => rows,
+                                Some(existing) => union_sorted(existing, rows),
+                                None => rows,
+                            });
+                        }
                     }
                 }
-                Ok(acc)
-            }
-            Expr::Not(inner) => self.collect_row_ids_domain(inner, all_rows_cache),
-            Expr::Literal(value) => {
-                // For literal expressions in domain collection:
-                // - true: return all rows (domain is entire table)
-                // - false: return empty (no rows satisfy this)
-                if *value {
-                    // Use ROW_ID_FIELD_ID to get all rows
-                    self.collect_all_row_ids_for_field(ROW_ID_FIELD_ID, all_rows_cache)
-                } else {
-                    Ok(Vec::new())
+                Expr::And(children) | Expr::Or(children) => {
+                    for child in children {
+                        stack.push(child);
+                    }
+                }
+                Expr::Not(inner) => stack.push(inner),
+                Expr::Literal(value) => {
+                    if *value {
+                        let rows = self.collect_all_row_ids(all_rows_cache)?;
+                        if !rows.is_empty() {
+                            let previous = domain.take();
+                            domain = Some(match previous {
+                                Some(existing) if existing.is_empty() => rows,
+                                Some(existing) => union_sorted(existing, rows),
+                                None => rows,
+                            });
+                        }
+                    }
                 }
             }
         }
+
+        Ok(domain.unwrap_or_default())
     }
 
     fn sort_row_ids_with_order(

@@ -40,6 +40,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Span;
 
 // TODO: Extract to constants.rs
 // TODO: Rename to SQL_PARSER_RECURSION_LIMIT
@@ -2363,11 +2364,14 @@ where
         }
 
         let filter = match selection {
-            Some(expr) => Some(translate_condition_with_context(
-                &resolver,
-                IdentifierContext::new(table_id),
-                &expr,
-            )?),
+            Some(expr) => {
+                let materialized_expr = self.materialize_in_subquery(expr)?;
+                Some(translate_condition_with_context(
+                    &resolver,
+                    IdentifierContext::new(table_id),
+                    &materialized_expr,
+                )?)
+            }
             None => None,
         };
 
@@ -2441,7 +2445,12 @@ where
 
         let filter = selection
             .map(|expr| {
-                translate_condition_with_context(&resolver, IdentifierContext::new(table_id), &expr)
+                let materialized_expr = self.materialize_in_subquery(expr)?;
+                translate_condition_with_context(
+                    &resolver,
+                    IdentifierContext::new(table_id),
+                    &materialized_expr,
+                )
             })
             .transpose()?;
 
@@ -2830,6 +2839,234 @@ where
         }
     }
 
+    /// Materialize IN (SELECT ...) subqueries by executing them and converting to IN lists.
+    ///
+    /// This preprocesses SQL expressions to execute subqueries and replace them with
+    /// their materialized results before translation to the execution plan.
+    ///
+    /// Uses iterative traversal with an explicit work stack to handle deeply nested
+    /// expressions without stack overflow.
+    fn materialize_in_subquery(&self, root_expr: SqlExpr) -> SqlResult<SqlExpr> {
+        // Stack-based iterative traversal to avoid recursion
+        enum WorkItem {
+            Process(SqlExpr),
+            BuildBinaryOp {
+                op: BinaryOperator,
+                left: Box<SqlExpr>,
+                right_done: bool,
+            },
+            BuildUnaryOp {
+                op: UnaryOperator,
+            },
+            BuildNested,
+            BuildIsNull,
+            BuildIsNotNull,
+            FinishBetween {
+                negated: bool,
+            },
+        }
+
+        let mut work_stack: Vec<WorkItem> = vec![WorkItem::Process(root_expr)];
+        let mut result_stack: Vec<SqlExpr> = Vec::new();
+
+        while let Some(item) = work_stack.pop() {
+            match item {
+                WorkItem::Process(expr) => match expr {
+                    SqlExpr::InSubquery {
+                        expr: left_expr,
+                        subquery,
+                        negated,
+                    } => {
+                        // Execute the subquery
+                        let result = self.handle_query(*subquery)?;
+
+                        // Extract values from first column
+                        let values = match result {
+                            RuntimeStatementResult::Select { execution, .. } => {
+                                let batches = execution.collect()?;
+                                let mut collected_values = Vec::new();
+
+                                for batch in batches {
+                                    if batch.num_columns() == 0 {
+                                        continue;
+                                    }
+                                    let column = batch.column(0);
+
+                                    for row_idx in 0..column.len() {
+                                        use arrow::datatypes::DataType;
+                                        let value = if column.is_null(row_idx) {
+                                            Value::Null
+                                        } else {
+                                            match column.data_type() {
+                                                DataType::Int64 => {
+                                                    let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::Int64Array>()
+                                                        .unwrap();
+                                                    Value::Number(arr.value(row_idx).to_string(), false)
+                                                }
+                                                DataType::Float64 => {
+                                                    let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::Float64Array>()
+                                                        .unwrap();
+                                                    Value::Number(arr.value(row_idx).to_string(), false)
+                                                }
+                                                DataType::Utf8 => {
+                                                    let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::StringArray>()
+                                                        .unwrap();
+                                                    Value::SingleQuotedString(
+                                                        arr.value(row_idx).to_string(),
+                                                    )
+                                                }
+                                                DataType::Boolean => {
+                                                    let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::BooleanArray>()
+                                                        .unwrap();
+                                                    Value::Boolean(arr.value(row_idx))
+                                                }
+                                                other => {
+                                                    return Err(Error::InvalidArgumentError(format!(
+                                                        "unsupported data type in IN subquery: {other:?}"
+                                                    )));
+                                                }
+                                            }
+                                        };
+                                        collected_values.push(ValueWithSpan {
+                                            value,
+                                            span: Span::empty(),
+                                        });
+                                    }
+                                }
+
+                                collected_values
+                            }
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "IN subquery must be a SELECT statement".into(),
+                                ));
+                            }
+                        };
+
+                        // Convert to IN list with materialized values
+                        result_stack.push(SqlExpr::InList {
+                            expr: left_expr,
+                            list: values.into_iter().map(SqlExpr::Value).collect(),
+                            negated,
+                        });
+                    }
+                    SqlExpr::BinaryOp { left, op, right } => {
+                        // Push builder, then schedule the left operand followed by the right.
+                        // Because the work stack is LIFO, the right-hand side executes first,
+                        // leaving the left result on top for the builder to consume without
+                        // swapping operand order.
+                        work_stack.push(WorkItem::BuildBinaryOp {
+                            op,
+                            left: left.clone(),
+                            right_done: false,
+                        });
+                        // Evaluate the right-hand side first so the left result remains on top
+                        // of the result stack when the builder consumes it. This preserves the
+                        // original operand ordering when reconstructing the expression tree.
+                        work_stack.push(WorkItem::Process(*left));
+                        work_stack.push(WorkItem::Process(*right));
+                    }
+                    SqlExpr::UnaryOp { op, expr } => {
+                        work_stack.push(WorkItem::BuildUnaryOp { op });
+                        work_stack.push(WorkItem::Process(*expr));
+                    }
+                    SqlExpr::Nested(inner) => {
+                        work_stack.push(WorkItem::BuildNested);
+                        work_stack.push(WorkItem::Process(*inner));
+                    }
+                    SqlExpr::IsNull(inner) => {
+                        work_stack.push(WorkItem::BuildIsNull);
+                        work_stack.push(WorkItem::Process(*inner));
+                    }
+                    SqlExpr::IsNotNull(inner) => {
+                        work_stack.push(WorkItem::BuildIsNotNull);
+                        work_stack.push(WorkItem::Process(*inner));
+                    }
+                    SqlExpr::Between {
+                        expr,
+                        negated,
+                        low,
+                        high,
+                    } => {
+                        work_stack.push(WorkItem::FinishBetween { negated });
+                        work_stack.push(WorkItem::Process(*high));
+                        work_stack.push(WorkItem::Process(*low));
+                        work_stack.push(WorkItem::Process(*expr));
+                    }
+                    // All other expressions: push as-is to result stack
+                    other => {
+                        result_stack.push(other);
+                    }
+                },
+                WorkItem::BuildBinaryOp {
+                    op,
+                    left,
+                    right_done,
+                } => {
+                    if !right_done {
+                        // Left done, now mark that right will be done next
+                        let left_result = result_stack.pop().unwrap();
+                        work_stack.push(WorkItem::BuildBinaryOp {
+                            op,
+                            left: Box::new(left_result),
+                            right_done: true,
+                        });
+                    } else {
+                        // Both done, build the BinaryOp
+                        let right_result = result_stack.pop().unwrap();
+                        let left_result = *left;
+                        result_stack.push(SqlExpr::BinaryOp {
+                            left: Box::new(left_result),
+                            op,
+                            right: Box::new(right_result),
+                        });
+                    }
+                }
+                WorkItem::BuildUnaryOp { op } => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::UnaryOp {
+                        op,
+                        expr: Box::new(inner),
+                    });
+                }
+                WorkItem::BuildNested => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::Nested(Box::new(inner)));
+                }
+                WorkItem::BuildIsNull => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::IsNull(Box::new(inner)));
+                }
+                WorkItem::BuildIsNotNull => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::IsNotNull(Box::new(inner)));
+                }
+                WorkItem::FinishBetween { negated } => {
+                    let high_result = result_stack.pop().unwrap();
+                    let low_result = result_stack.pop().unwrap();
+                    let expr_result = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::Between {
+                        expr: Box::new(expr_result),
+                        negated,
+                        low: Box::new(low_result),
+                        high: Box::new(high_result),
+                    });
+                }
+            }
+        }
+
+        // Final result should be the only item on the result stack
+        Ok(result_stack.pop().expect("result stack should have exactly one item"))
+    }
+
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
         // Check for pragma_table_info() table function first
         if let Some(result) = self.try_handle_pragma_table_info(&query)? {
@@ -2984,9 +3221,14 @@ where
         };
 
         let filter_expr = match &select.selection {
-            Some(expr) => Some(translate_condition_with_context(
-                resolver, id_context, expr,
-            )?),
+            Some(expr) => {
+                let materialized_expr = self.materialize_in_subquery(expr.clone())?;
+                Some(translate_condition_with_context(
+                    resolver,
+                    id_context,
+                    &materialized_expr,
+                )?)
+            }
             None => None,
         };
         plan = plan.with_filter(filter_expr);
@@ -4234,14 +4476,14 @@ fn translate_condition_with_context(
             }
         }
         SqlExpr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => Ok(llkv_expr::expr::Expr::And(vec![
+            BinaryOperator::And => Ok(flatten_and(
                 translate_condition_with_context(resolver, context, left)?,
                 translate_condition_with_context(resolver, context, right)?,
-            ])),
-            BinaryOperator::Or => Ok(llkv_expr::expr::Expr::Or(vec![
+            )),
+            BinaryOperator::Or => Ok(flatten_or(
                 translate_condition_with_context(resolver, context, left)?,
                 translate_condition_with_context(resolver, context, right)?,
-            ])),
+            )),
             BinaryOperator::Eq
             | BinaryOperator::NotEq
             | BinaryOperator::Lt
@@ -4269,10 +4511,16 @@ fn translate_condition_with_context(
             // Translate IN list to a series of OR conditions with equality checks
             // e.g., col IN (1, 2, 3) becomes (col = 1 OR col = 2 OR col = 3)
             // and col NOT IN (1, 2, 3) becomes NOT (col = 1 OR col = 2 OR col = 3)
+            //
+            // Empty IN list semantics:
+            // - IN (empty) is always FALSE (no values to match)
+            // - NOT IN (empty) is always TRUE (vacuously true)
             if list.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "IN list cannot be empty".into(),
-                ));
+                return if *negated {
+                    Ok(llkv_expr::expr::Expr::Literal(true))
+                } else {
+                    Ok(llkv_expr::expr::Expr::Literal(false))
+                };
             }
 
             let mut conditions = Vec::with_capacity(list.len());
@@ -4299,17 +4547,12 @@ fn translate_condition_with_context(
                 Ok(or_expr)
             }
         }
-        SqlExpr::InSubquery { negated, .. } => {
-            // TODO: Implement IN with subquery
-            // For now, treat as always false (no matches)
-            // This allows tests to progress without crashing
-            if *negated {
-                // NOT IN (empty) = TRUE
-                Ok(llkv_expr::expr::Expr::Literal(true))
-            } else {
-                // IN (empty) = FALSE
-                Ok(llkv_expr::expr::Expr::Literal(false))
-            }
+        SqlExpr::InSubquery { .. } => {
+            // This should not be reached - IN (SELECT ...) subqueries should be materialized
+            // to IN lists before translation via materialize_in_subquery()
+            Err(Error::InvalidArgumentError(
+                "IN (SELECT ...) subqueries must be materialized before translation".into(),
+            ))
         }
         SqlExpr::Between {
             expr,
@@ -4349,6 +4592,46 @@ fn translate_condition_with_context(
     }
 }
 
+fn flatten_and(
+    left: llkv_expr::expr::Expr<'static, String>,
+    right: llkv_expr::expr::Expr<'static, String>,
+) -> llkv_expr::expr::Expr<'static, String> {
+    let mut children: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
+    match left {
+        llkv_expr::expr::Expr::And(mut left_children) => children.append(&mut left_children),
+        other => children.push(other),
+    }
+    match right {
+        llkv_expr::expr::Expr::And(mut right_children) => children.append(&mut right_children),
+        other => children.push(other),
+    }
+    if children.len() == 1 {
+        children.into_iter().next().unwrap()
+    } else {
+        llkv_expr::expr::Expr::And(children)
+    }
+}
+
+fn flatten_or(
+    left: llkv_expr::expr::Expr<'static, String>,
+    right: llkv_expr::expr::Expr<'static, String>,
+) -> llkv_expr::expr::Expr<'static, String> {
+    let mut children: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
+    match left {
+        llkv_expr::expr::Expr::Or(mut left_children) => children.append(&mut left_children),
+        other => children.push(other),
+    }
+    match right {
+        llkv_expr::expr::Expr::Or(mut right_children) => children.append(&mut right_children),
+        other => children.push(other),
+    }
+    if children.len() == 1 {
+        children.into_iter().next().unwrap()
+    } else {
+        llkv_expr::expr::Expr::Or(children)
+    }
+}
+
 fn translate_comparison_with_context(
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
@@ -4378,6 +4661,12 @@ fn translate_comparison_with_context(
     ) = (&left_scalar, &right_scalar)
         && let Some(op) = compare_op_to_filter_operator(compare_op, literal)
     {
+        tracing::debug!(
+            column = ?column,
+            literal = ?literal,
+            ?compare_op,
+            "translate_comparison direct"
+        );
         return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
             field_id: column.clone(),
             op,
@@ -4391,6 +4680,13 @@ fn translate_comparison_with_context(
         && let Some(flipped) = flip_compare_op(compare_op)
         && let Some(op) = compare_op_to_filter_operator(flipped, literal)
     {
+        tracing::debug!(
+            column = ?column,
+            literal = ?literal,
+            original_op = ?compare_op,
+            flipped_op = ?flipped,
+            "translate_comparison flipped"
+        );
         return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
             field_id: column.clone(),
             op,
@@ -4409,6 +4705,7 @@ fn compare_op_to_filter_operator(
     literal: &Literal,
 ) -> Option<llkv_expr::expr::Operator<'static>> {
     let lit = literal.clone();
+    tracing::debug!(?op, literal = ?literal, "compare_op_to_filter_operator input");
     match op {
         llkv_expr::expr::CompareOp::Eq => Some(llkv_expr::expr::Operator::Equals(lit)),
         llkv_expr::expr::CompareOp::Lt => Some(llkv_expr::expr::Operator::LessThan(lit)),
