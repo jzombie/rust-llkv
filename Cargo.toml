@@ -6,25 +6,8 @@ license = "Apache-2.0"
 repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
-[package]
-name = "llkv"
-description = "Columnar Storage Layer for Key-Value Stores"
-authors.workspace = true
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-publish.workspace = true
-
-[dependencies]
-llkv-sql = { workspace = true }
-llkv-storage = { workspace = true }
-arrow = { workspace = true }
-llkv-runtime = { workspace = true }
-llkv-slt-tester = { workspace = true }
-llkv-result = { workspace = true }
-
 [workspace.dependencies]
+llkv = { path = "./llkv", version = "0.4.5-alpha" }
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.4.5-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.4.5-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.4.5-alpha" }
@@ -77,6 +60,7 @@ walkdir = "2.5"
 
 [workspace]
 members = [
+    "llkv",
     "llkv-aggregate",
     "llkv-column-map",
     "llkv-csv",
