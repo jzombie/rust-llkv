@@ -257,20 +257,6 @@ where
         self.execute_gather_single_pass_with_schema(&mut ctx, row_ids, policy, expected_schema)
     }
 
-    /// Executes a one-off gather using a freshly prepared context.
-    ///
-    /// This path reuses the planning metadata but fetches and decodes
-    /// required chunks for this call only, avoiding the reusable caches
-    /// maintained by [`Self::gather_rows_with_reusable_context`].
-    fn execute_gather_single_pass(
-        &self,
-        ctx: &mut MultiGatherContext,
-        row_ids: &[u64],
-        policy: GatherNullPolicy,
-    ) -> Result<RecordBatch> {
-        self.execute_gather_single_pass_with_schema(ctx, row_ids, policy, None)
-    }
-
     /// Executes a one-off gather with optional schema for empty result sets.
     fn execute_gather_single_pass_with_schema(
         &self,

@@ -14,8 +14,8 @@ use crate::constraints::{
 use crate::constraints::{ForeignKeyTableInfo, ValidatedForeignKey, validate_foreign_keys};
 use crate::reserved;
 use crate::resolvers::resolve_table_name;
-use crate::sys_catalog::{MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta};
 use crate::sys_catalog::{ConstraintNameRecord, SysCatalog};
+use crate::sys_catalog::{MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 use crate::view::{ForeignKeyView, TableView};
@@ -528,9 +528,13 @@ where
     ) -> LlkvResult<Option<MultiColumnIndexEntryMeta>> {
         self.ensure_table_state(table_id)?;
         let tables = self.tables.read().unwrap();
-        Ok(tables
-            .get(&table_id)
-            .and_then(|state| state.current.multi_column_indexes.get(canonical_index_name).cloned()))
+        Ok(tables.get(&table_id).and_then(|state| {
+            state
+                .current
+                .multi_column_indexes
+                .get(canonical_index_name)
+                .cloned()
+        }))
     }
 
     /// Register a sort index for a column at the metadata level, staging the change for the next flush.
@@ -890,8 +894,6 @@ where
             }
         }
 
-
-
         let sort_adds: Vec<FieldId> = state
             .current
             .sort_indexes
@@ -1225,7 +1227,15 @@ where
         let column_vec: Vec<FieldId> = column_ids.to_vec();
 
         // Generate canonical name from column IDs
-        let canonical_name = format!("__unique_{}_{}", table_id, column_vec.iter().map(|id| id.to_string()).collect::<Vec<_>>().join("_"));
+        let canonical_name = format!(
+            "__unique_{}_{}",
+            table_id,
+            column_vec
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join("_")
+        );
 
         self.update_multi_column_uniques(table_id, |entries| {
             if let Some(existing) = entries.iter().find(|entry| entry.column_ids == column_vec) {

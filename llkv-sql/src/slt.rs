@@ -169,7 +169,7 @@ where
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
             let fac = factory_factory_clone();
-            
+
             // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
             // Default thread stack is ~2MB which is insufficient for complex SLT test queries
             std::thread::Builder::new()

@@ -1247,8 +1247,6 @@ where
             index_columns.push(column_plan);
         }
 
-
-
         let plan = CreateIndexPlan::new(display_table_name)
             .with_name(index_name)
             .with_unique(unique)
@@ -2850,7 +2848,7 @@ where
     fn materialize_in_subquery(&self, root_expr: SqlExpr) -> SqlResult<SqlExpr> {
         // Stack-based iterative traversal to avoid recursion
         enum WorkItem {
-            Process(SqlExpr),
+            Process(Box<SqlExpr>),
             BuildBinaryOp {
                 op: BinaryOperator,
                 left: Box<SqlExpr>,
@@ -2867,146 +2865,156 @@ where
             },
         }
 
-        let mut work_stack: Vec<WorkItem> = vec![WorkItem::Process(root_expr)];
+        let mut work_stack: Vec<WorkItem> = vec![WorkItem::Process(Box::new(root_expr))];
         let mut result_stack: Vec<SqlExpr> = Vec::new();
 
         while let Some(item) = work_stack.pop() {
             match item {
-                WorkItem::Process(expr) => match expr {
-                    SqlExpr::InSubquery {
-                        expr: left_expr,
-                        subquery,
-                        negated,
-                    } => {
-                        // Execute the subquery
-                        let result = self.handle_query(*subquery)?;
+                WorkItem::Process(expr) => {
+                    match *expr {
+                        SqlExpr::InSubquery {
+                            expr: left_expr,
+                            subquery,
+                            negated,
+                        } => {
+                            // Execute the subquery
+                            let result = self.handle_query(*subquery)?;
 
-                        // Extract values from first column
-                        let values = match result {
-                            RuntimeStatementResult::Select { execution, .. } => {
-                                let batches = execution.collect()?;
-                                let mut collected_values = Vec::new();
+                            // Extract values from first column
+                            let values = match result {
+                                RuntimeStatementResult::Select { execution, .. } => {
+                                    let batches = execution.collect()?;
+                                    let mut collected_values = Vec::new();
 
-                                for batch in batches {
-                                    if batch.num_columns() == 0 {
-                                        continue;
-                                    }
-                                    let column = batch.column(0);
+                                    for batch in batches {
+                                        if batch.num_columns() == 0 {
+                                            continue;
+                                        }
+                                        let column = batch.column(0);
 
-                                    for row_idx in 0..column.len() {
-                                        use arrow::datatypes::DataType;
-                                        let value = if column.is_null(row_idx) {
-                                            Value::Null
-                                        } else {
-                                            match column.data_type() {
-                                                DataType::Int64 => {
-                                                    let arr = column
+                                        for row_idx in 0..column.len() {
+                                            use arrow::datatypes::DataType;
+                                            let value = if column.is_null(row_idx) {
+                                                Value::Null
+                                            } else {
+                                                match column.data_type() {
+                                                    DataType::Int64 => {
+                                                        let arr = column
                                                         .as_any()
                                                         .downcast_ref::<arrow::array::Int64Array>()
                                                         .unwrap();
-                                                    Value::Number(arr.value(row_idx).to_string(), false)
-                                                }
-                                                DataType::Float64 => {
-                                                    let arr = column
+                                                        Value::Number(
+                                                            arr.value(row_idx).to_string(),
+                                                            false,
+                                                        )
+                                                    }
+                                                    DataType::Float64 => {
+                                                        let arr = column
                                                         .as_any()
                                                         .downcast_ref::<arrow::array::Float64Array>()
                                                         .unwrap();
-                                                    Value::Number(arr.value(row_idx).to_string(), false)
-                                                }
-                                                DataType::Utf8 => {
-                                                    let arr = column
+                                                        Value::Number(
+                                                            arr.value(row_idx).to_string(),
+                                                            false,
+                                                        )
+                                                    }
+                                                    DataType::Utf8 => {
+                                                        let arr = column
                                                         .as_any()
                                                         .downcast_ref::<arrow::array::StringArray>()
                                                         .unwrap();
-                                                    Value::SingleQuotedString(
-                                                        arr.value(row_idx).to_string(),
-                                                    )
-                                                }
-                                                DataType::Boolean => {
-                                                    let arr = column
+                                                        Value::SingleQuotedString(
+                                                            arr.value(row_idx).to_string(),
+                                                        )
+                                                    }
+                                                    DataType::Boolean => {
+                                                        let arr = column
                                                         .as_any()
                                                         .downcast_ref::<arrow::array::BooleanArray>()
                                                         .unwrap();
-                                                    Value::Boolean(arr.value(row_idx))
+                                                        Value::Boolean(arr.value(row_idx))
+                                                    }
+                                                    other => {
+                                                        return Err(Error::InvalidArgumentError(
+                                                            format!(
+                                                                "unsupported data type in IN subquery: {other:?}"
+                                                            ),
+                                                        ));
+                                                    }
                                                 }
-                                                other => {
-                                                    return Err(Error::InvalidArgumentError(format!(
-                                                        "unsupported data type in IN subquery: {other:?}"
-                                                    )));
-                                                }
-                                            }
-                                        };
-                                        collected_values.push(ValueWithSpan {
-                                            value,
-                                            span: Span::empty(),
-                                        });
+                                            };
+                                            collected_values.push(ValueWithSpan {
+                                                value,
+                                                span: Span::empty(),
+                                            });
+                                        }
                                     }
+
+                                    collected_values
                                 }
+                                _ => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "IN subquery must be a SELECT statement".into(),
+                                    ));
+                                }
+                            };
 
-                                collected_values
-                            }
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "IN subquery must be a SELECT statement".into(),
-                                ));
-                            }
-                        };
-
-                        // Convert to IN list with materialized values
-                        result_stack.push(SqlExpr::InList {
-                            expr: left_expr,
-                            list: values.into_iter().map(SqlExpr::Value).collect(),
+                            // Convert to IN list with materialized values
+                            result_stack.push(SqlExpr::InList {
+                                expr: left_expr,
+                                list: values.into_iter().map(SqlExpr::Value).collect(),
+                                negated,
+                            });
+                        }
+                        SqlExpr::BinaryOp { left, op, right } => {
+                            // Push builder, then schedule the left operand followed by the right.
+                            // Because the work stack is LIFO, the right-hand side executes first,
+                            // leaving the left result on top for the builder to consume without
+                            // swapping operand order.
+                            work_stack.push(WorkItem::BuildBinaryOp {
+                                op,
+                                left: left.clone(),
+                                right_done: false,
+                            });
+                            // Evaluate the right-hand side first so the left result remains on top
+                            // of the result stack when the builder consumes it. This preserves the
+                            // original operand ordering when reconstructing the expression tree.
+                            work_stack.push(WorkItem::Process(left));
+                            work_stack.push(WorkItem::Process(right));
+                        }
+                        SqlExpr::UnaryOp { op, expr } => {
+                            work_stack.push(WorkItem::BuildUnaryOp { op });
+                            work_stack.push(WorkItem::Process(expr));
+                        }
+                        SqlExpr::Nested(inner) => {
+                            work_stack.push(WorkItem::BuildNested);
+                            work_stack.push(WorkItem::Process(inner));
+                        }
+                        SqlExpr::IsNull(inner) => {
+                            work_stack.push(WorkItem::BuildIsNull);
+                            work_stack.push(WorkItem::Process(inner));
+                        }
+                        SqlExpr::IsNotNull(inner) => {
+                            work_stack.push(WorkItem::BuildIsNotNull);
+                            work_stack.push(WorkItem::Process(inner));
+                        }
+                        SqlExpr::Between {
+                            expr,
                             negated,
-                        });
+                            low,
+                            high,
+                        } => {
+                            work_stack.push(WorkItem::FinishBetween { negated });
+                            work_stack.push(WorkItem::Process(high));
+                            work_stack.push(WorkItem::Process(low));
+                            work_stack.push(WorkItem::Process(expr));
+                        }
+                        // All other expressions: push as-is to result stack
+                        other => {
+                            result_stack.push(other);
+                        }
                     }
-                    SqlExpr::BinaryOp { left, op, right } => {
-                        // Push builder, then schedule the left operand followed by the right.
-                        // Because the work stack is LIFO, the right-hand side executes first,
-                        // leaving the left result on top for the builder to consume without
-                        // swapping operand order.
-                        work_stack.push(WorkItem::BuildBinaryOp {
-                            op,
-                            left: left.clone(),
-                            right_done: false,
-                        });
-                        // Evaluate the right-hand side first so the left result remains on top
-                        // of the result stack when the builder consumes it. This preserves the
-                        // original operand ordering when reconstructing the expression tree.
-                        work_stack.push(WorkItem::Process(*left));
-                        work_stack.push(WorkItem::Process(*right));
-                    }
-                    SqlExpr::UnaryOp { op, expr } => {
-                        work_stack.push(WorkItem::BuildUnaryOp { op });
-                        work_stack.push(WorkItem::Process(*expr));
-                    }
-                    SqlExpr::Nested(inner) => {
-                        work_stack.push(WorkItem::BuildNested);
-                        work_stack.push(WorkItem::Process(*inner));
-                    }
-                    SqlExpr::IsNull(inner) => {
-                        work_stack.push(WorkItem::BuildIsNull);
-                        work_stack.push(WorkItem::Process(*inner));
-                    }
-                    SqlExpr::IsNotNull(inner) => {
-                        work_stack.push(WorkItem::BuildIsNotNull);
-                        work_stack.push(WorkItem::Process(*inner));
-                    }
-                    SqlExpr::Between {
-                        expr,
-                        negated,
-                        low,
-                        high,
-                    } => {
-                        work_stack.push(WorkItem::FinishBetween { negated });
-                        work_stack.push(WorkItem::Process(*high));
-                        work_stack.push(WorkItem::Process(*low));
-                        work_stack.push(WorkItem::Process(*expr));
-                    }
-                    // All other expressions: push as-is to result stack
-                    other => {
-                        result_stack.push(other);
-                    }
-                },
+                }
                 WorkItem::BuildBinaryOp {
                     op,
                     left,
@@ -3065,7 +3073,9 @@ where
         }
 
         // Final result should be the only item on the result stack
-        Ok(result_stack.pop().expect("result stack should have exactly one item"))
+        Ok(result_stack
+            .pop()
+            .expect("result stack should have exactly one item"))
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
@@ -4452,24 +4462,24 @@ fn translate_condition_with_context(
     //
     // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
     // explicit work_stack and result_stack instead of recursion.
-    
+
     enum ConditionExitContext {
         And,
         Or,
         Not,
         Nested,
     }
-    
+
     type ConditionFrame<'a> = llkv_plan::TransformFrame<
         'a,
         SqlExpr,
         llkv_expr::expr::Expr<'static, String>,
         ConditionExitContext,
     >;
-    
+
     let mut work_stack: Vec<ConditionFrame> = vec![ConditionFrame::Enter(expr)];
     let mut result_stack: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
-    
+
     while let Some(frame) = work_stack.pop() {
         match frame {
             ConditionFrame::Enter(node) => match node {
@@ -4490,7 +4500,13 @@ fn translate_condition_with_context(
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
-                        let result = translate_comparison_with_context(resolver, context, left, op.clone(), right)?;
+                        let result = translate_comparison_with_context(
+                            resolver,
+                            context,
+                            left,
+                            op.clone(),
+                            right,
+                        )?;
                         work_stack.push(ConditionFrame::Leaf(result));
                     }
                     other => {
@@ -4514,14 +4530,17 @@ fn translate_condition_with_context(
                     let scalar = translate_scalar_with_context(resolver, context, inner)?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
-                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
-                                field_id: column,
-                                op: llkv_expr::expr::Operator::IsNull,
-                            })));
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
+                                llkv_expr::expr::Filter {
+                                    field_id: column,
+                                    op: llkv_expr::expr::Operator::IsNull,
+                                },
+                            )));
                         }
                         _ => {
                             return Err(Error::InvalidArgumentError(
-                                "IS NULL predicates currently support column references only".into(),
+                                "IS NULL predicates currently support column references only"
+                                    .into(),
                             ));
                         }
                     }
@@ -4530,14 +4549,17 @@ fn translate_condition_with_context(
                     let scalar = translate_scalar_with_context(resolver, context, inner)?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
-                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
-                                field_id: column,
-                                op: llkv_expr::expr::Operator::IsNotNull,
-                            })));
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
+                                llkv_expr::expr::Filter {
+                                    field_id: column,
+                                    op: llkv_expr::expr::Operator::IsNotNull,
+                                },
+                            )));
                         }
                         _ => {
                             return Err(Error::InvalidArgumentError(
-                                "IS NOT NULL predicates currently support column references only".into(),
+                                "IS NOT NULL predicates currently support column references only"
+                                    .into(),
                             ));
                         }
                     }
@@ -4607,7 +4629,8 @@ fn translate_condition_with_context(
                         high,
                     )?;
 
-                    let between_expr_result = llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]);
+                    let between_expr_result =
+                        llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]);
 
                     let result = if *negated {
                         llkv_expr::expr::Expr::not(between_expr_result)
@@ -4628,25 +4651,35 @@ fn translate_condition_with_context(
             ConditionFrame::Exit(exit_context) => match exit_context {
                 ConditionExitContext::And => {
                     let right = result_stack.pop().ok_or_else(|| {
-                        Error::Internal("translate_condition: result stack underflow for And right".into())
+                        Error::Internal(
+                            "translate_condition: result stack underflow for And right".into(),
+                        )
                     })?;
                     let left = result_stack.pop().ok_or_else(|| {
-                        Error::Internal("translate_condition: result stack underflow for And left".into())
+                        Error::Internal(
+                            "translate_condition: result stack underflow for And left".into(),
+                        )
                     })?;
                     result_stack.push(flatten_and(left, right));
                 }
                 ConditionExitContext::Or => {
                     let right = result_stack.pop().ok_or_else(|| {
-                        Error::Internal("translate_condition: result stack underflow for Or right".into())
+                        Error::Internal(
+                            "translate_condition: result stack underflow for Or right".into(),
+                        )
                     })?;
                     let left = result_stack.pop().ok_or_else(|| {
-                        Error::Internal("translate_condition: result stack underflow for Or left".into())
+                        Error::Internal(
+                            "translate_condition: result stack underflow for Or left".into(),
+                        )
                     })?;
                     result_stack.push(flatten_or(left, right));
                 }
                 ConditionExitContext::Not => {
                     let inner = result_stack.pop().ok_or_else(|| {
-                        Error::Internal("translate_condition: result stack underflow for Not".into())
+                        Error::Internal(
+                            "translate_condition: result stack underflow for Not".into(),
+                        )
                     })?;
                     result_stack.push(llkv_expr::expr::Expr::not(inner));
                 }
@@ -4656,7 +4689,7 @@ fn translate_condition_with_context(
             },
         }
     }
-    
+
     result_stack.pop().ok_or_else(|| {
         Error::Internal("translate_condition_with_context: empty result stack".into())
     })
@@ -4833,7 +4866,7 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
     //
     // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
     // explicit work_stack and result_stack instead of recursion.
-    
+
     /// Context passed through Exit frames during scalar expression translation
     enum ScalarExitContext {
         BinaryOp { op: BinaryOperator },
@@ -4841,17 +4874,20 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
         UnaryPlus,
         Nested,
     }
-    
-    type ScalarFrame<'a> = TransformFrame<'a, SqlExpr, llkv_expr::expr::ScalarExpr<String>, ScalarExitContext>;
-    
+
+    type ScalarFrame<'a> =
+        TransformFrame<'a, SqlExpr, llkv_expr::expr::ScalarExpr<String>, ScalarExitContext>;
+
     let mut work_stack: Vec<ScalarFrame> = vec![ScalarFrame::Enter(expr)];
     let mut result_stack: Vec<llkv_expr::expr::ScalarExpr<String>> = Vec::new();
-    
+
     while let Some(frame) = work_stack.pop() {
         match frame {
             ScalarFrame::Enter(node) => match node {
                 SqlExpr::Identifier(ident) => {
-                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::column(ident.value.clone())));
+                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::column(
+                        ident.value.clone(),
+                    )));
                 }
                 SqlExpr::CompoundIdentifier(idents) => {
                     if idents.is_empty() {
@@ -4875,7 +4911,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     work_stack.push(ScalarFrame::Leaf(result));
                 }
                 SqlExpr::BinaryOp { left, op, right } => {
-                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp { op: op.clone() }));
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp {
+                        op: op.clone(),
+                    }));
                     work_stack.push(ScalarFrame::Enter(right));
                     work_stack.push(ScalarFrame::Enter(left));
                 }
@@ -4899,7 +4937,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                 }
                 SqlExpr::Function(func) => {
                     if let Some(agg_call) = try_parse_aggregate_function(func)? {
-                        work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::aggregate(agg_call)));
+                        work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::aggregate(
+                            agg_call,
+                        )));
                     } else {
                         return Err(Error::InvalidArgumentError(format!(
                             "unsupported function in scalar expression: {:?}",
@@ -4926,9 +4966,9 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                             }
                         }
                     }
-                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(
-                        struct_fields,
-                    ))));
+                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::literal(
+                        Literal::Struct(struct_fields),
+                    )));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
@@ -4941,81 +4981,90 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
             }
             ScalarFrame::Exit(exit_context) => match exit_context {
                 ScalarExitContext::BinaryOp { op } => {
-                let right_expr = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_scalar: result stack underflow for BinaryOp right".into())
-                })?;
-                let left_expr = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_scalar: result stack underflow for BinaryOp left".into())
-                })?;
-                let binary_op = match op {
-                    BinaryOperator::Plus => llkv_expr::expr::BinaryOp::Add,
-                    BinaryOperator::Minus => llkv_expr::expr::BinaryOp::Subtract,
-                    BinaryOperator::Multiply => llkv_expr::expr::BinaryOp::Multiply,
-                    BinaryOperator::Divide => llkv_expr::expr::BinaryOp::Divide,
-                    BinaryOperator::Modulo => llkv_expr::expr::BinaryOp::Modulo,
-                    other => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "unsupported scalar binary operator: {other:?}"
-                        )));
-                    }
-                };
-                result_stack.push(llkv_expr::expr::ScalarExpr::binary(
-                    left_expr, binary_op, right_expr,
-                ));
-            }
-            ScalarExitContext::UnaryMinus => {
-                let inner = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_scalar: result stack underflow for UnaryMinus".into())
-                })?;
-                match inner {
-                    llkv_expr::expr::ScalarExpr::Literal(lit) => match lit {
-                        Literal::Integer(v) => {
-                            result_stack.push(llkv_expr::expr::ScalarExpr::literal(Literal::Integer(-v)));
+                    let right_expr = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for BinaryOp right".into(),
+                        )
+                    })?;
+                    let left_expr = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for BinaryOp left".into(),
+                        )
+                    })?;
+                    let binary_op = match op {
+                        BinaryOperator::Plus => llkv_expr::expr::BinaryOp::Add,
+                        BinaryOperator::Minus => llkv_expr::expr::BinaryOp::Subtract,
+                        BinaryOperator::Multiply => llkv_expr::expr::BinaryOp::Multiply,
+                        BinaryOperator::Divide => llkv_expr::expr::BinaryOp::Divide,
+                        BinaryOperator::Modulo => llkv_expr::expr::BinaryOp::Modulo,
+                        other => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported scalar binary operator: {other:?}"
+                            )));
                         }
-                        Literal::Float(v) => {
-                            result_stack.push(llkv_expr::expr::ScalarExpr::literal(Literal::Float(-v)));
-                        }
-                        Literal::Boolean(_) => {
+                    };
+                    result_stack.push(llkv_expr::expr::ScalarExpr::binary(
+                        left_expr, binary_op, right_expr,
+                    ));
+                }
+                ScalarExitContext::UnaryMinus => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for UnaryMinus".into(),
+                        )
+                    })?;
+                    match inner {
+                        llkv_expr::expr::ScalarExpr::Literal(lit) => match lit {
+                            Literal::Integer(v) => {
+                                result_stack.push(llkv_expr::expr::ScalarExpr::literal(
+                                    Literal::Integer(-v),
+                                ));
+                            }
+                            Literal::Float(v) => {
+                                result_stack
+                                    .push(llkv_expr::expr::ScalarExpr::literal(Literal::Float(-v)));
+                            }
+                            Literal::Boolean(_) => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate boolean literal".into(),
+                                ));
+                            }
+                            Literal::String(_) => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate string literal".into(),
+                                ));
+                            }
+                            Literal::Struct(_) => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate struct literal".into(),
+                                ));
+                            }
+                            Literal::Null => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate null literal".into(),
+                                ));
+                            }
+                        },
+                        _ => {
                             return Err(Error::InvalidArgumentError(
-                                "cannot negate boolean literal".into(),
+                                "cannot negate non-literal expression".into(),
                             ));
                         }
-                        Literal::String(_) => {
-                            return Err(Error::InvalidArgumentError(
-                                "cannot negate string literal".into(),
-                            ));
-                        }
-                        Literal::Struct(_) => {
-                            return Err(Error::InvalidArgumentError(
-                                "cannot negate struct literal".into(),
-                            ));
-                        }
-                        Literal::Null => {
-                            return Err(Error::InvalidArgumentError(
-                                "cannot negate null literal".into(),
-                            ));
-                        }
-                    },
-                    _ => {
-                        return Err(Error::InvalidArgumentError(
-                            "cannot negate non-literal expression".into(),
-                        ));
                     }
                 }
-            }
-            ScalarExitContext::UnaryPlus => {
-                // Unary plus is a no-op - just pass through
-            }
-            ScalarExitContext::Nested => {
-                // Nested is a no-op - just pass through
-            }
+                ScalarExitContext::UnaryPlus => {
+                    // Unary plus is a no-op - just pass through
+                }
+                ScalarExitContext::Nested => {
+                    // Nested is a no-op - just pass through
+                }
             },
         }
     }
-    
-    result_stack.pop().ok_or_else(|| {
-        Error::Internal("translate_scalar: empty result stack".into())
-    })
+
+    result_stack
+        .pop()
+        .ok_or_else(|| Error::Internal("translate_scalar: empty result stack".into()))
 }
 
 fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {

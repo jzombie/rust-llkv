@@ -32,7 +32,9 @@ use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_column_map::types::{LogicalFieldId, Namespace};
-use llkv_column_map::{llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string};
+use llkv_column_map::{
+    llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
+};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -56,7 +58,9 @@ use self::plan_graph::{
     PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
     PlanNodeId, PlanOperator,
 };
-use self::program::{DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler, ProgramSet};
+use self::program::{
+    DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler, ProgramSet,
+};
 use crate::stream::{RowStream, RowStreamBuilder};
 
 // NOTE: Planning and execution currently live together; once the dedicated
@@ -517,7 +521,7 @@ impl PredicateFusionCache {
         //
         // This avoids stack overflow on deeply nested expressions (50k+ nodes).
         let mut stack = vec![expr];
-        
+
         while let Some(node) = stack.pop() {
             match node {
                 Expr::Pred(filter) => {
@@ -1228,7 +1232,7 @@ where
             return Ok(());
         }
 
-    let fusion_cache = PredicateFusionCache::from_expr(filter_expr.as_ref());
+        let fusion_cache = PredicateFusionCache::from_expr(filter_expr.as_ref());
         let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
 
         // Intentionally skip logging the full filter expression here; deeply nested
@@ -1239,7 +1243,7 @@ where
         // 1. MVCC filtering to check visibility of all rows including NULL rows
         // 2. Aggregates like COUNT_NULLS that need to count NULL rows
         // We scan the MVCC created_by column which exists for every row.
-    let mut row_ids = if is_trivial_filter(filter_expr.as_ref()) {
+        let mut row_ids = if is_trivial_filter(filter_expr.as_ref()) {
             use arrow::datatypes::UInt64Type;
             use llkv_expr::typed_predicate::Predicate;
             let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
@@ -1476,17 +1480,6 @@ where
         }
     }
 
-    fn collect_row_ids_for_expr<'expr>(
-        &self,
-        expr: &Expr<'expr, FieldId>,
-        fusion_cache: &PredicateFusionCache,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
-        let expr_arc = Arc::new(expr.clone());
-        let programs = ProgramCompiler::new(expr_arc).compile()?;
-        self.collect_row_ids_for_program(&programs, fusion_cache, all_rows_cache)
-    }
-
     fn collect_row_ids_for_filter(&self, filter: &OwnedFilter) -> LlkvResult<Vec<RowId>> {
         if filter.field_id == ROW_ID_FIELD_ID {
             let op = filter.op.to_operator();
@@ -1579,19 +1572,23 @@ where
         right: &ScalarExpr<FieldId>,
     ) -> LlkvResult<bool> {
         use llkv_expr::literal::Literal;
-        
+
         // Extract literal values
         let left_lit = match left {
             ScalarExpr::Literal(lit) => lit,
-            _ => return Err(Error::InvalidArgumentError(
-                "constant comparison requires literal expressions".into(),
-            )),
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "constant comparison requires literal expressions".into(),
+                ));
+            }
         };
         let right_lit = match right {
             ScalarExpr::Literal(lit) => lit,
-            _ => return Err(Error::InvalidArgumentError(
-                "constant comparison requires literal expressions".into(),
-            )),
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "constant comparison requires literal expressions".into(),
+                ));
+            }
         };
 
         // Helper to compare literals
@@ -1653,13 +1650,13 @@ where
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(left, &mut fields);
         NumericKernels::collect_fields(right, &mut fields);
-        
+
         // Handle constant-only comparisons (e.g., from materialized IN subqueries)
         // These are comparisons like "5 IN (1,2,3)" with no column references
         if fields.is_empty() {
             // Evaluate the constant comparison
             let result = Self::evaluate_constant_compare(left, op, right)?;
-            
+
             // If true, return all rows; if false, return empty
             return if result {
                 self.collect_all_row_ids(all_rows_cache)
@@ -1667,7 +1664,7 @@ where
                 Ok(Vec::new())
             };
         }
-        
+
         let mut domain: Option<Vec<RowId>> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
@@ -1690,10 +1687,7 @@ where
                 "collect_row_ids_for_compare domain"
             );
         } else {
-            tracing::debug!(
-                ?ordered_fields,
-                "collect_row_ids_for_compare domain empty"
-            );
+            tracing::debug!(?ordered_fields, "collect_row_ids_for_compare domain empty");
         }
         let domain = domain.unwrap_or_default();
         if domain.is_empty() {
@@ -1859,7 +1853,8 @@ where
                     stack.push(self.collect_row_ids_for_filter(filter)?);
                 }
                 EvalOp::PushCompare { left, op, right } => {
-                    let rows = self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)?;
+                    let rows =
+                        self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)?;
                     stack.push(rows);
                 }
                 EvalOp::PushLiteral(value) => {
@@ -1878,13 +1873,13 @@ where
                     if *child_count == 0 {
                         return Err(Error::Internal("AND opcode requires operands".into()));
                     }
-                    let mut acc = stack.pop().ok_or_else(|| {
-                        Error::Internal("AND opcode underflow".into())
-                    })?;
+                    let mut acc = stack
+                        .pop()
+                        .ok_or_else(|| Error::Internal("AND opcode underflow".into()))?;
                     for _ in 1..*child_count {
-                        let next = stack.pop().ok_or_else(|| {
-                            Error::Internal("AND opcode underflow".into())
-                        })?;
+                        let next = stack
+                            .pop()
+                            .ok_or_else(|| Error::Internal("AND opcode underflow".into()))?;
                         if acc.is_empty() {
                             continue;
                         }
@@ -1900,13 +1895,13 @@ where
                     if *child_count == 0 {
                         return Err(Error::Internal("OR opcode requires operands".into()));
                     }
-                    let mut acc = stack.pop().ok_or_else(|| {
-                        Error::Internal("OR opcode underflow".into())
-                    })?;
+                    let mut acc = stack
+                        .pop()
+                        .ok_or_else(|| Error::Internal("OR opcode underflow".into()))?;
                     for _ in 1..*child_count {
-                        let next = stack.pop().ok_or_else(|| {
-                            Error::Internal("OR opcode underflow".into())
-                        })?;
+                        let next = stack
+                            .pop()
+                            .ok_or_else(|| Error::Internal("OR opcode underflow".into()))?;
                         if acc.is_empty() {
                             acc = next;
                         } else if !next.is_empty() {
@@ -1916,9 +1911,9 @@ where
                     stack.push(acc);
                 }
                 EvalOp::Not { domain } => {
-                    let matched = stack.pop().ok_or_else(|| {
-                        Error::Internal("NOT opcode underflow".into())
-                    })?;
+                    let matched = stack
+                        .pop()
+                        .ok_or_else(|| Error::Internal("NOT opcode underflow".into()))?;
                     let domain_rows = self.evaluate_domain_program(
                         programs,
                         *domain,
@@ -1976,13 +1971,13 @@ where
                 .map(|filter| filter.op.to_operator())
                 .collect();
             let rows = match &dtype {
-                DataType::Utf8 => self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops),
+                DataType::Utf8 => {
+                    self.collect_matching_row_ids_string_fused::<i32>(filter_lfid, &ops)
+                }
                 DataType::LargeUtf8 => {
                     self.collect_matching_row_ids_string_fused::<i64>(filter_lfid, &ops)
                 }
-                DataType::Boolean => {
-                    self.collect_matching_row_ids_bool_fused(filter_lfid, &ops)
-                }
+                DataType::Boolean => self.collect_matching_row_ids_bool_fused(filter_lfid, &ops),
                 other => llkv_column_map::with_integer_arrow_type!(
                     other.clone(),
                     |ArrowTy| self.collect_matching_row_ids_fused::<ArrowTy>(filter_lfid, &ops),
@@ -1996,9 +1991,8 @@ where
         }
 
         let mut iter = filters.iter();
-        let mut acc = self.collect_row_ids_for_filter(
-            iter.next().expect("expected at least one filter"),
-        )?;
+        let mut acc =
+            self.collect_row_ids_for_filter(iter.next().expect("expected at least one filter"))?;
         for filter in iter {
             if acc.is_empty() {
                 break;
@@ -2041,13 +2035,8 @@ where
                     op,
                     fields,
                 } => {
-                    let rows = self.collect_compare_domain_rows(
-                        left,
-                        right,
-                        *op,
-                        fields,
-                        all_rows_cache,
-                    )?;
+                    let rows =
+                        self.collect_compare_domain_rows(left, right, *op, fields, all_rows_cache)?;
                     stack.push(rows);
                 }
                 DomainOp::PushLiteralFalse => stack.push(Vec::new()),
@@ -2057,13 +2046,13 @@ where
                         stack.push(Vec::new());
                         continue;
                     }
-                    let mut acc = stack.pop().ok_or_else(|| {
-                        Error::Internal("domain UNION underflow".into())
-                    })?;
+                    let mut acc = stack
+                        .pop()
+                        .ok_or_else(|| Error::Internal("domain UNION underflow".into()))?;
                     for _ in 1..*child_count {
-                        let next = stack.pop().ok_or_else(|| {
-                            Error::Internal("domain UNION underflow".into())
-                        })?;
+                        let next = stack
+                            .pop()
+                            .ok_or_else(|| Error::Internal("domain UNION underflow".into()))?;
                         if acc.is_empty() {
                             acc = next;
                         } else if !next.is_empty() {
@@ -2106,10 +2095,10 @@ where
                 Some(existing) => intersect_sorted(existing, rows),
                 None => rows,
             });
-            if let Some(ref d) = domain {
-                if d.is_empty() {
-                    break;
-                }
+            if let Some(ref d) = domain
+                && d.is_empty()
+            {
+                break;
             }
         }
 

@@ -3,7 +3,7 @@
 use std::ops::Bound;
 use std::sync::Arc;
 
-use llkv_expr::{literal::Literal, CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_expr::{CompareOp, Expr, Filter, Operator, ScalarExpr, literal::Literal};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -26,15 +26,7 @@ pub(crate) struct ProgramSet<'expr> {
     _root_expr: Arc<Expr<'expr, FieldId>>,
 }
 
-impl<'expr> ProgramSet<'expr> {
-    pub(crate) fn root_expr(&self) -> Arc<Expr<'expr, FieldId>> {
-        Arc::clone(&self._root_expr)
-    }
-
-    pub(crate) fn root_expr_ref(&self) -> &Expr<'expr, FieldId> {
-        self._root_expr.as_ref()
-    }
-}
+impl<'expr> ProgramSet<'expr> {}
 
 #[derive(Debug, Default)]
 pub(crate) struct EvalProgram {
@@ -50,10 +42,19 @@ pub(crate) enum EvalOp {
         op: CompareOp,
     },
     PushLiteral(bool),
-    FusedAnd { field_id: FieldId, filters: Vec<OwnedFilter> },
-    And { child_count: usize },
-    Or { child_count: usize },
-    Not { domain: DomainProgramId },
+    FusedAnd {
+        field_id: FieldId,
+        filters: Vec<OwnedFilter>,
+    },
+    And {
+        child_count: usize,
+    },
+    Or {
+        child_count: usize,
+    },
+    Not {
+        domain: DomainProgramId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -130,14 +131,7 @@ impl OwnedOperator {
     }
 }
 
-impl OwnedFilter {
-    pub(crate) fn to_filter(&self) -> Filter<'_, FieldId> {
-        Filter {
-            field_id: self.field_id,
-            op: self.op.to_operator(),
-        }
-    }
-}
+impl OwnedFilter {}
 
 impl<'a> From<&'a Operator<'a>> for OwnedOperator {
     fn from(op: &'a Operator<'a>) -> Self {
@@ -202,10 +196,6 @@ impl DomainRegistry {
         self.programs.get(id as usize)
     }
 
-    pub(crate) fn root(&self) -> Option<&DomainProgram> {
-        self.root.and_then(|id| self.domain(id))
-    }
-
     fn ensure(&mut self, expr: &Expr<'_, FieldId>) -> DomainProgramId {
         let key = ExprKey::new(expr);
         if let Some(existing) = self.index.get(&key) {
@@ -235,7 +225,9 @@ pub(crate) enum DomainOp {
     },
     PushLiteralFalse,
     PushAllRows,
-    Union { child_count: usize },
+    Union {
+        child_count: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -272,10 +264,7 @@ impl<'expr> ProgramCompiler<'expr> {
 enum EvalVisit<'expr> {
     Enter(&'expr Expr<'expr, FieldId>),
     Exit(&'expr Expr<'expr, FieldId>),
-    EmitFused {
-        key: ExprKey,
-        field_id: FieldId,
-    },
+    EmitFused { key: ExprKey, field_id: FieldId },
 }
 
 type PredicateVec = Vec<OwnedFilter>;

@@ -65,37 +65,37 @@
 //!
 //! ```
 //! use llkv_plan::TransformFrame;
-//! 
+//!
 //! #[derive(Clone)]
 //! enum InputExpr {
 //!     Binary { left: Box<InputExpr>, op: BinaryOp, right: Box<InputExpr> },
 //!     Unary { op: UnaryOp, expr: Box<InputExpr> },
 //!     Value(i32),
 //! }
-//! 
+//!
 //! #[derive(Clone)]
 //! enum BinaryOp { Add, Subtract }
-//! 
+//!
 //! #[derive(Clone)]
 //! enum UnaryOp { Negate }
-//! 
+//!
 //! enum OutputExpr {
 //!     Binary { left: Box<OutputExpr>, op: BinaryOp, right: Box<OutputExpr> },
 //!     Unary { op: UnaryOp, expr: Box<OutputExpr> },
 //!     Value(i32),
 //! }
-//! 
+//!
 //! enum ExprExitContext {
 //!     Binary(BinaryOp),
 //!     Unary,
 //! }
-//! 
+//!
 //! type ExprFrame<'a> = TransformFrame<'a, InputExpr, OutputExpr, ExprExitContext>;
-//! 
+//!
 //! fn transform_expr(root_expr: &InputExpr) -> OutputExpr {
 //!     let mut work_stack = vec![ExprFrame::Enter(root_expr)];
 //!     let mut result_stack = Vec::new();
-//! 
+//!
 //!     while let Some(frame) = work_stack.pop() {
 //!         match frame {
 //!             ExprFrame::Enter(node) => match node {
@@ -135,7 +135,7 @@
 //!             }
 //!         }
 //!     }
-//! 
+//!
 //!     result_stack.pop().unwrap()
 //! }
 //! # transform_expr(&InputExpr::Value(42));
@@ -228,14 +228,14 @@ enum TraversalFrame<'a, T> {
 pub enum TransformFrame<'a, Input, Output, ExitContext> {
     /// Begin visiting an input node (descend to children).
     Enter(&'a Input),
-    
+
     /// Complete processing of a node (combine child results).
     ///
     /// The `ExitContext` carries operation-specific state needed to combine
     /// child results into the parent node's result. For example, in arithmetic
     /// expression evaluation, this might carry which operator to apply.
     Exit(ExitContext),
-    
+
     /// A leaf node that has been fully transformed to output.
     ///
     /// Used when a node can be immediately converted without further traversal
@@ -388,10 +388,7 @@ mod tests {
     #[test]
     fn test_simple_evaluation() {
         // 2 + 3 = 5
-        let expr = TestExpr::Add(
-            Box::new(TestExpr::Value(2)),
-            Box::new(TestExpr::Value(3)),
-        );
+        let expr = TestExpr::Add(Box::new(TestExpr::Value(2)), Box::new(TestExpr::Value(3)));
         assert_eq!(traverse_postorder(&expr).unwrap(), 5);
     }
 

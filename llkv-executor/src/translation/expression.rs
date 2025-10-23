@@ -44,24 +44,24 @@ where
     //
     // Note: We use a manual OwnedFrame enum here instead of TransformFrame because
     // this function takes ownership of the input expr, requiring owned values on the stack.
-    
+
     /// Context passed through Exit frames during predicate translation
     enum PredicateExitContext {
         And(usize), // child count
         Or(usize),  // child count
         Not,
     }
-    
+
     /// Frame enum for owned value traversal
     enum OwnedFrame {
         Enter(LlkvExpr<'static, String>),
         Exit(PredicateExitContext),
         Leaf(LlkvExpr<'static, FieldId>),
     }
-    
+
     let mut owned_stack: Vec<OwnedFrame> = vec![OwnedFrame::Enter(expr)];
     let mut result_stack: Vec<LlkvExpr<'static, FieldId>> = Vec::new();
-    
+
     while let Some(frame) = owned_stack.pop() {
         match frame {
             OwnedFrame::Enter(node) => match node {
@@ -110,26 +110,30 @@ where
             }
             OwnedFrame::Exit(exit_context) => match exit_context {
                 PredicateExitContext::And(count) => {
-                    let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
+                    let translated: Vec<_> =
+                        result_stack.drain(result_stack.len() - count..).collect();
                     result_stack.push(LlkvExpr::And(translated));
                 }
                 PredicateExitContext::Or(count) => {
-                    let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
+                    let translated: Vec<_> =
+                        result_stack.drain(result_stack.len() - count..).collect();
                     result_stack.push(LlkvExpr::Or(translated));
                 }
                 PredicateExitContext::Not => {
                     let inner = result_stack.pop().ok_or_else(|| {
-                        Error::Internal("translate_predicate_with: result stack underflow for Not".into())
+                        Error::Internal(
+                            "translate_predicate_with: result stack underflow for Not".into(),
+                        )
                     })?;
                     result_stack.push(LlkvExpr::Not(Box::new(inner)));
                 }
             },
         }
     }
-    
-    result_stack.pop().ok_or_else(|| {
-        Error::Internal("translate_predicate_with: empty result stack".into())
-    })
+
+    result_stack
+        .pop()
+        .ok_or_else(|| Error::Internal("translate_predicate_with: empty result stack".into()))
 }
 
 pub fn translate_scalar<F>(

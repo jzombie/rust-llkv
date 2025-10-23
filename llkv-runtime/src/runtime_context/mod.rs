@@ -850,10 +850,7 @@ where
                 )
             })?;
             let created = self.catalog_service.register_multi_column_index(
-                table_id,
-                &field_ids,
-                name,
-                false, // unique = false
+                table_id, &field_ids, name, false, // unique = false
             )?;
 
             if !created && !plan.if_not_exists {
