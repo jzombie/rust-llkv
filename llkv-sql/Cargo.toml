@@ -33,9 +33,4 @@ llkv-plan.workspace = true
 
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
-llkv-slt-tester = { workspace = true }
-
-[[test]]
-name = "slt_harness"
-path = "tests/slt_harness.rs"
-harness = false
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
