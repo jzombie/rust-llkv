@@ -5,5 +5,6 @@ allow = [
     "Apache-2.0",
     "BSL-1.0",
     "CC0-1.0",
-    "ISC"
+    "ISC",
+    "BSD-3-Clause"
 ]
