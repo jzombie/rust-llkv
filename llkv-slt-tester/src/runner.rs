@@ -1,24 +1,26 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::engine::HarnessFactory;
-use crate::parser::{expand_loops_with_mapping, map_temp_error_message, normalize_inline_connections};
 use crate::RuntimeKind;
+use crate::engine::HarnessFactory;
+use crate::parser::{
+    expand_loops_with_mapping, map_temp_error_message, normalize_inline_connections,
+};
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 
-/// Run a single slt file using the provided AsyncDB factory. The factory is
-/// a closure that returns a future resolving to a new DB instance for the
-/// runner. This mirrors sqllogictest's Runner::new signature and behavior.
-pub async fn run_slt_file_with_factory<F, Fut, D, E>(path: &Path, factory: F) -> Result<(), Error>
+/// Run SLT content that originated from the provided path using the supplied factory.
+pub async fn run_slt_text_with_factory<F, Fut, D, E>(
+    text: &str,
+    origin: &Path,
+    factory: F,
+) -> Result<(), Error>
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<D, E>> + Send,
     D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug,
 {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| Error::Internal(format!("failed to read slt file: {}", e)))?;
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
     let (expanded_lines, mapping) = {
@@ -28,7 +30,7 @@ where
             if line.trim_start().starts_with("load ") {
                 tracing::warn!(
                     "Ignoring unsupported SLT directive `load`: {}:{} -> {}",
-                    path.display(),
+                    origin.display(),
                     orig_line,
                     line.trim()
                 );
@@ -69,14 +71,13 @@ where
 
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
-            map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, path);
+            map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, origin);
         if let Some(orig_line) = opt_orig_line
-            && let Ok(text) = std::fs::read_to_string(path)
-            && let Some(line) = text.lines().nth(orig_line - 1)
+            && let Some(line) = text.lines().nth(orig_line.saturating_sub(1))
         {
             eprintln!(
                 "[llkv-slt] original {}:{}: {}",
-                path.display(),
+                origin.display(),
                 orig_line,
                 line.trim()
             );
@@ -87,6 +88,21 @@ where
 
     drop(named);
     Ok(())
+}
+
+/// Run a single slt file using the provided AsyncDB factory. The factory is
+/// a closure that returns a future resolving to a new DB instance for the
+/// runner. This mirrors sqllogictest's Runner::new signature and behavior.
+pub async fn run_slt_file_with_factory<F, Fut, D, E>(path: &Path, factory: F) -> Result<(), Error>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<D, E>> + Send,
+    D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
+    E: std::fmt::Debug,
+{
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::Internal(format!("failed to read slt file: {}", e)))?;
+    run_slt_text_with_factory(&text, path, factory).await
 }
 
 /// Helper to construct a Tokio runtime based on the requested mode.
@@ -111,6 +127,32 @@ pub fn run_slt_file_blocking_with_runtime(
     let result = rt.block_on(async move { run_slt_file_with_factory(path, factory).await });
     drop(rt);
     result
+}
+
+/// Run SLT text by creating a Tokio runtime matching the provided kind.
+pub fn run_slt_text_blocking_with_runtime(
+    origin: &Path,
+    script: &str,
+    factory: HarnessFactory,
+    kind: RuntimeKind,
+) -> Result<(), Error> {
+    let origin_buf: PathBuf = origin.to_path_buf();
+    let script_owned = script.to_owned();
+    let rt = build_runtime(kind)?;
+    let result = rt.block_on(async move {
+        run_slt_text_with_factory(&script_owned, origin_buf.as_path(), factory).await
+    });
+    drop(rt);
+    result
+}
+
+/// Convenience wrapper that defaults to a current-thread runtime for text inputs.
+pub fn run_slt_text_blocking(
+    origin: &Path,
+    script: &str,
+    factory: HarnessFactory,
+) -> Result<(), Error> {
+    run_slt_text_blocking_with_runtime(origin, script, factory, RuntimeKind::CurrentThread)
 }
 
 /// Convenience wrapper that defaults to a current-thread runtime.
@@ -211,7 +253,10 @@ where
 {
     let base = Path::new(dir);
     if !base.exists() {
-        return Err(Error::Internal(format!("slt directory does not exist: {}", dir)));
+        return Err(Error::Internal(format!(
+            "slt directory does not exist: {}",
+            dir
+        )));
     }
 
     for entry in walkdir::WalkDir::new(base)
@@ -225,4 +270,3 @@ where
 
     Ok(())
 }
-

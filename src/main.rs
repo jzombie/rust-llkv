@@ -5,9 +5,9 @@ use std::sync::Arc;
 use arrow::util::pretty::pretty_format_batches;
 use llkv_result::Error as LlkvError;
 use llkv_runtime::RuntimeStatementResult;
+use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
-use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
 
 fn print_banner() {
     // Use Cargo package metadata baked into the binary at compile time
@@ -27,9 +27,7 @@ fn print_help() {
     println!();
     println!("Command-line options:");
     println!("  --slt PATH            Run a single SLT file or directory");
-    println!(
-        "  --slt-runtime MODE    Override runtime (current|multi). Defaults to current"
-    );
+    println!("  --slt-runtime MODE    Override runtime (current|multi). Defaults to current");
     println!("  --help                Show this usage information");
 }
 
@@ -192,9 +190,8 @@ fn main() {
 
 fn run_slt_command(path: &str, runtime_kind: RuntimeKind) -> Result<(), LlkvError> {
     let runner = LlkvSltRunner::in_memory().with_runtime_kind(runtime_kind);
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        LlkvError::Internal(format!("failed to access {}: {}", path, e))
-    })?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| LlkvError::Internal(format!("failed to access {}: {}", path, e)))?;
     if metadata.is_dir() {
         runner.run_directory(path)
     } else if metadata.is_file() {

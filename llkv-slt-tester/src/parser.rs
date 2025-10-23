@@ -38,8 +38,7 @@ pub fn expand_loops_with_mapping(
             }
 
             let inner = &lines[i + 1..j];
-            let (expanded_inner, inner_map) =
-                expand_loops_with_mapping(inner, base_index + i + 1)?;
+            let (expanded_inner, inner_map) = expand_loops_with_mapping(inner, base_index + i + 1)?;
 
             for k in 0..count {
                 let val = (start + k).to_string();

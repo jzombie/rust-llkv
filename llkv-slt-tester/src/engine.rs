@@ -3,8 +3,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{Array as ArrowArray, BooleanArray, Float64Array, Int32Array, Int64Array,
-    StructArray, StringArray, UInt64Array};
+use arrow::array::{
+    Array as ArrowArray, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    StructArray, UInt64Array,
+};
 use llkv_result::Error;
 use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
@@ -127,7 +129,10 @@ impl AsyncDB for EngineHarness {
                                     let array = batch.column(col);
                                     let val = match array.data_type() {
                                         arrow::datatypes::DataType::Int64 => {
-                                            let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<Int64Array>()
+                                                .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
                                             } else {
@@ -135,7 +140,10 @@ impl AsyncDB for EngineHarness {
                                             }
                                         }
                                         arrow::datatypes::DataType::UInt64 => {
-                                            let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<UInt64Array>()
+                                                .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
                                             } else {
@@ -143,7 +151,10 @@ impl AsyncDB for EngineHarness {
                                             }
                                         }
                                         arrow::datatypes::DataType::Float64 => {
-                                            let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<Float64Array>()
+                                                .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
                                             } else {
@@ -151,7 +162,10 @@ impl AsyncDB for EngineHarness {
                                             }
                                         }
                                         arrow::datatypes::DataType::Utf8 => {
-                                            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<StringArray>()
+                                                .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
                                             } else {
@@ -159,7 +173,10 @@ impl AsyncDB for EngineHarness {
                                             }
                                         }
                                         arrow::datatypes::DataType::Boolean => {
-                                            let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<BooleanArray>()
+                                                .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
                                             } else if a.value(row_idx) {
@@ -169,7 +186,10 @@ impl AsyncDB for EngineHarness {
                                             }
                                         }
                                         arrow::datatypes::DataType::Struct(_) => {
-                                            let a = array.as_any().downcast_ref::<StructArray>().unwrap();
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<StructArray>()
+                                                .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
                                             } else {
@@ -188,7 +208,9 @@ impl AsyncDB for EngineHarness {
                             (0..first.num_columns())
                                 .map(|col| match first.column(col).data_type() {
                                     arrow::datatypes::DataType::Int64
-                                    | arrow::datatypes::DataType::UInt64 => DefaultColumnType::Integer,
+                                    | arrow::datatypes::DataType::UInt64 => {
+                                        DefaultColumnType::Integer
+                                    }
                                     arrow::datatypes::DataType::Float64 => {
                                         DefaultColumnType::FloatingPoint
                                     }

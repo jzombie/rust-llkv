@@ -16,13 +16,15 @@ llkv-runtime.workspace = true
 llkv-sql.workspace = true
 llkv-storage.workspace = true
 regex.workspace = true
+reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
 sqllogictest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing.workspace = true
-walkdir = "2.5"
+walkdir.workspace = true
 
 [dev-dependencies]
+indoc.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 
 [[test]]

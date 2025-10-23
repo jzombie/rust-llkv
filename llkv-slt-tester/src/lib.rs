@@ -5,10 +5,14 @@ mod parser;
 mod runner;
 
 pub use parser::{expand_loops_with_mapping, map_temp_error_message, normalize_inline_connections};
-pub use runner::{run_slt_file_blocking, run_slt_file_with_factory, run_slt_harness,
-    run_slt_harness_with_args};
+pub use runner::{
+    run_slt_file_blocking, run_slt_file_blocking_with_runtime, run_slt_file_with_factory,
+    run_slt_harness, run_slt_harness_with_args, run_slt_text_blocking,
+    run_slt_text_blocking_with_runtime, run_slt_text_with_factory,
+};
 
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use llkv_result::Error;
 
@@ -65,6 +69,40 @@ impl LlkvSltRunner {
         runner::run_slt_dir_blocking(dir, move || (factory_factory)(), self.runtime_kind)
     }
 
-    // TODO: Add ability to run scripts from strings or readers.
-    // TODO: Add ability to run scripts from URLs.
+    /// Execute the provided SLT script contents, tagging diagnostics with `name` for context.
+    pub fn run_script(&self, name: &str, script: &str) -> Result<(), Error> {
+        let display_name = if name.trim().is_empty() {
+            "<memory>"
+        } else {
+            name
+        };
+        let origin = PathBuf::from(display_name);
+        let factory = (self.factory_factory)();
+        runner::run_slt_text_blocking_with_runtime(
+            origin.as_path(),
+            script,
+            factory,
+            self.runtime_kind,
+        )
+    }
+
+    /// Execute SLT content read from an arbitrary reader.
+    pub fn run_reader<R: Read>(&self, name: &str, mut reader: R) -> Result<(), Error> {
+        let mut buf = String::new();
+        reader
+            .read_to_string(&mut buf)
+            .map_err(|e| Error::Internal(format!("failed to read SLT stream: {e}")))?;
+        self.run_script(name, &buf)
+    }
+
+    /// Fetch an SLT script from `url` and execute it.
+    pub fn run_url(&self, url: &str) -> Result<(), Error> {
+        let response = reqwest::blocking::get(url)
+            .map_err(|e| Error::Internal(format!("failed to fetch SLT URL {url}: {e}")))?;
+        let script = response.text().map_err(|e| {
+            Error::Internal(format!("failed to read SLT response body for {url}: {e}"))
+        })?;
+        let name = format!("url:{url}");
+        self.run_script(&name, &script)
+    }
 }
