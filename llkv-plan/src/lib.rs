@@ -23,4 +23,4 @@ pub use conversion::{
 };
 pub use plan_graph::*;
 pub use plans::*;
-pub use traversal::{Traversable, traverse_postorder};
+pub use traversal::{TransformFrame, Traversable, traverse_postorder};

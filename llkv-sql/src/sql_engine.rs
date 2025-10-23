@@ -10,6 +10,7 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
+use llkv_plan::TransformFrame;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
 };
@@ -4446,36 +4447,42 @@ fn translate_condition_with_context(
     context: IdentifierContext,
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    // Iterative postorder traversal using the Frame pattern.
-    // See llkv-plan::traversal module documentation for pattern details.
+    // Iterative postorder traversal using the TransformFrame pattern.
+    // See llkv-plan::TransformFrame documentation for pattern details.
     //
     // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
     // explicit work_stack and result_stack instead of recursion.
-    enum Frame<'a> {
-        Enter(&'a SqlExpr),
-        ExitAnd,
-        ExitOr,
-        ExitNot,
-        ExitNested,
-        ExitLeaf(llkv_expr::expr::Expr<'static, String>),
+    
+    enum ConditionExitContext {
+        And,
+        Or,
+        Not,
+        Nested,
     }
     
-    let mut work_stack: Vec<Frame> = vec![Frame::Enter(expr)];
+    type ConditionFrame<'a> = llkv_plan::TransformFrame<
+        'a,
+        SqlExpr,
+        llkv_expr::expr::Expr<'static, String>,
+        ConditionExitContext,
+    >;
+    
+    let mut work_stack: Vec<ConditionFrame> = vec![ConditionFrame::Enter(expr)];
     let mut result_stack: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
     
     while let Some(frame) = work_stack.pop() {
         match frame {
-            Frame::Enter(node) => match node {
+            ConditionFrame::Enter(node) => match node {
                 SqlExpr::BinaryOp { left, op, right } => match op {
                     BinaryOperator::And => {
-                        work_stack.push(Frame::ExitAnd);
-                        work_stack.push(Frame::Enter(right));
-                        work_stack.push(Frame::Enter(left));
+                        work_stack.push(ConditionFrame::Exit(ConditionExitContext::And));
+                        work_stack.push(ConditionFrame::Enter(right));
+                        work_stack.push(ConditionFrame::Enter(left));
                     }
                     BinaryOperator::Or => {
-                        work_stack.push(Frame::ExitOr);
-                        work_stack.push(Frame::Enter(right));
-                        work_stack.push(Frame::Enter(left));
+                        work_stack.push(ConditionFrame::Exit(ConditionExitContext::Or));
+                        work_stack.push(ConditionFrame::Enter(right));
+                        work_stack.push(ConditionFrame::Enter(left));
                     }
                     BinaryOperator::Eq
                     | BinaryOperator::NotEq
@@ -4484,7 +4491,7 @@ fn translate_condition_with_context(
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
                         let result = translate_comparison_with_context(resolver, context, left, op.clone(), right)?;
-                        work_stack.push(Frame::ExitLeaf(result));
+                        work_stack.push(ConditionFrame::Leaf(result));
                     }
                     other => {
                         return Err(Error::InvalidArgumentError(format!(
@@ -4496,18 +4503,18 @@ fn translate_condition_with_context(
                     op: UnaryOperator::Not,
                     expr: inner,
                 } => {
-                    work_stack.push(Frame::ExitNot);
-                    work_stack.push(Frame::Enter(inner));
+                    work_stack.push(ConditionFrame::Exit(ConditionExitContext::Not));
+                    work_stack.push(ConditionFrame::Enter(inner));
                 }
                 SqlExpr::Nested(inner) => {
-                    work_stack.push(Frame::ExitNested);
-                    work_stack.push(Frame::Enter(inner));
+                    work_stack.push(ConditionFrame::Exit(ConditionExitContext::Nested));
+                    work_stack.push(ConditionFrame::Enter(inner));
                 }
                 SqlExpr::IsNull(inner) => {
                     let scalar = translate_scalar_with_context(resolver, context, inner)?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
-                            work_stack.push(Frame::ExitLeaf(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
                                 field_id: column,
                                 op: llkv_expr::expr::Operator::IsNull,
                             })));
@@ -4523,7 +4530,7 @@ fn translate_condition_with_context(
                     let scalar = translate_scalar_with_context(resolver, context, inner)?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
-                            work_stack.push(Frame::ExitLeaf(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
                                 field_id: column,
                                 op: llkv_expr::expr::Operator::IsNotNull,
                             })));
@@ -4546,7 +4553,7 @@ fn translate_condition_with_context(
                         } else {
                             llkv_expr::expr::Expr::Literal(false)
                         };
-                        work_stack.push(Frame::ExitLeaf(result));
+                        work_stack.push(ConditionFrame::Leaf(result));
                     } else {
                         let mut conditions = Vec::with_capacity(list.len());
                         for value_expr in list {
@@ -4571,7 +4578,7 @@ fn translate_condition_with_context(
                         } else {
                             or_expr
                         };
-                        work_stack.push(Frame::ExitLeaf(result));
+                        work_stack.push(ConditionFrame::Leaf(result));
                     }
                 }
                 SqlExpr::InSubquery { .. } => {
@@ -4607,7 +4614,7 @@ fn translate_condition_with_context(
                     } else {
                         between_expr_result
                     };
-                    work_stack.push(Frame::ExitLeaf(result));
+                    work_stack.push(ConditionFrame::Leaf(result));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
@@ -4615,36 +4622,38 @@ fn translate_condition_with_context(
                     )));
                 }
             },
-            Frame::ExitLeaf(translated) => {
+            ConditionFrame::Leaf(translated) => {
                 result_stack.push(translated);
             }
-            Frame::ExitAnd => {
-                let right = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_condition: result stack underflow for And right".into())
-                })?;
-                let left = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_condition: result stack underflow for And left".into())
-                })?;
-                result_stack.push(flatten_and(left, right));
-            }
-            Frame::ExitOr => {
-                let right = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_condition: result stack underflow for Or right".into())
-                })?;
-                let left = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_condition: result stack underflow for Or left".into())
-                })?;
-                result_stack.push(flatten_or(left, right));
-            }
-            Frame::ExitNot => {
-                let inner = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_condition: result stack underflow for Not".into())
-                })?;
-                result_stack.push(llkv_expr::expr::Expr::not(inner));
-            }
-            Frame::ExitNested => {
-                // Nested is a no-op - just pass through the inner expression
-            }
+            ConditionFrame::Exit(exit_context) => match exit_context {
+                ConditionExitContext::And => {
+                    let right = result_stack.pop().ok_or_else(|| {
+                        Error::Internal("translate_condition: result stack underflow for And right".into())
+                    })?;
+                    let left = result_stack.pop().ok_or_else(|| {
+                        Error::Internal("translate_condition: result stack underflow for And left".into())
+                    })?;
+                    result_stack.push(flatten_and(left, right));
+                }
+                ConditionExitContext::Or => {
+                    let right = result_stack.pop().ok_or_else(|| {
+                        Error::Internal("translate_condition: result stack underflow for Or right".into())
+                    })?;
+                    let left = result_stack.pop().ok_or_else(|| {
+                        Error::Internal("translate_condition: result stack underflow for Or left".into())
+                    })?;
+                    result_stack.push(flatten_or(left, right));
+                }
+                ConditionExitContext::Not => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal("translate_condition: result stack underflow for Not".into())
+                    })?;
+                    result_stack.push(llkv_expr::expr::Expr::not(inner));
+                }
+                ConditionExitContext::Nested => {
+                    // Nested is a no-op - just pass through the inner expression
+                }
+            },
         }
     }
     
@@ -4819,28 +4828,30 @@ fn translate_scalar_with_context(
 
 // TODO: Rename?  Already many `translate_scaler` functions... be more specific?
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    // Iterative postorder traversal using the Frame pattern.
+    // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::traversal module documentation for pattern details.
     //
     // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
     // explicit work_stack and result_stack instead of recursion.
-    enum Frame<'a> {
-        Enter(&'a SqlExpr),
-        ExitBinaryOp { op: BinaryOperator },
-        ExitUnaryMinus,
-        ExitUnaryPlus,
-        ExitNested,
-        ExitLeaf(llkv_expr::expr::ScalarExpr<String>),
+    
+    /// Context passed through Exit frames during scalar expression translation
+    enum ScalarExitContext {
+        BinaryOp { op: BinaryOperator },
+        UnaryMinus,
+        UnaryPlus,
+        Nested,
     }
     
-    let mut work_stack: Vec<Frame> = vec![Frame::Enter(expr)];
+    type ScalarFrame<'a> = TransformFrame<'a, SqlExpr, llkv_expr::expr::ScalarExpr<String>, ScalarExitContext>;
+    
+    let mut work_stack: Vec<ScalarFrame> = vec![ScalarFrame::Enter(expr)];
     let mut result_stack: Vec<llkv_expr::expr::ScalarExpr<String>> = Vec::new();
     
     while let Some(frame) = work_stack.pop() {
         match frame {
-            Frame::Enter(node) => match node {
+            ScalarFrame::Enter(node) => match node {
                 SqlExpr::Identifier(ident) => {
-                    work_stack.push(Frame::ExitLeaf(llkv_expr::expr::ScalarExpr::column(ident.value.clone())));
+                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::column(ident.value.clone())));
                 }
                 SqlExpr::CompoundIdentifier(idents) => {
                     if idents.is_empty() {
@@ -4857,38 +4868,38 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                         result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
                     }
 
-                    work_stack.push(Frame::ExitLeaf(result));
+                    work_stack.push(ScalarFrame::Leaf(result));
                 }
                 SqlExpr::Value(value) => {
                     let result = literal_from_value(value)?;
-                    work_stack.push(Frame::ExitLeaf(result));
+                    work_stack.push(ScalarFrame::Leaf(result));
                 }
                 SqlExpr::BinaryOp { left, op, right } => {
-                    work_stack.push(Frame::ExitBinaryOp { op: op.clone() });
-                    work_stack.push(Frame::Enter(right));
-                    work_stack.push(Frame::Enter(left));
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp { op: op.clone() }));
+                    work_stack.push(ScalarFrame::Enter(right));
+                    work_stack.push(ScalarFrame::Enter(left));
                 }
                 SqlExpr::UnaryOp {
                     op: UnaryOperator::Minus,
                     expr: inner,
                 } => {
-                    work_stack.push(Frame::ExitUnaryMinus);
-                    work_stack.push(Frame::Enter(inner));
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::UnaryMinus));
+                    work_stack.push(ScalarFrame::Enter(inner));
                 }
                 SqlExpr::UnaryOp {
                     op: UnaryOperator::Plus,
                     expr: inner,
                 } => {
-                    work_stack.push(Frame::ExitUnaryPlus);
-                    work_stack.push(Frame::Enter(inner));
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::UnaryPlus));
+                    work_stack.push(ScalarFrame::Enter(inner));
                 }
                 SqlExpr::Nested(inner) => {
-                    work_stack.push(Frame::ExitNested);
-                    work_stack.push(Frame::Enter(inner));
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::Nested));
+                    work_stack.push(ScalarFrame::Enter(inner));
                 }
                 SqlExpr::Function(func) => {
                     if let Some(agg_call) = try_parse_aggregate_function(func)? {
-                        work_stack.push(Frame::ExitLeaf(llkv_expr::expr::ScalarExpr::aggregate(agg_call)));
+                        work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::aggregate(agg_call)));
                     } else {
                         return Err(Error::InvalidArgumentError(format!(
                             "unsupported function in scalar expression: {:?}",
@@ -4915,7 +4926,7 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                             }
                         }
                     }
-                    work_stack.push(Frame::ExitLeaf(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(
+                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(
                         struct_fields,
                     ))));
                 }
@@ -4925,10 +4936,11 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     )));
                 }
             },
-            Frame::ExitLeaf(translated) => {
+            ScalarFrame::Leaf(translated) => {
                 result_stack.push(translated);
             }
-            Frame::ExitBinaryOp { op } => {
+            ScalarFrame::Exit(exit_context) => match exit_context {
+                ScalarExitContext::BinaryOp { op } => {
                 let right_expr = result_stack.pop().ok_or_else(|| {
                     Error::Internal("translate_scalar: result stack underflow for BinaryOp right".into())
                 })?;
@@ -4951,7 +4963,7 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     left_expr, binary_op, right_expr,
                 ));
             }
-            Frame::ExitUnaryMinus => {
+            ScalarExitContext::UnaryMinus => {
                 let inner = result_stack.pop().ok_or_else(|| {
                     Error::Internal("translate_scalar: result stack underflow for UnaryMinus".into())
                 })?;
@@ -4991,12 +5003,13 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     }
                 }
             }
-            Frame::ExitUnaryPlus => {
+            ScalarExitContext::UnaryPlus => {
                 // Unary plus is a no-op - just pass through
             }
-            Frame::ExitNested => {
+            ScalarExitContext::Nested => {
                 // Nested is a no-op - just pass through
             }
+            },
         }
     }
     

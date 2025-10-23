@@ -36,46 +36,56 @@ where
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
 {
-    // Iterative postorder traversal using the Frame pattern.
+    // Iterative postorder traversal using a Frame-based pattern.
     // See llkv-plan::traversal module documentation for pattern details.
     //
     // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
     // explicit work_stack and result_stack instead of recursion.
-    enum Frame {
-        Enter(LlkvExpr<'static, String>),
-        ExitAnd(usize), // child count
-        ExitOr(usize),  // child count
-        ExitNot,
-        ExitLeaf(LlkvExpr<'static, FieldId>),
+    //
+    // Note: We use a manual OwnedFrame enum here instead of TransformFrame because
+    // this function takes ownership of the input expr, requiring owned values on the stack.
+    
+    /// Context passed through Exit frames during predicate translation
+    enum PredicateExitContext {
+        And(usize), // child count
+        Or(usize),  // child count
+        Not,
     }
     
-    let mut work_stack: Vec<Frame> = vec![Frame::Enter(expr)];
+    /// Frame enum for owned value traversal
+    enum OwnedFrame {
+        Enter(LlkvExpr<'static, String>),
+        Exit(PredicateExitContext),
+        Leaf(LlkvExpr<'static, FieldId>),
+    }
+    
+    let mut owned_stack: Vec<OwnedFrame> = vec![OwnedFrame::Enter(expr)];
     let mut result_stack: Vec<LlkvExpr<'static, FieldId>> = Vec::new();
     
-    while let Some(frame) = work_stack.pop() {
+    while let Some(frame) = owned_stack.pop() {
         match frame {
-            Frame::Enter(node) => match node {
+            OwnedFrame::Enter(node) => match node {
                 LlkvExpr::And(children) => {
                     let count = children.len();
-                    work_stack.push(Frame::ExitAnd(count));
+                    owned_stack.push(OwnedFrame::Exit(PredicateExitContext::And(count)));
                     for child in children.into_iter().rev() {
-                        work_stack.push(Frame::Enter(child));
+                        owned_stack.push(OwnedFrame::Enter(child));
                     }
                 }
                 LlkvExpr::Or(children) => {
                     let count = children.len();
-                    work_stack.push(Frame::ExitOr(count));
+                    owned_stack.push(OwnedFrame::Exit(PredicateExitContext::Or(count)));
                     for child in children.into_iter().rev() {
-                        work_stack.push(Frame::Enter(child));
+                        owned_stack.push(OwnedFrame::Enter(child));
                     }
                 }
                 LlkvExpr::Not(inner) => {
-                    work_stack.push(Frame::ExitNot);
-                    work_stack.push(Frame::Enter(*inner));
+                    owned_stack.push(OwnedFrame::Exit(PredicateExitContext::Not));
+                    owned_stack.push(OwnedFrame::Enter(*inner));
                 }
                 LlkvExpr::Pred(filter) => {
                     let field_id = resolve_field_id(schema, &filter.field_id, unknown_column)?;
-                    work_stack.push(Frame::ExitLeaf(LlkvExpr::Pred(Filter {
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Pred(Filter {
                         field_id,
                         op: filter.op,
                     })));
@@ -85,33 +95,35 @@ where
                         translate_scalar_with(&left, schema, unknown_column, unknown_aggregate)?;
                     let right_expr =
                         translate_scalar_with(&right, schema, unknown_column, unknown_aggregate)?;
-                    work_stack.push(Frame::ExitLeaf(LlkvExpr::Compare {
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Compare {
                         left: left_expr,
                         op,
                         right: right_expr,
                     }));
                 }
                 LlkvExpr::Literal(value) => {
-                    work_stack.push(Frame::ExitLeaf(LlkvExpr::Literal(value)));
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Literal(value)));
                 }
             },
-            Frame::ExitLeaf(translated) => {
+            OwnedFrame::Leaf(translated) => {
                 result_stack.push(translated);
             }
-            Frame::ExitAnd(count) => {
-                let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
-                result_stack.push(LlkvExpr::And(translated));
-            }
-            Frame::ExitOr(count) => {
-                let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
-                result_stack.push(LlkvExpr::Or(translated));
-            }
-            Frame::ExitNot => {
-                let inner = result_stack.pop().ok_or_else(|| {
-                    Error::Internal("translate_predicate_with: result stack underflow for Not".into())
-                })?;
-                result_stack.push(LlkvExpr::Not(Box::new(inner)));
-            }
+            OwnedFrame::Exit(exit_context) => match exit_context {
+                PredicateExitContext::And(count) => {
+                    let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
+                    result_stack.push(LlkvExpr::And(translated));
+                }
+                PredicateExitContext::Or(count) => {
+                    let translated: Vec<_> = result_stack.drain(result_stack.len() - count..).collect();
+                    result_stack.push(LlkvExpr::Or(translated));
+                }
+                PredicateExitContext::Not => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal("translate_predicate_with: result stack underflow for Not".into())
+                    })?;
+                    result_stack.push(LlkvExpr::Not(Box::new(inner)));
+                }
+            },
         }
     }
     

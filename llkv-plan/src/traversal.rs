@@ -61,48 +61,186 @@
 //! assert_eq!(traverse_postorder(&expr).unwrap(), 5);
 //! ```
 //!
-//! # Example (Manual Frame Pattern)
+//! # Example (TransformFrame Pattern)
 //!
-//! ```ignore
-//! enum Frame {
-//!     Enter(InputExpr),
-//!     ExitBinary(BinaryOp), // remember op, pop 2 children
-//!     ExitUnary,            // pop 1 child
+//! ```
+//! use llkv_plan::TransformFrame;
+//! 
+//! #[derive(Clone)]
+//! enum InputExpr {
+//!     Binary { left: Box<InputExpr>, op: BinaryOp, right: Box<InputExpr> },
+//!     Unary { op: UnaryOp, expr: Box<InputExpr> },
+//!     Value(i32),
 //! }
-//!
-//! let mut work_stack = vec![Frame::Enter(root_expr)];
-//! let mut result_stack = Vec::new();
-//!
-//! while let Some(frame) = work_stack.pop() {
-//!     match frame {
-//!         Frame::Enter(node) => {
-//!             // Decompose node, push Exit frame, then push children
-//!         }
-//!         Frame::ExitBinary(op) => {
-//!             // Pop 2 results, combine them, push back
-//!             let right = result_stack.pop().unwrap();
-//!             let left = result_stack.pop().unwrap();
-//!             result_stack.push(combine(left, op, right));
-//!         }
-//!         Frame::ExitUnary => {
-//!             // Pop 1 result, transform it, push back
+//! 
+//! #[derive(Clone)]
+//! enum BinaryOp { Add, Subtract }
+//! 
+//! #[derive(Clone)]
+//! enum UnaryOp { Negate }
+//! 
+//! enum OutputExpr {
+//!     Binary { left: Box<OutputExpr>, op: BinaryOp, right: Box<OutputExpr> },
+//!     Unary { op: UnaryOp, expr: Box<OutputExpr> },
+//!     Value(i32),
+//! }
+//! 
+//! enum ExprExitContext {
+//!     Binary(BinaryOp),
+//!     Unary,
+//! }
+//! 
+//! type ExprFrame<'a> = TransformFrame<'a, InputExpr, OutputExpr, ExprExitContext>;
+//! 
+//! fn transform_expr(root_expr: &InputExpr) -> OutputExpr {
+//!     let mut work_stack = vec![ExprFrame::Enter(root_expr)];
+//!     let mut result_stack = Vec::new();
+//! 
+//!     while let Some(frame) = work_stack.pop() {
+//!         match frame {
+//!             ExprFrame::Enter(node) => match node {
+//!                 InputExpr::Binary { left, op, right } => {
+//!                     work_stack.push(ExprFrame::Exit(ExprExitContext::Binary(op.clone())));
+//!                     work_stack.push(ExprFrame::Enter(right));
+//!                     work_stack.push(ExprFrame::Enter(left));
+//!                 }
+//!                 InputExpr::Unary { op: _, expr } => {
+//!                     work_stack.push(ExprFrame::Exit(ExprExitContext::Unary));
+//!                     work_stack.push(ExprFrame::Enter(expr));
+//!                 }
+//!                 InputExpr::Value(v) => {
+//!                     work_stack.push(ExprFrame::Leaf(OutputExpr::Value(*v)));
+//!                 }
+//!             },
+//!             ExprFrame::Exit(exit_context) => match exit_context {
+//!                 ExprExitContext::Binary(op) => {
+//!                     let right = result_stack.pop().unwrap();
+//!                     let left = result_stack.pop().unwrap();
+//!                     result_stack.push(OutputExpr::Binary {
+//!                         left: Box::new(left),
+//!                         op,
+//!                         right: Box::new(right),
+//!                     });
+//!                 }
+//!                 ExprExitContext::Unary => {
+//!                     let expr = result_stack.pop().unwrap();
+//!                     result_stack.push(OutputExpr::Unary {
+//!                         op: UnaryOp::Negate,
+//!                         expr: Box::new(expr),
+//!                     });
+//!                 }
+//!             },
+//!             ExprFrame::Leaf(output) => {
+//!                 result_stack.push(output);
+//!             }
 //!         }
 //!     }
+//! 
+//!     result_stack.pop().unwrap()
 //! }
-//!
-//! result_stack.pop() // final result
+//! # transform_expr(&InputExpr::Value(42));
 //! ```
 
 use llkv_result::Result as LlkvResult;
 
-/// A frame in the traversal work stack.
+/// Internal frame type used by [`traverse_postorder`] for borrowed tree traversal.
 ///
-/// Frames represent visit states during postorder traversal:
-/// - `Enter`: Begin visiting a node (descend to children)
-/// - `Exit`: Complete a node visit (combine child results)
-enum Frame<'a, T> {
+/// This is distinct from [`TransformFrame`] because it's used internally by the
+/// trait-based traversal function and tracks both the node reference and expected
+/// child count for the Exit variant.
+///
+/// Not exported - users should use [`TransformFrame`] for custom traversals.
+enum TraversalFrame<'a, T> {
     Enter(&'a T),
     Exit(&'a T, usize), // node and expected child count
+}
+
+/// A frame in the traversal work stack for tree transformations.
+///
+/// Used in manual iterative traversals that consume input nodes and produce
+/// transformed output nodes. This enum provides the common structure while
+/// allowing implementations to define custom exit variants for operation-specific
+/// context (e.g., which binary operator triggered the exit).
+///
+/// The pattern avoids stack overflow on deeply nested trees (50k+ nodes) by using
+/// explicit work and result stacks instead of recursion.
+///
+/// # Type Parameters
+/// * `Input` - The input node type being consumed during traversal
+/// * `Output` - The result type being built on the result stack
+/// * `ExitContext` - Custom enum carrying operation-specific exit state
+///
+/// # Traversal Pattern
+///
+/// ```rust
+/// use llkv_plan::TransformFrame;
+/// # use llkv_result::Result;
+/// # type SqlExpr = String;
+/// # type OutputExpr = i32;
+/// # #[derive(Clone)]
+/// # enum BinaryOp { Add, Subtract }
+///
+/// // Define operation-specific exit variants
+/// enum ScalarExitContext {
+///     BinaryOp { op: BinaryOp },
+///     UnaryMinus,
+/// }
+///
+/// type ScalarTransformFrame<'a> = TransformFrame<'a, SqlExpr, OutputExpr, ScalarExitContext>;
+///
+/// fn transform_scalar(expr: &SqlExpr) -> Result<OutputExpr> {
+///     let mut work_stack: Vec<ScalarTransformFrame> = vec![ScalarTransformFrame::Enter(expr)];
+///     let mut result_stack: Vec<OutputExpr> = Vec::new();
+///
+///     while let Some(frame) = work_stack.pop() {
+///         match frame {
+///             ScalarTransformFrame::Enter(node) => {
+///                 // Decompose node, push exit frame, then push children
+/// #               work_stack.push(ScalarTransformFrame::Leaf(42));
+///             }
+///             ScalarTransformFrame::Exit(ScalarExitContext::BinaryOp { op }) => {
+///                 // Pop children from result_stack, combine, push result
+/// #               let right = result_stack.pop().unwrap();
+/// #               let left = result_stack.pop().unwrap();
+/// #               result_stack.push(left + right);
+///             }
+///             ScalarTransformFrame::Exit(ScalarExitContext::UnaryMinus) => {
+///                 // Pop single child, transform, push result
+/// #               let val = result_stack.pop().unwrap();
+/// #               result_stack.push(-val);
+///             }
+///             ScalarTransformFrame::Leaf(output) => {
+///                 result_stack.push(output);
+///             }
+///         }
+///     }
+///
+///     Ok(result_stack.pop().unwrap())
+/// }
+/// # transform_scalar(&"test".to_string()).unwrap();
+/// ```
+///
+/// # See Also
+///
+/// Concrete implementations using this pattern:
+/// - `llkv-sql/src/sql_engine.rs`: `translate_condition_with_context`, `translate_scalar`
+/// - `llkv-executor/src/translation/expression.rs`: `translate_predicate_with`
+pub enum TransformFrame<'a, Input, Output, ExitContext> {
+    /// Begin visiting an input node (descend to children).
+    Enter(&'a Input),
+    
+    /// Complete processing of a node (combine child results).
+    ///
+    /// The `ExitContext` carries operation-specific state needed to combine
+    /// child results into the parent node's result. For example, in arithmetic
+    /// expression evaluation, this might carry which operator to apply.
+    Exit(ExitContext),
+    
+    /// A leaf node that has been fully transformed to output.
+    ///
+    /// Used when a node can be immediately converted without further traversal
+    /// (e.g., literals, pre-resolved identifiers).
+    Leaf(Output),
 }
 
 /// Trait for types that support iterative postorder traversal.
@@ -166,24 +304,24 @@ pub fn traverse_postorder<T>(root: &T) -> LlkvResult<T::Output>
 where
     T: Traversable,
 {
-    let mut work_stack: Vec<Frame<T>> = vec![Frame::Enter(root)];
+    let mut work_stack: Vec<TraversalFrame<T>> = vec![TraversalFrame::Enter(root)];
     let mut result_stack: Vec<T::Output> = Vec::new();
 
     while let Some(frame) = work_stack.pop() {
         match frame {
-            Frame::Enter(node) => {
+            TraversalFrame::Enter(node) => {
                 let children = node.visit_children()?;
                 let child_count = children.len();
 
                 // Schedule exit frame first
-                work_stack.push(Frame::Exit(node, child_count));
+                work_stack.push(TraversalFrame::Exit(node, child_count));
 
                 // Then push children in reverse order for correct postorder
                 for child in children.into_iter().rev() {
-                    work_stack.push(Frame::Enter(child));
+                    work_stack.push(TraversalFrame::Enter(child));
                 }
             }
-            Frame::Exit(node, child_count) => {
+            TraversalFrame::Exit(node, child_count) => {
                 // Collect child results from result stack
                 if result_stack.len() < child_count {
                     return Err(llkv_result::Error::Internal(
