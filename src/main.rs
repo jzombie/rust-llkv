@@ -1,4 +1,10 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write, IsTerminal};
+use std::sync::Arc;
+
+use arrow::util::pretty::pretty_format_batches;
+use llkv_sql::SqlEngine;
+use llkv_storage::pager::MemPager;
+use llkv_runtime::RuntimeStatementResult;
 
 fn print_banner() {
     // Use Cargo package metadata baked into the binary at compile time
@@ -59,8 +65,66 @@ fn repl() -> io::Result<()> {
     Ok(())
 }
 
+fn process_stream<R: std::io::Read>(reader: R) -> io::Result<()> {
+    let mut buf = String::new();
+    let mut rdr = std::io::BufReader::new(reader);
+    rdr.read_to_string(&mut buf)?;
+    // Create an in-memory SQL engine for this session (mirrors examples/simple_query.rs)
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    let sql = buf.trim();
+    if sql.is_empty() {
+        return Ok(());
+    }
+
+    match engine.execute(sql) {
+        Ok(results) => {
+            for res in results {
+                match res {
+                    RuntimeStatementResult::Select { execution, .. } => {
+                        match execution.collect() {
+                            Ok(batches) => {
+                                if batches.is_empty() {
+                                    println!("No batches returned");
+                                } else {
+                                    match pretty_format_batches(&batches) {
+                                        Ok(s) => println!("{}", s),
+                                        Err(e) => eprintln!("Query executed but failed to format batches: {:?}", e),
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to collect SELECT results: {:?}", e);
+                            }
+                        }
+                    }
+                    other => {
+                        println!("OK: {:?}", other);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Execution failed: {:?}", e);
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     print_banner();
+
+    // Use std's IsTerminal to detect whether stdin is coming from a TTY.
+    // If it's not a terminal, treat stdin as a piped script and process it
+    // non-interactively. This mirrors `sqlite3 DATABASE < file.sql` behavior.
+    if !std::io::stdin().is_terminal() {
+        if let Err(e) = process_stream(std::io::stdin()) {
+            eprintln!("Error processing stdin: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(e) = repl() {
         eprintln!("Error: {}", e);
         std::process::exit(1);

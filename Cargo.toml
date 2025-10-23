@@ -16,6 +16,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+llkv-sql = { workspace = true }
+llkv-storage = { workspace = true }
+arrow = { workspace = true }
+llkv-runtime = { workspace = true }
+
 [workspace.dependencies]
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.4.5-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.4.5-alpha" }
