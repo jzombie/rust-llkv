@@ -1311,8 +1311,6 @@ name = "llkv-sql"
 version = "0.4.5-alpha"
 dependencies = [
  "arrow",
- "async-trait",
- "libtest-mimic",
  "llkv-column-map",
  "llkv-executor",
  "llkv-expr",
@@ -1321,15 +1319,11 @@ dependencies = [
  "llkv-runtime",
  "llkv-storage",
  "llkv-table",
- "llkv-test-utils",
  "llkv-transaction",
  "regex",
  "simd-r-drive-entry-handle",
- "sqllogictest",
  "sqlparser",
  "tempfile",
- "time",
- "tokio",
  "tracing",
 ]
 

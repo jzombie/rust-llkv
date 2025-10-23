@@ -10,8 +10,6 @@ publish.workspace = true
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
-async-trait.workspace = true
-libtest-mimic.workspace = true
 llkv-column-map.workspace = true
 llkv-executor.workspace = true
 llkv-expr.workspace = true
@@ -20,17 +18,12 @@ llkv-runtime.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
 llkv-transaction.workspace = true
-llkv-test-utils = { workspace = true, features = ["auto-init"] }
 regex.workspace = true
 simd-r-drive-entry-handle.workspace = true
-sqllogictest.workspace = true
 sqlparser.workspace = true
-tempfile.workspace = true
-time = { workspace = true, features = ["parsing"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 llkv-plan.workspace = true
 
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
-llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
+tempfile.workspace = true
