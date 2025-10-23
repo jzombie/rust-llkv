@@ -2,7 +2,7 @@
 
 **Work in Progress**
 
-Utilities for running tests across the [LLKV](../) toolkit.
+Utilities for running integration tests across the [LLKV](../) toolkit.
 
 The crate currently provides a tiny, test-focused tracing initializer and a convenient `auto-init` feature for automatically installing a tracing subscriber at test-binary startup.
 
