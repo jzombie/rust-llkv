@@ -555,7 +555,6 @@ impl PredicateFusionCache {
     }
 }
 
-// TODO: Should this move to llkv-executor?
 pub(crate) struct TableExecutor<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
