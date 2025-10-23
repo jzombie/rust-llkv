@@ -1,3 +1,11 @@
+[workspace.package]
+authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
+version = "0.4.5-alpha"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/jzombie/rust-llkv"
+publish = true
+
 [package]
 name = "llkv"
 description = "Columnar Storage Layer for Key-Value Stores"
@@ -7,14 +15,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-
-[workspace.package]
-authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
-version = "0.4.5-alpha"
-edition = "2024"
-license = "Apache-2.0"
-repository = "https://github.com/jzombie/rust-llkv"
-publish = true
 
 [workspace.dependencies]
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.4.5-alpha" }
