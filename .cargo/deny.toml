@@ -10,5 +10,5 @@ allow = [
 ]
 
 exceptions = [
-  { name = "webpki-roots", version = "1.0.3" }
+  { name = "webpki-roots", version = ">=1.0.0,<2.0.0", allow = ["MPL-2.0", "CDLA-Permissive-2.0"] },
 ]
