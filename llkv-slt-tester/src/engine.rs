@@ -3,104 +3,25 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::Array as ArrowArray;
+use arrow::array::{
+    Array as ArrowArray, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray,
+    StructArray, UInt64Array,
+};
+use llkv_result::Error;
 use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
-/// Format a struct value in DuckDB-compatible format: {'field1': value1, 'field2': value2}
-fn format_struct_value(struct_array: &arrow::array::StructArray, row_idx: usize) -> String {
-    let mut parts = Vec::new();
-    let field_names = struct_array.column_names();
-    for (field_idx, column) in struct_array.columns().iter().enumerate() {
-        let field_name = field_names[field_idx];
-        let value_str = match column.data_type() {
-            arrow::datatypes::DataType::Int64 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-                if a.is_null(row_idx) {
-                    "NULL".to_string()
-                } else {
-                    a.value(row_idx).to_string()
-                }
-            }
-            arrow::datatypes::DataType::Int32 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .unwrap();
-                if a.is_null(row_idx) {
-                    "NULL".to_string()
-                } else {
-                    a.value(row_idx).to_string()
-                }
-            }
-            arrow::datatypes::DataType::Utf8 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                if a.is_null(row_idx) {
-                    "NULL".to_string()
-                } else {
-                    format!("'{}'", a.value(row_idx))
-                }
-            }
-            arrow::datatypes::DataType::Float64 => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
-                    .unwrap();
-                if a.is_null(row_idx) {
-                    "NULL".to_string()
-                } else {
-                    a.value(row_idx).to_string()
-                }
-            }
-            arrow::datatypes::DataType::Boolean => {
-                let a = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
-                    .unwrap();
-                if a.is_null(row_idx) {
-                    "NULL".to_string()
-                } else if a.value(row_idx) {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                }
-            }
-            arrow::datatypes::DataType::Struct(_) => {
-                // Recursively format nested struct
-                let a = column
-                    .as_any()
-                    .downcast_ref::<arrow::array::StructArray>()
-                    .unwrap();
-                if a.is_null(row_idx) {
-                    "NULL".to_string()
-                } else {
-                    format_struct_value(a, row_idx)
-                }
-            }
-            _ => "NULL".to_string(),
-        };
-        parts.push(format!("'{}': {}", field_name, value_str));
-    }
-    format!("{{{}}}", parts.join(", "))
-}
-
+/// Tokio-agnostic harness that adapts `SqlEngine` to the `sqllogictest` runner.
 pub struct EngineHarness {
     engine: SqlEngine<MemPager>,
 }
 
 impl EngineHarness {
     pub fn new(engine: SqlEngine<MemPager>) -> Self {
-        let harness = Self { engine };
-        tracing::debug!("[HARNESS] new() created harness at {:p}", &harness);
-        harness
+        tracing::debug!("[HARNESS] new() created harness at {:p}", &engine);
+        Self { engine }
     }
 }
 
@@ -127,20 +48,78 @@ impl SharedContext {
     }
 }
 
+fn format_struct_value(struct_array: &StructArray, row_idx: usize) -> String {
+    let mut parts = Vec::new();
+    let field_names = struct_array.column_names();
+    for (field_idx, column) in struct_array.columns().iter().enumerate() {
+        let field_name = field_names[field_idx];
+        let value_str = match column.data_type() {
+            arrow::datatypes::DataType::Int64 => {
+                let a = column.as_any().downcast_ref::<Int64Array>().unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    a.value(row_idx).to_string()
+                }
+            }
+            arrow::datatypes::DataType::Int32 => {
+                let a = column.as_any().downcast_ref::<Int32Array>().unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    a.value(row_idx).to_string()
+                }
+            }
+            arrow::datatypes::DataType::Utf8 => {
+                let a = column.as_any().downcast_ref::<StringArray>().unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", a.value(row_idx))
+                }
+            }
+            arrow::datatypes::DataType::Float64 => {
+                let a = column.as_any().downcast_ref::<Float64Array>().unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    a.value(row_idx).to_string()
+                }
+            }
+            arrow::datatypes::DataType::Boolean => {
+                let a = column.as_any().downcast_ref::<BooleanArray>().unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else if a.value(row_idx) {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            arrow::datatypes::DataType::Struct(_) => {
+                let a = column.as_any().downcast_ref::<StructArray>().unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    format_struct_value(a, row_idx)
+                }
+            }
+            _ => "NULL".to_string(),
+        };
+        parts.push(format!("'{}': {}", field_name, value_str));
+    }
+    format!("{{{}}}", parts.join(", "))
+}
+
 #[async_trait::async_trait]
 impl AsyncDB for EngineHarness {
-    type Error = llkv_result::Error;
+    type Error = Error;
     type ColumnType = DefaultColumnType;
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        // Log which SQL is being executed by this harness
-        tracing::debug!("[HARNESS {:p}] run() called, sql=\"{}\"", self, sql.trim());
+        tracing::debug!("[HARNESS] run() called, sql=\"{}\"", sql.trim());
         match self.engine.execute(sql) {
             Ok(mut results) => {
-                tracing::trace!(
-                    "[HARNESS] execute() returned Ok with {} results",
-                    results.len()
-                );
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }
@@ -158,7 +137,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Int64 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<arrow::array::Int64Array>()
+                                                .downcast_ref::<Int64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -169,7 +148,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::UInt64 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<arrow::array::UInt64Array>()
+                                                .downcast_ref::<UInt64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -180,7 +159,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Float64 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<arrow::array::Float64Array>()
+                                                .downcast_ref::<Float64Array>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -191,7 +170,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Utf8 => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<arrow::array::StringArray>()
+                                                .downcast_ref::<StringArray>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -202,7 +181,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Boolean => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<arrow::array::BooleanArray>()
+                                                .downcast_ref::<BooleanArray>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -215,7 +194,7 @@ impl AsyncDB for EngineHarness {
                                         arrow::datatypes::DataType::Struct(_) => {
                                             let a = array
                                                 .as_any()
-                                                .downcast_ref::<arrow::array::StructArray>()
+                                                .downcast_ref::<StructArray>()
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
@@ -251,43 +230,25 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    RuntimeStatementResult::Insert { rows_inserted, .. } => {
-                        // Return as a single-row result for compatibility with query directives
-                        Ok(DBOutput::Rows {
-                            types: vec![DefaultColumnType::Integer],
-                            rows: vec![vec![rows_inserted.to_string()]],
-                        })
-                    }
-                    RuntimeStatementResult::Update { rows_updated, .. } => {
-                        // Return as a single-row result for compatibility with query directives
-                        Ok(DBOutput::Rows {
-                            types: vec![DefaultColumnType::Integer],
-                            rows: vec![vec![rows_updated.to_string()]],
-                        })
-                    }
-                    RuntimeStatementResult::Delete { rows_deleted, .. } => {
-                        // Return as a single-row result for compatibility with query directives
-                        Ok(DBOutput::Rows {
-                            types: vec![DefaultColumnType::Integer],
-                            rows: vec![vec![rows_deleted.to_string()]],
-                        })
-                    }
-                    RuntimeStatementResult::CreateTable { .. } => {
-                        Ok(DBOutput::StatementComplete(0))
-                    }
-                    RuntimeStatementResult::CreateIndex { .. } => {
-                        Ok(DBOutput::StatementComplete(0))
-                    }
-                    RuntimeStatementResult::Transaction { .. } => {
-                        Ok(DBOutput::StatementComplete(0))
-                    }
-                    RuntimeStatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
+                    RuntimeStatementResult::Insert { rows_inserted, .. } => Ok(DBOutput::Rows {
+                        types: vec![DefaultColumnType::Integer],
+                        rows: vec![vec![rows_inserted.to_string()]],
+                    }),
+                    RuntimeStatementResult::Update { rows_updated, .. } => Ok(DBOutput::Rows {
+                        types: vec![DefaultColumnType::Integer],
+                        rows: vec![vec![rows_updated.to_string()]],
+                    }),
+                    RuntimeStatementResult::Delete { rows_deleted, .. } => Ok(DBOutput::Rows {
+                        types: vec![DefaultColumnType::Integer],
+                        rows: vec![vec![rows_deleted.to_string()]],
+                    }),
+                    RuntimeStatementResult::CreateTable { .. }
+                    | RuntimeStatementResult::CreateIndex { .. }
+                    | RuntimeStatementResult::Transaction { .. }
+                    | RuntimeStatementResult::NoOp => Ok(DBOutput::StatementComplete(0)),
                 }
             }
-            Err(e) => {
-                tracing::trace!("[HARNESS] execute() returned Err: {:?}", e);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -297,7 +258,8 @@ impl AsyncDB for EngineHarness {
 pub type HarnessFuture = Pin<Box<dyn Future<Output = Result<EngineHarness, ()>> + Send + 'static>>;
 pub type HarnessFactory = Box<dyn Fn() -> HarnessFuture + Send + Sync + 'static>;
 
-pub fn make_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
+/// Create a factory factory that shares a runtime context across harnesses.
+pub fn make_in_memory_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
     || {
         tracing::trace!("[FACTORY] make_factory_factory: Creating SharedContext");
         let shared = SharedContext::new();

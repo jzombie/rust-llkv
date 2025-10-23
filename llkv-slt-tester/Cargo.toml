@@ -1,0 +1,33 @@
+[package]
+name = "llkv-slt-tester"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow = { workspace = true, default-features = false }
+async-trait.workspace = true
+libtest-mimic.workspace = true
+llkv-result.workspace = true
+llkv-runtime.workspace = true
+llkv-sql.workspace = true
+llkv-storage.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
+sqllogictest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+indoc.workspace = true
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
+
+[[test]]
+name = "slt_harness"
+path = "tests/slt_harness.rs"
+harness = false

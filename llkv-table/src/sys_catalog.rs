@@ -5,7 +5,7 @@
 //!
 //! - **Table metadata** ([`TableMeta`]): Table ID, name, creation time, flags
 //! - **Column metadata** ([`ColMeta`]): Column ID, name, flags, default values
-//! - **Multi-column unique metadata** ([`TableMultiColumnUniqueMeta`]): Unique index definitions per table
+//! - **Multi-column index metadata** ([`TableMultiColumnIndexMeta`])
 //!
 //! # Storage Format
 //!
