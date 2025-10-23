@@ -498,6 +498,9 @@ where
             fn bool_chunk(&mut self, a: &BooleanArray) {
                 self.inner.bool_chunk(a)
             }
+            fn utf8_chunk(&mut self, a: &StringArray) {
+                self.inner.utf8_chunk(a)
+            }
             fn date64_chunk(&mut self, a: &Date64Array) {
                 self.inner.date64_chunk(a)
             }
@@ -541,6 +544,9 @@ where
             }
             fn bool_chunk_with_rids(&mut self, v: &BooleanArray, r: &UInt64Array) {
                 self.inner.bool_chunk_with_rids(v, r)
+            }
+            fn utf8_chunk_with_rids(&mut self, v: &StringArray, r: &UInt64Array) {
+                self.inner.utf8_chunk_with_rids(v, r)
             }
             fn date64_chunk_with_rids(&mut self, v: &Date64Array, r: &UInt64Array) {
                 self.inner.date64_chunk_with_rids(v, r)

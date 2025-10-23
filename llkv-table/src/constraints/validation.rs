@@ -7,7 +7,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use super::types::ForeignKeyAction;
-use crate::sys_catalog::MultiColumnUniqueEntryMeta;
+use crate::sys_catalog::MultiColumnIndexEntryMeta;
 use crate::types::{FieldId, TableId};
 
 /// Lightweight column descriptor used for constraint validation.
@@ -511,7 +511,7 @@ pub struct ForeignKeyTableInfo {
     pub canonical_name: String,
     pub table_id: TableId,
     pub columns: Vec<ForeignKeyColumn>,
-    pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
+    pub multi_column_uniques: Vec<MultiColumnIndexEntryMeta>,
 }
 
 /// Result of validating a foreign key specification.

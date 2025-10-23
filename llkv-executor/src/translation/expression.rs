@@ -36,56 +36,104 @@ where
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
 {
-    match expr {
-        LlkvExpr::And(exprs) => {
-            let mut translated = Vec::with_capacity(exprs.len());
-            for expr in exprs {
-                translated.push(translate_predicate_with(
-                    expr,
-                    schema,
-                    unknown_column,
-                    unknown_aggregate,
-                )?);
+    // Iterative postorder traversal using a Frame-based pattern.
+    // See llkv-plan::traversal module documentation for pattern details.
+    //
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
+    // explicit work_stack and result_stack instead of recursion.
+    //
+    // Note: We use a manual OwnedFrame enum here instead of TransformFrame because
+    // this function takes ownership of the input expr, requiring owned values on the stack.
+
+    /// Context passed through Exit frames during predicate translation
+    enum PredicateExitContext {
+        And(usize), // child count
+        Or(usize),  // child count
+        Not,
+    }
+
+    /// Frame enum for owned value traversal
+    enum OwnedFrame {
+        Enter(LlkvExpr<'static, String>),
+        Exit(PredicateExitContext),
+        Leaf(LlkvExpr<'static, FieldId>),
+    }
+
+    let mut owned_stack: Vec<OwnedFrame> = vec![OwnedFrame::Enter(expr)];
+    let mut result_stack: Vec<LlkvExpr<'static, FieldId>> = Vec::new();
+
+    while let Some(frame) = owned_stack.pop() {
+        match frame {
+            OwnedFrame::Enter(node) => match node {
+                LlkvExpr::And(children) => {
+                    let count = children.len();
+                    owned_stack.push(OwnedFrame::Exit(PredicateExitContext::And(count)));
+                    for child in children.into_iter().rev() {
+                        owned_stack.push(OwnedFrame::Enter(child));
+                    }
+                }
+                LlkvExpr::Or(children) => {
+                    let count = children.len();
+                    owned_stack.push(OwnedFrame::Exit(PredicateExitContext::Or(count)));
+                    for child in children.into_iter().rev() {
+                        owned_stack.push(OwnedFrame::Enter(child));
+                    }
+                }
+                LlkvExpr::Not(inner) => {
+                    owned_stack.push(OwnedFrame::Exit(PredicateExitContext::Not));
+                    owned_stack.push(OwnedFrame::Enter(*inner));
+                }
+                LlkvExpr::Pred(filter) => {
+                    let field_id = resolve_field_id(schema, &filter.field_id, unknown_column)?;
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Pred(Filter {
+                        field_id,
+                        op: filter.op,
+                    })));
+                }
+                LlkvExpr::Compare { left, op, right } => {
+                    let left_expr =
+                        translate_scalar_with(&left, schema, unknown_column, unknown_aggregate)?;
+                    let right_expr =
+                        translate_scalar_with(&right, schema, unknown_column, unknown_aggregate)?;
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Compare {
+                        left: left_expr,
+                        op,
+                        right: right_expr,
+                    }));
+                }
+                LlkvExpr::Literal(value) => {
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Literal(value)));
+                }
+            },
+            OwnedFrame::Leaf(translated) => {
+                result_stack.push(translated);
             }
-            Ok(LlkvExpr::And(translated))
-        }
-        LlkvExpr::Or(exprs) => {
-            let mut translated = Vec::with_capacity(exprs.len());
-            for expr in exprs {
-                translated.push(translate_predicate_with(
-                    expr,
-                    schema,
-                    unknown_column,
-                    unknown_aggregate,
-                )?);
-            }
-            Ok(LlkvExpr::Or(translated))
-        }
-        LlkvExpr::Not(inner) => Ok(LlkvExpr::Not(Box::new(translate_predicate_with(
-            *inner,
-            schema,
-            unknown_column,
-            unknown_aggregate,
-        )?))),
-        LlkvExpr::Pred(filter) => {
-            let field_id = resolve_field_id(schema, &filter.field_id, unknown_column)?;
-            Ok(LlkvExpr::Pred(Filter {
-                field_id,
-                op: filter.op,
-            }))
-        }
-        LlkvExpr::Compare { left, op, right } => {
-            let left_expr =
-                translate_scalar_with(&left, schema, unknown_column, unknown_aggregate)?;
-            let right_expr =
-                translate_scalar_with(&right, schema, unknown_column, unknown_aggregate)?;
-            Ok(LlkvExpr::Compare {
-                left: left_expr,
-                op,
-                right: right_expr,
-            })
+            OwnedFrame::Exit(exit_context) => match exit_context {
+                PredicateExitContext::And(count) => {
+                    let translated: Vec<_> =
+                        result_stack.drain(result_stack.len() - count..).collect();
+                    result_stack.push(LlkvExpr::And(translated));
+                }
+                PredicateExitContext::Or(count) => {
+                    let translated: Vec<_> =
+                        result_stack.drain(result_stack.len() - count..).collect();
+                    result_stack.push(LlkvExpr::Or(translated));
+                }
+                PredicateExitContext::Not => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_predicate_with: result stack underflow for Not".into(),
+                        )
+                    })?;
+                    result_stack.push(LlkvExpr::Not(Box::new(inner)));
+                }
+            },
         }
     }
+
+    result_stack
+        .pop()
+        .ok_or_else(|| Error::Internal("translate_predicate_with: empty result stack".into()))
 }
 
 pub fn translate_scalar<F>(

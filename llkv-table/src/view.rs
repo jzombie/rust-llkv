@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::MultiColumnUniqueEntryMeta;
+use crate::MultiColumnIndexEntryMeta;
 use crate::constraints::{ConstraintId, ConstraintRecord, ForeignKeyAction};
 use crate::sys_catalog::{ColMeta, TableMeta};
 use crate::types::{FieldId, TableId};
@@ -30,7 +30,7 @@ pub struct TableView {
     pub table_meta: Option<TableMeta>,
     pub column_metas: Vec<Option<ColMeta>>,
     pub constraint_records: Vec<ConstraintRecord>,
-    pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
+    pub multi_column_uniques: Vec<MultiColumnIndexEntryMeta>,
     pub foreign_keys: Vec<ForeignKeyView>,
 }
 
@@ -40,5 +40,5 @@ pub struct TableConstraintSummaryView {
     pub table_meta: Option<TableMeta>,
     pub column_metas: Vec<Option<ColMeta>>,
     pub constraint_records: Vec<ConstraintRecord>,
-    pub multi_column_uniques: Vec<MultiColumnUniqueEntryMeta>,
+    pub multi_column_uniques: Vec<MultiColumnIndexEntryMeta>,
 }

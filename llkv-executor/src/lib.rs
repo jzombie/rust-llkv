@@ -1263,7 +1263,9 @@ where
                     return Err(err);
                 }
                 if !produced {
-                    if total_rows > 0 {
+                    // Only synthesize null rows if this was a full table scan
+                    // If there was a filter and it matched no rows, we should return empty results
+                    if full_table_scan && total_rows > 0 {
                         for batch in synthesize_null_scan(Arc::clone(&schema), total_rows)? {
                             on_batch(batch)?;
                         }
