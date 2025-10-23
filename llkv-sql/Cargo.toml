@@ -33,6 +33,7 @@ llkv-plan.workspace = true
 
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
+llkv-slt-tester = { workspace = true }
 
 [[test]]
 name = "slt_harness"

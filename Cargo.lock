@@ -1139,7 +1139,9 @@ name = "llkv"
 version = "0.4.5-alpha"
 dependencies = [
  "arrow",
+ "llkv-result",
  "llkv-runtime",
+ "llkv-slt-tester",
  "llkv-sql",
  "llkv-storage",
 ]
@@ -1285,6 +1287,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-slt-tester"
+version = "0.4.5-alpha"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "libtest-mimic",
+ "llkv-result",
+ "llkv-runtime",
+ "llkv-sql",
+ "llkv-storage",
+ "regex",
+ "sqllogictest",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
 name = "llkv-sql"
 version = "0.4.5-alpha"
 dependencies = [
@@ -1297,6 +1318,7 @@ dependencies = [
  "llkv-plan",
  "llkv-result",
  "llkv-runtime",
+ "llkv-slt-tester",
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",

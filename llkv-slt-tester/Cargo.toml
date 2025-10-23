@@ -1,0 +1,23 @@
+[package]
+name = "llkv-slt-tester"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow = { workspace = true, default-features = false }
+async-trait.workspace = true
+libtest-mimic.workspace = true
+llkv-result.workspace = true
+llkv-runtime.workspace = true
+llkv-sql.workspace = true
+llkv-storage.workspace = true
+regex.workspace = true
+sqllogictest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing.workspace = true
+walkdir = "2.5"

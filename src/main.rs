@@ -1,10 +1,13 @@
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
+use llkv_result::Error as LlkvError;
 use llkv_runtime::RuntimeStatementResult;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
+use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
 
 fn print_banner() {
     // Use Cargo package metadata baked into the binary at compile time
@@ -21,6 +24,13 @@ fn print_help() {
     println!(".open FILE      Open persistent database file");
     println!(".exit/.quit     Exit the REPL");
     println!("Any other line is echoed as SQL (no execution in this stub)");
+    println!();
+    println!("Command-line options:");
+    println!("  --slt PATH            Run a single SLT file or directory");
+    println!(
+        "  --slt-runtime MODE    Override runtime (current|multi). Defaults to current"
+    );
+    println!("  --help                Show this usage information");
 }
 
 fn repl() -> io::Result<()> {
@@ -113,11 +123,59 @@ fn process_stream<R: std::io::Read>(reader: R) -> io::Result<()> {
 }
 
 fn main() {
+    let mut args = std::env::args().skip(1).peekable();
+    let mut slt_target: Option<String> = None;
+    let mut runtime_kind = RuntimeKind::CurrentThread;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--slt" => {
+                slt_target = args.next();
+                if slt_target.is_none() {
+                    eprintln!("--slt requires a path to a file or directory");
+                    std::process::exit(1);
+                }
+            }
+            "--slt-runtime" => {
+                if let Some(mode) = args.next() {
+                    runtime_kind = match mode.as_str() {
+                        "current" => RuntimeKind::CurrentThread,
+                        "multi" | "multi-thread" => RuntimeKind::MultiThread,
+                        other => {
+                            eprintln!("Unknown runtime mode: {}", other);
+                            std::process::exit(1);
+                        }
+                    };
+                } else {
+                    eprintln!("--slt-runtime requires a mode (current|multi)");
+                    std::process::exit(1);
+                }
+            }
+            "--help" | "-h" => {
+                print_banner();
+                print_help();
+                return;
+            }
+            other => {
+                // Preserve unhandled arguments for future database selection.
+                // Currently unused but kept to avoid silently swallowing input.
+                eprintln!("Unrecognized argument: {}", other);
+                print_help();
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(target) = slt_target {
+        if let Err(e) = run_slt_command(&target, runtime_kind) {
+            eprintln!("SLT execution failed: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     print_banner();
 
-    // Use std's IsTerminal to detect whether stdin is coming from a TTY.
-    // If it's not a terminal, treat stdin as a piped script and process it
-    // non-interactively. This mirrors `sqlite3 DATABASE < file.sql` behavior.
     if !std::io::stdin().is_terminal() {
         if let Err(e) = process_stream(std::io::stdin()) {
             eprintln!("Error processing stdin: {}", e);
@@ -129,5 +187,22 @@ fn main() {
     if let Err(e) = repl() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+fn run_slt_command(path: &str, runtime_kind: RuntimeKind) -> Result<(), LlkvError> {
+    let runner = LlkvSltRunner::in_memory().with_runtime_kind(runtime_kind);
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        LlkvError::Internal(format!("failed to access {}: {}", path, e))
+    })?;
+    if metadata.is_dir() {
+        runner.run_directory(path)
+    } else if metadata.is_file() {
+        runner.run_file(Path::new(path))
+    } else {
+        Err(LlkvError::Internal(format!(
+            "path is neither file nor directory: {}",
+            path
+        )))
     }
 }

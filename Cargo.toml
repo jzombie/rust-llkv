@@ -21,6 +21,8 @@ llkv-sql = { workspace = true }
 llkv-storage = { workspace = true }
 arrow = { workspace = true }
 llkv-runtime = { workspace = true }
+llkv-slt-tester = { workspace = true }
+llkv-result = { workspace = true }
 
 [workspace.dependencies]
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.4.5-alpha" }
@@ -32,6 +34,7 @@ llkv-join = { path = "./llkv-join", version = "0.4.5-alpha" }
 llkv-plan = { path = "./llkv-plan", version = "0.4.5-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.4.5-alpha" }
 llkv-runtime = { path = "./llkv-runtime", version = "0.4.5-alpha" }
+llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.4.5-alpha" }
 llkv-sql = { path = "./llkv-sql", version = "0.4.5-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.4.5-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.4.5-alpha" }
@@ -80,6 +83,7 @@ members = [
     "llkv-join",
     "llkv-plan",
     "llkv-result",
+    "llkv-slt-tester",
     "llkv-sql",
     "llkv-storage",
     "llkv-table",
