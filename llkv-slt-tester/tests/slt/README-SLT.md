@@ -5,13 +5,13 @@ This repository includes SQLite-compatible SLT (SQL Logic Test) files under `llk
 To run the entire SLT harness testsuite:
 
 ```bash
-cargo test --package llkv-sql --test slt_harness
+cargo test --package llkv-slt-tester --test slt_harness
 ```
 
 To run a single SLT file with the harness use the harness binary test filter. Example:
 
 ```bash
-cargo test --package llkv-sql --test slt_harness -- "slt/sqlite/index/in/10/slt_good_0.slt"
+cargo test --package llkv-slt-tester --test slt_harness -- "slt/sqlite/index/in/10/slt_good_0.slturl"
 ```
 
 Notes:
