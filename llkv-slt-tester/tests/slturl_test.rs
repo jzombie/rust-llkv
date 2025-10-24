@@ -7,7 +7,6 @@ use llkv_slt_tester::LlkvSltRunner;
 fn test_slturl_pointer_file() {
     let runner = LlkvSltRunner::in_memory();
     
-    // TODO: Target a simpler test case if available
     // Test a single .slturl pointer file
     let result = runner.run_file("tests/slt/sqlite/index/in/10/slt_good_0.slturl");
     
