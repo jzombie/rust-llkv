@@ -204,7 +204,7 @@ where
                         }
                     }
                 } else if let Some(ext) = p.extension()
-                    && ext == "slt"
+                    && (ext == "slt" || ext == "slturl")
                 {
                     out.push(p);
                 }
@@ -228,6 +228,10 @@ where
         let name = name.trim_start_matches(&['/', '\\'][..]).to_string();
         let path_clone = f.clone();
         let factory_factory_clone = factory_factory.clone();
+        
+        // Check if this is a .slturl pointer file
+        let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
+        
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
             let fac = factory_factory_clone();
@@ -242,8 +246,29 @@ where
                         .enable_all()
                         .build()
                         .map_err(|e| Failed::from(format!("failed to build tokio runtime: {e}")))?;
-                    let res: Result<(), Error> =
-                        rt.block_on(async move { run_slt_file_with_factory(&p, fac).await });
+                    
+                    let res: Result<(), Error> = if is_url_pointer {
+                        // Read the URL from the pointer file and fetch remotely
+                        let url = std::fs::read_to_string(&p)
+                            .map_err(|e| Error::Internal(format!("failed to read .slturl file: {e}")))?
+                            .trim()
+                            .to_string();
+                        
+                        // Fetch and run the remote SLT file
+                        let response = reqwest::blocking::get(&url)
+                            .map_err(|e| Error::Internal(format!("failed to fetch SLT URL {url}: {e}")))?;
+                        let script = response.text()
+                            .map_err(|e| Error::Internal(format!("failed to read SLT response body for {url}: {e}")))?;
+                        
+                        let origin = std::path::PathBuf::from(format!("url:{}", url));
+                        rt.block_on(async move { 
+                            run_slt_text_with_factory(&script, origin.as_path(), fac).await 
+                        })
+                    } else {
+                        // Run local .slt file as before
+                        rt.block_on(async move { run_slt_file_with_factory(&p, fac).await })
+                    };
+                    
                     res.map_err(|e| Failed::from(format!("slt runner error: {e}")))
                 })
                 .map_err(|e| Failed::from(format!("failed to spawn test thread: {e}")))?
