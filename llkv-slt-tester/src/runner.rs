@@ -9,6 +9,66 @@ use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 
+/// Path where the last failed SLT test content is persisted for debugging.
+/// 
+/// When a test fails, the normalized/processed SLT content is saved to this location
+/// so developers can inspect the actual test content that caused the failure.
+const LAST_FAILED_SLT_PATH: &str = "target/last_failed_slt.tmp";
+
+/// Generate a clickable file link for VS Code terminal.
+/// 
+/// Creates a vscode://file URI with proper URL encoding for special characters.
+fn make_vscode_file_link(path: &str, line: Option<usize>) -> String {
+    // URL encode the path - properly handle all special characters
+    let encoded = path
+        .chars()
+        .map(|c| match c {
+            ' ' => "%20".to_string(),
+            '!' => "%21".to_string(),
+            '"' => "%22".to_string(),
+            '#' => "%23".to_string(),
+            '$' => "%24".to_string(),
+            '%' => "%25".to_string(),
+            '&' => "%26".to_string(),
+            '\'' => "%27".to_string(),
+            '(' => "%28".to_string(),
+            ')' => "%29".to_string(),
+            '*' => "%2A".to_string(),
+            '+' => "%2B".to_string(),
+            ',' => "%2C".to_string(),
+            ';' => "%3B".to_string(),
+            '=' => "%3D".to_string(),
+            '?' => "%3F".to_string(),
+            '@' => "%40".to_string(),
+            '[' => "%5B".to_string(),
+            ']' => "%5D".to_string(),
+            c => c.to_string(),
+        })
+        .collect::<String>();
+    
+    if let Some(line_num) = line {
+        format!("vscode://file/{}:{}", encoded, line_num)
+    } else {
+        format!("vscode://file/{}", encoded)
+    }
+}
+
+/// Generate a shell-escaped path suitable for command-line use.
+/// 
+/// This escapes special characters so the path can be used directly in shell commands.
+fn make_shell_escaped_path(path: &str) -> String {
+    // For POSIX shells (bash, zsh, etc.), escape special characters
+    path.chars()
+        .map(|c| match c {
+            ' ' | '\t' | '\n' | '|' | '&' | ';' | '(' | ')' | '<' | '>' 
+            | '"' | '\'' | '\\' | '*' | '?' | '[' | ']' | '{' | '}' | '$' | '`' => {
+                format!("\\{}", c)
+            }
+            c => c.to_string(),
+        })
+        .collect()
+}
+
 /// Run SLT content that originated from the provided path using the supplied factory.
 pub async fn run_slt_text_with_factory<F, Fut, D, E>(
     text: &str,
@@ -72,18 +132,71 @@ where
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, origin);
-        if let Some(orig_line) = opt_orig_line
-            && let Some(line) = text.lines().nth(orig_line.saturating_sub(1))
-        {
-            eprintln!(
-                "[llkv-slt] original {}:{}: {}",
-                origin.display(),
-                orig_line,
-                line.trim()
-            );
+        
+        // Persist the temp file for debugging when there's an error
+        let persist_path = std::path::Path::new(LAST_FAILED_SLT_PATH);
+        if let Some(parent) = persist_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
+        let persisted = if let Err(_) = std::fs::copy(&tmp, persist_path) {
+            None
+        } else {
+            // Convert to absolute path for easier debugging
+            std::fs::canonicalize(persist_path)
+                .ok()
+                .map(|p| p.display().to_string())
+        };
         drop(named);
-        return Err(Error::Internal(format!("slt runner failed: {}", mapped)));
+        
+        if let Some(line_num) = opt_orig_line {
+            // Print the line from the normalized/processed content with context
+            if let Some(line) = normalized_lines.get(line_num.saturating_sub(1)) {
+                eprintln!(
+                    "[llkv-slt] Error at line {} in normalized content: {}",
+                    line_num,
+                    line.trim()
+                );
+            }
+            
+            // Also try to show the original line if available
+            if let Some(line) = text.lines().nth(line_num.saturating_sub(1)) {
+                eprintln!(
+                    "[llkv-slt] Original source line {}: {}",
+                    line_num,
+                    line.trim()
+                );
+            }
+        }
+        
+        if let Some(path) = &persisted {
+            eprintln!("[llkv-slt] Normalized SLT saved to: {}", path);
+            if let Some(line_num) = opt_orig_line {
+                eprintln!("[llkv-slt] View context: head -n {} {} | tail -20", line_num.saturating_add(10), path);
+            }
+        }
+        
+        // Build enhanced error message showing both remote URL and local debug file
+        let enhanced_msg = if let Some(debug_path) = persisted {
+            if let Some(line_num) = opt_orig_line {
+                let vscode_link = make_vscode_file_link(&debug_path, Some(line_num));
+                let shell_path = make_shell_escaped_path(&debug_path);
+                format!(
+                    "slt runner failed: {}\n  at: {}:{}\n  debug: {}:{}\n  vscode: {}",
+                    mapped, origin.display(), line_num, shell_path, line_num, vscode_link
+                )
+            } else {
+                let vscode_link = make_vscode_file_link(&debug_path, None);
+                let shell_path = make_shell_escaped_path(&debug_path);
+                format!(
+                    "slt runner failed: {}\n  at: {}\n  debug: {}\n  vscode: {}",
+                    mapped, origin.display(), shell_path, vscode_link
+                )
+            }
+        } else {
+            format!("slt runner failed: {}", mapped)
+        };
+        
+        return Err(Error::Internal(enhanced_msg));
     }
 
     drop(named);
