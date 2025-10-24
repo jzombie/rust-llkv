@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::RuntimeKind;
 use crate::engine::HarnessFactory;
 use crate::parser::{
-    expand_loops_with_mapping, map_temp_error_message, normalize_inline_connections,
+    expand_loops_with_mapping, filter_conditional_blocks, map_temp_error_message,
+    normalize_inline_connections,
 };
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
@@ -14,6 +15,16 @@ use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 /// When a test fails, the normalized/processed SLT content is saved to this location
 /// so developers can inspect the actual test content that caused the failure.
 const LAST_FAILED_SLT_PATH: &str = "target/last_failed_slt.tmp";
+
+/// Database engine identifiers for conditional test filtering.
+/// 
+/// LLKV is treated as compatible with these engines for the purposes of conditional
+/// directives in SLT test files. This means:
+/// - Tests marked `onlyif sqlite` or `onlyif duckdb` will be included
+/// - Tests marked `skipif sqlite` or `skipif duckdb` will be excluded
+/// - Tests marked `onlyif mysql/postgresql/etc` will be excluded
+/// - Tests marked `skipif mysql/postgresql/etc` will be included
+const SLT_ENGINE_COMPAT: &[&str] = &["sqlite", "duckdb"];
 
 /// Generate a clickable file link for VS Code terminal.
 /// 
@@ -83,6 +94,11 @@ where
 {
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
+    
+    // Filter out conditional blocks based on database engine compatibility.
+    // Apply filtering with all our compatible engines at once.
+    let (expanded_lines, mapping) = filter_conditional_blocks(expanded_lines, mapping, SLT_ENGINE_COMPAT);
+    
     let (expanded_lines, mapping) = {
         let mut filtered_lines = Vec::with_capacity(expanded_lines.len());
         let mut filtered_mapping = Vec::with_capacity(mapping.len());

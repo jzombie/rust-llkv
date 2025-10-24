@@ -4,7 +4,10 @@ pub mod engine;
 mod parser;
 mod runner;
 
-pub use parser::{expand_loops_with_mapping, map_temp_error_message, normalize_inline_connections};
+pub use parser::{
+    expand_loops_with_mapping, filter_conditional_blocks, map_temp_error_message,
+    normalize_inline_connections,
+};
 pub use runner::{
     run_slt_file_blocking, run_slt_file_blocking_with_runtime, run_slt_file_with_factory,
     run_slt_harness, run_slt_harness_with_args, run_slt_text_blocking,
