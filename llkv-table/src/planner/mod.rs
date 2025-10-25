@@ -1711,12 +1711,12 @@ where
         list: &[ScalarExpr<FieldId>],
         negated: bool,
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+    ) -> LlkvResult<(Vec<RowId>, Vec<RowId>)> {
         let arrays: NumericArrayMap = FxHashMap::default();
         let target = NumericKernels::evaluate_value(expr, 0, &arrays)?;
 
         let Some(target_val) = target else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
 
         let mut matched = false;
@@ -1734,16 +1734,26 @@ where
             }
         }
 
-        let keep = if negated {
-            !matched && !saw_null
+        let outcome = if matched {
+            Some(!negated)
+        } else if saw_null {
+            None
+        } else if negated {
+            Some(true)
         } else {
-            matched
+            Some(false)
         };
 
-        if keep {
-            self.collect_all_row_ids(all_rows_cache)
-        } else {
-            Ok(Vec::new())
+        match outcome {
+            Some(true) => {
+                let rows = self.collect_all_row_ids(all_rows_cache)?;
+                Ok((rows.clone(), rows))
+            }
+            Some(false) => {
+                let rows = self.collect_all_row_ids(all_rows_cache)?;
+                Ok((Vec::new(), rows))
+            }
+            None => Ok((Vec::new(), Vec::new())),
         }
     }
 
@@ -1754,9 +1764,9 @@ where
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         negated: bool,
-    ) -> LlkvResult<Vec<RowId>> {
+    ) -> LlkvResult<(Vec<RowId>, Vec<RowId>)> {
         if row_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
@@ -1811,7 +1821,8 @@ where
         let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
         let unique_index_arc = Arc::new(unique_index);
 
-        let mut result: Vec<RowId> = Vec::with_capacity(row_ids.len());
+        let mut matched_rows: Vec<RowId> = Vec::with_capacity(row_ids.len());
+        let mut determined_rows: Vec<RowId> = Vec::with_capacity(row_ids.len());
 
         let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
             if window.is_empty() {
@@ -1856,14 +1867,25 @@ where
                     }
                 }
 
-                let keep = if negated {
-                    !matched && !saw_null
+                let outcome = if matched {
+                    Some(!negated)
+                } else if saw_null {
+                    None
+                } else if negated {
+                    Some(true)
                 } else {
-                    matched
+                    Some(false)
                 };
 
-                if keep {
-                    result.push(row_id);
+                match outcome {
+                    Some(true) => {
+                        matched_rows.push(row_id);
+                        determined_rows.push(row_id);
+                    }
+                    Some(false) => {
+                        determined_rows.push(row_id);
+                    }
+                    None => {}
                 }
             }
 
@@ -1892,7 +1914,7 @@ where
             process_chunk(window, batch.columns())?;
         }
 
-        Ok(result)
+        Ok((matched_rows, determined_rows))
     }
 
     fn collect_row_ids_for_in_list(
@@ -1909,7 +1931,9 @@ where
         }
 
         if fields.is_empty() {
-            return self.evaluate_constant_in_list(expr, list, negated, all_rows_cache);
+            let (matched, _) =
+                self.evaluate_constant_in_list(expr, list, negated, all_rows_cache)?;
+            return Ok(matched);
         }
 
         let mut domain: Option<Vec<RowId>> = None;
@@ -1933,7 +1957,9 @@ where
             return Ok(Vec::new());
         }
 
-        self.evaluate_in_list_over_rows(&domain_rows, &ordered_fields, expr, list, negated)
+        let (matched, _) =
+            self.evaluate_in_list_over_rows(&domain_rows, &ordered_fields, expr, list, negated)?;
+        Ok(matched)
     }
 
     fn evaluate_compare_over_rows(
@@ -2287,11 +2313,17 @@ where
                         self.collect_compare_domain_rows(left, right, *op, fields, all_rows_cache)?;
                     stack.push(rows);
                 }
-                DomainOp::PushInListDomain { expr, list, fields } => {
+                DomainOp::PushInListDomain {
+                    expr,
+                    list,
+                    fields,
+                    negated,
+                } => {
                     let rows = self.collect_in_list_domain_rows(
                         expr,
                         list.as_slice(),
                         fields.as_slice(),
+                        *negated,
                         all_rows_cache,
                     )?;
                     stack.push(rows);
@@ -2371,18 +2403,22 @@ where
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         fields: &[FieldId],
+        negated: bool,
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
     ) -> LlkvResult<Vec<RowId>> {
-        let _ = expr;
-        let _ = list;
-
         if fields.is_empty() {
-            return self.collect_all_row_ids(all_rows_cache);
+            let (_, domain_rows) =
+                self.evaluate_constant_in_list(expr, list, negated, all_rows_cache)?;
+            return Ok(domain_rows);
         }
 
         let mut domain: Option<Vec<RowId>> = None;
-        for &fid in fields {
-            let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
+        let mut ordered_fields: Vec<FieldId> = fields.to_vec();
+        ordered_fields.sort_unstable();
+        ordered_fields.dedup();
+
+        for fid in &ordered_fields {
+            let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
                 Some(existing) => intersect_sorted(existing, rows),
                 None => rows,
@@ -2394,7 +2430,14 @@ where
             }
         }
 
-        Ok(domain.unwrap_or_default())
+        let candidate_rows = domain.unwrap_or_default();
+        if candidate_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (_, determined) =
+            self.evaluate_in_list_over_rows(&candidate_rows, &ordered_fields, expr, list, negated)?;
+        Ok(determined)
     }
 
     fn expr_is_null_literal(expr: &ScalarExpr<FieldId>) -> bool {

@@ -232,6 +232,7 @@ pub(crate) enum DomainOp {
         expr: ScalarExpr<FieldId>,
         list: Vec<ScalarExpr<FieldId>>,
         fields: Vec<FieldId>,
+        negated: bool,
     },
     PushLiteralFalse,
     PushAllRows,
@@ -429,7 +430,11 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                     op: *op,
                     fields: collect_fields([left, right]),
                 }),
-                Expr::InList { expr, list, .. } => {
+                Expr::InList {
+                    expr,
+                    list,
+                    negated,
+                } => {
                     let mut exprs: Vec<&ScalarExpr<FieldId>> = Vec::with_capacity(list.len() + 1);
                     exprs.push(expr);
                     exprs.extend(list.iter());
@@ -437,6 +442,7 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                         expr: expr.clone(),
                         list: list.clone(),
                         fields: collect_fields(exprs),
+                        negated: *negated,
                     });
                 }
                 Expr::Literal(value) => {

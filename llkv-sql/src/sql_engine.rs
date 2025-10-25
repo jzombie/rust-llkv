@@ -3190,9 +3190,6 @@ where
                 _ => None,
             });
 
-        if let Some(alias) = table_alias.as_ref() {
-            validate_projection_alias_qualifiers(&select.projection, alias)?;
-        }
         let has_joins = select
             .from
             .iter()
@@ -3216,6 +3213,9 @@ where
             let mut p = SelectPlan::new(display_name.clone());
             let single_table_context =
                 IdentifierContext::new(table_id).with_table_alias(table_alias.clone());
+            if let Some(alias) = table_alias.as_ref() {
+                validate_projection_alias_qualifiers(&select.projection, alias)?;
+            }
             if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
                 p = p.with_aggregates(aggregates);
             } else {
@@ -4826,6 +4826,9 @@ fn compare_op_to_filter_operator(
     op: llkv_expr::expr::CompareOp,
     literal: &Literal,
 ) -> Option<llkv_expr::expr::Operator<'static>> {
+    if matches!(literal, Literal::Null) {
+        return None;
+    }
     let lit = literal.clone();
     tracing::debug!(?op, literal = ?literal, "compare_op_to_filter_operator input");
     match op {
@@ -5747,6 +5750,26 @@ mod tests {
     }
 
     #[test]
+    fn not_null_in_list_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO tab0 VALUES (1, 2, 3)")
+            .expect("insert row");
+
+        let batches = engine
+            .sql("SELECT * FROM tab0 WHERE NOT ( NULL ) IN ( - col2 * + col2 )")
+            .expect("run IN list null comparison");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "expected IN list filter to remove all rows");
+    }
+
+    #[test]
     fn cross_join_not_null_comparison_filters_all_rows() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
@@ -5773,6 +5796,61 @@ mod tests {
             total_rows, 0,
             "expected cross join filter to remove all rows"
         );
+    }
+
+    #[test]
+    fn cross_join_duplicate_table_name_resolves_columns() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        use sqlparser::ast::{SetExpr, Statement};
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        engine
+            .execute("CREATE TABLE tab1(col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+            .expect("create tab1");
+        engine
+            .execute("INSERT INTO tab1 VALUES (7, 8, 9)")
+            .expect("insert tab1 row");
+
+        let dialect = SQLiteDialect {};
+        let ast = Parser::parse_sql(
+            &dialect,
+            "SELECT tab1.col2 FROM tab1 AS cor0 CROSS JOIN tab1",
+        )
+        .expect("parse cross join query");
+        let Statement::Query(query) = &ast[0] else {
+            panic!("expected SELECT query");
+        };
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select.as_ref(),
+            other => panic!("unexpected query body: {other:?}"),
+        };
+        assert_eq!(select.from.len(), 1);
+        assert!(!select.from[0].joins.is_empty());
+
+        let batches = engine
+            .sql("SELECT tab1.col2 FROM tab1 AS cor0 CROSS JOIN tab1")
+            .expect("run cross join with alias and base table");
+
+        let mut values = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..column.len() {
+                if column.is_null(idx) {
+                    values.push(None);
+                } else {
+                    values.push(Some(column.value(idx)));
+                }
+            }
+        }
+
+        assert_eq!(values, vec![Some(9)]);
     }
 
     #[test]

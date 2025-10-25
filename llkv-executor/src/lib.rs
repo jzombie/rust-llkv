@@ -300,11 +300,17 @@ where
             current = cross_join_table_batches(current, next)?;
         }
 
-        let mut combined_batches = current.batches;
-        let combined_schema = current.schema;
+        let TableCrossProductData {
+            schema: combined_schema,
+            batches: mut combined_batches,
+            column_counts,
+        } = current;
 
-        let column_lookup_map =
-            build_cross_product_column_lookup(combined_schema.as_ref(), &plan.tables);
+        let column_lookup_map = build_cross_product_column_lookup(
+            combined_schema.as_ref(),
+            &plan.tables,
+            &column_counts,
+        );
 
         if let Some(filter_expr) = &plan.filter {
             let mut filter_context = CrossProductExpressionContext::new(
@@ -2348,6 +2354,7 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<
 struct TableCrossProductData {
     schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
+    column_counts: Vec<usize>,
 }
 
 fn collect_table_data<P>(
@@ -2414,31 +2421,23 @@ where
     Ok(TableCrossProductData {
         schema,
         batches: normalized_batches,
+        column_counts: vec![table.schema.columns.len()],
     })
 }
 
 fn build_cross_product_column_lookup(
     schema: &Schema,
     tables: &[llkv_plan::TableRef],
+    column_counts: &[usize],
 ) -> FxHashMap<String, usize> {
+    debug_assert_eq!(tables.len(), column_counts.len());
+
     let mut table_column_counts: FxHashMap<String, usize> = FxHashMap::default();
     for field in schema.fields() {
         if let Some(name) = table_column_key(field.name()) {
             *table_column_counts
                 .entry(name.to_ascii_lowercase())
                 .or_insert(0) += 1;
-        }
-    }
-
-    let mut alias_map: FxHashMap<String, String> = FxHashMap::default();
-    for table_ref in tables {
-        if let Some(alias) = &table_ref.alias {
-            let alias_lower = alias.to_ascii_lowercase();
-            alias_map.insert(
-                table_ref.qualified_name().to_ascii_lowercase(),
-                alias_lower.clone(),
-            );
-            alias_map.insert(table_ref.table.to_ascii_lowercase(), alias_lower);
         }
     }
 
@@ -2469,14 +2468,28 @@ fn build_cross_product_column_lookup(
                         .or_insert(idx);
                 }
             }
+        }
+    }
 
-            let table_path_lower = parts.join(".").to_ascii_lowercase();
-            if let Some(alias_lower) = alias_map.get(&table_path_lower) {
+    let mut offset = 0usize;
+    for (table_ref, &count) in tables.iter().zip(column_counts.iter()) {
+        if let Some(alias) = &table_ref.alias {
+            let alias_lower = alias.to_ascii_lowercase();
+            let end = usize::min(schema.fields().len(), offset.saturating_add(count));
+            for column_index in offset..end {
+                let name = schema.field(column_index).name();
+                let trimmed = name.trim_start_matches('.');
+                let column_lower = trimmed
+                    .rsplit('.')
+                    .next()
+                    .map(|part| part.to_ascii_lowercase())
+                    .unwrap_or_else(|| trimmed.to_ascii_lowercase());
                 lookup
                     .entry(format!("{}.{}", alias_lower, column_lower))
-                    .or_insert(idx);
+                    .or_insert(column_index);
             }
         }
+        offset = offset.saturating_add(count);
     }
 
     lookup
@@ -2486,32 +2499,47 @@ fn cross_join_table_batches(
     left: TableCrossProductData,
     right: TableCrossProductData,
 ) -> ExecutorResult<TableCrossProductData> {
-    let combined_fields: Vec<Field> = left
-        .schema
+    let TableCrossProductData {
+        schema: left_schema,
+        batches: left_batches,
+        column_counts: mut left_counts,
+    } = left;
+    let TableCrossProductData {
+        schema: right_schema,
+        batches: right_batches,
+        column_counts: right_counts,
+    } = right;
+
+    let combined_fields: Vec<Field> = left_schema
         .fields()
         .iter()
-        .chain(right.schema.fields().iter())
+        .chain(right_schema.fields().iter())
         .map(|field| field.as_ref().clone())
         .collect();
 
+    let mut column_counts = Vec::with_capacity(left_counts.len() + right_counts.len());
+    column_counts.extend(left_counts.drain(..));
+    column_counts.extend(right_counts);
+
     let combined_schema = Arc::new(Schema::new(combined_fields));
 
-    let left_has_rows = left.batches.iter().any(|batch| batch.num_rows() > 0);
-    let right_has_rows = right.batches.iter().any(|batch| batch.num_rows() > 0);
+    let left_has_rows = left_batches.iter().any(|batch| batch.num_rows() > 0);
+    let right_has_rows = right_batches.iter().any(|batch| batch.num_rows() > 0);
 
     if !left_has_rows || !right_has_rows {
         return Ok(TableCrossProductData {
             schema: combined_schema,
             batches: Vec::new(),
+            column_counts,
         });
     }
 
     let mut output_batches = Vec::new();
-    for left_batch in &left.batches {
+    for left_batch in &left_batches {
         if left_batch.num_rows() == 0 {
             continue;
         }
-        for right_batch in &right.batches {
+        for right_batch in &right_batches {
             if right_batch.num_rows() == 0 {
                 continue;
             }
@@ -2527,6 +2555,7 @@ fn cross_join_table_batches(
     Ok(TableCrossProductData {
         schema: combined_schema,
         batches: output_batches,
+        column_counts,
     })
 }
 
@@ -2705,7 +2734,7 @@ mod tests {
         )
         .expect("valid batch");
 
-        let lookup = build_cross_product_column_lookup(schema.as_ref(), &[]);
+        let lookup = build_cross_product_column_lookup(schema.as_ref(), &[], &[]);
         let mut ctx = CrossProductExpressionContext::new(schema.as_ref(), lookup)
             .expect("context builds from schema");
 
@@ -2772,14 +2801,17 @@ mod tests {
         let data_a = TableCrossProductData {
             schema: schema_a,
             batches: vec![batch_a],
+            column_counts: vec![1],
         };
         let data_b = TableCrossProductData {
             schema: schema_b,
             batches: vec![batch_b],
+            column_counts: vec![1],
         };
         let data_c = TableCrossProductData {
             schema: schema_c,
             batches: vec![batch_c],
+            column_counts: vec![1],
         };
 
         let ab = cross_join_table_batches(data_a, data_b).expect("two-table product");
