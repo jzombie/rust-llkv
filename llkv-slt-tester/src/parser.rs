@@ -66,8 +66,8 @@ pub fn expand_loops_with_mapping(
 /// Handles `onlyif <engine>` and `skipif <engine>` directives for compatible engines.
 ///
 /// Logic:
-/// - `onlyif <engine>`: Include the block if <engine> is in our_engines list, skip otherwise
-/// - `skipif <engine>`: Skip the block if <engine> is in our_engines list, include otherwise
+/// - `onlyif <engine_name>`: Include the block if `engine_name` is in our_engines list, skip otherwise
+/// - `skipif <engine_name>`: Skip the block if `engine_name` is in our_engines list, include otherwise
 ///
 /// This allows a test marked `onlyif sqlite` OR `onlyif duckdb` to run if we're compatible
 /// with either engine, and a test marked `skipif sqlite` OR `skipif duckdb` to be skipped
