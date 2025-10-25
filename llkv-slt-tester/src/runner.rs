@@ -189,7 +189,7 @@ where
             eprintln!("[llkv-slt] Normalized SLT saved to: {}", path);
             if let Some(line_num) = opt_orig_line {
                 eprintln!(
-                    "[llkv-slt] View context: head -n {} {} | tail -20",
+                    "[llkv-slt] View context: head -n {} '{}' | tail -20",
                     line_num.saturating_add(10),
                     path
                 );
