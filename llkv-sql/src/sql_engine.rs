@@ -3640,11 +3640,8 @@ where
                     }
                     _ => {
                         let alias = format!("col{}", idx + 1);
-                        let scalar = translate_scalar_with_context(
-                            resolver,
-                            id_context.clone(),
-                            expr,
-                        )?;
+                        let scalar =
+                            translate_scalar_with_context(resolver, id_context.clone(), expr)?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias,
@@ -3684,11 +3681,8 @@ where
                         }
                     }
                     _ => {
-                        let scalar = translate_scalar_with_context(
-                            resolver,
-                            id_context.clone(),
-                            expr,
-                        )?;
+                        let scalar =
+                            translate_scalar_with_context(resolver, id_context.clone(), expr)?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias: alias.value.clone(),
@@ -4559,11 +4553,7 @@ fn translate_condition_with_context(
                     work_stack.push(ConditionFrame::Enter(inner));
                 }
                 SqlExpr::IsNull(inner) => {
-                    let scalar = translate_scalar_with_context(
-                        resolver,
-                        context.clone(),
-                        inner,
-                    )?;
+                    let scalar = translate_scalar_with_context(resolver, context.clone(), inner)?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
@@ -4582,11 +4572,7 @@ fn translate_condition_with_context(
                     }
                 }
                 SqlExpr::IsNotNull(inner) => {
-                    let scalar = translate_scalar_with_context(
-                        resolver,
-                        context.clone(),
-                        inner,
-                    )?;
+                    let scalar = translate_scalar_with_context(resolver, context.clone(), inner)?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
@@ -4976,6 +4962,11 @@ fn translate_scalar_internal(
                 }
                 SqlExpr::Nested(inner) => {
                     work_stack.push(ScalarFrame::Exit(ScalarExitContext::Nested));
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::Cast { expr: inner, .. } => {
+                    // TODO: implement typed CAST semantics once executor supports runtime coercions.
+                    // For now, treat CAST as a passthrough so the inner expression is evaluated normally.
                     work_stack.push(ScalarFrame::Enter(inner));
                 }
                 SqlExpr::Function(func) => {

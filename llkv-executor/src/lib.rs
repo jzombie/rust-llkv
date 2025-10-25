@@ -311,6 +311,9 @@ where
             })?
         };
 
+        let column_lookup_map =
+            build_cross_product_column_lookup(combined_schema.as_ref(), &plan.tables);
+
         // Apply SELECT projections if specified
         if !plan.projections.is_empty() {
             let mut selected_fields = Vec::new();
@@ -342,12 +345,8 @@ where
                     SelectProjection::Column { name, alias } => {
                         // Find the column by qualified name
                         let col_name = name.to_ascii_lowercase();
-                        if let Some((idx, field)) = combined_schema
-                            .fields()
-                            .iter()
-                            .enumerate()
-                            .find(|(_, f)| f.name().to_ascii_lowercase() == col_name)
-                        {
+                        if let Some(&idx) = column_lookup_map.get(&col_name) {
+                            let field = combined_schema.field(idx);
                             let output_name = alias.as_ref().unwrap_or(name).clone();
                             selected_fields.push(Arc::new(arrow::datatypes::Field::new(
                                 output_name,
@@ -364,8 +363,10 @@ where
                     }
                     SelectProjection::Computed { expr, alias } => {
                         if expr_context.is_none() {
-                            expr_context =
-                                Some(CrossProductExpressionContext::new(&combined_schema)?);
+                            expr_context = Some(CrossProductExpressionContext::new(
+                                combined_schema.as_ref(),
+                                column_lookup_map.clone(),
+                            )?);
                         }
                         let context = expr_context
                             .as_mut()
@@ -1133,18 +1134,8 @@ struct CrossProductExpressionContext {
 }
 
 impl CrossProductExpressionContext {
-    fn new(schema: &Schema) -> ExecutorResult<Self> {
-        let mut table_column_counts: FxHashMap<String, usize> = FxHashMap::default();
-        for field in schema.fields() {
-            if let Some(name) = table_column_key(field.name()) {
-                *table_column_counts
-                    .entry(name.to_ascii_lowercase())
-                    .or_insert(0) += 1;
-            }
-        }
-
+    fn new(schema: &Schema, lookup: FxHashMap<String, usize>) -> ExecutorResult<Self> {
         let mut columns = Vec::with_capacity(schema.fields().len());
-        let mut lookup = FxHashMap::default();
         let mut field_id_to_index = FxHashMap::default();
         let mut next_field_id: FieldId = 1;
 
@@ -1167,24 +1158,8 @@ impl CrossProductExpressionContext {
             let field_id = next_field_id;
             next_field_id = next_field_id.saturating_add(1);
 
-            let column_index = columns.len();
             columns.push(executor_column);
             field_id_to_index.insert(field_id, idx);
-
-            let normalized = field.name().to_ascii_lowercase();
-            lookup.insert(normalized.clone(), column_index);
-
-            let trimmed = normalized.trim_start_matches('.').to_string();
-            if trimmed != normalized {
-                lookup.entry(trimmed).or_insert(column_index);
-            }
-
-            if let Some(table_col) = table_column_key(field.name()) {
-                let key = table_col.to_ascii_lowercase();
-                if table_column_counts.get(&key).copied().unwrap_or(0) == 1 {
-                    lookup.entry(key).or_insert(column_index);
-                }
-            }
         }
 
         Ok(Self {
@@ -1269,7 +1244,6 @@ fn table_column_key(name: &str) -> Option<String> {
     let table = parts.pop()?;
     Some(format!("{}.{}", table, column))
 }
-
 
 /// Streaming execution handle for SELECT queries.
 #[derive(Clone)]
@@ -1773,6 +1747,71 @@ where
     })
 }
 
+fn build_cross_product_column_lookup(
+    schema: &Schema,
+    tables: &[llkv_plan::TableRef],
+) -> FxHashMap<String, usize> {
+    let mut table_column_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for field in schema.fields() {
+        if let Some(name) = table_column_key(field.name()) {
+            *table_column_counts
+                .entry(name.to_ascii_lowercase())
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut alias_map: FxHashMap<String, String> = FxHashMap::default();
+    for table_ref in tables {
+        if let Some(alias) = &table_ref.alias {
+            let alias_lower = alias.to_ascii_lowercase();
+            alias_map.insert(
+                table_ref.qualified_name().to_ascii_lowercase(),
+                alias_lower.clone(),
+            );
+            alias_map.insert(table_ref.table.to_ascii_lowercase(), alias_lower);
+        }
+    }
+
+    let mut lookup = FxHashMap::default();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        lookup.entry(name.to_ascii_lowercase()).or_insert(idx);
+
+        let trimmed = name.trim_start_matches('.');
+        lookup.entry(trimmed.to_ascii_lowercase()).or_insert(idx);
+
+        let mut parts: Vec<&str> = trimmed.split('.').collect();
+        if parts.len() >= 2 {
+            let column_part = parts.pop().unwrap();
+            let column_lower = column_part.to_ascii_lowercase();
+
+            if let Some(table_only) = parts.last() {
+                let table_lower = table_only.to_ascii_lowercase();
+                if table_column_counts
+                    .get(&format!("{}.{}", table_lower, column_lower))
+                    .copied()
+                    .unwrap_or(0)
+                    == 1
+                {
+                    lookup
+                        .entry(format!("{}.{}", table_lower, column_lower.clone()))
+                        .or_insert(idx);
+                }
+            }
+
+            let table_path_lower = parts.join(".").to_ascii_lowercase();
+            if let Some(alias_lower) = alias_map.get(&table_path_lower) {
+                lookup
+                    .entry(format!("{}.{}", alias_lower, column_lower))
+                    .or_insert(idx);
+            }
+        }
+    }
+
+    lookup
+}
+
 fn cross_join_table_batches(
     left: TableCrossProductData,
     right: TableCrossProductData,
@@ -1996,7 +2035,8 @@ mod tests {
         )
         .expect("valid batch");
 
-        let mut ctx = CrossProductExpressionContext::new(schema.as_ref())
+        let lookup = build_cross_product_column_lookup(schema.as_ref(), &[]);
+        let mut ctx = CrossProductExpressionContext::new(schema.as_ref(), lookup)
             .expect("context builds from schema");
 
         let literal_expr: ScalarExpr<String> = ScalarExpr::literal(67);

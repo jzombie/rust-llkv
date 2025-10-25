@@ -1142,11 +1142,22 @@ where
                                         .and_then(|dt| NumericKernels::kind_for_data_type(dt))
                                 };
 
-                                let result_kind = NumericKernels::infer_result_kind_from_types(
+                                let inferred_kind = NumericKernels::infer_result_kind_from_types(
                                     &info.expr,
                                     &mut resolver,
-                                )
-                                .unwrap_or(NumericKind::Float);
+                                );
+
+                                let result_kind = if let Some(kind) = inferred_kind {
+                                    kind
+                                } else if computed_expr_prefers_float(
+                                    &info.expr,
+                                    self.table.table_id(),
+                                    &lfid_dtypes,
+                                )? {
+                                    NumericKind::Float
+                                } else {
+                                    NumericKind::Integer
+                                };
 
                                 match result_kind {
                                     NumericKind::Integer => DataType::Int64,
@@ -1166,61 +1177,12 @@ where
                                 // carries precise aggregate signatures.
                                 DataType::Int64
                             }
-                            ScalarExpr::GetField { base, field_name } => {
-                                // Determine the data type of the field being extracted
-                                fn get_field_dtype(
-                                    expr: &ScalarExpr<FieldId>,
-                                    field_name: &str,
-                                    table_id: TableId,
-                                    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
-                                ) -> LlkvResult<DataType> {
-                                    let base_dtype = match expr {
-                                        ScalarExpr::Column(fid) => {
-                                            let lfid = LogicalFieldId::for_user(table_id, *fid);
-                                            lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
-                                                Error::Internal("missing dtype for column".into())
-                                            })?
-                                        }
-                                        ScalarExpr::GetField {
-                                            base: inner_base,
-                                            field_name: inner_field,
-                                        } => get_field_dtype(
-                                            inner_base,
-                                            inner_field,
-                                            table_id,
-                                            lfid_dtypes,
-                                        )?,
-                                        _ => return Err(Error::InvalidArgumentError(
-                                            "GetField base must be a column or another GetField"
-                                                .into(),
-                                        )),
-                                    };
-
-                                    if let DataType::Struct(fields) = base_dtype {
-                                        fields
-                                            .iter()
-                                            .find(|f| f.name() == field_name)
-                                            .map(|f| f.data_type().clone())
-                                            .ok_or_else(|| {
-                                                Error::InvalidArgumentError(format!(
-                                                    "Field '{}' not found in struct",
-                                                    field_name
-                                                ))
-                                            })
-                                    } else {
-                                        Err(Error::InvalidArgumentError(
-                                            "GetField can only be applied to struct types".into(),
-                                        ))
-                                    }
-                                }
-
-                                get_field_dtype(
-                                    base,
-                                    field_name,
-                                    self.table.table_id(),
-                                    &lfid_dtypes,
-                                )?
-                            }
+                            ScalarExpr::GetField { base, field_name } => get_field_dtype(
+                                base,
+                                field_name,
+                                self.table.table_id(),
+                                &lfid_dtypes,
+                            )?,
                         };
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     }
@@ -2566,6 +2528,95 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Binary { .. } => true,
         ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
+    }
+}
+
+fn computed_expr_prefers_float(
+    expr: &ScalarExpr<FieldId>,
+    table_id: TableId,
+    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
+) -> LlkvResult<bool> {
+    match expr {
+        ScalarExpr::Literal(lit) => literal_prefers_float(lit),
+        ScalarExpr::Column(fid) => {
+            let lfid = LogicalFieldId::for_user(table_id, *fid);
+            let dtype = lfid_dtypes
+                .get(&lfid)
+                .ok_or_else(|| Error::Internal("missing dtype for computed column".into()))?;
+            Ok(matches!(
+                NumericKernels::kind_for_data_type(dtype),
+                Some(NumericKind::Float)
+            ))
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            Ok(
+                computed_expr_prefers_float(left.as_ref(), table_id, lfid_dtypes)?
+                    || computed_expr_prefers_float(right.as_ref(), table_id, lfid_dtypes)?,
+            )
+        }
+        ScalarExpr::Aggregate(_) => Ok(false),
+        ScalarExpr::GetField { base, field_name } => {
+            let dtype = get_field_dtype(base.as_ref(), field_name, table_id, lfid_dtypes)?;
+            Ok(matches!(
+                NumericKernels::kind_for_data_type(&dtype),
+                Some(NumericKind::Float)
+            ))
+        }
+    }
+}
+
+fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
+    match literal {
+        Literal::Float(_) => Ok(true),
+        Literal::Struct(fields) => {
+            for (_, nested) in fields {
+                if literal_prefers_float(nested.as_ref())? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Literal::Integer(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
+    }
+}
+
+fn get_field_dtype(
+    expr: &ScalarExpr<FieldId>,
+    field_name: &str,
+    table_id: TableId,
+    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
+) -> LlkvResult<DataType> {
+    let base_dtype = match expr {
+        ScalarExpr::Column(fid) => {
+            let lfid = LogicalFieldId::for_user(table_id, *fid);
+            lfid_dtypes
+                .get(&lfid)
+                .cloned()
+                .ok_or_else(|| Error::Internal("missing dtype for column".into()))?
+        }
+        ScalarExpr::GetField {
+            base: inner_base,
+            field_name: inner_field,
+        } => get_field_dtype(inner_base.as_ref(), inner_field, table_id, lfid_dtypes)?,
+        _ => {
+            return Err(Error::InvalidArgumentError(
+                "GetField base must be a column or another GetField".into(),
+            ));
+        }
+    };
+
+    if let DataType::Struct(fields) = base_dtype {
+        fields
+            .iter()
+            .find(|f| f.name() == field_name)
+            .map(|f| f.data_type().clone())
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!("Field '{}' not found in struct", field_name))
+            })
+    } else {
+        Err(Error::InvalidArgumentError(
+            "GetField can only be applied to struct types".into(),
+        ))
     }
 }
 
