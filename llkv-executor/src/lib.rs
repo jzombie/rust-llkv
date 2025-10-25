@@ -2518,7 +2518,7 @@ fn cross_join_table_batches(
         .collect();
 
     let mut column_counts = Vec::with_capacity(left_counts.len() + right_counts.len());
-    column_counts.extend(left_counts.drain(..));
+    column_counts.append(&mut left_counts);
     column_counts.extend(right_counts);
 
     let combined_schema = Arc::new(Schema::new(combined_fields));

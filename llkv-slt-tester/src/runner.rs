@@ -163,7 +163,7 @@ where
         if let Some(parent) = persist_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let persisted = if let Err(_) = std::fs::copy(&tmp, persist_path) {
+        let persisted = if std::fs::copy(&tmp, persist_path).is_err() {
             None
         } else {
             // Convert to absolute path for easier debugging

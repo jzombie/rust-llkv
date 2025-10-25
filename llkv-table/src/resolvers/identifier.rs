@@ -94,16 +94,16 @@ impl<'a> IdentifierResolver<'a> {
         })?;
 
         let mut effective_parts = parts;
-        if let Some(alias) = context.table_alias() {
-            if !effective_parts.is_empty() && effective_parts[0].eq_ignore_ascii_case(alias) {
-                if effective_parts.len() == 1 {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "Binder Error: does not have a column named '{}'",
-                        effective_parts[0]
-                    )));
-                }
-                effective_parts = &effective_parts[1..];
+        if context.table_alias().is_some_and(|alias| {
+            !effective_parts.is_empty() && effective_parts[0].eq_ignore_ascii_case(alias)
+        }) {
+            if effective_parts.len() == 1 {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Binder Error: does not have a column named '{}'",
+                    effective_parts[0]
+                )));
             }
+            effective_parts = &effective_parts[1..];
         }
 
         resolve_identifier_parts(effective_parts, &table_meta)

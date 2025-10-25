@@ -174,6 +174,11 @@ impl NumericArray {
         self.len
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn value(&self, idx: usize) -> Option<NumericValue> {
         match self.kind {
             NumericKind::Integer => {
@@ -545,11 +550,10 @@ impl NumericKernels {
         let scalar_value = scalar.expect("checked above");
 
         if array_is_left && matches!(op, BinaryOp::Divide | BinaryOp::Modulo) {
-            let is_zero = match scalar_value {
-                NumericValue::Integer(0) => true,
-                NumericValue::Float(v) if v == 0.0 => true,
-                _ => false,
-            };
+            let is_zero = matches!(
+                scalar_value,
+                NumericValue::Integer(0) | NumericValue::Float(0.0)
+            );
             if is_zero {
                 return Ok(NumericArray::from_numeric_values(
                     vec![None; len],
@@ -604,19 +608,17 @@ impl NumericKernels {
     }
 
     fn literal_is_zero(expr: &ScalarExpr<FieldId>) -> bool {
-        match Self::literal_numeric_value(expr) {
-            Some(NumericValue::Integer(0)) => true,
-            Some(NumericValue::Float(v)) if v == 0.0 => true,
-            _ => false,
-        }
+        matches!(
+            Self::literal_numeric_value(expr),
+            Some(NumericValue::Integer(0)) | Some(NumericValue::Float(0.0))
+        )
     }
 
     fn literal_is_one(expr: &ScalarExpr<FieldId>) -> bool {
-        match Self::literal_numeric_value(expr) {
-            Some(NumericValue::Integer(1)) => true,
-            Some(NumericValue::Float(v)) if v == 1.0 => true,
-            _ => false,
-        }
+        matches!(
+            Self::literal_numeric_value(expr),
+            Some(NumericValue::Integer(1)) | Some(NumericValue::Float(1.0))
+        )
     }
 
     /// Recursively simplify the expression by folding literals and eliminating identity operations.
@@ -858,8 +860,7 @@ impl NumericKernels {
 
     fn div_values(lhs: NumericValue, rhs: NumericValue) -> Option<NumericValue> {
         match rhs {
-            NumericValue::Integer(0) => return None,
-            NumericValue::Float(v) if v == 0.0 => return None,
+            NumericValue::Integer(0) | NumericValue::Float(0.0) => return None,
             _ => {}
         }
 
@@ -873,8 +874,7 @@ impl NumericKernels {
 
     fn mod_values(lhs: NumericValue, rhs: NumericValue) -> Option<NumericValue> {
         match rhs {
-            NumericValue::Integer(0) => return None,
-            NumericValue::Float(v) if v == 0.0 => return None,
+            NumericValue::Integer(0) | NumericValue::Float(0.0) => return None,
             _ => {}
         }
 
@@ -931,7 +931,7 @@ impl NumericKernels {
         }
     }
 
-    /// Map an Arrow `DataType` to the corresponding [`NumericKind`], when supported.
+    /// Map an Arrow `DataType` to the corresponding numeric kind when supported.
     pub fn kind_for_data_type(dtype: &DataType) -> Option<NumericKind> {
         match dtype {
             DataType::Int8

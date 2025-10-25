@@ -59,6 +59,7 @@ fn multi_column_queries_succeed_with_flattening() {
 
 #[test]
 fn multi_column_queries_still_fail_on_real_mismatches() {
-    let result = LlkvSltRunner::in_memory().run_script("multi-column-bad.slt", MULTI_COLUMN_BAD_SLT);
+    let result =
+        LlkvSltRunner::in_memory().run_script("multi-column-bad.slt", MULTI_COLUMN_BAD_SLT);
     assert!(result.is_err(), "expected mismatch should still fail");
 }

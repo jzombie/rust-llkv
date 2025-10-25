@@ -1140,7 +1140,7 @@ where
                                     let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
                                     lfid_dtypes
                                         .get(&lfid)
-                                        .and_then(|dt| NumericKernels::kind_for_data_type(dt))
+                                        .and_then(NumericKernels::kind_for_data_type)
                                 };
 
                                 let inferred_kind = NumericKernels::infer_result_kind_from_types(
