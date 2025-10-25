@@ -59,7 +59,7 @@ Files with the `.slturl` extension are treated as pointers: the harness reads th
 
 ## Contributing
 
-If you add new SLT suites, place them under `tests/slt` (or adjust the harness invocation). When adding remote pointer tests, add a `.slturl` file whose contents is the URL to fetch.
+If you add new SLT suites, place them under `tests/slt` (or adjust the harness invocation). When adding remote pointer tests, add a `.slturl` file whose content is the URL to fetch.
 
 Please run `cargo test -p llkv-slt-tester --test slt_harness` after changes to verify behavior.
 
