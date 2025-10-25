@@ -1283,6 +1283,7 @@ impl CrossProductExpressionContext {
     }
 }
 
+// TODO: Move to llkv-aggregate?
 fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
     match expr {
         ScalarExpr::Column(fid) => {
@@ -1307,6 +1308,7 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
     }
 }
 
+// TODO: Move to llkv-table?
 fn table_column_key(name: &str) -> Option<String> {
     let trimmed = name.trim_start_matches('.');
     let mut parts = trimmed.split('.').collect::<Vec<_>>();
