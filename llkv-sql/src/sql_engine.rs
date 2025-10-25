@@ -33,11 +33,11 @@ use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind,
     BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics,
     DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, NullsDistinctOption,
-    ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, ReferentialAction,
-    SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption,
-    Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
-    TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+    LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind,
+    Query, ReferentialAction, SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set,
+    SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
+    TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3188,6 +3188,10 @@ where
         if let Some(alias) = table_alias.as_ref() {
             validate_projection_alias_qualifiers(&select.projection, alias)?;
         }
+        let has_joins = select
+            .from
+            .iter()
+            .any(|table_with_joins| !table_with_joins.joins.is_empty());
         // Handle different FROM clause scenarios
         let catalog = self.engine.context().table_catalog();
         let (mut plan, id_context) = if select.from.is_empty() {
@@ -3200,7 +3204,7 @@ where
             )?;
             p = p.with_projections(projections);
             (p, IdentifierContext::new(None))
-        } else if select.from.len() == 1 {
+        } else if select.from.len() == 1 && !has_joins {
             // Single table query
             let (display_name, canonical_name) = extract_single_table(&select.from)?;
             let table_id = catalog.table_id(&canonical_name);
@@ -3217,7 +3221,7 @@ where
             }
             (p, IdentifierContext::new(table_id))
         } else {
-            // Multiple tables - cross product
+            // Multiple tables or explicit joins - treat as cross product for now
             let tables = extract_tables(&select.from)?;
             let mut p = SelectPlan::with_tables(tables);
             // For multi-table queries, we'll build projections differently
@@ -5509,34 +5513,51 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
     }
 }
 
-/// Extract multiple tables from FROM clause for cross products
+/// Extract table references from a FROM clause, flattening supported JOINs.
 fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>> {
     let mut tables = Vec::new();
 
     for item in from {
-        // Check if this table has joins - we don't support JOIN yet
-        if !item.joins.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "JOIN clauses are not supported yet".into(),
-            ));
-        }
+        push_table_factor(&item.relation, &mut tables)?;
 
-        // Extract table name
-        match &item.relation {
-            TableFactor::Table { name, .. } => {
-                let (schema_opt, table) = parse_schema_qualified_name(name)?;
-                let schema = schema_opt.unwrap_or_default();
-                tables.push(llkv_plan::TableRef::new(schema, table));
-            }
-            _ => {
-                return Err(Error::InvalidArgumentError(
-                    "queries require a plain table name".into(),
-                ));
+        for join in &item.joins {
+            match &join.join_operator {
+                JoinOperator::CrossJoin(JoinConstraint::None)
+                | JoinOperator::Inner(JoinConstraint::None) => {
+                    push_table_factor(&join.relation, &mut tables)?;
+                }
+                JoinOperator::CrossJoin(_) => {
+                    return Err(Error::InvalidArgumentError(
+                        "CROSS JOIN with constraints is not supported".into(),
+                    ));
+                }
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "only CROSS JOIN without constraints is supported".into(),
+                    ));
+                }
             }
         }
     }
 
     Ok(tables)
+}
+
+fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>) -> SqlResult<()> {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            let (schema_opt, table) = parse_schema_qualified_name(name)?;
+            let schema = schema_opt.unwrap_or_default();
+            tables.push(llkv_plan::TableRef::new(schema, table));
+            Ok(())
+        }
+        TableFactor::Derived { .. } => Err(Error::InvalidArgumentError(
+            "JOIN clauses require base tables; derived tables are not supported".into(),
+        )),
+        _ => Err(Error::InvalidArgumentError(
+            "queries require a plain table name".into(),
+        )),
+    }
 }
 
 fn group_by_is_empty(expr: &GroupByExpr) -> bool {
