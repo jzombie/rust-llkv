@@ -74,8 +74,8 @@ pub use reserved::CATALOG_TABLE_ID;
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use sys_catalog::{
-    ColMeta, CustomTypeMeta, MultiColumnUniqueEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
-    TableMeta, TableMultiColumnUniqueMeta, TableSingleColumnIndexMeta,
+    ColMeta, CustomTypeMeta, MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
+    TableMeta, TableMultiColumnIndexMeta, TableSingleColumnIndexMeta,
 };
 pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
@@ -86,3 +86,4 @@ pub use planner::plan_graph::{
     PlanGraph, PlanGraphBuilder, PlanGraphError, PlanGraphResult, PlanGraphVersion, PlanInput,
     PlanNode, PlanNodeId, PlanOperator,
 };
+pub use scalar_eval::{NumericArray, NumericArrayMap, NumericKernels};

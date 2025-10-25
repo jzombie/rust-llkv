@@ -13,6 +13,7 @@ This guide keeps feature work aligned with our architecture so we avoid wasteful
 4. If you must stay in a higher layer for performance or ownership reasons, note the exception in the PR description.
 
 ## Guardrails
+- **No storage shortcuts:** every feature must drive through the full runtime → catalog → storage path so durability is possible. In-memory stopgaps, hidden caches, or "temporary" hacks that skip persistence are forbidden—no shortcuts, ever.
 - **Performance first:** moving logic downward must not introduce cross-crate chatter that slows hot paths.
 - **No duplicates:** extend existing modules instead of cloning functionality elsewhere. If you catch yourself wiring up the same method signature twice in different files or crates, stop and reassess (the architecture is likely wrong and needs refactoring rather than another copy).
 - **No loops:** ensure dependency arrows still point downward; adding a reference that forces a circular dependency is a blocker.

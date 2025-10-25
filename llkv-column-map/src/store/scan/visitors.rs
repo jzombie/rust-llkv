@@ -89,24 +89,28 @@ macro_rules! declare_sorted_with_rids_trait_methods {
 pub trait PrimitiveVisitor {
     llkv_for_each_arrow_numeric!(declare_primitive_trait_methods);
     llkv_for_each_arrow_boolean!(declare_primitive_trait_methods);
+    llkv_for_each_arrow_string!(declare_primitive_trait_methods);
 }
 
 /// Unsorted primitive visitor with row ids (u64).
 pub trait PrimitiveWithRowIdsVisitor {
     llkv_for_each_arrow_numeric!(declare_primitive_with_rids_trait_methods);
     llkv_for_each_arrow_boolean!(declare_primitive_with_rids_trait_methods);
+    llkv_for_each_arrow_string!(declare_primitive_with_rids_trait_methods);
 }
 
 /// Sorted visitor fed with coalesced runs (start,len) within a typed array.
 pub trait PrimitiveSortedVisitor {
     llkv_for_each_arrow_numeric!(declare_sorted_trait_methods);
     llkv_for_each_arrow_boolean!(declare_sorted_trait_methods);
+    llkv_for_each_arrow_string!(declare_sorted_trait_methods);
 }
 
 /// Sorted visitor with row ids.
 pub trait PrimitiveSortedWithRowIdsVisitor {
     llkv_for_each_arrow_numeric!(declare_sorted_with_rids_trait_methods);
     llkv_for_each_arrow_boolean!(declare_sorted_with_rids_trait_methods);
+    llkv_for_each_arrow_string!(declare_sorted_with_rids_trait_methods);
     /// Null-only run: values are missing; emits only row_ids.
     fn null_run(&mut self, _r: &UInt64Array, _start: usize, _len: usize) {}
 }
@@ -252,6 +256,7 @@ where
 {
     llkv_for_each_arrow_numeric!(expand_unsorted_paginate);
     llkv_for_each_arrow_boolean!(expand_unsorted_paginate);
+    llkv_for_each_arrow_string!(expand_unsorted_paginate);
 }
 
 macro_rules! impl_unsorted_with_rids_paginate_for_type {
@@ -296,6 +301,7 @@ where
 {
     llkv_for_each_arrow_numeric!(expand_unsorted_with_rids_paginate);
     llkv_for_each_arrow_boolean!(expand_unsorted_with_rids_paginate);
+    llkv_for_each_arrow_string!(expand_unsorted_with_rids_paginate);
 }
 
 macro_rules! impl_sorted_paginate_for_type {
@@ -343,6 +349,7 @@ where
 {
     llkv_for_each_arrow_numeric!(expand_sorted_paginate);
     llkv_for_each_arrow_boolean!(expand_sorted_paginate);
+    llkv_for_each_arrow_string!(expand_sorted_paginate);
 }
 
 macro_rules! impl_sorted_with_rids_paginate_for_type {
@@ -388,6 +395,7 @@ where
 {
     llkv_for_each_arrow_numeric!(expand_sorted_with_rids_paginate);
     llkv_for_each_arrow_boolean!(expand_sorted_with_rids_paginate);
+    llkv_for_each_arrow_string!(expand_sorted_with_rids_paginate);
     fn null_run(&mut self, r: &UInt64Array, start: usize, len: usize) {
         if self.done() {
             return;

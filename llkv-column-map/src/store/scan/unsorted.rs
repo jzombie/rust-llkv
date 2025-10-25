@@ -99,6 +99,7 @@ macro_rules! dispatch_unsorted_visit {
 
     llkv_for_each_arrow_numeric!(try_dispatch_unsorted);
     llkv_for_each_arrow_boolean!(try_dispatch_unsorted);
+    llkv_for_each_arrow_string!(try_dispatch_unsorted);
 
         result.unwrap_or_else(|| Err(Error::Internal("unsorted_visit: unsupported dtype".into())))
     }};
@@ -147,6 +148,7 @@ macro_rules! dispatch_unsorted_with_rids_visit {
 
     llkv_for_each_arrow_numeric!(try_dispatch_unsorted_with_rids);
     llkv_for_each_arrow_boolean!(try_dispatch_unsorted_with_rids);
+    llkv_for_each_arrow_string!(try_dispatch_unsorted_with_rids);
 
         result.unwrap_or_else(|| {
             Err(Error::Internal(
@@ -187,6 +189,7 @@ macro_rules! dispatch_unsorted_nulls {
 
     llkv_for_each_arrow_numeric!(try_dispatch_unsorted_nulls);
     llkv_for_each_arrow_boolean!(try_dispatch_unsorted_nulls);
+    llkv_for_each_arrow_string!(try_dispatch_unsorted_nulls);
 
         result.unwrap_or_else(|| {
             Err(Error::Internal(

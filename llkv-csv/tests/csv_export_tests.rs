@@ -200,15 +200,15 @@ fn export_with_computed_projection_alias() {
     let contents = String::from_utf8(buffer).expect("utf8 output");
     let mut lines = contents.lines();
     assert_eq!(lines.next(), Some("int_col_alias,int_times_two_alias"));
-    let mut rows: Vec<(i64, f64)> = Vec::new();
+    let mut rows: Vec<(i64, i64)> = Vec::new();
     for line in lines {
         let parts: Vec<&str> = line.split(',').collect();
         assert_eq!(parts.len(), 2);
         let base: i64 = parts[0].parse().expect("int value");
-        let computed: f64 = parts[1].parse().expect("float value");
+        let computed: i64 = parts[1].parse().expect("int value");
         rows.push((base, computed));
     }
 
-    let expected = vec![(10, 20.0), (20, 40.0), (30, 60.0)];
+    let expected = vec![(10, 20), (20, 40), (30, 60)];
     assert_eq!(rows, expected);
 }

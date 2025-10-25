@@ -2,11 +2,13 @@
 
 **Work in Progress**
 
-Utilities for running tests across the [LLKV](../) toolkit.
+Utilities for running integration tests across the [LLKV](../) toolkit.
 
 The crate currently provides a tiny, test-focused tracing initializer and a convenient `auto-init` feature for automatically installing a tracing subscriber at test-binary startup.
 
 This README documents what the crate does, how the `auto-init` feature works, and how to use the helper manually if you prefer explicit control.
+
+Note: This crate does not include the SLT test harness defined in [llkv-slt-tester](../llkv-slt-tester/) in order to prevent circular dependencies when these test utils are used throughout the LLKV workspace.
 
 ## What this crate provides
 

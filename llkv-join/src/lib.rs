@@ -6,6 +6,7 @@
 //! alternate algorithms when they land.
 #![forbid(unsafe_code)]
 
+mod cartesian;
 mod hash_join;
 
 use arrow::array::RecordBatch;
@@ -16,6 +17,7 @@ use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
 
+pub use cartesian::cross_join_pair;
 pub use hash_join::hash_join_stream;
 
 /// Type of join to perform.

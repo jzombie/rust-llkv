@@ -531,6 +531,7 @@ pub struct TruncatePlan {
 pub struct TableRef {
     pub schema: String,
     pub table: String,
+    pub alias: Option<String>,
 }
 
 impl TableRef {
@@ -538,10 +539,30 @@ impl TableRef {
         Self {
             schema: schema.into(),
             table: table.into(),
+            alias: None,
         }
     }
 
-    /// Get fully qualified name as "schema.table"
+    pub fn with_alias(
+        schema: impl Into<String>,
+        table: impl Into<String>,
+        alias: Option<String>,
+    ) -> Self {
+        Self {
+            schema: schema.into(),
+            table: table.into(),
+            alias,
+        }
+    }
+
+    /// Preferred display name for the table (alias if present).
+    pub fn display_name(&self) -> String {
+        self.alias
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| self.qualified_name())
+    }
+
     pub fn qualified_name(&self) -> String {
         if self.schema.is_empty() {
             self.table.clone()
@@ -561,6 +582,7 @@ pub struct SelectPlan {
     pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
     pub aggregates: Vec<AggregateExpr>,
     pub order_by: Vec<OrderByPlan>,
+    pub distinct: bool,
 }
 
 impl SelectPlan {
@@ -586,6 +608,7 @@ impl SelectPlan {
             filter: None,
             aggregates: Vec::new(),
             order_by: Vec::new(),
+            distinct: false,
         }
     }
 
@@ -597,6 +620,7 @@ impl SelectPlan {
             filter: None,
             aggregates: Vec::new(),
             order_by: Vec::new(),
+            distinct: false,
         }
     }
 
@@ -617,6 +641,11 @@ impl SelectPlan {
 
     pub fn with_order_by(mut self, order_by: Vec<OrderByPlan>) -> Self {
         self.order_by = order_by;
+        self
+    }
+
+    pub fn with_distinct(mut self, distinct: bool) -> Self {
+        self.distinct = distinct;
         self
     }
 }

@@ -10,6 +10,7 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
+use llkv_plan::TransformFrame;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
 };
@@ -31,15 +32,26 @@ use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind,
     BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics,
-    DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, LimitClause, NullsDistinctOption,
-    ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind, Query, ReferentialAction,
-    SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption,
-    Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
-    TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    DataType as SqlDataType, Delete, Distinct, ExceptionWhen, Expr as SqlExpr, FromTable,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
+    OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Span;
+
+// TODO: Extract to constants.rs
+// TODO: Rename to SQL_PARSER_RECURSION_LIMIT
+/// Maximum recursion depth for SQL parser.
+///
+/// The default in sqlparser is 50, which can be exceeded by deeply nested queries
+/// (e.g., SQLite test suite). This value allows for more complex expressions while
+/// still preventing stack overflows.
+const PARSER_RECURSION_LIMIT: usize = 200;
 
 /// SQL execution engine built on top of the LLKV runtime.
 ///
@@ -281,7 +293,7 @@ where
         let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
 
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(&dialect, &processed_sql)
+        let statements = parse_sql_with_recursion_limit(&dialect, &processed_sql)
             .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
         tracing::trace!("DEBUG SQL execute: parsed {} statements", statements.len());
 
@@ -1234,12 +1246,6 @@ where
 
             let column_plan = IndexColumnPlan::new(column_name).with_sort(ascending, nulls_first);
             index_columns.push(column_plan);
-        }
-
-        if index_columns.len() > 1 && !unique {
-            return Err(Error::InvalidArgumentError(
-                "multi-column CREATE INDEX currently supports UNIQUE indexes only".into(),
-            ));
         }
 
         let plan = CreateIndexPlan::new(display_table_name)
@@ -2358,11 +2364,14 @@ where
         }
 
         let filter = match selection {
-            Some(expr) => Some(translate_condition_with_context(
-                &resolver,
-                IdentifierContext::new(table_id),
-                &expr,
-            )?),
+            Some(expr) => {
+                let materialized_expr = self.materialize_in_subquery(expr)?;
+                Some(translate_condition_with_context(
+                    &resolver,
+                    IdentifierContext::new(table_id),
+                    &materialized_expr,
+                )?)
+            }
             None => None,
         };
 
@@ -2436,7 +2445,12 @@ where
 
         let filter = selection
             .map(|expr| {
-                translate_condition_with_context(&resolver, IdentifierContext::new(table_id), &expr)
+                let materialized_expr = self.materialize_in_subquery(expr)?;
+                translate_condition_with_context(
+                    &resolver,
+                    IdentifierContext::new(table_id),
+                    &materialized_expr,
+                )
             })
             .transpose()?;
 
@@ -2825,6 +2839,246 @@ where
         }
     }
 
+    /// Materialize IN (SELECT ...) subqueries by executing them and converting to IN lists.
+    ///
+    /// This preprocesses SQL expressions to execute subqueries and replace them with
+    /// their materialized results before translation to the execution plan.
+    ///
+    /// Uses iterative traversal with an explicit work stack to handle deeply nested
+    /// expressions without stack overflow.
+    fn materialize_in_subquery(&self, root_expr: SqlExpr) -> SqlResult<SqlExpr> {
+        // Stack-based iterative traversal to avoid recursion
+        enum WorkItem {
+            Process(Box<SqlExpr>),
+            BuildBinaryOp {
+                op: BinaryOperator,
+                left: Box<SqlExpr>,
+                right_done: bool,
+            },
+            BuildUnaryOp {
+                op: UnaryOperator,
+            },
+            BuildNested,
+            BuildIsNull,
+            BuildIsNotNull,
+            FinishBetween {
+                negated: bool,
+            },
+        }
+
+        let mut work_stack: Vec<WorkItem> = vec![WorkItem::Process(Box::new(root_expr))];
+        let mut result_stack: Vec<SqlExpr> = Vec::new();
+
+        while let Some(item) = work_stack.pop() {
+            match item {
+                WorkItem::Process(expr) => {
+                    match *expr {
+                        SqlExpr::InSubquery {
+                            expr: left_expr,
+                            subquery,
+                            negated,
+                        } => {
+                            // Execute the subquery
+                            let result = self.handle_query(*subquery)?;
+
+                            // Extract values from first column
+                            let values = match result {
+                                RuntimeStatementResult::Select { execution, .. } => {
+                                    let batches = execution.collect()?;
+                                    let mut collected_values = Vec::new();
+
+                                    for batch in batches {
+                                        if batch.num_columns() == 0 {
+                                            continue;
+                                        }
+                                        let column = batch.column(0);
+
+                                        for row_idx in 0..column.len() {
+                                            use arrow::datatypes::DataType;
+                                            let value = if column.is_null(row_idx) {
+                                                Value::Null
+                                            } else {
+                                                match column.data_type() {
+                                                    DataType::Int64 => {
+                                                        let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::Int64Array>()
+                                                        .unwrap();
+                                                        Value::Number(
+                                                            arr.value(row_idx).to_string(),
+                                                            false,
+                                                        )
+                                                    }
+                                                    DataType::Float64 => {
+                                                        let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::Float64Array>()
+                                                        .unwrap();
+                                                        Value::Number(
+                                                            arr.value(row_idx).to_string(),
+                                                            false,
+                                                        )
+                                                    }
+                                                    DataType::Utf8 => {
+                                                        let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::StringArray>()
+                                                        .unwrap();
+                                                        Value::SingleQuotedString(
+                                                            arr.value(row_idx).to_string(),
+                                                        )
+                                                    }
+                                                    DataType::Boolean => {
+                                                        let arr = column
+                                                        .as_any()
+                                                        .downcast_ref::<arrow::array::BooleanArray>()
+                                                        .unwrap();
+                                                        Value::Boolean(arr.value(row_idx))
+                                                    }
+                                                    other => {
+                                                        return Err(Error::InvalidArgumentError(
+                                                            format!(
+                                                                "unsupported data type in IN subquery: {other:?}"
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                            };
+                                            collected_values.push(ValueWithSpan {
+                                                value,
+                                                span: Span::empty(),
+                                            });
+                                        }
+                                    }
+
+                                    collected_values
+                                }
+                                _ => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "IN subquery must be a SELECT statement".into(),
+                                    ));
+                                }
+                            };
+
+                            // Convert to IN list with materialized values
+                            result_stack.push(SqlExpr::InList {
+                                expr: left_expr,
+                                list: values.into_iter().map(SqlExpr::Value).collect(),
+                                negated,
+                            });
+                        }
+                        SqlExpr::BinaryOp { left, op, right } => {
+                            // Push builder, then schedule the left operand followed by the right.
+                            // Because the work stack is LIFO, the right-hand side executes first,
+                            // leaving the left result on top for the builder to consume without
+                            // swapping operand order.
+                            work_stack.push(WorkItem::BuildBinaryOp {
+                                op,
+                                left: left.clone(),
+                                right_done: false,
+                            });
+                            // Evaluate the right-hand side first so the left result remains on top
+                            // of the result stack when the builder consumes it. This preserves the
+                            // original operand ordering when reconstructing the expression tree.
+                            work_stack.push(WorkItem::Process(left));
+                            work_stack.push(WorkItem::Process(right));
+                        }
+                        SqlExpr::UnaryOp { op, expr } => {
+                            work_stack.push(WorkItem::BuildUnaryOp { op });
+                            work_stack.push(WorkItem::Process(expr));
+                        }
+                        SqlExpr::Nested(inner) => {
+                            work_stack.push(WorkItem::BuildNested);
+                            work_stack.push(WorkItem::Process(inner));
+                        }
+                        SqlExpr::IsNull(inner) => {
+                            work_stack.push(WorkItem::BuildIsNull);
+                            work_stack.push(WorkItem::Process(inner));
+                        }
+                        SqlExpr::IsNotNull(inner) => {
+                            work_stack.push(WorkItem::BuildIsNotNull);
+                            work_stack.push(WorkItem::Process(inner));
+                        }
+                        SqlExpr::Between {
+                            expr,
+                            negated,
+                            low,
+                            high,
+                        } => {
+                            work_stack.push(WorkItem::FinishBetween { negated });
+                            work_stack.push(WorkItem::Process(high));
+                            work_stack.push(WorkItem::Process(low));
+                            work_stack.push(WorkItem::Process(expr));
+                        }
+                        // All other expressions: push as-is to result stack
+                        other => {
+                            result_stack.push(other);
+                        }
+                    }
+                }
+                WorkItem::BuildBinaryOp {
+                    op,
+                    left,
+                    right_done,
+                } => {
+                    if !right_done {
+                        // Left done, now mark that right will be done next
+                        let left_result = result_stack.pop().unwrap();
+                        work_stack.push(WorkItem::BuildBinaryOp {
+                            op,
+                            left: Box::new(left_result),
+                            right_done: true,
+                        });
+                    } else {
+                        // Both done, build the BinaryOp
+                        let right_result = result_stack.pop().unwrap();
+                        let left_result = *left;
+                        result_stack.push(SqlExpr::BinaryOp {
+                            left: Box::new(left_result),
+                            op,
+                            right: Box::new(right_result),
+                        });
+                    }
+                }
+                WorkItem::BuildUnaryOp { op } => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::UnaryOp {
+                        op,
+                        expr: Box::new(inner),
+                    });
+                }
+                WorkItem::BuildNested => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::Nested(Box::new(inner)));
+                }
+                WorkItem::BuildIsNull => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::IsNull(Box::new(inner)));
+                }
+                WorkItem::BuildIsNotNull => {
+                    let inner = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::IsNotNull(Box::new(inner)));
+                }
+                WorkItem::FinishBetween { negated } => {
+                    let high_result = result_stack.pop().unwrap();
+                    let low_result = result_stack.pop().unwrap();
+                    let expr_result = result_stack.pop().unwrap();
+                    result_stack.push(SqlExpr::Between {
+                        expr: Box::new(expr_result),
+                        negated,
+                        low: Box::new(low_result),
+                        high: Box::new(high_result),
+                    });
+                }
+            }
+        }
+
+        // Final result should be the only item on the result stack
+        Ok(result_stack
+            .pop()
+            .expect("result stack should have exactly one item"))
+    }
+
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
         // Check for pragma_table_info() table function first
         if let Some(result) = self.try_handle_pragma_table_info(&query)? {
@@ -2871,11 +3125,15 @@ where
         select: &Select,
         resolver: &IdentifierResolver<'_>,
     ) -> SqlResult<(SelectPlan, IdentifierContext)> {
-        if select.distinct.is_some() {
-            return Err(Error::InvalidArgumentError(
-                "SELECT DISTINCT is not supported".into(),
-            ));
-        }
+        let distinct = match &select.distinct {
+            None => false,
+            Some(Distinct::Distinct) => true,
+            Some(Distinct::On(_)) => {
+                return Err(Error::InvalidArgumentError(
+                    "SELECT DISTINCT ON is not supported".into(),
+                ));
+            }
+        };
         if select.top.is_some() {
             return Err(Error::InvalidArgumentError(
                 "SELECT TOP is not supported".into(),
@@ -2932,9 +3190,10 @@ where
                 _ => None,
             });
 
-        if let Some(alias) = table_alias.as_ref() {
-            validate_projection_alias_qualifiers(&select.projection, alias)?;
-        }
+        let has_joins = select
+            .from
+            .iter()
+            .any(|table_with_joins| !table_with_joins.joins.is_empty());
         // Handle different FROM clause scenarios
         let catalog = self.engine.context().table_catalog();
         let (mut plan, id_context) = if select.from.is_empty() {
@@ -2947,24 +3206,29 @@ where
             )?;
             p = p.with_projections(projections);
             (p, IdentifierContext::new(None))
-        } else if select.from.len() == 1 {
+        } else if select.from.len() == 1 && !has_joins {
             // Single table query
             let (display_name, canonical_name) = extract_single_table(&select.from)?;
             let table_id = catalog.table_id(&canonical_name);
             let mut p = SelectPlan::new(display_name.clone());
+            let single_table_context =
+                IdentifierContext::new(table_id).with_table_alias(table_alias.clone());
+            if let Some(alias) = table_alias.as_ref() {
+                validate_projection_alias_qualifiers(&select.projection, alias)?;
+            }
             if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
                 p = p.with_aggregates(aggregates);
             } else {
                 let projections = self.build_projection_list(
                     resolver,
-                    IdentifierContext::new(table_id),
+                    single_table_context.clone(),
                     &select.projection,
                 )?;
                 p = p.with_projections(projections);
             }
-            (p, IdentifierContext::new(table_id))
+            (p, single_table_context)
         } else {
-            // Multiple tables - cross product
+            // Multiple tables or explicit joins - treat as cross product for now
             let tables = extract_tables(&select.from)?;
             let mut p = SelectPlan::with_tables(tables);
             // For multi-table queries, we'll build projections differently
@@ -2979,12 +3243,18 @@ where
         };
 
         let filter_expr = match &select.selection {
-            Some(expr) => Some(translate_condition_with_context(
-                resolver, id_context, expr,
-            )?),
+            Some(expr) => {
+                let materialized_expr = self.materialize_in_subquery(expr.clone())?;
+                Some(translate_condition_with_context(
+                    resolver,
+                    id_context.clone(),
+                    &materialized_expr,
+                )?)
+            }
             None => None,
         };
         plan = plan.with_filter(filter_expr);
+        plan = plan.with_distinct(distinct);
         Ok((plan, id_context))
     }
 
@@ -3004,16 +3274,6 @@ where
         };
 
         let base_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
-
-        let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
-            let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
-            match scalar {
-                llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
-                other => Err(Error::InvalidArgumentError(format!(
-                    "ORDER BY expression must reference a simple column, found {other:?}"
-                ))),
-            }
-        };
 
         let mut plans = Vec::with_capacity(exprs.len());
         for order_expr in exprs {
@@ -3043,7 +3303,11 @@ where
 
             let (target, sort_type) = match &order_expr.expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
-                    OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
+                    OrderTarget::Column(Self::resolve_simple_column_expr(
+                        resolver,
+                        id_context.clone(),
+                        &order_expr.expr,
+                    )?),
                     OrderSortType::Native,
                 ),
                 SqlExpr::Cast {
@@ -3056,7 +3320,11 @@ where
                         | SqlDataType::TinyInt(_),
                     ..
                 } => (
-                    OrderTarget::Column(resolve_simple_column(expr)?),
+                    OrderTarget::Column(Self::resolve_simple_column_expr(
+                        resolver,
+                        id_context.clone(),
+                        expr,
+                    )?),
                     OrderSortType::CastTextToInteger,
                 ),
                 SqlExpr::Cast { data_type, .. } => {
@@ -3102,6 +3370,20 @@ where
         }
 
         Ok(plans)
+    }
+
+    fn resolve_simple_column_expr(
+        resolver: &IdentifierResolver<'_>,
+        context: IdentifierContext,
+        expr: &SqlExpr,
+    ) -> SqlResult<String> {
+        let scalar = translate_scalar_with_context(resolver, context, expr)?;
+        match scalar {
+            llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
+            other => Err(Error::InvalidArgumentError(format!(
+                "ORDER BY expression must reference a simple column, found {other:?}"
+            ))),
+        }
     }
 
     fn detect_simple_aggregates(
@@ -3325,7 +3607,7 @@ where
                 SelectItem::UnnamedExpr(expr) => match expr {
                     SqlExpr::Identifier(ident) => {
                         let parts = vec![ident.value.clone()];
-                        let resolution = resolver.resolve(&parts, id_context)?;
+                        let resolution = resolver.resolve(&parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3342,7 +3624,7 @@ where
                     SqlExpr::CompoundIdentifier(parts) => {
                         let name_parts: Vec<String> =
                             parts.iter().map(|part| part.value.clone()).collect();
-                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        let resolution = resolver.resolve(&name_parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3358,7 +3640,8 @@ where
                     }
                     _ => {
                         let alias = format!("col{}", idx + 1);
-                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+                        let scalar =
+                            translate_scalar_with_context(resolver, id_context.clone(), expr)?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias,
@@ -3368,7 +3651,7 @@ where
                 SelectItem::ExprWithAlias { expr, alias } => match expr {
                     SqlExpr::Identifier(ident) => {
                         let parts = vec![ident.value.clone()];
-                        let resolution = resolver.resolve(&parts, id_context)?;
+                        let resolution = resolver.resolve(&parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3384,7 +3667,7 @@ where
                     SqlExpr::CompoundIdentifier(parts) => {
                         let name_parts: Vec<String> =
                             parts.iter().map(|part| part.value.clone()).collect();
-                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        let resolution = resolver.resolve(&name_parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3398,7 +3681,8 @@ where
                         }
                     }
                     _ => {
-                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+                        let scalar =
+                            translate_scalar_with_context(resolver, id_context.clone(), expr)?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias: alias.value.clone(),
@@ -3693,22 +3977,10 @@ fn extract_index_column_name(
 
     // Validate sort options
     if allow_sort_options {
-        // For CREATE INDEX: validate specific values are supported
-        let ascending = order_expr.options.asc.unwrap_or(true);
-        let nulls_first = order_expr.options.nulls_first.unwrap_or(false);
-
-        if !ascending {
-            return Err(Error::InvalidArgumentError(format!(
-                "{} DESC ordering is not supported",
-                context
-            )));
-        }
-        if nulls_first {
-            return Err(Error::InvalidArgumentError(format!(
-                "{} NULLS FIRST ordering is not supported",
-                context
-            )));
-        }
+        // For CREATE INDEX: extract and validate sort options
+        let _ascending = order_expr.options.asc.unwrap_or(true);
+        let _nulls_first = order_expr.options.nulls_first.unwrap_or(false);
+        // DESC and NULLS FIRST are now supported
     } else {
         // For constraints: no sort options allowed
         if order_expr.options.asc.is_some()
@@ -4211,66 +4483,274 @@ fn translate_condition_with_context(
     context: IdentifierContext,
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    match expr {
-        SqlExpr::IsNull(inner) => {
-            let scalar = translate_scalar_with_context(resolver, context, inner)?;
-            match scalar {
-                llkv_expr::expr::ScalarExpr::Column(column) => {
-                    Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
-                        field_id: column,
-                        op: llkv_expr::expr::Operator::IsNull,
-                    }))
+    // Iterative postorder traversal using the TransformFrame pattern.
+    // See llkv-plan::TransformFrame documentation for pattern details.
+    //
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
+    // explicit work_stack and result_stack instead of recursion.
+
+    enum ConditionExitContext {
+        And,
+        Or,
+        Not,
+        Nested,
+    }
+
+    type ConditionFrame<'a> = llkv_plan::TransformFrame<
+        'a,
+        SqlExpr,
+        llkv_expr::expr::Expr<'static, String>,
+        ConditionExitContext,
+    >;
+
+    let mut work_stack: Vec<ConditionFrame> = vec![ConditionFrame::Enter(expr)];
+    let mut result_stack: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
+
+    while let Some(frame) = work_stack.pop() {
+        match frame {
+            ConditionFrame::Enter(node) => match node {
+                SqlExpr::BinaryOp { left, op, right } => match op {
+                    BinaryOperator::And => {
+                        work_stack.push(ConditionFrame::Exit(ConditionExitContext::And));
+                        work_stack.push(ConditionFrame::Enter(right));
+                        work_stack.push(ConditionFrame::Enter(left));
+                    }
+                    BinaryOperator::Or => {
+                        work_stack.push(ConditionFrame::Exit(ConditionExitContext::Or));
+                        work_stack.push(ConditionFrame::Enter(right));
+                        work_stack.push(ConditionFrame::Enter(left));
+                    }
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq => {
+                        let result = translate_comparison_with_context(
+                            resolver,
+                            context.clone(),
+                            left,
+                            op.clone(),
+                            right,
+                        )?;
+                        work_stack.push(ConditionFrame::Leaf(result));
+                    }
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "unsupported binary operator in WHERE clause: {other:?}"
+                        )));
+                    }
+                },
+                SqlExpr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: inner,
+                } => {
+                    work_stack.push(ConditionFrame::Exit(ConditionExitContext::Not));
+                    work_stack.push(ConditionFrame::Enter(inner));
                 }
-                _ => Err(Error::InvalidArgumentError(
-                    "IS NULL predicates currently support column references only".into(),
-                )),
-            }
-        }
-        SqlExpr::IsNotNull(inner) => {
-            let scalar = translate_scalar_with_context(resolver, context, inner)?;
-            match scalar {
-                llkv_expr::expr::ScalarExpr::Column(column) => {
-                    Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
-                        field_id: column,
-                        op: llkv_expr::expr::Operator::IsNotNull,
-                    }))
+                SqlExpr::Nested(inner) => {
+                    work_stack.push(ConditionFrame::Exit(ConditionExitContext::Nested));
+                    work_stack.push(ConditionFrame::Enter(inner));
                 }
-                _ => Err(Error::InvalidArgumentError(
-                    "IS NOT NULL predicates currently support column references only".into(),
-                )),
+                SqlExpr::IsNull(inner) => {
+                    let scalar = translate_scalar_with_context(resolver, context.clone(), inner)?;
+                    match scalar {
+                        llkv_expr::expr::ScalarExpr::Column(column) => {
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
+                                llkv_expr::expr::Filter {
+                                    field_id: column,
+                                    op: llkv_expr::expr::Operator::IsNull,
+                                },
+                            )));
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgumentError(
+                                "IS NULL predicates currently support column references only"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                SqlExpr::IsNotNull(inner) => {
+                    let scalar = translate_scalar_with_context(resolver, context.clone(), inner)?;
+                    match scalar {
+                        llkv_expr::expr::ScalarExpr::Column(column) => {
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
+                                llkv_expr::expr::Filter {
+                                    field_id: column,
+                                    op: llkv_expr::expr::Operator::IsNotNull,
+                                },
+                            )));
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgumentError(
+                                "IS NOT NULL predicates currently support column references only"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                SqlExpr::InList {
+                    expr: in_expr,
+                    list,
+                    negated,
+                } => {
+                    if list.is_empty() {
+                        let result = if *negated {
+                            llkv_expr::expr::Expr::Literal(true)
+                        } else {
+                            llkv_expr::expr::Expr::Literal(false)
+                        };
+                        work_stack.push(ConditionFrame::Leaf(result));
+                    } else {
+                        let target =
+                            translate_scalar_with_context(resolver, context.clone(), in_expr)?;
+                        let mut values = Vec::with_capacity(list.len());
+                        for value_expr in list {
+                            let scalar = translate_scalar_with_context(
+                                resolver,
+                                context.clone(),
+                                value_expr,
+                            )?;
+                            values.push(scalar);
+                        }
+
+                        work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::InList {
+                            expr: target,
+                            list: values,
+                            negated: *negated,
+                        }));
+                    }
+                }
+                SqlExpr::InSubquery { .. } => {
+                    return Err(Error::InvalidArgumentError(
+                        "IN (SELECT ...) subqueries must be materialized before translation".into(),
+                    ));
+                }
+                SqlExpr::Between {
+                    expr: between_expr,
+                    negated,
+                    low,
+                    high,
+                } => {
+                    let lower_bound = translate_comparison_with_context(
+                        resolver,
+                        context.clone(),
+                        between_expr,
+                        BinaryOperator::GtEq,
+                        low,
+                    )?;
+                    let upper_bound = translate_comparison_with_context(
+                        resolver,
+                        context.clone(),
+                        between_expr,
+                        BinaryOperator::LtEq,
+                        high,
+                    )?;
+
+                    let between_expr_result =
+                        llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]);
+
+                    let result = if *negated {
+                        llkv_expr::expr::Expr::not(between_expr_result)
+                    } else {
+                        between_expr_result
+                    };
+                    work_stack.push(ConditionFrame::Leaf(result));
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported WHERE clause: {other:?}"
+                    )));
+                }
+            },
+            ConditionFrame::Leaf(translated) => {
+                result_stack.push(translated);
             }
+            ConditionFrame::Exit(exit_context) => match exit_context {
+                ConditionExitContext::And => {
+                    let right = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_condition: result stack underflow for And right".into(),
+                        )
+                    })?;
+                    let left = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_condition: result stack underflow for And left".into(),
+                        )
+                    })?;
+                    result_stack.push(flatten_and(left, right));
+                }
+                ConditionExitContext::Or => {
+                    let right = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_condition: result stack underflow for Or right".into(),
+                        )
+                    })?;
+                    let left = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_condition: result stack underflow for Or left".into(),
+                        )
+                    })?;
+                    result_stack.push(flatten_or(left, right));
+                }
+                ConditionExitContext::Not => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_condition: result stack underflow for Not".into(),
+                        )
+                    })?;
+                    result_stack.push(llkv_expr::expr::Expr::not(inner));
+                }
+                ConditionExitContext::Nested => {
+                    // Nested is a no-op - just pass through the inner expression
+                }
+            },
         }
-        SqlExpr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => Ok(llkv_expr::expr::Expr::And(vec![
-                translate_condition_with_context(resolver, context, left)?,
-                translate_condition_with_context(resolver, context, right)?,
-            ])),
-            BinaryOperator::Or => Ok(llkv_expr::expr::Expr::Or(vec![
-                translate_condition_with_context(resolver, context, left)?,
-                translate_condition_with_context(resolver, context, right)?,
-            ])),
-            BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq => {
-                translate_comparison_with_context(resolver, context, left, op.clone(), right)
-            }
-            other => Err(Error::InvalidArgumentError(format!(
-                "unsupported binary operator in WHERE clause: {other:?}"
-            ))),
-        },
-        SqlExpr::UnaryOp {
-            op: UnaryOperator::Not,
-            expr,
-        } => Ok(llkv_expr::expr::Expr::not(
-            translate_condition_with_context(resolver, context, expr)?,
-        )),
-        SqlExpr::Nested(inner) => translate_condition_with_context(resolver, context, inner),
-        other => Err(Error::InvalidArgumentError(format!(
-            "unsupported WHERE clause: {other:?}"
-        ))),
+    }
+
+    result_stack.pop().ok_or_else(|| {
+        Error::Internal("translate_condition_with_context: empty result stack".into())
+    })
+}
+
+fn flatten_and(
+    left: llkv_expr::expr::Expr<'static, String>,
+    right: llkv_expr::expr::Expr<'static, String>,
+) -> llkv_expr::expr::Expr<'static, String> {
+    let mut children: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
+    match left {
+        llkv_expr::expr::Expr::And(mut left_children) => children.append(&mut left_children),
+        other => children.push(other),
+    }
+    match right {
+        llkv_expr::expr::Expr::And(mut right_children) => children.append(&mut right_children),
+        other => children.push(other),
+    }
+    if children.len() == 1 {
+        children.into_iter().next().unwrap()
+    } else {
+        llkv_expr::expr::Expr::And(children)
+    }
+}
+
+fn flatten_or(
+    left: llkv_expr::expr::Expr<'static, String>,
+    right: llkv_expr::expr::Expr<'static, String>,
+) -> llkv_expr::expr::Expr<'static, String> {
+    let mut children: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
+    match left {
+        llkv_expr::expr::Expr::Or(mut left_children) => children.append(&mut left_children),
+        other => children.push(other),
+    }
+    match right {
+        llkv_expr::expr::Expr::Or(mut right_children) => children.append(&mut right_children),
+        other => children.push(other),
+    }
+    if children.len() == 1 {
+        children.into_iter().next().unwrap()
+    } else {
+        llkv_expr::expr::Expr::Or(children)
     }
 }
 
@@ -4281,7 +4761,7 @@ fn translate_comparison_with_context(
     op: BinaryOperator,
     right: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    let left_scalar = translate_scalar_with_context(resolver, context, left)?;
+    let left_scalar = translate_scalar_with_context(resolver, context.clone(), left)?;
     let right_scalar = translate_scalar_with_context(resolver, context, right)?;
     let compare_op = match op {
         BinaryOperator::Eq => llkv_expr::expr::CompareOp::Eq,
@@ -4303,6 +4783,12 @@ fn translate_comparison_with_context(
     ) = (&left_scalar, &right_scalar)
         && let Some(op) = compare_op_to_filter_operator(compare_op, literal)
     {
+        tracing::debug!(
+            column = ?column,
+            literal = ?literal,
+            ?compare_op,
+            "translate_comparison direct"
+        );
         return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
             field_id: column.clone(),
             op,
@@ -4316,6 +4802,13 @@ fn translate_comparison_with_context(
         && let Some(flipped) = flip_compare_op(compare_op)
         && let Some(op) = compare_op_to_filter_operator(flipped, literal)
     {
+        tracing::debug!(
+            column = ?column,
+            literal = ?literal,
+            original_op = ?compare_op,
+            flipped_op = ?flipped,
+            "translate_comparison flipped"
+        );
         return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
             field_id: column.clone(),
             op,
@@ -4333,7 +4826,11 @@ fn compare_op_to_filter_operator(
     op: llkv_expr::expr::CompareOp,
     literal: &Literal,
 ) -> Option<llkv_expr::expr::Operator<'static>> {
+    if matches!(literal, Literal::Null) {
+        return None;
+    }
     let lit = literal.clone();
+    tracing::debug!(?op, literal = ?literal, "compare_op_to_filter_operator input");
     match op {
         llkv_expr::expr::CompareOp::Eq => Some(llkv_expr::expr::Operator::Equals(lit)),
         llkv_expr::expr::CompareOp::Lt => Some(llkv_expr::expr::Operator::LessThan(lit)),
@@ -4363,138 +4860,244 @@ fn translate_scalar_with_context(
     context: IdentifierContext,
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    match expr {
-        SqlExpr::Identifier(ident) => {
-            let parts = vec![ident.value.clone()];
-            let resolution = resolver.resolve(&parts, context)?;
-            Ok(resolution.into_scalar_expr())
-        }
-        SqlExpr::CompoundIdentifier(idents) => {
-            if idents.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "invalid compound identifier".into(),
-                ));
-            }
-
-            let parts: Vec<String> = idents.iter().map(|ident| ident.value.clone()).collect();
-            let resolution = resolver.resolve(&parts, context)?;
-            Ok(resolution.into_scalar_expr())
-        }
-        _ => translate_scalar(expr),
-    }
+    translate_scalar_internal(expr, Some(resolver), Some(&context))
 }
 
-// TODO: Rename?  Already many `translate_scaler` functions... be more sepcific?
+#[allow(dead_code)]
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    match expr {
-        SqlExpr::Identifier(ident) => Ok(llkv_expr::expr::ScalarExpr::column(ident.value.clone())),
-        SqlExpr::CompoundIdentifier(idents) => {
-            if idents.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "invalid compound identifier".into(),
-                ));
-            }
+    translate_scalar_internal(expr, None, None)
+}
 
-            // Without table context, treat first part as column, rest as fields
-            let column_name = idents[0].value.clone();
-            let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
+fn translate_scalar_internal(
+    expr: &SqlExpr,
+    resolver: Option<&IdentifierResolver<'_>>,
+    context: Option<&IdentifierContext>,
+) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+    // Iterative postorder traversal using the TransformFrame pattern.
+    // See llkv-plan::traversal module documentation for pattern details.
+    //
+    // This avoids stack overflow on deeply nested expressions (50k+ nodes) by using
+    // explicit work_stack and result_stack instead of recursion.
 
-            for part in &idents[1..] {
-                let field_name = part.value.clone();
-                result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
-            }
+    /// Context passed through Exit frames during scalar expression translation
+    enum ScalarExitContext {
+        BinaryOp { op: BinaryOperator },
+        UnaryMinus,
+        UnaryPlus,
+        Nested,
+    }
 
-            Ok(result)
-        }
-        SqlExpr::Value(value) => literal_from_value(value),
-        SqlExpr::BinaryOp { left, op, right } => {
-            let left_expr = translate_scalar(left)?;
-            let right_expr = translate_scalar(right)?;
-            let op = match op {
-                BinaryOperator::Plus => llkv_expr::expr::BinaryOp::Add,
-                BinaryOperator::Minus => llkv_expr::expr::BinaryOp::Subtract,
-                BinaryOperator::Multiply => llkv_expr::expr::BinaryOp::Multiply,
-                BinaryOperator::Divide => llkv_expr::expr::BinaryOp::Divide,
-                BinaryOperator::Modulo => llkv_expr::expr::BinaryOp::Modulo,
-                other => {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported scalar binary operator: {other:?}"
-                    )));
-                }
-            };
-            Ok(llkv_expr::expr::ScalarExpr::binary(
-                left_expr, op, right_expr,
-            ))
-        }
-        SqlExpr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr,
-        } => match translate_scalar(expr)? {
-            llkv_expr::expr::ScalarExpr::Literal(lit) => match lit {
-                Literal::Integer(v) => {
-                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Integer(-v)))
-                }
-                Literal::Float(v) => Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float(-v))),
-                Literal::Boolean(_) => Err(Error::InvalidArgumentError(
-                    "cannot negate boolean literal".into(),
-                )),
-                Literal::String(_) => Err(Error::InvalidArgumentError(
-                    "cannot negate string literal".into(),
-                )),
-                Literal::Struct(_) => Err(Error::InvalidArgumentError(
-                    "cannot negate struct literal".into(),
-                )),
-                Literal::Null => Err(Error::InvalidArgumentError(
-                    "cannot negate null literal".into(),
-                )),
-            },
-            _ => Err(Error::InvalidArgumentError(
-                "cannot negate non-literal expression".into(),
-            )),
-        },
-        SqlExpr::UnaryOp {
-            op: UnaryOperator::Plus,
-            expr,
-        } => translate_scalar(expr),
-        SqlExpr::Nested(inner) => translate_scalar(inner),
-        SqlExpr::Function(func) => {
-            // Try to parse as an aggregate function
-            if let Some(agg_call) = try_parse_aggregate_function(func)? {
-                Ok(llkv_expr::expr::ScalarExpr::aggregate(agg_call))
-            } else {
-                Err(Error::InvalidArgumentError(format!(
-                    "unsupported function in scalar expression: {:?}",
-                    func.name
-                )))
-            }
-        }
-        SqlExpr::Dictionary(fields) => {
-            // Dictionary literal like {'a': 1, 'b': 2} represents a STRUCT literal
-            let mut struct_fields = Vec::new();
-            for entry in fields {
-                let key = entry.key.value.clone(); // Use .value to get the actual identifier value
-                // Parse the value to a literal
-                let value_expr = translate_scalar(&entry.value)?;
-                // Extract the literal from the expression
-                match value_expr {
-                    llkv_expr::expr::ScalarExpr::Literal(lit) => {
-                        struct_fields.push((key, Box::new(lit)));
+    type ScalarFrame<'a> =
+        TransformFrame<'a, SqlExpr, llkv_expr::expr::ScalarExpr<String>, ScalarExitContext>;
+
+    let mut work_stack: Vec<ScalarFrame> = vec![ScalarFrame::Enter(expr)];
+    let mut result_stack: Vec<llkv_expr::expr::ScalarExpr<String>> = Vec::new();
+
+    while let Some(frame) = work_stack.pop() {
+        match frame {
+            ScalarFrame::Enter(node) => match node {
+                SqlExpr::Identifier(ident) => {
+                    if let (Some(resolver), Some(ctx)) = (resolver, context) {
+                        let parts = vec![ident.value.clone()];
+                        let resolution = resolver.resolve(&parts, (*ctx).clone())?;
+                        work_stack.push(ScalarFrame::Leaf(resolution.into_scalar_expr()));
+                    } else {
+                        work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::column(
+                            ident.value.clone(),
+                        )));
                     }
-                    _ => {
+                }
+                SqlExpr::CompoundIdentifier(idents) => {
+                    if idents.is_empty() {
                         return Err(Error::InvalidArgumentError(
-                            "Dictionary values must be literals".to_string(),
+                            "invalid compound identifier".into(),
                         ));
                     }
+
+                    if let (Some(resolver), Some(ctx)) = (resolver, context) {
+                        let parts: Vec<String> =
+                            idents.iter().map(|ident| ident.value.clone()).collect();
+                        let resolution = resolver.resolve(&parts, (*ctx).clone())?;
+                        work_stack.push(ScalarFrame::Leaf(resolution.into_scalar_expr()));
+                    } else {
+                        let column_name = idents[0].value.clone();
+                        let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
+
+                        for part in &idents[1..] {
+                            let field_name = part.value.clone();
+                            result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
+                        }
+
+                        work_stack.push(ScalarFrame::Leaf(result));
+                    }
                 }
+                SqlExpr::Value(value) => {
+                    let result = literal_from_value(value)?;
+                    work_stack.push(ScalarFrame::Leaf(result));
+                }
+                SqlExpr::BinaryOp { left, op, right } => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp {
+                        op: op.clone(),
+                    }));
+                    work_stack.push(ScalarFrame::Enter(right));
+                    work_stack.push(ScalarFrame::Enter(left));
+                }
+                SqlExpr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    expr: inner,
+                } => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::UnaryMinus));
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::UnaryOp {
+                    op: UnaryOperator::Plus,
+                    expr: inner,
+                } => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::UnaryPlus));
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::Nested(inner) => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::Nested));
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::Cast { expr: inner, .. } => {
+                    // TODO: implement typed CAST semantics once executor supports runtime coercions.
+                    // For now, treat CAST as a passthrough so the inner expression is evaluated normally.
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::Function(func) => {
+                    if let Some(agg_call) = try_parse_aggregate_function(func)? {
+                        work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::aggregate(
+                            agg_call,
+                        )));
+                    } else {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "unsupported function in scalar expression: {:?}",
+                            func.name
+                        )));
+                    }
+                }
+                SqlExpr::Dictionary(fields) => {
+                    // Process dictionary fields iteratively to avoid recursion
+                    let mut struct_fields = Vec::new();
+                    for entry in fields {
+                        let key = entry.key.value.clone();
+                        // Reuse scalar translation for nested values while honoring identifier context.
+                        // Dictionaries rarely nest deeply, so recursion here is acceptable.
+                        let value_expr =
+                            translate_scalar_internal(&entry.value, resolver, context)?;
+                        match value_expr {
+                            llkv_expr::expr::ScalarExpr::Literal(lit) => {
+                                struct_fields.push((key, Box::new(lit)));
+                            }
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "Dictionary values must be literals".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::literal(
+                        Literal::Struct(struct_fields),
+                    )));
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported scalar expression: {other:?}"
+                    )));
+                }
+            },
+            ScalarFrame::Leaf(translated) => {
+                result_stack.push(translated);
             }
-            Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Struct(
-                struct_fields,
-            )))
+            ScalarFrame::Exit(exit_context) => match exit_context {
+                ScalarExitContext::BinaryOp { op } => {
+                    let right_expr = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for BinaryOp right".into(),
+                        )
+                    })?;
+                    let left_expr = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for BinaryOp left".into(),
+                        )
+                    })?;
+                    let binary_op = match op {
+                        BinaryOperator::Plus => llkv_expr::expr::BinaryOp::Add,
+                        BinaryOperator::Minus => llkv_expr::expr::BinaryOp::Subtract,
+                        BinaryOperator::Multiply => llkv_expr::expr::BinaryOp::Multiply,
+                        BinaryOperator::Divide => llkv_expr::expr::BinaryOp::Divide,
+                        BinaryOperator::Modulo => llkv_expr::expr::BinaryOp::Modulo,
+                        other => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported scalar binary operator: {other:?}"
+                            )));
+                        }
+                    };
+                    result_stack.push(llkv_expr::expr::ScalarExpr::binary(
+                        left_expr, binary_op, right_expr,
+                    ));
+                }
+                ScalarExitContext::UnaryMinus => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for UnaryMinus".into(),
+                        )
+                    })?;
+                    match inner {
+                        llkv_expr::expr::ScalarExpr::Literal(lit) => match lit {
+                            Literal::Integer(v) => {
+                                result_stack.push(llkv_expr::expr::ScalarExpr::literal(
+                                    Literal::Integer(-v),
+                                ));
+                            }
+                            Literal::Float(v) => {
+                                result_stack
+                                    .push(llkv_expr::expr::ScalarExpr::literal(Literal::Float(-v)));
+                            }
+                            Literal::Boolean(_) => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate boolean literal".into(),
+                                ));
+                            }
+                            Literal::String(_) => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate string literal".into(),
+                                ));
+                            }
+                            Literal::Struct(_) => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate struct literal".into(),
+                                ));
+                            }
+                            Literal::Null => {
+                                result_stack
+                                    .push(llkv_expr::expr::ScalarExpr::literal(Literal::Null));
+                            }
+                        },
+                        other => {
+                            let zero = llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0));
+                            result_stack.push(llkv_expr::expr::ScalarExpr::binary(
+                                zero,
+                                llkv_expr::expr::BinaryOp::Subtract,
+                                other,
+                            ));
+                        }
+                    }
+                }
+                ScalarExitContext::UnaryPlus => {
+                    // Unary plus is a no-op - just pass through
+                }
+                ScalarExitContext::Nested => {
+                    // Nested is a no-op - just pass through
+                }
+            },
         }
-        other => Err(Error::InvalidArgumentError(format!(
-            "unsupported scalar expression: {other:?}"
-        ))),
     }
+
+    result_stack
+        .pop()
+        .ok_or_else(|| Error::Internal("translate_scalar: empty result stack".into()))
 }
 
 fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
@@ -4715,6 +5318,29 @@ fn resolve_row_field_types(
     Ok(fields)
 }
 
+/// Parse SQL string into statements with increased recursion limit.
+///
+/// This helper wraps sqlparser's `Parser` with a custom recursion limit to handle
+/// deeply nested queries that exceed the default limit of 50.
+///
+/// # Arguments
+///
+/// * `dialect` - SQL dialect to use for parsing
+/// * `sql` - SQL string to parse
+///
+/// # Returns
+///
+/// Parsed statements or parser error
+fn parse_sql_with_recursion_limit(
+    dialect: &GenericDialect,
+    sql: &str,
+) -> Result<Vec<Statement>, sqlparser::parser::ParserError> {
+    Parser::new(dialect)
+        .with_recursion_limit(PARSER_RECURSION_LIMIT)
+        .try_with_sql(sql)?
+        .parse_statements()
+}
+
 fn normalize_row_field_name(raw: &str) -> SqlResult<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -4737,7 +5363,7 @@ fn normalize_row_field_name(raw: &str) -> SqlResult<String> {
 fn parse_sql_data_type(type_str: &str, dialect: &GenericDialect) -> SqlResult<SqlDataType> {
     let trimmed = type_str.trim();
     let sql = format!("CREATE TABLE __row(__field {trimmed});");
-    let statements = Parser::parse_sql(dialect, &sql).map_err(|err| {
+    let statements = parse_sql_with_recursion_limit(dialect, &sql).map_err(|err| {
         Error::InvalidArgumentError(format!("failed to parse ROW field type '{trimmed}': {err}"))
     })?;
 
@@ -4916,34 +5542,52 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
     }
 }
 
-/// Extract multiple tables from FROM clause for cross products
+/// Extract table references from a FROM clause, flattening supported JOINs.
 fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>> {
     let mut tables = Vec::new();
 
     for item in from {
-        // Check if this table has joins - we don't support JOIN yet
-        if !item.joins.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "JOIN clauses are not supported yet".into(),
-            ));
-        }
+        push_table_factor(&item.relation, &mut tables)?;
 
-        // Extract table name
-        match &item.relation {
-            TableFactor::Table { name, .. } => {
-                let (schema_opt, table) = parse_schema_qualified_name(name)?;
-                let schema = schema_opt.unwrap_or_default();
-                tables.push(llkv_plan::TableRef::new(schema, table));
-            }
-            _ => {
-                return Err(Error::InvalidArgumentError(
-                    "queries require a plain table name".into(),
-                ));
+        for join in &item.joins {
+            match &join.join_operator {
+                JoinOperator::CrossJoin(JoinConstraint::None)
+                | JoinOperator::Inner(JoinConstraint::None) => {
+                    push_table_factor(&join.relation, &mut tables)?;
+                }
+                JoinOperator::CrossJoin(_) => {
+                    return Err(Error::InvalidArgumentError(
+                        "CROSS JOIN with constraints is not supported".into(),
+                    ));
+                }
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "only CROSS JOIN without constraints is supported".into(),
+                    ));
+                }
             }
         }
     }
 
     Ok(tables)
+}
+
+fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>) -> SqlResult<()> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let (schema_opt, table) = parse_schema_qualified_name(name)?;
+            let schema = schema_opt.unwrap_or_default();
+            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+            tables.push(llkv_plan::TableRef::with_alias(schema, table, alias_name));
+            Ok(())
+        }
+        TableFactor::Derived { .. } => Err(Error::InvalidArgumentError(
+            "JOIN clauses require base tables; derived tables are not supported".into(),
+        )),
+        _ => Err(Error::InvalidArgumentError(
+            "queries require a plain table name".into(),
+        )),
+    }
 }
 
 fn group_by_is_empty(expr: &GroupByExpr) -> bool {
@@ -5086,6 +5730,130 @@ mod tests {
     }
 
     #[test]
+    fn not_null_comparison_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE single(col INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO single VALUES (1)")
+            .expect("insert row");
+
+        let batches = engine
+            .sql("SELECT * FROM single WHERE NOT ( NULL ) >= NULL")
+            .expect("run constant null comparison");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "expected filter to remove all rows");
+    }
+
+    #[test]
+    fn not_null_in_list_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO tab0 VALUES (1, 2, 3)")
+            .expect("insert row");
+
+        let batches = engine
+            .sql("SELECT * FROM tab0 WHERE NOT ( NULL ) IN ( - col2 * + col2 )")
+            .expect("run IN list null comparison");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "expected IN list filter to remove all rows");
+    }
+
+    #[test]
+    fn cross_join_not_null_comparison_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE left_side(col INTEGER)")
+            .expect("create left table");
+        engine
+            .execute("CREATE TABLE right_side(col INTEGER)")
+            .expect("create right table");
+        engine
+            .execute("INSERT INTO left_side VALUES (1)")
+            .expect("insert left row");
+        engine
+            .execute("INSERT INTO right_side VALUES (2)")
+            .expect("insert right row");
+
+        let batches = engine
+            .sql("SELECT * FROM left_side CROSS JOIN right_side WHERE NOT ( NULL ) >= NULL")
+            .expect("run cross join null comparison");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "expected cross join filter to remove all rows"
+        );
+    }
+
+    #[test]
+    fn cross_join_duplicate_table_name_resolves_columns() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        use sqlparser::ast::{SetExpr, Statement};
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        engine
+            .execute("CREATE TABLE tab1(col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+            .expect("create tab1");
+        engine
+            .execute("INSERT INTO tab1 VALUES (7, 8, 9)")
+            .expect("insert tab1 row");
+
+        let dialect = SQLiteDialect {};
+        let ast = Parser::parse_sql(
+            &dialect,
+            "SELECT tab1.col2 FROM tab1 AS cor0 CROSS JOIN tab1",
+        )
+        .expect("parse cross join query");
+        let Statement::Query(query) = &ast[0] else {
+            panic!("expected SELECT query");
+        };
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select.as_ref(),
+            other => panic!("unexpected query body: {other:?}"),
+        };
+        assert_eq!(select.from.len(), 1);
+        assert!(!select.from[0].joins.is_empty());
+
+        let batches = engine
+            .sql("SELECT tab1.col2 FROM tab1 AS cor0 CROSS JOIN tab1")
+            .expect("run cross join with alias and base table");
+
+        let mut values = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..column.len() {
+                if column.is_null(idx) {
+                    values.push(None);
+                } else {
+                    values.push(Some(column.value(idx)));
+                }
+            }
+        }
+
+        assert_eq!(values, vec![Some(9)]);
+    }
+
+    #[test]
     fn update_with_where_clause_filters_rows() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
@@ -5218,7 +5986,7 @@ mod tests {
     #[test]
     fn arrow_type_from_row_returns_struct_fields() {
         let dialect = GenericDialect {};
-        let statements = Parser::parse_sql(
+        let statements = parse_sql_with_recursion_limit(
             &dialect,
             "CREATE TABLE row_types(payload ROW(a INTEGER, b VARCHAR));",
         )

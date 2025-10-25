@@ -14,12 +14,12 @@ use crate::constraints::{
 use crate::constraints::{ForeignKeyTableInfo, ValidatedForeignKey, validate_foreign_keys};
 use crate::reserved;
 use crate::resolvers::resolve_table_name;
-use crate::sys_catalog::SingleColumnIndexEntryMeta;
 use crate::sys_catalog::{ConstraintNameRecord, SysCatalog};
+use crate::sys_catalog::{MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 use crate::view::{ForeignKeyView, TableView};
-use crate::{ColMeta, MultiColumnUniqueEntryMeta, TableMeta, TableMultiColumnUniqueMeta};
+use crate::{ColMeta, TableMeta, TableMultiColumnIndexMeta};
 use arrow::datatypes::DataType;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
@@ -38,6 +38,8 @@ pub struct SingleColumnIndexEntry {
     pub column_id: FieldId,
     pub column_name: String,
     pub unique: bool,
+    pub ascending: bool,
+    pub nulls_first: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,9 +47,9 @@ struct TableSnapshot {
     table_meta: Option<TableMeta>,
     column_metas: FxHashMap<FieldId, ColMeta>,
     constraints: FxHashMap<ConstraintId, ConstraintRecord>,
-    multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
     constraint_names: FxHashMap<ConstraintId, String>,
     single_indexes: FxHashMap<String, SingleColumnIndexEntry>,
+    multi_column_indexes: FxHashMap<String, MultiColumnIndexEntryMeta>,
     sort_indexes: FxHashSet<FieldId>,
 }
 
@@ -56,18 +58,18 @@ impl TableSnapshot {
         table_meta: Option<TableMeta>,
         column_metas: FxHashMap<FieldId, ColMeta>,
         constraints: FxHashMap<ConstraintId, ConstraintRecord>,
-        multi_uniques: Vec<MultiColumnUniqueEntryMeta>,
         constraint_names: FxHashMap<ConstraintId, String>,
         single_indexes: FxHashMap<String, SingleColumnIndexEntry>,
+        multi_column_indexes: FxHashMap<String, MultiColumnIndexEntryMeta>,
         sort_indexes: FxHashSet<FieldId>,
     ) -> Self {
         Self {
             table_meta,
             column_metas,
             constraints,
-            multi_uniques,
             constraint_names,
             single_indexes,
+            multi_column_indexes,
             sort_indexes,
         }
     }
@@ -187,11 +189,13 @@ where
         } else {
             catalog.get_constraint_names(table_id, &constraint_ids)?
         };
-        let multi_uniques = catalog.get_multi_column_uniques(table_id)?;
+        let multi_uniques = catalog.get_multi_column_indexes(table_id)?;
         let single_index_metas = catalog.get_single_column_indexes(table_id)?;
+        let multi_column_index_metas = catalog.get_multi_column_indexes(table_id)?;
         let mut constraints = FxHashMap::default();
         let mut constraint_names = FxHashMap::default();
         let mut single_indexes = FxHashMap::default();
+        let mut multi_column_indexes = FxHashMap::default();
         let mut sort_indexes = FxHashSet::default();
         for meta in single_index_metas {
             sort_indexes.insert(meta.column_id);
@@ -203,8 +207,16 @@ where
                     column_id: meta.column_id,
                     column_name: meta.column_name,
                     unique: meta.unique,
+                    ascending: meta.ascending,
+                    nulls_first: meta.nulls_first,
                 },
             );
+        }
+        for meta in multi_uniques {
+            multi_column_indexes.insert(meta.canonical_name.clone(), meta);
+        }
+        for meta in multi_column_index_metas {
+            multi_column_indexes.insert(meta.canonical_name.clone(), meta);
         }
         for (record, name) in constraint_records
             .into_iter()
@@ -219,9 +231,9 @@ where
             table_meta,
             FxHashMap::default(),
             constraints,
-            multi_uniques,
             constraint_names,
             single_indexes,
+            multi_column_indexes,
             sort_indexes,
         );
         Ok(TableState::from_snapshot(snapshot))
@@ -372,23 +384,40 @@ where
     pub fn multi_column_uniques(
         &self,
         table_id: TableId,
-    ) -> LlkvResult<Vec<MultiColumnUniqueEntryMeta>> {
+    ) -> LlkvResult<Vec<MultiColumnIndexEntryMeta>> {
         self.ensure_table_state(table_id)?;
         let tables = self.tables.read().unwrap();
         let state = tables.get(&table_id).unwrap();
-        Ok(state.current.multi_uniques.clone())
+        Ok(state
+            .current
+            .multi_column_indexes
+            .values()
+            .filter(|entry| entry.unique)
+            .cloned()
+            .collect())
     }
 
     /// Replace the cached multi-column UNIQUE definitions for the table.
     pub fn set_multi_column_uniques(
         &self,
         table_id: TableId,
-        uniques: Vec<MultiColumnUniqueEntryMeta>,
+        uniques: Vec<MultiColumnIndexEntryMeta>,
     ) -> LlkvResult<()> {
         self.ensure_table_state(table_id)?;
         let mut tables = self.tables.write().unwrap();
         let state = tables.get_mut(&table_id).unwrap();
-        state.current.multi_uniques = uniques;
+        // Remove all existing unique multi-column indexes
+        state
+            .current
+            .multi_column_indexes
+            .retain(|_, entry| !entry.unique);
+        // Add the new unique indexes
+        for unique in uniques {
+            state
+                .current
+                .multi_column_indexes
+                .insert(unique.canonical_name.clone(), unique);
+        }
         Ok(())
     }
 
@@ -460,6 +489,54 @@ where
         Ok(removed)
     }
 
+    /// Register or replace a multi-column index metadata entry in the cached snapshot.
+    pub fn put_multi_column_index(
+        &self,
+        table_id: TableId,
+        entry: MultiColumnIndexEntryMeta,
+    ) -> LlkvResult<()> {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        state
+            .current
+            .multi_column_indexes
+            .insert(entry.canonical_name.clone(), entry);
+        Ok(())
+    }
+
+    /// Remove a multi-column index metadata entry from the cached snapshot.
+    pub fn remove_multi_column_index(
+        &self,
+        table_id: TableId,
+        canonical_index_name: &str,
+    ) -> LlkvResult<Option<MultiColumnIndexEntryMeta>> {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        Ok(state
+            .current
+            .multi_column_indexes
+            .remove(canonical_index_name))
+    }
+
+    /// Retrieve a multi-column index metadata entry by canonical name.
+    pub fn get_multi_column_index(
+        &self,
+        table_id: TableId,
+        canonical_index_name: &str,
+    ) -> LlkvResult<Option<MultiColumnIndexEntryMeta>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        Ok(tables.get(&table_id).and_then(|state| {
+            state
+                .current
+                .multi_column_indexes
+                .get(canonical_index_name)
+                .cloned()
+        }))
+    }
+
     /// Register a sort index for a column at the metadata level, staging the change for the next flush.
     pub fn register_sort_index(&self, table_id: TableId, field_id: FieldId) -> LlkvResult<()> {
         self.ensure_table_state(table_id)?;
@@ -512,12 +589,31 @@ where
     /// Mutate the cached multi-column UNIQUE definitions for a table in-place.
     pub fn update_multi_column_uniques<F, T>(&self, table_id: TableId, f: F) -> LlkvResult<T>
     where
-        F: FnOnce(&mut Vec<MultiColumnUniqueEntryMeta>) -> T,
+        F: FnOnce(&mut Vec<MultiColumnIndexEntryMeta>) -> T,
     {
         self.ensure_table_state(table_id)?;
         let mut tables = self.tables.write().unwrap();
         let state = tables.get_mut(&table_id).unwrap();
-        let result = f(&mut state.current.multi_uniques);
+        let mut uniques: Vec<MultiColumnIndexEntryMeta> = state
+            .current
+            .multi_column_indexes
+            .values()
+            .filter(|entry| entry.unique)
+            .cloned()
+            .collect();
+        let result = f(&mut uniques);
+        // Remove all existing unique multi-column indexes
+        state
+            .current
+            .multi_column_indexes
+            .retain(|_, entry| !entry.unique);
+        // Add back the modified unique indexes
+        for unique in uniques {
+            state
+                .current
+                .multi_column_indexes
+                .insert(unique.canonical_name.clone(), unique);
+        }
         Ok(result)
     }
 
@@ -537,9 +633,9 @@ where
             state.current.table_meta = None;
             state.current.column_metas.clear();
             state.current.constraints.clear();
-            state.current.multi_uniques.clear();
             state.current.constraint_names.clear();
             state.current.single_indexes.clear();
+            state.current.multi_column_indexes.clear();
             state.current.sort_indexes.clear();
         }
         drop(tables);
@@ -755,14 +851,21 @@ where
             }
         }
 
-        if state.current.multi_uniques != state.persisted.multi_uniques {
-            if state.current.multi_uniques.is_empty() {
-                catalog.delete_multi_column_uniques(table_id)?;
-                state.persisted.multi_uniques.clear();
+        // Flush all multi-column indexes (both unique and non-unique) to the catalog
+        if state.current.multi_column_indexes != state.persisted.multi_column_indexes {
+            if state.current.multi_column_indexes.is_empty() {
+                catalog.delete_multi_column_indexes(table_id)?;
             } else {
-                catalog.put_multi_column_uniques(table_id, &state.current.multi_uniques)?;
-                state.persisted.multi_uniques = state.current.multi_uniques.clone();
+                let mut entries: Vec<MultiColumnIndexEntryMeta> = state
+                    .current
+                    .multi_column_indexes
+                    .values()
+                    .cloned()
+                    .collect();
+                entries.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+                catalog.put_multi_column_indexes(table_id, &entries)?;
             }
+            state.persisted.multi_column_indexes = state.current.multi_column_indexes.clone();
         }
 
         if state.current.single_indexes != state.persisted.single_indexes {
@@ -781,6 +884,8 @@ where
                         column_id: entry.column_id,
                         column_name: entry.column_name,
                         unique: entry.unique,
+                        ascending: entry.ascending,
+                        nulls_first: entry.nulls_first,
                     })
                     .collect();
                 entries.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
@@ -837,9 +942,18 @@ where
     }
 
     /// Return all persisted multi-column unique metadata.
-    pub fn all_multi_column_unique_metas(&self) -> LlkvResult<Vec<TableMultiColumnUniqueMeta>> {
+    pub fn all_multi_column_unique_metas(&self) -> LlkvResult<Vec<TableMultiColumnIndexMeta>> {
         let catalog = SysCatalog::new(&self.store);
-        catalog.all_multi_column_unique_metas()
+        let all = catalog.all_multi_column_index_metas()?;
+        // Filter to unique indexes only
+        Ok(all
+            .into_iter()
+            .map(|mut meta| {
+                meta.indexes.retain(|idx| idx.unique);
+                meta
+            })
+            .filter(|meta| !meta.indexes.is_empty())
+            .collect())
     }
 
     /// Assemble foreign key descriptors for the table using cached metadata.
@@ -1112,13 +1226,26 @@ where
         let mut existing_name: Option<Option<String>> = None;
         let column_vec: Vec<FieldId> = column_ids.to_vec();
 
+        // Generate canonical name from column IDs
+        let canonical_name = format!(
+            "__unique_{}_{}",
+            table_id,
+            column_vec
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join("_")
+        );
+
         self.update_multi_column_uniques(table_id, |entries| {
             if let Some(existing) = entries.iter().find(|entry| entry.column_ids == column_vec) {
                 existing_name = Some(existing.index_name.clone());
             } else {
-                entries.push(MultiColumnUniqueEntryMeta {
+                entries.push(MultiColumnIndexEntryMeta {
                     index_name: index_name.clone(),
+                    canonical_name: canonical_name.clone(),
                     column_ids: column_vec.clone(),
+                    unique: true,
                 });
                 created = true;
             }
@@ -1206,7 +1333,7 @@ where
 mod tests {
     use super::*;
     use crate::constraints::{ConstraintKind, ConstraintState, PrimaryKeyConstraint};
-    use crate::{MultiColumnUniqueEntryMeta, Table};
+    use crate::{MultiColumnIndexEntryMeta, Table};
     use llkv_column_map::ColumnStore;
     use llkv_column_map::store::IndexKind;
     use llkv_storage::pager::MemPager;
@@ -1270,9 +1397,11 @@ mod tests {
             .put_constraint_records(table_id, std::slice::from_ref(&constraint))
             .unwrap();
 
-        let multi_unique = MultiColumnUniqueEntryMeta {
+        let multi_unique = MultiColumnIndexEntryMeta {
             index_name: Some("uniq_users_name".into()),
+            canonical_name: "uniq_users_name".to_lowercase(),
             column_ids: vec![column_meta.col_id],
+            unique: true,
         };
         manager
             .set_multi_column_uniques(table_id, vec![multi_unique.clone()])
@@ -1296,7 +1425,7 @@ mod tests {
             .constraint_records_for_table(table_id)
             .unwrap();
         assert_eq!(constraints, vec![constraint.clone()]);
-        let unique_roundtrip = verify_catalog.get_multi_column_uniques(table_id).unwrap();
+        let unique_roundtrip = verify_catalog.get_multi_column_indexes(table_id).unwrap();
         assert_eq!(unique_roundtrip, vec![multi_unique.clone()]);
 
         let meta_from_cache = manager.table_meta(table_id).unwrap();
@@ -1345,12 +1474,14 @@ mod tests {
         initial_catalog
             .put_constraint_records(table_id, std::slice::from_ref(&constraint))
             .unwrap();
-        let multi_unique = MultiColumnUniqueEntryMeta {
+        let multi_unique = MultiColumnIndexEntryMeta {
             index_name: Some("uniq_value".into()),
+            canonical_name: "uniq_value".to_lowercase(),
             column_ids: vec![column_meta.col_id],
+            unique: true,
         };
         initial_catalog
-            .put_multi_column_uniques(table_id, std::slice::from_ref(&multi_unique))
+            .put_multi_column_indexes(table_id, std::slice::from_ref(&multi_unique))
             .unwrap();
 
         let columns = manager

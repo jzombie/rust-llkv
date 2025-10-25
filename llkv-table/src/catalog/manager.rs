@@ -23,7 +23,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use super::table_catalog::{FieldDefinition, TableCatalog};
 use crate::constraints::{ConstraintId, ConstraintKind};
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration, SingleColumnIndexEntry};
-use crate::sys_catalog::{ColMeta, SysCatalog};
+use crate::sys_catalog::{ColMeta, MultiColumnIndexEntryMeta, SysCatalog};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
 use crate::{
@@ -612,6 +612,8 @@ where
         column_name: &str,
         index_name: Option<String>,
         mark_unique: bool,
+        ascending: bool,
+        nulls_first: bool,
         if_not_exists: bool,
     ) -> LlkvResult<SingleColumnIndexRegistration> {
         let table_id = table.table_id();
@@ -672,6 +674,8 @@ where
             column_id: field_id,
             column_name: column_name.to_string(),
             unique: mark_unique,
+            ascending,
+            nulls_first,
         };
 
         self.metadata.put_single_column_index(table_id, entry)?;
@@ -762,6 +766,40 @@ where
         }
 
         Ok(registration)
+    }
+
+    /// Register a multi-column index (unique or non-unique).
+    ///
+    /// Returns true if the index was created, false if it already exists.
+    pub fn register_multi_column_index(
+        &self,
+        table_id: TableId,
+        field_ids: &[FieldId],
+        index_name: String,
+        unique: bool,
+    ) -> LlkvResult<bool> {
+        let canonical_name = index_name.to_lowercase();
+
+        // Check if index already exists
+        if let Some(_existing) = self
+            .metadata
+            .get_multi_column_index(table_id, &canonical_name)?
+        {
+            return Ok(false);
+        }
+
+        // Create new index entry
+        let entry = MultiColumnIndexEntryMeta {
+            index_name: Some(index_name),
+            canonical_name,
+            column_ids: field_ids.to_vec(),
+            unique,
+        };
+
+        self.metadata.put_multi_column_index(table_id, entry)?;
+        self.metadata.flush_table(table_id)?;
+
+        Ok(true)
     }
 
     fn generate_single_column_index_name(
@@ -892,7 +930,8 @@ where
 
         let multi_column_uniques = {
             let catalog = SysCatalog::new(&self.store);
-            catalog.get_multi_column_uniques(table_id)?
+            let all_indexes = catalog.get_multi_column_indexes(table_id)?;
+            all_indexes.into_iter().filter(|idx| idx.unique).collect()
         };
 
         let referencing_table = ForeignKeyTableInfo {
@@ -955,7 +994,8 @@ where
 
             let multi_column_uniques = {
                 let catalog = SysCatalog::new(&self.store);
-                catalog.get_multi_column_uniques(table_id)?
+                let all_indexes = catalog.get_multi_column_indexes(table_id)?;
+                all_indexes.into_iter().filter(|idx| idx.unique).collect()
             };
 
             results.push(ForeignKeyTableInfo {

@@ -7,6 +7,7 @@ repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
+llkv = { path = "./llkv", version = "0.4.5-alpha" }
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.4.5-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.4.5-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.4.5-alpha" }
@@ -16,6 +17,7 @@ llkv-join = { path = "./llkv-join", version = "0.4.5-alpha" }
 llkv-plan = { path = "./llkv-plan", version = "0.4.5-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.4.5-alpha" }
 llkv-runtime = { path = "./llkv-runtime", version = "0.4.5-alpha" }
+llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.4.5-alpha" }
 llkv-sql = { path = "./llkv-sql", version = "0.4.5-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.4.5-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.4.5-alpha" }
@@ -33,6 +35,7 @@ async-trait = "0.1.89"
 bitcode = "0.6.7"
 criterion = "0.7.0"
 crossbeam-channel = "0.5.15"
+indoc = "2.0.7"
 libtest-mimic = "0.8"
 line-ending = "1.5.1"
 modular-bitfield = "0.13.0"
@@ -44,6 +47,7 @@ roaring = "0.11.2"
 sqlparser = "0.59.0"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
 rustc-hash = "2.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -52,9 +56,11 @@ time = { version = "0.3.44", features = ["parsing"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
+walkdir = "2.5"
 
 [workspace]
 members = [
+    "llkv",
     "llkv-aggregate",
     "llkv-column-map",
     "llkv-csv",
@@ -64,6 +70,7 @@ members = [
     "llkv-join",
     "llkv-plan",
     "llkv-result",
+    "llkv-slt-tester",
     "llkv-sql",
     "llkv-storage",
     "llkv-table",

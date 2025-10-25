@@ -1,0 +1,20 @@
+[package]
+name = "llkv"
+description = "Columnar Storage Layer for Key-Value Stores"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+llkv-sql = { workspace = true }
+llkv-storage = { workspace = true }
+arrow = { workspace = true }
+llkv-runtime = { workspace = true }
+llkv-slt-tester = { workspace = true }
+llkv-result = { workspace = true }
+
+[dev-dependencies]
+llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
