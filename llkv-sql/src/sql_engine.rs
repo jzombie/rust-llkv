@@ -32,12 +32,13 @@ use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind,
     BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics,
-    DataType as SqlDataType, Delete, ExceptionWhen, Expr as SqlExpr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType, OrderBy, OrderByKind,
-    Query, ReferentialAction, SchemaName, Select, SelectItem, SelectItemQualifiedWildcardKind, Set,
-    SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject, TableWithJoins,
-    TransactionMode, TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    DataType as SqlDataType, Delete, Distinct, ExceptionWhen, Expr as SqlExpr, FromTable,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
+    OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -3124,11 +3125,15 @@ where
         select: &Select,
         resolver: &IdentifierResolver<'_>,
     ) -> SqlResult<(SelectPlan, IdentifierContext)> {
-        if select.distinct.is_some() {
-            return Err(Error::InvalidArgumentError(
-                "SELECT DISTINCT is not supported".into(),
-            ));
-        }
+        let distinct = match &select.distinct {
+            None => false,
+            Some(Distinct::Distinct) => true,
+            Some(Distinct::On(_)) => {
+                return Err(Error::InvalidArgumentError(
+                    "SELECT DISTINCT ON is not supported".into(),
+                ));
+            }
+        };
         if select.top.is_some() {
             return Err(Error::InvalidArgumentError(
                 "SELECT TOP is not supported".into(),
@@ -3247,6 +3252,7 @@ where
             None => None,
         };
         plan = plan.with_filter(filter_expr);
+        plan = plan.with_distinct(distinct);
         Ok((plan, id_context))
     }
 

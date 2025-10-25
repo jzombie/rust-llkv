@@ -561,6 +561,7 @@ pub struct SelectPlan {
     pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
     pub aggregates: Vec<AggregateExpr>,
     pub order_by: Vec<OrderByPlan>,
+    pub distinct: bool,
 }
 
 impl SelectPlan {
@@ -586,6 +587,7 @@ impl SelectPlan {
             filter: None,
             aggregates: Vec::new(),
             order_by: Vec::new(),
+            distinct: false,
         }
     }
 
@@ -597,6 +599,7 @@ impl SelectPlan {
             filter: None,
             aggregates: Vec::new(),
             order_by: Vec::new(),
+            distinct: false,
         }
     }
 
@@ -617,6 +620,11 @@ impl SelectPlan {
 
     pub fn with_order_by(mut self, order_by: Vec<OrderByPlan>) -> Self {
         self.order_by = order_by;
+        self
+    }
+
+    pub fn with_distinct(mut self, distinct: bool) -> Self {
+        self.distinct = distinct;
         self
     }
 }

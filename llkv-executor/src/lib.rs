@@ -14,16 +14,20 @@
 //! in this module for now, but should be extracted to a dedicated `query` module
 //! in a future refactoring.
 
-use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, UInt32Array};
-use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
+use arrow::array::{
+    Array, ArrayRef, BooleanBuilder, Int64Builder, RecordBatch, StringArray, UInt32Array,
+};
+use arrow::compute::{
+    SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
+};
 use arrow::datatypes::{DataType, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
-    AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, PlanValue,
-    SelectPlan, SelectProjection,
+    AggregateExpr, AggregateFunction, CanonicalRow, OrderByPlan, OrderSortType, OrderTarget,
+    PlanValue, SelectPlan, SelectProjection,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -32,7 +36,7 @@ use llkv_table::table::{
     ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
 use std::sync::Arc;
@@ -183,8 +187,18 @@ where
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+        let mut batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
             .map_err(|e| Error::Internal(format!("failed to create record batch: {}", e)))?;
+
+        if plan.distinct {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        let schema = batch.schema();
 
         Ok(SelectExecution::new_single_batch(
             String::new(), // No table name
@@ -435,13 +449,24 @@ where
                 .map_err(|e| Error::Internal(format!("failed to apply projections: {}", e)))?;
         }
 
+        if plan.distinct {
+            let mut state = DistinctState::default();
+            let source_schema = combined_batch.schema();
+            combined_batch = match distinct_filter_batch(combined_batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(source_schema),
+            };
+        }
+
+        let schema = combined_batch.schema();
+
         Ok(SelectExecution::new_single_batch(
             format!(
                 "{},{}",
                 left_ref.qualified_name(),
                 right_ref.qualified_name()
             ),
-            combined_batch.schema(),
+            schema,
             combined_batch,
         ))
     }
@@ -519,6 +544,7 @@ where
             options,
             full_table_scan,
             expanded_order,
+            plan.distinct,
         ))
     }
 
@@ -530,6 +556,7 @@ where
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
+        let distinct = plan.distinct;
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
         for aggregate in plan.aggregates {
             match aggregate {
@@ -763,7 +790,18 @@ where
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+        let mut batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+
+        if distinct {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        let schema = batch.schema();
+
         Ok(SelectExecution::new_single_batch(
             display_name,
             schema,
@@ -784,6 +822,7 @@ where
         use llkv_expr::expr::AggregateCall;
 
         let table_ref = table.as_ref();
+        let distinct = plan.distinct;
 
         // First, extract all unique aggregates from the projections
         let mut aggregate_specs: Vec<(String, AggregateCall<String>)> = Vec::new();
@@ -842,7 +881,18 @@ where
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+        let mut batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+
+        if distinct {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        let schema = batch.schema();
+
         Ok(SelectExecution::new_single_batch(
             display_name,
             schema,
@@ -1159,6 +1209,7 @@ where
         options: ScanStreamOptions<P>,
         full_table_scan: bool,
         order_by: Vec<OrderByPlan>,
+        distinct: bool,
     },
     Aggregation {
         batch: RecordBatch,
@@ -1179,6 +1230,7 @@ where
         options: ScanStreamOptions<P>,
         full_table_scan: bool,
         order_by: Vec<OrderByPlan>,
+        distinct: bool,
     ) -> Self {
         Self {
             table_name,
@@ -1190,6 +1242,7 @@ where
                 options,
                 full_table_scan,
                 order_by,
+                distinct,
             },
         }
     }
@@ -1227,6 +1280,7 @@ where
                 options,
                 full_table_scan,
                 order_by,
+                distinct,
             } => {
                 // Early return for empty tables to avoid ColumnStore data_type() errors
                 let total_rows = table.total_rows.load(Ordering::SeqCst);
@@ -1243,6 +1297,11 @@ where
                 let collect_batches = needs_post_sort || capture_nulls_first;
                 let include_nulls = options.include_nulls;
                 let has_row_id_filter = options.row_id_filter.is_some();
+                let mut distinct_state = if distinct {
+                    Some(DistinctState::default())
+                } else {
+                    None
+                };
                 let scan_options = options;
                 let mut buffered_batches: Vec<RecordBatch> = Vec::new();
                 table
@@ -1250,6 +1309,21 @@ where
                     .scan_stream(projections, &filter_expr, scan_options, |batch| {
                         if error.is_some() {
                             return;
+                        }
+                        let mut batch = batch;
+                        if let Some(state) = distinct_state.as_mut() {
+                            match distinct_filter_batch(batch, state) {
+                                Ok(Some(filtered)) => {
+                                    batch = filtered;
+                                }
+                                Ok(None) => {
+                                    return;
+                                }
+                                Err(err) => {
+                                    error = Some(err);
+                                    return;
+                                }
+                            }
                         }
                         produced = true;
                         produced_rows = produced_rows.saturating_add(batch.num_rows() as u64);
@@ -1265,7 +1339,7 @@ where
                 if !produced {
                     // Only synthesize null rows if this was a full table scan
                     // If there was a filter and it matched no rows, we should return empty results
-                    if full_table_scan && total_rows > 0 {
+                    if !distinct && full_table_scan && total_rows > 0 {
                         for batch in synthesize_null_scan(Arc::clone(&schema), total_rows)? {
                             on_batch(batch)?;
                         }
@@ -1278,7 +1352,8 @@ where
                 // 2. This is a full table scan
                 // 3. We produced fewer rows than the total
                 // 4. We DON'T have a row_id_filter (e.g., MVCC filter) that intentionally filtered rows
-                if include_nulls
+                if !distinct
+                    && include_nulls
                     && full_table_scan
                     && produced_rows < total_rows
                     && !has_row_id_filter
@@ -1539,6 +1614,59 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<
 
     let batch = RecordBatch::try_new(schema, arrays)?;
     Ok(vec![batch])
+}
+
+#[derive(Default)]
+struct DistinctState {
+    seen: FxHashSet<CanonicalRow>,
+}
+
+impl DistinctState {
+    fn insert(&mut self, row: CanonicalRow) -> bool {
+        self.seen.insert(row)
+    }
+}
+
+fn distinct_filter_batch(
+    batch: RecordBatch,
+    state: &mut DistinctState,
+) -> ExecutorResult<Option<RecordBatch>> {
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    let mut keep_flags = Vec::with_capacity(batch.num_rows());
+    let mut keep_count = 0usize;
+
+    for row_idx in 0..batch.num_rows() {
+        let row = CanonicalRow::from_batch(&batch, row_idx)?;
+        if state.insert(row) {
+            keep_flags.push(true);
+            keep_count += 1;
+        } else {
+            keep_flags.push(false);
+        }
+    }
+
+    if keep_count == 0 {
+        return Ok(None);
+    }
+
+    if keep_count == batch.num_rows() {
+        return Ok(Some(batch));
+    }
+
+    let mut builder = BooleanBuilder::with_capacity(batch.num_rows());
+    for flag in keep_flags {
+        builder.append_value(flag);
+    }
+    let mask = Arc::new(builder.finish());
+
+    let filtered = filter_record_batch(&batch, &mask).map_err(|err| {
+        Error::InvalidArgumentError(format!("failed to apply DISTINCT filter: {err}"))
+    })?;
+
+    Ok(Some(filtered))
 }
 
 fn sort_record_batch_with_order(

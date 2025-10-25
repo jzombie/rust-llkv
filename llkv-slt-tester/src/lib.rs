@@ -65,7 +65,7 @@ impl LlkvSltRunner {
     /// a URL to the actual test content, which will be fetched and executed.
     pub fn run_file(&self, path: impl AsRef<Path>) -> Result<(), Error> {
         let path = path.as_ref();
-        
+
         // Check if this is a .slturl pointer file
         if path.extension().is_some_and(|ext| ext == "slturl") {
             let url = std::fs::read_to_string(path)
@@ -74,7 +74,7 @@ impl LlkvSltRunner {
                 .to_string();
             return self.run_url(&url);
         }
-        
+
         // Otherwise, run as a normal .slt file
         let factory = (self.factory_factory)();
         runner::run_slt_file_blocking_with_runtime(path, factory, self.runtime_kind)

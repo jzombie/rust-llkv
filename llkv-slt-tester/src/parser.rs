@@ -62,13 +62,13 @@ pub fn expand_loops_with_mapping(
 }
 
 /// Filter out conditional test blocks based on database engine directives.
-/// 
+///
 /// Handles `onlyif <engine>` and `skipif <engine>` directives for compatible engines.
-/// 
+///
 /// Logic:
 /// - `onlyif <engine>`: Include the block if <engine> is in our_engines list, skip otherwise
 /// - `skipif <engine>`: Skip the block if <engine> is in our_engines list, include otherwise
-/// 
+///
 /// This allows a test marked `onlyif sqlite` OR `onlyif duckdb` to run if we're compatible
 /// with either engine, and a test marked `skipif sqlite` OR `skipif duckdb` to be skipped
 /// if we're compatible with either.
@@ -81,11 +81,11 @@ pub fn filter_conditional_blocks(
     let mut out_lines = Vec::new();
     let mut out_map = Vec::new();
     let mut i = 0;
-    
+
     while i < lines.len() {
         let line = &lines[i];
         let trimmed = line.trim_start();
-        
+
         // Check for conditional directives
         if let Some(rest) = trimmed.strip_prefix("onlyif ") {
             let engine = rest.split_whitespace().next().unwrap_or("");
@@ -113,26 +113,26 @@ pub fn filter_conditional_blocks(
                 continue;
             }
         }
-        
+
         // Not a conditional directive - keep the line
         out_lines.push(line.clone());
         out_map.push(mapping[i]);
         i += 1;
     }
-    
+
     (out_lines, out_map)
 }
 
 /// Skip a test block (query, statement, etc.) after a conditional directive.
-/// 
+///
 /// SLT test blocks are delimited by blank lines. This function skips all non-blank
 /// lines until it hits a blank line, which marks the end of the current test block.
-/// 
+///
 /// Returns the index of the next line after the block (which should be the blank line
 /// or the start of the next block if there's no trailing blank line).
 fn skip_test_block(lines: &[String], start_idx: usize) -> usize {
     let mut i = start_idx;
-    
+
     // Skip all non-blank lines - test blocks are terminated by blank lines in SLT format
     while i < lines.len() {
         let line = lines[i].trim();
@@ -143,7 +143,7 @@ fn skip_test_block(lines: &[String], start_idx: usize) -> usize {
         }
         i += 1;
     }
-    
+
     i
 }
 
@@ -402,9 +402,9 @@ mod tests {
             "".to_string(),
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
-        
+
         let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv"]);
-        
+
         // Should include first test and second test (without the directive line)
         assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
         assert!(filtered.iter().any(|l| l.contains("SELECT 2")));
@@ -433,9 +433,9 @@ mod tests {
             "".to_string(),
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
-        
+
         let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv"]);
-        
+
         // Should include first and third tests, but not the mysql-only test
         assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
         assert!(!filtered.iter().any(|l| l.contains("SELECT 2")));
@@ -460,9 +460,9 @@ mod tests {
             "".to_string(),
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
-        
+
         let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv"]);
-        
+
         // Should include first test but not the second (skipped for llkv)
         assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
         assert!(!filtered.iter().any(|l| l.contains("SELECT 2")));
@@ -486,9 +486,9 @@ mod tests {
             "".to_string(),
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
-        
+
         let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv"]);
-        
+
         // Should include both tests (second test is skipped for mysql, not llkv)
         assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
         assert!(filtered.iter().any(|l| l.contains("SELECT 2")));
@@ -519,9 +519,9 @@ mod tests {
             "".to_string(),
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
-        
+
         let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv"]);
-        
+
         // Should skip first (mysql only), include second (not mysql), include third (llkv only)
         assert!(!filtered.iter().any(|l| l.contains("SELECT 1")));
         assert!(filtered.iter().any(|l| l.contains("SELECT 2")));
@@ -542,9 +542,9 @@ mod tests {
             "".to_string(),
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
-        
+
         let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv"]);
-        
+
         // Should skip first (mysql only), include second (not postgresql)
         assert!(!filtered.iter().any(|l| l.contains("CREATE TABLE")));
         assert!(filtered.iter().any(|l| l.contains("DROP TABLE")));
@@ -560,23 +560,26 @@ mod tests {
             "1".to_string(),
             "".to_string(),
             "onlyif mysql".to_string(), // line 6
-            "query I".to_string(),       // line 7 - should be skipped
-            "SELECT 2".to_string(),      // line 8 - should be skipped
-            "----".to_string(),          // line 9 - should be skipped
-            "2".to_string(),             // line 10 - should be skipped
-            "".to_string(),              // line 11 - should be skipped
-            "query I".to_string(),       // line 12
-            "SELECT 3".to_string(),      // line 13
-            "----".to_string(),          // line 14
-            "3".to_string(),             // line 15
-            "".to_string(),              // line 16
+            "query I".to_string(),      // line 7 - should be skipped
+            "SELECT 2".to_string(),     // line 8 - should be skipped
+            "----".to_string(),         // line 9 - should be skipped
+            "2".to_string(),            // line 10 - should be skipped
+            "".to_string(),             // line 11 - should be skipped
+            "query I".to_string(),      // line 12
+            "SELECT 3".to_string(),     // line 13
+            "----".to_string(),         // line 14
+            "3".to_string(),            // line 15
+            "".to_string(),             // line 16
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
-        
+
         let (filtered, filtered_mapping) = filter_conditional_blocks(lines, mapping, &["llkv"]);
-        
+
         // Verify that SELECT 3 is in the output and its mapping points to line 13
-        let select3_idx = filtered.iter().position(|l| l.contains("SELECT 3")).unwrap();
+        let select3_idx = filtered
+            .iter()
+            .position(|l| l.contains("SELECT 3"))
+            .unwrap();
         assert_eq!(filtered_mapping[select3_idx], 13);
     }
 }

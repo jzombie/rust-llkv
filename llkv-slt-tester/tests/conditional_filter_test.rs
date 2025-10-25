@@ -1,8 +1,7 @@
 /// Integration tests for conditional directive filtering (onlyif/skipif).
-/// 
+///
 /// These tests verify that the SLT runner correctly filters test blocks based on
 /// database engine compatibility directives.
-
 use indoc::indoc;
 use llkv_slt_tester::LlkvSltRunner;
 use std::io::Write;
@@ -11,7 +10,9 @@ use tempfile::NamedTempFile;
 /// Helper to create a temporary .slt file with the given content
 fn create_temp_slt(content: &str) -> NamedTempFile {
     let mut temp_file = NamedTempFile::with_suffix(".slt").expect("Failed to create temp file");
-    temp_file.write_all(content.as_bytes()).expect("Failed to write");
+    temp_file
+        .write_all(content.as_bytes())
+        .expect("Failed to write");
     temp_file.flush().expect("Failed to flush");
     temp_file
 }
@@ -36,14 +37,18 @@ fn test_onlyif_sqlite_included() {
         1
         2
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - both inserts should run
-    assert!(result.is_ok(), "Expected success for onlyif sqlite block: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success for onlyif sqlite block: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -62,14 +67,18 @@ fn test_onlyif_duckdb_included() {
         ----
         10
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - duckdb-specific insert should run
-    assert!(result.is_ok(), "Expected success for onlyif duckdb block: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success for onlyif duckdb block: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -91,14 +100,18 @@ fn test_onlyif_mysql_excluded() {
         ----
         1
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - mysql-only insert should be skipped, only value 1 present
-    assert!(result.is_ok(), "Expected success with mysql block excluded: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with mysql block excluded: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -120,14 +133,18 @@ fn test_skipif_sqlite_excluded() {
         ----
         1
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - skipif sqlite means skip for us, only value 1 present
-    assert!(result.is_ok(), "Expected success with skipif sqlite block excluded: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with skipif sqlite block excluded: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -149,14 +166,18 @@ fn test_skipif_duckdb_excluded() {
         ----
         1
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - skipif duckdb means skip for us, only value 1 present
-    assert!(result.is_ok(), "Expected success with skipif duckdb block excluded: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with skipif duckdb block excluded: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -175,14 +196,18 @@ fn test_skipif_mysql_included() {
         ----
         42
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - skipif mysql means include for us
-    assert!(result.is_ok(), "Expected success with skipif mysql block included: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with skipif mysql block included: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -218,14 +243,18 @@ fn test_multiple_conditionals() {
         2
         3
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed with values 1, 2, 3 (skipping mysql-only and skipif sqlite)
-    assert!(result.is_ok(), "Expected success with multiple conditionals: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with multiple conditionals: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -247,14 +276,18 @@ fn test_onlyif_postgresql_excluded() {
         ----
         1
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - postgresql-only block should be skipped
-    assert!(result.is_ok(), "Expected success with postgresql block excluded: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with postgresql block excluded: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -276,14 +309,18 @@ fn test_no_conditionals() {
         1
         2
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - no conditionals means run everything
-    assert!(result.is_ok(), "Expected success with no conditionals: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with no conditionals: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -307,12 +344,16 @@ fn test_conditional_with_query_block() {
         ----
         1
     "};
-    
+
     let temp_file = create_temp_slt(content);
     let runner = LlkvSltRunner::in_memory();
-    
+
     let result = runner.run_file(temp_file.path());
-    
+
     // Should succeed - mysql-only query should be skipped
-    assert!(result.is_ok(), "Expected success with conditional query block: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Expected success with conditional query block: {:?}",
+        result.err()
+    );
 }

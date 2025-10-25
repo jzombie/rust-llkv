@@ -11,13 +11,13 @@ use llkv_result::Error;
 use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
 
 /// Path where the last failed SLT test content is persisted for debugging.
-/// 
+///
 /// When a test fails, the normalized/processed SLT content is saved to this location
 /// so developers can inspect the actual test content that caused the failure.
 const LAST_FAILED_SLT_PATH: &str = "target/last_failed_slt.tmp";
 
 /// Database engine identifiers for conditional test filtering.
-/// 
+///
 /// LLKV is treated as compatible with these engines for the purposes of conditional
 /// directives in SLT test files. This means:
 /// - Tests marked `onlyif sqlite` or `onlyif duckdb` will be included
@@ -27,7 +27,7 @@ const LAST_FAILED_SLT_PATH: &str = "target/last_failed_slt.tmp";
 const SLT_ENGINE_COMPAT: &[&str] = &["sqlite", "duckdb"];
 
 /// Generate a clickable file link for VS Code terminal.
-/// 
+///
 /// Creates a vscode://file URI with proper URL encoding for special characters.
 fn make_vscode_file_link(path: &str, line: Option<usize>) -> String {
     // URL encode the path - properly handle all special characters
@@ -56,7 +56,7 @@ fn make_vscode_file_link(path: &str, line: Option<usize>) -> String {
             c => c.to_string(),
         })
         .collect::<String>();
-    
+
     if let Some(line_num) = line {
         format!("vscode://file/{}:{}", encoded, line_num)
     } else {
@@ -65,14 +65,14 @@ fn make_vscode_file_link(path: &str, line: Option<usize>) -> String {
 }
 
 /// Generate a shell-escaped path suitable for command-line use.
-/// 
+///
 /// This escapes special characters so the path can be used directly in shell commands.
 fn make_shell_escaped_path(path: &str) -> String {
     // For POSIX shells (bash, zsh, etc.), escape special characters
     path.chars()
         .map(|c| match c {
-            ' ' | '\t' | '\n' | '|' | '&' | ';' | '(' | ')' | '<' | '>' 
-            | '"' | '\'' | '\\' | '*' | '?' | '[' | ']' | '{' | '}' | '$' | '`' => {
+            ' ' | '\t' | '\n' | '|' | '&' | ';' | '(' | ')' | '<' | '>' | '"' | '\'' | '\\'
+            | '*' | '?' | '[' | ']' | '{' | '}' | '$' | '`' => {
                 format!("\\{}", c)
             }
             c => c.to_string(),
@@ -94,11 +94,12 @@ where
 {
     let raw_lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let (expanded_lines, mapping) = expand_loops_with_mapping(&raw_lines, 0)?;
-    
+
     // Filter out conditional blocks based on database engine compatibility.
     // Apply filtering with all our compatible engines at once.
-    let (expanded_lines, mapping) = filter_conditional_blocks(expanded_lines, mapping, SLT_ENGINE_COMPAT);
-    
+    let (expanded_lines, mapping) =
+        filter_conditional_blocks(expanded_lines, mapping, SLT_ENGINE_COMPAT);
+
     let (expanded_lines, mapping) = {
         let mut filtered_lines = Vec::with_capacity(expanded_lines.len());
         let mut filtered_mapping = Vec::with_capacity(mapping.len());
@@ -148,7 +149,7 @@ where
     if let Err(e) = runner.run_file_async(&tmp).await {
         let (mapped, opt_orig_line) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, origin);
-        
+
         // Persist the temp file for debugging when there's an error
         let persist_path = std::path::Path::new(LAST_FAILED_SLT_PATH);
         if let Some(parent) = persist_path.parent() {
@@ -163,7 +164,7 @@ where
                 .map(|p| p.display().to_string())
         };
         drop(named);
-        
+
         if let Some(line_num) = opt_orig_line {
             // Print the line from the normalized/processed content with context
             if let Some(line) = normalized_lines.get(line_num.saturating_sub(1)) {
@@ -173,7 +174,7 @@ where
                     line.trim()
                 );
             }
-            
+
             // Also try to show the original line if available
             if let Some(line) = text.lines().nth(line_num.saturating_sub(1)) {
                 eprintln!(
@@ -183,14 +184,18 @@ where
                 );
             }
         }
-        
+
         if let Some(path) = &persisted {
             eprintln!("[llkv-slt] Normalized SLT saved to: {}", path);
             if let Some(line_num) = opt_orig_line {
-                eprintln!("[llkv-slt] View context: head -n {} {} | tail -20", line_num.saturating_add(10), path);
+                eprintln!(
+                    "[llkv-slt] View context: head -n {} {} | tail -20",
+                    line_num.saturating_add(10),
+                    path
+                );
             }
         }
-        
+
         // Build enhanced error message showing both remote URL and local debug file
         let enhanced_msg = if let Some(debug_path) = persisted {
             if let Some(line_num) = opt_orig_line {
@@ -198,20 +203,28 @@ where
                 let shell_path = make_shell_escaped_path(&debug_path);
                 format!(
                     "slt runner failed: {}\n  at: {}:{}\n  debug: {}:{}\n  vscode: {}",
-                    mapped, origin.display(), line_num, shell_path, line_num, vscode_link
+                    mapped,
+                    origin.display(),
+                    line_num,
+                    shell_path,
+                    line_num,
+                    vscode_link
                 )
             } else {
                 let vscode_link = make_vscode_file_link(&debug_path, None);
                 let shell_path = make_shell_escaped_path(&debug_path);
                 format!(
                     "slt runner failed: {}\n  at: {}\n  debug: {}\n  vscode: {}",
-                    mapped, origin.display(), shell_path, vscode_link
+                    mapped,
+                    origin.display(),
+                    shell_path,
+                    vscode_link
                 )
             }
         } else {
             format!("slt runner failed: {}", mapped)
         };
-        
+
         return Err(Error::Internal(enhanced_msg));
     }
 
@@ -357,10 +370,10 @@ where
         let name = name.trim_start_matches(&['/', '\\'][..]).to_string();
         let path_clone = f.clone();
         let factory_factory_clone = factory_factory.clone();
-        
+
         // Check if this is a .slturl pointer file
         let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
-        
+
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
             let fac = factory_factory_clone();
@@ -375,29 +388,35 @@ where
                         .enable_all()
                         .build()
                         .map_err(|e| Failed::from(format!("failed to build tokio runtime: {e}")))?;
-                    
+
                     let res: Result<(), Error> = if is_url_pointer {
                         // Read the URL from the pointer file and fetch remotely
                         let url = std::fs::read_to_string(&p)
-                            .map_err(|e| Error::Internal(format!("failed to read .slturl file: {e}")))?
+                            .map_err(|e| {
+                                Error::Internal(format!("failed to read .slturl file: {e}"))
+                            })?
                             .trim()
                             .to_string();
-                        
+
                         // Fetch and run the remote SLT file
-                        let response = reqwest::blocking::get(&url)
-                            .map_err(|e| Error::Internal(format!("failed to fetch SLT URL {url}: {e}")))?;
-                        let script = response.text()
-                            .map_err(|e| Error::Internal(format!("failed to read SLT response body for {url}: {e}")))?;
-                        
+                        let response = reqwest::blocking::get(&url).map_err(|e| {
+                            Error::Internal(format!("failed to fetch SLT URL {url}: {e}"))
+                        })?;
+                        let script = response.text().map_err(|e| {
+                            Error::Internal(format!(
+                                "failed to read SLT response body for {url}: {e}"
+                            ))
+                        })?;
+
                         let origin = std::path::PathBuf::from(format!("url:{}", url));
-                        rt.block_on(async move { 
-                            run_slt_text_with_factory(&script, origin.as_path(), fac).await 
+                        rt.block_on(async move {
+                            run_slt_text_with_factory(&script, origin.as_path(), fac).await
                         })
                     } else {
                         // Run local .slt file as before
                         rt.block_on(async move { run_slt_file_with_factory(&p, fac).await })
                     };
-                    
+
                     res.map_err(|e| Failed::from(format!("slt runner error: {e}")))
                 })
                 .map_err(|e| Failed::from(format!("failed to spawn test thread: {e}")))?

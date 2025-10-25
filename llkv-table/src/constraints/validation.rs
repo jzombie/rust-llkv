@@ -1,5 +1,7 @@
 use arrow::datatypes::DataType;
-use llkv_plan::{ForeignKeyAction as PlanForeignKeyAction, ForeignKeySpec, PlanValue};
+use llkv_plan::{
+    CanonicalScalar, ForeignKeyAction as PlanForeignKeyAction, ForeignKeySpec, PlanValue,
+};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast::{self, Expr as SqlExpr};
@@ -22,11 +24,30 @@ pub struct ConstraintColumnInfo {
 
 /// Canonical representation of values participating in UNIQUE or PRIMARY KEY checks.
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
-pub enum UniqueKey {
-    Int(i64),
-    Float(u64),
-    Str(String),
-    Composite(Vec<UniqueKey>),
+pub struct UniqueKey(Vec<CanonicalScalar>);
+
+impl UniqueKey {
+    pub fn from_scalar(value: CanonicalScalar) -> Self {
+        UniqueKey(vec![value])
+    }
+
+    pub fn from_components(values: Vec<CanonicalScalar>) -> Self {
+        UniqueKey(values)
+    }
+
+    pub fn components(&self) -> &[CanonicalScalar] {
+        &self.0
+    }
+
+    pub fn into_components(self) -> Vec<CanonicalScalar> {
+        self.0
+    }
+}
+
+impl From<CanonicalScalar> for UniqueKey {
+    fn from(value: CanonicalScalar) -> Self {
+        UniqueKey::from_scalar(value)
+    }
 }
 
 /// Validate all CHECK constraints for the provided rows.
@@ -112,13 +133,18 @@ pub fn ensure_multi_column_unique(
 pub fn unique_key_component(value: &PlanValue, column_name: &str) -> LlkvResult<Option<UniqueKey>> {
     match value {
         PlanValue::Null => Ok(None),
-        PlanValue::Integer(v) => Ok(Some(UniqueKey::Int(*v))),
-        PlanValue::Float(v) => Ok(Some(UniqueKey::Float(v.to_bits()))),
-        PlanValue::String(s) => Ok(Some(UniqueKey::Str(s.clone()))),
         PlanValue::Struct(_) => Err(Error::InvalidArgumentError(format!(
             "UNIQUE index is not supported on struct column '{}'",
             column_name
         ))),
+        _ => {
+            let scalar = CanonicalScalar::from_plan_value(value)?;
+            if matches!(scalar, CanonicalScalar::Null) {
+                Ok(None)
+            } else {
+                Ok(Some(UniqueKey::from_scalar(scalar)))
+            }
+        }
     }
 }
 
@@ -134,12 +160,12 @@ pub fn build_composite_unique_key(
     let mut components = Vec::with_capacity(values.len());
     for (value, column_name) in values.iter().zip(column_names) {
         match unique_key_component(value, column_name)? {
-            Some(component) => components.push(component),
+            Some(component) => components.extend(component.into_components()),
             None => return Ok(None),
         }
     }
 
-    Ok(Some(UniqueKey::Composite(components)))
+    Ok(Some(UniqueKey::from_components(components)))
 }
 
 fn parse_check_expression(dialect: &GenericDialect, check_expr_str: &str) -> LlkvResult<SqlExpr> {
