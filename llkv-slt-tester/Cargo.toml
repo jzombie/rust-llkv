@@ -1,5 +1,6 @@
 [package]
 name = "llkv-slt-tester"
+description = "SLT (sqllogictest) testing for the LLKV toolkit"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -27,12 +28,6 @@ walkdir.workspace = true
 indoc.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 
-# This test file provides its own test runner (a `fn main()` that uses
-# `libtest-mimic` / a custom harness). Cargo's default test harness injects
-# its own `main` when compiling tests, which would conflict with the
-# `main` defined in `tests/slt_harness.rs` and cause duplicate-main/linker
-# errors. Setting `harness = false` tells Cargo to compile this test as a
-# normal binary and allows the crate to supply the custom test runner.
 [[test]]
 name = "slt_harness"
 path = "tests/slt_harness.rs"
