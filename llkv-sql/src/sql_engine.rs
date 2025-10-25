@@ -3214,17 +3214,19 @@ where
             let (display_name, canonical_name) = extract_single_table(&select.from)?;
             let table_id = catalog.table_id(&canonical_name);
             let mut p = SelectPlan::new(display_name.clone());
+            let single_table_context =
+                IdentifierContext::new(table_id).with_table_alias(table_alias.clone());
             if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
                 p = p.with_aggregates(aggregates);
             } else {
                 let projections = self.build_projection_list(
                     resolver,
-                    IdentifierContext::new(table_id),
+                    single_table_context.clone(),
                     &select.projection,
                 )?;
                 p = p.with_projections(projections);
             }
-            (p, IdentifierContext::new(table_id))
+            (p, single_table_context)
         } else {
             // Multiple tables or explicit joins - treat as cross product for now
             let tables = extract_tables(&select.from)?;
@@ -3245,7 +3247,7 @@ where
                 let materialized_expr = self.materialize_in_subquery(expr.clone())?;
                 Some(translate_condition_with_context(
                     resolver,
-                    id_context,
+                    id_context.clone(),
                     &materialized_expr,
                 )?)
             }
@@ -3272,16 +3274,6 @@ where
         };
 
         let base_nulls_first = self.default_nulls_first.load(AtomicOrdering::Relaxed);
-
-        let resolve_simple_column = |expr: &SqlExpr| -> SqlResult<String> {
-            let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
-            match scalar {
-                llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
-                other => Err(Error::InvalidArgumentError(format!(
-                    "ORDER BY expression must reference a simple column, found {other:?}"
-                ))),
-            }
-        };
 
         let mut plans = Vec::with_capacity(exprs.len());
         for order_expr in exprs {
@@ -3311,7 +3303,11 @@ where
 
             let (target, sort_type) = match &order_expr.expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
-                    OrderTarget::Column(resolve_simple_column(&order_expr.expr)?),
+                    OrderTarget::Column(Self::resolve_simple_column_expr(
+                        resolver,
+                        id_context.clone(),
+                        &order_expr.expr,
+                    )?),
                     OrderSortType::Native,
                 ),
                 SqlExpr::Cast {
@@ -3324,7 +3320,11 @@ where
                         | SqlDataType::TinyInt(_),
                     ..
                 } => (
-                    OrderTarget::Column(resolve_simple_column(expr)?),
+                    OrderTarget::Column(Self::resolve_simple_column_expr(
+                        resolver,
+                        id_context.clone(),
+                        expr,
+                    )?),
                     OrderSortType::CastTextToInteger,
                 ),
                 SqlExpr::Cast { data_type, .. } => {
@@ -3370,6 +3370,20 @@ where
         }
 
         Ok(plans)
+    }
+
+    fn resolve_simple_column_expr(
+        resolver: &IdentifierResolver<'_>,
+        context: IdentifierContext,
+        expr: &SqlExpr,
+    ) -> SqlResult<String> {
+        let scalar = translate_scalar_with_context(resolver, context, expr)?;
+        match scalar {
+            llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
+            other => Err(Error::InvalidArgumentError(format!(
+                "ORDER BY expression must reference a simple column, found {other:?}"
+            ))),
+        }
     }
 
     fn detect_simple_aggregates(
@@ -3593,7 +3607,7 @@ where
                 SelectItem::UnnamedExpr(expr) => match expr {
                     SqlExpr::Identifier(ident) => {
                         let parts = vec![ident.value.clone()];
-                        let resolution = resolver.resolve(&parts, id_context)?;
+                        let resolution = resolver.resolve(&parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3610,7 +3624,7 @@ where
                     SqlExpr::CompoundIdentifier(parts) => {
                         let name_parts: Vec<String> =
                             parts.iter().map(|part| part.value.clone()).collect();
-                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        let resolution = resolver.resolve(&name_parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3626,7 +3640,11 @@ where
                     }
                     _ => {
                         let alias = format!("col{}", idx + 1);
-                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+                        let scalar = translate_scalar_with_context(
+                            resolver,
+                            id_context.clone(),
+                            expr,
+                        )?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias,
@@ -3636,7 +3654,7 @@ where
                 SelectItem::ExprWithAlias { expr, alias } => match expr {
                     SqlExpr::Identifier(ident) => {
                         let parts = vec![ident.value.clone()];
-                        let resolution = resolver.resolve(&parts, id_context)?;
+                        let resolution = resolver.resolve(&parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3652,7 +3670,7 @@ where
                     SqlExpr::CompoundIdentifier(parts) => {
                         let name_parts: Vec<String> =
                             parts.iter().map(|part| part.value.clone()).collect();
-                        let resolution = resolver.resolve(&name_parts, id_context)?;
+                        let resolution = resolver.resolve(&name_parts, id_context.clone())?;
                         if resolution.is_simple() {
                             projections.push(SelectProjection::Column {
                                 name: resolution.column().to_string(),
@@ -3666,7 +3684,11 @@ where
                         }
                     }
                     _ => {
-                        let scalar = translate_scalar_with_context(resolver, id_context, expr)?;
+                        let scalar = translate_scalar_with_context(
+                            resolver,
+                            id_context.clone(),
+                            expr,
+                        )?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias: alias.value.clone(),
@@ -4512,7 +4534,7 @@ fn translate_condition_with_context(
                     | BinaryOperator::GtEq => {
                         let result = translate_comparison_with_context(
                             resolver,
-                            context,
+                            context.clone(),
                             left,
                             op.clone(),
                             right,
@@ -4537,7 +4559,11 @@ fn translate_condition_with_context(
                     work_stack.push(ConditionFrame::Enter(inner));
                 }
                 SqlExpr::IsNull(inner) => {
-                    let scalar = translate_scalar_with_context(resolver, context, inner)?;
+                    let scalar = translate_scalar_with_context(
+                        resolver,
+                        context.clone(),
+                        inner,
+                    )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
@@ -4556,7 +4582,11 @@ fn translate_condition_with_context(
                     }
                 }
                 SqlExpr::IsNotNull(inner) => {
-                    let scalar = translate_scalar_with_context(resolver, context, inner)?;
+                    let scalar = translate_scalar_with_context(
+                        resolver,
+                        context.clone(),
+                        inner,
+                    )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
@@ -4591,7 +4621,7 @@ fn translate_condition_with_context(
                         for value_expr in list {
                             let comparison = translate_comparison_with_context(
                                 resolver,
-                                context,
+                                context.clone(),
                                 in_expr,
                                 BinaryOperator::Eq,
                                 value_expr,
@@ -4626,14 +4656,14 @@ fn translate_condition_with_context(
                 } => {
                     let lower_bound = translate_comparison_with_context(
                         resolver,
-                        context,
+                        context.clone(),
                         between_expr,
                         BinaryOperator::GtEq,
                         low,
                     )?;
                     let upper_bound = translate_comparison_with_context(
                         resolver,
-                        context,
+                        context.clone(),
                         between_expr,
                         BinaryOperator::LtEq,
                         high,
@@ -4752,7 +4782,7 @@ fn translate_comparison_with_context(
     op: BinaryOperator,
     right: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    let left_scalar = translate_scalar_with_context(resolver, context, left)?;
+    let left_scalar = translate_scalar_with_context(resolver, context.clone(), left)?;
     let right_scalar = translate_scalar_with_context(resolver, context, right)?;
     let compare_op = match op {
         BinaryOperator::Eq => llkv_expr::expr::CompareOp::Eq,
@@ -4848,29 +4878,19 @@ fn translate_scalar_with_context(
     context: IdentifierContext,
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    match expr {
-        SqlExpr::Identifier(ident) => {
-            let parts = vec![ident.value.clone()];
-            let resolution = resolver.resolve(&parts, context)?;
-            Ok(resolution.into_scalar_expr())
-        }
-        SqlExpr::CompoundIdentifier(idents) => {
-            if idents.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "invalid compound identifier".into(),
-                ));
-            }
-
-            let parts: Vec<String> = idents.iter().map(|ident| ident.value.clone()).collect();
-            let resolution = resolver.resolve(&parts, context)?;
-            Ok(resolution.into_scalar_expr())
-        }
-        _ => translate_scalar(expr),
-    }
+    translate_scalar_internal(expr, Some(resolver), Some(&context))
 }
 
-// TODO: Rename?  Already many `translate_scaler` functions... be more specific?
+#[allow(dead_code)]
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+    translate_scalar_internal(expr, None, None)
+}
+
+fn translate_scalar_internal(
+    expr: &SqlExpr,
+    resolver: Option<&IdentifierResolver<'_>>,
+    context: Option<&IdentifierContext>,
+) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::traversal module documentation for pattern details.
     //
@@ -4895,9 +4915,15 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
         match frame {
             ScalarFrame::Enter(node) => match node {
                 SqlExpr::Identifier(ident) => {
-                    work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::column(
-                        ident.value.clone(),
-                    )));
+                    if let (Some(resolver), Some(ctx)) = (resolver, context) {
+                        let parts = vec![ident.value.clone()];
+                        let resolution = resolver.resolve(&parts, (*ctx).clone())?;
+                        work_stack.push(ScalarFrame::Leaf(resolution.into_scalar_expr()));
+                    } else {
+                        work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::column(
+                            ident.value.clone(),
+                        )));
+                    }
                 }
                 SqlExpr::CompoundIdentifier(idents) => {
                     if idents.is_empty() {
@@ -4906,15 +4932,22 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                         ));
                     }
 
-                    let column_name = idents[0].value.clone();
-                    let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
+                    if let (Some(resolver), Some(ctx)) = (resolver, context) {
+                        let parts: Vec<String> =
+                            idents.iter().map(|ident| ident.value.clone()).collect();
+                        let resolution = resolver.resolve(&parts, (*ctx).clone())?;
+                        work_stack.push(ScalarFrame::Leaf(resolution.into_scalar_expr()));
+                    } else {
+                        let column_name = idents[0].value.clone();
+                        let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
 
-                    for part in &idents[1..] {
-                        let field_name = part.value.clone();
-                        result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
+                        for part in &idents[1..] {
+                            let field_name = part.value.clone();
+                            result = llkv_expr::expr::ScalarExpr::get_field(result, field_name);
+                        }
+
+                        work_stack.push(ScalarFrame::Leaf(result));
                     }
-
-                    work_stack.push(ScalarFrame::Leaf(result));
                 }
                 SqlExpr::Value(value) => {
                     let result = literal_from_value(value)?;
@@ -4962,9 +4995,10 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                     let mut struct_fields = Vec::new();
                     for entry in fields {
                         let key = entry.key.value.clone();
-                        // Use iterative translate_scalar call (self-referential but not deeply nested)
-                        // Since dictionaries rarely nest deeply, this is safe
-                        let value_expr = translate_scalar(&entry.value)?;
+                        // Reuse scalar translation for nested values while honoring identifier context.
+                        // Dictionaries rarely nest deeply, so recursion here is acceptable.
+                        let value_expr =
+                            translate_scalar_internal(&entry.value, resolver, context)?;
                         match value_expr {
                             llkv_expr::expr::ScalarExpr::Literal(lit) => {
                                 struct_fields.push((key, Box::new(lit)));
@@ -5554,10 +5588,11 @@ fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>
 
 fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>) -> SqlResult<()> {
     match factor {
-        TableFactor::Table { name, .. } => {
+        TableFactor::Table { name, alias, .. } => {
             let (schema_opt, table) = parse_schema_qualified_name(name)?;
             let schema = schema_opt.unwrap_or_default();
-            tables.push(llkv_plan::TableRef::new(schema, table));
+            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+            tables.push(llkv_plan::TableRef::with_alias(schema, table, alias_name));
             Ok(())
         }
         TableFactor::Derived { .. } => Err(Error::InvalidArgumentError(

@@ -4,18 +4,31 @@ use llkv_expr::expr::ScalarExpr;
 use llkv_result::{Error, Result};
 
 /// Context for resolving identifiers (e.g., default table from FROM clause).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IdentifierContext {
     default_table_id: Option<TableId>,
+    table_alias: Option<String>,
 }
 
 impl IdentifierContext {
     pub fn new(default_table_id: Option<TableId>) -> Self {
-        Self { default_table_id }
+        Self {
+            default_table_id,
+            table_alias: None,
+        }
+    }
+
+    pub fn with_table_alias(mut self, alias: Option<String>) -> Self {
+        self.table_alias = alias.map(|value| value.to_ascii_lowercase());
+        self
     }
 
     pub fn default_table_id(&self) -> Option<TableId> {
         self.default_table_id
+    }
+
+    pub fn table_alias(&self) -> Option<&str> {
+        self.table_alias.as_deref()
     }
 }
 
@@ -80,7 +93,20 @@ impl<'a> IdentifierResolver<'a> {
             ))
         })?;
 
-        resolve_identifier_parts(parts, &table_meta)
+        let mut effective_parts = parts;
+        if let Some(alias) = context.table_alias() {
+            if !effective_parts.is_empty() && effective_parts[0].eq_ignore_ascii_case(alias) {
+                if effective_parts.len() == 1 {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: does not have a column named '{}'",
+                        effective_parts[0]
+                    )));
+                }
+                effective_parts = &effective_parts[1..];
+            }
+        }
+
+        resolve_identifier_parts(effective_parts, &table_meta)
     }
 }
 
