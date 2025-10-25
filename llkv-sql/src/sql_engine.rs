@@ -5747,6 +5747,35 @@ mod tests {
     }
 
     #[test]
+    fn cross_join_not_null_comparison_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE left_side(col INTEGER)")
+            .expect("create left table");
+        engine
+            .execute("CREATE TABLE right_side(col INTEGER)")
+            .expect("create right table");
+        engine
+            .execute("INSERT INTO left_side VALUES (1)")
+            .expect("insert left row");
+        engine
+            .execute("INSERT INTO right_side VALUES (2)")
+            .expect("insert right row");
+
+        let batches = engine
+            .sql("SELECT * FROM left_side CROSS JOIN right_side WHERE NOT ( NULL ) >= NULL")
+            .expect("run cross join null comparison");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "expected cross join filter to remove all rows"
+        );
+    }
+
+    #[test]
     fn update_with_where_clause_filters_rows() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
