@@ -1,1 +1,1 @@
-Note: More extensive testing of SQL semantics is handled by [llkv-slt-tester](../../llkv-slt-tester/)
+Note: More extensive testing of SQL semantics is handled by [llkv-slt-tester](../../llkv-slt-tester/).
