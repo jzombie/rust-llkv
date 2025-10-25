@@ -12,13 +12,13 @@ This crate provides a small harness and API for running sqllogictest (`.slt`) su
 
 **Key points:**
 
-- The test binary (`tests/slt_harness.rs`) builds a standalone test runner using `libtest-mimic` so the harness controls discovery and reporting.
+- The harness source file (`tests/slt_harness.rs`) implements a standalone test runner using `libtest-mimic` so the harness controls discovery and reporting.
 - Programmatic API is exposed via `LlkvSltRunner` for embedding SLT execution in other tooling.
 - `.slturl` pointer files are supported: a `.slturl` file contains a URL which will be fetched (via `reqwest`) and executed.
 
 ## Usage
 
-Run the included test harness binary (it uses a custom runner and is declared with `harness = false` in `Cargo.toml`):
+Run the included test harness:
 
 From the workspace root:
 
@@ -54,7 +54,7 @@ Files with the `.slturl` extension are treated as pointers: the harness reads th
 
 ## Internals / Implementation notes
 
-- The test harness binary (`tests/slt_harness.rs`) provides a custom `main` that parses `libtest-mimic::Arguments` and calls into `run_slt_harness_with_args` so the crate can control discovery and reporting.
+- The test harness source file (`tests/slt_harness.rs`) provides a custom `main` that parses `libtest-mimic::Arguments` and calls into `run_slt_harness_with_args` so the crate can control discovery and reporting.
 - The public API lives in `src/lib.rs` and delegates parsing and execution to `src/runner.rs`.
 
 ## Contributing
