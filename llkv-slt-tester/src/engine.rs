@@ -202,6 +202,7 @@ impl AsyncDB for EngineHarness {
                                                 format_struct_value(a, row_idx)
                                             }
                                         }
+                                        arrow::datatypes::DataType::Null => "NULL".to_string(),
                                         _ => "".to_string(),
                                     };
                                     row.push(val);

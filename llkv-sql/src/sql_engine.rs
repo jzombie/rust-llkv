@@ -4603,30 +4603,23 @@ fn translate_condition_with_context(
                         };
                         work_stack.push(ConditionFrame::Leaf(result));
                     } else {
-                        let mut conditions = Vec::with_capacity(list.len());
+                        let target =
+                            translate_scalar_with_context(resolver, context.clone(), in_expr)?;
+                        let mut values = Vec::with_capacity(list.len());
                         for value_expr in list {
-                            let comparison = translate_comparison_with_context(
+                            let scalar = translate_scalar_with_context(
                                 resolver,
                                 context.clone(),
-                                in_expr,
-                                BinaryOperator::Eq,
                                 value_expr,
                             )?;
-                            conditions.push(comparison);
+                            values.push(scalar);
                         }
 
-                        let or_expr = if conditions.len() == 1 {
-                            conditions.into_iter().next().unwrap()
-                        } else {
-                            llkv_expr::expr::Expr::Or(conditions)
-                        };
-
-                        let result = if *negated {
-                            llkv_expr::expr::Expr::not(or_expr)
-                        } else {
-                            or_expr
-                        };
-                        work_stack.push(ConditionFrame::Leaf(result));
+                        work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::InList {
+                            expr: target,
+                            list: values,
+                            negated: *negated,
+                        }));
                     }
                 }
                 SqlExpr::InSubquery { .. } => {
@@ -5075,9 +5068,8 @@ fn translate_scalar_internal(
                                 ));
                             }
                             Literal::Null => {
-                                return Err(Error::InvalidArgumentError(
-                                    "cannot negate null literal".into(),
-                                ));
+                                result_stack
+                                    .push(llkv_expr::expr::ScalarExpr::literal(Literal::Null));
                             }
                         },
                         other => {
@@ -5732,6 +5724,26 @@ mod tests {
         }
 
         assert_eq!(values, vec![Some(42), None]);
+    }
+
+    #[test]
+    fn not_null_comparison_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE single(col INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO single VALUES (1)")
+            .expect("insert row");
+
+        let batches = engine
+            .sql("SELECT * FROM single WHERE NOT ( NULL ) >= NULL")
+            .expect("run constant null comparison");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "expected filter to remove all rows");
     }
 
     #[test]

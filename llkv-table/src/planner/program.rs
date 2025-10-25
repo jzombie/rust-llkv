@@ -41,6 +41,11 @@ pub(crate) enum EvalOp {
         right: ScalarExpr<FieldId>,
         op: CompareOp,
     },
+    PushInList {
+        expr: ScalarExpr<FieldId>,
+        list: Vec<ScalarExpr<FieldId>>,
+        negated: bool,
+    },
     PushLiteral(bool),
     FusedAnd {
         field_id: FieldId,
@@ -223,6 +228,11 @@ pub(crate) enum DomainOp {
         op: CompareOp,
         fields: Vec<FieldId>,
     },
+    PushInListDomain {
+        expr: ScalarExpr<FieldId>,
+        list: Vec<ScalarExpr<FieldId>>,
+        fields: Vec<FieldId>,
+    },
     PushLiteralFalse,
     PushAllRows,
     Union {
@@ -325,6 +335,17 @@ fn compile_eval<'expr>(
                         op: *op,
                     });
                 }
+                Expr::InList {
+                    expr,
+                    list,
+                    negated,
+                } => {
+                    ops.push(EvalOp::PushInList {
+                        expr: expr.clone(),
+                        list: list.clone(),
+                        negated: *negated,
+                    });
+                }
                 Expr::Literal(value) => ops.push(EvalOp::PushLiteral(*value)),
                 Expr::And(children) => ops.push(EvalOp::And {
                     child_count: children.len(),
@@ -408,6 +429,16 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                     op: *op,
                     fields: collect_fields([left, right]),
                 }),
+                Expr::InList { expr, list, .. } => {
+                    let mut exprs: Vec<&ScalarExpr<FieldId>> = Vec::with_capacity(list.len() + 1);
+                    exprs.push(expr);
+                    exprs.extend(list.iter());
+                    ops.push(DomainOp::PushInListDomain {
+                        expr: expr.clone(),
+                        list: list.clone(),
+                        fields: collect_fields(exprs),
+                    });
+                }
                 Expr::Literal(value) => {
                     if *value {
                         ops.push(DomainOp::PushAllRows);
