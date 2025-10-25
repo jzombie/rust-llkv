@@ -101,6 +101,29 @@ where
                         right: right_expr,
                     }));
                 }
+                LlkvExpr::InList {
+                    expr: target,
+                    list,
+                    negated,
+                } => {
+                    let translated_target =
+                        translate_scalar_with(&target, schema, unknown_column, unknown_aggregate)?;
+                    let mut translated_list: Vec<ScalarExpr<FieldId>> =
+                        Vec::with_capacity(list.len());
+                    for value in list {
+                        translated_list.push(translate_scalar_with(
+                            &value,
+                            schema,
+                            unknown_column,
+                            unknown_aggregate,
+                        )?);
+                    }
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::InList {
+                        expr: translated_target,
+                        list: translated_list,
+                        negated,
+                    }));
+                }
                 LlkvExpr::Literal(value) => {
                     owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Literal(value)));
                 }
