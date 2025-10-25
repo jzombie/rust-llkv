@@ -65,4 +65,4 @@ Please run `cargo test -p llkv-slt-tester --test slt_harness` after changes to v
 
 ## License
 
-Licensed under the [Apache-2.0 License](./LICENSE).
+Licensed under the [Apache-2.0 License](../LICENSE).
