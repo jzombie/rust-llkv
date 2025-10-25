@@ -47,7 +47,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
-use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+use crate::scalar_eval::{NumericArray, NumericArrayMap, NumericKernels, NumericKind};
 use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
@@ -1134,7 +1134,25 @@ where
                                     .collect::<LlkvResult<Vec<_>>>()?;
                                 DataType::Struct(struct_fields.into())
                             }
-                            ScalarExpr::Binary { .. } => DataType::Float64,
+                            ScalarExpr::Binary { .. } => {
+                                let mut resolver = |fid: FieldId| {
+                                    let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
+                                    lfid_dtypes
+                                        .get(&lfid)
+                                        .and_then(|dt| NumericKernels::kind_for_data_type(dt))
+                                };
+
+                                let result_kind = NumericKernels::infer_result_kind_from_types(
+                                    &info.expr,
+                                    &mut resolver,
+                                )
+                                .unwrap_or(NumericKind::Float);
+
+                                match result_kind {
+                                    NumericKind::Integer => DataType::Int64,
+                                    NumericKind::Float => DataType::Float64,
+                                }
+                            }
                             ScalarExpr::Column(fid) => {
                                 let lfid = LogicalFieldId::for_user(self.table.table_id(), *fid);
                                 lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
@@ -1410,6 +1428,24 @@ where
                 let field_alias = alias.clone();
                 let dtype = self.table.store().data_type(lfid)?;
 
+                let column_kind =
+                    NumericKernels::kind_for_data_type(&dtype).unwrap_or(NumericKind::Float);
+                let mut resolver = |fid: FieldId| {
+                    if fid == field_id {
+                        Some(column_kind)
+                    } else {
+                        None
+                    }
+                };
+                let result_kind =
+                    NumericKernels::infer_result_kind_from_types(&simplified, &mut resolver)
+                        .unwrap_or(NumericKind::Float);
+
+                let output_dtype = match result_kind {
+                    NumericKind::Integer => DataType::Int64,
+                    NumericKind::Float => DataType::Float64,
+                };
+
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
                     if passthrough_fid != field_id {
                         return Err(Error::InvalidArgumentError(
@@ -1438,29 +1474,31 @@ where
                     if !is_supported_numeric(&dtype) {
                         return Ok(StreamOutcome::Fallback);
                     }
-                    let schema = Arc::new(Schema::new(vec![Field::new(
-                        field_alias.clone(),
-                        DataType::Float64,
-                        true,
-                    )]));
-                    let mut visitor = AffineSingleColumnVisitor::new(
-                        schema,
-                        affine.scale,
-                        affine.offset,
-                        on_batch,
-                    );
-                    ScanBuilder::new(self.table.store(), lfid)
-                        .options(ScanOptions::default())
-                        .run(&mut visitor)?;
-                    visitor.finish()?;
-                    return Ok(StreamOutcome::Handled);
+                    if matches!(result_kind, NumericKind::Float) {
+                        let schema = Arc::new(Schema::new(vec![Field::new(
+                            field_alias.clone(),
+                            output_dtype.clone(),
+                            true,
+                        )]));
+                        let mut visitor = AffineSingleColumnVisitor::new(
+                            schema,
+                            affine.scale,
+                            affine.offset,
+                            on_batch,
+                        );
+                        ScanBuilder::new(self.table.store(), lfid)
+                            .options(ScanOptions::default())
+                            .run(&mut visitor)?;
+                        visitor.finish()?;
+                        return Ok(StreamOutcome::Handled);
+                    }
                 }
 
                 let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
                 numeric_fields.insert(field_id);
                 let schema = Arc::new(Schema::new(vec![Field::new(
                     field_alias.clone(),
-                    DataType::Float64,
+                    output_dtype,
                     true,
                 )]));
                 let mut visitor = ComputedSingleColumnVisitor::new(
@@ -1784,7 +1822,8 @@ where
 
             if has_row_id {
                 let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(Float64Array::from(rid_values)));
+                let array = Float64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {

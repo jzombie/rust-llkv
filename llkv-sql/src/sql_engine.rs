@@ -5055,9 +5055,12 @@ fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<Str
                                 ));
                             }
                         },
-                        _ => {
-                            return Err(Error::InvalidArgumentError(
-                                "cannot negate non-literal expression".into(),
+                        other => {
+                            let zero = llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0));
+                            result_stack.push(llkv_expr::expr::ScalarExpr::binary(
+                                zero,
+                                llkv_expr::expr::BinaryOp::Subtract,
+                                other,
                             ));
                         }
                     }
