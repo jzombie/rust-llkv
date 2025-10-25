@@ -20,11 +20,12 @@ use arrow::array::{
 use arrow::compute::{
     SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::expr::{AggregateCall, Expr as LlkvExpr, ScalarExpr};
+use llkv_join::cross_join_pair;
 use llkv_plan::{
     AggregateExpr, AggregateFunction, CanonicalRow, OrderByPlan, OrderSortType, OrderTarget,
     PlanValue, SelectPlan, SelectProjection,
@@ -36,7 +37,7 @@ use llkv_table::table::{
     ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
-use llkv_table::{NumericArray, NumericArrayMap, NumericKernels};
+use llkv_table::{NumericArray, NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
@@ -272,92 +273,39 @@ where
             ));
         }
 
-        // Get all tables
-        let mut tables = Vec::new();
+        // Acquire table handles and materialize the base batches for each table.
+        let mut tables = Vec::with_capacity(plan.tables.len());
         for table_ref in &plan.tables {
             let qualified_name = table_ref.qualified_name();
             let table = self.provider.get_table(&qualified_name)?;
             tables.push((table_ref.clone(), table));
         }
 
-        // For now, support only 2-table cross product
-        if tables.len() > 2 {
-            return Err(Error::InvalidArgumentError(
-                "cross products with more than 2 tables not yet supported".into(),
-            ));
+        let mut staged: Vec<TableCrossProductData> = Vec::with_capacity(tables.len());
+        for (table_ref, table) in &tables {
+            staged.push(collect_table_data(table_ref, table.as_ref())?);
         }
 
-        let (left_ref, left_table) = &tables[0];
-        let (right_ref, right_table) = &tables[1];
+        let mut staged_iter = staged.into_iter();
+        let mut current = staged_iter
+            .next()
+            .ok_or_else(|| Error::Internal("cross product preparation yielded no tables".into()))?;
 
-        // Build the cross product using llkv-join crate
-        // For cross product, we pass empty join keys = Cartesian product
-        use llkv_join::{JoinOptions, JoinType, TableJoinExt};
-
-        let mut result_batches = Vec::new();
-        left_table.table.join_stream(
-            &right_table.table,
-            &[], // Empty join keys = cross product
-            &JoinOptions {
-                join_type: JoinType::Inner,
-                ..Default::default()
-            },
-            |batch| {
-                result_batches.push(batch);
-            },
-        )?;
-
-        // Build combined schema with qualified column names
-        let mut combined_fields = Vec::new();
-
-        // Add left table columns with schema.table.column prefix
-        for col in &left_table.schema.columns {
-            let qualified_name = format!("{}.{}.{}", left_ref.schema, left_ref.table, col.name);
-            combined_fields.push(arrow::datatypes::Field::new(
-                qualified_name,
-                col.data_type.clone(),
-                col.nullable,
-            ));
+        for next in staged_iter {
+            current = cross_join_table_batches(current, next)?;
         }
 
-        // Add right table columns with schema.table.column prefix
-        for col in &right_table.schema.columns {
-            let qualified_name = format!("{}.{}.{}", right_ref.schema, right_ref.table, col.name);
-            combined_fields.push(arrow::datatypes::Field::new(
-                qualified_name,
-                col.data_type.clone(),
-                col.nullable,
-            ));
-        }
+        let mut combined_batches = current.batches;
+        let combined_schema = current.schema;
 
-        let combined_schema = Arc::new(Schema::new(combined_fields));
-
-        // Combine all result batches with the combined schema (renames columns)
-        let mut combined_batch = if result_batches.is_empty() {
+        let mut combined_batch = if combined_batches.is_empty() {
             RecordBatch::new_empty(Arc::clone(&combined_schema))
-        } else if result_batches.len() == 1 {
-            let batch = result_batches.into_iter().next().unwrap();
-            // The batch from join has original column names, we need to apply our qualified schema
-            RecordBatch::try_new(Arc::clone(&combined_schema), batch.columns().to_vec()).map_err(
-                |e| {
-                    Error::Internal(format!(
-                        "failed to create batch with qualified names: {}",
-                        e
-                    ))
-                },
-            )?
+        } else if combined_batches.len() == 1 {
+            combined_batches.pop().unwrap()
         } else {
-            // First concatenate with original schema
-            let original_batch = concat_batches(&result_batches[0].schema(), &result_batches)
-                .map_err(|e| Error::Internal(format!("failed to concatenate batches: {}", e)))?;
-            // Then apply qualified schema
-            RecordBatch::try_new(
-                Arc::clone(&combined_schema),
-                original_batch.columns().to_vec(),
-            )
-            .map_err(|e| {
+            concat_batches(&combined_schema, &combined_batches).map_err(|e| {
                 Error::Internal(format!(
-                    "failed to create batch with qualified names: {}",
+                    "failed to concatenate cross product batches: {}",
                     e
                 ))
             })?
@@ -450,12 +398,14 @@ where
 
         let schema = combined_batch.schema();
 
+        let display_name = tables
+            .iter()
+            .map(|(table_ref, _)| table_ref.qualified_name())
+            .collect::<Vec<_>>()
+            .join(",");
+
         Ok(SelectExecution::new_single_batch(
-            format!(
-                "{},{}",
-                left_ref.qualified_name(),
-                right_ref.qualified_name()
-            ),
+            display_name,
             schema,
             combined_batch,
         ))
@@ -1320,59 +1270,6 @@ fn table_column_key(name: &str) -> Option<String> {
     Some(format!("{}.{}", table, column))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::{Array, ArrayRef, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use llkv_expr::expr::BinaryOp;
-    use std::sync::Arc;
-
-    #[test]
-    fn cross_product_context_evaluates_expressions() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("main.tab2.a", DataType::Int64, false),
-            Field::new("main.tab2.b", DataType::Int64, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
-                Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
-            ],
-        )
-        .expect("valid batch");
-
-        let mut ctx = CrossProductExpressionContext::new(schema.as_ref())
-            .expect("context builds from schema");
-
-        let literal_expr: ScalarExpr<String> = ScalarExpr::literal(67);
-        let literal = ctx
-            .evaluate(&literal_expr, &batch)
-            .expect("literal evaluation succeeds");
-        let literal_array = literal
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 literal result");
-        assert_eq!(literal_array.len(), 3);
-        assert!(literal_array.iter().all(|value| value == Some(67)));
-
-        let add_expr = ScalarExpr::binary(
-            ScalarExpr::column("tab2.a".to_string()),
-            BinaryOp::Add,
-            ScalarExpr::literal(5),
-        );
-        let added = ctx
-            .evaluate(&add_expr, &batch)
-            .expect("column addition succeeds");
-        let added_array = added
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 addition result");
-        assert_eq!(added_array.values(), &[6, 7, 8]);
-    }
-}
 
 /// Streaming execution handle for SELECT queries.
 #[derive(Clone)]
@@ -1804,6 +1701,126 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<
     Ok(vec![batch])
 }
 
+struct TableCrossProductData {
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+}
+
+fn collect_table_data<P>(
+    table_ref: &llkv_plan::TableRef,
+    table: &ExecutorTable<P>,
+) -> ExecutorResult<TableCrossProductData>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if table.schema.columns.is_empty() {
+        return Err(Error::InvalidArgumentError(format!(
+            "table '{}' has no columns; cross products require at least one column",
+            table_ref.qualified_name()
+        )));
+    }
+
+    let mut projections = Vec::with_capacity(table.schema.columns.len());
+    let mut fields = Vec::with_capacity(table.schema.columns.len());
+
+    for column in &table.schema.columns {
+        let qualified_name = format!("{}.{}.{}", table_ref.schema, table_ref.table, column.name);
+        projections.push(ScanProjection::from(StoreProjection::with_alias(
+            LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+            qualified_name.clone(),
+        )));
+        fields.push(Field::new(
+            qualified_name,
+            column.data_type.clone(),
+            column.nullable,
+        ));
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+
+    let filter_field_id = table.schema.first_field_id().unwrap_or(ROW_ID_FIELD_ID);
+    let filter_expr = crate::translation::expression::full_table_scan_filter(filter_field_id);
+
+    let mut raw_batches = Vec::new();
+    table.table.scan_stream(
+        projections,
+        &filter_expr,
+        ScanStreamOptions {
+            include_nulls: true,
+            ..ScanStreamOptions::default()
+        },
+        |batch| {
+            raw_batches.push(batch);
+        },
+    )?;
+
+    let mut normalized_batches = Vec::with_capacity(raw_batches.len());
+    for batch in raw_batches {
+        let normalized = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
+            .map_err(|err| {
+                Error::Internal(format!(
+                    "failed to align scan batch for table '{}': {}",
+                    table_ref.qualified_name(),
+                    err
+                ))
+            })?;
+        normalized_batches.push(normalized);
+    }
+
+    Ok(TableCrossProductData {
+        schema,
+        batches: normalized_batches,
+    })
+}
+
+fn cross_join_table_batches(
+    left: TableCrossProductData,
+    right: TableCrossProductData,
+) -> ExecutorResult<TableCrossProductData> {
+    let combined_fields: Vec<Field> = left
+        .schema
+        .fields()
+        .iter()
+        .chain(right.schema.fields().iter())
+        .map(|field| field.as_ref().clone())
+        .collect();
+
+    let combined_schema = Arc::new(Schema::new(combined_fields));
+
+    let left_has_rows = left.batches.iter().any(|batch| batch.num_rows() > 0);
+    let right_has_rows = right.batches.iter().any(|batch| batch.num_rows() > 0);
+
+    if !left_has_rows || !right_has_rows {
+        return Ok(TableCrossProductData {
+            schema: combined_schema,
+            batches: Vec::new(),
+        });
+    }
+
+    let mut output_batches = Vec::new();
+    for left_batch in &left.batches {
+        if left_batch.num_rows() == 0 {
+            continue;
+        }
+        for right_batch in &right.batches {
+            if right_batch.num_rows() == 0 {
+                continue;
+            }
+
+            let batch =
+                cross_join_pair(left_batch, right_batch, &combined_schema).map_err(|err| {
+                    Error::Internal(format!("failed to build cross join batch: {err}"))
+                })?;
+            output_batches.push(batch);
+        }
+    }
+
+    Ok(TableCrossProductData {
+        schema: combined_schema,
+        batches: output_batches,
+    })
+}
+
 #[derive(Default)]
 struct DistinctState {
     seen: FxHashSet<CanonicalRow>,
@@ -1953,4 +1970,139 @@ fn sort_record_batch_with_order(
 
     RecordBatch::try_new(Arc::clone(schema), reordered_columns)
         .map_err(|err| Error::Internal(format!("failed to build reordered ORDER BY batch: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use llkv_expr::expr::BinaryOp;
+    use std::sync::Arc;
+
+    #[test]
+    fn cross_product_context_evaluates_expressions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("main.tab2.a", DataType::Int64, false),
+            Field::new("main.tab2.b", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+            ],
+        )
+        .expect("valid batch");
+
+        let mut ctx = CrossProductExpressionContext::new(schema.as_ref())
+            .expect("context builds from schema");
+
+        let literal_expr: ScalarExpr<String> = ScalarExpr::literal(67);
+        let literal = ctx
+            .evaluate(&literal_expr, &batch)
+            .expect("literal evaluation succeeds");
+        let literal_array = literal
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 literal result");
+        assert_eq!(literal_array.len(), 3);
+        assert!(literal_array.iter().all(|value| value == Some(67)));
+
+        let add_expr = ScalarExpr::binary(
+            ScalarExpr::column("tab2.a".to_string()),
+            BinaryOp::Add,
+            ScalarExpr::literal(5),
+        );
+        let added = ctx
+            .evaluate(&add_expr, &batch)
+            .expect("column addition succeeds");
+        let added_array = added
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 addition result");
+        assert_eq!(added_array.values(), &[6, 7, 8]);
+    }
+
+    #[test]
+    fn cross_product_handles_more_than_two_tables() {
+        let schema_a = Arc::new(Schema::new(vec![Field::new(
+            "main.t1.a",
+            DataType::Int64,
+            false,
+        )]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new(
+            "main.t2.b",
+            DataType::Int64,
+            false,
+        )]));
+        let schema_c = Arc::new(Schema::new(vec![Field::new(
+            "main.t3.c",
+            DataType::Int64,
+            false,
+        )]));
+
+        let batch_a = RecordBatch::try_new(
+            Arc::clone(&schema_a),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("valid batch");
+        let batch_b = RecordBatch::try_new(
+            Arc::clone(&schema_b),
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef],
+        )
+        .expect("valid batch");
+        let batch_c = RecordBatch::try_new(
+            Arc::clone(&schema_c),
+            vec![Arc::new(Int64Array::from(vec![100])) as ArrayRef],
+        )
+        .expect("valid batch");
+
+        let data_a = TableCrossProductData {
+            schema: schema_a,
+            batches: vec![batch_a],
+        };
+        let data_b = TableCrossProductData {
+            schema: schema_b,
+            batches: vec![batch_b],
+        };
+        let data_c = TableCrossProductData {
+            schema: schema_c,
+            batches: vec![batch_c],
+        };
+
+        let ab = cross_join_table_batches(data_a, data_b).expect("two-table product");
+        assert_eq!(ab.schema.fields().len(), 2);
+        assert_eq!(ab.batches.len(), 1);
+        assert_eq!(ab.batches[0].num_rows(), 6);
+
+        let abc = cross_join_table_batches(ab, data_c).expect("three-table product");
+        assert_eq!(abc.schema.fields().len(), 3);
+        assert_eq!(abc.batches.len(), 1);
+
+        let final_batch = &abc.batches[0];
+        assert_eq!(final_batch.num_rows(), 6);
+
+        let col_a = final_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("left column values");
+        assert_eq!(col_a.values(), &[1, 1, 1, 2, 2, 2]);
+
+        let col_b = final_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("middle column values");
+        assert_eq!(col_b.values(), &[10, 20, 30, 10, 20, 30]);
+
+        let col_c = final_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("right column values");
+        assert_eq!(col_c.values(), &[100, 100, 100, 100, 100, 100]);
+    }
 }

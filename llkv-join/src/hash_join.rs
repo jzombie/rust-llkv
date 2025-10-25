@@ -33,7 +33,6 @@
 
 use crate::{JoinKey, JoinOptions, JoinType};
 use arrow::array::{Array, ArrayRef, RecordBatch};
-use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
 use llkv_column_map::gather::{
     gather_indices, gather_indices_from_batches, gather_optional_indices_from_batches,
@@ -1438,9 +1437,6 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     F: FnMut(RecordBatch),
 {
-    use arrow::array::new_null_array;
-    use arrow::compute::concat_batches;
-
     let left_schema = left.schema()?;
     let right_schema = right.schema()?;
 
@@ -1451,7 +1447,6 @@ where
     // Output schema: all left columns + all right columns
     let output_schema = build_output_schema(&left_schema, &right_schema, options.join_type)?;
 
-    // Collect all rows from right table first (build side)
     let mut right_batches = Vec::new();
     if !right_projections.is_empty() {
         let filter_expr = build_all_rows_filter(&right_projections)?;
@@ -1465,74 +1460,44 @@ where
         )?;
     }
 
-    // Concatenate all right batches into one
-    let right_batch = if right_batches.is_empty() {
-        RecordBatch::new_empty(Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new())))
-    } else if right_batches.len() == 1 {
-        right_batches.into_iter().next().unwrap()
-    } else {
-        let schema = right_batches[0].schema();
-        concat_batches(&schema, &right_batches)
-            .map_err(|e| Error::Internal(format!("failed to concat right batches: {}", e)))?
-    };
+    if right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0) {
+        return Ok(());
+    }
 
-    let right_num_rows = right_batch.num_rows();
+    if left_projections.is_empty() {
+        return Ok(());
+    }
 
-    // Now scan left table and emit cross product
-    if !left_projections.is_empty() {
-        let filter_expr = build_all_rows_filter(&left_projections)?;
+    let filter_expr = build_all_rows_filter(&left_projections)?;
+    let mut error: Option<Error> = None;
 
-        left.scan_stream(
-            &left_projections,
-            &filter_expr,
-            ScanStreamOptions::default(),
-            |left_batch| {
-                let left_num_rows = left_batch.num_rows();
+    left.scan_stream(
+        &left_projections,
+        &filter_expr,
+        ScanStreamOptions::default(),
+        |left_batch| {
+            if error.is_some() || left_batch.num_rows() == 0 {
+                return;
+            }
 
-                // For each left row, replicate it right_num_rows times
-                // and combine with all right rows
-                if left_num_rows == 0 || right_num_rows == 0 {
-                    return;
+            for right_batch in &right_batches {
+                if right_batch.num_rows() == 0 {
+                    continue;
                 }
 
-                // Replicate left columns
-                let mut result_columns = Vec::new();
-                for col in left_batch.columns() {
-                    let mut indices = Vec::with_capacity(left_num_rows * right_num_rows);
-                    for left_idx in 0..left_num_rows {
-                        for _ in 0..right_num_rows {
-                            indices.push(left_idx as u32);
-                        }
+                match crate::cartesian::cross_join_pair(&left_batch, right_batch, &output_schema) {
+                    Ok(result) => on_batch(result),
+                    Err(err) => {
+                        error = Some(err);
+                        break;
                     }
-                    let indices_array = arrow::array::UInt32Array::from(indices);
-                    let replicated = take(col, &indices_array, None).unwrap_or_else(|_| {
-                        new_null_array(col.data_type(), left_num_rows * right_num_rows)
-                    });
-                    result_columns.push(replicated);
                 }
+            }
+        },
+    )?;
 
-                // Replicate right columns
-                for col in right_batch.columns() {
-                    let mut indices = Vec::with_capacity(left_num_rows * right_num_rows);
-                    for _ in 0..left_num_rows {
-                        for right_idx in 0..right_num_rows {
-                            indices.push(right_idx as u32);
-                        }
-                    }
-                    let indices_array = arrow::array::UInt32Array::from(indices);
-                    let replicated = take(col, &indices_array, None).unwrap_or_else(|_| {
-                        new_null_array(col.data_type(), left_num_rows * right_num_rows)
-                    });
-                    result_columns.push(replicated);
-                }
-
-                // Create result batch
-                let result_batch =
-                    RecordBatch::try_new(Arc::clone(&output_schema), result_columns).unwrap();
-
-                on_batch(result_batch);
-            },
-        )?;
+    if let Some(err) = error {
+        return Err(err);
     }
 
     Ok(())
