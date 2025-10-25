@@ -24,7 +24,7 @@ use arrow::datatypes::{DataType, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::expr::{Expr as LlkvExpr, ScalarExpr};
+use llkv_expr::expr::{AggregateCall, Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{
     AggregateExpr, AggregateFunction, CanonicalRow, OrderByPlan, OrderSortType, OrderTarget,
     PlanValue, SelectPlan, SelectProjection,
@@ -36,6 +36,7 @@ use llkv_table::table::{
     ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
+use llkv_table::{NumericArray, NumericArrayMap, NumericKernels};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
@@ -366,6 +367,7 @@ where
         if !plan.projections.is_empty() {
             let mut selected_fields = Vec::new();
             let mut selected_columns = Vec::new();
+            let mut expr_context: Option<CrossProductExpressionContext> = None;
 
             for proj in &plan.projections {
                 match proj {
@@ -413,33 +415,21 @@ where
                         }
                     }
                     SelectProjection::Computed { expr, alias } => {
-                        // Handle simple column references (like s1.t1.t)
-                        if let ScalarExpr::Column(col_name) = expr {
-                            let col_name_lower = col_name.to_ascii_lowercase();
-                            if let Some((idx, field)) = combined_schema
-                                .fields()
-                                .iter()
-                                .enumerate()
-                                .find(|(_, f)| f.name().to_ascii_lowercase() == col_name_lower)
-                            {
-                                selected_fields.push(Arc::new(arrow::datatypes::Field::new(
-                                    alias.clone(),
-                                    field.data_type().clone(),
-                                    field.is_nullable(),
-                                )));
-                                selected_columns.push(combined_batch.column(idx).clone());
-                            } else {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "column '{}' not found in cross product result",
-                                    col_name
-                                )));
-                            }
-                        } else {
-                            return Err(Error::InvalidArgumentError(
-                                "complex computed projections not yet supported in cross products"
-                                    .into(),
-                            ));
+                        if expr_context.is_none() {
+                            expr_context =
+                                Some(CrossProductExpressionContext::new(&combined_schema)?);
                         }
+                        let context = expr_context
+                            .as_mut()
+                            .expect("projection context must be initialized");
+                        let evaluated = context.evaluate(expr, &combined_batch)?;
+                        let field = Arc::new(arrow::datatypes::Field::new(
+                            alias.clone(),
+                            evaluated.data_type().clone(),
+                            true,
+                        ));
+                        selected_fields.push(field);
+                        selected_columns.push(evaluated);
                     }
                 }
             }
@@ -1183,6 +1173,202 @@ where
                 "GetField not supported in aggregate-only expressions".into(),
             )),
         }
+    }
+}
+
+struct CrossProductExpressionContext {
+    schema: Arc<ExecutorSchema>,
+    field_id_to_index: FxHashMap<FieldId, usize>,
+    numeric_cache: FxHashMap<FieldId, NumericArray>,
+}
+
+impl CrossProductExpressionContext {
+    fn new(schema: &Schema) -> ExecutorResult<Self> {
+        let mut table_column_counts: FxHashMap<String, usize> = FxHashMap::default();
+        for field in schema.fields() {
+            if let Some(name) = table_column_key(field.name()) {
+                *table_column_counts
+                    .entry(name.to_ascii_lowercase())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        let mut lookup = FxHashMap::default();
+        let mut field_id_to_index = FxHashMap::default();
+        let mut next_field_id: FieldId = 1;
+
+        for (idx, field) in schema.fields().iter().enumerate() {
+            if next_field_id == u32::MAX {
+                return Err(Error::Internal(
+                    "cross product projection exhausted FieldId space".into(),
+                ));
+            }
+
+            let executor_column = ExecutorColumn {
+                name: field.name().clone(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                primary_key: false,
+                unique: false,
+                field_id: next_field_id,
+                check_expr: None,
+            };
+            let field_id = next_field_id;
+            next_field_id = next_field_id.saturating_add(1);
+
+            let column_index = columns.len();
+            columns.push(executor_column);
+            field_id_to_index.insert(field_id, idx);
+
+            let normalized = field.name().to_ascii_lowercase();
+            lookup.insert(normalized.clone(), column_index);
+
+            let trimmed = normalized.trim_start_matches('.').to_string();
+            if trimmed != normalized {
+                lookup.entry(trimmed).or_insert(column_index);
+            }
+
+            if let Some(table_col) = table_column_key(field.name()) {
+                let key = table_col.to_ascii_lowercase();
+                if table_column_counts.get(&key).copied().unwrap_or(0) == 1 {
+                    lookup.entry(key).or_insert(column_index);
+                }
+            }
+        }
+
+        Ok(Self {
+            schema: Arc::new(ExecutorSchema { columns, lookup }),
+            field_id_to_index,
+            numeric_cache: FxHashMap::default(),
+        })
+    }
+
+    fn evaluate(
+        &mut self,
+        expr: &ScalarExpr<String>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<ArrayRef> {
+        let translated = translate_scalar(expr, self.schema.as_ref(), |name| {
+            Error::InvalidArgumentError(format!(
+                "column '{}' not found in cross product result",
+                name
+            ))
+        })?;
+
+        let mut required = FxHashSet::default();
+        collect_field_ids(&translated, &mut required);
+
+        let mut arrays = NumericArrayMap::default();
+        for field_id in required {
+            let column_index = *self.field_id_to_index.get(&field_id).ok_or_else(|| {
+                Error::Internal("field mapping missing during cross product evaluation".into())
+            })?;
+
+            if !self.numeric_cache.contains_key(&field_id) {
+                let array_ref = batch.column(column_index).clone();
+                let numeric = NumericArray::try_from_arrow(&array_ref)?;
+                self.numeric_cache.insert(field_id, numeric);
+            }
+
+            let numeric = self
+                .numeric_cache
+                .get(&field_id)
+                .expect("numeric cache populated")
+                .clone();
+            arrays.insert(field_id, numeric);
+        }
+
+        NumericKernels::evaluate_batch(&translated, batch.num_rows(), &arrays)
+    }
+}
+
+fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
+    match expr {
+        ScalarExpr::Column(fid) => {
+            out.insert(*fid);
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            collect_field_ids(left, out);
+            collect_field_ids(right, out);
+        }
+        ScalarExpr::Aggregate(call) => match call {
+            AggregateCall::CountStar => {}
+            AggregateCall::Count(fid)
+            | AggregateCall::Sum(fid)
+            | AggregateCall::Min(fid)
+            | AggregateCall::Max(fid)
+            | AggregateCall::CountNulls(fid) => {
+                out.insert(*fid);
+            }
+        },
+        ScalarExpr::GetField { base, .. } => collect_field_ids(base, out),
+        ScalarExpr::Literal(_) => {}
+    }
+}
+
+fn table_column_key(name: &str) -> Option<String> {
+    let trimmed = name.trim_start_matches('.');
+    let mut parts = trimmed.split('.').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    let column = parts.pop()?;
+    let table = parts.pop()?;
+    Some(format!("{}.{}", table, column))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use llkv_expr::expr::BinaryOp;
+    use std::sync::Arc;
+
+    #[test]
+    fn cross_product_context_evaluates_expressions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("main.tab2.a", DataType::Int64, false),
+            Field::new("main.tab2.b", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+            ],
+        )
+        .expect("valid batch");
+
+        let mut ctx = CrossProductExpressionContext::new(schema.as_ref())
+            .expect("context builds from schema");
+
+        let literal_expr: ScalarExpr<String> = ScalarExpr::literal(67);
+        let literal = ctx
+            .evaluate(&literal_expr, &batch)
+            .expect("literal evaluation succeeds");
+        let literal_array = literal
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 literal result");
+        assert_eq!(literal_array.len(), 3);
+        assert!(literal_array.iter().all(|value| value == Some(67)));
+
+        let add_expr = ScalarExpr::binary(
+            ScalarExpr::column("tab2.a".to_string()),
+            BinaryOp::Add,
+            ScalarExpr::literal(5),
+        );
+        let added = ctx
+            .evaluate(&add_expr, &batch)
+            .expect("column addition succeeds");
+        let added_array = added
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 addition result");
+        assert_eq!(added_array.values(), &[6, 7, 8]);
     }
 }
 

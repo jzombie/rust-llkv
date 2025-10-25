@@ -86,3 +86,4 @@ pub use planner::plan_graph::{
     PlanGraph, PlanGraphBuilder, PlanGraphError, PlanGraphResult, PlanGraphVersion, PlanInput,
     PlanNode, PlanNodeId, PlanOperator,
 };
+pub use scalar_eval::{NumericArray, NumericArrayMap, NumericKernels};

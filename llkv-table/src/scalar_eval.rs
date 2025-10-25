@@ -101,6 +101,69 @@ impl NumericArray {
         }
     }
 
+    /// Build a [`NumericArray`] from an Arrow array, casting when necessary.
+    pub fn try_from_arrow(array: &ArrayRef) -> LlkvResult<Self> {
+        match array.data_type() {
+            DataType::Int64 => {
+                let int_array = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::Internal("expected Int64 array".into()))?
+                    .clone();
+                Ok(NumericArray::from_int(Arc::new(int_array)))
+            }
+            DataType::Float64 => {
+                let float_array = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| Error::Internal("expected Float64 array".into()))?
+                    .clone();
+                Ok(NumericArray::from_float(Arc::new(float_array)))
+            }
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+                let casted = cast(array.as_ref(), &DataType::Int64)
+                    .map_err(|e| Error::Internal(format!("cast to Int64 failed: {e}")))?;
+                let int_array = casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::Internal("cast produced non-Int64 array".into()))?
+                    .clone();
+                Ok(NumericArray::from_int(Arc::new(int_array)))
+            }
+            DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32 => {
+                let casted = cast(array.as_ref(), &DataType::Float64)
+                    .map_err(|e| Error::Internal(format!("cast to Float64 failed: {e}")))?;
+                let float_array = casted
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| Error::Internal("cast produced non-Float64 array".into()))?
+                    .clone();
+                Ok(NumericArray::from_float(Arc::new(float_array)))
+            }
+            DataType::Boolean => {
+                let casted = cast(array.as_ref(), &DataType::Int64)
+                    .map_err(|e| Error::Internal(format!("cast to Int64 failed: {e}")))?;
+                let int_array = casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::Internal("cast produced non-Int64 array".into()))?
+                    .clone();
+                Ok(NumericArray::from_int(Arc::new(int_array)))
+            }
+            DataType::Null => {
+                let float_array = Float64Array::from(vec![None; array.len()]);
+                Ok(NumericArray::from_float(Arc::new(float_array)))
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported data type in numeric kernel: {other:?}"
+            ))),
+        }
+    }
+
     #[inline]
     pub fn kind(&self) -> NumericKind {
         self.kind
@@ -933,74 +996,7 @@ impl NumericKernels {
     }
 
     fn coerce_array(array: &ArrayRef) -> LlkvResult<NumericArray> {
-        let numeric = match array.data_type() {
-            DataType::Int64 => {
-                let int_array = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| Error::Internal("expected Int64 array".into()))?
-                    .clone();
-                NumericArray::from_int(Arc::new(int_array))
-            }
-            DataType::Float64 => {
-                let float_array = array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| Error::Internal("expected Float64 array".into()))?
-                    .clone();
-                NumericArray::from_float(Arc::new(float_array))
-            }
-            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
-                let casted = cast(array.as_ref(), &DataType::Int64)
-                    .map_err(|e| Error::Internal(format!("cast to Int64 failed: {e}")))?;
-                let int_array = casted
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| Error::Internal("cast produced non-Int64 array".into()))?
-                    .clone();
-                NumericArray::from_int(Arc::new(int_array))
-            }
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                let casted = cast(array.as_ref(), &DataType::Float64)
-                    .map_err(|e| Error::Internal(format!("cast to Float64 failed: {e}")))?;
-                let float_array = casted
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| Error::Internal("cast produced non-Float64 array".into()))?
-                    .clone();
-                NumericArray::from_float(Arc::new(float_array))
-            }
-            DataType::Float32 => {
-                let casted = cast(array.as_ref(), &DataType::Float64)
-                    .map_err(|e| Error::Internal(format!("cast to Float64 failed: {e}")))?;
-                let float_array = casted
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| Error::Internal("cast produced non-Float64 array".into()))?
-                    .clone();
-                NumericArray::from_float(Arc::new(float_array))
-            }
-            DataType::Boolean => {
-                let casted = cast(array.as_ref(), &DataType::Int64)
-                    .map_err(|e| Error::Internal(format!("cast to Int64 failed: {e}")))?;
-                let int_array = casted
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| Error::Internal("cast produced non-Int64 array".into()))?
-                    .clone();
-                NumericArray::from_int(Arc::new(int_array))
-            }
-            DataType::Null => {
-                let float_array = Float64Array::from(vec![None; array.len()]);
-                NumericArray::from_float(Arc::new(float_array))
-            }
-            other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unsupported data type in numeric kernel: {other:?}"
-                )));
-            }
-        };
-        Ok(numeric)
+        NumericArray::try_from_arrow(array)
     }
 }
 
