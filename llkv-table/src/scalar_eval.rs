@@ -661,9 +661,6 @@ impl NumericKernels {
                         if Self::literal_is_one(&right_s) {
                             return left_s;
                         }
-                        if Self::literal_is_zero(&left_s) || Self::literal_is_zero(&right_s) {
-                            return ScalarExpr::literal(0);
-                        }
                     }
                     BinaryOp::Divide => {
                         if Self::literal_is_one(&right_s) {

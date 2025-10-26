@@ -4514,29 +4514,45 @@ fn comparison_involves_null(expr: &SqlExpr) -> bool {
     }
 }
 
-fn translate_between_clause(
+fn translate_between_expr(
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     between_expr: &SqlExpr,
     low: &SqlExpr,
     high: &SqlExpr,
+    negated: bool,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+    let lower_op = if negated {
+        BinaryOperator::Lt
+    } else {
+        BinaryOperator::GtEq
+    };
+    let upper_op = if negated {
+        BinaryOperator::Gt
+    } else {
+        BinaryOperator::LtEq
+    };
+
     let lower_bound = translate_comparison_with_context(
         resolver,
         context.clone(),
         between_expr,
-        BinaryOperator::GtEq,
+        lower_op,
         low,
     )?;
     let upper_bound = translate_comparison_with_context(
         resolver,
         context,
         between_expr,
-        BinaryOperator::LtEq,
+        upper_op,
         high,
     )?;
 
-    Ok(llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]))
+    if negated {
+        Ok(llkv_expr::expr::Expr::Or(vec![lower_bound, upper_bound]))
+    } else {
+        Ok(llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]))
+    }
 }
 
 fn translate_condition_with_context(
@@ -4614,35 +4630,16 @@ fn translate_condition_with_context(
                         high,
                     } = inner_stripped
                     {
-                        if *inner_negated {
-                            let between_expr_result = translate_between_clause(
-                                resolver,
-                                context.clone(),
-                                between_expr,
-                                low,
-                                high,
-                            )?;
-                            work_stack.push(ConditionFrame::Leaf(between_expr_result));
-                        } else {
-                            let below_lower = translate_comparison_with_context(
-                                resolver,
-                                context.clone(),
-                                between_expr,
-                                BinaryOperator::Lt,
-                                low,
-                            )?;
-                            let above_upper = translate_comparison_with_context(
-                                resolver,
-                                context.clone(),
-                                between_expr,
-                                BinaryOperator::Gt,
-                                high,
-                            )?;
-                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Or(vec![
-                                below_lower,
-                                above_upper,
-                            ])));
-                        }
+                        let negated_mode = !*inner_negated;
+                        let between_expr_result = translate_between_expr(
+                            resolver,
+                            context.clone(),
+                            between_expr,
+                            low,
+                            high,
+                            negated_mode,
+                        )?;
+                        work_stack.push(ConditionFrame::Leaf(between_expr_result));
                         continue;
                     }
                     if comparison_involves_null(inner_stripped) {
@@ -4742,19 +4739,15 @@ fn translate_condition_with_context(
                     low,
                     high,
                 } => {
-                    let between_expr_result = translate_between_clause(
+                    let between_expr_result = translate_between_expr(
                         resolver,
                         context.clone(),
                         between_expr,
                         low,
                         high,
+                        *negated,
                     )?;
-                    let result = if *negated {
-                        llkv_expr::expr::Expr::not(between_expr_result)
-                    } else {
-                        between_expr_result
-                    };
-                    work_stack.push(ConditionFrame::Leaf(result));
+                    work_stack.push(ConditionFrame::Leaf(between_expr_result));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
