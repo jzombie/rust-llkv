@@ -1150,14 +1150,6 @@ where
             ));
         }
 
-        for column_plan in &plan.columns {
-            if !column_plan.ascending || column_plan.nulls_first {
-                return Err(Error::InvalidArgumentError(
-                    "only ASC indexes with NULLS LAST are supported".into(),
-                ));
-            }
-        }
-
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 

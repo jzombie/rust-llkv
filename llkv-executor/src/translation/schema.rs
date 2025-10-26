@@ -1,5 +1,5 @@
 use crate::ExecutorResult;
-use crate::types::ExecutorTable;
+use crate::types::{ExecutorSchema, ExecutorTable};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_expr::expr::ScalarExpr;
 use llkv_expr::literal::Literal;
@@ -40,87 +40,192 @@ where
                 fields.push(field);
             }
             ScanProjection::Computed { alias, expr } => {
-                let dtype = match expr {
-                    ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
-                    ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
-                    ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
-                    ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
-                    ScalarExpr::Literal(Literal::Null) => DataType::Null,
-                    ScalarExpr::Literal(Literal::Struct(_)) => {
-                        // For struct literals, we need to infer the type
-                        // For now, create a simple struct type
-                        // In a real implementation, we'd recursively determine field types
-                        DataType::Utf8 // Placeholder - should be DataType::Struct
-                    }
-                    ScalarExpr::Column(field_id) => {
-                        let column =
-                            table.schema.column_by_field_id(*field_id).ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "unknown column with field id {} in computed projection",
-                                    field_id
-                                ))
-                            })?;
-                        column.data_type.clone()
-                    }
-                    ScalarExpr::Binary { .. } => DataType::Float64,
-                    ScalarExpr::Aggregate(_) => DataType::Int64, // Aggregates return Int64
-                    ScalarExpr::GetField { base, field_name } => {
-                        // Recursively determine the data type of the field being accessed
-                        fn get_field_type<P>(
-                            expr: &ScalarExpr<FieldId>,
-                            field_name: &str,
-                            table: &ExecutorTable<P>,
-                        ) -> ExecutorResult<DataType>
-                        where
-                            P: Pager<Blob = EntryHandle> + Send + Sync,
-                        {
-                            let base_dtype = match expr {
-                                ScalarExpr::Column(fid) => {
-                                    let column =
-                                        table.schema.column_by_field_id(*fid).ok_or_else(|| {
-                                            Error::InvalidArgumentError(format!(
-                                                "unknown column with field id {} in GetField",
-                                                fid
-                                            ))
-                                        })?;
-                                    column.data_type.clone()
-                                }
-                                ScalarExpr::GetField {
-                                    base: inner_base,
-                                    field_name: inner_field,
-                                } => get_field_type(inner_base, inner_field, table)?,
-                                _ => {
-                                    return Err(Error::InvalidArgumentError(
-                                        "GetField base must be a column or another GetField".into(),
-                                    ));
-                                }
-                            };
-
-                            if let DataType::Struct(fields) = base_dtype {
-                                fields
-                                    .iter()
-                                    .find(|f| f.name() == field_name)
-                                    .map(|f| f.data_type().clone())
-                                    .ok_or_else(|| {
-                                        Error::InvalidArgumentError(format!(
-                                            "Field '{}' not found in struct",
-                                            field_name
-                                        ))
-                                    })
-                            } else {
-                                Err(Error::InvalidArgumentError(
-                                    "GetField can only be applied to struct types".into(),
-                                ))
-                            }
-                        }
-
-                        get_field_type(base, field_name, table)?
-                    }
-                };
+                let dtype = infer_computed_data_type(table.schema.as_ref(), expr)?;
                 let field = Field::new(alias, dtype, true);
                 fields.push(field);
             }
         }
     }
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn infer_computed_data_type(
+    schema: &ExecutorSchema,
+    expr: &ScalarExpr<FieldId>,
+) -> ExecutorResult<DataType> {
+    match expr {
+        ScalarExpr::Literal(Literal::Integer(_)) => Ok(DataType::Int64),
+        ScalarExpr::Literal(Literal::Float(_)) => Ok(DataType::Float64),
+        ScalarExpr::Literal(Literal::Boolean(_)) => Ok(DataType::Boolean),
+        ScalarExpr::Literal(Literal::String(_)) => Ok(DataType::Utf8),
+        ScalarExpr::Literal(Literal::Null) => Ok(DataType::Null),
+        ScalarExpr::Literal(Literal::Struct(_)) => Ok(DataType::Utf8),
+        ScalarExpr::Column(field_id) => {
+            let column = schema.column_by_field_id(*field_id).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "unknown column with field id {} in computed projection",
+                    field_id
+                ))
+            })?;
+            Ok(normalized_numeric_type(&column.data_type))
+        }
+        ScalarExpr::Binary { .. } => {
+            if expression_uses_float(schema, expr)? {
+                Ok(DataType::Float64)
+            } else {
+                Ok(DataType::Int64)
+            }
+        }
+        ScalarExpr::Aggregate(_) => Ok(DataType::Int64),
+        ScalarExpr::GetField { base, field_name } => {
+            let field_type = resolve_struct_field_type(schema, base, field_name)?;
+            Ok(field_type)
+        }
+    }
+}
+
+fn normalized_numeric_type(dtype: &DataType) -> DataType {
+    match dtype {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Boolean => DataType::Int64,
+        DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64 => DataType::Float64,
+        other => other.clone(),
+    }
+}
+
+fn expression_uses_float(
+    schema: &ExecutorSchema,
+    expr: &ScalarExpr<FieldId>,
+) -> ExecutorResult<bool> {
+    match expr {
+        ScalarExpr::Literal(Literal::Float(_)) => Ok(true),
+        ScalarExpr::Literal(Literal::Integer(_))
+        | ScalarExpr::Literal(Literal::Boolean(_))
+        | ScalarExpr::Literal(Literal::Null)
+        | ScalarExpr::Literal(Literal::String(_))
+        | ScalarExpr::Literal(Literal::Struct(_)) => Ok(false),
+        ScalarExpr::Column(field_id) => {
+            let column = schema.column_by_field_id(*field_id).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "unknown column with field id {} in computed projection",
+                    field_id
+                ))
+            })?;
+            Ok(matches!(
+                normalized_numeric_type(&column.data_type),
+                DataType::Float64
+            ))
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            let left_float = expression_uses_float(schema, left)?;
+            if left_float {
+                return Ok(true);
+            }
+            expression_uses_float(schema, right)
+        }
+        ScalarExpr::Aggregate(_) => Ok(false),
+        ScalarExpr::GetField { base, field_name } => {
+            let field_type = resolve_struct_field_type(schema, base, field_name)?;
+            Ok(matches!(
+                normalized_numeric_type(&field_type),
+                DataType::Float64
+            ))
+        }
+    }
+}
+
+fn resolve_struct_field_type(
+    schema: &ExecutorSchema,
+    base: &ScalarExpr<FieldId>,
+    field_name: &str,
+) -> ExecutorResult<DataType> {
+    let base_type = infer_computed_data_type(schema, base)?;
+    if let DataType::Struct(fields) = base_type {
+        fields
+            .iter()
+            .find(|f| f.name() == field_name)
+            .map(|f| f.data_type().clone())
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!("Field '{}' not found in struct", field_name))
+            })
+    } else {
+        Err(Error::InvalidArgumentError(
+            "GetField can only be applied to struct types".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ExecutorColumn;
+    use arrow::datatypes::DataType;
+    use llkv_expr::expr::BinaryOp;
+    use rustc_hash::FxHashMap;
+
+    #[test]
+    fn inferred_type_for_integer_expression_remains_int64() {
+        const COL0: FieldId = 1;
+        const COL1: FieldId = 2;
+
+        let columns = vec![
+            ExecutorColumn {
+                name: "tab1.col0".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                field_id: COL0,
+                check_expr: None,
+            },
+            ExecutorColumn {
+                name: "tab1.col1".into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                field_id: COL1,
+                check_expr: None,
+            },
+        ];
+        let schema = ExecutorSchema {
+            columns,
+            lookup: FxHashMap::default(),
+        };
+
+        let col0 = ScalarExpr::Column(COL0);
+        let col1 = ScalarExpr::Column(COL1);
+        let divisor = ScalarExpr::Literal(Literal::Null);
+        let division = ScalarExpr::Binary {
+            left: Box::new(col1.clone()),
+            op: BinaryOp::Divide,
+            right: Box::new(divisor),
+        };
+        let neg_col1 = ScalarExpr::Binary {
+            left: Box::new(ScalarExpr::Literal(Literal::Integer(0))),
+            op: BinaryOp::Subtract,
+            right: Box::new(col1.clone()),
+        };
+        let sum_left = ScalarExpr::Binary {
+            left: Box::new(col0),
+            op: BinaryOp::Add,
+            right: Box::new(division),
+        };
+        let expr = ScalarExpr::Binary {
+            left: Box::new(sum_left),
+            op: BinaryOp::Add,
+            right: Box::new(neg_col1),
+        };
+
+        let dtype = infer_computed_data_type(&schema, &expr).expect("type inference succeeds");
+        assert_eq!(dtype, DataType::Int64);
+    }
 }

@@ -318,6 +318,25 @@ macro_rules! llkv_for_each_arrow_boolean {
     };
 }
 
+#[macro_export]
+#[rustfmt::skip]
+macro_rules! llkv_for_each_arrow_string {
+    ($macro:ident) => {
+        $macro!(
+            utf8,
+            utf8_chunk,
+            utf8_chunk_with_rids,
+            utf8_run,
+            utf8_run_with_rids,
+            arrow::array::StringArray,
+            arrow::datatypes::Utf8Type,
+            arrow::datatypes::DataType::Utf8,
+            &str,
+            |_v: &str| 0.0
+        );
+    };
+}
+
 pub fn is_supported_arrow_type(dtype: &arrow::datatypes::DataType) -> bool {
     use arrow::datatypes::DataType;
 

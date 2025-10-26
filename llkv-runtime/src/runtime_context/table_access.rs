@@ -18,7 +18,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
 use llkv_table::{
-    ConstraintKind, FieldId, MultiColumnUniqueEntryMeta, RowId, Table, TableConstraintSummaryView,
+    ConstraintKind, FieldId, MultiColumnIndexEntryMeta, RowId, Table, TableConstraintSummaryView,
 };
 use llkv_transaction::{TransactionSnapshot, mvcc};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -419,7 +419,7 @@ where
 
     pub(super) fn build_executor_multi_column_uniques(
         table: &ExecutorTable<P>,
-        stored: &[MultiColumnUniqueEntryMeta],
+        stored: &[MultiColumnIndexEntryMeta],
     ) -> Vec<ExecutorMultiColumnUnique> {
         let mut results = Vec::with_capacity(stored.len());
 

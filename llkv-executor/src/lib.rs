@@ -14,16 +14,26 @@
 //! in this module for now, but should be extracted to a dedicated `query` module
 //! in a future refactoring.
 
-use arrow::array::{Array, ArrayRef, Int64Builder, RecordBatch, StringArray, UInt32Array};
-use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
-use arrow::datatypes::{DataType, Schema};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Int64Array, Int64Builder,
+    RecordBatch, StringArray, UInt32Array, new_null_array,
+};
+use arrow::compute::{
+    SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
+};
+use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::expr::{Expr as LlkvExpr, ScalarExpr};
+use llkv_expr::expr::{AggregateCall, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
+use llkv_expr::literal::Literal;
+use llkv_expr::typed_predicate::{
+    build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
+};
+use llkv_join::cross_join_pair;
 use llkv_plan::{
-    AggregateExpr, AggregateFunction, OrderByPlan, OrderSortType, OrderTarget, PlanValue,
-    SelectPlan, SelectProjection,
+    AggregateExpr, AggregateFunction, CanonicalRow, OrderByPlan, OrderSortType, OrderTarget,
+    PlanValue, SelectPlan, SelectProjection,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -32,7 +42,8 @@ use llkv_table::table::{
     ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
-use rustc_hash::FxHashMap;
+use llkv_table::{NumericArray, NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
+use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
 use std::sync::Arc;
@@ -183,8 +194,18 @@ where
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+        let mut batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
             .map_err(|e| Error::Internal(format!("failed to create record batch: {}", e)))?;
+
+        if plan.distinct {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        let schema = batch.schema();
 
         Ok(SelectExecution::new_single_batch(
             String::new(), // No table name
@@ -257,92 +278,77 @@ where
             ));
         }
 
-        // Get all tables
-        let mut tables = Vec::new();
+        // Acquire table handles and materialize the base batches for each table.
+        let mut tables = Vec::with_capacity(plan.tables.len());
         for table_ref in &plan.tables {
             let qualified_name = table_ref.qualified_name();
             let table = self.provider.get_table(&qualified_name)?;
             tables.push((table_ref.clone(), table));
         }
 
-        // For now, support only 2-table cross product
-        if tables.len() > 2 {
-            return Err(Error::InvalidArgumentError(
-                "cross products with more than 2 tables not yet supported".into(),
-            ));
+        let mut staged: Vec<TableCrossProductData> = Vec::with_capacity(tables.len());
+        for (table_ref, table) in &tables {
+            staged.push(collect_table_data(table_ref, table.as_ref())?);
         }
 
-        let (left_ref, left_table) = &tables[0];
-        let (right_ref, right_table) = &tables[1];
+        let mut staged_iter = staged.into_iter();
+        let mut current = staged_iter
+            .next()
+            .ok_or_else(|| Error::Internal("cross product preparation yielded no tables".into()))?;
 
-        // Build the cross product using llkv-join crate
-        // For cross product, we pass empty join keys = Cartesian product
-        use llkv_join::{JoinOptions, JoinType, TableJoinExt};
-
-        let mut result_batches = Vec::new();
-        left_table.table.join_stream(
-            &right_table.table,
-            &[], // Empty join keys = cross product
-            &JoinOptions {
-                join_type: JoinType::Inner,
-                ..Default::default()
-            },
-            |batch| {
-                result_batches.push(batch);
-            },
-        )?;
-
-        // Build combined schema with qualified column names
-        let mut combined_fields = Vec::new();
-
-        // Add left table columns with schema.table.column prefix
-        for col in &left_table.schema.columns {
-            let qualified_name = format!("{}.{}.{}", left_ref.schema, left_ref.table, col.name);
-            combined_fields.push(arrow::datatypes::Field::new(
-                qualified_name,
-                col.data_type.clone(),
-                col.nullable,
-            ));
+        for next in staged_iter {
+            current = cross_join_table_batches(current, next)?;
         }
 
-        // Add right table columns with schema.table.column prefix
-        for col in &right_table.schema.columns {
-            let qualified_name = format!("{}.{}.{}", right_ref.schema, right_ref.table, col.name);
-            combined_fields.push(arrow::datatypes::Field::new(
-                qualified_name,
-                col.data_type.clone(),
-                col.nullable,
-            ));
-        }
+        let TableCrossProductData {
+            schema: combined_schema,
+            batches: mut combined_batches,
+            column_counts,
+        } = current;
 
-        let combined_schema = Arc::new(Schema::new(combined_fields));
+        let column_lookup_map = build_cross_product_column_lookup(
+            combined_schema.as_ref(),
+            &plan.tables,
+            &column_counts,
+        );
 
-        // Combine all result batches with the combined schema (renames columns)
-        let mut combined_batch = if result_batches.is_empty() {
-            RecordBatch::new_empty(Arc::clone(&combined_schema))
-        } else if result_batches.len() == 1 {
-            let batch = result_batches.into_iter().next().unwrap();
-            // The batch from join has original column names, we need to apply our qualified schema
-            RecordBatch::try_new(Arc::clone(&combined_schema), batch.columns().to_vec()).map_err(
-                |e| {
-                    Error::Internal(format!(
-                        "failed to create batch with qualified names: {}",
-                        e
+        if let Some(filter_expr) = &plan.filter {
+            let mut filter_context = CrossProductExpressionContext::new(
+                combined_schema.as_ref(),
+                column_lookup_map.clone(),
+            )?;
+            let translated_filter =
+                translate_predicate(filter_expr.clone(), filter_context.schema(), |name| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' not found in cross product result",
+                        name
                     ))
-                },
-            )?
+                })?;
+
+            let mut filtered_batches = Vec::with_capacity(combined_batches.len());
+            for batch in combined_batches.into_iter() {
+                filter_context.reset();
+                let mask = filter_context.evaluate_predicate_mask(&translated_filter, &batch)?;
+                let filtered = filter_record_batch(&batch, &mask).map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "failed to apply cross product filter: {err}"
+                    ))
+                })?;
+                if filtered.num_rows() > 0 {
+                    filtered_batches.push(filtered);
+                }
+            }
+            combined_batches = filtered_batches;
+        }
+
+        let mut combined_batch = if combined_batches.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&combined_schema))
+        } else if combined_batches.len() == 1 {
+            combined_batches.pop().unwrap()
         } else {
-            // First concatenate with original schema
-            let original_batch = concat_batches(&result_batches[0].schema(), &result_batches)
-                .map_err(|e| Error::Internal(format!("failed to concatenate batches: {}", e)))?;
-            // Then apply qualified schema
-            RecordBatch::try_new(
-                Arc::clone(&combined_schema),
-                original_batch.columns().to_vec(),
-            )
-            .map_err(|e| {
+            concat_batches(&combined_schema, &combined_batches).map_err(|e| {
                 Error::Internal(format!(
-                    "failed to create batch with qualified names: {}",
+                    "failed to concatenate cross product batches: {}",
                     e
                 ))
             })?
@@ -352,6 +358,7 @@ where
         if !plan.projections.is_empty() {
             let mut selected_fields = Vec::new();
             let mut selected_columns = Vec::new();
+            let mut expr_context: Option<CrossProductExpressionContext> = None;
 
             for proj in &plan.projections {
                 match proj {
@@ -378,12 +385,8 @@ where
                     SelectProjection::Column { name, alias } => {
                         // Find the column by qualified name
                         let col_name = name.to_ascii_lowercase();
-                        if let Some((idx, field)) = combined_schema
-                            .fields()
-                            .iter()
-                            .enumerate()
-                            .find(|(_, f)| f.name().to_ascii_lowercase() == col_name)
-                        {
+                        if let Some(&idx) = column_lookup_map.get(&col_name) {
+                            let field = combined_schema.field(idx);
                             let output_name = alias.as_ref().unwrap_or(name).clone();
                             selected_fields.push(Arc::new(arrow::datatypes::Field::new(
                                 output_name,
@@ -399,33 +402,23 @@ where
                         }
                     }
                     SelectProjection::Computed { expr, alias } => {
-                        // Handle simple column references (like s1.t1.t)
-                        if let ScalarExpr::Column(col_name) = expr {
-                            let col_name_lower = col_name.to_ascii_lowercase();
-                            if let Some((idx, field)) = combined_schema
-                                .fields()
-                                .iter()
-                                .enumerate()
-                                .find(|(_, f)| f.name().to_ascii_lowercase() == col_name_lower)
-                            {
-                                selected_fields.push(Arc::new(arrow::datatypes::Field::new(
-                                    alias.clone(),
-                                    field.data_type().clone(),
-                                    field.is_nullable(),
-                                )));
-                                selected_columns.push(combined_batch.column(idx).clone());
-                            } else {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "column '{}' not found in cross product result",
-                                    col_name
-                                )));
-                            }
-                        } else {
-                            return Err(Error::InvalidArgumentError(
-                                "complex computed projections not yet supported in cross products"
-                                    .into(),
-                            ));
+                        if expr_context.is_none() {
+                            expr_context = Some(CrossProductExpressionContext::new(
+                                combined_schema.as_ref(),
+                                column_lookup_map.clone(),
+                            )?);
                         }
+                        let context = expr_context
+                            .as_mut()
+                            .expect("projection context must be initialized");
+                        let evaluated = context.evaluate(expr, &combined_batch)?;
+                        let field = Arc::new(arrow::datatypes::Field::new(
+                            alias.clone(),
+                            evaluated.data_type().clone(),
+                            true,
+                        ));
+                        selected_fields.push(field);
+                        selected_columns.push(evaluated);
                     }
                 }
             }
@@ -435,13 +428,26 @@ where
                 .map_err(|e| Error::Internal(format!("failed to apply projections: {}", e)))?;
         }
 
+        if plan.distinct {
+            let mut state = DistinctState::default();
+            let source_schema = combined_batch.schema();
+            combined_batch = match distinct_filter_batch(combined_batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(source_schema),
+            };
+        }
+
+        let schema = combined_batch.schema();
+
+        let display_name = tables
+            .iter()
+            .map(|(table_ref, _)| table_ref.qualified_name())
+            .collect::<Vec<_>>()
+            .join(",");
+
         Ok(SelectExecution::new_single_batch(
-            format!(
-                "{},{}",
-                left_ref.qualified_name(),
-                right_ref.qualified_name()
-            ),
-            combined_batch.schema(),
+            display_name,
+            schema,
             combined_batch,
         ))
     }
@@ -519,6 +525,7 @@ where
             options,
             full_table_scan,
             expanded_order,
+            plan.distinct,
         ))
     }
 
@@ -530,6 +537,7 @@ where
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
+        let distinct = plan.distinct;
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
         for aggregate in plan.aggregates {
             match aggregate {
@@ -763,7 +771,18 @@ where
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+        let mut batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+
+        if distinct {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        let schema = batch.schema();
+
         Ok(SelectExecution::new_single_batch(
             display_name,
             schema,
@@ -784,6 +803,7 @@ where
         use llkv_expr::expr::AggregateCall;
 
         let table_ref = table.as_ref();
+        let distinct = plan.distinct;
 
         // First, extract all unique aggregates from the projections
         let mut aggregate_specs: Vec<(String, AggregateCall<String>)> = Vec::new();
@@ -842,7 +862,18 @@ where
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+        let mut batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+
+        if distinct {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        let schema = batch.schema();
+
         Ok(SelectExecution::new_single_batch(
             display_name,
             schema,
@@ -1136,6 +1167,760 @@ where
     }
 }
 
+struct CrossProductExpressionContext {
+    schema: Arc<ExecutorSchema>,
+    field_id_to_index: FxHashMap<FieldId, usize>,
+    numeric_cache: FxHashMap<FieldId, NumericArray>,
+    column_cache: FxHashMap<FieldId, ColumnAccessor>,
+}
+
+#[derive(Clone)]
+enum ColumnAccessor {
+    Int64(Arc<Int64Array>),
+    Float64(Arc<Float64Array>),
+    Boolean(Arc<BooleanArray>),
+    Utf8(Arc<StringArray>),
+    Null(usize),
+}
+
+impl ColumnAccessor {
+    fn from_array(array: &ArrayRef) -> ExecutorResult<Self> {
+        match array.data_type() {
+            DataType::Int64 => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::Internal("expected Int64 array".into()))?
+                    .clone();
+                Ok(Self::Int64(Arc::new(typed)))
+            }
+            DataType::Float64 => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| Error::Internal("expected Float64 array".into()))?
+                    .clone();
+                Ok(Self::Float64(Arc::new(typed)))
+            }
+            DataType::Boolean => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| Error::Internal("expected Boolean array".into()))?
+                    .clone();
+                Ok(Self::Boolean(Arc::new(typed)))
+            }
+            DataType::Utf8 => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| Error::Internal("expected Utf8 array".into()))?
+                    .clone();
+                Ok(Self::Utf8(Arc::new(typed)))
+            }
+            DataType::Null => Ok(Self::Null(array.len())),
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported column type {:?} in cross product filter",
+                other
+            ))),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            ColumnAccessor::Int64(array) => array.len(),
+            ColumnAccessor::Float64(array) => array.len(),
+            ColumnAccessor::Boolean(array) => array.len(),
+            ColumnAccessor::Utf8(array) => array.len(),
+            ColumnAccessor::Null(len) => *len,
+        }
+    }
+
+    fn is_null(&self, idx: usize) -> bool {
+        match self {
+            ColumnAccessor::Int64(array) => array.is_null(idx),
+            ColumnAccessor::Float64(array) => array.is_null(idx),
+            ColumnAccessor::Boolean(array) => array.is_null(idx),
+            ColumnAccessor::Utf8(array) => array.is_null(idx),
+            ColumnAccessor::Null(_) => true,
+        }
+    }
+
+    fn as_array_ref(&self) -> ArrayRef {
+        match self {
+            ColumnAccessor::Int64(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Float64(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Boolean(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Utf8(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Null(len) => new_null_array(&DataType::Null, *len),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ValueArray {
+    Numeric(NumericArray),
+    Boolean(Arc<BooleanArray>),
+    Utf8(Arc<StringArray>),
+    Null(usize),
+}
+
+impl ValueArray {
+    fn from_array(array: ArrayRef) -> ExecutorResult<Self> {
+        match array.data_type() {
+            DataType::Boolean => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| Error::Internal("expected Boolean array".into()))?
+                    .clone();
+                Ok(Self::Boolean(Arc::new(typed)))
+            }
+            DataType::Utf8 => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| Error::Internal("expected Utf8 array".into()))?
+                    .clone();
+                Ok(Self::Utf8(Arc::new(typed)))
+            }
+            DataType::Null => Ok(Self::Null(array.len())),
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64 => {
+                let numeric = NumericArray::try_from_arrow(&array)?;
+                Ok(Self::Numeric(numeric))
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported data type {:?} in cross product expression",
+                other
+            ))),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            ValueArray::Numeric(array) => array.len(),
+            ValueArray::Boolean(array) => array.len(),
+            ValueArray::Utf8(array) => array.len(),
+            ValueArray::Null(len) => *len,
+        }
+    }
+}
+
+fn truth_and(lhs: Option<bool>, rhs: Option<bool>) -> Option<bool> {
+    match (lhs, rhs) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        (Some(true), None) | (None, Some(true)) | (None, None) => None,
+    }
+}
+
+fn truth_or(lhs: Option<bool>, rhs: Option<bool>) -> Option<bool> {
+    match (lhs, rhs) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        (Some(false), None) | (None, Some(false)) | (None, None) => None,
+    }
+}
+
+fn truth_not(value: Option<bool>) -> Option<bool> {
+    match value {
+        Some(true) => Some(false),
+        Some(false) => Some(true),
+        None => None,
+    }
+}
+
+fn compare_bool(op: CompareOp, lhs: bool, rhs: bool) -> bool {
+    let l = lhs as u8;
+    let r = rhs as u8;
+    match op {
+        CompareOp::Eq => lhs == rhs,
+        CompareOp::NotEq => lhs != rhs,
+        CompareOp::Lt => l < r,
+        CompareOp::LtEq => l <= r,
+        CompareOp::Gt => l > r,
+        CompareOp::GtEq => l >= r,
+    }
+}
+
+fn compare_str(op: CompareOp, lhs: &str, rhs: &str) -> bool {
+    match op {
+        CompareOp::Eq => lhs == rhs,
+        CompareOp::NotEq => lhs != rhs,
+        CompareOp::Lt => lhs < rhs,
+        CompareOp::LtEq => lhs <= rhs,
+        CompareOp::Gt => lhs > rhs,
+        CompareOp::GtEq => lhs >= rhs,
+    }
+}
+
+fn finalize_in_list_result(has_match: bool, saw_null: bool, negated: bool) -> Option<bool> {
+    if has_match {
+        Some(!negated)
+    } else if saw_null {
+        None
+    } else if negated {
+        Some(true)
+    } else {
+        Some(false)
+    }
+}
+
+fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<ArrayRef> {
+    match literal {
+        Literal::Integer(v) => {
+            let value = i64::try_from(*v).unwrap_or(0);
+            let values = vec![value; len];
+            Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+        }
+        Literal::Float(v) => {
+            let values = vec![*v; len];
+            Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+        }
+        Literal::Boolean(v) => {
+            let values = vec![Some(*v); len];
+            Ok(Arc::new(BooleanArray::from(values)) as ArrayRef)
+        }
+        Literal::String(v) => {
+            let values: Vec<Option<String>> = (0..len).map(|_| Some(v.clone())).collect();
+            Ok(Arc::new(StringArray::from(values)) as ArrayRef)
+        }
+        Literal::Null => Ok(new_null_array(&DataType::Null, len)),
+        Literal::Struct(_) => Err(Error::InvalidArgumentError(
+            "struct literals are not supported in cross product filters".into(),
+        )),
+    }
+}
+
+impl CrossProductExpressionContext {
+    fn new(schema: &Schema, lookup: FxHashMap<String, usize>) -> ExecutorResult<Self> {
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        let mut field_id_to_index = FxHashMap::default();
+        let mut next_field_id: FieldId = 1;
+
+        for (idx, field) in schema.fields().iter().enumerate() {
+            if next_field_id == u32::MAX {
+                return Err(Error::Internal(
+                    "cross product projection exhausted FieldId space".into(),
+                ));
+            }
+
+            let executor_column = ExecutorColumn {
+                name: field.name().clone(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                primary_key: false,
+                unique: false,
+                field_id: next_field_id,
+                check_expr: None,
+            };
+            let field_id = next_field_id;
+            next_field_id = next_field_id.saturating_add(1);
+
+            columns.push(executor_column);
+            field_id_to_index.insert(field_id, idx);
+        }
+
+        Ok(Self {
+            schema: Arc::new(ExecutorSchema { columns, lookup }),
+            field_id_to_index,
+            numeric_cache: FxHashMap::default(),
+            column_cache: FxHashMap::default(),
+        })
+    }
+
+    fn schema(&self) -> &ExecutorSchema {
+        self.schema.as_ref()
+    }
+
+    fn reset(&mut self) {
+        self.numeric_cache.clear();
+        self.column_cache.clear();
+    }
+
+    fn evaluate(
+        &mut self,
+        expr: &ScalarExpr<String>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<ArrayRef> {
+        let translated = translate_scalar(expr, self.schema.as_ref(), |name| {
+            Error::InvalidArgumentError(format!(
+                "column '{}' not found in cross product result",
+                name
+            ))
+        })?;
+
+        self.evaluate_numeric(&translated, batch)
+    }
+
+    fn evaluate_predicate_mask(
+        &mut self,
+        expr: &LlkvExpr<'static, FieldId>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<BooleanArray> {
+        let truths = self.evaluate_predicate_truths(expr, batch)?;
+        let mut builder = BooleanBuilder::with_capacity(truths.len());
+        for value in truths {
+            builder.append_value(value.unwrap_or(false));
+        }
+        Ok(builder.finish())
+    }
+
+    fn evaluate_predicate_truths(
+        &mut self,
+        expr: &LlkvExpr<'static, FieldId>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<Vec<Option<bool>>> {
+        match expr {
+            LlkvExpr::Literal(value) => Ok(vec![Some(*value); batch.num_rows()]),
+            LlkvExpr::And(children) => {
+                if children.is_empty() {
+                    return Ok(vec![Some(true); batch.num_rows()]);
+                }
+                let mut result = self.evaluate_predicate_truths(&children[0], batch)?;
+                for child in &children[1..] {
+                    let next = self.evaluate_predicate_truths(child, batch)?;
+                    for (lhs, rhs) in result.iter_mut().zip(next.into_iter()) {
+                        *lhs = truth_and(*lhs, rhs);
+                    }
+                }
+                Ok(result)
+            }
+            LlkvExpr::Or(children) => {
+                if children.is_empty() {
+                    return Ok(vec![Some(false); batch.num_rows()]);
+                }
+                let mut result = self.evaluate_predicate_truths(&children[0], batch)?;
+                for child in &children[1..] {
+                    let next = self.evaluate_predicate_truths(child, batch)?;
+                    for (lhs, rhs) in result.iter_mut().zip(next.into_iter()) {
+                        *lhs = truth_or(*lhs, rhs);
+                    }
+                }
+                Ok(result)
+            }
+            LlkvExpr::Not(inner) => {
+                let mut values = self.evaluate_predicate_truths(inner, batch)?;
+                for value in &mut values {
+                    *value = truth_not(*value);
+                }
+                Ok(values)
+            }
+            LlkvExpr::Pred(filter) => self.evaluate_filter_truths(filter, batch),
+            LlkvExpr::Compare { left, op, right } => {
+                self.evaluate_compare_truths(left, *op, right, batch)
+            }
+            LlkvExpr::InList {
+                expr: target,
+                list,
+                negated,
+            } => self.evaluate_in_list_truths(target, list, *negated, batch),
+        }
+    }
+
+    fn evaluate_filter_truths(
+        &mut self,
+        filter: &Filter<FieldId>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<Vec<Option<bool>>> {
+        let accessor = self.column_accessor(filter.field_id, batch)?;
+        let len = accessor.len();
+
+        match &filter.op {
+            Operator::IsNull => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    out.push(Some(accessor.is_null(idx)));
+                }
+                Ok(out)
+            }
+            Operator::IsNotNull => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    out.push(Some(!accessor.is_null(idx)));
+                }
+                Ok(out)
+            }
+            _ => match accessor {
+                ColumnAccessor::Int64(array) => {
+                    let predicate = build_fixed_width_predicate::<Int64Type>(&filter.op)
+                        .map_err(Error::predicate_build)?;
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                        } else {
+                            let value = array.value(idx);
+                            out.push(Some(predicate.matches(&value)));
+                        }
+                    }
+                    Ok(out)
+                }
+                ColumnAccessor::Float64(array) => {
+                    let predicate = build_fixed_width_predicate::<Float64Type>(&filter.op)
+                        .map_err(Error::predicate_build)?;
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                        } else {
+                            let value = array.value(idx);
+                            out.push(Some(predicate.matches(&value)));
+                        }
+                    }
+                    Ok(out)
+                }
+                ColumnAccessor::Boolean(array) => {
+                    let predicate =
+                        build_bool_predicate(&filter.op).map_err(Error::predicate_build)?;
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                        } else {
+                            let value = array.value(idx);
+                            out.push(Some(predicate.matches(&value)));
+                        }
+                    }
+                    Ok(out)
+                }
+                ColumnAccessor::Utf8(array) => {
+                    let predicate =
+                        build_var_width_predicate(&filter.op).map_err(Error::predicate_build)?;
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                        } else {
+                            let value = array.value(idx);
+                            out.push(Some(predicate.matches(value)));
+                        }
+                    }
+                    Ok(out)
+                }
+                ColumnAccessor::Null(len) => Ok(vec![None; len]),
+            },
+        }
+    }
+
+    fn evaluate_compare_truths(
+        &mut self,
+        left: &ScalarExpr<FieldId>,
+        op: CompareOp,
+        right: &ScalarExpr<FieldId>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<Vec<Option<bool>>> {
+        let left_values = self.materialize_value_array(left, batch)?;
+        let right_values = self.materialize_value_array(right, batch)?;
+
+        if left_values.len() != right_values.len() {
+            return Err(Error::Internal(
+                "mismatched compare operand lengths in cross product filter".into(),
+            ));
+        }
+
+        let len = left_values.len();
+        match (&left_values, &right_values) {
+            (ValueArray::Null(_), _) | (_, ValueArray::Null(_)) => Ok(vec![None; len]),
+            (ValueArray::Numeric(lhs), ValueArray::Numeric(rhs)) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    match (lhs.value(idx), rhs.value(idx)) {
+                        (Some(lv), Some(rv)) => out.push(Some(NumericKernels::compare(op, lv, rv))),
+                        _ => out.push(None),
+                    }
+                }
+                Ok(out)
+            }
+            (ValueArray::Boolean(lhs), ValueArray::Boolean(rhs)) => {
+                let lhs = lhs.as_ref();
+                let rhs = rhs.as_ref();
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if lhs.is_null(idx) || rhs.is_null(idx) {
+                        out.push(None);
+                    } else {
+                        out.push(Some(compare_bool(op, lhs.value(idx), rhs.value(idx))));
+                    }
+                }
+                Ok(out)
+            }
+            (ValueArray::Utf8(lhs), ValueArray::Utf8(rhs)) => {
+                let lhs = lhs.as_ref();
+                let rhs = rhs.as_ref();
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if lhs.is_null(idx) || rhs.is_null(idx) {
+                        out.push(None);
+                    } else {
+                        out.push(Some(compare_str(op, lhs.value(idx), rhs.value(idx))));
+                    }
+                }
+                Ok(out)
+            }
+            _ => Err(Error::InvalidArgumentError(
+                "unsupported comparison between mismatched types in cross product filter".into(),
+            )),
+        }
+    }
+
+    fn evaluate_in_list_truths(
+        &mut self,
+        target: &ScalarExpr<FieldId>,
+        list: &[ScalarExpr<FieldId>],
+        negated: bool,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<Vec<Option<bool>>> {
+        let target_values = self.materialize_value_array(target, batch)?;
+        let list_values = list
+            .iter()
+            .map(|expr| self.materialize_value_array(expr, batch))
+            .collect::<ExecutorResult<Vec<_>>>()?;
+
+        let len = target_values.len();
+        for values in &list_values {
+            if values.len() != len {
+                return Err(Error::Internal(
+                    "mismatched IN list operand lengths in cross product filter".into(),
+                ));
+            }
+        }
+
+        match &target_values {
+            ValueArray::Numeric(target_numeric) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    let target_value = match target_numeric.value(idx) {
+                        Some(value) => value,
+                        None => {
+                            out.push(None);
+                            continue;
+                        }
+                    };
+                    let mut has_match = false;
+                    let mut saw_null = false;
+                    for candidate in &list_values {
+                        match candidate {
+                            ValueArray::Numeric(array) => match array.value(idx) {
+                                Some(value) => {
+                                    if NumericKernels::compare(CompareOp::Eq, target_value, value) {
+                                        has_match = true;
+                                        break;
+                                    }
+                                }
+                                None => saw_null = true,
+                            },
+                            ValueArray::Null(_) => saw_null = true,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "type mismatch in IN list evaluation".into(),
+                                ));
+                            }
+                        }
+                    }
+                    out.push(finalize_in_list_result(has_match, saw_null, negated));
+                }
+                Ok(out)
+            }
+            ValueArray::Boolean(target_bool) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if target_bool.is_null(idx) {
+                        out.push(None);
+                        continue;
+                    }
+                    let target_value = target_bool.value(idx);
+                    let mut has_match = false;
+                    let mut saw_null = false;
+                    for candidate in &list_values {
+                        match candidate {
+                            ValueArray::Boolean(array) => {
+                                if array.is_null(idx) {
+                                    saw_null = true;
+                                } else if array.value(idx) == target_value {
+                                    has_match = true;
+                                    break;
+                                }
+                            }
+                            ValueArray::Null(_) => saw_null = true,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "type mismatch in IN list evaluation".into(),
+                                ));
+                            }
+                        }
+                    }
+                    out.push(finalize_in_list_result(has_match, saw_null, negated));
+                }
+                Ok(out)
+            }
+            ValueArray::Utf8(target_utf8) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if target_utf8.is_null(idx) {
+                        out.push(None);
+                        continue;
+                    }
+                    let target_value = target_utf8.value(idx);
+                    let mut has_match = false;
+                    let mut saw_null = false;
+                    for candidate in &list_values {
+                        match candidate {
+                            ValueArray::Utf8(array) => {
+                                if array.is_null(idx) {
+                                    saw_null = true;
+                                } else if array.value(idx) == target_value {
+                                    has_match = true;
+                                    break;
+                                }
+                            }
+                            ValueArray::Null(_) => saw_null = true,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "type mismatch in IN list evaluation".into(),
+                                ));
+                            }
+                        }
+                    }
+                    out.push(finalize_in_list_result(has_match, saw_null, negated));
+                }
+                Ok(out)
+            }
+            ValueArray::Null(len) => Ok(vec![None; *len]),
+        }
+    }
+
+    fn evaluate_numeric(
+        &mut self,
+        expr: &ScalarExpr<FieldId>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<ArrayRef> {
+        let mut required = FxHashSet::default();
+        collect_field_ids(expr, &mut required);
+
+        let mut arrays = NumericArrayMap::default();
+        for field_id in required {
+            let numeric = self.numeric_array(field_id, batch)?;
+            arrays.insert(field_id, numeric);
+        }
+
+        NumericKernels::evaluate_batch(expr, batch.num_rows(), &arrays)
+    }
+
+    fn numeric_array(
+        &mut self,
+        field_id: FieldId,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<NumericArray> {
+        if let Some(existing) = self.numeric_cache.get(&field_id) {
+            return Ok(existing.clone());
+        }
+
+        let column_index = *self.field_id_to_index.get(&field_id).ok_or_else(|| {
+            Error::Internal("field mapping missing during cross product evaluation".into())
+        })?;
+
+        let array_ref = batch.column(column_index).clone();
+        let numeric = NumericArray::try_from_arrow(&array_ref)?;
+        self.numeric_cache.insert(field_id, numeric.clone());
+        Ok(numeric)
+    }
+
+    fn column_accessor(
+        &mut self,
+        field_id: FieldId,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<ColumnAccessor> {
+        if let Some(existing) = self.column_cache.get(&field_id) {
+            return Ok(existing.clone());
+        }
+
+        let column_index = *self.field_id_to_index.get(&field_id).ok_or_else(|| {
+            Error::Internal("field mapping missing during cross product evaluation".into())
+        })?;
+
+        let accessor = ColumnAccessor::from_array(batch.column(column_index))?;
+        self.column_cache.insert(field_id, accessor.clone());
+        Ok(accessor)
+    }
+
+    fn materialize_scalar_array(
+        &mut self,
+        expr: &ScalarExpr<FieldId>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<ArrayRef> {
+        match expr {
+            ScalarExpr::Column(field_id) => {
+                let accessor = self.column_accessor(*field_id, batch)?;
+                Ok(accessor.as_array_ref())
+            }
+            ScalarExpr::Literal(literal) => literal_to_constant_array(literal, batch.num_rows()),
+            ScalarExpr::Binary { .. } => self.evaluate_numeric(expr, batch),
+            ScalarExpr::Aggregate(_) => Err(Error::InvalidArgumentError(
+                "aggregate expressions are not supported in cross product filters".into(),
+            )),
+            ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
+                "struct field access is not supported in cross product filters".into(),
+            )),
+        }
+    }
+
+    fn materialize_value_array(
+        &mut self,
+        expr: &ScalarExpr<FieldId>,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<ValueArray> {
+        let array = self.materialize_scalar_array(expr, batch)?;
+        ValueArray::from_array(array)
+    }
+}
+
+// TODO: Move to llkv-aggregate?
+fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
+    match expr {
+        ScalarExpr::Column(fid) => {
+            out.insert(*fid);
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            collect_field_ids(left, out);
+            collect_field_ids(right, out);
+        }
+        ScalarExpr::Aggregate(call) => match call {
+            AggregateCall::CountStar => {}
+            AggregateCall::Count(fid)
+            | AggregateCall::Sum(fid)
+            | AggregateCall::Min(fid)
+            | AggregateCall::Max(fid)
+            | AggregateCall::CountNulls(fid) => {
+                out.insert(*fid);
+            }
+        },
+        ScalarExpr::GetField { base, .. } => collect_field_ids(base, out),
+        ScalarExpr::Literal(_) => {}
+    }
+}
+
+// TODO: Move to llkv-table?
+fn table_column_key(name: &str) -> Option<String> {
+    let trimmed = name.trim_start_matches('.');
+    let mut parts = trimmed.split('.').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    let column = parts.pop()?;
+    let table = parts.pop()?;
+    Some(format!("{}.{}", table, column))
+}
+
 /// Streaming execution handle for SELECT queries.
 #[derive(Clone)]
 pub struct SelectExecution<P>
@@ -1159,6 +1944,7 @@ where
         options: ScanStreamOptions<P>,
         full_table_scan: bool,
         order_by: Vec<OrderByPlan>,
+        distinct: bool,
     },
     Aggregation {
         batch: RecordBatch,
@@ -1179,6 +1965,7 @@ where
         options: ScanStreamOptions<P>,
         full_table_scan: bool,
         order_by: Vec<OrderByPlan>,
+        distinct: bool,
     ) -> Self {
         Self {
             table_name,
@@ -1190,6 +1977,7 @@ where
                 options,
                 full_table_scan,
                 order_by,
+                distinct,
             },
         }
     }
@@ -1227,6 +2015,7 @@ where
                 options,
                 full_table_scan,
                 order_by,
+                distinct,
             } => {
                 // Early return for empty tables to avoid ColumnStore data_type() errors
                 let total_rows = table.total_rows.load(Ordering::SeqCst);
@@ -1243,6 +2032,11 @@ where
                 let collect_batches = needs_post_sort || capture_nulls_first;
                 let include_nulls = options.include_nulls;
                 let has_row_id_filter = options.row_id_filter.is_some();
+                let mut distinct_state = if distinct {
+                    Some(DistinctState::default())
+                } else {
+                    None
+                };
                 let scan_options = options;
                 let mut buffered_batches: Vec<RecordBatch> = Vec::new();
                 table
@@ -1250,6 +2044,21 @@ where
                     .scan_stream(projections, &filter_expr, scan_options, |batch| {
                         if error.is_some() {
                             return;
+                        }
+                        let mut batch = batch;
+                        if let Some(state) = distinct_state.as_mut() {
+                            match distinct_filter_batch(batch, state) {
+                                Ok(Some(filtered)) => {
+                                    batch = filtered;
+                                }
+                                Ok(None) => {
+                                    return;
+                                }
+                                Err(err) => {
+                                    error = Some(err);
+                                    return;
+                                }
+                            }
                         }
                         produced = true;
                         produced_rows = produced_rows.saturating_add(batch.num_rows() as u64);
@@ -1263,7 +2072,9 @@ where
                     return Err(err);
                 }
                 if !produced {
-                    if total_rows > 0 {
+                    // Only synthesize null rows if this was a full table scan
+                    // If there was a filter and it matched no rows, we should return empty results
+                    if !distinct && full_table_scan && total_rows > 0 {
                         for batch in synthesize_null_scan(Arc::clone(&schema), total_rows)? {
                             on_batch(batch)?;
                         }
@@ -1276,7 +2087,8 @@ where
                 // 2. This is a full table scan
                 // 3. We produced fewer rows than the total
                 // 4. We DON'T have a row_id_filter (e.g., MVCC filter) that intentionally filtered rows
-                if include_nulls
+                if !distinct
+                    && include_nulls
                     && full_table_scan
                     && produced_rows < total_rows
                     && !has_row_id_filter
@@ -1539,6 +2351,267 @@ fn synthesize_null_scan(schema: Arc<Schema>, total_rows: u64) -> ExecutorResult<
     Ok(vec![batch])
 }
 
+struct TableCrossProductData {
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+    column_counts: Vec<usize>,
+}
+
+fn collect_table_data<P>(
+    table_ref: &llkv_plan::TableRef,
+    table: &ExecutorTable<P>,
+) -> ExecutorResult<TableCrossProductData>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if table.schema.columns.is_empty() {
+        return Err(Error::InvalidArgumentError(format!(
+            "table '{}' has no columns; cross products require at least one column",
+            table_ref.qualified_name()
+        )));
+    }
+
+    let mut projections = Vec::with_capacity(table.schema.columns.len());
+    let mut fields = Vec::with_capacity(table.schema.columns.len());
+
+    for column in &table.schema.columns {
+        let qualified_name = format!("{}.{}.{}", table_ref.schema, table_ref.table, column.name);
+        projections.push(ScanProjection::from(StoreProjection::with_alias(
+            LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+            qualified_name.clone(),
+        )));
+        fields.push(Field::new(
+            qualified_name,
+            column.data_type.clone(),
+            column.nullable,
+        ));
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+
+    let filter_field_id = table.schema.first_field_id().unwrap_or(ROW_ID_FIELD_ID);
+    let filter_expr = crate::translation::expression::full_table_scan_filter(filter_field_id);
+
+    let mut raw_batches = Vec::new();
+    table.table.scan_stream(
+        projections,
+        &filter_expr,
+        ScanStreamOptions {
+            include_nulls: true,
+            ..ScanStreamOptions::default()
+        },
+        |batch| {
+            raw_batches.push(batch);
+        },
+    )?;
+
+    let mut normalized_batches = Vec::with_capacity(raw_batches.len());
+    for batch in raw_batches {
+        let normalized = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
+            .map_err(|err| {
+                Error::Internal(format!(
+                    "failed to align scan batch for table '{}': {}",
+                    table_ref.qualified_name(),
+                    err
+                ))
+            })?;
+        normalized_batches.push(normalized);
+    }
+
+    Ok(TableCrossProductData {
+        schema,
+        batches: normalized_batches,
+        column_counts: vec![table.schema.columns.len()],
+    })
+}
+
+fn build_cross_product_column_lookup(
+    schema: &Schema,
+    tables: &[llkv_plan::TableRef],
+    column_counts: &[usize],
+) -> FxHashMap<String, usize> {
+    debug_assert_eq!(tables.len(), column_counts.len());
+
+    let mut table_column_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for field in schema.fields() {
+        if let Some(name) = table_column_key(field.name()) {
+            *table_column_counts
+                .entry(name.to_ascii_lowercase())
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut lookup = FxHashMap::default();
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        lookup.entry(name.to_ascii_lowercase()).or_insert(idx);
+
+        let trimmed = name.trim_start_matches('.');
+        lookup.entry(trimmed.to_ascii_lowercase()).or_insert(idx);
+
+        let mut parts: Vec<&str> = trimmed.split('.').collect();
+        if parts.len() >= 2 {
+            let column_part = parts.pop().unwrap();
+            let column_lower = column_part.to_ascii_lowercase();
+
+            if let Some(table_only) = parts.last() {
+                let table_lower = table_only.to_ascii_lowercase();
+                if table_column_counts
+                    .get(&format!("{}.{}", table_lower, column_lower))
+                    .copied()
+                    .unwrap_or(0)
+                    == 1
+                {
+                    lookup
+                        .entry(format!("{}.{}", table_lower, column_lower.clone()))
+                        .or_insert(idx);
+                }
+            }
+        }
+    }
+
+    let mut offset = 0usize;
+    for (table_ref, &count) in tables.iter().zip(column_counts.iter()) {
+        if let Some(alias) = &table_ref.alias {
+            let alias_lower = alias.to_ascii_lowercase();
+            let end = usize::min(schema.fields().len(), offset.saturating_add(count));
+            for column_index in offset..end {
+                let name = schema.field(column_index).name();
+                let trimmed = name.trim_start_matches('.');
+                let column_lower = trimmed
+                    .rsplit('.')
+                    .next()
+                    .map(|part| part.to_ascii_lowercase())
+                    .unwrap_or_else(|| trimmed.to_ascii_lowercase());
+                lookup
+                    .entry(format!("{}.{}", alias_lower, column_lower))
+                    .or_insert(column_index);
+            }
+        }
+        offset = offset.saturating_add(count);
+    }
+
+    lookup
+}
+
+fn cross_join_table_batches(
+    left: TableCrossProductData,
+    right: TableCrossProductData,
+) -> ExecutorResult<TableCrossProductData> {
+    let TableCrossProductData {
+        schema: left_schema,
+        batches: left_batches,
+        column_counts: mut left_counts,
+    } = left;
+    let TableCrossProductData {
+        schema: right_schema,
+        batches: right_batches,
+        column_counts: right_counts,
+    } = right;
+
+    let combined_fields: Vec<Field> = left_schema
+        .fields()
+        .iter()
+        .chain(right_schema.fields().iter())
+        .map(|field| field.as_ref().clone())
+        .collect();
+
+    let mut column_counts = Vec::with_capacity(left_counts.len() + right_counts.len());
+    column_counts.append(&mut left_counts);
+    column_counts.extend(right_counts);
+
+    let combined_schema = Arc::new(Schema::new(combined_fields));
+
+    let left_has_rows = left_batches.iter().any(|batch| batch.num_rows() > 0);
+    let right_has_rows = right_batches.iter().any(|batch| batch.num_rows() > 0);
+
+    if !left_has_rows || !right_has_rows {
+        return Ok(TableCrossProductData {
+            schema: combined_schema,
+            batches: Vec::new(),
+            column_counts,
+        });
+    }
+
+    let mut output_batches = Vec::new();
+    for left_batch in &left_batches {
+        if left_batch.num_rows() == 0 {
+            continue;
+        }
+        for right_batch in &right_batches {
+            if right_batch.num_rows() == 0 {
+                continue;
+            }
+
+            let batch =
+                cross_join_pair(left_batch, right_batch, &combined_schema).map_err(|err| {
+                    Error::Internal(format!("failed to build cross join batch: {err}"))
+                })?;
+            output_batches.push(batch);
+        }
+    }
+
+    Ok(TableCrossProductData {
+        schema: combined_schema,
+        batches: output_batches,
+        column_counts,
+    })
+}
+
+#[derive(Default)]
+struct DistinctState {
+    seen: FxHashSet<CanonicalRow>,
+}
+
+impl DistinctState {
+    fn insert(&mut self, row: CanonicalRow) -> bool {
+        self.seen.insert(row)
+    }
+}
+
+fn distinct_filter_batch(
+    batch: RecordBatch,
+    state: &mut DistinctState,
+) -> ExecutorResult<Option<RecordBatch>> {
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    let mut keep_flags = Vec::with_capacity(batch.num_rows());
+    let mut keep_count = 0usize;
+
+    for row_idx in 0..batch.num_rows() {
+        let row = CanonicalRow::from_batch(&batch, row_idx)?;
+        if state.insert(row) {
+            keep_flags.push(true);
+            keep_count += 1;
+        } else {
+            keep_flags.push(false);
+        }
+    }
+
+    if keep_count == 0 {
+        return Ok(None);
+    }
+
+    if keep_count == batch.num_rows() {
+        return Ok(Some(batch));
+    }
+
+    let mut builder = BooleanBuilder::with_capacity(batch.num_rows());
+    for flag in keep_flags {
+        builder.append_value(flag);
+    }
+    let mask = Arc::new(builder.finish());
+
+    let filtered = filter_record_batch(&batch, &mask).map_err(|err| {
+        Error::InvalidArgumentError(format!("failed to apply DISTINCT filter: {err}"))
+    })?;
+
+    Ok(Some(filtered))
+}
+
 fn sort_record_batch_with_order(
     schema: &Arc<Schema>,
     batch: &RecordBatch,
@@ -1635,4 +2708,143 @@ fn sort_record_batch_with_order(
 
     RecordBatch::try_new(Arc::clone(schema), reordered_columns)
         .map_err(|err| Error::Internal(format!("failed to build reordered ORDER BY batch: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use llkv_expr::expr::BinaryOp;
+    use std::sync::Arc;
+
+    #[test]
+    fn cross_product_context_evaluates_expressions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("main.tab2.a", DataType::Int64, false),
+            Field::new("main.tab2.b", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+            ],
+        )
+        .expect("valid batch");
+
+        let lookup = build_cross_product_column_lookup(schema.as_ref(), &[], &[]);
+        let mut ctx = CrossProductExpressionContext::new(schema.as_ref(), lookup)
+            .expect("context builds from schema");
+
+        let literal_expr: ScalarExpr<String> = ScalarExpr::literal(67);
+        let literal = ctx
+            .evaluate(&literal_expr, &batch)
+            .expect("literal evaluation succeeds");
+        let literal_array = literal
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 literal result");
+        assert_eq!(literal_array.len(), 3);
+        assert!(literal_array.iter().all(|value| value == Some(67)));
+
+        let add_expr = ScalarExpr::binary(
+            ScalarExpr::column("tab2.a".to_string()),
+            BinaryOp::Add,
+            ScalarExpr::literal(5),
+        );
+        let added = ctx
+            .evaluate(&add_expr, &batch)
+            .expect("column addition succeeds");
+        let added_array = added
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 addition result");
+        assert_eq!(added_array.values(), &[6, 7, 8]);
+    }
+
+    #[test]
+    fn cross_product_handles_more_than_two_tables() {
+        let schema_a = Arc::new(Schema::new(vec![Field::new(
+            "main.t1.a",
+            DataType::Int64,
+            false,
+        )]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new(
+            "main.t2.b",
+            DataType::Int64,
+            false,
+        )]));
+        let schema_c = Arc::new(Schema::new(vec![Field::new(
+            "main.t3.c",
+            DataType::Int64,
+            false,
+        )]));
+
+        let batch_a = RecordBatch::try_new(
+            Arc::clone(&schema_a),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("valid batch");
+        let batch_b = RecordBatch::try_new(
+            Arc::clone(&schema_b),
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef],
+        )
+        .expect("valid batch");
+        let batch_c = RecordBatch::try_new(
+            Arc::clone(&schema_c),
+            vec![Arc::new(Int64Array::from(vec![100])) as ArrayRef],
+        )
+        .expect("valid batch");
+
+        let data_a = TableCrossProductData {
+            schema: schema_a,
+            batches: vec![batch_a],
+            column_counts: vec![1],
+        };
+        let data_b = TableCrossProductData {
+            schema: schema_b,
+            batches: vec![batch_b],
+            column_counts: vec![1],
+        };
+        let data_c = TableCrossProductData {
+            schema: schema_c,
+            batches: vec![batch_c],
+            column_counts: vec![1],
+        };
+
+        let ab = cross_join_table_batches(data_a, data_b).expect("two-table product");
+        assert_eq!(ab.schema.fields().len(), 2);
+        assert_eq!(ab.batches.len(), 1);
+        assert_eq!(ab.batches[0].num_rows(), 6);
+
+        let abc = cross_join_table_batches(ab, data_c).expect("three-table product");
+        assert_eq!(abc.schema.fields().len(), 3);
+        assert_eq!(abc.batches.len(), 1);
+
+        let final_batch = &abc.batches[0];
+        assert_eq!(final_batch.num_rows(), 6);
+
+        let col_a = final_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("left column values");
+        assert_eq!(col_a.values(), &[1, 1, 1, 2, 2, 2]);
+
+        let col_b = final_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("middle column values");
+        assert_eq!(col_b.values(), &[10, 20, 30, 10, 20, 30]);
+
+        let col_c = final_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("right column values");
+        assert_eq!(col_c.values(), &[100, 100, 100, 100, 100, 100]);
+    }
 }

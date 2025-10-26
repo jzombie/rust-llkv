@@ -1,4 +1,4 @@
-use llkv_sql::slt::expand_loops_with_mapping;
+use llkv_slt_tester::expand_loops_with_mapping;
 
 #[test]
 fn expand_loops_basic() {

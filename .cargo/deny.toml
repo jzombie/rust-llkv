@@ -1,8 +1,14 @@
 [licenses]
 allow = [
-    "MIT",
-    "Unicode-3.0",
     "Apache-2.0",
+    "BSD-3-Clause",
     "BSL-1.0",
-    "CC0-1.0"
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0"
+]
+
+exceptions = [
+  { name = "webpki-roots", version = ">=1.0.0,<2.0.0", allow = ["MPL-2.0", "CDLA-Permissive-2.0"] },
 ]
