@@ -4478,6 +4478,67 @@ fn is_integer_literal(expr: &SqlExpr, expected: i64) -> bool {
     }
 }
 
+fn sql_expr_is_null_literal(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Value(ValueWithSpan {
+            value: Value::Null, ..
+        }) => true,
+        SqlExpr::Nested(inner) => sql_expr_is_null_literal(inner),
+        _ => false,
+    }
+}
+
+fn strip_sql_expr_nesting(expr: &SqlExpr) -> &SqlExpr {
+    match expr {
+        SqlExpr::Nested(inner) => strip_sql_expr_nesting(inner),
+        other => other,
+    }
+}
+
+fn comparison_involves_null(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+            ) =>
+        {
+            sql_expr_is_null_literal(left) || sql_expr_is_null_literal(right)
+        }
+        _ => false,
+    }
+}
+
+fn translate_between_clause(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    between_expr: &SqlExpr,
+    low: &SqlExpr,
+    high: &SqlExpr,
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+    let lower_bound = translate_comparison_with_context(
+        resolver,
+        context.clone(),
+        between_expr,
+        BinaryOperator::GtEq,
+        low,
+    )?;
+    let upper_bound = translate_comparison_with_context(
+        resolver,
+        context,
+        between_expr,
+        BinaryOperator::LtEq,
+        high,
+    )?;
+
+    Ok(llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]))
+}
+
 fn translate_condition_with_context(
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
@@ -4545,6 +4606,54 @@ fn translate_condition_with_context(
                     op: UnaryOperator::Not,
                     expr: inner,
                 } => {
+                    let inner_stripped = strip_sql_expr_nesting(inner);
+                    if let SqlExpr::Between {
+                        expr: between_expr,
+                        negated: inner_negated,
+                        low,
+                        high,
+                    } = inner_stripped
+                    {
+                        if *inner_negated {
+                            let between_expr_result = translate_between_clause(
+                                resolver,
+                                context.clone(),
+                                between_expr,
+                                low,
+                                high,
+                            )?;
+                            work_stack.push(ConditionFrame::Leaf(between_expr_result));
+                        } else {
+                            let below_lower = translate_comparison_with_context(
+                                resolver,
+                                context.clone(),
+                                between_expr,
+                                BinaryOperator::Lt,
+                                low,
+                            )?;
+                            let above_upper = translate_comparison_with_context(
+                                resolver,
+                                context.clone(),
+                                between_expr,
+                                BinaryOperator::Gt,
+                                high,
+                            )?;
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Or(vec![
+                                below_lower,
+                                above_upper,
+                            ])));
+                        }
+                        continue;
+                    }
+                    if comparison_involves_null(inner_stripped) {
+                        tracing::debug!(
+                            expr = ?inner,
+                            "short-circuit NOT comparison due to NULL literal",
+                        );
+                        work_stack
+                            .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(false)));
+                        continue;
+                    }
                     work_stack.push(ConditionFrame::Exit(ConditionExitContext::Not));
                     work_stack.push(ConditionFrame::Enter(inner));
                 }
@@ -4633,24 +4742,13 @@ fn translate_condition_with_context(
                     low,
                     high,
                 } => {
-                    let lower_bound = translate_comparison_with_context(
+                    let between_expr_result = translate_between_clause(
                         resolver,
                         context.clone(),
                         between_expr,
-                        BinaryOperator::GtEq,
                         low,
-                    )?;
-                    let upper_bound = translate_comparison_with_context(
-                        resolver,
-                        context.clone(),
-                        between_expr,
-                        BinaryOperator::LtEq,
                         high,
                     )?;
-
-                    let between_expr_result =
-                        llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]);
-
                     let result = if *negated {
                         llkv_expr::expr::Expr::not(between_expr_result)
                     } else {
@@ -5796,6 +5894,163 @@ mod tests {
             total_rows, 0,
             "expected cross join filter to remove all rows"
         );
+    }
+
+    #[test]
+    fn not_between_null_bounds_matches_sqlite_behavior() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab2(col1 INTEGER, col2 INTEGER)")
+            .expect("create tab2");
+        engine
+            .execute("INSERT INTO tab2 VALUES (1, 2), (-5, 7), (NULL, 11)")
+            .expect("seed rows");
+
+        let batches = engine
+            .sql(
+                "SELECT DISTINCT - col2 AS col1 FROM tab2 WHERE NOT ( col1 ) BETWEEN ( NULL ) AND ( + col1 - col2 )",
+            )
+            .expect("run NOT BETWEEN query with NULL bounds");
+
+        let mut values: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("integer column");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    values.push(column.value(idx));
+                }
+            }
+        }
+
+        values.sort_unstable();
+        assert_eq!(values, vec![-7, -2]);
+    }
+
+    #[test]
+    fn not_between_null_bounds_matches_harness_fixture() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab2(col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+            .expect("create tab2");
+        engine
+            .execute("INSERT INTO tab2 VALUES (7, 31, 27), (79, 17, 38), (78, 59, 26)")
+            .expect("seed rows");
+
+        let batches = engine
+            .sql(
+                "SELECT DISTINCT - col2 AS col1 FROM tab2 WHERE NOT ( col1 ) BETWEEN ( NULL ) AND ( + col1 - col2 )",
+            )
+            .expect("run harness-matched NOT BETWEEN query");
+
+        let mut values: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("integer column");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    values.push(column.value(idx));
+                }
+            }
+        }
+
+        values.sort_unstable();
+        assert_eq!(values, vec![-38, -27, -26]);
+    }
+
+    #[test]
+    fn not_between_null_bounds_parser_negated_flag() {
+        use sqlparser::ast::{Expr as SqlExprAst, Statement};
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = SQLiteDialect {};
+        let sql =
+            "SELECT DISTINCT - col2 AS col1 FROM tab2 WHERE NOT ( col1 ) BETWEEN ( NULL ) AND ( + col1 - col2 )";
+
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse sql");
+        let statement = statements
+            .pop()
+            .expect("expected single statement");
+        let Statement::Query(query) = statement else {
+            panic!("expected SELECT query");
+        };
+        let select = query
+            .body
+            .as_select()
+            .expect("expected SELECT body");
+        let where_expr = select
+            .selection
+            .as_ref()
+            .expect("expected WHERE clause");
+
+        match where_expr {
+            SqlExprAst::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr } => match expr.as_ref() {
+                SqlExprAst::Between { negated, .. } => {
+                    assert!(
+                        !negated,
+                        "expected BETWEEN parser to treat leading NOT as part of expression"
+                    );
+                }
+                other => panic!("unexpected inner expression: {other:?}"),
+            },
+            other => panic!("unexpected where expression: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn double_negated_between_null_bounds_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab2(col0 INTEGER, col1 INTEGER, col2 INTEGER)")
+            .expect("create tab2");
+        engine
+            .execute("INSERT INTO tab2 VALUES (1, 2, 3), (-2, -13, 19), (NULL, 5, 7)")
+            .expect("seed rows");
+
+        let batches = engine
+            .sql(
+                "SELECT - col1 * + col2 FROM tab2 WHERE NOT ( col1 ) NOT BETWEEN ( NULL ) AND ( col0 )",
+            )
+            .expect("run double NOT BETWEEN query with NULL bounds");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "expected double NOT BETWEEN to filter all rows"
+        );
+    }
+
+    #[test]
+    fn not_scalar_less_than_null_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab(col0 INTEGER, col2 INTEGER)")
+            .expect("create tab");
+        engine
+            .execute("INSERT INTO tab VALUES (1, 2), (5, 10), (-3, 7)")
+            .expect("seed rows");
+
+        let batches = engine
+            .sql("SELECT col0 FROM tab WHERE NOT ( - col0 / - col2 + - col0 ) < NULL")
+            .expect("run NOT < NULL query");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "expected NOT < NULL to filter all rows");
     }
 
     #[test]

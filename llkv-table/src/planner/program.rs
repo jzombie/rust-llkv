@@ -239,6 +239,9 @@ pub(crate) enum DomainOp {
     Union {
         child_count: usize,
     },
+    Intersect {
+        child_count: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -452,7 +455,14 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                         ops.push(DomainOp::PushLiteralFalse);
                     }
                 }
-                Expr::And(children) | Expr::Or(children) => {
+                Expr::And(children) => {
+                    if children.len() > 1 {
+                        ops.push(DomainOp::Intersect {
+                            child_count: children.len(),
+                        });
+                    }
+                }
+                Expr::Or(children) => {
                     if children.len() > 1 {
                         ops.push(DomainOp::Union {
                             child_count: children.len(),
