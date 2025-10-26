@@ -388,6 +388,13 @@ pub fn map_temp_error_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
+
+    fn slt_fixture(input: &str) -> (Vec<String>, Vec<usize>) {
+        let lines: Vec<String> = input.split('\n').map(|line| line.to_string()).collect();
+        let mapping: Vec<usize> = (1..=lines.len()).collect();
+        (lines, mapping)
+    }
 
     #[test]
     fn test_filter_conditional_blocks_onlyif_match() {
@@ -448,15 +455,49 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_conditional_blocks_onlyif_skips_single_block() {
+        let (lines, mapping) = slt_fixture(indoc! {
+            r#"
+            query I
+            SELECT 1
+            ----
+            1
+
+            onlyif mysql # requires mysql
+            query I rowsort
+            SELECT 2
+            ----
+            2
+
+            query I
+            SELECT 3
+            ----
+            3
+            "#
+        });
+
+        let (filtered, filtered_mapping) = filter_conditional_blocks(lines, mapping, &["llkv"]);
+
+        assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
+        assert!(!filtered.iter().any(|l| l.contains("SELECT 2")));
+
+        let select3_idx = filtered
+            .iter()
+            .position(|l| l.contains("SELECT 3"))
+            .expect("expected trailing block to remain");
+        assert_eq!(filtered_mapping[select3_idx], 13);
+    }
+
+    #[test]
     fn test_filter_conditional_blocks_skipif_match() {
-        // Test that "skipif llkv" excludes the test for llkv
+        // Test that "skipif mysql" excludes the block for engines we consider compatible
         let lines = vec![
             "query I".to_string(),
             "SELECT 1".to_string(),
             "----".to_string(),
             "1".to_string(),
             "".to_string(),
-            "skipif llkv".to_string(),
+            "skipif mysql".to_string(),
             "query I".to_string(),
             "SELECT 2".to_string(),
             "----".to_string(),
@@ -465,12 +506,44 @@ mod tests {
         ];
         let mapping: Vec<usize> = (1..=lines.len()).collect();
 
-        let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv"]);
+        let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv", "mysql"]);
 
-        // Should include first test but not the second (skipped for llkv)
+        // Should include first test but not the second (skipped for mysql)
         assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
         assert!(!filtered.iter().any(|l| l.contains("SELECT 2")));
         assert!(!filtered.iter().any(|l| l.contains("skipif")));
+    }
+
+    #[test]
+    fn test_filter_conditional_blocks_skipif_skips_only_next_block() {
+        let (lines, mapping) = slt_fixture(indoc! {
+            r#"
+            skipif mysql # not compatible
+            query I rowsort label-9840
+            SELECT ALL CAST ( - col1 AS INTEGER ) + cor0.col0 + - CAST ( NULL AS INTEGER ) AS col0 FROM tab0 AS cor0
+            ----
+            NULL
+            NULL
+            NULL
+
+            query I rowsort
+            SELECT DISTINCT - col0 * - col1 + col1 FROM tab1 AS cor0
+            ----
+            104
+            1053
+            650
+            "#
+        });
+
+        let (filtered, filtered_mapping) =
+            filter_conditional_blocks(lines, mapping, &["llkv", "mysql"]);
+
+        assert!(!filtered.iter().any(|l| l.contains("label-9840")));
+        let select2_idx = filtered
+            .iter()
+            .position(|l| l.contains("SELECT DISTINCT"))
+            .expect("expected second block to remain");
+        assert_eq!(filtered_mapping[select2_idx], 10);
     }
 
     #[test]
@@ -497,6 +570,29 @@ mod tests {
         assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
         assert!(filtered.iter().any(|l| l.contains("SELECT 2")));
         assert!(!filtered.iter().any(|l| l.contains("skipif")));
+    }
+
+    #[test]
+    fn test_filter_conditional_blocks_skipif_at_eof_without_blank_line() {
+        // Skip a trailing block that is not terminated by a blank line
+        let lines = vec![
+            "query I".to_string(),
+            "SELECT 1".to_string(),
+            "----".to_string(),
+            "1".to_string(),
+            "".to_string(),
+            "skipif sqlite".to_string(),
+            "query I".to_string(),
+            "SELECT 2".to_string(),
+            "----".to_string(),
+            "2".to_string(),
+        ];
+        let mapping: Vec<usize> = (1..=lines.len()).collect();
+
+        let (filtered, _) = filter_conditional_blocks(lines, mapping, &["llkv", "sqlite"]);
+
+        assert!(filtered.iter().any(|l| l.contains("SELECT 1")));
+        assert!(!filtered.iter().any(|l| l.contains("SELECT 2")));
     }
 
     #[test]
