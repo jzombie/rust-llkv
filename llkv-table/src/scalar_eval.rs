@@ -1103,7 +1103,6 @@ impl NumericKernels {
 mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array};
-    use arrow::datatypes::DataType;
     use llkv_expr::Literal;
 
     fn float_array(values: &[Option<f64>]) -> NumericArray {

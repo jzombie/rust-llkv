@@ -4515,19 +4515,17 @@ fn strip_sql_expr_nesting(expr: &SqlExpr) -> &SqlExpr {
 
 fn comparison_involves_null(expr: &SqlExpr) -> bool {
     match expr {
-        SqlExpr::BinaryOp { left, op, right }
-            if matches!(
-                op,
+        SqlExpr::BinaryOp {
+            left,
+            op:
                 BinaryOperator::Eq
-                    | BinaryOperator::NotEq
-                    | BinaryOperator::Lt
-                    | BinaryOperator::LtEq
-                    | BinaryOperator::Gt
-                    | BinaryOperator::GtEq
-            ) =>
-        {
-            sql_expr_is_null_literal(left) || sql_expr_is_null_literal(right)
-        }
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq,
+            right,
+        } => sql_expr_is_null_literal(left) || sql_expr_is_null_literal(right),
         _ => false,
     }
 }

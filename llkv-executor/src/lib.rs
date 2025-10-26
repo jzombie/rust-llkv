@@ -2381,7 +2381,7 @@ where
         let table_component = table_ref
             .alias
             .as_deref()
-            .unwrap_or_else(|| table_ref.table.as_str());
+            .unwrap_or(table_ref.table.as_str());
         let qualified_name = format!("{}.{}.{}", table_ref.schema, table_component, column.name);
         projections.push(ScanProjection::from(StoreProjection::with_alias(
             LogicalFieldId::for_user(table.table.table_id(), column.field_id),
@@ -2469,10 +2469,10 @@ fn build_cross_product_column_lookup(
             let trimmed_lower = field.name().trim_start_matches('.').to_ascii_lowercase();
             lookup.entry(trimmed_lower).or_insert(idx);
 
-            if let Some(pair) = table_column_suffix(field.name()) {
-                if table_column_counts.get(&pair).copied().unwrap_or(0) == 1 {
-                    lookup.entry(pair).or_insert(idx);
-                }
+            if let Some(pair) = table_column_suffix(field.name())
+                && table_column_counts.get(&pair).copied().unwrap_or(0) == 1
+            {
+                lookup.entry(pair).or_insert(idx);
             }
 
             let column_name = extract_column_name(field.name());
@@ -2537,12 +2537,11 @@ fn build_cross_product_column_lookup(
                 lookup.entry(column_name.clone()).or_insert(field_index);
             }
 
-            if table_keys.is_empty() {
-                if let Some(pair) = table_column_suffix(field.name()) {
-                    if table_column_counts.get(&pair).copied().unwrap_or(0) == 1 {
-                        lookup.entry(pair).or_insert(field_index);
-                    }
-                }
+            if table_keys.is_empty()
+                && let Some(pair) = table_column_suffix(field.name())
+                && table_column_counts.get(&pair).copied().unwrap_or(0) == 1
+            {
+                lookup.entry(pair).or_insert(field_index);
             }
         }
 

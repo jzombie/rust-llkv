@@ -15,7 +15,7 @@ use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
 thread_local! {
-    static EXPECTED_COLUMN_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = RefCell::new(None);
+    static EXPECTED_COLUMN_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn set_expected_column_types(types: Vec<DefaultColumnType>) {
