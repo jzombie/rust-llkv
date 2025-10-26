@@ -147,7 +147,7 @@ where
     runner.with_hash_threshold(256);
 
     if let Err(e) = runner.run_file_async(&tmp).await {
-        let (mapped, opt_orig_line) =
+        let (mapped, opt_line_info) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, origin);
 
         if flattening_resolves_mismatch(&mapped) {
@@ -173,21 +173,19 @@ where
         };
         drop(named);
 
-        if let Some(line_num) = opt_orig_line {
-            // Print the line from the normalized/processed content with context
-            if let Some(line) = normalized_lines.get(line_num.saturating_sub(1)) {
+        if let Some((orig_line, normalized_line)) = opt_line_info {
+            if let Some(line) = normalized_lines.get(normalized_line.saturating_sub(1)) {
                 eprintln!(
-                    "[llkv-slt] Error at line {} in normalized content: {}",
-                    line_num,
+                    "[llkv-slt] Normalized line {}: {}",
+                    normalized_line,
                     line.trim()
                 );
             }
 
-            // Also try to show the original line if available
-            if let Some(line) = text.lines().nth(line_num.saturating_sub(1)) {
+            if let Some(line) = text.lines().nth(orig_line.saturating_sub(1)) {
                 eprintln!(
                     "[llkv-slt] Original source line {}: {}",
-                    line_num,
+                    orig_line,
                     line.trim()
                 );
             }
@@ -195,10 +193,10 @@ where
 
         if let Some(path) = &persisted {
             eprintln!("[llkv-slt] Normalized SLT saved to: {}", path);
-            if let Some(line_num) = opt_orig_line {
+            if let Some((_, normalized_line)) = opt_line_info {
                 eprintln!(
                     "[llkv-slt] View context: head -n {} '{}' | tail -20",
-                    line_num.saturating_add(10),
+                    normalized_line.saturating_add(10),
                     path
                 );
             }
@@ -206,16 +204,16 @@ where
 
         // Build enhanced error message showing both remote URL and local debug file
         let enhanced_msg = if let Some(debug_path) = persisted {
-            if let Some(line_num) = opt_orig_line {
-                let vscode_link = make_vscode_file_link(&debug_path, Some(line_num));
+            if let Some((orig_line, normalized_line)) = opt_line_info {
+                let vscode_link = make_vscode_file_link(&debug_path, Some(normalized_line));
                 let shell_path = make_shell_escaped_path(&debug_path);
                 format!(
                     "slt runner failed: {}\n  at: {}:{}\n  debug: {}:{}\n  vscode: {}",
                     mapped,
                     origin.display(),
-                    line_num,
+                    orig_line,
                     shell_path,
-                    line_num,
+                    normalized_line,
                     vscode_link
                 )
             } else {

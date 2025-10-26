@@ -332,15 +332,18 @@ pub fn normalize_inline_connections(
     (out_lines, out_map)
 }
 
-/// Map a temporary expanded-file error message back to the original file path
-/// and line; returns (mapped_message, optional original line number).
+/// Map a temporary expanded-file error message back to the original and
+/// normalized line numbers.
+///
+/// Returns the rewritten message plus an optional pair of line numbers in the
+/// form `(original_source_line, normalized_line)`.
 pub fn map_temp_error_message(
     err_msg: &str,
     tmp_path: &Path,
     expanded_lines: &[String],
     mapping: &[usize],
     orig_path: &Path,
-) -> (String, Option<usize>) {
+) -> (String, Option<(usize, usize)>) {
     let tmp_str = tmp_path.to_string_lossy().to_string();
     let mut out = err_msg.to_string();
     if let Some(pos) = out.find(&tmp_str) {
@@ -372,7 +375,8 @@ pub fn map_temp_error_message(
                             &replacement,
                             1,
                         );
-                        return (out, Some(orig_line));
+                        let normalized_line = idx_us + 1;
+                        return (out, Some((orig_line, normalized_line)));
                     }
                 }
             }
