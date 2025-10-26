@@ -19,7 +19,7 @@ use arrow::array::{
     RecordBatch, StringArray, UInt32Array, new_null_array,
 };
 use arrow::compute::{
-    SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
+    SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
@@ -153,6 +153,7 @@ where
                 Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
             }
             ScalarExpr::GetField { base, .. } => Self::expr_contains_aggregate(base),
+            ScalarExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
         }
     }
@@ -901,6 +902,9 @@ where
             ScalarExpr::GetField { base, .. } => {
                 Self::collect_aggregates(base, aggregates);
             }
+            ScalarExpr::Cast { expr, .. } => {
+                Self::collect_aggregates(expr, aggregates);
+            }
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
         }
     }
@@ -1160,6 +1164,9 @@ where
                     Error::InvalidArgumentError("Arithmetic overflow in expression".into())
                 })
             }
+            ScalarExpr::Cast { .. } => Err(Error::InvalidArgumentError(
+                "CAST is not supported in aggregate-only expressions".into(),
+            )),
             ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
                 "GetField not supported in aggregate-only expressions".into(),
             )),
@@ -1871,6 +1878,13 @@ impl CrossProductExpressionContext {
             ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
                 "struct field access is not supported in cross product filters".into(),
             )),
+            ScalarExpr::Cast { expr, data_type } => {
+                let source = self.materialize_scalar_array(expr.as_ref(), batch)?;
+                let casted = cast(source.as_ref(), data_type).map_err(|err| {
+                    Error::InvalidArgumentError(format!("failed to cast expression: {err}"))
+                })?;
+                Ok(casted)
+            }
         }
     }
 
@@ -1905,6 +1919,7 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             }
         },
         ScalarExpr::GetField { base, .. } => collect_field_ids(base, out),
+        ScalarExpr::Cast { expr, .. } => collect_field_ids(expr, out),
         ScalarExpr::Literal(_) => {}
     }
 }

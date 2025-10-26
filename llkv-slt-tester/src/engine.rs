@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,6 +13,26 @@ use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
+
+thread_local! {
+    static EXPECTED_COLUMN_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = RefCell::new(None);
+}
+
+pub(crate) fn set_expected_column_types(types: Vec<DefaultColumnType>) {
+    EXPECTED_COLUMN_TYPES.with(|cell| {
+        *cell.borrow_mut() = Some(types);
+    });
+}
+
+pub(crate) fn clear_expected_column_types() {
+    EXPECTED_COLUMN_TYPES.with(|cell| {
+        cell.borrow_mut().take();
+    });
+}
+
+fn take_expected_column_types() -> Option<Vec<DefaultColumnType>> {
+    EXPECTED_COLUMN_TYPES.with(|cell| cell.borrow_mut().take())
+}
 
 /// Tokio-agnostic harness that adapts `SqlEngine` to the `sqllogictest` runner.
 pub struct EngineHarness {
@@ -127,12 +148,17 @@ impl AsyncDB for EngineHarness {
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
+                        let mut expected_types = take_expected_column_types();
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
                             for row_idx in 0..batch.num_rows() {
                                 let mut row: Vec<String> = Vec::new();
                                 for col in 0..batch.num_columns() {
                                     let array = batch.column(col);
+                                    let expected_type = expected_types
+                                        .as_ref()
+                                        .and_then(|types| types.get(col))
+                                        .cloned();
                                     let val = match array.data_type() {
                                         arrow::datatypes::DataType::Int64 => {
                                             let a = array
@@ -163,6 +189,19 @@ impl AsyncDB for EngineHarness {
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
+                                            } else if matches!(
+                                                expected_type,
+                                                Some(DefaultColumnType::Integer)
+                                            ) {
+                                                let value = a.value(row_idx).trunc();
+                                                if !value.is_finite()
+                                                    || value < i64::MIN as f64
+                                                    || value > i64::MAX as f64
+                                                {
+                                                    value.to_string()
+                                                } else {
+                                                    (value as i64).to_string()
+                                                }
                                             } else {
                                                 a.value(row_idx).to_string()
                                             }
@@ -211,7 +250,9 @@ impl AsyncDB for EngineHarness {
                             }
                         }
 
-                        let types = if let Some(first) = batches.first() {
+                        let types = if let Some(expected) = expected_types.take() {
+                            expected
+                        } else if let Some(first) = batches.first() {
                             (0..first.num_columns())
                                 .map(|col| match first.column(col).data_type() {
                                     arrow::datatypes::DataType::Int64

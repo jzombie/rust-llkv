@@ -507,6 +507,9 @@ fn collect_fields<'expr>(
             ScalarExpr::GetField { base, .. } => {
                 stack.push(base);
             }
+            ScalarExpr::Cast { expr, .. } => {
+                stack.push(expr.as_ref());
+            }
         }
     }
     let mut fields: Vec<FieldId> = seen.into_iter().collect();

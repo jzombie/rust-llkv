@@ -231,6 +231,15 @@ where
             )?),
             field_name: field_name.clone(),
         }),
+        ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+            expr: Box::new(translate_scalar_with(
+                expr,
+                schema,
+                unknown_column,
+                unknown_aggregate,
+            )?),
+            data_type: data_type.clone(),
+        }),
     }
 }
 

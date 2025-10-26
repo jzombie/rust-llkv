@@ -6,6 +6,7 @@ use std::sync::{
 
 use crate::SqlResult;
 use crate::SqlValue;
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
 use llkv_executor::SelectExecution;
@@ -4320,6 +4321,7 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
         llkv_expr::expr::ScalarExpr::GetField { base, .. } => expr_contains_aggregate(base),
+        llkv_expr::expr::ScalarExpr::Cast { expr, .. } => expr_contains_aggregate(expr),
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
     }
 }
@@ -4982,6 +4984,7 @@ fn translate_scalar_internal(
         UnaryMinus,
         UnaryPlus,
         Nested,
+        Cast(DataType),
     }
 
     type ScalarFrame<'a> =
@@ -5057,9 +5060,13 @@ fn translate_scalar_internal(
                     work_stack.push(ScalarFrame::Exit(ScalarExitContext::Nested));
                     work_stack.push(ScalarFrame::Enter(inner));
                 }
-                SqlExpr::Cast { expr: inner, .. } => {
-                    // TODO: implement typed CAST semantics once executor supports runtime coercions.
-                    // For now, treat CAST as a passthrough so the inner expression is evaluated normally.
+                SqlExpr::Cast {
+                    expr: inner,
+                    data_type,
+                    ..
+                } => {
+                    let target_type = arrow_type_from_sql(data_type)?;
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::Cast(target_type)));
                     work_stack.push(ScalarFrame::Enter(inner));
                 }
                 SqlExpr::Function(func) => {
@@ -5187,6 +5194,12 @@ fn translate_scalar_internal(
                 }
                 ScalarExitContext::Nested => {
                     // Nested is a no-op - just pass through
+                }
+                ScalarExitContext::Cast(target_type) => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal("translate_scalar: result stack underflow for CAST".into())
+                    })?;
+                    result_stack.push(llkv_expr::expr::ScalarExpr::cast(inner, target_type));
                 }
             },
         }

@@ -12,6 +12,7 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch,
     StringArray, UInt64Array, new_null_array,
 };
+use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1137,6 +1138,7 @@ where
                                     .collect::<LlkvResult<Vec<_>>>()?;
                                 DataType::Struct(struct_fields.into())
                             }
+                            ScalarExpr::Cast { data_type, .. } => data_type.clone(),
                             ScalarExpr::Binary { .. } => {
                                 let mut resolver = |fid: FieldId| {
                                     let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
@@ -2934,6 +2936,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Binary { .. } => true,
         ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
+        ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
     }
 }
 
@@ -2967,6 +2970,13 @@ fn computed_expr_prefers_float(
                 NumericKernels::kind_for_data_type(&dtype),
                 Some(NumericKind::Float)
             ))
+        }
+        ScalarExpr::Cast { expr, data_type } => {
+            if let Some(kind) = NumericKernels::kind_for_data_type(data_type) {
+                Ok(matches!(kind, NumericKind::Float))
+            } else {
+                computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)
+            }
         }
     }
 }
@@ -3125,6 +3135,24 @@ fn synthesize_computed_literal_array(
             .map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
 
             Ok(Arc::new(struct_array) as ArrayRef)
+        }
+        ScalarExpr::Cast {
+            expr,
+            data_type: target_type,
+        } => {
+            let inner_dtype = match expr.as_ref() {
+                ScalarExpr::Literal(lit) => infer_literal_datatype(lit)?,
+                ScalarExpr::Cast { data_type, .. } => data_type.clone(),
+                _ => return Ok(new_null_array(data_type, row_count)),
+            };
+
+            let inner_info = ComputedProjectionInfo {
+                expr: expr.as_ref().clone(),
+                alias: info.alias.clone(),
+            };
+            let inner = synthesize_computed_literal_array(&inner_info, &inner_dtype, row_count)?;
+            compute::cast(&inner, target_type)
+                .map_err(|e| Error::InvalidArgumentError(format!("failed to cast literal: {e}")))
         }
         ScalarExpr::Column(_)
         | ScalarExpr::Binary { .. }
@@ -3324,6 +3352,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 traverse_stack.push(right);
             }
             GetField { base, .. } => traverse_stack.push(base),
+            Cast { expr, .. } => traverse_stack.push(expr),
             Column(_) | Literal(_) | Aggregate(_) => {}
         }
     }
@@ -3337,6 +3366,10 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             GetField { field_name, .. } => {
                 let base = result_stack.pop().unwrap_or_default();
                 result_stack.push(format!("{base}.{field_name}"));
+            }
+            Cast { data_type, .. } => {
+                let value = result_stack.pop().unwrap_or_default();
+                result_stack.push(format!("CAST({value} AS {data_type:?})"));
             }
             Binary { op, .. } => {
                 let right = result_stack.pop().unwrap_or_default();
@@ -4041,6 +4074,13 @@ where
                         out_schema.field(idx).data_type(),
                         batch_len,
                     )?,
+                    ScalarExpr::Cast { .. } if !computed_expr_requires_numeric(&info.expr) => {
+                        synthesize_computed_literal_array(
+                            info,
+                            out_schema.field(idx).data_type(),
+                            batch_len,
+                        )?
+                    }
                     ScalarExpr::GetField { base, field_name } => {
                         fn eval_get_field(
                             expr: &ScalarExpr<FieldId>,

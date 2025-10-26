@@ -81,6 +81,7 @@ fn infer_computed_data_type(
             let field_type = resolve_struct_field_type(schema, base, field_name)?;
             Ok(field_type)
         }
+        ScalarExpr::Cast { data_type, .. } => Ok(data_type.clone()),
     }
 }
 
@@ -138,6 +139,12 @@ fn expression_uses_float(
                 normalized_numeric_type(&field_type),
                 DataType::Float64
             ))
+        }
+        ScalarExpr::Cast { expr, data_type } => {
+            if matches!(normalized_numeric_type(data_type), DataType::Float64) {
+                return Ok(true);
+            }
+            expression_uses_float(schema, expr)
         }
     }
 }
