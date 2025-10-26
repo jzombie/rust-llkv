@@ -370,6 +370,9 @@ impl NumericKernels {
                 // Collect fields from the base expression
                 Self::collect_fields(base, acc);
             }
+            ScalarExpr::Cast { expr, .. } => {
+                Self::collect_fields(expr, acc);
+            }
         }
     }
 
@@ -419,6 +422,16 @@ impl NumericKernels {
             ScalarExpr::GetField { .. } => Err(Error::Internal(
                 "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
+            ScalarExpr::Cast { expr, data_type } => {
+                let value = Self::evaluate_value(expr, idx, arrays)?;
+                let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "unsupported cast target type {:?}",
+                        data_type
+                    ))
+                })?;
+                Self::cast_numeric_value_to_kind(value, target_kind)
+            }
         }
     }
 
@@ -505,6 +518,26 @@ impl NumericKernels {
             ScalarExpr::GetField { .. } => Err(Error::Internal(
                 "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
+            ScalarExpr::Cast { expr, data_type } => {
+                let inner_kind = Self::infer_result_kind(expr, arrays);
+                let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays, inner_kind)?;
+                let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "unsupported cast target type {:?}",
+                        data_type
+                    ))
+                })?;
+
+                match inner_vec {
+                    Some(VectorizedExpr::Scalar(value)) => Ok(Some(VectorizedExpr::Scalar(
+                        Self::cast_numeric_value_to_kind(value, target_kind)?,
+                    ))),
+                    Some(VectorizedExpr::Array(array)) => Ok(Some(VectorizedExpr::Array(
+                        Self::cast_numeric_array_to_kind(&array, target_kind)?,
+                    ))),
+                    None => Ok(None),
+                }
+            }
         }
     }
 
@@ -661,9 +694,6 @@ impl NumericKernels {
                         if Self::literal_is_one(&right_s) {
                             return left_s;
                         }
-                        if Self::literal_is_zero(&left_s) || Self::literal_is_zero(&right_s) {
-                            return ScalarExpr::literal(0);
-                        }
                     }
                     BinaryOp::Divide => {
                         if Self::literal_is_one(&right_s) {
@@ -674,6 +704,10 @@ impl NumericKernels {
                 }
 
                 ScalarExpr::binary(left_s, *op, right_s)
+            }
+            ScalarExpr::Cast { expr, data_type } => {
+                let inner = Self::simplify(expr);
+                ScalarExpr::cast(inner, data_type.clone())
             }
         }
     }
@@ -725,6 +759,7 @@ impl NumericKernels {
                     BinaryOp::Modulo => None,
                 }
             }
+            ScalarExpr::Cast { expr, .. } => Self::affine_state(expr),
         }
     }
 
@@ -886,6 +921,62 @@ impl NumericKernels {
         }
     }
 
+    fn cast_numeric_value_to_kind(
+        value: Option<NumericValue>,
+        target: NumericKind,
+    ) -> LlkvResult<Option<NumericValue>> {
+        match value {
+            None => Ok(None),
+            Some(NumericValue::Integer(v)) => Ok(Some(match target {
+                NumericKind::Integer => NumericValue::Integer(v),
+                NumericKind::Float => NumericValue::Float(v as f64),
+            })),
+            Some(NumericValue::Float(v)) => {
+                if !v.is_finite() {
+                    return Err(Error::InvalidArgumentError(
+                        "cannot cast non-finite float value".into(),
+                    ));
+                }
+                match target {
+                    NumericKind::Float => Ok(Some(NumericValue::Float(v))),
+                    NumericKind::Integer => {
+                        let truncated = v.trunc();
+                        if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+                            return Err(Error::InvalidArgumentError(
+                                "float out of range for INT64 cast".into(),
+                            ));
+                        }
+                        Ok(Some(NumericValue::Integer(truncated as i64)))
+                    }
+                }
+            }
+        }
+    }
+
+    fn cast_numeric_array_to_kind(
+        array: &NumericArray,
+        target: NumericKind,
+    ) -> LlkvResult<NumericArray> {
+        match target {
+            NumericKind::Float => Ok(array.promote_to_float()),
+            NumericKind::Integer => {
+                if array.kind() == NumericKind::Integer {
+                    Ok(array.clone())
+                } else {
+                    let mut values = Vec::with_capacity(array.len());
+                    for idx in 0..array.len() {
+                        let value = array.value(idx);
+                        values.push(Self::cast_numeric_value_to_kind(value, target)?);
+                    }
+                    Ok(NumericArray::from_numeric_values(
+                        values,
+                        NumericKind::Integer,
+                    ))
+                }
+            }
+        }
+    }
+
     fn infer_result_kind(expr: &ScalarExpr<FieldId>, arrays: &NumericArrayMap) -> NumericKind {
         match expr {
             ScalarExpr::Literal(lit) => match lit {
@@ -907,6 +998,10 @@ impl NumericKernels {
             }
             ScalarExpr::Aggregate(_) => NumericKind::Float,
             ScalarExpr::GetField { .. } => NumericKind::Float,
+            ScalarExpr::Cast { expr, data_type } => {
+                let target_kind = Self::kind_for_data_type(data_type);
+                target_kind.unwrap_or_else(|| Self::infer_result_kind(expr, arrays))
+            }
         }
     }
 
@@ -928,6 +1023,10 @@ impl NumericKernels {
             }
             ScalarExpr::Aggregate(_) => Some(NumericKind::Float),
             ScalarExpr::GetField { .. } => None,
+            ScalarExpr::Cast { expr, data_type } => {
+                let target_kind = Self::kind_for_data_type(data_type);
+                target_kind.or_else(|| Self::infer_result_kind_from_types(expr, resolve_kind))
+            }
         }
     }
 

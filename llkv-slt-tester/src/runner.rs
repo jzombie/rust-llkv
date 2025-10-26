@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use crate::RuntimeKind;
-use crate::engine::HarnessFactory;
+use crate::engine::{HarnessFactory, clear_expected_column_types, set_expected_column_types};
 use crate::parser::{
     expand_loops_with_mapping, filter_conditional_blocks, map_temp_error_message,
     normalize_inline_connections,
 };
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
-use sqllogictest::{AsyncDB, DefaultColumnType, Runner};
+use sqllogictest::{AsyncDB, DefaultColumnType, QueryExpect, Runner};
 
 /// Path where the last failed SLT test content is persisted for debugging.
 ///
@@ -25,6 +25,23 @@ const LAST_FAILED_SLT_PATH: &str = "target/last_failed_slt.tmp";
 /// - Tests marked `onlyif mysql/postgresql/etc` will be excluded
 /// - Tests marked `skipif mysql/postgresql/etc` will be included
 const SLT_ENGINE_COMPAT: &[&str] = &["sqlite", "duckdb"];
+
+/// Scope guard that installs expected column types before executing a query and
+/// clears thread-local state even if execution exits early.
+struct ColumnTypeExpectationGuard;
+
+impl ColumnTypeExpectationGuard {
+    fn install(types: Vec<DefaultColumnType>) -> Self {
+        set_expected_column_types(types);
+        Self
+    }
+}
+
+impl Drop for ColumnTypeExpectationGuard {
+    fn drop(&mut self) {
+        clear_expected_column_types();
+    }
+}
 
 /// Generate a clickable file link for VS Code terminal.
 ///
@@ -146,8 +163,37 @@ where
 
     runner.with_hash_threshold(256);
 
-    if let Err(e) = runner.run_file_async(&tmp).await {
-        let (mapped, opt_orig_line) =
+    let records = sqllogictest::parse_file(&tmp).map_err(|e| {
+        Error::Internal(format!(
+            "failed to parse normalized slt file {}: {}",
+            tmp.display(),
+            e
+        ))
+    })?;
+
+    let run_result = async {
+        for record in records {
+            let type_hint = match &record {
+                sqllogictest::Record::Query { expected, .. } => match expected {
+                    QueryExpect::Results { types, .. } if !types.is_empty() => Some(types.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let _type_guard = type_hint.map(ColumnTypeExpectationGuard::install);
+
+            if matches!(&record, sqllogictest::Record::Halt { .. }) {
+                break;
+            }
+
+            runner.run_async(record).await?;
+        }
+        Ok::<(), sqllogictest::TestError>(())
+    }
+    .await;
+
+    if let Err(e) = run_result {
+        let (mapped, opt_line_info) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, origin);
 
         if flattening_resolves_mismatch(&mapped) {
@@ -173,21 +219,19 @@ where
         };
         drop(named);
 
-        if let Some(line_num) = opt_orig_line {
-            // Print the line from the normalized/processed content with context
-            if let Some(line) = normalized_lines.get(line_num.saturating_sub(1)) {
+        if let Some((orig_line, normalized_line)) = opt_line_info {
+            if let Some(line) = normalized_lines.get(normalized_line.saturating_sub(1)) {
                 eprintln!(
-                    "[llkv-slt] Error at line {} in normalized content: {}",
-                    line_num,
+                    "[llkv-slt] Normalized line {}: {}",
+                    normalized_line,
                     line.trim()
                 );
             }
 
-            // Also try to show the original line if available
-            if let Some(line) = text.lines().nth(line_num.saturating_sub(1)) {
+            if let Some(line) = text.lines().nth(orig_line.saturating_sub(1)) {
                 eprintln!(
                     "[llkv-slt] Original source line {}: {}",
-                    line_num,
+                    orig_line,
                     line.trim()
                 );
             }
@@ -195,10 +239,10 @@ where
 
         if let Some(path) = &persisted {
             eprintln!("[llkv-slt] Normalized SLT saved to: {}", path);
-            if let Some(line_num) = opt_orig_line {
+            if let Some((_, normalized_line)) = opt_line_info {
                 eprintln!(
                     "[llkv-slt] View context: head -n {} '{}' | tail -20",
-                    line_num.saturating_add(10),
+                    normalized_line.saturating_add(10),
                     path
                 );
             }
@@ -206,16 +250,16 @@ where
 
         // Build enhanced error message showing both remote URL and local debug file
         let enhanced_msg = if let Some(debug_path) = persisted {
-            if let Some(line_num) = opt_orig_line {
-                let vscode_link = make_vscode_file_link(&debug_path, Some(line_num));
+            if let Some((orig_line, normalized_line)) = opt_line_info {
+                let vscode_link = make_vscode_file_link(&debug_path, Some(normalized_line));
                 let shell_path = make_shell_escaped_path(&debug_path);
                 format!(
                     "slt runner failed: {}\n  at: {}:{}\n  debug: {}:{}\n  vscode: {}",
                     mapped,
                     origin.display(),
-                    line_num,
+                    orig_line,
                     shell_path,
-                    line_num,
+                    normalized_line,
                     vscode_link
                 )
             } else {

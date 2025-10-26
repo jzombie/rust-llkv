@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub use crate::literal::*;
+use arrow::datatypes::DataType;
 use std::ops::Bound;
 
 /// Logical expression over predicates.
@@ -73,6 +74,11 @@ pub enum ScalarExpr<F> {
         base: Box<ScalarExpr<F>>,
         field_name: String,
     },
+    /// Explicit type cast to an Arrow data type.
+    Cast {
+        expr: Box<ScalarExpr<F>>,
+        data_type: DataType,
+    },
 }
 
 /// Aggregate function call within a scalar expression
@@ -116,6 +122,14 @@ impl<F> ScalarExpr<F> {
         Self::GetField {
             base: Box::new(base),
             field_name,
+        }
+    }
+
+    #[inline]
+    pub fn cast(expr: Self, data_type: DataType) -> Self {
+        Self::Cast {
+            expr: Box::new(expr),
+            data_type,
         }
     }
 }

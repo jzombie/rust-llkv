@@ -12,6 +12,7 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch,
     StringArray, UInt64Array, new_null_array,
 };
+use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +48,9 @@ use simd_r_drive_entry_handle::EntryHandle;
 use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
-use crate::scalar_eval::{NumericArray, NumericArrayMap, NumericKernels, NumericKind};
+use crate::scalar_eval::{
+    NumericArray, NumericArrayMap, NumericKernels, NumericKind, NumericValue,
+};
 use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
@@ -1135,6 +1138,7 @@ where
                                     .collect::<LlkvResult<Vec<_>>>()?;
                                 DataType::Struct(struct_fields.into())
                             }
+                            ScalarExpr::Cast { data_type, .. } => data_type.clone(),
                             ScalarExpr::Binary { .. } => {
                                 let mut resolver = |fid: FieldId| {
                                     let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
@@ -1973,6 +1977,39 @@ where
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let mut result: Vec<RowId> = Vec::with_capacity(row_ids.len());
+        self.for_each_compare_row(
+            row_ids,
+            fields,
+            left,
+            right,
+            |row_id, left_val, right_val| {
+                if let (Some(lv), Some(rv)) = (left_val, right_val)
+                    && NumericKernels::compare(op, lv, rv)
+                {
+                    result.push(row_id);
+                }
+            },
+        )?;
+
+        Ok(result)
+    }
+
+    fn for_each_compare_row<F>(
+        &self,
+        row_ids: &[RowId],
+        fields: &[FieldId],
+        left: &ScalarExpr<FieldId>,
+        right: &ScalarExpr<FieldId>,
+        mut on_row: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RowId, Option<NumericValue>, Option<NumericValue>),
+    {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+
         let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
         let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
 
@@ -2026,8 +2063,6 @@ where
         let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
         let unique_index_arc = Arc::new(unique_index);
 
-        let mut result: Vec<RowId> = Vec::with_capacity(row_ids.len());
-
         let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
             if window.is_empty() {
                 return Ok(());
@@ -2052,11 +2087,7 @@ where
             for (offset, &row_id) in window.iter().enumerate() {
                 let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
                 let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
-                if let (Some(lv), Some(rv)) = (left_val, right_val)
-                    && NumericKernels::compare(op, lv, rv)
-                {
-                    result.push(row_id);
-                }
+                on_row(row_id, left_val, right_val);
             }
 
             Ok(())
@@ -2069,7 +2100,7 @@ where
                 process_chunk(&row_ids[start..end], &[])?;
                 start = end;
             }
-            return Ok(result);
+            return Ok(());
         }
 
         let mut row_stream = RowStreamBuilder::new(
@@ -2094,7 +2125,7 @@ where
             process_chunk(window, batch.columns())?;
         }
 
-        Ok(result)
+        Ok(())
     }
 
     fn collect_row_ids_for_program(
@@ -2281,6 +2312,7 @@ where
         Ok(acc)
     }
 
+    // TODO: Should this be moved to llkv-executor?
     fn evaluate_domain_program(
         &self,
         programs: &ProgramSet<'_>,
@@ -2350,6 +2382,29 @@ where
                     }
                     stack.push(acc);
                 }
+                DomainOp::Intersect { child_count } => {
+                    if *child_count == 0 {
+                        stack.push(Vec::new());
+                        continue;
+                    }
+                    let mut acc = stack
+                        .pop()
+                        .ok_or_else(|| Error::Internal("domain INTERSECT underflow".into()))?;
+                    for _ in 1..*child_count {
+                        let next = stack
+                            .pop()
+                            .ok_or_else(|| Error::Internal("domain INTERSECT underflow".into()))?;
+                        if acc.is_empty() {
+                            continue;
+                        }
+                        if next.is_empty() {
+                            acc.clear();
+                            continue;
+                        }
+                        acc = intersect_sorted(acc, next);
+                    }
+                    stack.push(acc);
+                }
             }
         }
 
@@ -2370,10 +2425,6 @@ where
         fields: &[FieldId],
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
     ) -> LlkvResult<Vec<RowId>> {
-        if Self::expr_is_null_literal(left) || Self::expr_is_null_literal(right) {
-            return Ok(Vec::new());
-        }
-
         if fields.is_empty() {
             if Self::evaluate_constant_compare(left, op, right)? {
                 return self.collect_all_row_ids(all_rows_cache);
@@ -2381,8 +2432,12 @@ where
             return Ok(Vec::new());
         }
 
+        let mut ordered_fields: Vec<FieldId> = fields.to_vec();
+        ordered_fields.sort_unstable();
+        ordered_fields.dedup();
+
         let mut domain: Option<Vec<RowId>> = None;
-        for &fid in fields {
+        for &fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
             domain = Some(match domain {
                 Some(existing) => intersect_sorted(existing, rows),
@@ -2395,7 +2450,25 @@ where
             }
         }
 
-        Ok(domain.unwrap_or_default())
+        let candidate_rows = domain.unwrap_or_default();
+        if candidate_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut usable_rows: Vec<RowId> = Vec::new();
+        self.for_each_compare_row(
+            &candidate_rows,
+            &ordered_fields,
+            left,
+            right,
+            |row_id, left_val, right_val| {
+                if left_val.is_some() && right_val.is_some() {
+                    usable_rows.push(row_id);
+                }
+            },
+        )?;
+
+        Ok(usable_rows)
     }
 
     fn collect_in_list_domain_rows(
@@ -2438,10 +2511,6 @@ where
         let (_, determined) =
             self.evaluate_in_list_over_rows(&candidate_rows, &ordered_fields, expr, list, negated)?;
         Ok(determined)
-    }
-
-    fn expr_is_null_literal(expr: &ScalarExpr<FieldId>) -> bool {
-        matches!(expr, ScalarExpr::Literal(llkv_expr::literal::Literal::Null))
     }
 
     fn sort_row_ids_with_order(
@@ -2867,6 +2936,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Binary { .. } => true,
         ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
+        ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
     }
 }
 
@@ -2900,6 +2970,13 @@ fn computed_expr_prefers_float(
                 NumericKernels::kind_for_data_type(&dtype),
                 Some(NumericKind::Float)
             ))
+        }
+        ScalarExpr::Cast { expr, data_type } => {
+            if let Some(kind) = NumericKernels::kind_for_data_type(data_type) {
+                Ok(matches!(kind, NumericKind::Float))
+            } else {
+                computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)
+            }
         }
     }
 }
@@ -3058,6 +3135,24 @@ fn synthesize_computed_literal_array(
             .map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
 
             Ok(Arc::new(struct_array) as ArrayRef)
+        }
+        ScalarExpr::Cast {
+            expr,
+            data_type: target_type,
+        } => {
+            let inner_dtype = match expr.as_ref() {
+                ScalarExpr::Literal(lit) => infer_literal_datatype(lit)?,
+                ScalarExpr::Cast { data_type, .. } => data_type.clone(),
+                _ => return Ok(new_null_array(data_type, row_count)),
+            };
+
+            let inner_info = ComputedProjectionInfo {
+                expr: expr.as_ref().clone(),
+                alias: info.alias.clone(),
+            };
+            let inner = synthesize_computed_literal_array(&inner_info, &inner_dtype, row_count)?;
+            compute::cast(&inner, target_type)
+                .map_err(|e| Error::InvalidArgumentError(format!("failed to cast literal: {e}")))
         }
         ScalarExpr::Column(_)
         | ScalarExpr::Binary { .. }
@@ -3257,6 +3352,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 traverse_stack.push(right);
             }
             GetField { base, .. } => traverse_stack.push(base),
+            Cast { expr, .. } => traverse_stack.push(expr),
             Column(_) | Literal(_) | Aggregate(_) => {}
         }
     }
@@ -3270,6 +3366,10 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             GetField { field_name, .. } => {
                 let base = result_stack.pop().unwrap_or_default();
                 result_stack.push(format!("{base}.{field_name}"));
+            }
+            Cast { data_type, .. } => {
+                let value = result_stack.pop().unwrap_or_default();
+                result_stack.push(format!("CAST({value} AS {data_type:?})"));
             }
             Binary { op, .. } => {
                 let right = result_stack.pop().unwrap_or_default();
@@ -3974,6 +4074,13 @@ where
                         out_schema.field(idx).data_type(),
                         batch_len,
                     )?,
+                    ScalarExpr::Cast { .. } if !computed_expr_requires_numeric(&info.expr) => {
+                        synthesize_computed_literal_array(
+                            info,
+                            out_schema.field(idx).data_type(),
+                            batch_len,
+                        )?
+                    }
                     ScalarExpr::GetField { base, field_name } => {
                         fn eval_get_field(
                             expr: &ScalarExpr<FieldId>,
