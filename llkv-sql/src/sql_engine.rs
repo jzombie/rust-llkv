@@ -3194,6 +3194,7 @@ where
             .from
             .iter()
             .any(|table_with_joins| !table_with_joins.joins.is_empty());
+        let mut join_conditions: Vec<SqlExpr> = Vec::new();
         // Handle different FROM clause scenarios
         let catalog = self.engine.context().table_catalog();
         let (mut plan, id_context) = if select.from.is_empty() {
@@ -3229,7 +3230,8 @@ where
             (p, single_table_context)
         } else {
             // Multiple tables or explicit joins - treat as cross product for now
-            let tables = extract_tables(&select.from)?;
+            let (tables, extracted_filters) = extract_tables(&select.from)?;
+            join_conditions = extracted_filters;
             let mut p = SelectPlan::with_tables(tables);
             // For multi-table queries, we'll build projections differently
             // For now, just handle simple column references
@@ -3242,16 +3244,30 @@ where
             (p, IdentifierContext::new(None))
         };
 
-        let filter_expr = match &select.selection {
-            Some(expr) => {
-                let materialized_expr = self.materialize_in_subquery(expr.clone())?;
-                Some(translate_condition_with_context(
-                    resolver,
-                    id_context.clone(),
-                    &materialized_expr,
-                )?)
-            }
-            None => None,
+        let mut filter_components: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
+
+        if let Some(expr) = &select.selection {
+            let materialized_expr = self.materialize_in_subquery(expr.clone())?;
+            filter_components.push(translate_condition_with_context(
+                resolver,
+                id_context.clone(),
+                &materialized_expr,
+            )?);
+        }
+
+        for join_expr in join_conditions {
+            let materialized_expr = self.materialize_in_subquery(join_expr)?;
+            filter_components.push(translate_condition_with_context(
+                resolver,
+                id_context.clone(),
+                &materialized_expr,
+            )?);
+        }
+
+        let filter_expr = match filter_components.len() {
+            0 => None,
+            1 => filter_components.into_iter().next(),
+            _ => Some(llkv_expr::expr::Expr::And(filter_components)),
         };
         plan = plan.with_filter(filter_expr);
         plan = plan.with_distinct(distinct);
@@ -5623,9 +5639,11 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
     }
 }
 
-/// Extract table references from a FROM clause, flattening supported JOINs.
-fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>> {
+/// Extract table references from a FROM clause, flattening supported JOINs and
+/// collecting any join predicates that must be applied as filters.
+fn extract_tables(from: &[TableWithJoins]) -> SqlResult<(Vec<llkv_plan::TableRef>, Vec<SqlExpr>)> {
     let mut tables = Vec::new();
+    let mut join_filters = Vec::new();
 
     for item in from {
         push_table_factor(&item.relation, &mut tables)?;
@@ -5633,24 +5651,56 @@ fn extract_tables(from: &[TableWithJoins]) -> SqlResult<Vec<llkv_plan::TableRef>
         for join in &item.joins {
             match &join.join_operator {
                 JoinOperator::CrossJoin(JoinConstraint::None)
+                | JoinOperator::Join(JoinConstraint::None)
                 | JoinOperator::Inner(JoinConstraint::None) => {
                     push_table_factor(&join.relation, &mut tables)?;
+                }
+                JoinOperator::Join(JoinConstraint::On(condition))
+                | JoinOperator::Inner(JoinConstraint::On(condition)) => {
+                    push_table_factor(&join.relation, &mut tables)?;
+                    join_filters.push(condition.clone());
                 }
                 JoinOperator::CrossJoin(_) => {
                     return Err(Error::InvalidArgumentError(
                         "CROSS JOIN with constraints is not supported".into(),
                     ));
                 }
-                _ => {
+                JoinOperator::Join(JoinConstraint::Using(_))
+                | JoinOperator::Inner(JoinConstraint::Using(_)) => {
                     return Err(Error::InvalidArgumentError(
-                        "only CROSS JOIN without constraints is supported".into(),
+                        "JOIN ... USING (...) is not supported yet".into(),
                     ));
+                }
+                JoinOperator::Join(JoinConstraint::Natural)
+                | JoinOperator::Inner(JoinConstraint::Natural)
+                | JoinOperator::Left(_)
+                | JoinOperator::LeftOuter(_)
+                | JoinOperator::Right(_)
+                | JoinOperator::RightOuter(_)
+                | JoinOperator::FullOuter(_)
+                | JoinOperator::Semi(_)
+                | JoinOperator::LeftSemi(_)
+                | JoinOperator::LeftAnti(_)
+                | JoinOperator::RightSemi(_)
+                | JoinOperator::RightAnti(_)
+                | JoinOperator::CrossApply
+                | JoinOperator::OuterApply
+                | JoinOperator::Anti(_)
+                | JoinOperator::StraightJoin(_) => {
+                    return Err(Error::InvalidArgumentError(
+                        "only INNER JOIN with optional ON constraints is supported".into(),
+                    ));
+                }
+                other => {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "unsupported JOIN clause: {other:?}"
+                    )));
                 }
             }
         }
     }
 
-    Ok(tables)
+    Ok((tables, join_filters))
 }
 
 fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>) -> SqlResult<()> {
