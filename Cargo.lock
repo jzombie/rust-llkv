@@ -1412,7 +1412,7 @@ checksum = "241eaef5fd12c88705a01fc1066c48c4b36e0dd4377dcdc7ec3942cea7a69956"
 
 [[package]]
 name = "llkv"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-result",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-aggregate"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-column-map"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "arrow-ord",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-csv"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-executor"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-aggregate",
@@ -1493,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-expr"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-join"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "criterion",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-plan"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-expr",
@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-result"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-test-utils",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-runtime"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-slt-tester"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-sql"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-storage"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-result",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-table"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-test-utils"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "ctor",
  "tracing",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "llkv-transaction"
-version = "0.4.5-alpha"
+version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
