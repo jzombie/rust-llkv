@@ -4533,20 +4533,10 @@ fn translate_between_expr(
         BinaryOperator::LtEq
     };
 
-    let lower_bound = translate_comparison_with_context(
-        resolver,
-        context.clone(),
-        between_expr,
-        lower_op,
-        low,
-    )?;
-    let upper_bound = translate_comparison_with_context(
-        resolver,
-        context,
-        between_expr,
-        upper_op,
-        high,
-    )?;
+    let lower_bound =
+        translate_comparison_with_context(resolver, context.clone(), between_expr, lower_op, low)?;
+    let upper_bound =
+        translate_comparison_with_context(resolver, context, between_expr, upper_op, high)?;
 
     if negated {
         Ok(llkv_expr::expr::Expr::Or(vec![lower_bound, upper_bound]))
@@ -5968,27 +5958,21 @@ mod tests {
         use sqlparser::parser::Parser;
 
         let dialect = SQLiteDialect {};
-        let sql =
-            "SELECT DISTINCT - col2 AS col1 FROM tab2 WHERE NOT ( col1 ) BETWEEN ( NULL ) AND ( + col1 - col2 )";
+        let sql = "SELECT DISTINCT - col2 AS col1 FROM tab2 WHERE NOT ( col1 ) BETWEEN ( NULL ) AND ( + col1 - col2 )";
 
         let mut statements = Parser::parse_sql(&dialect, sql).expect("parse sql");
-        let statement = statements
-            .pop()
-            .expect("expected single statement");
+        let statement = statements.pop().expect("expected single statement");
         let Statement::Query(query) = statement else {
             panic!("expected SELECT query");
         };
-        let select = query
-            .body
-            .as_select()
-            .expect("expected SELECT body");
-        let where_expr = select
-            .selection
-            .as_ref()
-            .expect("expected WHERE clause");
+        let select = query.body.as_select().expect("expected SELECT body");
+        let where_expr = select.selection.as_ref().expect("expected WHERE clause");
 
         match where_expr {
-            SqlExprAst::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr } => match expr.as_ref() {
+            SqlExprAst::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Not,
+                expr,
+            } => match expr.as_ref() {
                 SqlExprAst::Between { negated, .. } => {
                     assert!(
                         !negated,

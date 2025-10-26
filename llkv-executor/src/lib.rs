@@ -1909,18 +1909,6 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
     }
 }
 
-// TODO: Move to llkv-table?
-fn table_column_key(name: &str) -> Option<String> {
-    let trimmed = name.trim_start_matches('.');
-    let mut parts = trimmed.split('.').collect::<Vec<_>>();
-    if parts.len() < 2 {
-        return None;
-    }
-    let column = parts.pop()?;
-    let table = parts.pop()?;
-    Some(format!("{}.{}", table, column))
-}
-
 /// Streaming execution handle for SELECT queries.
 #[derive(Clone)]
 pub struct SelectExecution<P>
@@ -2375,7 +2363,11 @@ where
     let mut fields = Vec::with_capacity(table.schema.columns.len());
 
     for column in &table.schema.columns {
-        let qualified_name = format!("{}.{}.{}", table_ref.schema, table_ref.table, column.name);
+        let table_component = table_ref
+            .alias
+            .as_deref()
+            .unwrap_or_else(|| table_ref.table.as_str());
+        let qualified_name = format!("{}.{}.{}", table_ref.schema, table_component, column.name);
         projections.push(ScanProjection::from(StoreProjection::with_alias(
             LogicalFieldId::for_user(table.table.table_id(), column.field_id),
             qualified_name.clone(),
@@ -2432,67 +2424,146 @@ fn build_cross_product_column_lookup(
 ) -> FxHashMap<String, usize> {
     debug_assert_eq!(tables.len(), column_counts.len());
 
+    let mut column_occurrences: FxHashMap<String, usize> = FxHashMap::default();
     let mut table_column_counts: FxHashMap<String, usize> = FxHashMap::default();
     for field in schema.fields() {
-        if let Some(name) = table_column_key(field.name()) {
-            *table_column_counts
-                .entry(name.to_ascii_lowercase())
-                .or_insert(0) += 1;
+        let column_name = extract_column_name(field.name());
+        *column_occurrences.entry(column_name).or_insert(0) += 1;
+        if let Some(pair) = table_column_suffix(field.name()) {
+            *table_column_counts.entry(pair).or_insert(0) += 1;
+        }
+    }
+
+    let mut base_table_totals: FxHashMap<String, usize> = FxHashMap::default();
+    let mut base_table_unaliased: FxHashMap<String, usize> = FxHashMap::default();
+    for table_ref in tables {
+        let key = base_table_key(table_ref);
+        *base_table_totals.entry(key.clone()).or_insert(0) += 1;
+        if table_ref.alias.is_none() {
+            *base_table_unaliased.entry(key).or_insert(0) += 1;
         }
     }
 
     let mut lookup = FxHashMap::default();
 
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let name = field.name();
-        lookup.entry(name.to_ascii_lowercase()).or_insert(idx);
+    if tables.is_empty() || column_counts.is_empty() {
+        for (idx, field) in schema.fields().iter().enumerate() {
+            let field_name_lower = field.name().to_ascii_lowercase();
+            lookup.entry(field_name_lower).or_insert(idx);
 
-        let trimmed = name.trim_start_matches('.');
-        lookup.entry(trimmed.to_ascii_lowercase()).or_insert(idx);
+            let trimmed_lower = field.name().trim_start_matches('.').to_ascii_lowercase();
+            lookup.entry(trimmed_lower).or_insert(idx);
 
-        let mut parts: Vec<&str> = trimmed.split('.').collect();
-        if parts.len() >= 2 {
-            let column_part = parts.pop().unwrap();
-            let column_lower = column_part.to_ascii_lowercase();
-
-            if let Some(table_only) = parts.last() {
-                let table_lower = table_only.to_ascii_lowercase();
-                if table_column_counts
-                    .get(&format!("{}.{}", table_lower, column_lower))
-                    .copied()
-                    .unwrap_or(0)
-                    == 1
-                {
-                    lookup
-                        .entry(format!("{}.{}", table_lower, column_lower.clone()))
-                        .or_insert(idx);
+            if let Some(pair) = table_column_suffix(field.name()) {
+                if table_column_counts.get(&pair).copied().unwrap_or(0) == 1 {
+                    lookup.entry(pair).or_insert(idx);
                 }
             }
+
+            let column_name = extract_column_name(field.name());
+            if column_occurrences.get(&column_name).copied().unwrap_or(0) == 1 {
+                lookup.entry(column_name).or_insert(idx);
+            }
         }
+        return lookup;
     }
 
     let mut offset = 0usize;
     for (table_ref, &count) in tables.iter().zip(column_counts.iter()) {
-        if let Some(alias) = &table_ref.alias {
-            let alias_lower = alias.to_ascii_lowercase();
-            let end = usize::min(schema.fields().len(), offset.saturating_add(count));
-            for column_index in offset..end {
-                let name = schema.field(column_index).name();
-                let trimmed = name.trim_start_matches('.');
-                let column_lower = trimmed
-                    .rsplit('.')
-                    .next()
-                    .map(|part| part.to_ascii_lowercase())
-                    .unwrap_or_else(|| trimmed.to_ascii_lowercase());
-                lookup
-                    .entry(format!("{}.{}", alias_lower, column_lower))
-                    .or_insert(column_index);
+        let alias_lower = table_ref
+            .alias
+            .as_ref()
+            .map(|alias| alias.to_ascii_lowercase());
+        let table_lower = table_ref.table.to_ascii_lowercase();
+        let schema_lower = table_ref.schema.to_ascii_lowercase();
+        let base_key = base_table_key(table_ref);
+        let total_refs = base_table_totals.get(&base_key).copied().unwrap_or(0);
+        let unaliased_refs = base_table_unaliased.get(&base_key).copied().unwrap_or(0);
+
+        let allow_base_mapping = if table_ref.alias.is_none() {
+            unaliased_refs == 1
+        } else {
+            unaliased_refs == 0 && total_refs == 1
+        };
+
+        let mut table_keys: Vec<String> = Vec::new();
+
+        if let Some(alias) = &alias_lower {
+            table_keys.push(alias.clone());
+            if !schema_lower.is_empty() {
+                table_keys.push(format!("{}.{}", schema_lower, alias));
             }
         }
+
+        if allow_base_mapping {
+            table_keys.push(table_lower.clone());
+            if !schema_lower.is_empty() {
+                table_keys.push(format!("{}.{}", schema_lower, table_lower));
+            }
+        }
+
+        for local_idx in 0..count {
+            let field_index = offset + local_idx;
+            let field = schema.field(field_index);
+            let field_name_lower = field.name().to_ascii_lowercase();
+            lookup.entry(field_name_lower).or_insert(field_index);
+
+            let trimmed_lower = field.name().trim_start_matches('.').to_ascii_lowercase();
+            lookup.entry(trimmed_lower).or_insert(field_index);
+
+            let column_name = extract_column_name(field.name());
+            for table_key in &table_keys {
+                lookup
+                    .entry(format!("{}.{}", table_key, column_name))
+                    .or_insert(field_index);
+            }
+
+            if column_occurrences.get(&column_name).copied().unwrap_or(0) == 1 {
+                lookup.entry(column_name.clone()).or_insert(field_index);
+            }
+
+            if table_keys.is_empty() {
+                if let Some(pair) = table_column_suffix(field.name()) {
+                    if table_column_counts.get(&pair).copied().unwrap_or(0) == 1 {
+                        lookup.entry(pair).or_insert(field_index);
+                    }
+                }
+            }
+        }
+
         offset = offset.saturating_add(count);
     }
 
     lookup
+}
+
+fn base_table_key(table_ref: &llkv_plan::TableRef) -> String {
+    let schema_lower = table_ref.schema.to_ascii_lowercase();
+    let table_lower = table_ref.table.to_ascii_lowercase();
+    if schema_lower.is_empty() {
+        table_lower
+    } else {
+        format!("{}.{}", schema_lower, table_lower)
+    }
+}
+
+fn extract_column_name(name: &str) -> String {
+    name.trim_start_matches('.')
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase()
+}
+
+fn table_column_suffix(name: &str) -> Option<String> {
+    let trimmed = name.trim_start_matches('.');
+    let mut parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let column = parts.pop()?.to_ascii_lowercase();
+    let table = parts.pop()?.to_ascii_lowercase();
+    Some(format!("{}.{}", table, column))
 }
 
 fn cross_join_table_batches(
