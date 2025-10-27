@@ -90,6 +90,10 @@ fn infer_computed_data_type(
                 Ok(DataType::Int64)
             }
         }
+        ScalarExpr::ScalarSubquery(_) => {
+            // TODO: Infer type from subquery result
+            Ok(DataType::Utf8)
+        }
     }
 }
 
@@ -178,6 +182,7 @@ fn expression_uses_float(
             }
             Ok(false)
         }
+        ScalarExpr::ScalarSubquery(_) => Ok(false),
     }
 }
 

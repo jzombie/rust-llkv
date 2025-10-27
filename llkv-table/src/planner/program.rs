@@ -538,6 +538,9 @@ fn collect_fields<'expr>(
                     stack.push(inner);
                 }
             }
+            ScalarExpr::ScalarSubquery(_) => {
+                // Scalar subqueries are resolved separately at planning time
+            }
         }
     }
     let mut fields: Vec<FieldId> = seen.into_iter().collect();

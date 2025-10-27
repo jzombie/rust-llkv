@@ -393,6 +393,9 @@ impl NumericKernels {
                     Self::collect_fields(inner, acc);
                 }
             }
+            ScalarExpr::ScalarSubquery(_) => {
+                // Scalar subqueries don't directly reference fields from the outer query
+            }
         }
     }
 
@@ -497,6 +500,11 @@ impl NumericKernels {
                 } else {
                     Ok(None)
                 }
+            }
+            ScalarExpr::ScalarSubquery(_) => {
+                Err(Error::Internal(
+                    "Scalar subquery evaluation requires a separate execution context".into(),
+                ))
             }
         }
     }
@@ -606,6 +614,7 @@ impl NumericKernels {
                 }
             }
             ScalarExpr::Case { .. } => Ok(None),
+            ScalarExpr::ScalarSubquery(_) => Ok(None),
         }
     }
 
@@ -811,6 +820,7 @@ impl NumericKernels {
                 let else_s = else_expr.as_ref().map(|inner| Self::simplify(inner));
                 ScalarExpr::case(operand_s, branch_vec, else_s)
             }
+            ScalarExpr::ScalarSubquery(_) => expr.clone(),
         }
     }
 
@@ -864,6 +874,7 @@ impl NumericKernels {
             ScalarExpr::Compare { .. } => None,
             ScalarExpr::Cast { expr, .. } => Self::affine_state(expr),
             ScalarExpr::Case { .. } => None,
+            ScalarExpr::ScalarSubquery(_) => None,
         }
     }
 
@@ -1131,6 +1142,7 @@ impl NumericKernels {
                 }
                 result_kind
             }
+            ScalarExpr::ScalarSubquery(_) => NumericKind::Float,
         }
     }
 
@@ -1182,6 +1194,7 @@ impl NumericKernels {
                 }
                 Some(result_kind)
             }
+            ScalarExpr::ScalarSubquery(_) => Some(NumericKind::Float),
         }
     }
 

@@ -4188,7 +4188,12 @@ where
                     }
                     _ => {
                         let alias = format!("col{}", idx + 1);
-                        let normalized_expr = self.materialize_in_subquery(expr.clone())?;
+                        // Check if this is a scalar subquery - if so, skip materialization
+                        let normalized_expr = if matches!(expr, SqlExpr::Subquery(_)) {
+                            expr.clone()
+                        } else {
+                            self.materialize_in_subquery(expr.clone())?
+                        };
                         let scalar = translate_scalar_with_context(
                             resolver,
                             id_context.clone(),
@@ -4233,7 +4238,12 @@ where
                         }
                     }
                     _ => {
-                        let normalized_expr = self.materialize_in_subquery(expr.clone())?;
+                        // Check if this is a scalar subquery - if so, skip materialization
+                        let normalized_expr = if matches!(expr, SqlExpr::Subquery(_)) {
+                            expr.clone()
+                        } else {
+                            self.materialize_in_subquery(expr.clone())?
+                        };
                         let scalar = translate_scalar_with_context(
                             resolver,
                             id_context.clone(),
@@ -4882,6 +4892,7 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
                     .unwrap_or(false)
         }
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
+        llkv_expr::expr::ScalarExpr::ScalarSubquery(_) => false,
     }
 }
 
@@ -5997,6 +6008,26 @@ fn translate_scalar_internal(
                     work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::literal(
                         Literal::Struct(struct_fields),
                     )));
+                }
+                SqlExpr::Subquery(_) => {
+                    // TODO: Implement full scalar subquery support
+                    // 
+                    // Scalar subqueries in SELECT lists require:
+                    // 1. Building the subquery plan with correlated column tracking (like EXISTS)
+                    // 2. Creating ScalarSubquery metadata and adding to SelectPlan.scalar_subqueries
+                    // 3. Generating a ScalarExpr::ScalarSubquery with the subquery ID
+                    // 4. Executor evaluation: row-by-row subquery execution with binding
+                    //
+                    // This follows the same pattern as FilterSubquery for EXISTS predicates,
+                    // but returns a single value instead of a boolean.
+                    //
+                    // Implementation requires:
+                    // - Threading scalar_subqueries accumulator through build_projection_list
+                    // - Accessing self (SqlEngine) context to call build_select_plan_internal
+                    // - Modifying CrossProductExpressionContext to support scalar subquery evaluation
+                    return Err(Error::InvalidArgumentError(
+                        "Correlated scalar subqueries not yet fully implemented - requires plan-level support".to_string(),
+                    ));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(

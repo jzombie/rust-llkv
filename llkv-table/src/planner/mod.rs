@@ -1191,6 +1191,12 @@ where
                                 self.table.table_id(),
                                 &lfid_dtypes,
                             )?,
+                            ScalarExpr::ScalarSubquery(_) => {
+                                // Scalar subqueries will be resolved at execution time
+                                // For now, assume they can be null and return a generic type
+                                // TODO: Infer type from subquery plan
+                                DataType::Utf8
+                            }
                         };
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     }
@@ -2942,6 +2948,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
         ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
         ScalarExpr::Case { .. } => true,
+        ScalarExpr::ScalarSubquery(_) => false,
     }
 }
 
@@ -3008,9 +3015,9 @@ fn computed_expr_prefers_float(
             }
             Ok(false)
         }
+        ScalarExpr::ScalarSubquery(_) => Ok(false),
     }
 }
-
 fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
     match literal {
         Literal::Float(_) => Ok(true),
@@ -3190,6 +3197,7 @@ fn synthesize_computed_literal_array(
         | ScalarExpr::Aggregate(_)
         | ScalarExpr::GetField { .. }
         | ScalarExpr::Case { .. } => Ok(new_null_array(data_type, row_count)),
+        ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
     }
 }
 
@@ -3409,6 +3417,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 }
             }
             Column(_) | Literal(_) | Aggregate(_) => {}
+            ScalarExpr::ScalarSubquery(_) => {}
         }
     }
 
@@ -3473,6 +3482,9 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 }
                 parts.push("END".to_string());
                 result_stack.push(parts.join(" "));
+            }
+            ScalarExpr::ScalarSubquery(sub) => {
+                result_stack.push(format!("(SCALAR_SUBQUERY#{})", sub.id.0));
             }
         }
     }

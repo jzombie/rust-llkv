@@ -176,6 +176,7 @@ where
                         .unwrap_or(false)
             }
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
+            ScalarExpr::ScalarSubquery(_) => false,
         }
     }
 
@@ -1222,6 +1223,7 @@ where
                 }
             }
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
+            ScalarExpr::ScalarSubquery(_) => {}
         }
     }
 
@@ -1491,6 +1493,9 @@ where
             )),
             ScalarExpr::Case { .. } => Err(Error::InvalidArgumentError(
                 "CASE not supported in aggregate-only expressions".into(),
+            )),
+            ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
+                "Scalar subqueries not supported in aggregate-only expressions".into(),
             )),
         }
     }
@@ -2250,6 +2255,9 @@ impl CrossProductExpressionContext {
                 Ok(casted)
             }
             ScalarExpr::Case { .. } => self.evaluate_numeric(expr, batch),
+            ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
+                "scalar subqueries are not supported in cross product filters".into(),
+            )),
         }
     }
 
@@ -2306,6 +2314,7 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             }
         }
         ScalarExpr::Literal(_) => {}
+        ScalarExpr::ScalarSubquery(_) => {}
     }
 }
 
@@ -2366,6 +2375,7 @@ fn bind_select_plan(
         aggregates,
         order_by: Vec::new(),
         distinct: plan.distinct,
+        scalar_subqueries: Vec::new(), // TODO: Support binding scalar subqueries
     })
 }
 
@@ -2517,6 +2527,7 @@ fn bind_scalar_expr(
                 else_expr: bound_else,
             })
         }
+        ScalarExpr::ScalarSubquery(sub) => Ok(ScalarExpr::ScalarSubquery(sub.clone())),
     }
 }
 

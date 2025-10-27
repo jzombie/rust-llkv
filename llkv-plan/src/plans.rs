@@ -39,6 +39,17 @@ pub struct FilterSubquery {
     pub correlated_columns: Vec<CorrelatedColumn>,
 }
 
+/// Correlated subquery invoked from within a scalar projection expression.
+#[derive(Clone, Debug)]
+pub struct ScalarSubquery {
+    /// Identifier referenced by [`llkv_expr::expr::ScalarExpr::ScalarSubquery`].
+    pub id: SubqueryId,
+    /// Logical plan for the subquery.
+    pub plan: Box<SelectPlan>,
+    /// Mappings for correlated column placeholders to real outer columns.
+    pub correlated_columns: Vec<CorrelatedColumn>,
+}
+
 /// Description of a correlated column captured by an EXISTS predicate.
 #[derive(Clone, Debug)]
 pub struct CorrelatedColumn {
@@ -616,6 +627,7 @@ pub struct SelectPlan {
     pub tables: Vec<TableRef>,
     pub projections: Vec<SelectProjection>,
     pub filter: Option<SelectFilter>,
+    pub scalar_subqueries: Vec<ScalarSubquery>,
     pub aggregates: Vec<AggregateExpr>,
     pub order_by: Vec<OrderByPlan>,
     pub distinct: bool,
@@ -642,6 +654,7 @@ impl SelectPlan {
             tables,
             projections: Vec::new(),
             filter: None,
+            scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
@@ -654,6 +667,7 @@ impl SelectPlan {
             tables,
             projections: Vec::new(),
             filter: None,
+            scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
@@ -667,6 +681,11 @@ impl SelectPlan {
 
     pub fn with_filter(mut self, filter: Option<SelectFilter>) -> Self {
         self.filter = filter;
+        self
+    }
+
+    pub fn with_scalar_subqueries(mut self, scalar_subqueries: Vec<ScalarSubquery>) -> Self {
+        self.scalar_subqueries = scalar_subqueries;
         self
     }
 

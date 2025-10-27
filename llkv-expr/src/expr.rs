@@ -48,6 +48,13 @@ pub struct SubqueryExpr {
     pub negated: bool,
 }
 
+/// Scalar subquery evaluated as part of a scalar expression.
+#[derive(Clone, Debug)]
+pub struct ScalarSubqueryExpr {
+    /// Identifier referencing the subquery definition attached to the parent projection.
+    pub id: SubqueryId,
+}
+
 impl<'a, F> Expr<'a, F> {
     /// Build an AND of filters.
     #[inline]
@@ -100,6 +107,8 @@ pub enum ScalarExpr<F> {
         op: CompareOp,
         right: Box<ScalarExpr<F>>,
     },
+    /// Scalar subquery evaluated per input row.
+    ScalarSubquery(ScalarSubqueryExpr),
     /// SQL CASE expression with optional operand and ELSE branch.
     Case {
         /// Optional operand for simple CASE (e.g., `CASE x WHEN ...`).
@@ -170,6 +179,11 @@ impl<F> ScalarExpr<F> {
             op,
             right: Box::new(right),
         }
+    }
+
+    #[inline]
+    pub fn scalar_subquery(id: SubqueryId) -> Self {
+        Self::ScalarSubquery(ScalarSubqueryExpr { id })
     }
 
     #[inline]
