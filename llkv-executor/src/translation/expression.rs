@@ -127,6 +127,9 @@ where
                 LlkvExpr::Literal(value) => {
                     owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Literal(value)));
                 }
+                LlkvExpr::Exists(subquery) => {
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Exists(subquery)));
+                }
             },
             OwnedFrame::Leaf(translated) => {
                 result_stack.push(translated);

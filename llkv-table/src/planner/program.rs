@@ -361,6 +361,11 @@ fn compile_eval<'expr>(
                     let id = domains.ensure(inner);
                     ops.push(EvalOp::Not { domain: id });
                 }
+                Expr::Exists(_) => {
+                    return Err(Error::InvalidArgumentError(
+                        "EXISTS predicates are not supported in storage evaluation".into(),
+                    ));
+                }
             },
             EvalVisit::EmitFused { key, field_id } => {
                 let filters = fused
@@ -471,6 +476,9 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                 }
                 Expr::Not(_) => {
                     // Domain equals child domain; no-op.
+                }
+                Expr::Exists(_) => {
+                    panic!("EXISTS predicates should not reach storage domain evaluation stage");
                 }
             },
         }

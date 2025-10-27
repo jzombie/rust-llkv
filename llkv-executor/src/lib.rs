@@ -334,18 +334,26 @@ where
             &column_counts,
         );
 
-        if let Some(filter_expr) = &plan.filter {
+        if let Some(filter_wrapper) = &plan.filter {
+            if !filter_wrapper.subqueries.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "EXISTS subqueries not yet implemented in cross-product queries".into(),
+                ));
+            }
             let mut filter_context = CrossProductExpressionContext::new(
                 combined_schema.as_ref(),
                 column_lookup_map.clone(),
             )?;
-            let translated_filter =
-                translate_predicate(filter_expr.clone(), filter_context.schema(), |name| {
+            let translated_filter = translate_predicate(
+                filter_wrapper.predicate.clone(),
+                filter_context.schema(),
+                |name| {
                     Error::InvalidArgumentError(format!(
                         "column '{}' not found in cross product result",
                         name
                     ))
-                })?;
+                },
+            )?;
 
             let mut filtered_batches = Vec::with_capacity(combined_batches.len());
             for batch in combined_batches.into_iter() {
@@ -489,15 +497,29 @@ where
         };
         let schema = schema_for_projections(table_ref, &projections)?;
 
-        let (filter_expr, full_table_scan) = match plan.filter {
-            Some(expr) => (
-                crate::translation::expression::translate_predicate(
-                    expr,
-                    table_ref.schema.as_ref(),
-                    |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
-                )?,
-                false,
-            ),
+        let (filter_expr, full_table_scan) = match &plan.filter {
+            Some(filter_wrapper) => {
+                // TODO: Implement EXISTS subquery evaluation
+                // For correlated subqueries, we need to:
+                // 1. For each row, bind correlated column values
+                // 2. Execute the subquery
+                // 3. Check if any rows were returned
+                // 4. Evaluate the EXISTS predicate as true/false
+                // This requires executing nested SelectPlans within the filter evaluation loop
+                if !filter_wrapper.subqueries.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "EXISTS subqueries not yet implemented - requires nested query execution engine".into(),
+                    ));
+                }
+                (
+                    crate::translation::expression::translate_predicate(
+                        filter_wrapper.predicate.clone(),
+                        table_ref.schema.as_ref(),
+                        |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+                    )?,
+                    false,
+                )
+            }
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
@@ -667,12 +689,19 @@ where
         }
 
         let had_filter = plan.filter.is_some();
-        let filter_expr = match plan.filter {
-            Some(expr) => crate::translation::expression::translate_predicate(
-                expr,
-                table.schema.as_ref(),
-                |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
-            )?,
+        let filter_expr = match &plan.filter {
+            Some(filter_wrapper) => {
+                if !filter_wrapper.subqueries.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "EXISTS subqueries not yet implemented in aggregate queries".into(),
+                    ));
+                }
+                crate::translation::expression::translate_predicate(
+                    filter_wrapper.predicate.clone(),
+                    table.schema.as_ref(),
+                    |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+                )?
+            }
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
@@ -856,9 +885,22 @@ where
         }
 
         // Compute the aggregates using the existing aggregate execution infrastructure
+        let filter_predicate = plan
+            .filter
+            .as_ref()
+            .map(|wrapper| {
+                if !wrapper.subqueries.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "EXISTS subqueries not yet implemented with aggregates".into(),
+                    ));
+                }
+                Ok(wrapper.predicate.clone())
+            })
+            .transpose()?;
+
         let computed_aggregates = self.compute_aggregate_values(
             table.clone(),
-            &plan.filter,
+            &filter_predicate,
             &aggregate_specs,
             row_filter.clone(),
         )?;
@@ -1598,6 +1640,13 @@ impl CrossProductExpressionContext {
                 list,
                 negated,
             } => self.evaluate_in_list_truths(target, list, *negated, batch),
+            LlkvExpr::Exists(_subquery_expr) => {
+                // EXISTS evaluation should happen before we reach per-row predicate evaluation.
+                // If we hit this, it means EXISTS wasn't properly handled during query setup.
+                Err(Error::Internal(
+                    "Unresolved EXISTS in predicate - this is a bug".into(),
+                ))
+            }
         }
     }
 

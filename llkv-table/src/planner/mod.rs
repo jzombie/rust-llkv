@@ -543,6 +543,7 @@ impl PredicateFusionCache {
                 Expr::Compare { .. } => {}
                 Expr::InList { .. } => {}
                 Expr::Literal(_) => {}
+                Expr::Exists(_) => {}
             }
         }
     }
@@ -3230,7 +3231,7 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
                 }
             }
             Not(inner) => traverse_stack.push(inner),
-            Pred(_) | Compare { .. } | InList { .. } | Literal(_) => {}
+            Pred(_) | Compare { .. } | InList { .. } | Literal(_) | Exists(_) => {}
         }
     }
 
@@ -3295,6 +3296,9 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
                 } else {
                     "FALSE".to_string()
                 });
+            }
+            Exists(_) => {
+                result_stack.push("EXISTS(...)".to_string());
             }
         }
     }

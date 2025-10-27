@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use llkv_executor::{ExecutorRowBatch, SelectExecution};
 use llkv_expr::expr::Expr as LlkvExpr;
-use llkv_plan::{AggregateExpr, PlanValue, SelectPlan, SelectProjection};
+use llkv_plan::{AggregateExpr, PlanValue, SelectFilter, SelectPlan, SelectProjection};
 use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -32,7 +32,10 @@ where
     }
 
     pub fn filter(mut self, predicate: LlkvExpr<'static, String>) -> Self {
-        self.plan.filter = Some(predicate);
+        self.plan.filter = Some(SelectFilter {
+            predicate,
+            subqueries: Vec::new(),
+        });
         self
     }
 

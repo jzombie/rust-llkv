@@ -55,6 +55,104 @@ use sqlparser::tokenizer::Span;
 /// still preventing stack overflows.
 const PARSER_RECURSION_LIMIT: usize = 200;
 
+const CORRELATED_PLACEHOLDER_PREFIX: &str = "__llkv_outer$";
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct OuterColumnKey {
+    column: String,
+    field_path: Vec<String>,
+}
+
+impl OuterColumnKey {
+    fn from_resolution(resolution: &llkv_table::catalog::ColumnResolution) -> Self {
+        Self {
+            column: resolution.column().to_ascii_lowercase(),
+            field_path: resolution
+                .field_path()
+                .iter()
+                .map(|segment| segment.to_ascii_lowercase())
+                .collect(),
+        }
+    }
+}
+
+struct CorrelatedColumnTracker {
+    placeholders: std::collections::HashMap<OuterColumnKey, usize>,
+    columns: Vec<llkv_plan::CorrelatedColumn>,
+}
+
+impl CorrelatedColumnTracker {
+    fn new() -> Self {
+        Self {
+            placeholders: std::collections::HashMap::new(),
+            columns: Vec::new(),
+        }
+    }
+
+    fn placeholder_for_resolution(
+        &mut self,
+        resolution: &llkv_table::catalog::ColumnResolution,
+    ) -> String {
+        use std::collections::hash_map::Entry;
+        let key = OuterColumnKey::from_resolution(resolution);
+        match self.placeholders.entry(key) {
+            Entry::Occupied(existing) => correlated_placeholder(*existing.get()),
+            Entry::Vacant(slot) => {
+                let index = self.columns.len();
+                let placeholder = correlated_placeholder(index);
+                self.columns.push(llkv_plan::CorrelatedColumn {
+                    placeholder: placeholder.clone(),
+                    column: resolution.column().to_string(),
+                    field_path: resolution.field_path().to_vec(),
+                });
+                slot.insert(index);
+                placeholder
+            }
+        }
+    }
+
+    fn into_columns(self) -> Vec<llkv_plan::CorrelatedColumn> {
+        self.columns
+    }
+}
+
+fn correlated_placeholder(index: usize) -> String {
+    format!("{CORRELATED_PLACEHOLDER_PREFIX}{index}")
+}
+
+enum CorrelatedTracker<'a> {
+    Active(&'a mut CorrelatedColumnTracker),
+    Inactive,
+}
+
+impl<'a> CorrelatedTracker<'a> {
+    fn from_option(tracker: Option<&'a mut CorrelatedColumnTracker>) -> Self {
+        match tracker {
+            Some(inner) => CorrelatedTracker::Active(inner),
+            None => CorrelatedTracker::Inactive,
+        }
+    }
+
+    fn placeholder_for_resolution(
+        &mut self,
+        resolution: &llkv_table::catalog::ColumnResolution,
+    ) -> Option<String> {
+        match self {
+            CorrelatedTracker::Active(tracker) => {
+                Some(tracker.placeholder_for_resolution(resolution))
+            }
+            CorrelatedTracker::Inactive => None,
+        }
+    }
+
+    fn reborrow(&mut self) -> CorrelatedTracker<'_> {
+        match self {
+            CorrelatedTracker::Active(tracker) => CorrelatedTracker::Active(&mut **tracker),
+            CorrelatedTracker::Inactive => CorrelatedTracker::Inactive,
+        }
+    }
+}
+
 /// SQL execution engine built on top of the LLKV runtime.
 ///
 /// # Examples
@@ -2369,11 +2467,23 @@ where
         let filter = match selection {
             Some(expr) => {
                 let materialized_expr = self.materialize_in_subquery(expr)?;
-                Some(translate_condition_with_context(
+                let mut subqueries = Vec::new();
+                let predicate = translate_condition_with_context(
+                    self,
                     &resolver,
                     IdentifierContext::new(table_id),
                     &materialized_expr,
-                )?)
+                    &[],
+                    &mut subqueries,
+                    None,
+                )?;
+                if subqueries.is_empty() {
+                    Some(predicate)
+                } else {
+                    return Err(Error::InvalidArgumentError(
+                        "EXISTS subqueries are not supported in UPDATE WHERE clauses".into(),
+                    ));
+                }
             }
             None => None,
         };
@@ -2446,16 +2556,27 @@ where
         let resolver = catalog.identifier_resolver();
         let table_id = catalog.table_id(&canonical_name);
 
-        let filter = selection
-            .map(|expr| {
-                let materialized_expr = self.materialize_in_subquery(expr)?;
-                translate_condition_with_context(
-                    &resolver,
-                    IdentifierContext::new(table_id),
-                    &materialized_expr,
-                )
-            })
-            .transpose()?;
+        let filter = if let Some(expr) = selection {
+            let materialized_expr = self.materialize_in_subquery(expr)?;
+            let mut subqueries = Vec::new();
+            let predicate = translate_condition_with_context(
+                self,
+                &resolver,
+                IdentifierContext::new(table_id),
+                &materialized_expr,
+                &[],
+                &mut subqueries,
+                None,
+            )?;
+            if !subqueries.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "EXISTS subqueries are not supported in DELETE WHERE clauses".into(),
+                ));
+            }
+            Some(predicate)
+        } else {
+            None
+        };
 
         let plan = DeletePlan {
             table: display_name.clone(),
@@ -3438,10 +3559,74 @@ where
         Ok(select_plan)
     }
 
+    /// Internal version of build_select_plan that supports correlated subqueries.
+    ///
+    /// # Parameters
+    /// - `query`: The SQL query to translate
+    /// - `resolver`: Identifier resolver for column lookups
+    /// - `outer_scopes`: Stack of outer query contexts for correlated column resolution
+    /// - `subqueries`: Accumulator for EXISTS subqueries encountered during translation
+    /// - `correlated_tracker`: Optional tracker for recording correlated column references
+    fn build_select_plan_internal(
+        &self,
+        query: Query,
+        resolver: &IdentifierResolver<'_>,
+        outer_scopes: &[IdentifierContext],
+        subqueries: &mut Vec<llkv_plan::FilterSubquery>,
+        correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    ) -> SqlResult<SelectPlan> {
+        if self.engine.session().has_active_transaction() && self.engine.session().is_aborted() {
+            return Err(Error::TransactionContextError(
+                "TransactionContext Error: transaction is aborted".into(),
+            ));
+        }
+
+        validate_simple_query(&query)?;
+
+        let (mut select_plan, select_context) = match query.body.as_ref() {
+            SetExpr::Select(select) => {
+                self.translate_select_internal(select.as_ref(), resolver, outer_scopes, subqueries, correlated_tracker)?
+            }
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unsupported query expression: {other:?}"
+                )));
+            }
+        };
+        if let Some(order_by) = &query.order_by {
+            if !select_plan.aggregates.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "ORDER BY is not supported for aggregate queries".into(),
+                ));
+            }
+            let order_plan = self.translate_order_by(resolver, select_context, order_by)?;
+            select_plan = select_plan.with_order_by(order_plan);
+        }
+        Ok(select_plan)
+    }
+
     fn translate_select(
         &self,
         select: &Select,
         resolver: &IdentifierResolver<'_>,
+    ) -> SqlResult<(SelectPlan, IdentifierContext)> {
+        let mut subqueries = Vec::new();
+        let result = self.translate_select_internal(select, resolver, &[], &mut subqueries, None)?;
+        if !subqueries.is_empty() {
+            return Err(Error::Internal(
+                "translate_select: unexpected subqueries from non-correlated translation".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn translate_select_internal(
+        &self,
+        select: &Select,
+        resolver: &IdentifierResolver<'_>,
+        outer_scopes: &[IdentifierContext],
+        subqueries: &mut Vec<llkv_plan::FilterSubquery>,
+        mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
     ) -> SqlResult<(SelectPlan, IdentifierContext)> {
         let distinct = match &select.distinct {
             None => false,
@@ -3563,31 +3748,54 @@ where
         };
 
         let mut filter_components: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
+        let mut all_subqueries = Vec::new();
 
         if let Some(expr) = &select.selection {
             let materialized_expr = self.materialize_in_subquery(expr.clone())?;
             filter_components.push(translate_condition_with_context(
+                self,
                 resolver,
                 id_context.clone(),
                 &materialized_expr,
+                outer_scopes,
+                &mut all_subqueries,
+                correlated_tracker.as_deref_mut(),
             )?);
         }
 
         for join_expr in join_conditions {
             let materialized_expr = self.materialize_in_subquery(join_expr)?;
             filter_components.push(translate_condition_with_context(
+                self,
                 resolver,
                 id_context.clone(),
                 &materialized_expr,
+                outer_scopes,
+                &mut all_subqueries,
+                correlated_tracker.as_deref_mut(),
             )?);
         }
 
-        let filter_expr = match filter_components.len() {
+        subqueries.append(&mut all_subqueries);
+
+        let filter = match filter_components.len() {
             0 => None,
-            1 => filter_components.into_iter().next(),
-            _ => Some(llkv_expr::expr::Expr::And(filter_components)),
+            1 if subqueries.is_empty() => {
+                Some(llkv_plan::SelectFilter {
+                    predicate: filter_components.into_iter().next().unwrap(),
+                    subqueries: Vec::new(),
+                })
+            }
+            1 => Some(llkv_plan::SelectFilter {
+                predicate: filter_components.into_iter().next().unwrap(),
+                subqueries: std::mem::take(subqueries),
+            }),
+            _ => Some(llkv_plan::SelectFilter {
+                predicate: llkv_expr::expr::Expr::And(filter_components),
+                subqueries: std::mem::take(subqueries),
+            }),
         };
-        plan = plan.with_filter(filter_expr);
+        plan = plan.with_filter(filter);
         plan = plan.with_distinct(distinct);
         Ok((plan, id_context))
     }
@@ -4908,11 +5116,18 @@ fn translate_between_expr(
     }
 }
 
-fn translate_condition_with_context(
+fn translate_condition_with_context<P>(
+    engine: &SqlEngine<P>,
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     expr: &SqlExpr,
-) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+    outer_scopes: &[IdentifierContext],
+    subqueries: &mut Vec<llkv_plan::FilterSubquery>,
+    correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::TransformFrame documentation for pattern details.
     //
@@ -5101,6 +5316,38 @@ fn translate_condition_with_context(
                         *negated,
                     )?;
                     work_stack.push(ConditionFrame::Leaf(between_expr_result));
+                }
+                SqlExpr::Exists { subquery, negated } => {
+                    // Build nested select plan for the subquery
+                    let mut nested_scopes = outer_scopes.to_vec();
+                    nested_scopes.push(context.clone());
+
+                    let mut tracker = CorrelatedColumnTracker::new();
+                    let mut nested_subqueries = Vec::new();
+
+                    // Translate the subquery in an extended scope
+                    let subquery_plan = engine.build_select_plan_internal(
+                        (**subquery).clone(),
+                        resolver,
+                        &nested_scopes,
+                        &mut nested_subqueries,
+                        Some(&mut tracker),
+                    )?;
+
+                    let subquery_id = llkv_expr::SubqueryId(subqueries.len() as u32);
+                    let filter_subquery = llkv_plan::FilterSubquery {
+                        id: subquery_id,
+                        plan: Box::new(subquery_plan),
+                        correlated_columns: tracker.into_columns(),
+                    };
+                    subqueries.push(filter_subquery);
+
+                    work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Exists(
+                        llkv_expr::SubqueryExpr {
+                            id: subquery_id,
+                            negated: *negated,
+                        },
+                    )));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(

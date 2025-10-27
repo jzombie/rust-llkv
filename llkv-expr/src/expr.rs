@@ -31,6 +31,21 @@ pub enum Expr<'a, F> {
     /// A literal boolean value (true/false).
     /// Used for conditions that are always true or always false (e.g., empty IN lists).
     Literal(bool),
+    /// Correlated subquery evaluated in a boolean context.
+    Exists(SubqueryExpr),
+}
+
+/// Metadata describing a correlated subquery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct SubqueryId(pub u32);
+
+/// Correlated subquery used within a predicate expression.
+#[derive(Clone, Debug)]
+pub struct SubqueryExpr {
+    /// Identifier referencing the subquery definition attached to the parent filter.
+    pub id: SubqueryId,
+    /// True when the SQL contained `NOT EXISTS`.
+    pub negated: bool,
 }
 
 impl<'a, F> Expr<'a, F> {
