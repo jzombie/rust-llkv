@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod canonical;
+pub mod correlation;
 pub mod conversion;
 pub mod plan_graph;
 pub mod plans;
@@ -20,6 +21,10 @@ pub mod traversal;
 pub mod validation;
 
 pub use canonical::{CanonicalRow, CanonicalScalar};
+pub use correlation::{
+    CorrelatedColumnTracker, CorrelatedTracker, CORRELATED_PLACEHOLDER_PREFIX,
+    correlated_placeholder,
+};
 pub use conversion::{
     RangeSelectRows, extract_rows_from_range, plan_value_from_sql_expr, plan_value_from_sql_value,
 };

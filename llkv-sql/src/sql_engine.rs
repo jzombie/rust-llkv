@@ -13,7 +13,7 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
-use llkv_plan::TransformFrame;
+use llkv_plan::{CorrelatedColumnTracker, CorrelatedTracker, TransformFrame};
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
 };
@@ -56,108 +56,6 @@ use sqlparser::tokenizer::Span;
 /// still preventing stack overflows.
 const PARSER_RECURSION_LIMIT: usize = 200;
 
-const CORRELATED_PLACEHOLDER_PREFIX: &str = "__llkv_outer$";
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct OuterColumnKey {
-    column: String,
-    field_path: Vec<String>,
-}
-
-impl OuterColumnKey {
-    fn from_resolution(resolution: &llkv_table::catalog::ColumnResolution) -> Self {
-        Self {
-            column: resolution.column().to_ascii_lowercase(),
-            field_path: resolution
-                .field_path()
-                .iter()
-                .map(|segment| segment.to_ascii_lowercase())
-                .collect(),
-        }
-    }
-}
-
-struct CorrelatedColumnTracker {
-    placeholders: std::collections::HashMap<OuterColumnKey, usize>,
-    columns: Vec<llkv_plan::CorrelatedColumn>,
-}
-
-impl CorrelatedColumnTracker {
-    fn new() -> Self {
-        Self {
-            placeholders: std::collections::HashMap::new(),
-            columns: Vec::new(),
-        }
-    }
-
-    fn placeholder_for_resolution(
-        &mut self,
-        resolution: &llkv_table::catalog::ColumnResolution,
-    ) -> String {
-        use std::collections::hash_map::Entry;
-        let key = OuterColumnKey::from_resolution(resolution);
-        match self.placeholders.entry(key) {
-            Entry::Occupied(existing) => correlated_placeholder(*existing.get()),
-            Entry::Vacant(slot) => {
-                let index = self.columns.len();
-                let placeholder = correlated_placeholder(index);
-                self.columns.push(llkv_plan::CorrelatedColumn {
-                    placeholder: placeholder.clone(),
-                    column: resolution.column().to_string(),
-                    field_path: resolution.field_path().to_vec(),
-                });
-                slot.insert(index);
-                placeholder
-            }
-        }
-    }
-
-    fn into_columns(self) -> Vec<llkv_plan::CorrelatedColumn> {
-        self.columns
-    }
-}
-
-fn correlated_placeholder(index: usize) -> String {
-    format!("{CORRELATED_PLACEHOLDER_PREFIX}{index}")
-}
-
-enum CorrelatedTracker<'a> {
-    Active(&'a mut CorrelatedColumnTracker),
-    Inactive,
-}
-
-impl<'a> CorrelatedTracker<'a> {
-    fn from_option(tracker: Option<&'a mut CorrelatedColumnTracker>) -> Self {
-        match tracker {
-            Some(inner) => CorrelatedTracker::Active(inner),
-            None => CorrelatedTracker::Inactive,
-        }
-    }
-
-    fn placeholder_for_resolution(
-        &mut self,
-        resolution: &llkv_table::catalog::ColumnResolution,
-    ) -> Option<String> {
-        match self {
-            CorrelatedTracker::Active(tracker) => {
-                Some(tracker.placeholder_for_resolution(resolution))
-            }
-            CorrelatedTracker::Inactive => None,
-        }
-    }
-
-    fn reborrow(&mut self) -> CorrelatedTracker<'_> {
-        match self {
-            CorrelatedTracker::Active(tracker) => CorrelatedTracker::Active(&mut **tracker),
-            CorrelatedTracker::Inactive => CorrelatedTracker::Inactive,
-        }
-    }
-
-    fn is_active(&self) -> bool {
-        matches!(self, CorrelatedTracker::Active(_))
-    }
-}
-
 trait ScalarSubqueryResolver {
     fn handle_scalar_subquery(
         &mut self,
@@ -166,6 +64,22 @@ trait ScalarSubqueryResolver {
         context: &IdentifierContext,
         outer_scopes: &[IdentifierContext],
     ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>>;
+}
+
+trait CorrelatedTrackerExt {
+    fn placeholder_for_resolution(
+        &mut self,
+        resolution: &llkv_table::catalog::ColumnResolution,
+    ) -> Option<String>;
+}
+
+impl CorrelatedTrackerExt for CorrelatedTracker<'_> {
+    fn placeholder_for_resolution(
+        &mut self,
+        resolution: &llkv_table::catalog::ColumnResolution,
+    ) -> Option<String> {
+        self.placeholder_for_column_path(resolution.column(), resolution.field_path())
+    }
 }
 
 /// SQL execution engine built on top of the LLKV runtime.
