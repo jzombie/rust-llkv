@@ -179,6 +179,27 @@ where
         }
     }
 
+    fn evaluate_exists_subquery(
+        &self,
+        context: &mut CrossProductExpressionContext,
+        subquery: &llkv_plan::FilterSubquery,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> ExecutorResult<bool> {
+        let bindings =
+            collect_correlated_bindings(context, batch, row_idx, &subquery.correlated_columns)?;
+        let bound_plan = bind_select_plan(&subquery.plan, &bindings)?;
+        let execution = self.execute_select(bound_plan)?;
+        let mut found = false;
+        execution.stream(|inner_batch| {
+            if inner_batch.num_rows() > 0 {
+                found = true;
+            }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
     /// Execute a SELECT without a FROM clause (e.g., SELECT 42, SELECT {'a': 1})
     fn execute_select_without_table(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
         use arrow::array::ArrayRef;
@@ -335,11 +356,6 @@ where
         );
 
         if let Some(filter_wrapper) = &plan.filter {
-            if !filter_wrapper.subqueries.is_empty() {
-                return Err(Error::InvalidArgumentError(
-                    "EXISTS subqueries not yet implemented in cross-product queries".into(),
-                ));
-            }
             let mut filter_context = CrossProductExpressionContext::new(
                 combined_schema.as_ref(),
                 column_lookup_map.clone(),
@@ -355,10 +371,33 @@ where
                 },
             )?;
 
+            let subquery_lookup: FxHashMap<llkv_expr::SubqueryId, &llkv_plan::FilterSubquery> =
+                filter_wrapper
+                    .subqueries
+                    .iter()
+                    .map(|subquery| (subquery.id, subquery))
+                    .collect();
+
             let mut filtered_batches = Vec::with_capacity(combined_batches.len());
             for batch in combined_batches.into_iter() {
                 filter_context.reset();
-                let mask = filter_context.evaluate_predicate_mask(&translated_filter, &batch)?;
+                let mask = filter_context.evaluate_predicate_mask(
+                    &translated_filter,
+                    &batch,
+                    |ctx, subquery_expr, row_idx, current_batch| {
+                        let subquery = subquery_lookup.get(&subquery_expr.id).ok_or_else(|| {
+                            Error::Internal("missing correlated subquery metadata".into())
+                        })?;
+                        let exists =
+                            self.evaluate_exists_subquery(ctx, subquery, current_batch, row_idx)?;
+                        let value = if subquery_expr.negated {
+                            !exists
+                        } else {
+                            exists
+                        };
+                        Ok(Some(value))
+                    },
+                )?;
                 let filtered = filter_record_batch(&batch, &mask).map_err(|err| {
                     Error::InvalidArgumentError(format!(
                         "failed to apply cross product filter: {err}"
@@ -489,6 +528,19 @@ where
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        if plan
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.subqueries.is_empty())
+        {
+            return self.execute_projection_with_subqueries(
+                table,
+                display_name,
+                plan,
+                row_filter,
+            );
+        }
+
         let table_ref = table.as_ref();
         let projections = if plan.projections.is_empty() {
             build_wildcard_projections(table_ref)
@@ -498,28 +550,14 @@ where
         let schema = schema_for_projections(table_ref, &projections)?;
 
         let (filter_expr, full_table_scan) = match &plan.filter {
-            Some(filter_wrapper) => {
-                // TODO: Implement EXISTS subquery evaluation
-                // For correlated subqueries, we need to:
-                // 1. For each row, bind correlated column values
-                // 2. Execute the subquery
-                // 3. Check if any rows were returned
-                // 4. Evaluate the EXISTS predicate as true/false
-                // This requires executing nested SelectPlans within the filter evaluation loop
-                if !filter_wrapper.subqueries.is_empty() {
-                    return Err(Error::InvalidArgumentError(
-                        "EXISTS subqueries not yet implemented - requires nested query execution engine".into(),
-                    ));
-                }
-                (
-                    crate::translation::expression::translate_predicate(
-                        filter_wrapper.predicate.clone(),
-                        table_ref.schema.as_ref(),
-                        |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
-                    )?,
-                    false,
-                )
-            }
+            Some(filter_wrapper) => (
+                crate::translation::expression::translate_predicate(
+                    filter_wrapper.predicate.clone(),
+                    table_ref.schema.as_ref(),
+                    |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+                )?,
+                false,
+            ),
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
@@ -590,6 +628,181 @@ where
             full_table_scan,
             expanded_order,
             plan.distinct,
+        ))
+    }
+
+    fn execute_projection_with_subqueries(
+        &self,
+        table: Arc<ExecutorTable<P>>,
+        display_name: String,
+        plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        let table_ref = table.as_ref();
+
+        let (output_scan_projections, effective_projections): (Vec<ScanProjection>, Vec<SelectProjection>) =
+            if plan.projections.is_empty() {
+                (
+                    build_wildcard_projections(table_ref),
+                    vec![SelectProjection::AllColumns],
+                )
+            } else {
+                (
+                    build_projected_columns(table_ref, &plan.projections)?,
+                    plan.projections.clone(),
+                )
+            };
+
+        let base_projections = build_wildcard_projections(table_ref);
+
+        let filter_wrapper = plan
+            .filter
+            .as_ref()
+            .expect("subquery projection path requires a filter");
+        let translated_filter = crate::translation::expression::translate_predicate(
+            filter_wrapper.predicate.clone(),
+            table_ref.schema.as_ref(),
+            |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+        )?;
+        let pushdown_filter = strip_exists(&translated_filter);
+
+        let mut base_fields: Vec<Field> = Vec::with_capacity(table_ref.schema.columns.len());
+        for column in &table_ref.schema.columns {
+            base_fields.push(Field::new(
+                column.name.clone(),
+                column.data_type.clone(),
+                column.nullable,
+            ));
+        }
+        let base_schema = Arc::new(Schema::new(base_fields));
+        let base_lookup = build_cross_product_column_lookup(
+            base_schema.as_ref(),
+            &plan.tables,
+            &[base_schema.fields().len()],
+        );
+
+        let mut filter_context =
+            CrossProductExpressionContext::new(base_schema.as_ref(), base_lookup.clone())?;
+
+        let options = ScanStreamOptions {
+            include_nulls: true,
+            order: None,
+            row_id_filter: row_filter.clone(),
+        };
+
+        let subquery_lookup: FxHashMap<llkv_expr::SubqueryId, &llkv_plan::FilterSubquery> =
+            filter_wrapper
+                .subqueries
+                .iter()
+                .map(|subquery| (subquery.id, subquery))
+                .collect();
+
+        let mut projected_batches: Vec<RecordBatch> = Vec::new();
+        let mut scan_error: Option<Error> = None;
+
+        table.table.scan_stream(
+            base_projections.clone(),
+            &pushdown_filter,
+            options,
+            |batch| {
+                if scan_error.is_some() {
+                    return;
+                }
+                filter_context.reset();
+                let mask = match filter_context.evaluate_predicate_mask(
+                    &translated_filter,
+                    &batch,
+                    |ctx, subquery_expr, row_idx, current_batch| {
+                        let subquery = subquery_lookup.get(&subquery_expr.id).ok_or_else(|| {
+                            Error::Internal("missing correlated subquery metadata".into())
+                        })?;
+                        let exists = self.evaluate_exists_subquery(
+                            ctx,
+                            subquery,
+                            current_batch,
+                            row_idx,
+                        )?;
+                        let value = if subquery_expr.negated { !exists } else { exists };
+                        Ok(Some(value))
+                    },
+                ) {
+                    Ok(mask) => mask,
+                    Err(err) => {
+                        scan_error = Some(err);
+                        return;
+                    }
+                };
+                let filtered = match filter_record_batch(&batch, &mask) {
+                    Ok(filtered) => filtered,
+                    Err(err) => {
+                        scan_error = Some(Error::InvalidArgumentError(format!(
+                            "failed to apply EXISTS filter: {err}"
+                        )));
+                        return;
+                    }
+                };
+                if filtered.num_rows() == 0 {
+                    return;
+                }
+                let projected = match project_record_batch(
+                    &filtered,
+                    &effective_projections,
+                    &base_lookup,
+                ) {
+                    Ok(batch) => batch,
+                    Err(err) => {
+                        scan_error = Some(Error::InvalidArgumentError(format!(
+                            "failed to evaluate projections: {err}"
+                        )));
+                        return;
+                    }
+                };
+                projected_batches.push(projected);
+            },
+        )?;
+
+        if let Some(err) = scan_error {
+            return Err(err);
+        }
+
+        let mut result_batch = if projected_batches.is_empty() {
+            let empty_batch = RecordBatch::new_empty(Arc::clone(&base_schema));
+            project_record_batch(&empty_batch, &effective_projections, &base_lookup)?
+        } else if projected_batches.len() == 1 {
+            projected_batches.pop().unwrap()
+        } else {
+            let schema = projected_batches[0].schema();
+            concat_batches(&schema, &projected_batches).map_err(|err| {
+                Error::Internal(format!("failed to combine filtered batches: {err}"))
+            })?
+        };
+
+        if plan.distinct && result_batch.num_rows() > 0 {
+            let mut state = DistinctState::default();
+            let schema = result_batch.schema();
+            result_batch = match distinct_filter_batch(result_batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(schema),
+            };
+        }
+
+        if !plan.order_by.is_empty() && result_batch.num_rows() > 0 {
+            let expanded_order = expand_order_targets(&plan.order_by, &output_scan_projections)?;
+            if !expanded_order.is_empty() {
+                result_batch = sort_record_batch_with_order(
+                    &result_batch.schema(),
+                    &result_batch,
+                    &expanded_order,
+                )?;
+            }
+        }
+
+        let schema = result_batch.schema();
+
+        Ok(SelectExecution::new_single_batch(
+            display_name,
+            schema,
+            result_batch,
         ))
     }
 
@@ -1362,6 +1575,19 @@ impl ColumnAccessor {
         }
     }
 
+    fn literal_at(&self, idx: usize) -> ExecutorResult<Literal> {
+        if self.is_null(idx) {
+            return Ok(Literal::Null);
+        }
+        match self {
+            ColumnAccessor::Int64(array) => Ok(Literal::Integer(array.value(idx) as i128)),
+            ColumnAccessor::Float64(array) => Ok(Literal::Float(array.value(idx))),
+            ColumnAccessor::Boolean(array) => Ok(Literal::Boolean(array.value(idx))),
+            ColumnAccessor::Utf8(array) => Ok(Literal::String(array.value(idx).to_string())),
+            ColumnAccessor::Null(_) => Ok(Literal::Null),
+        }
+    }
+
     fn as_array_ref(&self) -> ArrayRef {
         match self {
             ColumnAccessor::Int64(array) => Arc::clone(array) as ArrayRef,
@@ -1558,6 +1784,12 @@ impl CrossProductExpressionContext {
         self.schema.as_ref()
     }
 
+    fn field_id_for_column(&self, name: &str) -> Option<FieldId> {
+        self.schema
+            .resolve(name)
+            .map(|column| column.field_id)
+    }
+
     fn reset(&mut self) {
         self.numeric_cache.clear();
         self.column_cache.clear();
@@ -1582,8 +1814,14 @@ impl CrossProductExpressionContext {
         &mut self,
         expr: &LlkvExpr<'static, FieldId>,
         batch: &RecordBatch,
+        mut exists_eval: impl FnMut(
+            &mut Self,
+            &llkv_expr::SubqueryExpr,
+            usize,
+            &RecordBatch,
+        ) -> ExecutorResult<Option<bool>>,
     ) -> ExecutorResult<BooleanArray> {
-        let truths = self.evaluate_predicate_truths(expr, batch)?;
+        let truths = self.evaluate_predicate_truths(expr, batch, &mut exists_eval)?;
         let mut builder = BooleanBuilder::with_capacity(truths.len());
         for value in truths {
             builder.append_value(value.unwrap_or(false));
@@ -1595,6 +1833,12 @@ impl CrossProductExpressionContext {
         &mut self,
         expr: &LlkvExpr<'static, FieldId>,
         batch: &RecordBatch,
+        exists_eval: &mut impl FnMut(
+            &mut Self,
+            &llkv_expr::SubqueryExpr,
+            usize,
+            &RecordBatch,
+        ) -> ExecutorResult<Option<bool>>,
     ) -> ExecutorResult<Vec<Option<bool>>> {
         match expr {
             LlkvExpr::Literal(value) => Ok(vec![Some(*value); batch.num_rows()]),
@@ -1602,9 +1846,10 @@ impl CrossProductExpressionContext {
                 if children.is_empty() {
                     return Ok(vec![Some(true); batch.num_rows()]);
                 }
-                let mut result = self.evaluate_predicate_truths(&children[0], batch)?;
+                let mut result =
+                    self.evaluate_predicate_truths(&children[0], batch, exists_eval)?;
                 for child in &children[1..] {
-                    let next = self.evaluate_predicate_truths(child, batch)?;
+                    let next = self.evaluate_predicate_truths(child, batch, exists_eval)?;
                     for (lhs, rhs) in result.iter_mut().zip(next.into_iter()) {
                         *lhs = truth_and(*lhs, rhs);
                     }
@@ -1615,9 +1860,10 @@ impl CrossProductExpressionContext {
                 if children.is_empty() {
                     return Ok(vec![Some(false); batch.num_rows()]);
                 }
-                let mut result = self.evaluate_predicate_truths(&children[0], batch)?;
+                let mut result =
+                    self.evaluate_predicate_truths(&children[0], batch, exists_eval)?;
                 for child in &children[1..] {
-                    let next = self.evaluate_predicate_truths(child, batch)?;
+                    let next = self.evaluate_predicate_truths(child, batch, exists_eval)?;
                     for (lhs, rhs) in result.iter_mut().zip(next.into_iter()) {
                         *lhs = truth_or(*lhs, rhs);
                     }
@@ -1625,7 +1871,7 @@ impl CrossProductExpressionContext {
                 Ok(result)
             }
             LlkvExpr::Not(inner) => {
-                let mut values = self.evaluate_predicate_truths(inner, batch)?;
+                let mut values = self.evaluate_predicate_truths(inner, batch, exists_eval)?;
                 for value in &mut values {
                     *value = truth_not(*value);
                 }
@@ -1640,12 +1886,13 @@ impl CrossProductExpressionContext {
                 list,
                 negated,
             } => self.evaluate_in_list_truths(target, list, *negated, batch),
-            LlkvExpr::Exists(_subquery_expr) => {
-                // EXISTS evaluation should happen before we reach per-row predicate evaluation.
-                // If we hit this, it means EXISTS wasn't properly handled during query setup.
-                Err(Error::Internal(
-                    "Unresolved EXISTS in predicate - this is a bug".into(),
-                ))
+            LlkvExpr::Exists(subquery_expr) => {
+                let mut values = Vec::with_capacity(batch.num_rows());
+                for row_idx in 0..batch.num_rows() {
+                    let value = exists_eval(self, subquery_expr, row_idx, batch)?;
+                    values.push(value);
+                }
+                Ok(values)
             }
         }
     }
@@ -2060,6 +2307,530 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
         }
         ScalarExpr::Literal(_) => {}
     }
+}
+
+fn strip_exists(expr: &LlkvExpr<'static, FieldId>) -> LlkvExpr<'static, FieldId> {
+    match expr {
+        LlkvExpr::And(children) => LlkvExpr::And(children.iter().map(strip_exists).collect()),
+        LlkvExpr::Or(children) => LlkvExpr::Or(children.iter().map(strip_exists).collect()),
+        LlkvExpr::Not(inner) => LlkvExpr::Not(Box::new(strip_exists(inner))),
+        LlkvExpr::Pred(filter) => LlkvExpr::Pred(filter.clone()),
+        LlkvExpr::Compare { left, op, right } => LlkvExpr::Compare {
+            left: left.clone(),
+            op: *op,
+            right: right.clone(),
+        },
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => LlkvExpr::InList {
+            expr: expr.clone(),
+            list: list.clone(),
+            negated: *negated,
+        },
+        LlkvExpr::Literal(value) => LlkvExpr::Literal(*value),
+        LlkvExpr::Exists(_) => LlkvExpr::Literal(true),
+    }
+}
+
+fn bind_select_plan(
+    plan: &SelectPlan,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<SelectPlan> {
+    if bindings.is_empty() {
+        return Ok(plan.clone());
+    }
+
+    let projections = plan
+        .projections
+        .iter()
+        .map(|projection| bind_projection(projection, bindings))
+        .collect::<ExecutorResult<Vec<_>>>()?;
+
+    let filter = match &plan.filter {
+        Some(wrapper) => Some(bind_select_filter(wrapper, bindings)?),
+        None => None,
+    };
+
+    let aggregates = plan
+        .aggregates
+        .iter()
+        .map(|aggregate| bind_aggregate_expr(aggregate, bindings))
+        .collect::<ExecutorResult<Vec<_>>>()?;
+
+    Ok(SelectPlan {
+        tables: plan.tables.clone(),
+        projections,
+        filter,
+        aggregates,
+        order_by: Vec::new(),
+        distinct: plan.distinct,
+    })
+}
+
+fn bind_select_filter(
+    filter: &llkv_plan::SelectFilter,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<llkv_plan::SelectFilter> {
+    let predicate = bind_predicate_expr(&filter.predicate, bindings)?;
+    let subqueries = filter
+        .subqueries
+        .iter()
+        .map(|subquery| bind_filter_subquery(subquery, bindings))
+        .collect::<ExecutorResult<Vec<_>>>()?;
+
+    Ok(llkv_plan::SelectFilter { predicate, subqueries })
+}
+
+fn bind_filter_subquery(
+    subquery: &llkv_plan::FilterSubquery,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<llkv_plan::FilterSubquery> {
+    let bound_plan = bind_select_plan(&subquery.plan, bindings)?;
+    Ok(llkv_plan::FilterSubquery {
+        id: subquery.id,
+        plan: Box::new(bound_plan),
+        correlated_columns: subquery.correlated_columns.clone(),
+    })
+}
+
+fn bind_projection(
+    projection: &SelectProjection,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<SelectProjection> {
+    match projection {
+        SelectProjection::AllColumns => Ok(projection.clone()),
+        SelectProjection::AllColumnsExcept { exclude } => Ok(SelectProjection::AllColumnsExcept {
+            exclude: exclude.clone(),
+        }),
+        SelectProjection::Column { name, alias } => {
+            if let Some(literal) = bindings.get(name) {
+                let expr = ScalarExpr::Literal(literal.clone());
+                Ok(SelectProjection::Computed {
+                    expr,
+                    alias: alias.clone().unwrap_or_else(|| name.clone()),
+                })
+            } else {
+                Ok(projection.clone())
+            }
+        }
+        SelectProjection::Computed { expr, alias } => Ok(SelectProjection::Computed {
+            expr: bind_scalar_expr(expr, bindings)?,
+            alias: alias.clone(),
+        }),
+    }
+}
+
+fn bind_aggregate_expr(
+    aggregate: &AggregateExpr,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<AggregateExpr> {
+    match aggregate {
+        AggregateExpr::CountStar { .. } => Ok(aggregate.clone()),
+        AggregateExpr::Column {
+            column,
+            alias,
+            function,
+            distinct,
+        } => {
+            if bindings.contains_key(column) {
+                return Err(Error::InvalidArgumentError(
+                    "correlated columns are not supported inside aggregate expressions".into(),
+                ));
+            }
+            Ok(AggregateExpr::Column {
+                column: column.clone(),
+                alias: alias.clone(),
+                function: function.clone(),
+                distinct: *distinct,
+            })
+        }
+    }
+}
+
+fn bind_scalar_expr(
+    expr: &ScalarExpr<String>,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<ScalarExpr<String>> {
+    match expr {
+        ScalarExpr::Column(name) => {
+            if let Some(literal) = bindings.get(name) {
+                Ok(ScalarExpr::Literal(literal.clone()))
+            } else {
+                Ok(ScalarExpr::Column(name.clone()))
+            }
+        }
+        ScalarExpr::Literal(literal) => Ok(ScalarExpr::Literal(literal.clone())),
+        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+            left: Box::new(bind_scalar_expr(left, bindings)?),
+            op: *op,
+            right: Box::new(bind_scalar_expr(right, bindings)?),
+        }),
+        ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+            left: Box::new(bind_scalar_expr(left, bindings)?),
+            op: *op,
+            right: Box::new(bind_scalar_expr(right, bindings)?),
+        }),
+        ScalarExpr::Aggregate(call) => Ok(ScalarExpr::Aggregate(call.clone())),
+        ScalarExpr::GetField { base, field_name } => {
+            let bound_base = bind_scalar_expr(base, bindings)?;
+            match bound_base {
+                ScalarExpr::Literal(literal) => {
+                    let value = extract_struct_field(&literal, field_name)
+                        .unwrap_or(Literal::Null);
+                    Ok(ScalarExpr::Literal(value))
+                }
+                other => Ok(ScalarExpr::GetField {
+                    base: Box::new(other),
+                    field_name: field_name.clone(),
+                }),
+            }
+        }
+        ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+            expr: Box::new(bind_scalar_expr(expr, bindings)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            let bound_operand = match operand {
+                Some(inner) => Some(Box::new(bind_scalar_expr(inner, bindings)?)),
+                None => None,
+            };
+            let mut bound_branches = Vec::with_capacity(branches.len());
+            for (when_expr, then_expr) in branches {
+                bound_branches.push((
+                    bind_scalar_expr(when_expr, bindings)?,
+                    bind_scalar_expr(then_expr, bindings)?,
+                ));
+            }
+            let bound_else = match else_expr {
+                Some(inner) => Some(Box::new(bind_scalar_expr(inner, bindings)?)),
+                None => None,
+            };
+            Ok(ScalarExpr::Case {
+                operand: bound_operand,
+                branches: bound_branches,
+                else_expr: bound_else,
+            })
+        }
+    }
+}
+
+fn bind_predicate_expr(
+    expr: &LlkvExpr<'static, String>,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<LlkvExpr<'static, String>> {
+    match expr {
+        LlkvExpr::And(children) => {
+            let mut bound = Vec::with_capacity(children.len());
+            for child in children {
+                bound.push(bind_predicate_expr(child, bindings)?);
+            }
+            Ok(LlkvExpr::And(bound))
+        }
+        LlkvExpr::Or(children) => {
+            let mut bound = Vec::with_capacity(children.len());
+            for child in children {
+                bound.push(bind_predicate_expr(child, bindings)?);
+            }
+            Ok(LlkvExpr::Or(bound))
+        }
+        LlkvExpr::Not(inner) => Ok(LlkvExpr::Not(Box::new(bind_predicate_expr(
+            inner, bindings,
+        )?))),
+        LlkvExpr::Pred(filter) => bind_filter_predicate(filter, bindings),
+        LlkvExpr::Compare { left, op, right } => Ok(LlkvExpr::Compare {
+            left: bind_scalar_expr(left, bindings)?,
+            op: *op,
+            right: bind_scalar_expr(right, bindings)?,
+        }),
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let target = bind_scalar_expr(expr, bindings)?;
+            let mut bound_list = Vec::with_capacity(list.len());
+            for item in list {
+                bound_list.push(bind_scalar_expr(item, bindings)?);
+            }
+            Ok(LlkvExpr::InList {
+                expr: target,
+                list: bound_list,
+                negated: *negated,
+            })
+        }
+        LlkvExpr::Literal(value) => Ok(LlkvExpr::Literal(*value)),
+        LlkvExpr::Exists(subquery) => Ok(LlkvExpr::Exists(subquery.clone())),
+    }
+}
+
+fn bind_filter_predicate(
+    filter: &Filter<'static, String>,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<LlkvExpr<'static, String>> {
+    if let Some(literal) = bindings.get(&filter.field_id) {
+        let result = evaluate_filter_against_literal(literal, &filter.op)?;
+        return Ok(LlkvExpr::Literal(result));
+    }
+    Ok(LlkvExpr::Pred(filter.clone()))
+}
+
+fn evaluate_filter_against_literal(
+    value: &Literal,
+    op: &Operator,
+) -> ExecutorResult<bool> {
+    use std::ops::Bound;
+
+    match op {
+        Operator::IsNull => Ok(matches!(value, Literal::Null)),
+        Operator::IsNotNull => Ok(!matches!(value, Literal::Null)),
+        Operator::Equals(rhs) => Ok(literal_equals(value, rhs).unwrap_or(false)),
+        Operator::GreaterThan(rhs) => Ok(
+            literal_compare(value, rhs)
+                .map(|cmp| cmp == std::cmp::Ordering::Greater)
+                .unwrap_or(false),
+        ),
+        Operator::GreaterThanOrEquals(rhs) => Ok(
+            literal_compare(value, rhs)
+                .map(|cmp| matches!(cmp, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+                .unwrap_or(false),
+        ),
+        Operator::LessThan(rhs) => Ok(
+            literal_compare(value, rhs)
+                .map(|cmp| cmp == std::cmp::Ordering::Less)
+                .unwrap_or(false),
+        ),
+        Operator::LessThanOrEquals(rhs) => Ok(
+            literal_compare(value, rhs)
+                .map(|cmp| matches!(cmp, std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+                .unwrap_or(false),
+        ),
+        Operator::In(values) => Ok(values
+            .iter()
+            .any(|candidate| literal_equals(value, candidate).unwrap_or(false))),
+        Operator::Range { lower, upper } => {
+            let lower_ok = match lower {
+                Bound::Unbounded => Some(true),
+                Bound::Included(bound) => literal_compare(value, bound)
+                    .map(|cmp| matches!(cmp, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+                Bound::Excluded(bound) => literal_compare(value, bound)
+                    .map(|cmp| cmp == std::cmp::Ordering::Greater),
+            }
+            .unwrap_or(false);
+
+            let upper_ok = match upper {
+                Bound::Unbounded => Some(true),
+                Bound::Included(bound) => literal_compare(value, bound)
+                    .map(|cmp| matches!(cmp, std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+                Bound::Excluded(bound) => literal_compare(value, bound)
+                    .map(|cmp| cmp == std::cmp::Ordering::Less),
+            }
+            .unwrap_or(false);
+
+            Ok(lower_ok && upper_ok)
+        }
+        Operator::StartsWith {
+            pattern,
+            case_sensitive,
+        } => {
+            let target = if *case_sensitive {
+                pattern.to_string()
+            } else {
+                pattern.to_ascii_lowercase()
+            };
+            Ok(literal_string(value, *case_sensitive)
+                .map(|source| source.starts_with(&target))
+                .unwrap_or(false))
+        }
+        Operator::EndsWith {
+            pattern,
+            case_sensitive,
+        } => {
+            let target = if *case_sensitive {
+                pattern.to_string()
+            } else {
+                pattern.to_ascii_lowercase()
+            };
+            Ok(literal_string(value, *case_sensitive)
+                .map(|source| source.ends_with(&target))
+                .unwrap_or(false))
+        }
+        Operator::Contains {
+            pattern,
+            case_sensitive,
+        } => {
+            let target = if *case_sensitive {
+                pattern.to_string()
+            } else {
+                pattern.to_ascii_lowercase()
+            };
+            Ok(literal_string(value, *case_sensitive)
+                .map(|source| source.contains(&target))
+                .unwrap_or(false))
+        }
+    }
+}
+
+fn literal_compare(lhs: &Literal, rhs: &Literal) -> Option<std::cmp::Ordering> {
+    match (lhs, rhs) {
+        (Literal::Integer(a), Literal::Integer(b)) => Some(a.cmp(b)),
+        (Literal::Float(a), Literal::Float(b)) => a.partial_cmp(b),
+        (Literal::Integer(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
+        (Literal::Float(a), Literal::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (Literal::String(a), Literal::String(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
+fn literal_equals(lhs: &Literal, rhs: &Literal) -> Option<bool> {
+    match (lhs, rhs) {
+        (Literal::Boolean(a), Literal::Boolean(b)) => Some(a == b),
+        (Literal::String(a), Literal::String(b)) => Some(a == b),
+        (Literal::Integer(_), Literal::Integer(_))
+        | (Literal::Integer(_), Literal::Float(_))
+        | (Literal::Float(_), Literal::Integer(_))
+        | (Literal::Float(_), Literal::Float(_)) => {
+            literal_compare(lhs, rhs).map(|cmp| cmp == std::cmp::Ordering::Equal)
+        }
+        _ => None,
+    }
+}
+
+fn literal_string<'a>(literal: &'a Literal, case_sensitive: bool) -> Option<String> {
+    match literal {
+        Literal::String(value) => {
+            if case_sensitive {
+                Some(value.clone())
+            } else {
+                Some(value.to_ascii_lowercase())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_struct_field(literal: &Literal, field_name: &str) -> Option<Literal> {
+    if let Literal::Struct(fields) = literal {
+        for (name, value) in fields {
+            if name.eq_ignore_ascii_case(field_name) {
+                return Some((**value).clone());
+            }
+        }
+    }
+    None
+}
+
+fn collect_correlated_bindings(
+    context: &mut CrossProductExpressionContext,
+    batch: &RecordBatch,
+    row_idx: usize,
+    columns: &[llkv_plan::CorrelatedColumn],
+) -> ExecutorResult<FxHashMap<String, Literal>> {
+    let mut out = FxHashMap::default();
+
+    for correlated in columns {
+        if !correlated.field_path.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "correlated field path resolution is not yet supported".into(),
+            ));
+        }
+
+        let field_id = context.field_id_for_column(&correlated.column).ok_or_else(|| {
+            Error::InvalidArgumentError(format!(
+                "correlated column '{}' not found in outer query output",
+                correlated.column
+            ))
+        })?;
+
+        let accessor = context.column_accessor(field_id, batch)?;
+        let literal = accessor.literal_at(row_idx)?;
+        out.insert(correlated.placeholder.clone(), literal);
+    }
+
+    Ok(out)
+}
+
+fn project_record_batch(
+    batch: &RecordBatch,
+    projections: &[SelectProjection],
+    lookup: &FxHashMap<String, usize>,
+) -> ExecutorResult<RecordBatch> {
+    if projections.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    let schema = batch.schema();
+    let mut selected_fields: Vec<Arc<Field>> = Vec::new();
+    let mut selected_columns: Vec<ArrayRef> = Vec::new();
+    let mut expr_context: Option<CrossProductExpressionContext> = None;
+
+    for proj in projections {
+        match proj {
+            SelectProjection::AllColumns => {
+                selected_fields = schema.fields().iter().cloned().collect();
+                selected_columns = batch.columns().to_vec();
+                break;
+            }
+        SelectProjection::AllColumnsExcept { exclude } => {
+            let exclude_lower: FxHashSet<String> =
+                exclude.iter().map(|name| name.to_ascii_lowercase()).collect();
+            for (idx, field) in schema.fields().iter().enumerate() {
+                let column_name = field.name().to_ascii_lowercase();
+                if !exclude_lower.contains(&column_name) {
+                    selected_fields.push(Arc::clone(field));
+                    selected_columns.push(batch.column(idx).clone());
+                }
+            }
+            break;
+        }
+            SelectProjection::Column { name, alias } => {
+                let normalized = name.to_ascii_lowercase();
+                let column_index = lookup.get(&normalized).ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' not found in projection",
+                        name
+                    ))
+                })?;
+                let field = schema.field(*column_index);
+                let output_field = Arc::new(Field::new(
+                    alias.as_ref().unwrap_or_else(|| field.name()),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                selected_fields.push(output_field);
+                selected_columns.push(batch.column(*column_index).clone());
+            }
+            SelectProjection::Computed { expr, alias } => {
+                if expr_context.is_none() {
+                    expr_context = Some(CrossProductExpressionContext::new(
+                        schema.as_ref(),
+                        lookup.clone(),
+                    )?);
+                }
+                let context = expr_context
+                    .as_mut()
+                    .expect("projection context must be initialized");
+                context.reset();
+                let evaluated = context.evaluate(expr, batch)?;
+                let field = Arc::new(Field::new(
+                    alias.clone(),
+                    evaluated.data_type().clone(),
+                    true,
+                ));
+                selected_fields.push(field);
+                selected_columns.push(evaluated);
+            }
+        }
+    }
+
+    let projected_schema = Arc::new(Schema::new(selected_fields));
+    RecordBatch::try_new(projected_schema, selected_columns)
+        .map_err(|e| Error::Internal(format!("failed to apply projections: {}", e)))
 }
 
 /// Streaming execution handle for SELECT queries.

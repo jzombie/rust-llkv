@@ -28,7 +28,7 @@ use llkv_runtime::{
 };
 use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;
-use llkv_table::catalog::{IdentifierContext, IdentifierResolver};
+use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -150,6 +150,10 @@ impl<'a> CorrelatedTracker<'a> {
             CorrelatedTracker::Active(tracker) => CorrelatedTracker::Active(&mut **tracker),
             CorrelatedTracker::Inactive => CorrelatedTracker::Inactive,
         }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, CorrelatedTracker::Active(_))
     }
 }
 
@@ -5092,6 +5096,8 @@ fn translate_between_expr(
     low: &SqlExpr,
     high: &SqlExpr,
     negated: bool,
+    outer_scopes: &[IdentifierContext],
+    mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     let lower_op = if negated {
         BinaryOperator::Lt
@@ -5104,15 +5110,86 @@ fn translate_between_expr(
         BinaryOperator::LtEq
     };
 
-    let lower_bound =
-        translate_comparison_with_context(resolver, context.clone(), between_expr, lower_op, low)?;
-    let upper_bound =
-        translate_comparison_with_context(resolver, context, between_expr, upper_op, high)?;
+    let lower_bound = translate_comparison_with_context(
+        resolver,
+        context.clone(),
+        between_expr,
+        lower_op,
+        low,
+        outer_scopes,
+        correlated_tracker.as_deref_mut(),
+    )?;
+    let upper_bound = translate_comparison_with_context(
+        resolver,
+        context,
+        between_expr,
+        upper_op,
+        high,
+        outer_scopes,
+        correlated_tracker,
+    )?;
 
     if negated {
         Ok(llkv_expr::expr::Expr::Or(vec![lower_bound, upper_bound]))
     } else {
         Ok(llkv_expr::expr::Expr::And(vec![lower_bound, upper_bound]))
+    }
+}
+
+fn correlated_scalar_from_resolution(
+    placeholder: String,
+    resolution: &ColumnResolution,
+) -> llkv_expr::expr::ScalarExpr<String> {
+    let mut expr = llkv_expr::expr::ScalarExpr::column(placeholder);
+    for field in resolution.field_path() {
+        expr = llkv_expr::expr::ScalarExpr::get_field(expr, field.clone());
+    }
+    expr
+}
+
+fn resolve_correlated_identifier(
+    resolver: &IdentifierResolver<'_>,
+    parts: &[String],
+    outer_scopes: &[IdentifierContext],
+    mut tracker: CorrelatedTracker<'_>,
+) -> SqlResult<Option<llkv_expr::expr::ScalarExpr<String>>> {
+    if !tracker.is_active() {
+        return Ok(None);
+    }
+
+    for scope in outer_scopes.iter().rev() {
+        match resolver.resolve(parts, scope.clone()) {
+            Ok(resolution) => {
+                if let Some(placeholder) = tracker.placeholder_for_resolution(&resolution) {
+                    let expr = correlated_scalar_from_resolution(placeholder, &resolution);
+                    return Ok(Some(expr));
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_identifier_expr(
+    resolver: &IdentifierResolver<'_>,
+    context: &IdentifierContext,
+    parts: Vec<String>,
+    outer_scopes: &[IdentifierContext],
+    tracker: CorrelatedTracker<'_>,
+) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+    match resolver.resolve(&parts, context.clone()) {
+        Ok(resolution) => Ok(resolution.into_scalar_expr()),
+        Err(err) => {
+            if let Some(expr) =
+                resolve_correlated_identifier(resolver, &parts, outer_scopes, tracker)?
+            {
+                Ok(expr)
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
@@ -5123,7 +5200,7 @@ fn translate_condition_with_context<P>(
     expr: &SqlExpr,
     outer_scopes: &[IdentifierContext],
     subqueries: &mut Vec<llkv_plan::FilterSubquery>,
-    correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -5177,6 +5254,8 @@ where
                             left,
                             op.clone(),
                             right,
+                            outer_scopes,
+                            correlated_tracker.as_deref_mut(),
                         )?;
                         work_stack.push(ConditionFrame::Leaf(result));
                     }
@@ -5206,6 +5285,8 @@ where
                             low,
                             high,
                             negated_mode,
+                            outer_scopes,
+                            correlated_tracker.as_deref_mut(),
                         )?;
                         work_stack.push(ConditionFrame::Leaf(between_expr_result));
                         continue;
@@ -5227,7 +5308,13 @@ where
                     work_stack.push(ConditionFrame::Enter(inner));
                 }
                 SqlExpr::IsNull(inner) => {
-                    let scalar = translate_scalar_with_context(resolver, context.clone(), inner)?;
+                    let scalar = translate_scalar_with_context_scoped(
+                        resolver,
+                        context.clone(),
+                        inner,
+                        outer_scopes,
+                        correlated_tracker.as_deref_mut(),
+                    )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
@@ -5246,7 +5333,13 @@ where
                     }
                 }
                 SqlExpr::IsNotNull(inner) => {
-                    let scalar = translate_scalar_with_context(resolver, context.clone(), inner)?;
+                    let scalar = translate_scalar_with_context_scoped(
+                        resolver,
+                        context.clone(),
+                        inner,
+                        outer_scopes,
+                        correlated_tracker.as_deref_mut(),
+                    )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
@@ -5277,14 +5370,21 @@ where
                         };
                         work_stack.push(ConditionFrame::Leaf(result));
                     } else {
-                        let target =
-                            translate_scalar_with_context(resolver, context.clone(), in_expr)?;
+                        let target = translate_scalar_with_context_scoped(
+                            resolver,
+                            context.clone(),
+                            in_expr,
+                            outer_scopes,
+                            correlated_tracker.as_deref_mut(),
+                        )?;
                         let mut values = Vec::with_capacity(list.len());
                         for value_expr in list {
-                            let scalar = translate_scalar_with_context(
+                            let scalar = translate_scalar_with_context_scoped(
                                 resolver,
                                 context.clone(),
                                 value_expr,
+                                outer_scopes,
+                                correlated_tracker.as_deref_mut(),
                             )?;
                             values.push(scalar);
                         }
@@ -5314,6 +5414,8 @@ where
                         low,
                         high,
                         *negated,
+                        outer_scopes,
+                        correlated_tracker.as_deref_mut(),
                     )?;
                     work_stack.push(ConditionFrame::Leaf(between_expr_result));
                 }
@@ -5451,9 +5553,17 @@ fn translate_comparison_with_context(
     left: &SqlExpr,
     op: BinaryOperator,
     right: &SqlExpr,
+    outer_scopes: &[IdentifierContext],
+    mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
-    let left_scalar = translate_scalar_with_context(resolver, context.clone(), left)?;
-    let right_scalar = translate_scalar_with_context(resolver, context, right)?;
+    let left_scalar = {
+        let tracker = correlated_tracker.as_deref_mut();
+        translate_scalar_with_context_scoped(resolver, context.clone(), left, outer_scopes, tracker)?
+    };
+    let right_scalar = {
+        let tracker = correlated_tracker.as_deref_mut();
+        translate_scalar_with_context_scoped(resolver, context, right, outer_scopes, tracker)?
+    };
     let compare_op = match op {
         BinaryOperator::Eq => llkv_expr::expr::CompareOp::Eq,
         BinaryOperator::NotEq => llkv_expr::expr::CompareOp::NotEq,
@@ -5472,7 +5582,7 @@ fn translate_comparison_with_context(
         llkv_expr::expr::ScalarExpr::Column(column),
         llkv_expr::expr::ScalarExpr::Literal(literal),
     ) = (&left_scalar, &right_scalar)
-        && let Some(op) = compare_op_to_filter_operator(compare_op, literal)
+        && let Some(op) = compare_op_to_filter_operator(compare_op, &literal)
     {
         tracing::debug!(
             column = ?column,
@@ -5491,7 +5601,7 @@ fn translate_comparison_with_context(
         llkv_expr::expr::ScalarExpr::Column(column),
     ) = (&left_scalar, &right_scalar)
         && let Some(flipped) = flip_compare_op(compare_op)
-        && let Some(op) = compare_op_to_filter_operator(flipped, literal)
+        && let Some(op) = compare_op_to_filter_operator(flipped, &literal)
     {
         tracing::debug!(
             column = ?column,
@@ -5551,18 +5661,33 @@ fn translate_scalar_with_context(
     context: IdentifierContext,
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    translate_scalar_internal(expr, Some(resolver), Some(&context))
+    let mut tracker = CorrelatedTracker::from_option(None);
+    translate_scalar_internal(expr, Some(resolver), Some(&context), &[], &mut tracker)
+}
+
+fn translate_scalar_with_context_scoped(
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    expr: &SqlExpr,
+    outer_scopes: &[IdentifierContext],
+    correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+    let mut tracker = CorrelatedTracker::from_option(correlated_tracker);
+    translate_scalar_internal(expr, Some(resolver), Some(&context), outer_scopes, &mut tracker)
 }
 
 #[allow(dead_code)]
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    translate_scalar_internal(expr, None, None)
+    let mut tracker = CorrelatedTracker::from_option(None);
+    translate_scalar_internal(expr, None, None, &[], &mut tracker)
 }
 
 fn translate_scalar_internal(
     expr: &SqlExpr,
     resolver: Option<&IdentifierResolver<'_>>,
     context: Option<&IdentifierContext>,
+    outer_scopes: &[IdentifierContext],
+    tracker: &mut CorrelatedTracker<'_>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::traversal module documentation for pattern details.
@@ -5610,8 +5735,15 @@ fn translate_scalar_internal(
                 SqlExpr::Identifier(ident) => {
                     if let (Some(resolver), Some(ctx)) = (resolver, context) {
                         let parts = vec![ident.value.clone()];
-                        let resolution = resolver.resolve(&parts, (*ctx).clone())?;
-                        work_stack.push(ScalarFrame::Leaf(resolution.into_scalar_expr()));
+                        let tracker_view = tracker.reborrow();
+                        let expr = resolve_identifier_expr(
+                            resolver,
+                            ctx,
+                            parts,
+                            outer_scopes,
+                            tracker_view,
+                        )?;
+                        work_stack.push(ScalarFrame::Leaf(expr));
                     } else {
                         work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::column(
                             ident.value.clone(),
@@ -5628,8 +5760,15 @@ fn translate_scalar_internal(
                     if let (Some(resolver), Some(ctx)) = (resolver, context) {
                         let parts: Vec<String> =
                             idents.iter().map(|ident| ident.value.clone()).collect();
-                        let resolution = resolver.resolve(&parts, (*ctx).clone())?;
-                        work_stack.push(ScalarFrame::Leaf(resolution.into_scalar_expr()));
+                        let tracker_view = tracker.reborrow();
+                        let expr = resolve_identifier_expr(
+                            resolver,
+                            ctx,
+                            parts,
+                            outer_scopes,
+                            tracker_view,
+                        )?;
+                        work_stack.push(ScalarFrame::Leaf(expr));
                     } else {
                         let column_name = idents[0].value.clone();
                         let mut result = llkv_expr::expr::ScalarExpr::column(column_name);
@@ -5836,8 +5975,14 @@ fn translate_scalar_internal(
                         let key = entry.key.value.clone();
                         // Reuse scalar translation for nested values while honoring identifier context.
                         // Dictionaries rarely nest deeply, so recursion here is acceptable.
-                        let value_expr =
-                            translate_scalar_internal(&entry.value, resolver, context)?;
+                        let mut tracker_view = tracker.reborrow();
+                        let value_expr = translate_scalar_internal(
+                            &entry.value,
+                            resolver,
+                            context,
+                            outer_scopes,
+                            &mut tracker_view,
+                        )?;
                         match value_expr {
                             llkv_expr::expr::ScalarExpr::Literal(lit) => {
                                 struct_fields.push((key, Box::new(lit)));
