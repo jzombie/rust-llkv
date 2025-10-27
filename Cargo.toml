@@ -28,7 +28,7 @@ simd-r-drive-entry-handle = "0.15.0-alpha"
 
 # Vendor crates
 arrow = { version = "56.2.0", default-features = false, features = ["prettyprint", "ipc"] }
-arrow-array = { version = "56.2.0", default-features = false }
+arrow-array = { version = "57.0.0", default-features = false }
 arrow-ord = { version = "56.2.0", default-features = false }
 arrow-schema = { version = "56.2.0", default-features = false }
 async-trait = "0.1.89"
