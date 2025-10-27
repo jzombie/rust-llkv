@@ -6,6 +6,7 @@ use std::sync::{
 
 use crate::SqlResult;
 use crate::SqlValue;
+use arrow::array::Array;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
@@ -2349,10 +2350,11 @@ where
                 Err(Error::InvalidArgumentError(msg))
                     if msg.contains("unsupported literal expression") =>
                 {
+                    let normalized_expr = self.materialize_in_subquery(assignment.value.clone())?;
                     let translated = translate_scalar_with_context(
                         &resolver,
                         IdentifierContext::new(table_id),
-                        &assignment.value,
+                        &normalized_expr,
                     )?;
                     AssignmentValue::Expression(translated)
                 }
@@ -2847,6 +2849,288 @@ where
     ///
     /// Uses iterative traversal with an explicit work stack to handle deeply nested
     /// expressions without stack overflow.
+    fn try_materialize_avg_subquery(&self, query: &Query) -> SqlResult<Option<SqlExpr>> {
+        use sqlparser::ast::{
+            DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+            ObjectNamePart, SelectItem, SetExpr,
+        };
+
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select.as_ref(),
+            _ => return Ok(None),
+        };
+
+        if select.projection.len() != 1
+            || select.distinct.is_some()
+            || select.top.is_some()
+            || select.value_table_mode.is_some()
+            || select.having.is_some()
+            || !group_by_is_empty(&select.group_by)
+            || select.into.is_some()
+            || !select.lateral_views.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let func = match &select.projection[0] {
+            SelectItem::UnnamedExpr(SqlExpr::Function(func)) => func,
+            _ => return Ok(None),
+        };
+
+        if func.uses_odbc_syntax
+            || func.filter.is_some()
+            || func.null_treatment.is_some()
+            || func.over.is_some()
+            || !func.within_group.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let func_name = func.name.to_string().to_ascii_lowercase();
+        if func_name != "avg" {
+            return Ok(None);
+        }
+
+        let args = match &func.args {
+            FunctionArguments::List(list) => {
+                if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+                    || !list.clauses.is_empty()
+                {
+                    return Ok(None);
+                }
+                &list.args
+            }
+            _ => return Ok(None),
+        };
+
+        if args.len() != 1 {
+            return Ok(None);
+        }
+
+        match &args[0] {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(_)) => {}
+            _ => return Ok(None),
+        };
+
+        let mut sum_query = query.clone();
+        let mut count_query = query.clone();
+
+        let build_replacement = |target_query: &mut Query, name: &str| -> SqlResult<()> {
+            let select = match target_query.body.as_mut() {
+                SetExpr::Select(select) => select,
+                _ => {
+                    return Err(Error::Internal(
+                        "expected SELECT query in AVG materialization".into(),
+                    ));
+                }
+            };
+
+            let mut replacement_func = func.clone();
+            replacement_func.name = ObjectName(vec![ObjectNamePart::Identifier(Ident {
+                value: name.to_string(),
+                quote_style: None,
+                span: Span::empty(),
+            })]);
+            select.projection = vec![SelectItem::UnnamedExpr(SqlExpr::Function(replacement_func))];
+            Ok(())
+        };
+
+        build_replacement(&mut sum_query, "sum")?;
+        build_replacement(&mut count_query, "count")?;
+
+        let sum_value = self.execute_scalar_int64(sum_query)?;
+        let count_value = self.execute_scalar_int64(count_query)?;
+
+        let Some(count_value) = count_value else {
+            return Ok(Some(SqlExpr::Value(ValueWithSpan {
+                value: Value::Null,
+                span: Span::empty(),
+            })));
+        };
+
+        if count_value == 0 {
+            return Ok(Some(SqlExpr::Value(ValueWithSpan {
+                value: Value::Null,
+                span: Span::empty(),
+            })));
+        }
+
+        let sum_value = match sum_value {
+            Some(value) => value,
+            None => {
+                return Ok(Some(SqlExpr::Value(ValueWithSpan {
+                    value: Value::Null,
+                    span: Span::empty(),
+                })));
+            }
+        };
+
+        let avg = (sum_value as f64) / (count_value as f64);
+        let value = ValueWithSpan {
+            value: Value::Number(avg.to_string(), false),
+            span: Span::empty(),
+        };
+        Ok(Some(SqlExpr::Value(value)))
+    }
+
+    fn execute_scalar_int64(&self, query: Query) -> SqlResult<Option<i64>> {
+        let result = self.handle_query(query)?;
+        let execution = match result {
+            RuntimeStatementResult::Select { execution, .. } => execution,
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "scalar aggregate must be a SELECT statement".into(),
+                ));
+            }
+        };
+
+        let batches = execution.collect()?;
+        let mut captured: Option<Option<i64>> = None;
+
+        for batch in batches {
+            if batch.num_columns() == 0 {
+                continue;
+            }
+            if batch.num_columns() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "scalar aggregate must return exactly one column".into(),
+                ));
+            }
+
+            let array = batch.column(0);
+            let values = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "scalar aggregate result must be an INT64 value".into(),
+                    )
+                })?;
+
+            for idx in 0..values.len() {
+                if captured.is_some() {
+                    return Err(Error::InvalidArgumentError(
+                        "scalar aggregate returned more than one row".into(),
+                    ));
+                }
+                if values.is_null(idx) {
+                    captured = Some(None);
+                } else {
+                    captured = Some(Some(values.value(idx)));
+                }
+            }
+        }
+
+        Ok(captured.unwrap_or(None))
+    }
+
+    fn materialize_scalar_subquery(&self, subquery: Query) -> SqlResult<SqlExpr> {
+        if let Some(avg_literal) = self.try_materialize_avg_subquery(&subquery)? {
+            return Ok(avg_literal);
+        }
+
+        let result = self.handle_query(subquery)?;
+        let execution = match result {
+            RuntimeStatementResult::Select { execution, .. } => execution,
+            _ => {
+                return Err(Error::InvalidArgumentError(
+                    "scalar subquery must be a SELECT statement".into(),
+                ));
+            }
+        };
+
+        let batches = execution.collect()?;
+        let mut captured_value: Option<ValueWithSpan> = None;
+
+        for batch in batches {
+            if batch.num_columns() == 0 {
+                continue;
+            }
+            if batch.num_columns() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "scalar subquery must return exactly one column".into(),
+                ));
+            }
+
+            let column = batch.column(0);
+            for row_idx in 0..batch.num_rows() {
+                if captured_value.is_some() {
+                    return Err(Error::InvalidArgumentError(
+                        "scalar subquery returned more than one row".into(),
+                    ));
+                }
+
+                let value = if column.is_null(row_idx) {
+                    Value::Null
+                } else {
+                    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+                    match column.data_type() {
+                        arrow::datatypes::DataType::Int64 => {
+                            let array =
+                                column
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .ok_or_else(|| {
+                                        Error::Internal(
+                                            "expected Int64 array for scalar subquery".into(),
+                                        )
+                                    })?;
+                            Value::Number(array.value(row_idx).to_string(), false)
+                        }
+                        arrow::datatypes::DataType::Float64 => {
+                            let array = column.as_any().downcast_ref::<Float64Array>().ok_or_else(
+                                || {
+                                    Error::Internal(
+                                        "expected Float64 array for scalar subquery".into(),
+                                    )
+                                },
+                            )?;
+                            Value::Number(array.value(row_idx).to_string(), false)
+                        }
+                        arrow::datatypes::DataType::Utf8 => {
+                            let array =
+                                column
+                                    .as_any()
+                                    .downcast_ref::<StringArray>()
+                                    .ok_or_else(|| {
+                                        Error::Internal(
+                                            "expected String array for scalar subquery".into(),
+                                        )
+                                    })?;
+                            Value::SingleQuotedString(array.value(row_idx).to_string())
+                        }
+                        arrow::datatypes::DataType::Boolean => {
+                            let array = column.as_any().downcast_ref::<BooleanArray>().ok_or_else(
+                                || {
+                                    Error::Internal(
+                                        "expected Boolean array for scalar subquery".into(),
+                                    )
+                                },
+                            )?;
+                            Value::Boolean(array.value(row_idx))
+                        }
+                        other => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported data type in scalar subquery result: {other:?}"
+                            )));
+                        }
+                    }
+                };
+
+                captured_value = Some(ValueWithSpan {
+                    value,
+                    span: Span::empty(),
+                });
+            }
+        }
+
+        let final_value = captured_value.unwrap_or(ValueWithSpan {
+            value: Value::Null,
+            span: Span::empty(),
+        });
+        Ok(SqlExpr::Value(final_value))
+    }
+
     fn materialize_in_subquery(&self, root_expr: SqlExpr) -> SqlResult<SqlExpr> {
         // Stack-based iterative traversal to avoid recursion
         enum WorkItem {
@@ -2966,6 +3250,39 @@ where
                                 expr: left_expr,
                                 list: values.into_iter().map(SqlExpr::Value).collect(),
                                 negated,
+                            });
+                        }
+                        SqlExpr::Subquery(subquery) => {
+                            let scalar_expr = self.materialize_scalar_subquery(*subquery)?;
+                            result_stack.push(scalar_expr);
+                        }
+                        SqlExpr::Case {
+                            case_token,
+                            end_token,
+                            operand,
+                            conditions,
+                            else_result,
+                        } => {
+                            let new_operand = match operand {
+                                Some(expr) => Some(Box::new(self.materialize_in_subquery(*expr)?)),
+                                None => None,
+                            };
+                            let mut new_conditions = Vec::with_capacity(conditions.len());
+                            for branch in conditions {
+                                let condition = self.materialize_in_subquery(branch.condition)?;
+                                let result = self.materialize_in_subquery(branch.result)?;
+                                new_conditions.push(sqlparser::ast::CaseWhen { condition, result });
+                            }
+                            let new_else = match else_result {
+                                Some(expr) => Some(Box::new(self.materialize_in_subquery(*expr)?)),
+                                None => None,
+                            };
+                            result_stack.push(SqlExpr::Case {
+                                case_token,
+                                end_token,
+                                operand: new_operand,
+                                conditions: new_conditions,
+                                else_result: new_else,
                             });
                         }
                         SqlExpr::BinaryOp { left, op, right } => {
@@ -3320,7 +3637,7 @@ where
 
             let (target, sort_type) = match &order_expr.expr {
                 SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => (
-                    OrderTarget::Column(Self::resolve_simple_column_expr(
+                    OrderTarget::Column(self.resolve_simple_column_expr(
                         resolver,
                         id_context.clone(),
                         &order_expr.expr,
@@ -3337,7 +3654,7 @@ where
                         | SqlDataType::TinyInt(_),
                     ..
                 } => (
-                    OrderTarget::Column(Self::resolve_simple_column_expr(
+                    OrderTarget::Column(self.resolve_simple_column_expr(
                         resolver,
                         id_context.clone(),
                         expr,
@@ -3390,11 +3707,13 @@ where
     }
 
     fn resolve_simple_column_expr(
+        &self,
         resolver: &IdentifierResolver<'_>,
         context: IdentifierContext,
         expr: &SqlExpr,
     ) -> SqlResult<String> {
-        let scalar = translate_scalar_with_context(resolver, context, expr)?;
+        let normalized_expr = self.materialize_in_subquery(expr.clone())?;
+        let scalar = translate_scalar_with_context(resolver, context, &normalized_expr)?;
         match scalar {
             llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
             other => Err(Error::InvalidArgumentError(format!(
@@ -3657,8 +3976,12 @@ where
                     }
                     _ => {
                         let alias = format!("col{}", idx + 1);
-                        let scalar =
-                            translate_scalar_with_context(resolver, id_context.clone(), expr)?;
+                        let normalized_expr = self.materialize_in_subquery(expr.clone())?;
+                        let scalar = translate_scalar_with_context(
+                            resolver,
+                            id_context.clone(),
+                            &normalized_expr,
+                        )?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias,
@@ -3698,8 +4021,12 @@ where
                         }
                     }
                     _ => {
-                        let scalar =
-                            translate_scalar_with_context(resolver, id_context.clone(), expr)?;
+                        let normalized_expr = self.materialize_in_subquery(expr.clone())?;
+                        let scalar = translate_scalar_with_context(
+                            resolver,
+                            id_context.clone(),
+                            &normalized_expr,
+                        )?;
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias: alias.value.clone(),
@@ -4320,8 +4647,28 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
         llkv_expr::expr::ScalarExpr::Binary { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
+        llkv_expr::expr::ScalarExpr::Compare { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
         llkv_expr::expr::ScalarExpr::GetField { base, .. } => expr_contains_aggregate(base),
         llkv_expr::expr::ScalarExpr::Cast { expr, .. } => expr_contains_aggregate(expr),
+        llkv_expr::expr::ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .map(expr_contains_aggregate)
+                .unwrap_or(false)
+                || branches.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_aggregate(when_expr) || expr_contains_aggregate(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .map(expr_contains_aggregate)
+                    .unwrap_or(false)
+        }
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
     }
 }
@@ -4978,11 +5325,30 @@ fn translate_scalar_internal(
 
     /// Context passed through Exit frames during scalar expression translation
     enum ScalarExitContext {
-        BinaryOp { op: BinaryOperator },
+        BinaryOp {
+            op: BinaryOperator,
+        },
+        Compare {
+            op: llkv_expr::expr::CompareOp,
+        },
         UnaryMinus,
         UnaryPlus,
         Nested,
         Cast(DataType),
+        Case {
+            branch_count: usize,
+            has_operand: bool,
+            has_else: bool,
+        },
+        BuiltinFunction {
+            func: BuiltinScalarFunction,
+            arg_count: usize,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    enum BuiltinScalarFunction {
+        Abs,
     }
 
     type ScalarFrame<'a> =
@@ -5033,13 +5399,45 @@ fn translate_scalar_internal(
                     let result = literal_from_value(value)?;
                     work_stack.push(ScalarFrame::Leaf(result));
                 }
-                SqlExpr::BinaryOp { left, op, right } => {
-                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp {
-                        op: op.clone(),
-                    }));
-                    work_stack.push(ScalarFrame::Enter(right));
-                    work_stack.push(ScalarFrame::Enter(left));
-                }
+                SqlExpr::BinaryOp { left, op, right } => match op {
+                    BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo => {
+                        work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp {
+                            op: op.clone(),
+                        }));
+                        work_stack.push(ScalarFrame::Enter(right));
+                        work_stack.push(ScalarFrame::Enter(left));
+                    }
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq => {
+                        let compare_op = match op {
+                            BinaryOperator::Eq => llkv_expr::expr::CompareOp::Eq,
+                            BinaryOperator::NotEq => llkv_expr::expr::CompareOp::NotEq,
+                            BinaryOperator::Lt => llkv_expr::expr::CompareOp::Lt,
+                            BinaryOperator::LtEq => llkv_expr::expr::CompareOp::LtEq,
+                            BinaryOperator::Gt => llkv_expr::expr::CompareOp::Gt,
+                            BinaryOperator::GtEq => llkv_expr::expr::CompareOp::GtEq,
+                            _ => unreachable!(),
+                        };
+                        work_stack.push(ScalarFrame::Exit(ScalarExitContext::Compare {
+                            op: compare_op,
+                        }));
+                        work_stack.push(ScalarFrame::Enter(right));
+                        work_stack.push(ScalarFrame::Enter(left));
+                    }
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "unsupported scalar binary operator: {other:?}"
+                        )));
+                    }
+                },
                 SqlExpr::UnaryOp {
                     op: UnaryOperator::Minus,
                     expr: inner,
@@ -5067,16 +5465,121 @@ fn translate_scalar_internal(
                     work_stack.push(ScalarFrame::Exit(ScalarExitContext::Cast(target_type)));
                     work_stack.push(ScalarFrame::Enter(inner));
                 }
+                SqlExpr::Case {
+                    operand,
+                    conditions,
+                    else_result,
+                    ..
+                } => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::Case {
+                        branch_count: conditions.len(),
+                        has_operand: operand.is_some(),
+                        has_else: else_result.is_some(),
+                    }));
+                    if let Some(else_expr) = else_result.as_deref() {
+                        work_stack.push(ScalarFrame::Enter(else_expr));
+                    }
+                    for case_when in conditions.iter().rev() {
+                        work_stack.push(ScalarFrame::Enter(&case_when.result));
+                        work_stack.push(ScalarFrame::Enter(&case_when.condition));
+                    }
+                    if let Some(opnd) = operand.as_deref() {
+                        work_stack.push(ScalarFrame::Enter(opnd));
+                    }
+                }
                 SqlExpr::Function(func) => {
                     if let Some(agg_call) = try_parse_aggregate_function(func)? {
                         work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::aggregate(
                             agg_call,
                         )));
                     } else {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "unsupported function in scalar expression: {:?}",
-                            func.name
-                        )));
+                        use sqlparser::ast::{
+                            FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart,
+                        };
+
+                        if func.uses_odbc_syntax
+                            || !matches!(func.parameters, FunctionArguments::None)
+                            || func.filter.is_some()
+                            || func.null_treatment.is_some()
+                            || func.over.is_some()
+                            || !func.within_group.is_empty()
+                        {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported function in scalar expression: {:?}",
+                                func.name
+                            )));
+                        }
+
+                        let func_name = if func.name.0.len() == 1 {
+                            match &func.name.0[0] {
+                                ObjectNamePart::Identifier(ident) => {
+                                    ident.value.to_ascii_lowercase()
+                                }
+                                _ => {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "unsupported function in scalar expression: {:?}",
+                                        func.name
+                                    )));
+                                }
+                            }
+                        } else {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "unsupported function in scalar expression: {:?}",
+                                func.name
+                            )));
+                        };
+
+                        match func_name.as_str() {
+                            "abs" => {
+                                let args_slice: &[FunctionArg] = match &func.args {
+                                    FunctionArguments::List(list) => {
+                                        if list.duplicate_treatment.is_some()
+                                            || !list.clauses.is_empty()
+                                        {
+                                            return Err(Error::InvalidArgumentError(
+                                                "ABS does not support qualifiers".into(),
+                                            ));
+                                        }
+                                        &list.args
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "ABS requires exactly one argument".into(),
+                                        ));
+                                    }
+                                };
+
+                                if args_slice.len() != 1 {
+                                    return Err(Error::InvalidArgumentError(
+                                        "ABS requires exactly one argument".into(),
+                                    ));
+                                }
+
+                                let arg_expr = match &args_slice[0] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "ABS argument must be an expression".into(),
+                                        ));
+                                    }
+                                };
+
+                                work_stack.push(ScalarFrame::Exit(
+                                    ScalarExitContext::BuiltinFunction {
+                                        func: BuiltinScalarFunction::Abs,
+                                        arg_count: 1,
+                                    },
+                                ));
+                                work_stack.push(ScalarFrame::Enter(arg_expr));
+                                continue;
+                            }
+                            _ => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported function in scalar expression: {:?}",
+                                    func.name
+                                )));
+                            }
+                        }
                     }
                 }
                 SqlExpr::Dictionary(fields) => {
@@ -5140,6 +5643,46 @@ fn translate_scalar_internal(
                         left_expr, binary_op, right_expr,
                     ));
                 }
+                ScalarExitContext::Compare { op } => {
+                    let right_expr = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for Compare right".into(),
+                        )
+                    })?;
+                    let left_expr = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for Compare left".into(),
+                        )
+                    })?;
+                    result_stack.push(llkv_expr::expr::ScalarExpr::compare(
+                        left_expr, op, right_expr,
+                    ));
+                }
+                ScalarExitContext::BuiltinFunction { func, arg_count } => {
+                    if result_stack.len() < arg_count {
+                        return Err(Error::Internal(
+                            "translate_scalar: result stack underflow for builtin function".into(),
+                        ));
+                    }
+
+                    let mut args: Vec<llkv_expr::expr::ScalarExpr<String>> =
+                        Vec::with_capacity(arg_count);
+                    for _ in 0..arg_count {
+                        if let Some(expr) = result_stack.pop() {
+                            args.push(expr);
+                        }
+                    }
+                    args.reverse();
+
+                    let result_expr = match func {
+                        BuiltinScalarFunction::Abs => {
+                            debug_assert_eq!(args.len(), 1);
+                            build_abs_case_expr(args.pop().expect("ABS expects one argument"))
+                        }
+                    };
+
+                    result_stack.push(result_expr);
+                }
                 ScalarExitContext::UnaryMinus => {
                     let inner = result_stack.pop().ok_or_else(|| {
                         Error::Internal(
@@ -5199,6 +5742,51 @@ fn translate_scalar_internal(
                     })?;
                     result_stack.push(llkv_expr::expr::ScalarExpr::cast(inner, target_type));
                 }
+                ScalarExitContext::Case {
+                    branch_count,
+                    has_operand,
+                    has_else,
+                } => {
+                    let else_expr = if has_else {
+                        Some(result_stack.pop().ok_or_else(|| {
+                            Error::Internal(
+                                "translate_scalar: result stack underflow for CASE ELSE".into(),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+
+                    let mut branches_rev = Vec::with_capacity(branch_count);
+                    for _ in 0..branch_count {
+                        let then_expr = result_stack.pop().ok_or_else(|| {
+                            Error::Internal(
+                                "translate_scalar: result stack underflow for CASE THEN".into(),
+                            )
+                        })?;
+                        let when_expr = result_stack.pop().ok_or_else(|| {
+                            Error::Internal(
+                                "translate_scalar: result stack underflow for CASE WHEN".into(),
+                            )
+                        })?;
+                        branches_rev.push((when_expr, then_expr));
+                    }
+                    branches_rev.reverse();
+
+                    let operand_expr = if has_operand {
+                        Some(result_stack.pop().ok_or_else(|| {
+                            Error::Internal(
+                                "translate_scalar: result stack underflow for CASE operand".into(),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+
+                    let case_expr =
+                        llkv_expr::expr::ScalarExpr::case(operand_expr, branches_rev, else_expr);
+                    result_stack.push(case_expr);
+                }
             },
         }
     }
@@ -5206,6 +5794,18 @@ fn translate_scalar_internal(
     result_stack
         .pop()
         .ok_or_else(|| Error::Internal("translate_scalar: empty result stack".into()))
+}
+
+fn build_abs_case_expr(
+    arg: llkv_expr::expr::ScalarExpr<String>,
+) -> llkv_expr::expr::ScalarExpr<String> {
+    use llkv_expr::expr::{BinaryOp, CompareOp, ScalarExpr};
+
+    let zero = ScalarExpr::literal(Literal::Integer(0));
+    let condition = ScalarExpr::compare(arg.clone(), CompareOp::Lt, zero.clone());
+    let negated = ScalarExpr::binary(zero.clone(), BinaryOp::Subtract, arg.clone());
+
+    ScalarExpr::case(None, vec![(condition, negated)], Some(arg))
 }
 
 fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {

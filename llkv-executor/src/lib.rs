@@ -152,8 +152,29 @@ where
             ScalarExpr::Binary { left, right, .. } => {
                 Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
             }
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
+            }
             ScalarExpr::GetField { base, .. } => Self::expr_contains_aggregate(base),
             ScalarExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand
+                    .as_deref()
+                    .map(Self::expr_contains_aggregate)
+                    .unwrap_or(false)
+                    || branches.iter().any(|(when_expr, then_expr)| {
+                        Self::expr_contains_aggregate(when_expr)
+                            || Self::expr_contains_aggregate(then_expr)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .map(Self::expr_contains_aggregate)
+                        .unwrap_or(false)
+            }
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
         }
     }
@@ -491,11 +512,31 @@ where
         };
 
         let expanded_order = expand_order_targets(&plan.order_by, &projections)?;
-        let physical_order = if let Some(first) = expanded_order.first() {
-            Some(resolve_scan_order(table_ref, &projections, first)?)
-        } else {
-            None
-        };
+
+        let mut physical_order: Option<ScanOrderSpec> = None;
+
+        if let Some(first) = expanded_order.first() {
+            match &first.target {
+                OrderTarget::Column(name) => {
+                    if table_ref.schema.resolve(name).is_some() {
+                        physical_order = Some(resolve_scan_order(table_ref, &projections, first)?);
+                    }
+                }
+                OrderTarget::Index(position) => match projections.get(*position) {
+                    Some(ScanProjection::Column(_)) => {
+                        physical_order = Some(resolve_scan_order(table_ref, &projections, first)?);
+                    }
+                    Some(ScanProjection::Computed { .. }) => {}
+                    None => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "ORDER BY position {} is out of range",
+                            position + 1
+                        )));
+                    }
+                },
+                OrderTarget::All => {}
+            }
+        }
 
         let options = if let Some(order_spec) = physical_order {
             if row_filter.is_some() {
@@ -899,11 +940,31 @@ where
                 Self::collect_aggregates(left, aggregates);
                 Self::collect_aggregates(right, aggregates);
             }
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::collect_aggregates(left, aggregates);
+                Self::collect_aggregates(right, aggregates);
+            }
             ScalarExpr::GetField { base, .. } => {
                 Self::collect_aggregates(base, aggregates);
             }
             ScalarExpr::Cast { expr, .. } => {
                 Self::collect_aggregates(expr, aggregates);
+            }
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(inner) = operand.as_deref() {
+                    Self::collect_aggregates(inner, aggregates);
+                }
+                for (when_expr, then_expr) in branches {
+                    Self::collect_aggregates(when_expr, aggregates);
+                    Self::collect_aggregates(then_expr, aggregates);
+                }
+                if let Some(inner) = else_expr.as_deref() {
+                    Self::collect_aggregates(inner, aggregates);
+                }
             }
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
         }
@@ -1132,6 +1193,9 @@ where
             ScalarExpr::Column(_) => Err(Error::InvalidArgumentError(
                 "Column references not supported in aggregate-only expressions".into(),
             )),
+            ScalarExpr::Compare { .. } => Err(Error::InvalidArgumentError(
+                "Comparisons not supported in aggregate-only expressions".into(),
+            )),
             ScalarExpr::Aggregate(agg) => {
                 let key = format!("{:?}", agg);
                 aggregates.get(&key).copied().ok_or_else(|| {
@@ -1169,6 +1233,9 @@ where
             )),
             ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
                 "GetField not supported in aggregate-only expressions".into(),
+            )),
+            ScalarExpr::Case { .. } => Err(Error::InvalidArgumentError(
+                "CASE not supported in aggregate-only expressions".into(),
             )),
         }
     }
@@ -1872,6 +1939,7 @@ impl CrossProductExpressionContext {
             }
             ScalarExpr::Literal(literal) => literal_to_constant_array(literal, batch.num_rows()),
             ScalarExpr::Binary { .. } => self.evaluate_numeric(expr, batch),
+            ScalarExpr::Compare { .. } => self.evaluate_numeric(expr, batch),
             ScalarExpr::Aggregate(_) => Err(Error::InvalidArgumentError(
                 "aggregate expressions are not supported in cross product filters".into(),
             )),
@@ -1885,6 +1953,7 @@ impl CrossProductExpressionContext {
                 })?;
                 Ok(casted)
             }
+            ScalarExpr::Case { .. } => self.evaluate_numeric(expr, batch),
         }
     }
 
@@ -1908,6 +1977,10 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             collect_field_ids(left, out);
             collect_field_ids(right, out);
         }
+        ScalarExpr::Compare { left, right, .. } => {
+            collect_field_ids(left, out);
+            collect_field_ids(right, out);
+        }
         ScalarExpr::Aggregate(call) => match call {
             AggregateCall::CountStar => {}
             AggregateCall::Count(fid)
@@ -1920,6 +1993,22 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
         },
         ScalarExpr::GetField { base, .. } => collect_field_ids(base, out),
         ScalarExpr::Cast { expr, .. } => collect_field_ids(expr, out),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(inner) = operand.as_deref() {
+                collect_field_ids(inner, out);
+            }
+            for (when_expr, then_expr) in branches {
+                collect_field_ids(when_expr, out);
+                collect_field_ids(then_expr, out);
+            }
+            if let Some(inner) = else_expr.as_deref() {
+                collect_field_ids(inner, out);
+            }
+        }
         ScalarExpr::Literal(_) => {}
     }
 }
@@ -2031,7 +2120,8 @@ where
                 let mut produced = false;
                 let mut produced_rows: u64 = 0;
                 let capture_nulls_first = matches!(options.order, Some(spec) if spec.nulls_first);
-                let needs_post_sort = order_by.len() > 1;
+                let needs_post_sort =
+                    !order_by.is_empty() && (order_by.len() > 1 || options.order.is_none());
                 let collect_batches = needs_post_sort || capture_nulls_first;
                 let include_nulls = options.include_nulls;
                 let has_row_id_filter = options.row_id_filter.is_some();

@@ -353,6 +353,10 @@ impl NumericKernels {
                 Self::collect_fields(left, acc);
                 Self::collect_fields(right, acc);
             }
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::collect_fields(left, acc);
+                Self::collect_fields(right, acc);
+            }
             ScalarExpr::Aggregate(agg) => {
                 // Collect fields referenced by the aggregate
                 match agg {
@@ -372,6 +376,22 @@ impl NumericKernels {
             }
             ScalarExpr::Cast { expr, .. } => {
                 Self::collect_fields(expr, acc);
+            }
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(inner) = operand.as_deref() {
+                    Self::collect_fields(inner, acc);
+                }
+                for (when_expr, then_expr) in branches {
+                    Self::collect_fields(when_expr, acc);
+                    Self::collect_fields(then_expr, acc);
+                }
+                if let Some(inner) = else_expr.as_deref() {
+                    Self::collect_fields(inner, acc);
+                }
             }
         }
     }
@@ -416,6 +436,17 @@ impl NumericKernels {
                 let r = Self::evaluate_value(right, idx, arrays)?;
                 Ok(Self::apply_binary(*op, l, r))
             }
+            ScalarExpr::Compare { left, op, right } => {
+                let l = Self::evaluate_value(left, idx, arrays)?;
+                let r = Self::evaluate_value(right, idx, arrays)?;
+                match (l, r) {
+                    (Some(lhs), Some(rhs)) => {
+                        let result = Self::compare(*op, lhs, rhs);
+                        Ok(Some(NumericValue::Integer(result as i64)))
+                    }
+                    _ => Ok(None),
+                }
+            }
             ScalarExpr::Aggregate(_) => Err(Error::Internal(
                 "Aggregate expressions should not appear in row-level evaluation".into(),
             )),
@@ -431,6 +462,41 @@ impl NumericKernels {
                     ))
                 })?;
                 Self::cast_numeric_value_to_kind(value, target_kind)
+            }
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                let operand_value = match operand.as_deref() {
+                    Some(op) => Some(Self::evaluate_value(op, idx, arrays)?),
+                    None => None,
+                };
+
+                for (when_expr, then_expr) in branches {
+                    let matched = if let Some(op_val_opt) = &operand_value {
+                        let when_val = Self::evaluate_value(when_expr, idx, arrays)?;
+                        match (op_val_opt, &when_val) {
+                            (Some(op_val), Some(branch_val)) => {
+                                Self::numeric_equals(*op_val, *branch_val)
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        let cond_val = Self::evaluate_value(when_expr, idx, arrays)?;
+                        cond_val.map_or(false, Self::truthy_numeric)
+                    };
+
+                    if matched {
+                        return Self::evaluate_value(then_expr, idx, arrays);
+                    }
+                }
+
+                if let Some(else_expr) = else_expr.as_deref() {
+                    Self::evaluate_value(else_expr, idx, arrays)
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -512,6 +578,7 @@ impl NumericKernels {
                     _ => Ok(None),
                 }
             }
+            ScalarExpr::Compare { .. } => Ok(None),
             ScalarExpr::Aggregate(_) => Err(Error::Internal(
                 "Aggregate expressions should not appear in row-level evaluation".into(),
             )),
@@ -538,6 +605,7 @@ impl NumericKernels {
                     None => Ok(None),
                 }
             }
+            ScalarExpr::Case { .. } => Ok(None),
         }
     }
 
@@ -654,6 +722,22 @@ impl NumericKernels {
         )
     }
 
+    #[inline]
+    fn numeric_equals(lhs: NumericValue, rhs: NumericValue) -> bool {
+        match (lhs, rhs) {
+            (NumericValue::Integer(a), NumericValue::Integer(b)) => a == b,
+            _ => lhs.as_f64() == rhs.as_f64(),
+        }
+    }
+
+    #[inline]
+    fn truthy_numeric(value: NumericValue) -> bool {
+        match value {
+            NumericValue::Integer(v) => v != 0,
+            NumericValue::Float(v) => v != 0.0,
+        }
+    }
+
     /// Recursively simplify the expression by folding literals and eliminating identity operations.
     pub fn simplify(expr: &ScalarExpr<FieldId>) -> ScalarExpr<FieldId> {
         match expr {
@@ -705,9 +789,27 @@ impl NumericKernels {
 
                 ScalarExpr::binary(left_s, *op, right_s)
             }
+            ScalarExpr::Compare { left, op, right } => {
+                let left_s = Self::simplify(left);
+                let right_s = Self::simplify(right);
+                ScalarExpr::compare(left_s, *op, right_s)
+            }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
                 ScalarExpr::cast(inner, data_type.clone())
+            }
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                let operand_s = operand.as_ref().map(|inner| Self::simplify(inner));
+                let mut branch_vec = Vec::with_capacity(branches.len());
+                for (when_expr, then_expr) in branches {
+                    branch_vec.push((Self::simplify(when_expr), Self::simplify(then_expr)));
+                }
+                let else_s = else_expr.as_ref().map(|inner| Self::simplify(inner));
+                ScalarExpr::case(operand_s, branch_vec, else_s)
             }
         }
     }
@@ -759,7 +861,9 @@ impl NumericKernels {
                     BinaryOp::Modulo => None,
                 }
             }
+            ScalarExpr::Compare { .. } => None,
             ScalarExpr::Cast { expr, .. } => Self::affine_state(expr),
+            ScalarExpr::Case { .. } => None,
         }
     }
 
@@ -996,11 +1100,36 @@ impl NumericKernels {
                 let right_kind = Self::infer_result_kind(right, arrays);
                 Self::binary_result_kind(*op, left_kind, right_kind)
             }
+            ScalarExpr::Compare { .. } => NumericKind::Integer,
             ScalarExpr::Aggregate(_) => NumericKind::Float,
             ScalarExpr::GetField { .. } => NumericKind::Float,
             ScalarExpr::Cast { expr, data_type } => {
                 let target_kind = Self::kind_for_data_type(data_type);
                 target_kind.unwrap_or_else(|| Self::infer_result_kind(expr, arrays))
+            }
+            ScalarExpr::Case {
+                branches,
+                else_expr,
+                ..
+            } => {
+                let mut result_kind = NumericKind::Integer;
+                for (_, then_expr) in branches {
+                    if matches!(
+                        Self::infer_result_kind(then_expr, arrays),
+                        NumericKind::Float
+                    ) {
+                        result_kind = NumericKind::Float;
+                        break;
+                    }
+                }
+                if result_kind != NumericKind::Float {
+                    if let Some(inner) = else_expr.as_deref() {
+                        if matches!(Self::infer_result_kind(inner, arrays), NumericKind::Float) {
+                            result_kind = NumericKind::Float;
+                        }
+                    }
+                }
+                result_kind
             }
         }
     }
@@ -1021,11 +1150,37 @@ impl NumericKernels {
                 let right_kind = Self::infer_result_kind_from_types(right, resolve_kind)?;
                 Some(Self::binary_result_kind(*op, left_kind, right_kind))
             }
+            ScalarExpr::Compare { .. } => Some(NumericKind::Integer),
             ScalarExpr::Aggregate(_) => Some(NumericKind::Float),
             ScalarExpr::GetField { .. } => None,
             ScalarExpr::Cast { expr, data_type } => {
                 let target_kind = Self::kind_for_data_type(data_type);
                 target_kind.or_else(|| Self::infer_result_kind_from_types(expr, resolve_kind))
+            }
+            ScalarExpr::Case {
+                branches,
+                else_expr,
+                ..
+            } => {
+                let mut result_kind = NumericKind::Integer;
+                for (_, then_expr) in branches {
+                    let kind = Self::infer_result_kind_from_types(then_expr, resolve_kind)?;
+                    if matches!(kind, NumericKind::Float) {
+                        result_kind = NumericKind::Float;
+                        break;
+                    }
+                }
+                if result_kind != NumericKind::Float {
+                    if let Some(inner) = else_expr.as_deref() {
+                        if let Some(kind) = Self::infer_result_kind_from_types(inner, resolve_kind)
+                        {
+                            if matches!(kind, NumericKind::Float) {
+                                result_kind = NumericKind::Float;
+                            }
+                        }
+                    }
+                }
+                Some(result_kind)
             }
         }
     }
@@ -1406,6 +1561,61 @@ mod tests {
         assert!(result.is_null(1));
         assert!(result.is_null(2));
         assert_eq!(result.value(3), -6.0 % -4.0);
+    }
+
+    #[test]
+    fn evaluate_simple_case_expression() {
+        const F1: FieldId = 200;
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(F1, int_array(&[Some(1), Some(2), None]));
+
+        let expr = ScalarExpr::case(
+            Some(ScalarExpr::column(F1)),
+            vec![(ScalarExpr::literal(1), ScalarExpr::literal(10))],
+            Some(ScalarExpr::literal(20)),
+        );
+
+        let result = NumericKernels::evaluate_batch(&expr, 3, &arrays).unwrap();
+        let array = result
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected Int64Array");
+
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.value(0), 10);
+        assert_eq!(array.value(1), 20);
+        assert_eq!(array.value(2), 20);
+    }
+
+    #[test]
+    fn evaluate_searched_case_expression() {
+        const F1: FieldId = 201;
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(F1, int_array(&[Some(2), Some(5), None]));
+
+        let condition = ScalarExpr::compare(
+            ScalarExpr::column(F1),
+            CompareOp::Gt,
+            ScalarExpr::literal(3),
+        );
+        let expr = ScalarExpr::case(
+            None,
+            vec![(condition, ScalarExpr::column(F1))],
+            Some(ScalarExpr::literal(0)),
+        );
+
+        let result = NumericKernels::evaluate_batch(&expr, 3, &arrays).unwrap();
+        let array = result
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected Int64Array");
+
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.value(0), 0);
+        assert_eq!(array.value(1), 5);
+        assert_eq!(array.value(2), 0);
     }
 
     #[test]

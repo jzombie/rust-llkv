@@ -201,6 +201,21 @@ where
                 unknown_aggregate,
             )?),
         }),
+        ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+            left: Box::new(translate_scalar_with(
+                left,
+                schema,
+                unknown_column,
+                unknown_aggregate,
+            )?),
+            op: *op,
+            right: Box::new(translate_scalar_with(
+                right,
+                schema,
+                unknown_column,
+                unknown_aggregate,
+            )?),
+        }),
         ScalarExpr::Aggregate(agg) => {
             let translated = match agg {
                 AggregateCall::CountStar => AggregateCall::CountStar,
@@ -240,6 +255,46 @@ where
             )?),
             data_type: data_type.clone(),
         }),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            let translated_operand = match operand.as_deref() {
+                Some(inner) => Some(translate_scalar_with(
+                    inner,
+                    schema,
+                    unknown_column,
+                    unknown_aggregate,
+                )?),
+                None => None,
+            };
+
+            let mut translated_branches = Vec::with_capacity(branches.len());
+            for (when_expr, then_expr) in branches {
+                let translated_when =
+                    translate_scalar_with(when_expr, schema, unknown_column, unknown_aggregate)?;
+                let translated_then =
+                    translate_scalar_with(then_expr, schema, unknown_column, unknown_aggregate)?;
+                translated_branches.push((translated_when, translated_then));
+            }
+
+            let translated_else = match else_expr.as_deref() {
+                Some(inner) => Some(translate_scalar_with(
+                    inner,
+                    schema,
+                    unknown_column,
+                    unknown_aggregate,
+                )?),
+                None => None,
+            };
+
+            Ok(ScalarExpr::Case {
+                operand: translated_operand.map(Box::new),
+                branches: translated_branches,
+                else_expr: translated_else.map(Box::new),
+            })
+        }
     }
 }
 

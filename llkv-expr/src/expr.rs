@@ -79,6 +79,21 @@ pub enum ScalarExpr<F> {
         expr: Box<ScalarExpr<F>>,
         data_type: DataType,
     },
+    /// Comparison producing a boolean (1/0) result.
+    Compare {
+        left: Box<ScalarExpr<F>>,
+        op: CompareOp,
+        right: Box<ScalarExpr<F>>,
+    },
+    /// SQL CASE expression with optional operand and ELSE branch.
+    Case {
+        /// Optional operand for simple CASE (e.g., `CASE x WHEN ...`).
+        operand: Option<Box<ScalarExpr<F>>>,
+        /// Ordered (WHEN, THEN) branches.
+        branches: Vec<(ScalarExpr<F>, ScalarExpr<F>)>,
+        /// Optional ELSE result.
+        else_expr: Option<Box<ScalarExpr<F>>>,
+    },
 }
 
 /// Aggregate function call within a scalar expression
@@ -130,6 +145,28 @@ impl<F> ScalarExpr<F> {
         Self::Cast {
             expr: Box::new(expr),
             data_type,
+        }
+    }
+
+    #[inline]
+    pub fn compare(left: Self, op: CompareOp, right: Self) -> Self {
+        Self::Compare {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+
+    #[inline]
+    pub fn case(
+        operand: Option<Self>,
+        branches: Vec<(Self, Self)>,
+        else_expr: Option<Self>,
+    ) -> Self {
+        Self::Case {
+            operand: operand.map(Box::new),
+            branches,
+            else_expr: else_expr.map(Box::new),
         }
     }
 }
