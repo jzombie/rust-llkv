@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -155,6 +156,16 @@ impl<'a> CorrelatedTracker<'a> {
     fn is_active(&self) -> bool {
         matches!(self, CorrelatedTracker::Active(_))
     }
+}
+
+trait ScalarSubqueryResolver {
+    fn handle_scalar_subquery(
+        &mut self,
+        subquery: &Query,
+        resolver: &IdentifierResolver<'_>,
+        context: &IdentifierContext,
+        outer_scopes: &[IdentifierContext],
+    ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>>;
 }
 
 /// SQL execution engine built on top of the LLKV runtime.
@@ -3588,9 +3599,13 @@ where
         validate_simple_query(&query)?;
 
         let (mut select_plan, select_context) = match query.body.as_ref() {
-            SetExpr::Select(select) => {
-                self.translate_select_internal(select.as_ref(), resolver, outer_scopes, subqueries, correlated_tracker)?
-            }
+            SetExpr::Select(select) => self.translate_select_internal(
+                select.as_ref(),
+                resolver,
+                outer_scopes,
+                subqueries,
+                correlated_tracker,
+            )?,
             other => {
                 return Err(Error::InvalidArgumentError(format!(
                     "unsupported query expression: {other:?}"
@@ -3615,7 +3630,8 @@ where
         resolver: &IdentifierResolver<'_>,
     ) -> SqlResult<(SelectPlan, IdentifierContext)> {
         let mut subqueries = Vec::new();
-        let result = self.translate_select_internal(select, resolver, &[], &mut subqueries, None)?;
+        let result =
+            self.translate_select_internal(select, resolver, &[], &mut subqueries, None)?;
         if !subqueries.is_empty() {
             return Err(Error::Internal(
                 "translate_select: unexpected subqueries from non-correlated translation".into(),
@@ -3702,6 +3718,7 @@ where
             .iter()
             .any(|table_with_joins| !table_with_joins.joins.is_empty());
         let mut join_conditions: Vec<SqlExpr> = Vec::new();
+        let mut scalar_subqueries: Vec<llkv_plan::ScalarSubquery> = Vec::new();
         // Handle different FROM clause scenarios
         let catalog = self.engine.context().table_catalog();
         let (mut plan, id_context) = if select.from.is_empty() {
@@ -3711,6 +3728,9 @@ where
                 resolver,
                 IdentifierContext::new(None),
                 &select.projection,
+                outer_scopes,
+                &mut scalar_subqueries,
+                correlated_tracker.as_deref_mut(),
             )?;
             p = p.with_projections(projections);
             (p, IdentifierContext::new(None))
@@ -3731,6 +3751,9 @@ where
                     resolver,
                     single_table_context.clone(),
                     &select.projection,
+                    outer_scopes,
+                    &mut scalar_subqueries,
+                    correlated_tracker.as_deref_mut(),
                 )?;
                 p = p.with_projections(projections);
             }
@@ -3746,6 +3769,9 @@ where
                 resolver,
                 IdentifierContext::new(None),
                 &select.projection,
+                outer_scopes,
+                &mut scalar_subqueries,
+                correlated_tracker.as_deref_mut(),
             )?;
             p = p.with_projections(projections);
             (p, IdentifierContext::new(None))
@@ -3784,12 +3810,10 @@ where
 
         let filter = match filter_components.len() {
             0 => None,
-            1 if subqueries.is_empty() => {
-                Some(llkv_plan::SelectFilter {
-                    predicate: filter_components.into_iter().next().unwrap(),
-                    subqueries: Vec::new(),
-                })
-            }
+            1 if subqueries.is_empty() => Some(llkv_plan::SelectFilter {
+                predicate: filter_components.into_iter().next().unwrap(),
+                subqueries: Vec::new(),
+            }),
             1 => Some(llkv_plan::SelectFilter {
                 predicate: filter_components.into_iter().next().unwrap(),
                 subqueries: std::mem::take(subqueries),
@@ -3800,6 +3824,7 @@ where
             }),
         };
         plan = plan.with_filter(filter);
+        plan = plan.with_scalar_subqueries(std::mem::take(&mut scalar_subqueries));
         plan = plan.with_distinct(distinct);
         Ok((plan, id_context))
     }
@@ -4113,6 +4138,9 @@ where
         resolver: &IdentifierResolver<'_>,
         id_context: IdentifierContext,
         projection_items: &[SelectItem],
+        outer_scopes: &[IdentifierContext],
+        scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
+        mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
     ) -> SqlResult<Vec<SelectProjection>> {
         if projection_items.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -4188,17 +4216,27 @@ where
                     }
                     _ => {
                         let alias = format!("col{}", idx + 1);
-                        // Check if this is a scalar subquery - if so, skip materialization
                         let normalized_expr = if matches!(expr, SqlExpr::Subquery(_)) {
                             expr.clone()
                         } else {
                             self.materialize_in_subquery(expr.clone())?
                         };
-                        let scalar = translate_scalar_with_context(
-                            resolver,
-                            id_context.clone(),
-                            &normalized_expr,
-                        )?;
+                        let scalar = {
+                            let tracker_view = correlated_tracker.as_deref_mut();
+                            let mut builder = ScalarSubqueryPlanner {
+                                engine: self,
+                                scalar_subqueries,
+                            };
+                            let mut tracker_wrapper = CorrelatedTracker::from_option(tracker_view);
+                            translate_scalar_internal(
+                                &normalized_expr,
+                                Some(resolver),
+                                Some(&id_context),
+                                outer_scopes,
+                                &mut tracker_wrapper,
+                                Some(&mut builder),
+                            )?
+                        };
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias,
@@ -4238,17 +4276,27 @@ where
                         }
                     }
                     _ => {
-                        // Check if this is a scalar subquery - if so, skip materialization
                         let normalized_expr = if matches!(expr, SqlExpr::Subquery(_)) {
                             expr.clone()
                         } else {
                             self.materialize_in_subquery(expr.clone())?
                         };
-                        let scalar = translate_scalar_with_context(
-                            resolver,
-                            id_context.clone(),
-                            &normalized_expr,
-                        )?;
+                        let scalar = {
+                            let tracker_view = correlated_tracker.as_deref_mut();
+                            let mut builder = ScalarSubqueryPlanner {
+                                engine: self,
+                                scalar_subqueries,
+                            };
+                            let mut tracker_wrapper = CorrelatedTracker::from_option(tracker_view);
+                            translate_scalar_internal(
+                                &normalized_expr,
+                                Some(resolver),
+                                Some(&id_context),
+                                outer_scopes,
+                                &mut tracker_wrapper,
+                                Some(&mut builder),
+                            )?
+                        };
                         projections.push(SelectProjection::Computed {
                             expr: scalar,
                             alias: alias.value.clone(),
@@ -5569,7 +5617,13 @@ fn translate_comparison_with_context(
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     let left_scalar = {
         let tracker = correlated_tracker.as_deref_mut();
-        translate_scalar_with_context_scoped(resolver, context.clone(), left, outer_scopes, tracker)?
+        translate_scalar_with_context_scoped(
+            resolver,
+            context.clone(),
+            left,
+            outer_scopes,
+            tracker,
+        )?
     };
     let right_scalar = {
         let tracker = correlated_tracker.as_deref_mut();
@@ -5673,7 +5727,14 @@ fn translate_scalar_with_context(
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     let mut tracker = CorrelatedTracker::from_option(None);
-    translate_scalar_internal(expr, Some(resolver), Some(&context), &[], &mut tracker)
+    translate_scalar_internal(
+        expr,
+        Some(resolver),
+        Some(&context),
+        &[],
+        &mut tracker,
+        None,
+    )
 }
 
 fn translate_scalar_with_context_scoped(
@@ -5684,13 +5745,20 @@ fn translate_scalar_with_context_scoped(
     correlated_tracker: Option<&mut CorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     let mut tracker = CorrelatedTracker::from_option(correlated_tracker);
-    translate_scalar_internal(expr, Some(resolver), Some(&context), outer_scopes, &mut tracker)
+    translate_scalar_internal(
+        expr,
+        Some(resolver),
+        Some(&context),
+        outer_scopes,
+        &mut tracker,
+        None,
+    )
 }
 
 #[allow(dead_code)]
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     let mut tracker = CorrelatedTracker::from_option(None);
-    translate_scalar_internal(expr, None, None, &[], &mut tracker)
+    translate_scalar_internal(expr, None, None, &[], &mut tracker, None)
 }
 
 fn translate_scalar_internal(
@@ -5699,6 +5767,7 @@ fn translate_scalar_internal(
     context: Option<&IdentifierContext>,
     outer_scopes: &[IdentifierContext],
     tracker: &mut CorrelatedTracker<'_>,
+    mut subquery_resolver: Option<&mut dyn ScalarSubqueryResolver>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::traversal module documentation for pattern details.
@@ -5993,6 +6062,7 @@ fn translate_scalar_internal(
                             context,
                             outer_scopes,
                             &mut tracker_view,
+                            None,
                         )?;
                         match value_expr {
                             llkv_expr::expr::ScalarExpr::Literal(lit) => {
@@ -6009,25 +6079,30 @@ fn translate_scalar_internal(
                         Literal::Struct(struct_fields),
                     )));
                 }
-                SqlExpr::Subquery(_) => {
-                    // TODO: Implement full scalar subquery support
-                    // 
-                    // Scalar subqueries in SELECT lists require:
-                    // 1. Building the subquery plan with correlated column tracking (like EXISTS)
-                    // 2. Creating ScalarSubquery metadata and adding to SelectPlan.scalar_subqueries
-                    // 3. Generating a ScalarExpr::ScalarSubquery with the subquery ID
-                    // 4. Executor evaluation: row-by-row subquery execution with binding
-                    //
-                    // This follows the same pattern as FilterSubquery for EXISTS predicates,
-                    // but returns a single value instead of a boolean.
-                    //
-                    // Implementation requires:
-                    // - Threading scalar_subqueries accumulator through build_projection_list
-                    // - Accessing self (SqlEngine) context to call build_select_plan_internal
-                    // - Modifying CrossProductExpressionContext to support scalar subquery evaluation
-                    return Err(Error::InvalidArgumentError(
-                        "Correlated scalar subqueries not yet fully implemented - requires plan-level support".to_string(),
-                    ));
+                SqlExpr::Subquery(subquery) => {
+                    let handler = subquery_resolver.as_mut().ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "Correlated scalar subqueries not yet fully implemented - requires plan-level support".
+                                to_string(),
+                        )
+                    })?;
+                    let resolver_ref = resolver.ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "scalar subquery translation requires identifier resolver".into(),
+                        )
+                    })?;
+                    let context_ref = context.ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "scalar subquery translation requires identifier context".into(),
+                        )
+                    })?;
+                    let translated = handler.handle_scalar_subquery(
+                        subquery.as_ref(),
+                        resolver_ref,
+                        context_ref,
+                        outer_scopes,
+                    )?;
+                    work_stack.push(ScalarFrame::Leaf(translated));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
@@ -6217,6 +6292,57 @@ fn translate_scalar_internal(
     result_stack
         .pop()
         .ok_or_else(|| Error::Internal("translate_scalar: empty result stack".into()))
+}
+
+struct ScalarSubqueryPlanner<'engine, 'vec, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    engine: &'engine SqlEngine<P>,
+    scalar_subqueries: &'vec mut Vec<llkv_plan::ScalarSubquery>,
+}
+
+impl<'engine, 'vec, P> ScalarSubqueryResolver for ScalarSubqueryPlanner<'engine, 'vec, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn handle_scalar_subquery(
+        &mut self,
+        subquery: &Query,
+        resolver: &IdentifierResolver<'_>,
+        context: &IdentifierContext,
+        outer_scopes: &[IdentifierContext],
+    ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
+        let mut nested_scopes = outer_scopes.to_vec();
+        nested_scopes.push(context.clone());
+
+        let mut tracker = CorrelatedColumnTracker::new();
+        let mut nested_filter_subqueries = Vec::new();
+
+        let plan = self.engine.build_select_plan_internal(
+            subquery.clone(),
+            resolver,
+            &nested_scopes,
+            &mut nested_filter_subqueries,
+            Some(&mut tracker),
+        )?;
+
+        debug_assert!(nested_filter_subqueries.is_empty());
+
+        let id = u32::try_from(self.scalar_subqueries.len()).map_err(|_| {
+            Error::InvalidArgumentError(
+                "scalar subquery limit exceeded for current query".to_string(),
+            )
+        })?;
+        let subquery_id = llkv_expr::SubqueryId(id);
+        self.scalar_subqueries.push(llkv_plan::ScalarSubquery {
+            id: subquery_id,
+            plan: Box::new(plan),
+            correlated_columns: tracker.into_columns(),
+        });
+
+        Ok(llkv_expr::expr::ScalarExpr::scalar_subquery(subquery_id))
+    }
 }
 
 fn build_abs_case_expr(

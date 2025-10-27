@@ -298,10 +298,8 @@ where
                 else_expr: translated_else.map(Box::new),
             })
         }
-        ScalarExpr::ScalarSubquery(_) => {
-            Err(Error::Internal(
-                "Scalar subqueries not yet supported in executor translation".to_string(),
-            ))
+        ScalarExpr::ScalarSubquery(subquery) => {
+            Ok(ScalarExpr::ScalarSubquery(subquery.clone()))
         }
     }
 }
