@@ -393,6 +393,11 @@ impl NumericKernels {
                     Self::collect_fields(inner, acc);
                 }
             }
+            ScalarExpr::Coalesce(items) => {
+                for item in items {
+                    Self::collect_fields(item, acc);
+                }
+            }
             ScalarExpr::ScalarSubquery(_) => {
                 // Scalar subqueries don't directly reference fields from the outer query
             }
@@ -500,6 +505,14 @@ impl NumericKernels {
                 } else {
                     Ok(None)
                 }
+            }
+            ScalarExpr::Coalesce(items) => {
+                for item in items {
+                    if let Some(value) = Self::evaluate_value(item, idx, arrays)? {
+                        return Ok(Some(value));
+                    }
+                }
+                Ok(None)
             }
             ScalarExpr::ScalarSubquery(_) => Err(Error::Internal(
                 "Scalar subquery evaluation requires a separate execution context".into(),
@@ -612,6 +625,7 @@ impl NumericKernels {
                 }
             }
             ScalarExpr::Case { .. } => Ok(None),
+            ScalarExpr::Coalesce(_) => Ok(None),
             ScalarExpr::ScalarSubquery(_) => Ok(None),
         }
     }
@@ -818,6 +832,10 @@ impl NumericKernels {
                 let else_s = else_expr.as_ref().map(|inner| Self::simplify(inner));
                 ScalarExpr::case(operand_s, branch_vec, else_s)
             }
+            ScalarExpr::Coalesce(items) => {
+                let simplified_items = items.iter().map(Self::simplify).collect();
+                ScalarExpr::coalesce(simplified_items)
+            }
             ScalarExpr::ScalarSubquery(_) => expr.clone(),
         }
     }
@@ -872,6 +890,7 @@ impl NumericKernels {
             ScalarExpr::Compare { .. } => None,
             ScalarExpr::Cast { expr, .. } => Self::affine_state(expr),
             ScalarExpr::Case { .. } => None,
+            ScalarExpr::Coalesce(_) => None,
             ScalarExpr::ScalarSubquery(_) => None,
         }
     }
@@ -1139,6 +1158,16 @@ impl NumericKernels {
                 }
                 result_kind
             }
+            ScalarExpr::Coalesce(items) => {
+                let mut result_kind = NumericKind::Integer;
+                for item in items {
+                    if matches!(Self::infer_result_kind(item, arrays), NumericKind::Float) {
+                        result_kind = NumericKind::Float;
+                        break;
+                    }
+                }
+                result_kind
+            }
             ScalarExpr::ScalarSubquery(_) => NumericKind::Float,
         }
     }
@@ -1185,6 +1214,17 @@ impl NumericKernels {
                     && matches!(kind, NumericKind::Float)
                 {
                     result_kind = NumericKind::Float;
+                }
+                Some(result_kind)
+            }
+            ScalarExpr::Coalesce(items) => {
+                let mut result_kind = NumericKind::Integer;
+                for item in items {
+                    let kind = Self::infer_result_kind_from_types(item, resolve_kind)?;
+                    if matches!(kind, NumericKind::Float) {
+                        result_kind = NumericKind::Float;
+                        break;
+                    }
                 }
                 Some(result_kind)
             }
@@ -1390,6 +1430,52 @@ mod tests {
         assert_eq!(result.value(1), 1.0);
         assert!(result.is_null(2));
         assert_eq!(result.value(3), 3.0);
+    }
+
+    #[test]
+    fn coalesce_evaluation_in_comparison() {
+        const A: FieldId = 401;
+        const B: FieldId = 402;
+        const C: FieldId = 403;
+        const D: FieldId = 404;
+        const E: FieldId = 405;
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(A, int_array(&[Some(1), None, None, None, None, None]));
+        arrays.insert(B, int_array(&[Some(2), Some(2), None, None, None, None]));
+        arrays.insert(C, int_array(&[Some(3), None, Some(3), None, None, None]));
+        arrays.insert(D, int_array(&[Some(4), None, None, Some(4), None, None]));
+        arrays.insert(E, int_array(&[Some(5), None, None, None, Some(5), None]));
+
+        let coalesce_expr = ScalarExpr::coalesce(vec![
+            ScalarExpr::column(A),
+            ScalarExpr::column(B),
+            ScalarExpr::column(C),
+            ScalarExpr::column(D),
+            ScalarExpr::column(E),
+        ]);
+
+        let expected_values = [Some(1), Some(2), Some(3), Some(4), Some(5), None];
+        for (idx, expected) in expected_values.iter().enumerate() {
+            let value = NumericKernels::evaluate_value(&coalesce_expr, idx, &arrays).unwrap();
+            let actual = value.map(|num| match num {
+                NumericValue::Integer(v) => v,
+                NumericValue::Float(v) => v as i64,
+            });
+            assert_eq!(actual, *expected, "row {idx} did not match");
+        }
+
+        let compare_expr =
+            ScalarExpr::compare(coalesce_expr, CompareOp::NotEq, ScalarExpr::literal(0));
+
+        let expected_flags = [Some(1), Some(1), Some(1), Some(1), Some(1), None];
+        for (idx, expected) in expected_flags.iter().enumerate() {
+            let value = NumericKernels::evaluate_value(&compare_expr, idx, &arrays).unwrap();
+            let actual = value.map(|num| match num {
+                NumericValue::Integer(v) => v,
+                NumericValue::Float(v) => v as i64,
+            });
+            assert_eq!(actual, *expected, "comparison row {idx} mismatch");
+        }
     }
 
     #[test]

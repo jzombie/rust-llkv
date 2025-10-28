@@ -1489,6 +1489,7 @@ dependencies = [
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",
+ "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "time",
@@ -2412,6 +2413,8 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "simd-r-drive"
 version = "0.15.5-alpha"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36fffae65f91f5d7133b5f5e6d05137e75c4176034623991f3c602c48f672466"
 dependencies = [
  "async-trait",
  "clap",
@@ -2428,6 +2431,8 @@ dependencies = [
 [[package]]
 name = "simd-r-drive-entry-handle"
 version = "0.15.5-alpha"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9250e918e79b4dfcd9f3494ae092b38e2234b803a163f10512ce6fba99844118"
 dependencies = [
  "arrow",
  "crc32fast",

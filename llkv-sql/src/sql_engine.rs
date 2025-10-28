@@ -11,7 +11,7 @@ use arrow::array::Array;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
-use llkv_executor::SelectExecution;
+use llkv_executor::{SelectExecution, push_query_label};
 use llkv_expr::literal::Literal;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
@@ -39,9 +39,9 @@ use sqlparser::ast::{
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
     JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
     OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Set, SetExpr, SqlOption, Statement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TransactionMode, TransactionModifier, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SetQuantifier, SqlOption, Statement,
+    TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
+    TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -402,6 +402,9 @@ where
     }
 
     fn execute_statement(&self, statement: Statement) -> SqlResult<RuntimeStatementResult<P>> {
+        let statement_sql = statement.to_string();
+        let _query_label_guard = push_query_label(statement_sql.clone());
+        tracing::debug!("SQL execute_statement: {}", statement_sql.trim());
         tracing::trace!(
             "DEBUG SQL execute_statement: {:?}",
             match &statement {
@@ -3481,14 +3484,8 @@ where
         let catalog = self.engine.context().table_catalog();
         let resolver = catalog.identifier_resolver();
 
-        let (mut select_plan, select_context) = match query.body.as_ref() {
-            SetExpr::Select(select) => self.translate_select(select.as_ref(), &resolver)?,
-            other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unsupported query expression: {other:?}"
-                )));
-            }
-        };
+        let (mut select_plan, select_context) =
+            self.translate_query_body(query.body.as_ref(), &resolver)?;
         if let Some(order_by) = &query.order_by {
             if !select_plan.aggregates.is_empty() {
                 return Err(Error::InvalidArgumentError(
@@ -3525,20 +3522,13 @@ where
 
         validate_simple_query(&query)?;
 
-        let (mut select_plan, select_context) = match query.body.as_ref() {
-            SetExpr::Select(select) => self.translate_select_internal(
-                select.as_ref(),
-                resolver,
-                outer_scopes,
-                subqueries,
-                correlated_tracker,
-            )?,
-            other => {
-                return Err(Error::InvalidArgumentError(format!(
-                    "unsupported query expression: {other:?}"
-                )));
-            }
-        };
+        let (mut select_plan, select_context) = self.translate_query_body_internal(
+            query.body.as_ref(),
+            resolver,
+            outer_scopes,
+            subqueries,
+            correlated_tracker,
+        )?;
         if let Some(order_by) = &query.order_by {
             if !select_plan.aggregates.is_empty() {
                 return Err(Error::InvalidArgumentError(
@@ -3565,6 +3555,102 @@ where
             ));
         }
         Ok(result)
+    }
+
+    fn translate_query_body(
+        &self,
+        body: &SetExpr,
+        resolver: &IdentifierResolver<'_>,
+    ) -> SqlResult<(SelectPlan, IdentifierContext)> {
+        let mut subqueries = Vec::new();
+        let result =
+            self.translate_query_body_internal(body, resolver, &[], &mut subqueries, None)?;
+        if !subqueries.is_empty() {
+            return Err(Error::Internal(
+                "translate_query_body: unexpected subqueries from non-correlated translation"
+                    .into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn translate_query_body_internal(
+        &self,
+        body: &SetExpr,
+        resolver: &IdentifierResolver<'_>,
+        outer_scopes: &[IdentifierContext],
+        subqueries: &mut Vec<llkv_plan::FilterSubquery>,
+        mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
+    ) -> SqlResult<(SelectPlan, IdentifierContext)> {
+        match body {
+            SetExpr::Select(select) => self.translate_select_internal(
+                select.as_ref(),
+                resolver,
+                outer_scopes,
+                subqueries,
+                correlated_tracker,
+            ),
+            SetExpr::Query(query) => self.translate_query_body_internal(
+                &query.body,
+                resolver,
+                outer_scopes,
+                subqueries,
+                correlated_tracker,
+            ),
+            SetExpr::SetOperation {
+                left,
+                right,
+                op,
+                set_quantifier,
+            } => {
+                let left_tracker = correlated_tracker.reborrow();
+                let (left_plan, left_context) = self.translate_query_body_internal(
+                    left.as_ref(),
+                    resolver,
+                    outer_scopes,
+                    subqueries,
+                    left_tracker,
+                )?;
+
+                let right_tracker = correlated_tracker.reborrow();
+                let (right_plan, _) = self.translate_query_body_internal(
+                    right.as_ref(),
+                    resolver,
+                    outer_scopes,
+                    subqueries,
+                    right_tracker,
+                )?;
+
+                let operator = match op {
+                    sqlparser::ast::SetOperator::Union => llkv_plan::CompoundOperator::Union,
+                    sqlparser::ast::SetOperator::Intersect => {
+                        llkv_plan::CompoundOperator::Intersect
+                    }
+                    sqlparser::ast::SetOperator::Except | sqlparser::ast::SetOperator::Minus => {
+                        llkv_plan::CompoundOperator::Except
+                    }
+                };
+
+                let quantifier = match set_quantifier {
+                    SetQuantifier::All => llkv_plan::CompoundQuantifier::All,
+                    _ => llkv_plan::CompoundQuantifier::Distinct,
+                };
+
+                let mut compound = if let Some(existing) = left_plan.compound {
+                    existing
+                } else {
+                    llkv_plan::CompoundSelectPlan::new(left_plan)
+                };
+                compound.push_operation(operator, quantifier, right_plan);
+
+                let result_plan = SelectPlan::new("").with_compound(compound);
+
+                Ok((result_plan, left_context))
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported query expression: {other:?}"
+            ))),
+        }
     }
 
     fn translate_select_internal(
@@ -4868,6 +4954,7 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
                     .map(expr_contains_aggregate)
                     .unwrap_or(false)
         }
+        llkv_expr::expr::ScalarExpr::Coalesce(items) => items.iter().any(expr_contains_aggregate),
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
         llkv_expr::expr::ScalarExpr::ScalarSubquery(_) => false,
     }
@@ -5738,6 +5825,7 @@ fn translate_scalar_internal(
     #[derive(Clone, Copy)]
     enum BuiltinScalarFunction {
         Abs,
+        Coalesce,
     }
 
     type ScalarFrame<'a> =
@@ -5976,6 +6064,51 @@ fn translate_scalar_internal(
                                 work_stack.push(ScalarFrame::Enter(arg_expr));
                                 continue;
                             }
+                            "coalesce" => {
+                                let args_slice: &[FunctionArg] = match &func.args {
+                                    FunctionArguments::List(list) => {
+                                        if list.duplicate_treatment.is_some()
+                                            || !list.clauses.is_empty()
+                                        {
+                                            return Err(Error::InvalidArgumentError(
+                                                "COALESCE does not support qualifiers".into(),
+                                            ));
+                                        }
+                                        &list.args
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "COALESCE requires at least one argument".into(),
+                                        ));
+                                    }
+                                };
+
+                                if args_slice.is_empty() {
+                                    return Err(Error::InvalidArgumentError(
+                                        "COALESCE requires at least one argument".into(),
+                                    ));
+                                }
+
+                                work_stack.push(ScalarFrame::Exit(
+                                    ScalarExitContext::BuiltinFunction {
+                                        func: BuiltinScalarFunction::Coalesce,
+                                        arg_count: args_slice.len(),
+                                    },
+                                ));
+
+                                for arg in args_slice.iter().rev() {
+                                    let arg_expr = match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                                        _ => {
+                                            return Err(Error::InvalidArgumentError(
+                                                "COALESCE arguments must be expressions".into(),
+                                            ));
+                                        }
+                                    };
+                                    work_stack.push(ScalarFrame::Enter(arg_expr));
+                                }
+                                continue;
+                            }
                             _ => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "unsupported function in scalar expression: {:?}",
@@ -6113,6 +6246,9 @@ fn translate_scalar_internal(
                         BuiltinScalarFunction::Abs => {
                             debug_assert_eq!(args.len(), 1);
                             build_abs_case_expr(args.pop().expect("ABS expects one argument"))
+                        }
+                        BuiltinScalarFunction::Coalesce => {
+                            llkv_expr::expr::ScalarExpr::coalesce(args)
                         }
                     };
 
