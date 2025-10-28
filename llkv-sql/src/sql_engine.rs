@@ -66,6 +66,7 @@ trait ScalarSubqueryResolver {
     ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>>;
 }
 
+/// Helper trait for requesting placeholders directly from catalog resolutions.
 trait CorrelatedTrackerExt {
     fn placeholder_for_resolution(
         &mut self,
@@ -82,6 +83,8 @@ impl CorrelatedTrackerExt for CorrelatedTracker<'_> {
     }
 }
 
+/// Convenience extension so optional tracker references can be reborrowed without
+/// repeating `as_mut` callers across translation helpers.
 trait CorrelatedTrackerOptionExt {
     fn reborrow(&mut self) -> Option<&mut CorrelatedColumnTracker>;
 }

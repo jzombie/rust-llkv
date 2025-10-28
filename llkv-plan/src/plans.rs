@@ -626,7 +626,9 @@ pub struct SelectPlan {
     /// Single element for simple queries, multiple for joins/cross products.
     pub tables: Vec<TableRef>,
     pub projections: Vec<SelectProjection>,
+    /// Optional WHERE predicate plus dependent correlated subqueries.
     pub filter: Option<SelectFilter>,
+    /// Scalar subqueries referenced by projections, keyed by `SubqueryId`.
     pub scalar_subqueries: Vec<ScalarSubquery>,
     pub aggregates: Vec<AggregateExpr>,
     pub order_by: Vec<OrderByPlan>,
@@ -684,6 +686,7 @@ impl SelectPlan {
         self
     }
 
+    /// Attach scalar subqueries discovered during SELECT translation.
     pub fn with_scalar_subqueries(mut self, scalar_subqueries: Vec<ScalarSubquery>) -> Self {
         self.scalar_subqueries = scalar_subqueries;
         self

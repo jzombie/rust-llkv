@@ -1,3 +1,11 @@
+//! Correlated subquery bookkeeping shared across SQL planning and execution.
+//!
+//! This module centralizes placeholder generation and correlated column tracking so that
+//! higher layers can request synthetic bindings without keeping duplicate hash maps or
+//! placeholder naming rules in sync. Planner code records correlated accesses while
+//! translating SQL expressions and surfaces the collected metadata alongside the final
+//! [`SelectPlan`](crate::plans::SelectPlan).
+
 use crate::plans::CorrelatedColumn;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -22,8 +30,10 @@ impl OuterColumnKey {
         }
     }
 }
-
 /// Tracks correlated columns discovered while translating scalar or EXISTS subqueries.
+///
+/// The tracker exposes stable placeholder names for a given `(column, field_path)` pair and
+/// records the corresponding [`CorrelatedColumn`] metadata in encounter order.
 #[derive(Default)]
 pub struct CorrelatedColumnTracker {
     placeholders: HashMap<OuterColumnKey, usize>,
