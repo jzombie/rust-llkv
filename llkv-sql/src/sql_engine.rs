@@ -16,7 +16,7 @@ use llkv_expr::literal::Literal;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
 };
-use llkv_plan::{CorrelatedColumnTracker, CorrelatedTracker, TransformFrame};
+use llkv_plan::{SubqueryCorrelatedColumnTracker, SubqueryCorrelatedTracker, TransformFrame};
 use llkv_result::Error;
 use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
@@ -67,14 +67,14 @@ trait ScalarSubqueryResolver {
 }
 
 /// Helper trait for requesting placeholders directly from catalog resolutions.
-trait CorrelatedTrackerExt {
+trait SubqueryCorrelatedTrackerExt {
     fn placeholder_for_resolution(
         &mut self,
         resolution: &llkv_table::catalog::ColumnResolution,
     ) -> Option<String>;
 }
 
-impl CorrelatedTrackerExt for CorrelatedTracker<'_> {
+impl SubqueryCorrelatedTrackerExt for SubqueryCorrelatedTracker<'_> {
     fn placeholder_for_resolution(
         &mut self,
         resolution: &llkv_table::catalog::ColumnResolution,
@@ -85,12 +85,12 @@ impl CorrelatedTrackerExt for CorrelatedTracker<'_> {
 
 /// Convenience extension so optional tracker references can be reborrowed without
 /// repeating `as_mut` callers across translation helpers.
-trait CorrelatedTrackerOptionExt {
-    fn reborrow(&mut self) -> Option<&mut CorrelatedColumnTracker>;
+trait SubqueryCorrelatedTrackerOptionExt {
+    fn reborrow(&mut self) -> Option<&mut SubqueryCorrelatedColumnTracker>;
 }
 
-impl CorrelatedTrackerOptionExt for Option<&mut CorrelatedColumnTracker> {
-    fn reborrow(&mut self) -> Option<&mut CorrelatedColumnTracker> {
+impl SubqueryCorrelatedTrackerOptionExt for Option<&mut SubqueryCorrelatedColumnTracker> {
+    fn reborrow(&mut self) -> Option<&mut SubqueryCorrelatedColumnTracker> {
         self.as_mut().map(|tracker| &mut **tracker)
     }
 }
@@ -3515,7 +3515,7 @@ where
         resolver: &IdentifierResolver<'_>,
         outer_scopes: &[IdentifierContext],
         subqueries: &mut Vec<llkv_plan::FilterSubquery>,
-        correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
     ) -> SqlResult<SelectPlan> {
         if self.engine.session().has_active_transaction() && self.engine.session().is_aborted() {
             return Err(Error::TransactionContextError(
@@ -3573,7 +3573,7 @@ where
         resolver: &IdentifierResolver<'_>,
         outer_scopes: &[IdentifierContext],
         subqueries: &mut Vec<llkv_plan::FilterSubquery>,
-        mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
     ) -> SqlResult<(SelectPlan, IdentifierContext)> {
         let distinct = match &select.distinct {
             None => false,
@@ -4067,7 +4067,7 @@ where
         projection_items: &[SelectItem],
         outer_scopes: &[IdentifierContext],
         scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
-        mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
     ) -> SqlResult<Vec<SelectProjection>> {
         if projection_items.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -4154,7 +4154,8 @@ where
                                 engine: self,
                                 scalar_subqueries,
                             };
-                            let mut tracker_wrapper = CorrelatedTracker::from_option(tracker_view);
+                            let mut tracker_wrapper =
+                                SubqueryCorrelatedTracker::from_option(tracker_view);
                             translate_scalar_internal(
                                 &normalized_expr,
                                 Some(resolver),
@@ -4214,7 +4215,8 @@ where
                                 engine: self,
                                 scalar_subqueries,
                             };
-                            let mut tracker_wrapper = CorrelatedTracker::from_option(tracker_view);
+                            let mut tracker_wrapper =
+                                SubqueryCorrelatedTracker::from_option(tracker_view);
                             translate_scalar_internal(
                                 &normalized_expr,
                                 Some(resolver),
@@ -5087,7 +5089,7 @@ fn translate_between_expr(
     bounds: BetweenBounds<'_>,
     negated: bool,
     outer_scopes: &[IdentifierContext],
-    mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     let lower_op = if negated {
         BinaryOperator::Lt
@@ -5141,7 +5143,7 @@ fn resolve_correlated_identifier(
     resolver: &IdentifierResolver<'_>,
     parts: &[String],
     outer_scopes: &[IdentifierContext],
-    mut tracker: CorrelatedTracker<'_>,
+    mut tracker: SubqueryCorrelatedTracker<'_>,
 ) -> SqlResult<Option<llkv_expr::expr::ScalarExpr<String>>> {
     if !tracker.is_active() {
         return Ok(None);
@@ -5167,7 +5169,7 @@ fn resolve_identifier_expr(
     context: &IdentifierContext,
     parts: Vec<String>,
     outer_scopes: &[IdentifierContext],
-    tracker: CorrelatedTracker<'_>,
+    tracker: SubqueryCorrelatedTracker<'_>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match resolver.resolve(&parts, context.clone()) {
         Ok(resolution) => Ok(resolution.into_scalar_expr()),
@@ -5190,7 +5192,7 @@ fn translate_condition_with_context<P>(
     expr: &SqlExpr,
     outer_scopes: &[IdentifierContext],
     subqueries: &mut Vec<llkv_plan::FilterSubquery>,
-    mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -5418,7 +5420,7 @@ where
                     let mut nested_scopes = outer_scopes.to_vec();
                     nested_scopes.push(context.clone());
 
-                    let mut tracker = CorrelatedColumnTracker::new();
+                    let mut tracker = SubqueryCorrelatedColumnTracker::new();
                     let mut nested_subqueries = Vec::new();
 
                     // Translate the subquery in an extended scope
@@ -5548,7 +5550,7 @@ fn translate_comparison_with_context(
     op: BinaryOperator,
     right: &SqlExpr,
     outer_scopes: &[IdentifierContext],
-    mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     let left_scalar = {
         let tracker = correlated_tracker.reborrow();
@@ -5661,7 +5663,7 @@ fn translate_scalar_with_context(
     context: IdentifierContext,
     expr: &SqlExpr,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    let mut tracker = CorrelatedTracker::from_option(None);
+    let mut tracker = SubqueryCorrelatedTracker::from_option(None);
     translate_scalar_internal(
         expr,
         Some(resolver),
@@ -5677,9 +5679,9 @@ fn translate_scalar_with_context_scoped(
     context: IdentifierContext,
     expr: &SqlExpr,
     outer_scopes: &[IdentifierContext],
-    correlated_tracker: Option<&mut CorrelatedColumnTracker>,
+    correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    let mut tracker = CorrelatedTracker::from_option(correlated_tracker);
+    let mut tracker = SubqueryCorrelatedTracker::from_option(correlated_tracker);
     translate_scalar_internal(
         expr,
         Some(resolver),
@@ -5692,7 +5694,7 @@ fn translate_scalar_with_context_scoped(
 
 #[allow(dead_code)]
 fn translate_scalar(expr: &SqlExpr) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
-    let mut tracker = CorrelatedTracker::from_option(None);
+    let mut tracker = SubqueryCorrelatedTracker::from_option(None);
     translate_scalar_internal(expr, None, None, &[], &mut tracker, None)
 }
 
@@ -5701,7 +5703,7 @@ fn translate_scalar_internal(
     resolver: Option<&IdentifierResolver<'_>>,
     context: Option<&IdentifierContext>,
     outer_scopes: &[IdentifierContext],
-    tracker: &mut CorrelatedTracker<'_>,
+    tracker: &mut SubqueryCorrelatedTracker<'_>,
     mut subquery_resolver: Option<&mut dyn ScalarSubqueryResolver>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     // Iterative postorder traversal using the TransformFrame pattern.
@@ -6251,7 +6253,7 @@ where
         let mut nested_scopes = outer_scopes.to_vec();
         nested_scopes.push(context.clone());
 
-        let mut tracker = CorrelatedColumnTracker::new();
+    let mut tracker = SubqueryCorrelatedColumnTracker::new();
         let mut nested_filter_subqueries = Vec::new();
 
         let plan = self.engine.build_select_plan_internal(

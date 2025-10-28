@@ -14,9 +14,9 @@
 
 pub mod canonical;
 pub mod conversion;
-pub mod correlation;
 pub mod plan_graph;
 pub mod plans;
+pub mod subquery_correlation;
 pub mod traversal;
 pub mod validation;
 
@@ -24,9 +24,9 @@ pub use canonical::{CanonicalRow, CanonicalScalar};
 pub use conversion::{
     RangeSelectRows, extract_rows_from_range, plan_value_from_sql_expr, plan_value_from_sql_value,
 };
-pub use correlation::{
-    CORRELATED_PLACEHOLDER_PREFIX, CorrelatedColumnTracker, CorrelatedTracker,
-    correlated_placeholder,
+pub use subquery_correlation::{
+    SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,
+    SubqueryCorrelatedTracker, subquery_correlated_placeholder,
 };
 pub use plan_graph::*;
 pub use plans::*;

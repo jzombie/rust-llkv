@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 /// Prefix applied to synthetic field placeholders injected for correlated columns.
-pub const CORRELATED_PLACEHOLDER_PREFIX: &str = "__llkv_outer$";
+pub const SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX: &str = "__llkv_outer$";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct OuterColumnKey {
@@ -35,12 +35,12 @@ impl OuterColumnKey {
 /// The tracker exposes stable placeholder names for a given `(column, field_path)` pair and
 /// records the corresponding [`CorrelatedColumn`] metadata in encounter order.
 #[derive(Default)]
-pub struct CorrelatedColumnTracker {
+pub struct SubqueryCorrelatedColumnTracker {
     placeholders: HashMap<OuterColumnKey, usize>,
     columns: Vec<CorrelatedColumn>,
 }
 
-impl CorrelatedColumnTracker {
+impl SubqueryCorrelatedColumnTracker {
     /// Create a new tracker instance.
     #[inline]
     pub fn new() -> Self {
@@ -51,10 +51,10 @@ impl CorrelatedColumnTracker {
     pub fn placeholder_for_column_path(&mut self, column: &str, field_path: &[String]) -> String {
         let key = OuterColumnKey::new(column, field_path);
         match self.placeholders.entry(key) {
-            Entry::Occupied(existing) => correlated_placeholder(*existing.get()),
+            Entry::Occupied(existing) => subquery_correlated_placeholder(*existing.get()),
             Entry::Vacant(slot) => {
                 let index = self.columns.len();
-                let placeholder = correlated_placeholder(index);
+                let placeholder = subquery_correlated_placeholder(index);
                 self.columns.push(CorrelatedColumn {
                     placeholder: placeholder.clone(),
                     column: column.to_string(),
@@ -75,23 +75,23 @@ impl CorrelatedColumnTracker {
 
 /// Generate the synthetic placeholder name for a correlated column binding.
 #[inline]
-pub fn correlated_placeholder(index: usize) -> String {
-    format!("{CORRELATED_PLACEHOLDER_PREFIX}{index}")
+pub fn subquery_correlated_placeholder(index: usize) -> String {
+    format!("{SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX}{index}")
 }
 
 /// Optional wrapper used when correlated tracking is conditional.
-pub enum CorrelatedTracker<'a> {
-    Active(&'a mut CorrelatedColumnTracker),
+pub enum SubqueryCorrelatedTracker<'a> {
+    Active(&'a mut SubqueryCorrelatedColumnTracker),
     Inactive,
 }
 
-impl<'a> CorrelatedTracker<'a> {
+impl<'a> SubqueryCorrelatedTracker<'a> {
     /// Create a tracker wrapper from an optional mutable reference.
     #[inline]
-    pub fn from_option(tracker: Option<&'a mut CorrelatedColumnTracker>) -> Self {
+    pub fn from_option(tracker: Option<&'a mut SubqueryCorrelatedColumnTracker>) -> Self {
         match tracker {
-            Some(inner) => CorrelatedTracker::Active(inner),
-            None => CorrelatedTracker::Inactive,
+            Some(inner) => SubqueryCorrelatedTracker::Active(inner),
+            None => SubqueryCorrelatedTracker::Inactive,
         }
     }
 
@@ -103,25 +103,27 @@ impl<'a> CorrelatedTracker<'a> {
         field_path: &[String],
     ) -> Option<String> {
         match self {
-            CorrelatedTracker::Active(tracker) => {
+            SubqueryCorrelatedTracker::Active(tracker) => {
                 Some(tracker.placeholder_for_column_path(column, field_path))
             }
-            CorrelatedTracker::Inactive => None,
+            SubqueryCorrelatedTracker::Inactive => None,
         }
     }
 
     /// Reborrow the tracker, preserving the active/inactive state.
     #[inline]
-    pub fn reborrow(&mut self) -> CorrelatedTracker<'_> {
+    pub fn reborrow(&mut self) -> SubqueryCorrelatedTracker<'_> {
         match self {
-            CorrelatedTracker::Active(tracker) => CorrelatedTracker::Active(tracker),
-            CorrelatedTracker::Inactive => CorrelatedTracker::Inactive,
+            SubqueryCorrelatedTracker::Active(tracker) => {
+                SubqueryCorrelatedTracker::Active(tracker)
+            }
+            SubqueryCorrelatedTracker::Inactive => SubqueryCorrelatedTracker::Inactive,
         }
     }
 
     /// True when correlation tracking is enabled.
     #[inline]
     pub fn is_active(&self) -> bool {
-        matches!(self, CorrelatedTracker::Active(_))
+        matches!(self, SubqueryCorrelatedTracker::Active(_))
     }
 }
