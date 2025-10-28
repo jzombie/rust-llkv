@@ -112,7 +112,7 @@ pub fn push_query_label(label: impl Into<String>) -> QueryLogGuard {
 
 /// Install a query label for the current thread so that executor logs can
 /// annotate diagnostics with the originating SQL statement.
-/// 
+///
 /// No-op in non-test builds.
 #[cfg(not(test))]
 #[inline]
@@ -144,7 +144,7 @@ pub fn current_query_label() -> Option<String> {
 }
 
 /// Fetch the innermost query label associated with the current execution thread.
-/// 
+///
 /// Always returns None in non-test builds.
 #[cfg(not(test))]
 #[inline]
