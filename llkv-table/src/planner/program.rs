@@ -361,6 +361,11 @@ fn compile_eval<'expr>(
                     let id = domains.ensure(inner);
                     ops.push(EvalOp::Not { domain: id });
                 }
+                Expr::Exists(_) => {
+                    return Err(Error::InvalidArgumentError(
+                        "EXISTS predicates are not supported in storage evaluation".into(),
+                    ));
+                }
             },
             EvalVisit::EmitFused { key, field_id } => {
                 let filters = fused
@@ -472,6 +477,9 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                 Expr::Not(_) => {
                     // Domain equals child domain; no-op.
                 }
+                Expr::Exists(_) => {
+                    panic!("EXISTS predicates should not reach storage domain evaluation stage");
+                }
             },
         }
     }
@@ -494,6 +502,10 @@ fn collect_fields<'expr>(
                 stack.push(left);
                 stack.push(right);
             }
+            ScalarExpr::Compare { left, right, .. } => {
+                stack.push(left);
+                stack.push(right);
+            }
             ScalarExpr::Aggregate(agg) => match agg {
                 llkv_expr::expr::AggregateCall::CountStar => {}
                 llkv_expr::expr::AggregateCall::Count(fid)
@@ -509,6 +521,25 @@ fn collect_fields<'expr>(
             }
             ScalarExpr::Cast { expr, .. } => {
                 stack.push(expr.as_ref());
+            }
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(inner) = operand.as_deref() {
+                    stack.push(inner);
+                }
+                for (when_expr, then_expr) in branches {
+                    stack.push(when_expr);
+                    stack.push(then_expr);
+                }
+                if let Some(inner) = else_expr.as_deref() {
+                    stack.push(inner);
+                }
+            }
+            ScalarExpr::ScalarSubquery(_) => {
+                // Scalar subqueries are resolved separately at planning time
             }
         }
     }

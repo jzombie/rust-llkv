@@ -9,10 +9,57 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use llkv_expr::expr::SubqueryId;
 use llkv_result::Error;
 
 /// Result type for plan operations.
 pub type PlanResult<T> = llkv_result::Result<T>;
+
+// ============================================================================
+// Filter Metadata
+// ============================================================================
+
+/// Boolean predicate plus correlated subquery metadata attached to a [`SelectPlan`].
+#[derive(Clone, Debug)]
+pub struct SelectFilter {
+    /// Predicate applied to rows before projections execute.
+    pub predicate: llkv_expr::expr::Expr<'static, String>,
+    /// Correlated subqueries required to evaluate the predicate.
+    pub subqueries: Vec<FilterSubquery>,
+}
+
+/// Correlated subquery invoked from within a filter predicate.
+#[derive(Clone, Debug)]
+pub struct FilterSubquery {
+    /// Identifier referenced by [`llkv_expr::expr::Expr::Exists`].
+    pub id: SubqueryId,
+    /// Logical plan for the subquery.
+    pub plan: Box<SelectPlan>,
+    /// Mappings for correlated column placeholders to real outer columns.
+    pub correlated_columns: Vec<CorrelatedColumn>,
+}
+
+/// Correlated subquery invoked from within a scalar projection expression.
+#[derive(Clone, Debug)]
+pub struct ScalarSubquery {
+    /// Identifier referenced by [`llkv_expr::expr::ScalarExpr::ScalarSubquery`].
+    pub id: SubqueryId,
+    /// Logical plan for the subquery.
+    pub plan: Box<SelectPlan>,
+    /// Mappings for correlated column placeholders to real outer columns.
+    pub correlated_columns: Vec<CorrelatedColumn>,
+}
+
+/// Description of a correlated column captured by an EXISTS predicate.
+#[derive(Clone, Debug)]
+pub struct CorrelatedColumn {
+    /// Placeholder column name injected into the subquery expression tree.
+    pub placeholder: String,
+    /// Canonical outer column name.
+    pub column: String,
+    /// Optional nested field path for struct lookups.
+    pub field_path: Vec<String>,
+}
 
 // ============================================================================
 // PlanValue Types
@@ -579,7 +626,10 @@ pub struct SelectPlan {
     /// Single element for simple queries, multiple for joins/cross products.
     pub tables: Vec<TableRef>,
     pub projections: Vec<SelectProjection>,
-    pub filter: Option<llkv_expr::expr::Expr<'static, String>>,
+    /// Optional WHERE predicate plus dependent correlated subqueries.
+    pub filter: Option<SelectFilter>,
+    /// Scalar subqueries referenced by projections, keyed by `SubqueryId`.
+    pub scalar_subqueries: Vec<ScalarSubquery>,
     pub aggregates: Vec<AggregateExpr>,
     pub order_by: Vec<OrderByPlan>,
     pub distinct: bool,
@@ -606,6 +656,7 @@ impl SelectPlan {
             tables,
             projections: Vec::new(),
             filter: None,
+            scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
@@ -618,6 +669,7 @@ impl SelectPlan {
             tables,
             projections: Vec::new(),
             filter: None,
+            scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
@@ -629,8 +681,14 @@ impl SelectPlan {
         self
     }
 
-    pub fn with_filter(mut self, filter: Option<llkv_expr::expr::Expr<'static, String>>) -> Self {
+    pub fn with_filter(mut self, filter: Option<SelectFilter>) -> Self {
         self.filter = filter;
+        self
+    }
+
+    /// Attach scalar subqueries discovered during SELECT translation.
+    pub fn with_scalar_subqueries(mut self, scalar_subqueries: Vec<ScalarSubquery>) -> Self {
+        self.scalar_subqueries = scalar_subqueries;
         self
     }
 

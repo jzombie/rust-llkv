@@ -543,6 +543,7 @@ impl PredicateFusionCache {
                 Expr::Compare { .. } => {}
                 Expr::InList { .. } => {}
                 Expr::Literal(_) => {}
+                Expr::Exists(_) => {}
             }
         }
     }
@@ -1139,7 +1140,9 @@ where
                                 DataType::Struct(struct_fields.into())
                             }
                             ScalarExpr::Cast { data_type, .. } => data_type.clone(),
-                            ScalarExpr::Binary { .. } => {
+                            ScalarExpr::Binary { .. }
+                            | ScalarExpr::Compare { .. }
+                            | ScalarExpr::Case { .. } => {
                                 let mut resolver = |fid: FieldId| {
                                     let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
                                     lfid_dtypes
@@ -1188,6 +1191,12 @@ where
                                 self.table.table_id(),
                                 &lfid_dtypes,
                             )?,
+                            ScalarExpr::ScalarSubquery(_) => {
+                                // Scalar subqueries will be resolved at execution time
+                                // For now, assume they can be null and return a generic type
+                                // TODO: Infer type from subquery plan
+                                DataType::Utf8
+                            }
                         };
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     }
@@ -2934,9 +2943,12 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Literal(_) => false,
         ScalarExpr::Column(_) => true,
         ScalarExpr::Binary { .. } => true,
+        ScalarExpr::Compare { .. } => true,
         ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
         ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
+        ScalarExpr::Case { .. } => true,
+        ScalarExpr::ScalarSubquery(_) => false,
     }
 }
 
@@ -2963,6 +2975,7 @@ fn computed_expr_prefers_float(
                     || computed_expr_prefers_float(right.as_ref(), table_id, lfid_dtypes)?,
             )
         }
+        ScalarExpr::Compare { .. } => Ok(false),
         ScalarExpr::Aggregate(_) => Ok(false),
         ScalarExpr::GetField { base, field_name } => {
             let dtype = get_field_dtype(base.as_ref(), field_name, table_id, lfid_dtypes)?;
@@ -2978,9 +2991,33 @@ fn computed_expr_prefers_float(
                 computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)
             }
         }
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(inner) = operand.as_deref()
+                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
+            {
+                return Ok(true);
+            }
+            for (when_expr, then_expr) in branches {
+                if computed_expr_prefers_float(when_expr, table_id, lfid_dtypes)?
+                    || computed_expr_prefers_float(then_expr, table_id, lfid_dtypes)?
+                {
+                    return Ok(true);
+                }
+            }
+            if let Some(inner) = else_expr.as_deref()
+                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
+            {
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        ScalarExpr::ScalarSubquery(_) => Ok(false),
     }
 }
-
 fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
     match literal {
         Literal::Float(_) => Ok(true),
@@ -3156,8 +3193,11 @@ fn synthesize_computed_literal_array(
         }
         ScalarExpr::Column(_)
         | ScalarExpr::Binary { .. }
+        | ScalarExpr::Compare { .. }
         | ScalarExpr::Aggregate(_)
-        | ScalarExpr::GetField { .. } => Ok(new_null_array(data_type, row_count)),
+        | ScalarExpr::GetField { .. }
+        | ScalarExpr::Case { .. } => Ok(new_null_array(data_type, row_count)),
+        ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
     }
 }
 
@@ -3199,7 +3239,7 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
                 }
             }
             Not(inner) => traverse_stack.push(inner),
-            Pred(_) | Compare { .. } | InList { .. } | Literal(_) => {}
+            Pred(_) | Compare { .. } | InList { .. } | Literal(_) | Exists(_) => {}
         }
     }
 
@@ -3264,6 +3304,9 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
                 } else {
                     "FALSE".to_string()
                 });
+            }
+            Exists(_) => {
+                result_stack.push("EXISTS(...)".to_string());
             }
         }
     }
@@ -3351,9 +3394,30 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 traverse_stack.push(left);
                 traverse_stack.push(right);
             }
+            Compare { left, right, .. } => {
+                traverse_stack.push(left);
+                traverse_stack.push(right);
+            }
             GetField { base, .. } => traverse_stack.push(base),
             Cast { expr, .. } => traverse_stack.push(expr),
+            Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(inner) = else_expr.as_deref() {
+                    traverse_stack.push(inner);
+                }
+                for (when_expr, then_expr) in branches.iter().rev() {
+                    traverse_stack.push(then_expr);
+                    traverse_stack.push(when_expr);
+                }
+                if let Some(inner) = operand.as_deref() {
+                    traverse_stack.push(inner);
+                }
+            }
             Column(_) | Literal(_) | Aggregate(_) => {}
+            ScalarExpr::ScalarSubquery(_) => {}
         }
     }
 
@@ -3375,6 +3439,52 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 let right = result_stack.pop().unwrap_or_default();
                 let left = result_stack.pop().unwrap_or_default();
                 result_stack.push(format!("({} {} {})", left, format_binary_op(*op), right));
+            }
+            Compare { op, .. } => {
+                let right = result_stack.pop().unwrap_or_default();
+                let left = result_stack.pop().unwrap_or_default();
+                result_stack.push(format!("({} {} {})", left, format_compare_op(*op), right));
+            }
+            Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                let else_str = if else_expr.is_some() {
+                    Some(result_stack.pop().unwrap_or_default())
+                } else {
+                    None
+                };
+                let mut branch_pairs = Vec::with_capacity(branches.len());
+                for _ in 0..branches.len() {
+                    let then_str = result_stack.pop().unwrap_or_default();
+                    let when_str = result_stack.pop().unwrap_or_default();
+                    branch_pairs.push((when_str, then_str));
+                }
+                branch_pairs.reverse();
+                let operand_str = if operand.is_some() {
+                    Some(result_stack.pop().unwrap_or_default())
+                } else {
+                    None
+                };
+
+                let mut parts = Vec::new();
+                if let Some(op_str) = operand_str {
+                    parts.push(format!("CASE {op_str}"));
+                } else {
+                    parts.push("CASE".to_string());
+                }
+                for (when_str, then_str) in branch_pairs {
+                    parts.push(format!("WHEN {when_str} THEN {then_str}"));
+                }
+                if let Some(else_str) = else_str {
+                    parts.push(format!("ELSE {else_str}"));
+                }
+                parts.push("END".to_string());
+                result_stack.push(parts.join(" "));
+            }
+            ScalarExpr::ScalarSubquery(sub) => {
+                result_stack.push(format!("(SCALAR_SUBQUERY#{})", sub.id.0));
             }
         }
     }

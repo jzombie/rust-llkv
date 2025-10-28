@@ -16,6 +16,7 @@ pub mod canonical;
 pub mod conversion;
 pub mod plan_graph;
 pub mod plans;
+pub mod subquery_correlation;
 pub mod traversal;
 pub mod validation;
 
@@ -25,4 +26,8 @@ pub use conversion::{
 };
 pub use plan_graph::*;
 pub use plans::*;
+pub use subquery_correlation::{
+    SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,
+    SubqueryCorrelatedTracker, subquery_correlated_placeholder,
+};
 pub use traversal::{TransformFrame, Traversable, traverse_postorder};

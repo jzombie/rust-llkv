@@ -76,12 +76,24 @@ fn infer_computed_data_type(
                 Ok(DataType::Int64)
             }
         }
+        ScalarExpr::Compare { .. } => Ok(DataType::Int64),
         ScalarExpr::Aggregate(_) => Ok(DataType::Int64),
         ScalarExpr::GetField { base, field_name } => {
             let field_type = resolve_struct_field_type(schema, base, field_name)?;
             Ok(field_type)
         }
         ScalarExpr::Cast { data_type, .. } => Ok(data_type.clone()),
+        ScalarExpr::Case { .. } => {
+            if expression_uses_float(schema, expr)? {
+                Ok(DataType::Float64)
+            } else {
+                Ok(DataType::Int64)
+            }
+        }
+        ScalarExpr::ScalarSubquery(_) => {
+            // TODO: Infer type from subquery result
+            Ok(DataType::Utf8)
+        }
     }
 }
 
@@ -132,6 +144,13 @@ fn expression_uses_float(
             }
             expression_uses_float(schema, right)
         }
+        ScalarExpr::Compare { left, right, .. } => {
+            let left_float = expression_uses_float(schema, left)?;
+            if left_float {
+                return Ok(true);
+            }
+            expression_uses_float(schema, right)
+        }
         ScalarExpr::Aggregate(_) => Ok(false),
         ScalarExpr::GetField { base, field_name } => {
             let field_type = resolve_struct_field_type(schema, base, field_name)?;
@@ -146,6 +165,24 @@ fn expression_uses_float(
             }
             expression_uses_float(schema, expr)
         }
+        ScalarExpr::Case {
+            branches,
+            else_expr,
+            ..
+        } => {
+            for (_, then_expr) in branches {
+                if expression_uses_float(schema, then_expr)? {
+                    return Ok(true);
+                }
+            }
+            if let Some(inner) = else_expr.as_deref()
+                && expression_uses_float(schema, inner)?
+            {
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        ScalarExpr::ScalarSubquery(_) => Ok(false),
     }
 }
 

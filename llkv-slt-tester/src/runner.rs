@@ -172,7 +172,34 @@ where
     })?;
 
     let run_result = async {
+        let mut current_hash_threshold: usize = 256;
         for record in records {
+            let hash_threshold_update = match &record {
+                sqllogictest::Record::HashThreshold { threshold, .. } => Some(*threshold as usize),
+                _ => None,
+            };
+
+            let expected_hash_count = if let sqllogictest::Record::Query {
+                expected: QueryExpect::Results { results, .. },
+                ..
+            } = &record
+            {
+                detect_expected_hash_values(results)
+            } else {
+                None
+            };
+
+            let mut previous_hash_threshold = None;
+            if let Some(count) = expected_hash_count
+                && count > 0
+                && (current_hash_threshold == 0 || count <= current_hash_threshold)
+            {
+                let forced = count.saturating_sub(1).max(1);
+                previous_hash_threshold = Some(current_hash_threshold);
+                runner.with_hash_threshold(forced);
+                current_hash_threshold = forced;
+            }
+
             let type_hint = match &record {
                 sqllogictest::Record::Query { expected, .. } => match expected {
                     QueryExpect::Results { types, .. } if !types.is_empty() => Some(types.clone()),
@@ -183,10 +210,23 @@ where
             let _type_guard = type_hint.map(ColumnTypeExpectationGuard::install);
 
             if matches!(&record, sqllogictest::Record::Halt { .. }) {
+                if let Some(prev) = previous_hash_threshold {
+                    runner.with_hash_threshold(prev);
+                }
                 break;
             }
 
             runner.run_async(record).await?;
+
+            if let Some(prev) = previous_hash_threshold {
+                runner.with_hash_threshold(prev);
+                current_hash_threshold = prev;
+            }
+
+            if let Some(new_threshold) = hash_threshold_update {
+                current_hash_threshold = new_threshold;
+                runner.with_hash_threshold(new_threshold);
+            }
         }
         Ok::<(), sqllogictest::TestError>(())
     }
@@ -364,6 +404,23 @@ fn split_diff_values(line: &str) -> Vec<String> {
     }
 
     values
+}
+
+fn detect_expected_hash_values(expected: &[String]) -> Option<usize> {
+    let first = expected.first()?.trim();
+    let mut parts = first.split_whitespace();
+    let count_str = parts.next()?;
+    let count = count_str.parse().ok()?;
+    if parts.next()? != "values" {
+        return None;
+    }
+    if parts.next()? != "hashing" {
+        return None;
+    }
+    if parts.next()? != "to" {
+        return None;
+    }
+    Some(count)
 }
 
 /// Run a single slt file using the provided AsyncDB factory. The factory is

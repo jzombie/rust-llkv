@@ -94,25 +94,45 @@ impl<'a> IdentifierResolver<'a> {
         })?;
 
         let mut effective_parts = parts;
-        if context.table_alias().is_some_and(|alias| {
-            !effective_parts.is_empty() && effective_parts[0].eq_ignore_ascii_case(alias)
-        }) {
-            if effective_parts.len() == 1 {
-                return Err(Error::InvalidArgumentError(format!(
-                    "Binder Error: does not have a column named '{}'",
-                    effective_parts[0]
-                )));
+        if let Some(alias) = context.table_alias() {
+            if !effective_parts.is_empty() && effective_parts[0].eq_ignore_ascii_case(alias) {
+                if effective_parts.len() == 1 {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: does not have a column named '{}'",
+                        effective_parts[0]
+                    )));
+                }
+                effective_parts = &effective_parts[1..];
+            } else if !effective_parts.is_empty() {
+                let canonical_table = table_meta.canonical_table();
+                if effective_parts[0].eq_ignore_ascii_case(canonical_table) {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: table '{}' not found",
+                        effective_parts[0]
+                    )));
+                }
+                if effective_parts.len() >= 2
+                    && let Some(schema) = table_meta.canonical_schema()
+                    && effective_parts[0].eq_ignore_ascii_case(schema)
+                    && effective_parts[1].eq_ignore_ascii_case(canonical_table)
+                {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: table '{}' not found",
+                        effective_parts[1]
+                    )));
+                }
             }
-            effective_parts = &effective_parts[1..];
         }
 
-        resolve_identifier_parts(effective_parts, &table_meta)
+        let alias_active = context.table_alias().is_some();
+        resolve_identifier_parts(effective_parts, &table_meta, alias_active)
     }
 }
 
 fn resolve_identifier_parts(
     parts: &[String],
     table_meta: &TableMetadataView,
+    alias_active: bool,
 ) -> Result<ColumnResolution> {
     let canonical_table = table_meta.canonical_table().to_string();
     let canonical_schema = table_meta.canonical_schema().map(str::to_string);
@@ -120,32 +140,35 @@ fn resolve_identifier_parts(
 
     let mut column_start_idx = 0usize;
 
-    if let Some(schema) = canonical_schema.as_deref() {
-        let schema_then_table = canonical_parts.len() == 2
-            && canonical_parts[0] == schema
-            && canonical_parts[1] == canonical_table;
-        let starts_with_table = canonical_parts.len() >= 2 && canonical_parts[0] == canonical_table;
+    if !alias_active {
+        if let Some(schema) = canonical_schema.as_deref() {
+            let schema_then_table = canonical_parts.len() == 2
+                && canonical_parts[0] == schema
+                && canonical_parts[1] == canonical_table;
+            let starts_with_table =
+                canonical_parts.len() >= 2 && canonical_parts[0] == canonical_table;
 
-        if canonical_parts.len() >= 3
-            && canonical_parts[0] == schema
-            && canonical_parts[1] == canonical_table
-        {
-            column_start_idx = 2;
-        } else if schema_then_table || starts_with_table {
+            if canonical_parts.len() >= 3
+                && canonical_parts[0] == schema
+                && canonical_parts[1] == canonical_table
+            {
+                column_start_idx = 2;
+            } else if schema_then_table || starts_with_table {
+                column_start_idx = 1;
+            } else if canonical_parts.len() >= 3 && canonical_parts[1] == canonical_table {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Binder Error: table '{}' not found",
+                    parts[0]
+                )));
+            } else if canonical_parts.len() >= 3 && canonical_parts[0] == schema {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Binder Error: table '{}' not found",
+                    parts[1]
+                )));
+            }
+        } else if canonical_parts.len() >= 2 && canonical_parts[0] == canonical_table {
             column_start_idx = 1;
-        } else if canonical_parts.len() >= 3 && canonical_parts[1] == canonical_table {
-            return Err(Error::InvalidArgumentError(format!(
-                "Binder Error: table '{}' not found",
-                parts[0]
-            )));
-        } else if canonical_parts.len() >= 3 && canonical_parts[0] == schema {
-            return Err(Error::InvalidArgumentError(format!(
-                "Binder Error: table '{}' not found",
-                parts[1]
-            )));
         }
-    } else if canonical_parts.len() >= 2 && canonical_parts[0] == canonical_table {
-        column_start_idx = 1;
     }
 
     if column_start_idx >= parts.len() {

@@ -31,6 +31,28 @@ pub enum Expr<'a, F> {
     /// A literal boolean value (true/false).
     /// Used for conditions that are always true or always false (e.g., empty IN lists).
     Literal(bool),
+    /// Correlated subquery evaluated in a boolean context.
+    Exists(SubqueryExpr),
+}
+
+/// Metadata describing a correlated subquery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct SubqueryId(pub u32);
+
+/// Correlated subquery used within a predicate expression.
+#[derive(Clone, Debug)]
+pub struct SubqueryExpr {
+    /// Identifier referencing the subquery definition attached to the parent filter.
+    pub id: SubqueryId,
+    /// True when the SQL contained `NOT EXISTS`.
+    pub negated: bool,
+}
+
+/// Scalar subquery evaluated as part of a scalar expression.
+#[derive(Clone, Debug)]
+pub struct ScalarSubqueryExpr {
+    /// Identifier referencing the subquery definition attached to the parent projection.
+    pub id: SubqueryId,
 }
 
 impl<'a, F> Expr<'a, F> {
@@ -78,6 +100,23 @@ pub enum ScalarExpr<F> {
     Cast {
         expr: Box<ScalarExpr<F>>,
         data_type: DataType,
+    },
+    /// Comparison producing a boolean (1/0) result.
+    Compare {
+        left: Box<ScalarExpr<F>>,
+        op: CompareOp,
+        right: Box<ScalarExpr<F>>,
+    },
+    /// Scalar subquery evaluated per input row.
+    ScalarSubquery(ScalarSubqueryExpr),
+    /// SQL CASE expression with optional operand and ELSE branch.
+    Case {
+        /// Optional operand for simple CASE (e.g., `CASE x WHEN ...`).
+        operand: Option<Box<ScalarExpr<F>>>,
+        /// Ordered (WHEN, THEN) branches.
+        branches: Vec<(ScalarExpr<F>, ScalarExpr<F>)>,
+        /// Optional ELSE result.
+        else_expr: Option<Box<ScalarExpr<F>>>,
     },
 }
 
@@ -130,6 +169,33 @@ impl<F> ScalarExpr<F> {
         Self::Cast {
             expr: Box::new(expr),
             data_type,
+        }
+    }
+
+    #[inline]
+    pub fn compare(left: Self, op: CompareOp, right: Self) -> Self {
+        Self::Compare {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    }
+
+    #[inline]
+    pub fn scalar_subquery(id: SubqueryId) -> Self {
+        Self::ScalarSubquery(ScalarSubqueryExpr { id })
+    }
+
+    #[inline]
+    pub fn case(
+        operand: Option<Self>,
+        branches: Vec<(Self, Self)>,
+        else_expr: Option<Self>,
+    ) -> Self {
+        Self::Case {
+            operand: operand.map(Box::new),
+            branches,
+            else_expr: else_expr.map(Box::new),
         }
     }
 }
