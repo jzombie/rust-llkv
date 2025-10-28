@@ -211,6 +211,25 @@ where
         }
     }
 
+    /// Execute a compound SELECT query (UNION, EXCEPT, INTERSECT).
+    ///
+    /// Evaluates the initial SELECT and each subsequent operation, combining results
+    /// according to the specified operator and quantifier. Handles deduplication for
+    /// DISTINCT quantifiers using hash-based row encoding.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - SELECT plan containing compound operations
+    /// * `row_filter` - Optional row ID filter to apply to all component queries
+    ///
+    /// # Implementation Notes
+    ///
+    /// - UNION ALL: Simple concatenation with no deduplication
+    /// - UNION DISTINCT: Hash-based deduplication across all rows
+    /// - EXCEPT DISTINCT: Removes right-side rows from left-side results
+    /// - INTERSECT DISTINCT: Keeps only rows present in both sides
+    /// - EXCEPT ALL: Not yet implemented
+    /// - INTERSECT ALL: Not yet implemented
     fn execute_compound_select(
         &self,
         plan: SelectPlan,
@@ -4686,6 +4705,35 @@ type JoinMatchIndices = Vec<(usize, usize)>;
 /// Type alias for hash table mapping join keys to row positions
 type JoinHashTable = FxHashMap<Vec<u8>, Vec<(usize, usize)>>;
 
+/// Build hash join match indices using parallel hash table construction and probing.
+///
+/// Constructs a hash table from the right batches (build phase), then probes it with
+/// rows from the left batches to find matches. Both phases are parallelized using Rayon.
+///
+/// # Parallelization Strategy
+///
+/// **Build Phase**: Each right batch is processed in parallel. Each thread builds a local
+/// hash table for its batch(es), then all local tables are merged into a single shared
+/// hash table. This eliminates lock contention during the build phase.
+///
+/// **Probe Phase**: Each left batch is probed against the shared hash table in parallel.
+/// Each thread generates local match lists which are concatenated at the end.
+///
+/// # Arguments
+///
+/// * `left_batches` - Batches to probe against the hash table
+/// * `right_batches` - Batches used to build the hash table
+/// * `join_keys` - Column indices for join keys: (left_column_idx, right_column_idx)
+///
+/// # Returns
+///
+/// Tuple of `(left_matches, right_matches)` where each vector contains (batch_idx, row_idx)
+/// pairs indicating which rows from left and right should be joined together.
+///
+/// # Performance
+///
+/// Scales with available CPU cores via `llkv_column_map::parallel::with_thread_pool()`.
+/// Respects `LLKV_MAX_THREADS` environment variable for thread pool sizing.
 fn build_join_match_indices(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
@@ -5143,6 +5191,30 @@ fn table_column_suffix(name: &str) -> Option<String> {
     Some(format!("{}.{}", table, column))
 }
 
+/// Combine two table batch sets into a cartesian product using parallel processing.
+///
+/// For each pair of (left_batch, right_batch), generates the cross product using
+/// [`llkv_join::cross_join_pair`]. The computation is parallelized across all batch
+/// pairs since they are independent.
+///
+/// # Parallelization
+///
+/// Uses nested parallel iteration via Rayon:
+/// - Outer loop: parallel iteration over left batches
+/// - Inner loop: parallel iteration over right batches
+/// - Each (left, right) pair is processed independently
+///
+/// This effectively distributes N×M batch pairs across available CPU cores, providing
+/// significant speedup for multi-batch joins.
+///
+/// # Arguments
+///
+/// * `left` - Left side table data with batches
+/// * `right` - Right side table data with batches
+///
+/// # Returns
+///
+/// Combined table data containing the cartesian product of all left and right rows.
 fn cross_join_table_batches(
     left: TableCrossProductData,
     right: TableCrossProductData,
@@ -5260,6 +5332,32 @@ struct JoinConstraintPlan {
     handled_conjuncts: usize,
 }
 
+/// Extract join constraints from a WHERE clause predicate for hash join optimization.
+///
+/// Analyzes the predicate to identify:
+/// - **Equality constraints**: column-to-column equalities for hash join keys
+/// - **Literal constraints**: column-to-literal comparisons that can be pushed down
+/// - **Unsatisfiable conditions**: `WHERE false` that makes result set empty
+///
+/// Returns `None` if the predicate structure is too complex for optimization (e.g.,
+/// contains OR, NOT, or other non-conjunctive patterns).
+///
+/// # Partial Handling
+///
+/// The optimizer tracks `handled_conjuncts` vs `total_conjuncts`. If some predicates
+/// cannot be optimized (e.g., complex expressions, unsupported operators), they are
+/// left for post-join filtering. This allows partial optimization rather than falling
+/// back to full cartesian product.
+///
+/// # Arguments
+///
+/// * `expr` - WHERE clause expression to analyze
+/// * `table_infos` - Metadata about tables in the query (for column resolution)
+///
+/// # Returns
+///
+/// * `Some(JoinConstraintPlan)` - Successfully extracted constraints
+/// * `None` - Predicate cannot be optimized (fall back to cartesian product)
 fn extract_join_constraints(
     expr: &LlkvExpr<'static, String>,
     table_infos: &[TableInfo<'_>],
