@@ -3515,7 +3515,7 @@ where
         resolver: &IdentifierResolver<'_>,
         outer_scopes: &[IdentifierContext],
         subqueries: &mut Vec<llkv_plan::FilterSubquery>,
-    correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
+        correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
     ) -> SqlResult<SelectPlan> {
         if self.engine.session().has_active_transaction() && self.engine.session().is_aborted() {
             return Err(Error::TransactionContextError(
@@ -3573,7 +3573,7 @@ where
         resolver: &IdentifierResolver<'_>,
         outer_scopes: &[IdentifierContext],
         subqueries: &mut Vec<llkv_plan::FilterSubquery>,
-    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
+        mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
     ) -> SqlResult<(SelectPlan, IdentifierContext)> {
         let distinct = match &select.distinct {
             None => false,
@@ -4067,7 +4067,7 @@ where
         projection_items: &[SelectItem],
         outer_scopes: &[IdentifierContext],
         scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
-    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
+        mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
     ) -> SqlResult<Vec<SelectProjection>> {
         if projection_items.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -6253,7 +6253,7 @@ where
         let mut nested_scopes = outer_scopes.to_vec();
         nested_scopes.push(context.clone());
 
-    let mut tracker = SubqueryCorrelatedColumnTracker::new();
+        let mut tracker = SubqueryCorrelatedColumnTracker::new();
         let mut nested_filter_subqueries = Vec::new();
 
         let plan = self.engine.build_select_plan_internal(

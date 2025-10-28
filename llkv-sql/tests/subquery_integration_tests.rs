@@ -87,21 +87,24 @@ fn scalar_subquery_with_nested_filter_exists() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 2, "expected two result rows");
 
-    let names = batch.column(0)
+    let names = batch
+        .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("downcast names column to StringArray");
     assert_eq!(names.value(0), "alice", "expected first customer");
     assert_eq!(names.value(1), "bob", "expected second customer");
 
-    let nested_prices = batch.column(1)
+    let nested_prices = batch
+        .column(1)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("downcast nested_price column to Int64Array");
     assert_eq!(nested_prices.value(0), 20, "expected alice nested price");
     assert_eq!(nested_prices.value(1), 20, "expected bob nested price");
 
-    let total_orders = batch.column(2)
+    let total_orders = batch
+        .column(2)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("downcast total_orders column to Int64Array");
