@@ -2126,9 +2126,9 @@ where
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
-            let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
-            let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
-            on_row(row_id, left_val, right_val);
+                let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
+                let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
+                on_row(row_id, left_val, right_val);
             }
 
             Ok(())
@@ -3065,8 +3065,7 @@ fn computed_expr_prefers_float(
 fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
     match expr {
         ScalarExpr::Coalesce(_) => true,
-        ScalarExpr::Binary { left, right, .. }
-        | ScalarExpr::Compare { left, right, .. } => {
+        ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
             scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right)
         }
         ScalarExpr::Cast { expr, .. } => scalar_expr_contains_coalesce(expr),

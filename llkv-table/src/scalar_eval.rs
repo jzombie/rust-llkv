@@ -1464,11 +1464,8 @@ mod tests {
             assert_eq!(actual, *expected, "row {idx} did not match");
         }
 
-        let compare_expr = ScalarExpr::compare(
-            coalesce_expr,
-            CompareOp::NotEq,
-            ScalarExpr::literal(0),
-        );
+        let compare_expr =
+            ScalarExpr::compare(coalesce_expr, CompareOp::NotEq, ScalarExpr::literal(0));
 
         let expected_flags = [Some(1), Some(1), Some(1), Some(1), Some(1), None];
         for (idx, expected) in expected_flags.iter().enumerate() {

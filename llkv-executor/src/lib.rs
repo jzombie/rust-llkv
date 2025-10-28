@@ -34,7 +34,8 @@ use llkv_expr::typed_predicate::{
 };
 use llkv_join::cross_join_pair;
 use llkv_plan::{
-    AggregateExpr, AggregateFunction, CanonicalRow, OrderByPlan, OrderSortType, OrderTarget,
+    AggregateExpr, AggregateFunction, CanonicalRow, CompoundOperator, CompoundQuantifier,
+    CompoundSelectComponent, CompoundSelectPlan, OrderByPlan, OrderSortType, OrderTarget,
     PlanValue, SelectPlan, SelectProjection,
 };
 use llkv_result::Error;
@@ -112,6 +113,10 @@ where
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        if plan.compound.is_some() {
+            return self.execute_compound_select(plan, row_filter);
+        }
+
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
         if plan.tables.is_empty() {
             return self.execute_select_without_table(plan);
@@ -135,6 +140,119 @@ where
         } else {
             self.execute_projection(table, display_name, plan, row_filter)
         }
+    }
+
+    fn execute_compound_select(
+        &self,
+        plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        let order_by = plan.order_by.clone();
+        let compound = plan.compound.expect("compound plan should be present");
+
+        let CompoundSelectPlan {
+            initial,
+            operations,
+        } = compound;
+
+        let initial_exec = self.execute_select_with_filter(*initial, row_filter.clone())?;
+        let schema = initial_exec.schema();
+        let mut rows = initial_exec.into_rows()?;
+        let mut distinct_cache: Option<FxHashSet<Vec<u8>>> = None;
+
+        for component in operations {
+            let exec = self.execute_select_with_filter(component.plan, row_filter.clone())?;
+            let other_schema = exec.schema();
+            ensure_schema_compatibility(schema.as_ref(), other_schema.as_ref())?;
+            let other_rows = exec.into_rows()?;
+
+            match (component.operator, component.quantifier) {
+                (CompoundOperator::Union, CompoundQuantifier::All) => {
+                    rows.extend(other_rows);
+                    distinct_cache = None;
+                }
+                (CompoundOperator::Union, CompoundQuantifier::Distinct) => {
+                    ensure_distinct_rows(&mut rows, &mut distinct_cache);
+                    let cache = distinct_cache
+                        .as_mut()
+                        .expect("distinct cache should be initialized");
+                    for row in other_rows {
+                        let key = encode_row(&row);
+                        if cache.insert(key) {
+                            rows.push(row);
+                        }
+                    }
+                }
+                (CompoundOperator::Except, CompoundQuantifier::Distinct) => {
+                    ensure_distinct_rows(&mut rows, &mut distinct_cache);
+                    let cache = distinct_cache
+                        .as_mut()
+                        .expect("distinct cache should be initialized");
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let mut remove_keys = FxHashSet::default();
+                    for row in other_rows {
+                        remove_keys.insert(encode_row(&row));
+                    }
+                    if remove_keys.is_empty() {
+                        continue;
+                    }
+                    rows.retain(|row| {
+                        let key = encode_row(row);
+                        if remove_keys.contains(&key) {
+                            cache.remove(&key);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                (CompoundOperator::Except, CompoundQuantifier::All) => {
+                    return Err(Error::InvalidArgumentError(
+                        "EXCEPT ALL is not supported yet".into(),
+                    ));
+                }
+                (CompoundOperator::Intersect, CompoundQuantifier::Distinct) => {
+                    ensure_distinct_rows(&mut rows, &mut distinct_cache);
+                    let mut right_keys = FxHashSet::default();
+                    for row in other_rows {
+                        right_keys.insert(encode_row(&row));
+                    }
+                    if right_keys.is_empty() {
+                        rows.clear();
+                        distinct_cache = Some(FxHashSet::default());
+                        continue;
+                    }
+                    let mut new_rows = Vec::new();
+                    let mut new_cache = FxHashSet::default();
+                    for row in rows.drain(..) {
+                        let key = encode_row(&row);
+                        if right_keys.contains(&key) && new_cache.insert(key) {
+                            new_rows.push(row);
+                        }
+                    }
+                    rows = new_rows;
+                    distinct_cache = Some(new_cache);
+                }
+                (CompoundOperator::Intersect, CompoundQuantifier::All) => {
+                    return Err(Error::InvalidArgumentError(
+                        "INTERSECT ALL is not supported yet".into(),
+                    ));
+                }
+            }
+        }
+
+        let mut batch = rows_to_record_batch(schema.clone(), &rows)?;
+        if !order_by.is_empty() && batch.num_rows() > 0 {
+            batch = sort_record_batch_with_order(&schema, &batch, &order_by)?;
+        }
+
+        Ok(SelectExecution::new_single_batch(
+            String::new(),
+            schema,
+            batch,
+        ))
     }
 
     /// Check if any computed projections contain aggregate functions
@@ -2671,6 +2789,20 @@ fn bind_select_plan(
         .map(|subquery| bind_scalar_subquery(subquery, bindings))
         .collect::<ExecutorResult<Vec<_>>>()?;
 
+    if let Some(compound) = &plan.compound {
+        let bound_compound = bind_compound_select(compound, bindings)?;
+        return Ok(SelectPlan {
+            tables: Vec::new(),
+            projections: Vec::new(),
+            filter: None,
+            aggregates: Vec::new(),
+            order_by: plan.order_by.clone(),
+            distinct: false,
+            scalar_subqueries: Vec::new(),
+            compound: Some(bound_compound),
+        });
+    }
+
     Ok(SelectPlan {
         tables: plan.tables.clone(),
         projections,
@@ -2679,6 +2811,134 @@ fn bind_select_plan(
         order_by: Vec::new(),
         distinct: plan.distinct,
         scalar_subqueries,
+        compound: None,
+    })
+}
+
+fn bind_compound_select(
+    compound: &CompoundSelectPlan,
+    bindings: &FxHashMap<String, Literal>,
+) -> ExecutorResult<CompoundSelectPlan> {
+    let initial = bind_select_plan(&compound.initial, bindings)?;
+    let mut operations = Vec::with_capacity(compound.operations.len());
+    for component in &compound.operations {
+        let bound_plan = bind_select_plan(&component.plan, bindings)?;
+        operations.push(CompoundSelectComponent {
+            operator: component.operator.clone(),
+            quantifier: component.quantifier.clone(),
+            plan: bound_plan,
+        });
+    }
+    Ok(CompoundSelectPlan {
+        initial: Box::new(initial),
+        operations,
+    })
+}
+
+fn ensure_schema_compatibility(base: &Schema, other: &Schema) -> ExecutorResult<()> {
+    if base.fields().len() != other.fields().len() {
+        return Err(Error::InvalidArgumentError(
+            "compound SELECT requires matching column counts".into(),
+        ));
+    }
+    for (left, right) in base.fields().iter().zip(other.fields().iter()) {
+        if left.data_type() != right.data_type() {
+            return Err(Error::InvalidArgumentError(format!(
+                "compound SELECT column type mismatch: {} vs {}",
+                left.data_type(),
+                right.data_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_distinct_rows(rows: &mut Vec<Vec<PlanValue>>, cache: &mut Option<FxHashSet<Vec<u8>>>) {
+    if cache.is_some() {
+        return;
+    }
+    let mut set = FxHashSet::default();
+    let mut deduped: Vec<Vec<PlanValue>> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let key = encode_row(&row);
+        if set.insert(key) {
+            deduped.push(row);
+        }
+    }
+    *rows = deduped;
+    *cache = Some(set);
+}
+
+fn encode_row(row: &[PlanValue]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for value in row {
+        encode_plan_value(&mut buf, value);
+        buf.push(0x1F);
+    }
+    buf
+}
+
+fn encode_plan_value(buf: &mut Vec<u8>, value: &PlanValue) {
+    match value {
+        PlanValue::Null => buf.push(0),
+        PlanValue::Integer(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+        PlanValue::Float(v) => {
+            buf.push(2);
+            buf.extend_from_slice(&v.to_bits().to_be_bytes());
+        }
+        PlanValue::String(s) => {
+            buf.push(3);
+            let bytes = s.as_bytes();
+            let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        PlanValue::Struct(map) => {
+            buf.push(4);
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let len = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+            buf.extend_from_slice(&len.to_be_bytes());
+            for (key, val) in entries {
+                let key_bytes = key.as_bytes();
+                let key_len = u32::try_from(key_bytes.len()).unwrap_or(u32::MAX);
+                buf.extend_from_slice(&key_len.to_be_bytes());
+                buf.extend_from_slice(key_bytes);
+                encode_plan_value(buf, val);
+            }
+        }
+    }
+}
+
+fn rows_to_record_batch(
+    schema: Arc<Schema>,
+    rows: &[Vec<PlanValue>],
+) -> ExecutorResult<RecordBatch> {
+    let column_count = schema.fields().len();
+    let mut columns: Vec<Vec<PlanValue>> = vec![Vec::with_capacity(rows.len()); column_count];
+    for row in rows {
+        if row.len() != column_count {
+            return Err(Error::InvalidArgumentError(
+                "compound SELECT produced mismatched column counts".into(),
+            ));
+        }
+        for (idx, value) in row.iter().enumerate() {
+            columns[idx].push(value.clone());
+        }
+    }
+
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_count);
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let array =
+            build_array_for_column(field.data_type(), &columns[idx]).map_err(Error::from)?;
+        arrays.push(array);
+    }
+
+    RecordBatch::try_new(schema, arrays).map_err(|err| {
+        Error::InvalidArgumentError(format!("failed to materialize compound SELECT: {err}"))
     })
 }
 

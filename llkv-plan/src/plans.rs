@@ -633,6 +633,8 @@ pub struct SelectPlan {
     pub aggregates: Vec<AggregateExpr>,
     pub order_by: Vec<OrderByPlan>,
     pub distinct: bool,
+    /// Optional compound (set-operation) plan.
+    pub compound: Option<CompoundSelectPlan>,
 }
 
 impl SelectPlan {
@@ -660,6 +662,7 @@ impl SelectPlan {
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
+            compound: None,
         }
     }
 
@@ -673,6 +676,7 @@ impl SelectPlan {
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
+            compound: None,
         }
     }
 
@@ -705,6 +709,64 @@ impl SelectPlan {
     pub fn with_distinct(mut self, distinct: bool) -> Self {
         self.distinct = distinct;
         self
+    }
+
+    /// Attach a compound (set operation) plan.
+    pub fn with_compound(mut self, compound: CompoundSelectPlan) -> Self {
+        self.compound = Some(compound);
+        self
+    }
+}
+
+/// Set operation applied between SELECT statements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompoundOperator {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// Quantifier associated with set operations (e.g., UNION vs UNION ALL).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompoundQuantifier {
+    Distinct,
+    All,
+}
+
+/// Component of a compound SELECT (set operation).
+#[derive(Clone, Debug)]
+pub struct CompoundSelectComponent {
+    pub operator: CompoundOperator,
+    pub quantifier: CompoundQuantifier,
+    pub plan: SelectPlan,
+}
+
+/// Compound SELECT plan representing a tree of set operations.
+#[derive(Clone, Debug)]
+pub struct CompoundSelectPlan {
+    pub initial: Box<SelectPlan>,
+    pub operations: Vec<CompoundSelectComponent>,
+}
+
+impl CompoundSelectPlan {
+    pub fn new(initial: SelectPlan) -> Self {
+        Self {
+            initial: Box::new(initial),
+            operations: Vec::new(),
+        }
+    }
+
+    pub fn push_operation(
+        &mut self,
+        operator: CompoundOperator,
+        quantifier: CompoundQuantifier,
+        plan: SelectPlan,
+    ) {
+        self.operations.push(CompoundSelectComponent {
+            operator,
+            quantifier,
+            plan,
+        });
     }
 }
 

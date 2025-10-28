@@ -1,0 +1,41 @@
+hash-threshold 0
+
+statement ok
+CREATE TABLE a(x INTEGER)
+
+statement ok
+INSERT INTO a VALUES (1),(2),(2)
+
+statement ok
+CREATE TABLE b(x INTEGER)
+
+statement ok
+INSERT INTO b VALUES (2),(3)
+
+query I rowsort
+SELECT x FROM a
+UNION
+SELECT x FROM b
+----
+1
+2
+3
+
+query I rowsort
+SELECT x FROM a
+UNION ALL
+SELECT x FROM b
+----
+1
+2
+2
+2
+3
+
+query I rowsort
+SELECT x FROM a
+EXCEPT
+SELECT x FROM b
+----
+1
+
