@@ -47,6 +47,7 @@ use llkv_table::table::{
 };
 use llkv_table::types::FieldId;
 use llkv_table::{NumericArray, NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::cell::RefCell;
@@ -4656,45 +4657,95 @@ fn build_join_match_indices(
     right_batches: &[RecordBatch],
     join_keys: &[(usize, usize)],
 ) -> ExecutorResult<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
-    let mut hash_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> = FxHashMap::default();
     let right_key_indices: Vec<usize> = join_keys.iter().map(|(_, right)| *right).collect();
-    let mut key_buffer: Vec<u8> = Vec::new();
 
-    for (batch_idx, batch) in right_batches.iter().enumerate() {
-        for row_idx in 0..batch.num_rows() {
-            key_buffer.clear();
-            if !build_join_key(batch, &right_key_indices, row_idx, &mut key_buffer)? {
-                continue;
+    // Parallelize hash table build phase across batches
+    // Each thread builds a local hash table for its batch(es), then we merge them
+    let hash_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> =
+        llkv_column_map::parallel::with_thread_pool(|| {
+            let local_tables: Vec<FxHashMap<Vec<u8>, Vec<(usize, usize)>>> = right_batches
+                .par_iter()
+                .enumerate()
+                .map(|(batch_idx, batch)| {
+                    let mut local_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> =
+                        FxHashMap::default();
+                    let mut key_buffer: Vec<u8> = Vec::new();
+
+                    for row_idx in 0..batch.num_rows() {
+                        key_buffer.clear();
+                        match build_join_key(batch, &right_key_indices, row_idx, &mut key_buffer)
+                        {
+                            Ok(true) => {
+                                local_table
+                                    .entry(key_buffer.clone())
+                                    .or_default()
+                                    .push((batch_idx, row_idx));
+                            }
+                            Ok(false) => continue,
+                            Err(_) => continue, // Skip rows with errors during parallel build
+                        }
+                    }
+
+                    local_table
+                })
+                .collect();
+
+            // Merge all local hash tables into one
+            let mut merged_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> = FxHashMap::default();
+            for local_table in local_tables {
+                for (key, mut positions) in local_table {
+                    merged_table.entry(key).or_default().append(&mut positions);
+                }
             }
-            hash_table
-                .entry(key_buffer.clone())
-                .or_default()
-                .push((batch_idx, row_idx));
-        }
-    }
+
+            merged_table
+        });
 
     if hash_table.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
 
     let left_key_indices: Vec<usize> = join_keys.iter().map(|(left, _)| *left).collect();
+
+    // Parallelize probe phase across left batches
+    // Each thread probes its batch(es) against the shared hash table
+    let matches: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)> =
+        llkv_column_map::parallel::with_thread_pool(|| {
+            left_batches
+                .par_iter()
+                .enumerate()
+                .map(|(batch_idx, batch)| {
+                    let mut local_left_matches: Vec<(usize, usize)> = Vec::new();
+                    let mut local_right_matches: Vec<(usize, usize)> = Vec::new();
+                    let mut key_buffer: Vec<u8> = Vec::new();
+
+                    for row_idx in 0..batch.num_rows() {
+                        key_buffer.clear();
+                        match build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer) {
+                            Ok(true) => {
+                                if let Some(entries) = hash_table.get(&key_buffer) {
+                                    for &(r_batch, r_row) in entries {
+                                        local_left_matches.push((batch_idx, row_idx));
+                                        local_right_matches.push((r_batch, r_row));
+                                    }
+                                }
+                            }
+                            Ok(false) => continue,
+                            Err(_) => continue, // Skip rows with errors during parallel probe
+                        }
+                    }
+
+                    (local_left_matches, local_right_matches)
+                })
+                .collect()
+        });
+
+    // Merge all match results
     let mut left_matches: Vec<(usize, usize)> = Vec::new();
     let mut right_matches: Vec<(usize, usize)> = Vec::new();
-
-    for (batch_idx, batch) in left_batches.iter().enumerate() {
-        for row_idx in 0..batch.num_rows() {
-            key_buffer.clear();
-            if !build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer)? {
-                continue;
-            }
-
-            if let Some(entries) = hash_table.get(&key_buffer) {
-                for &(r_batch, r_row) in entries {
-                    left_matches.push((batch_idx, row_idx));
-                    right_matches.push((r_batch, r_row));
-                }
-            }
-        }
+    for (mut left, mut right) in matches {
+        left_matches.append(&mut left);
+        right_matches.append(&mut right);
     }
 
     Ok((left_matches, right_matches))
@@ -5107,23 +5158,23 @@ fn cross_join_table_batches(
         });
     }
 
-    let mut output_batches = Vec::new();
-    for left_batch in &left_batches {
-        if left_batch.num_rows() == 0 {
-            continue;
-        }
-        for right_batch in &right_batches {
-            if right_batch.num_rows() == 0 {
-                continue;
-            }
-
-            let batch =
-                cross_join_pair(left_batch, right_batch, &combined_schema).map_err(|err| {
-                    Error::Internal(format!("failed to build cross join batch: {err}"))
-                })?;
-            output_batches.push(batch);
-        }
-    }
+    // Parallelize cross join batch generation using nested parallel iteration
+    // This is safe because cross_join_pair is pure and each batch pair is independent
+    let output_batches: Vec<RecordBatch> = llkv_column_map::parallel::with_thread_pool(|| {
+        left_batches
+            .par_iter()
+            .filter(|left_batch| left_batch.num_rows() > 0)
+            .flat_map(|left_batch| {
+                right_batches
+                    .par_iter()
+                    .filter(|right_batch| right_batch.num_rows() > 0)
+                    .filter_map(|right_batch| {
+                        cross_join_pair(left_batch, right_batch, &combined_schema).ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    });
 
     Ok(TableCrossProductData {
         schema: combined_schema,

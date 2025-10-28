@@ -18,6 +18,7 @@ llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
+rayon.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle.workspace = true
 tracing.workspace = true

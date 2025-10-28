@@ -1489,6 +1489,7 @@ dependencies = [
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",
+ "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "time",
