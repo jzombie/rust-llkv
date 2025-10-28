@@ -175,10 +175,10 @@ fn expression_uses_float(
                     return Ok(true);
                 }
             }
-            if let Some(inner) = else_expr.as_deref() {
-                if expression_uses_float(schema, inner)? {
-                    return Ok(true);
-                }
+            if let Some(inner) = else_expr.as_deref()
+                && expression_uses_float(schema, inner)?
+            {
+                return Ok(true);
             }
             Ok(false)
         }

@@ -15,9 +15,9 @@
 //! in a future refactoring.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int64Builder, Int8Array, LargeStringArray, RecordBatch, StringArray,
-    StructArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array, new_null_array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, Int64Builder, LargeStringArray, RecordBatch, StringArray,
+    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
@@ -26,9 +26,9 @@ use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
+use llkv_expr::SubqueryId;
 use llkv_expr::expr::{AggregateCall, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
-use llkv_expr::SubqueryId;
 use llkv_expr::typed_predicate::{
     build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
@@ -47,10 +47,10 @@ use llkv_table::types::FieldId;
 use llkv_table::{NumericArray, NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
+use std::convert::TryFrom;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::convert::TryFrom;
 
 // ============================================================================
 // Module Declarations
@@ -239,7 +239,8 @@ where
         if rows_seen == 0 {
             Ok(Literal::Null)
         } else {
-            result.ok_or_else(|| Error::Internal("scalar subquery evaluation missing result".into()))
+            result
+                .ok_or_else(|| Error::Internal("scalar subquery evaluation missing result".into()))
         }
     }
 
@@ -253,7 +254,8 @@ where
         let mut all_integer = true;
 
         for row_idx in 0..batch.num_rows() {
-            let literal = self.evaluate_scalar_subquery_literal(context, subquery, batch, row_idx)?;
+            let literal =
+                self.evaluate_scalar_subquery_literal(context, subquery, batch, row_idx)?;
             match literal {
                 Literal::Null => values.push(None),
                 Literal::Integer(value) => {
@@ -283,10 +285,10 @@ where
         if all_integer {
             let iter = values.into_iter().map(|opt| opt.map(|v| v as i64));
             let array = Int64Array::from_iter(iter);
-            NumericArray::try_from_arrow(&(Arc::new(array) as ArrayRef)).map_err(Error::from)
+            NumericArray::try_from_arrow(&(Arc::new(array) as ArrayRef))
         } else {
             let array = Float64Array::from_iter(values);
-            NumericArray::try_from_arrow(&(Arc::new(array) as ArrayRef)).map_err(Error::from)
+            NumericArray::try_from_arrow(&(Arc::new(array) as ArrayRef))
         }
     }
 
@@ -309,9 +311,9 @@ where
 
         let mut mapping: FxHashMap<SubqueryId, FieldId> = FxHashMap::default();
         for subquery_id in subquery_ids {
-            let info = scalar_lookup.get(&subquery_id).ok_or_else(|| {
-                Error::Internal("missing scalar subquery metadata".into())
-            })?;
+            let info = scalar_lookup
+                .get(&subquery_id)
+                .ok_or_else(|| Error::Internal("missing scalar subquery metadata".into()))?;
             let field_id = context.allocate_synthetic_field_id()?;
             let numeric = self.evaluate_scalar_subquery_numeric(context, info, batch)?;
             context.numeric_cache.insert(field_id, numeric);
@@ -545,11 +547,11 @@ where
             })?
         };
 
-        let scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> =
-            plan.scalar_subqueries
-                .iter()
-                .map(|subquery| (subquery.id, subquery))
-                .collect();
+        let scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> = plan
+            .scalar_subqueries
+            .iter()
+            .map(|subquery| (subquery.id, subquery))
+            .collect();
 
         // Apply SELECT projections if specified
         if !plan.projections.is_empty() {
@@ -668,12 +670,7 @@ where
             .is_some_and(|filter| !filter.subqueries.is_empty())
             || !plan.scalar_subqueries.is_empty()
         {
-            return self.execute_projection_with_subqueries(
-                table,
-                display_name,
-                plan,
-                row_filter,
-            );
+            return self.execute_projection_with_subqueries(table, display_name, plan, row_filter);
         }
 
         let table_ref = table.as_ref();
@@ -775,24 +772,26 @@ where
     ) -> ExecutorResult<SelectExecution<P>> {
         let table_ref = table.as_ref();
 
-        let (output_scan_projections, effective_projections): (Vec<ScanProjection>, Vec<SelectProjection>) =
-            if plan.projections.is_empty() {
-                (
-                    build_wildcard_projections(table_ref),
-                    vec![SelectProjection::AllColumns],
-                )
-            } else {
-                (
-                    build_projected_columns(table_ref, &plan.projections)?,
-                    plan.projections.clone(),
-                )
-            };
+        let (output_scan_projections, effective_projections): (
+            Vec<ScanProjection>,
+            Vec<SelectProjection>,
+        ) = if plan.projections.is_empty() {
+            (
+                build_wildcard_projections(table_ref),
+                vec![SelectProjection::AllColumns],
+            )
+        } else {
+            (
+                build_projected_columns(table_ref, &plan.projections)?,
+                plan.projections.clone(),
+            )
+        };
 
-        let scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> =
-            plan.scalar_subqueries
-                .iter()
-                .map(|subquery| (subquery.id, subquery))
-                .collect();
+        let scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> = plan
+            .scalar_subqueries
+            .iter()
+            .map(|subquery| (subquery.id, subquery))
+            .collect();
 
         let base_projections = build_wildcard_projections(table_ref);
 
@@ -881,12 +880,9 @@ where
                         translated,
                         &batch,
                         |ctx, subquery_expr, row_idx, current_batch| {
-                            let subquery = subquery_lookup
-                                .get(&subquery_expr.id)
-                                .ok_or_else(|| {
-                                    Error::Internal(
-                                        "missing correlated subquery metadata".into(),
-                                    )
+                            let subquery =
+                                subquery_lookup.get(&subquery_expr.id).ok_or_else(|| {
+                                    Error::Internal("missing correlated subquery metadata".into())
                                 })?;
                             let exists = self.evaluate_exists_subquery(
                                 ctx,
@@ -894,7 +890,11 @@ where
                                 current_batch,
                                 row_idx,
                             )?;
-                            let value = if subquery_expr.negated { !exists } else { exists };
+                            let value = if subquery_expr.negated {
+                                !exists
+                            } else {
+                                exists
+                            };
                             Ok(Some(value))
                         },
                     ) {
@@ -1018,8 +1018,10 @@ where
                     break;
                 }
                 SelectProjection::AllColumnsExcept { exclude } => {
-                    let exclude_lower: FxHashSet<String> =
-                        exclude.iter().map(|name| name.to_ascii_lowercase()).collect();
+                    let exclude_lower: FxHashSet<String> = exclude
+                        .iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect();
                     for (idx, field) in schema.fields().iter().enumerate() {
                         let column_name = field.name().to_ascii_lowercase();
                         if !exclude_lower.contains(&column_name) {
@@ -1057,12 +1059,8 @@ where
                         .as_mut()
                         .expect("projection context must be initialized");
                     context.reset();
-                    let evaluated = self.evaluate_projection_expression(
-                        context,
-                        expr,
-                        batch,
-                        scalar_lookup,
-                    )?;
+                    let evaluated =
+                        self.evaluate_projection_expression(context, expr, batch, scalar_lookup)?;
                     let field = Arc::new(Field::new(
                         alias.clone(),
                         evaluated.data_type().clone(),
@@ -2064,9 +2062,7 @@ impl CrossProductExpressionContext {
     }
 
     fn field_id_for_column(&self, name: &str) -> Option<FieldId> {
-        self.schema
-            .resolve(name)
-            .map(|column| column.field_id)
+        self.schema.resolve(name).map(|column| column.field_id)
     }
 
     fn reset(&mut self) {
@@ -2085,6 +2081,7 @@ impl CrossProductExpressionContext {
         Ok(field_id)
     }
 
+    #[cfg(test)]
     fn evaluate(
         &mut self,
         expr: &ScalarExpr<String>,
@@ -2681,7 +2678,10 @@ fn bind_select_filter(
         .map(|subquery| bind_filter_subquery(subquery, bindings))
         .collect::<ExecutorResult<Vec<_>>>()?;
 
-    Ok(llkv_plan::SelectFilter { predicate, subqueries })
+    Ok(llkv_plan::SelectFilter {
+        predicate,
+        subqueries,
+    })
 }
 
 fn bind_filter_subquery(
@@ -2790,8 +2790,7 @@ fn bind_scalar_expr(
             let bound_base = bind_scalar_expr(base, bindings)?;
             match bound_base {
                 ScalarExpr::Literal(literal) => {
-                    let value = extract_struct_field(&literal, field_name)
-                        .unwrap_or(Literal::Null);
+                    let value = extract_struct_field(&literal, field_name).unwrap_or(Literal::Null);
                     Ok(ScalarExpr::Literal(value))
                 }
                 other => Ok(ScalarExpr::GetField {
@@ -2894,46 +2893,37 @@ fn bind_filter_predicate(
     Ok(LlkvExpr::Pred(filter.clone()))
 }
 
-fn evaluate_filter_against_literal(
-    value: &Literal,
-    op: &Operator,
-) -> ExecutorResult<bool> {
+fn evaluate_filter_against_literal(value: &Literal, op: &Operator) -> ExecutorResult<bool> {
     use std::ops::Bound;
 
     match op {
         Operator::IsNull => Ok(matches!(value, Literal::Null)),
         Operator::IsNotNull => Ok(!matches!(value, Literal::Null)),
         Operator::Equals(rhs) => Ok(literal_equals(value, rhs).unwrap_or(false)),
-        Operator::GreaterThan(rhs) => Ok(
-            literal_compare(value, rhs)
-                .map(|cmp| cmp == std::cmp::Ordering::Greater)
-                .unwrap_or(false),
-        ),
-        Operator::GreaterThanOrEquals(rhs) => Ok(
-            literal_compare(value, rhs)
-                .map(|cmp| matches!(cmp, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
-                .unwrap_or(false),
-        ),
-        Operator::LessThan(rhs) => Ok(
-            literal_compare(value, rhs)
-                .map(|cmp| cmp == std::cmp::Ordering::Less)
-                .unwrap_or(false),
-        ),
-        Operator::LessThanOrEquals(rhs) => Ok(
-            literal_compare(value, rhs)
-                .map(|cmp| matches!(cmp, std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
-                .unwrap_or(false),
-        ),
+        Operator::GreaterThan(rhs) => Ok(literal_compare(value, rhs)
+            .map(|cmp| cmp == std::cmp::Ordering::Greater)
+            .unwrap_or(false)),
+        Operator::GreaterThanOrEquals(rhs) => Ok(literal_compare(value, rhs)
+            .map(|cmp| matches!(cmp, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+            .unwrap_or(false)),
+        Operator::LessThan(rhs) => Ok(literal_compare(value, rhs)
+            .map(|cmp| cmp == std::cmp::Ordering::Less)
+            .unwrap_or(false)),
+        Operator::LessThanOrEquals(rhs) => Ok(literal_compare(value, rhs)
+            .map(|cmp| matches!(cmp, std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
+            .unwrap_or(false)),
         Operator::In(values) => Ok(values
             .iter()
             .any(|candidate| literal_equals(value, candidate).unwrap_or(false))),
         Operator::Range { lower, upper } => {
             let lower_ok = match lower {
                 Bound::Unbounded => Some(true),
-                Bound::Included(bound) => literal_compare(value, bound)
-                    .map(|cmp| matches!(cmp, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
-                Bound::Excluded(bound) => literal_compare(value, bound)
-                    .map(|cmp| cmp == std::cmp::Ordering::Greater),
+                Bound::Included(bound) => literal_compare(value, bound).map(|cmp| {
+                    matches!(cmp, std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                }),
+                Bound::Excluded(bound) => {
+                    literal_compare(value, bound).map(|cmp| cmp == std::cmp::Ordering::Greater)
+                }
             }
             .unwrap_or(false);
 
@@ -2941,8 +2931,9 @@ fn evaluate_filter_against_literal(
                 Bound::Unbounded => Some(true),
                 Bound::Included(bound) => literal_compare(value, bound)
                     .map(|cmp| matches!(cmp, std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
-                Bound::Excluded(bound) => literal_compare(value, bound)
-                    .map(|cmp| cmp == std::cmp::Ordering::Less),
+                Bound::Excluded(bound) => {
+                    literal_compare(value, bound).map(|cmp| cmp == std::cmp::Ordering::Less)
+                }
             }
             .unwrap_or(false);
 
@@ -3015,7 +3006,7 @@ fn literal_equals(lhs: &Literal, rhs: &Literal) -> Option<bool> {
     }
 }
 
-fn literal_string<'a>(literal: &'a Literal, case_sensitive: bool) -> Option<String> {
+fn literal_string(literal: &Literal, case_sensitive: bool) -> Option<String> {
     match literal {
         Literal::String(value) => {
             if case_sensitive {
@@ -3155,10 +3146,7 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
     }
 }
 
-fn collect_scalar_subquery_ids(
-    expr: &ScalarExpr<FieldId>,
-    ids: &mut FxHashSet<SubqueryId>,
-) {
+fn collect_scalar_subquery_ids(expr: &ScalarExpr<FieldId>, ids: &mut FxHashSet<SubqueryId>) {
     match expr {
         ScalarExpr::ScalarSubquery(subquery) => {
             ids.insert(subquery.id);
@@ -3193,9 +3181,7 @@ fn collect_scalar_subquery_ids(
                 collect_scalar_subquery_ids(else_expr, ids);
             }
         }
-        ScalarExpr::Aggregate(_)
-        | ScalarExpr::Column(_)
-        | ScalarExpr::Literal(_) => {}
+        ScalarExpr::Aggregate(_) | ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
     }
 }
 
@@ -3266,12 +3252,14 @@ fn collect_correlated_bindings(
             ));
         }
 
-        let field_id = context.field_id_for_column(&correlated.column).ok_or_else(|| {
-            Error::InvalidArgumentError(format!(
-                "correlated column '{}' not found in outer query output",
-                correlated.column
-            ))
-        })?;
+        let field_id = context
+            .field_id_for_column(&correlated.column)
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "correlated column '{}' not found in outer query output",
+                    correlated.column
+                ))
+            })?;
 
         let accessor = context.column_accessor(field_id, batch)?;
         let literal = accessor.literal_at(row_idx)?;

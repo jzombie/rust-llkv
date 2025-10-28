@@ -2996,10 +2996,10 @@ fn computed_expr_prefers_float(
             branches,
             else_expr,
         } => {
-            if let Some(inner) = operand.as_deref() {
-                if computed_expr_prefers_float(inner, table_id, lfid_dtypes)? {
-                    return Ok(true);
-                }
+            if let Some(inner) = operand.as_deref()
+                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
+            {
+                return Ok(true);
             }
             for (when_expr, then_expr) in branches {
                 if computed_expr_prefers_float(when_expr, table_id, lfid_dtypes)?
@@ -3008,10 +3008,10 @@ fn computed_expr_prefers_float(
                     return Ok(true);
                 }
             }
-            if let Some(inner) = else_expr.as_deref() {
-                if computed_expr_prefers_float(inner, table_id, lfid_dtypes)? {
-                    return Ok(true);
-                }
+            if let Some(inner) = else_expr.as_deref()
+                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
+            {
+                return Ok(true);
             }
             Ok(false)
         }

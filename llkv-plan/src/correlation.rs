@@ -1,6 +1,6 @@
 use crate::plans::CorrelatedColumn;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 /// Prefix applied to synthetic field placeholders injected for correlated columns.
 pub const CORRELATED_PLACEHOLDER_PREFIX: &str = "__llkv_outer$";
@@ -38,11 +38,7 @@ impl CorrelatedColumnTracker {
     }
 
     /// Return the placeholder name for the given column/field path pair, creating it when absent.
-    pub fn placeholder_for_column_path(
-        &mut self,
-        column: &str,
-        field_path: &[String],
-    ) -> String {
+    pub fn placeholder_for_column_path(&mut self, column: &str, field_path: &[String]) -> String {
         let key = OuterColumnKey::new(column, field_path);
         match self.placeholders.entry(key) {
             Entry::Occupied(existing) => correlated_placeholder(*existing.get()),
@@ -108,7 +104,7 @@ impl<'a> CorrelatedTracker<'a> {
     #[inline]
     pub fn reborrow(&mut self) -> CorrelatedTracker<'_> {
         match self {
-            CorrelatedTracker::Active(tracker) => CorrelatedTracker::Active(&mut **tracker),
+            CorrelatedTracker::Active(tracker) => CorrelatedTracker::Active(tracker),
             CorrelatedTracker::Inactive => CorrelatedTracker::Inactive,
         }
     }

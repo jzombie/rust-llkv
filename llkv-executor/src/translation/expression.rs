@@ -298,9 +298,7 @@ where
                 else_expr: translated_else.map(Box::new),
             })
         }
-        ScalarExpr::ScalarSubquery(subquery) => {
-            Ok(ScalarExpr::ScalarSubquery(subquery.clone()))
-        }
+        ScalarExpr::ScalarSubquery(subquery) => Ok(ScalarExpr::ScalarSubquery(subquery.clone())),
     }
 }
 

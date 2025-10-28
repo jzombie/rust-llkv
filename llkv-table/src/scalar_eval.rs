@@ -487,7 +487,7 @@ impl NumericKernels {
                         }
                     } else {
                         let cond_val = Self::evaluate_value(when_expr, idx, arrays)?;
-                        cond_val.map_or(false, Self::truthy_numeric)
+                        cond_val.is_some_and(Self::truthy_numeric)
                     };
 
                     if matched {
@@ -501,11 +501,9 @@ impl NumericKernels {
                     Ok(None)
                 }
             }
-            ScalarExpr::ScalarSubquery(_) => {
-                Err(Error::Internal(
-                    "Scalar subquery evaluation requires a separate execution context".into(),
-                ))
-            }
+            ScalarExpr::ScalarSubquery(_) => Err(Error::Internal(
+                "Scalar subquery evaluation requires a separate execution context".into(),
+            )),
         }
     }
 
@@ -1133,12 +1131,11 @@ impl NumericKernels {
                         break;
                     }
                 }
-                if result_kind != NumericKind::Float {
-                    if let Some(inner) = else_expr.as_deref() {
-                        if matches!(Self::infer_result_kind(inner, arrays), NumericKind::Float) {
-                            result_kind = NumericKind::Float;
-                        }
-                    }
+                if result_kind != NumericKind::Float
+                    && let Some(inner) = else_expr.as_deref()
+                    && matches!(Self::infer_result_kind(inner, arrays), NumericKind::Float)
+                {
+                    result_kind = NumericKind::Float;
                 }
                 result_kind
             }
@@ -1182,15 +1179,12 @@ impl NumericKernels {
                         break;
                     }
                 }
-                if result_kind != NumericKind::Float {
-                    if let Some(inner) = else_expr.as_deref() {
-                        if let Some(kind) = Self::infer_result_kind_from_types(inner, resolve_kind)
-                        {
-                            if matches!(kind, NumericKind::Float) {
-                                result_kind = NumericKind::Float;
-                            }
-                        }
-                    }
+                if result_kind != NumericKind::Float
+                    && let Some(inner) = else_expr.as_deref()
+                    && let Some(kind) = Self::infer_result_kind_from_types(inner, resolve_kind)
+                    && matches!(kind, NumericKind::Float)
+                {
+                    result_kind = NumericKind::Float;
                 }
                 Some(result_kind)
             }

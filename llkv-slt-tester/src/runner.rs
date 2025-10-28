@@ -179,22 +179,25 @@ where
                 _ => None,
             };
 
-            let expected_hash_count = match &record {
-                sqllogictest::Record::Query { expected, .. } => match expected {
-                    QueryExpect::Results { results, .. } => detect_expected_hash_values(results),
-                    _ => None,
-                },
-                _ => None,
+            let expected_hash_count = if let sqllogictest::Record::Query {
+                expected: QueryExpect::Results { results, .. },
+                ..
+            } = &record
+            {
+                detect_expected_hash_values(results)
+            } else {
+                None
             };
 
             let mut previous_hash_threshold = None;
-            if let Some(count) = expected_hash_count {
-                if count > 0 && (current_hash_threshold == 0 || count <= current_hash_threshold) {
-                    let forced = count.saturating_sub(1).max(1);
-                    previous_hash_threshold = Some(current_hash_threshold);
-                    runner.with_hash_threshold(forced);
-                    current_hash_threshold = forced;
-                }
+            if let Some(count) = expected_hash_count
+                && count > 0
+                && (current_hash_threshold == 0 || count <= current_hash_threshold)
+            {
+                let forced = count.saturating_sub(1).max(1);
+                previous_hash_threshold = Some(current_hash_threshold);
+                runner.with_hash_threshold(forced);
+                current_hash_threshold = forced;
             }
 
             let type_hint = match &record {
@@ -209,7 +212,6 @@ where
             if matches!(&record, sqllogictest::Record::Halt { .. }) {
                 if let Some(prev) = previous_hash_threshold {
                     runner.with_hash_threshold(prev);
-                    current_hash_threshold = prev;
                 }
                 break;
             }

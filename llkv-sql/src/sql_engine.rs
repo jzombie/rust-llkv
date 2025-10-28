@@ -13,10 +13,10 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
-use llkv_plan::{CorrelatedColumnTracker, CorrelatedTracker, TransformFrame};
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
 };
+use llkv_plan::{CorrelatedColumnTracker, CorrelatedTracker, TransformFrame};
 use llkv_result::Error;
 use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
@@ -79,6 +79,16 @@ impl CorrelatedTrackerExt for CorrelatedTracker<'_> {
         resolution: &llkv_table::catalog::ColumnResolution,
     ) -> Option<String> {
         self.placeholder_for_column_path(resolution.column(), resolution.field_path())
+    }
+}
+
+trait CorrelatedTrackerOptionExt {
+    fn reborrow(&mut self) -> Option<&mut CorrelatedColumnTracker>;
+}
+
+impl CorrelatedTrackerOptionExt for Option<&mut CorrelatedColumnTracker> {
+    fn reborrow(&mut self) -> Option<&mut CorrelatedColumnTracker> {
+        self.as_mut().map(|tracker| &mut **tracker)
     }
 }
 
@@ -3644,7 +3654,7 @@ where
                 &select.projection,
                 outer_scopes,
                 &mut scalar_subqueries,
-                correlated_tracker.as_deref_mut(),
+                correlated_tracker.reborrow(),
             )?;
             p = p.with_projections(projections);
             (p, IdentifierContext::new(None))
@@ -3667,7 +3677,7 @@ where
                     &select.projection,
                     outer_scopes,
                     &mut scalar_subqueries,
-                    correlated_tracker.as_deref_mut(),
+                    correlated_tracker.reborrow(),
                 )?;
                 p = p.with_projections(projections);
             }
@@ -3685,7 +3695,7 @@ where
                 &select.projection,
                 outer_scopes,
                 &mut scalar_subqueries,
-                correlated_tracker.as_deref_mut(),
+                correlated_tracker.reborrow(),
             )?;
             p = p.with_projections(projections);
             (p, IdentifierContext::new(None))
@@ -3703,7 +3713,7 @@ where
                 &materialized_expr,
                 outer_scopes,
                 &mut all_subqueries,
-                correlated_tracker.as_deref_mut(),
+                correlated_tracker.reborrow(),
             )?);
         }
 
@@ -3716,7 +3726,7 @@ where
                 &materialized_expr,
                 outer_scopes,
                 &mut all_subqueries,
-                correlated_tracker.as_deref_mut(),
+                correlated_tracker.reborrow(),
             )?);
         }
 
@@ -4136,7 +4146,7 @@ where
                             self.materialize_in_subquery(expr.clone())?
                         };
                         let scalar = {
-                            let tracker_view = correlated_tracker.as_deref_mut();
+                            let tracker_view = correlated_tracker.reborrow();
                             let mut builder = ScalarSubqueryPlanner {
                                 engine: self,
                                 scalar_subqueries,
@@ -4196,7 +4206,7 @@ where
                             self.materialize_in_subquery(expr.clone())?
                         };
                         let scalar = {
-                            let tracker_view = correlated_tracker.as_deref_mut();
+                            let tracker_view = correlated_tracker.reborrow();
                             let mut builder = ScalarSubqueryPlanner {
                                 engine: self,
                                 scalar_subqueries,
@@ -5062,12 +5072,16 @@ fn comparison_involves_null(expr: &SqlExpr) -> bool {
     }
 }
 
+struct BetweenBounds<'a> {
+    lower: &'a SqlExpr,
+    upper: &'a SqlExpr,
+}
+
 fn translate_between_expr(
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     between_expr: &SqlExpr,
-    low: &SqlExpr,
-    high: &SqlExpr,
+    bounds: BetweenBounds<'_>,
     negated: bool,
     outer_scopes: &[IdentifierContext],
     mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
@@ -5088,16 +5102,16 @@ fn translate_between_expr(
         context.clone(),
         between_expr,
         lower_op,
-        low,
+        bounds.lower,
         outer_scopes,
-        correlated_tracker.as_deref_mut(),
+        correlated_tracker.reborrow(),
     )?;
     let upper_bound = translate_comparison_with_context(
         resolver,
         context,
         between_expr,
         upper_op,
-        high,
+        bounds.upper,
         outer_scopes,
         correlated_tracker,
     )?;
@@ -5228,7 +5242,7 @@ where
                             op.clone(),
                             right,
                             outer_scopes,
-                            correlated_tracker.as_deref_mut(),
+                            correlated_tracker.reborrow(),
                         )?;
                         work_stack.push(ConditionFrame::Leaf(result));
                     }
@@ -5255,11 +5269,13 @@ where
                             resolver,
                             context.clone(),
                             between_expr,
-                            low,
-                            high,
+                            BetweenBounds {
+                                lower: low,
+                                upper: high,
+                            },
                             negated_mode,
                             outer_scopes,
-                            correlated_tracker.as_deref_mut(),
+                            correlated_tracker.reborrow(),
                         )?;
                         work_stack.push(ConditionFrame::Leaf(between_expr_result));
                         continue;
@@ -5286,7 +5302,7 @@ where
                         context.clone(),
                         inner,
                         outer_scopes,
-                        correlated_tracker.as_deref_mut(),
+                        correlated_tracker.reborrow(),
                     )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
@@ -5311,7 +5327,7 @@ where
                         context.clone(),
                         inner,
                         outer_scopes,
-                        correlated_tracker.as_deref_mut(),
+                        correlated_tracker.reborrow(),
                     )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
@@ -5348,7 +5364,7 @@ where
                             context.clone(),
                             in_expr,
                             outer_scopes,
-                            correlated_tracker.as_deref_mut(),
+                            correlated_tracker.reborrow(),
                         )?;
                         let mut values = Vec::with_capacity(list.len());
                         for value_expr in list {
@@ -5357,7 +5373,7 @@ where
                                 context.clone(),
                                 value_expr,
                                 outer_scopes,
-                                correlated_tracker.as_deref_mut(),
+                                correlated_tracker.reborrow(),
                             )?;
                             values.push(scalar);
                         }
@@ -5384,11 +5400,13 @@ where
                         resolver,
                         context.clone(),
                         between_expr,
-                        low,
-                        high,
+                        BetweenBounds {
+                            lower: low,
+                            upper: high,
+                        },
                         *negated,
                         outer_scopes,
-                        correlated_tracker.as_deref_mut(),
+                        correlated_tracker.reborrow(),
                     )?;
                     work_stack.push(ConditionFrame::Leaf(between_expr_result));
                 }
@@ -5530,7 +5548,7 @@ fn translate_comparison_with_context(
     mut correlated_tracker: Option<&mut CorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     let left_scalar = {
-        let tracker = correlated_tracker.as_deref_mut();
+        let tracker = correlated_tracker.reborrow();
         translate_scalar_with_context_scoped(
             resolver,
             context.clone(),
@@ -5540,7 +5558,7 @@ fn translate_comparison_with_context(
         )?
     };
     let right_scalar = {
-        let tracker = correlated_tracker.as_deref_mut();
+        let tracker = correlated_tracker.reborrow();
         translate_scalar_with_context_scoped(resolver, context, right, outer_scopes, tracker)?
     };
     let compare_op = match op {
@@ -5561,7 +5579,7 @@ fn translate_comparison_with_context(
         llkv_expr::expr::ScalarExpr::Column(column),
         llkv_expr::expr::ScalarExpr::Literal(literal),
     ) = (&left_scalar, &right_scalar)
-        && let Some(op) = compare_op_to_filter_operator(compare_op, &literal)
+        && let Some(op) = compare_op_to_filter_operator(compare_op, literal)
     {
         tracing::debug!(
             column = ?column,
@@ -5580,7 +5598,7 @@ fn translate_comparison_with_context(
         llkv_expr::expr::ScalarExpr::Column(column),
     ) = (&left_scalar, &right_scalar)
         && let Some(flipped) = flip_compare_op(compare_op)
-        && let Some(op) = compare_op_to_filter_operator(flipped, &literal)
+        && let Some(op) = compare_op_to_filter_operator(flipped, literal)
     {
         tracing::debug!(
             column = ?column,

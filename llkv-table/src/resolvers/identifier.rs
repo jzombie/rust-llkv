@@ -111,17 +111,15 @@ impl<'a> IdentifierResolver<'a> {
                         effective_parts[0]
                     )));
                 }
-                if effective_parts.len() >= 2 {
-                    if let Some(schema) = table_meta.canonical_schema() {
-                        if effective_parts[0].eq_ignore_ascii_case(schema)
-                            && effective_parts[1].eq_ignore_ascii_case(canonical_table)
-                        {
-                            return Err(Error::InvalidArgumentError(format!(
-                                "Binder Error: table '{}' not found",
-                                effective_parts[1]
-                            )));
-                        }
-                    }
+                if effective_parts.len() >= 2
+                    && let Some(schema) = table_meta.canonical_schema()
+                    && effective_parts[0].eq_ignore_ascii_case(schema)
+                    && effective_parts[1].eq_ignore_ascii_case(canonical_table)
+                {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: table '{}' not found",
+                        effective_parts[1]
+                    )));
                 }
             }
         }
