@@ -24,6 +24,7 @@ use arrow::compute::{
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
+use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::SubqueryId;
@@ -48,6 +49,7 @@ use llkv_table::types::FieldId;
 use llkv_table::{NumericArray, NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
+use std::cell::RefCell;
 use std::convert::TryFrom;
 use std::fmt;
 use std::sync::Arc;
@@ -82,6 +84,39 @@ pub use types::{
     ExecutorTableProvider,
 };
 pub use utils::current_time_micros;
+
+// ============================================================================
+// Query Logging Helpers
+// ============================================================================
+
+thread_local! {
+    static QUERY_LABEL_STACK: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+/// Guard object that pops the current query label when dropped.
+pub struct QueryLogGuard {
+    _private: (),
+}
+
+/// Install a query label for the current thread so that executor logs can
+/// annotate diagnostics with the originating SQL statement.
+pub fn push_query_label(label: impl Into<String>) -> QueryLogGuard {
+    QUERY_LABEL_STACK.with(|stack| stack.borrow_mut().push(label.into()));
+    QueryLogGuard { _private: () }
+}
+
+impl Drop for QueryLogGuard {
+    fn drop(&mut self) {
+        QUERY_LABEL_STACK.with(|stack| {
+            let _ = stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// Fetch the innermost query label associated with the current execution thread.
+pub fn current_query_label() -> Option<String> {
+    QUERY_LABEL_STACK.with(|stack| stack.borrow().last().cloned())
+}
 
 // ============================================================================
 // Query Executor - Implementation
@@ -564,32 +599,45 @@ where
             ));
         }
 
-        // Acquire table handles and materialize the base batches for each table.
-        let mut tables = Vec::with_capacity(plan.tables.len());
+        let mut tables_with_handles = Vec::with_capacity(plan.tables.len());
         for table_ref in &plan.tables {
             let qualified_name = table_ref.qualified_name();
             let table = self.provider.get_table(&qualified_name)?;
-            tables.push((table_ref.clone(), table));
+            tables_with_handles.push((table_ref.clone(), table));
         }
 
-        let mut staged: Vec<TableCrossProductData> = Vec::with_capacity(tables.len());
-        for (table_ref, table) in &tables {
-            staged.push(collect_table_data(table_ref, table.as_ref())?);
-        }
+        let mut remaining_filter = plan.filter.clone();
 
-        let mut staged_iter = staged.into_iter();
-        let mut current = staged_iter
-            .next()
-            .ok_or_else(|| Error::Internal("cross product preparation yielded no tables".into()))?;
+        // Try hash join optimization first - this avoids materializing all tables
+        let join_data = if plan.scalar_subqueries.is_empty() && remaining_filter.as_ref().is_some()
+        {
+            self.try_execute_hash_join(&plan, &tables_with_handles)?
+        } else {
+            None
+        };
 
-        for next in staged_iter {
-            current = cross_join_table_batches(current, next)?;
-        }
+        let current = if let Some((joined, handled_all_predicates)) = join_data {
+            // Clear filter only if hash join handled all predicates
+            if handled_all_predicates {
+                remaining_filter = None;
+            }
+            joined
+        } else {
+            // Hash join not applicable - fall back to cartesian product
+            // Only materialize tables now that we know we need them
+            let mut staged: Vec<TableCrossProductData> =
+                Vec::with_capacity(tables_with_handles.len());
+            for (idx, (table_ref, table)) in tables_with_handles.iter().enumerate() {
+                staged.push(collect_table_data(idx, table_ref, table.as_ref(), &[])?);
+            }
+            cross_join_all(staged)?
+        };
 
         let TableCrossProductData {
             schema: combined_schema,
             batches: mut combined_batches,
             column_counts,
+            table_indices: _table_indices,
         } = current;
 
         let column_lookup_map = build_cross_product_column_lookup(
@@ -598,7 +646,7 @@ where
             &column_counts,
         );
 
-        if let Some(filter_wrapper) = &plan.filter {
+        if let Some(filter_wrapper) = remaining_filter.as_ref() {
             let mut filter_context = CrossProductExpressionContext::new(
                 combined_schema.as_ref(),
                 column_lookup_map.clone(),
@@ -763,7 +811,7 @@ where
 
         let schema = combined_batch.schema();
 
-        let display_name = tables
+        let display_name = tables_with_handles
             .iter()
             .map(|(table_ref, _)| table_ref.qualified_name())
             .collect::<Vec<_>>()
@@ -774,6 +822,239 @@ where
             schema,
             combined_batch,
         ))
+    }
+
+    /// Attempt to optimize a multi-table query using hash joins instead of cartesian product.
+    ///
+    /// This replaces the O(n₁×n₂×...×nₖ) backtracking algorithm with O(n₁+n₂+...+nₖ)
+    /// hash join execution. For two-table joins, applies a single hash join. For N-way joins,
+    /// performs left-associative pairwise joins: ((T₁ ⋈ T₂) ⋈ T₃) ⋈ ... ⋈ Tₙ.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - The SELECT plan containing table references and filter predicates
+    /// * `tables_with_handles` - Vector of (TableRef, ExecutorTable) pairs for all tables in the query
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some((data, handled_all)))` - Join optimization succeeded, returning joined batches and whether all predicates were handled
+    /// * `Ok(None)` - Optimization cannot be applied (falls back to cartesian product)
+    /// * `Err(...)` - Join execution failed
+    fn try_execute_hash_join(
+        &self,
+        plan: &SelectPlan,
+        tables_with_handles: &[(llkv_plan::TableRef, Arc<ExecutorTable<P>>)],
+    ) -> ExecutorResult<Option<(TableCrossProductData, bool)>> {
+        let query_label_opt = current_query_label();
+        let query_label = query_label_opt.as_deref().unwrap_or("<unknown query>");
+
+        // Validate preconditions for hash join optimization
+        let filter_wrapper = match &plan.filter {
+            Some(filter) if filter.subqueries.is_empty() => filter,
+            _ => {
+                tracing::debug!(
+                    "join_opt[{query_label}]: skipping optimization – filter missing or uses subqueries"
+                );
+                return Ok(None);
+            }
+        };
+
+        if tables_with_handles.len() < 2 {
+            tracing::debug!(
+                "join_opt[{query_label}]: skipping optimization – requires at least 2 tables"
+            );
+            return Ok(None);
+        }
+
+        // Build table metadata for join constraint extraction
+        let mut table_infos = Vec::with_capacity(tables_with_handles.len());
+        for (index, (table_ref, executor_table)) in tables_with_handles.iter().enumerate() {
+            let mut column_map = FxHashMap::default();
+            for (column_idx, column) in executor_table.schema.columns.iter().enumerate() {
+                let column_name = column.name.to_ascii_lowercase();
+                column_map.entry(column_name).or_insert(column_idx);
+            }
+            table_infos.push(TableInfo {
+                index,
+                table_ref,
+                column_map,
+            });
+        }
+
+        // Extract join constraints from WHERE clause
+        let constraint_plan = match extract_join_constraints(
+            &filter_wrapper.predicate,
+            &table_infos,
+        ) {
+            Some(plan) => plan,
+            None => {
+                tracing::debug!(
+                    "join_opt[{query_label}]: skipping optimization – predicate parsing failed (contains OR or other unsupported top-level structure)"
+                );
+                return Ok(None);
+            }
+        };
+
+        tracing::debug!(
+            "join_opt[{query_label}]: constraint extraction succeeded - equalities={}, literals={}, handled={}/{} predicates",
+            constraint_plan.equalities.len(),
+            constraint_plan.literals.len(),
+            constraint_plan.handled_conjuncts,
+            constraint_plan.total_conjuncts
+        );
+
+        tracing::debug!(
+            "join_opt[{query_label}]: attempting hash join with tables={:?} filter={:?}",
+            plan.tables
+                .iter()
+                .map(|t| t.qualified_name())
+                .collect::<Vec<_>>(),
+            filter_wrapper.predicate,
+        );
+
+        // Handle unsatisfiable predicates (e.g., WHERE FALSE)
+        if constraint_plan.unsatisfiable {
+            tracing::debug!(
+                "join_opt[{query_label}]: predicate unsatisfiable – returning empty result"
+            );
+            let mut combined_fields = Vec::new();
+            let mut column_counts = Vec::new();
+            for (_table_ref, executor_table) in tables_with_handles {
+                for column in &executor_table.schema.columns {
+                    combined_fields.push(Field::new(
+                        column.name.clone(),
+                        column.data_type.clone(),
+                        column.nullable,
+                    ));
+                }
+                column_counts.push(executor_table.schema.columns.len());
+            }
+            let combined_schema = Arc::new(Schema::new(combined_fields));
+            let empty_batch = RecordBatch::new_empty(Arc::clone(&combined_schema));
+            return Ok(Some((
+                TableCrossProductData {
+                    schema: combined_schema,
+                    batches: vec![empty_batch],
+                    column_counts,
+                    table_indices: (0..tables_with_handles.len()).collect(),
+                },
+                true, // Handled all predicates (unsatisfiable predicate consumes everything)
+            )));
+        }
+
+        // Hash join requires equality predicates
+        if constraint_plan.equalities.is_empty() {
+            tracing::debug!(
+                "join_opt[{query_label}]: skipping optimization – no join equalities found"
+            );
+            return Ok(None);
+        }
+
+        // Note: Literal constraints (e.g., t1.x = 5) are currently ignored in the hash join path.
+        // They should ideally be pushed down as pre-filters on individual tables before joining.
+        // For now, we'll let the hash join proceed and any literal constraints will be handled
+        // by the fallback cartesian product path if needed.
+        if !constraint_plan.literals.is_empty() {
+            tracing::debug!(
+                "join_opt[{query_label}]: found {} literal constraints - proceeding with hash join but may need fallback",
+                constraint_plan.literals.len()
+            );
+        }
+
+        tracing::debug!(
+            "join_opt[{query_label}]: hash join optimization applicable with {} equality constraints",
+            constraint_plan.equalities.len()
+        );
+
+        let mut literal_map: Vec<Vec<ColumnLiteral>> = vec![Vec::new(); tables_with_handles.len()];
+        for literal in &constraint_plan.literals {
+            if literal.column.table >= literal_map.len() {
+                tracing::debug!(
+                    "join_opt[{query_label}]: literal references unknown table index {}; falling back",
+                    literal.column.table
+                );
+                return Ok(None);
+            }
+            literal_map[literal.column.table].push(literal.clone());
+        }
+
+        let mut per_table: Vec<Option<TableCrossProductData>> =
+            Vec::with_capacity(tables_with_handles.len());
+        for (idx, (table_ref, table)) in tables_with_handles.iter().enumerate() {
+            let data =
+                collect_table_data(idx, table_ref, table.as_ref(), literal_map[idx].as_slice())?;
+            per_table.push(Some(data));
+        }
+
+        let mut remaining: Vec<usize> = (0..tables_with_handles.len()).collect();
+        let mut used_tables: FxHashSet<usize> = FxHashSet::default();
+        let mut current: Option<TableCrossProductData> = None;
+
+        while !remaining.is_empty() {
+            let next_index = if used_tables.is_empty() {
+                remaining[0]
+            } else {
+                match remaining.iter().copied().find(|idx| {
+                    table_has_join_with_used(*idx, &used_tables, &constraint_plan.equalities)
+                }) {
+                    Some(idx) => idx,
+                    None => {
+                        tracing::debug!(
+                            "join_opt[{query_label}]: equality graph disconnected – falling back to cartesian product"
+                        );
+                        return Ok(None);
+                    }
+                }
+            };
+
+            let position = remaining
+                .iter()
+                .position(|&idx| idx == next_index)
+                .expect("next index present");
+
+            let next_data = per_table[next_index]
+                .take()
+                .ok_or_else(|| Error::Internal("hash join consumed table data twice".into()))?;
+
+            if let Some(current_data) = current.take() {
+                let join_keys = gather_join_keys(
+                    &current_data,
+                    &next_data,
+                    &used_tables,
+                    next_index,
+                    &constraint_plan.equalities,
+                )?;
+
+                if join_keys.is_empty() {
+                    tracing::debug!(
+                        "join_opt[{query_label}]: no equality constraints to join '{}' – falling back",
+                        tables_with_handles[next_index].0.qualified_name()
+                    );
+                    return Ok(None);
+                }
+
+                let joined = hash_join_table_batches(current_data, next_data, &join_keys)?;
+                current = Some(joined);
+            } else {
+                current = Some(next_data);
+            }
+
+            used_tables.insert(next_index);
+            remaining.remove(position);
+        }
+
+        if let Some(result) = current {
+            let handled_all = constraint_plan.handled_conjuncts == constraint_plan.total_conjuncts;
+            tracing::debug!(
+                "join_opt[{query_label}]: hash join succeeded across {} tables (handled {}/{} predicates)",
+                tables_with_handles.len(),
+                constraint_plan.handled_conjuncts,
+                constraint_plan.total_conjuncts
+            );
+            return Ok(Some((result, handled_all)));
+        }
+
+        Ok(None)
     }
 
     fn execute_projection(
@@ -3997,11 +4278,14 @@ struct TableCrossProductData {
     schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
     column_counts: Vec<usize>,
+    table_indices: Vec<usize>,
 }
 
 fn collect_table_data<P>(
+    table_index: usize,
     table_ref: &llkv_plan::TableRef,
     table: &ExecutorTable<P>,
+    literals: &[ColumnLiteral],
 ) -> ExecutorResult<TableCrossProductData>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -4064,11 +4348,569 @@ where
         normalized_batches.push(normalized);
     }
 
+    if !literals.is_empty() {
+        normalized_batches = apply_literal_constraints_to_batches(normalized_batches, literals)?;
+    }
+
     Ok(TableCrossProductData {
         schema,
         batches: normalized_batches,
         column_counts: vec![table.schema.columns.len()],
+        table_indices: vec![table_index],
     })
+}
+
+fn apply_literal_constraints_to_batches(
+    batches: Vec<RecordBatch>,
+    literals: &[ColumnLiteral],
+) -> ExecutorResult<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+
+    let mut filtered = batches;
+    for literal in literals {
+        filtered = filter_batches_by_literal(filtered, literal.column.column, &literal.value)?;
+        if filtered.is_empty() {
+            break;
+        }
+    }
+
+    Ok(filtered)
+}
+
+fn filter_batches_by_literal(
+    batches: Vec<RecordBatch>,
+    column_idx: usize,
+    literal: &PlanValue,
+) -> ExecutorResult<Vec<RecordBatch>> {
+    let mut result = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        if column_idx >= batch.num_columns() {
+            return Err(Error::Internal(
+                "literal constraint referenced invalid column index".into(),
+            ));
+        }
+
+        if batch.num_rows() == 0 {
+            result.push(batch);
+            continue;
+        }
+
+        let column = batch.column(column_idx);
+        let mut keep_rows: Vec<u32> = Vec::new();
+        keep_rows.reserve(batch.num_rows());
+
+        for row_idx in 0..batch.num_rows() {
+            if array_value_equals_plan_value(column.as_ref(), row_idx, literal)? {
+                keep_rows.push(row_idx as u32);
+            }
+        }
+
+        if keep_rows.len() == batch.num_rows() {
+            result.push(batch);
+            continue;
+        }
+
+        if keep_rows.is_empty() {
+            // Constraint filtered out entire batch; skip it.
+            continue;
+        }
+
+        let indices = UInt32Array::from(keep_rows);
+        let mut filtered_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+        for col_idx in 0..batch.num_columns() {
+            let filtered = take(batch.column(col_idx).as_ref(), &indices, None)
+                .map_err(|err| Error::Internal(format!("failed to apply literal filter: {err}")))?;
+            filtered_columns.push(filtered);
+        }
+
+        let filtered_batch =
+            RecordBatch::try_new(batch.schema(), filtered_columns).map_err(|err| {
+                Error::Internal(format!(
+                    "failed to rebuild batch after literal filter: {err}"
+                ))
+            })?;
+        result.push(filtered_batch);
+    }
+
+    Ok(result)
+}
+
+fn array_value_equals_plan_value(
+    array: &dyn Array,
+    row_idx: usize,
+    literal: &PlanValue,
+) -> ExecutorResult<bool> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    match literal {
+        PlanValue::Null => Ok(array.is_null(row_idx)),
+        PlanValue::Integer(expected) => match array.data_type() {
+            DataType::Int8 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .expect("int8 array")
+                    .value(row_idx) as i64
+                    == *expected),
+            DataType::Int16 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .expect("int16 array")
+                    .value(row_idx) as i64
+                    == *expected),
+            DataType::Int32 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("int32 array")
+                    .value(row_idx) as i64
+                    == *expected),
+            DataType::Int64 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 array")
+                    .value(row_idx)
+                    == *expected),
+            DataType::UInt8 if *expected >= 0 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<UInt8Array>()
+                    .expect("uint8 array")
+                    .value(row_idx) as i64
+                    == *expected),
+            DataType::UInt16 if *expected >= 0 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<UInt16Array>()
+                    .expect("uint16 array")
+                    .value(row_idx) as i64
+                    == *expected),
+            DataType::UInt32 if *expected >= 0 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .expect("uint32 array")
+                    .value(row_idx) as i64
+                    == *expected),
+            DataType::UInt64 if *expected >= 0 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("uint64 array")
+                    .value(row_idx)
+                    == *expected as u64),
+            DataType::Boolean => {
+                if array.is_null(row_idx) {
+                    Ok(false)
+                } else if *expected == 0 || *expected == 1 {
+                    let value = array
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .expect("bool array")
+                        .value(row_idx);
+                    Ok(value == (*expected == 1))
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "literal integer comparison not supported for {:?}",
+                array.data_type()
+            ))),
+        },
+        PlanValue::Float(expected) => match array.data_type() {
+            DataType::Float32 => Ok(!array.is_null(row_idx)
+                && (array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("float32 array")
+                    .value(row_idx) as f64
+                    - *expected)
+                    .abs()
+                    .eq(&0.0)),
+            DataType::Float64 => Ok(!array.is_null(row_idx)
+                && (array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("float64 array")
+                    .value(row_idx)
+                    - *expected)
+                    .abs()
+                    .eq(&0.0)),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "literal float comparison not supported for {:?}",
+                array.data_type()
+            ))),
+        },
+        PlanValue::String(expected) => match array.data_type() {
+            DataType::Utf8 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("string array")
+                    .value(row_idx)
+                    == expected),
+            DataType::LargeUtf8 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("large string array")
+                    .value(row_idx)
+                    == expected),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "literal string comparison not supported for {:?}",
+                array.data_type()
+            ))),
+        },
+        PlanValue::Struct(_) => Err(Error::InvalidArgumentError(
+            "struct literals are not supported in join filters".into(),
+        )),
+    }
+}
+
+fn hash_join_table_batches(
+    left: TableCrossProductData,
+    right: TableCrossProductData,
+    join_keys: &[(usize, usize)],
+) -> ExecutorResult<TableCrossProductData> {
+    let TableCrossProductData {
+        schema: left_schema,
+        batches: left_batches,
+        column_counts: left_counts,
+        table_indices: left_tables,
+    } = left;
+
+    let TableCrossProductData {
+        schema: right_schema,
+        batches: right_batches,
+        column_counts: right_counts,
+        table_indices: right_tables,
+    } = right;
+
+    let combined_fields: Vec<Field> = left_schema
+        .fields()
+        .iter()
+        .chain(right_schema.fields().iter())
+        .map(|field| field.as_ref().clone())
+        .collect();
+
+    let combined_schema = Arc::new(Schema::new(combined_fields));
+
+    let mut column_counts = Vec::with_capacity(left_counts.len() + right_counts.len());
+    column_counts.extend(left_counts.iter());
+    column_counts.extend(right_counts.iter());
+
+    let mut table_indices = Vec::with_capacity(left_tables.len() + right_tables.len());
+    table_indices.extend(left_tables.iter().copied());
+    table_indices.extend(right_tables.iter().copied());
+
+    if left_batches.is_empty() || right_batches.is_empty() {
+        return Ok(TableCrossProductData {
+            schema: combined_schema,
+            batches: Vec::new(),
+            column_counts,
+            table_indices,
+        });
+    }
+
+    let (left_matches, right_matches) =
+        build_join_match_indices(&left_batches, &right_batches, join_keys)?;
+
+    if left_matches.is_empty() {
+        return Ok(TableCrossProductData {
+            schema: combined_schema,
+            batches: Vec::new(),
+            column_counts,
+            table_indices,
+        });
+    }
+
+    let left_arrays =
+        gather_indices_from_batches(&left_batches, &left_matches).map_err(Error::from)?;
+    let right_arrays =
+        gather_indices_from_batches(&right_batches, &right_matches).map_err(Error::from)?;
+
+    let mut combined_columns = Vec::with_capacity(left_arrays.len() + right_arrays.len());
+    combined_columns.extend(left_arrays.into_iter());
+    combined_columns.extend(right_arrays.into_iter());
+
+    let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), combined_columns)
+        .map_err(|err| Error::Internal(format!("failed to materialize hash join batch: {err}")))?;
+
+    Ok(TableCrossProductData {
+        schema: combined_schema,
+        batches: vec![joined_batch],
+        column_counts,
+        table_indices,
+    })
+}
+
+fn build_join_match_indices(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    join_keys: &[(usize, usize)],
+) -> ExecutorResult<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
+    let mut hash_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> = FxHashMap::default();
+    let right_key_indices: Vec<usize> = join_keys.iter().map(|(_, right)| *right).collect();
+    let mut key_buffer: Vec<u8> = Vec::new();
+
+    for (batch_idx, batch) in right_batches.iter().enumerate() {
+        for row_idx in 0..batch.num_rows() {
+            key_buffer.clear();
+            if !build_join_key(batch, &right_key_indices, row_idx, &mut key_buffer)? {
+                continue;
+            }
+            hash_table
+                .entry(key_buffer.clone())
+                .or_default()
+                .push((batch_idx, row_idx));
+        }
+    }
+
+    if hash_table.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let left_key_indices: Vec<usize> = join_keys.iter().map(|(left, _)| *left).collect();
+    let mut left_matches: Vec<(usize, usize)> = Vec::new();
+    let mut right_matches: Vec<(usize, usize)> = Vec::new();
+
+    for (batch_idx, batch) in left_batches.iter().enumerate() {
+        for row_idx in 0..batch.num_rows() {
+            key_buffer.clear();
+            if !build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer)? {
+                continue;
+            }
+
+            if let Some(entries) = hash_table.get(&key_buffer) {
+                for &(r_batch, r_row) in entries {
+                    left_matches.push((batch_idx, row_idx));
+                    right_matches.push((r_batch, r_row));
+                }
+            }
+        }
+    }
+
+    Ok((left_matches, right_matches))
+}
+
+fn build_join_key(
+    batch: &RecordBatch,
+    column_indices: &[usize],
+    row_idx: usize,
+    buffer: &mut Vec<u8>,
+) -> ExecutorResult<bool> {
+    buffer.clear();
+
+    for &col_idx in column_indices {
+        let array = batch.column(col_idx);
+        if array.is_null(row_idx) {
+            return Ok(false);
+        }
+        append_array_value_to_key(array.as_ref(), row_idx, buffer)?;
+    }
+
+    Ok(true)
+}
+
+fn append_array_value_to_key(
+    array: &dyn Array,
+    row_idx: usize,
+    buffer: &mut Vec<u8>,
+) -> ExecutorResult<()> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    match array.data_type() {
+        DataType::Int8 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .expect("int8 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::Int16 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("int16 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::Int32 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("int32 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::Int64 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::UInt8 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .expect("uint8 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::UInt16 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("uint16 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::UInt32 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("uint32 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::UInt64 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("uint64 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::Float32 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("float32 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::Float64 => buffer.extend_from_slice(
+            &array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64 array")
+                .value(row_idx)
+                .to_le_bytes(),
+        ),
+        DataType::Boolean => buffer.push(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("bool array")
+                .value(row_idx) as u8,
+        ),
+        DataType::Utf8 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("utf8 array")
+                .value(row_idx);
+            buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(value.as_bytes());
+        }
+        DataType::LargeUtf8 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("large utf8 array")
+                .value(row_idx);
+            buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(value.as_bytes());
+        }
+        DataType::Binary => {
+            let value = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("binary array")
+                .value(row_idx);
+            buffer.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(value);
+        }
+        other => {
+            return Err(Error::InvalidArgumentError(format!(
+                "hash join does not support join key type {:?}",
+                other
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn table_has_join_with_used(
+    candidate: usize,
+    used_tables: &FxHashSet<usize>,
+    equalities: &[ColumnEquality],
+) -> bool {
+    equalities.iter().any(|equality| {
+        (equality.left.table == candidate && used_tables.contains(&equality.right.table))
+            || (equality.right.table == candidate && used_tables.contains(&equality.left.table))
+    })
+}
+
+fn gather_join_keys(
+    left: &TableCrossProductData,
+    right: &TableCrossProductData,
+    used_tables: &FxHashSet<usize>,
+    right_table_index: usize,
+    equalities: &[ColumnEquality],
+) -> ExecutorResult<Vec<(usize, usize)>> {
+    let mut keys = Vec::new();
+
+    for equality in equalities {
+        if equality.left.table == right_table_index && used_tables.contains(&equality.right.table) {
+            let left_idx = resolve_column_index(left, &equality.right).ok_or_else(|| {
+                Error::Internal("failed to resolve column offset for hash join".into())
+            })?;
+            let right_idx = resolve_column_index(right, &equality.left).ok_or_else(|| {
+                Error::Internal("failed to resolve column offset for hash join".into())
+            })?;
+            keys.push((left_idx, right_idx));
+        } else if equality.right.table == right_table_index
+            && used_tables.contains(&equality.left.table)
+        {
+            let left_idx = resolve_column_index(left, &equality.left).ok_or_else(|| {
+                Error::Internal("failed to resolve column offset for hash join".into())
+            })?;
+            let right_idx = resolve_column_index(right, &equality.right).ok_or_else(|| {
+                Error::Internal("failed to resolve column offset for hash join".into())
+            })?;
+            keys.push((left_idx, right_idx));
+        }
+    }
+
+    Ok(keys)
+}
+
+fn resolve_column_index(data: &TableCrossProductData, column: &ColumnRef) -> Option<usize> {
+    let mut offset = 0;
+    for (table_idx, count) in data.table_indices.iter().zip(data.column_counts.iter()) {
+        if *table_idx == column.table {
+            if column.column < *count {
+                return Some(offset + column.column);
+            } else {
+                return None;
+            }
+        }
+        offset += count;
+    }
+    None
 }
 
 fn build_cross_product_column_lookup(
@@ -4227,11 +5069,13 @@ fn cross_join_table_batches(
         schema: left_schema,
         batches: left_batches,
         column_counts: mut left_counts,
+        table_indices: mut left_tables,
     } = left;
     let TableCrossProductData {
         schema: right_schema,
         batches: right_batches,
         column_counts: right_counts,
+        table_indices: right_tables,
     } = right;
 
     let combined_fields: Vec<Field> = left_schema
@@ -4245,6 +5089,10 @@ fn cross_join_table_batches(
     column_counts.append(&mut left_counts);
     column_counts.extend(right_counts);
 
+    let mut table_indices = Vec::with_capacity(left_tables.len() + right_tables.len());
+    table_indices.append(&mut left_tables);
+    table_indices.extend(right_tables);
+
     let combined_schema = Arc::new(Schema::new(combined_fields));
 
     let left_has_rows = left_batches.iter().any(|batch| batch.num_rows() > 0);
@@ -4255,6 +5103,7 @@ fn cross_join_table_batches(
             schema: combined_schema,
             batches: Vec::new(),
             column_counts,
+            table_indices,
         });
     }
 
@@ -4280,7 +5129,243 @@ fn cross_join_table_batches(
         schema: combined_schema,
         batches: output_batches,
         column_counts,
+        table_indices,
     })
+}
+
+fn cross_join_all(staged: Vec<TableCrossProductData>) -> ExecutorResult<TableCrossProductData> {
+    let mut iter = staged.into_iter();
+    let mut current = iter
+        .next()
+        .ok_or_else(|| Error::Internal("cross product preparation yielded no tables".into()))?;
+    for next in iter {
+        current = cross_join_table_batches(current, next)?;
+    }
+    Ok(current)
+}
+
+struct TableInfo<'a> {
+    index: usize,
+    table_ref: &'a llkv_plan::TableRef,
+    column_map: FxHashMap<String, usize>,
+}
+
+#[derive(Clone, Copy)]
+struct ColumnRef {
+    table: usize,
+    column: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ColumnEquality {
+    left: ColumnRef,
+    right: ColumnRef,
+}
+
+#[derive(Clone)]
+struct ColumnLiteral {
+    column: ColumnRef,
+    value: PlanValue,
+}
+
+struct JoinConstraintPlan {
+    equalities: Vec<ColumnEquality>,
+    literals: Vec<ColumnLiteral>,
+    unsatisfiable: bool,
+    /// Total number of conjuncts in the original WHERE clause
+    total_conjuncts: usize,
+    /// Number of conjuncts successfully handled (as equalities or literals)
+    handled_conjuncts: usize,
+}
+
+fn extract_join_constraints(
+    expr: &LlkvExpr<'static, String>,
+    table_infos: &[TableInfo<'_>],
+) -> Option<JoinConstraintPlan> {
+    let mut conjuncts = Vec::new();
+    if !collect_conjuncts(expr, &mut conjuncts) {
+        return None;
+    }
+
+    let total_conjuncts = conjuncts.len();
+    let mut equalities = Vec::new();
+    let mut literals = Vec::new();
+    let mut unsatisfiable = false;
+    let mut handled_conjuncts = 0;
+
+    for conjunct in conjuncts {
+        match conjunct {
+            LlkvExpr::Literal(true) => {
+                handled_conjuncts += 1;
+            }
+            LlkvExpr::Literal(false) => {
+                unsatisfiable = true;
+                handled_conjuncts += 1;
+                break;
+            }
+            LlkvExpr::Compare { left, op, right } if matches!(op, CompareOp::Eq) => {
+                match (
+                    resolve_column_reference(left, table_infos),
+                    resolve_column_reference(right, table_infos),
+                ) {
+                    (Some(left_col), Some(right_col)) => {
+                        equalities.push(ColumnEquality {
+                            left: left_col,
+                            right: right_col,
+                        });
+                        handled_conjuncts += 1;
+                        continue;
+                    }
+                    (Some(column), None) => {
+                        if let Some(literal) = extract_literal(right) {
+                            if let Some(value) = literal_to_plan_value_for_join(&literal) {
+                                literals.push(ColumnLiteral { column, value });
+                                handled_conjuncts += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    (None, Some(column)) => {
+                        if let Some(literal) = extract_literal(left) {
+                            if let Some(value) = literal_to_plan_value_for_join(&literal) {
+                                literals.push(ColumnLiteral { column, value });
+                                handled_conjuncts += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Ignore this predicate - it will be handled by post-join filter
+            }
+            _ => {
+                // Ignore unsupported predicates - they will be handled by post-join filter
+            }
+        }
+    }
+
+    Some(JoinConstraintPlan {
+        equalities,
+        literals,
+        unsatisfiable,
+        total_conjuncts,
+        handled_conjuncts,
+    })
+}
+
+fn collect_conjuncts<'a>(
+    expr: &'a LlkvExpr<'static, String>,
+    out: &mut Vec<&'a LlkvExpr<'static, String>>,
+) -> bool {
+    match expr {
+        LlkvExpr::And(children) => {
+            for child in children {
+                if !collect_conjuncts(child, out) {
+                    return false;
+                }
+            }
+            true
+        }
+        LlkvExpr::Or(_) => false,
+        other => {
+            out.push(other);
+            true
+        }
+    }
+}
+
+fn resolve_column_reference(
+    expr: &ScalarExpr<String>,
+    table_infos: &[TableInfo<'_>],
+) -> Option<ColumnRef> {
+    let name = match expr {
+        ScalarExpr::Column(name) => name.trim(),
+        _ => return None,
+    };
+
+    let mut parts: Vec<&str> = name
+        .trim_start_matches('.')
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let column_part = parts.pop()?.to_ascii_lowercase();
+    if parts.is_empty() {
+        let mut candidate: Option<ColumnRef> = None;
+        for info in table_infos {
+            if let Some(&col_idx) = info.column_map.get(&column_part) {
+                if candidate.is_some() {
+                    return None;
+                }
+                candidate = Some(ColumnRef {
+                    table: info.index,
+                    column: col_idx,
+                });
+            }
+        }
+        return candidate;
+    }
+
+    let table_ident = parts.join(".").to_ascii_lowercase();
+    for info in table_infos {
+        if matches_table_ident(info.table_ref, &table_ident) {
+            if let Some(&col_idx) = info.column_map.get(&column_part) {
+                return Some(ColumnRef {
+                    table: info.index,
+                    column: col_idx,
+                });
+            } else {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn matches_table_ident(table_ref: &llkv_plan::TableRef, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    if let Some(alias) = &table_ref.alias {
+        if alias.to_ascii_lowercase() == ident {
+            return true;
+        }
+    }
+    if table_ref.table.to_ascii_lowercase() == ident {
+        return true;
+    }
+    if !table_ref.schema.is_empty() {
+        let full = format!(
+            "{}.{}",
+            table_ref.schema.to_ascii_lowercase(),
+            table_ref.table.to_ascii_lowercase()
+        );
+        if full == ident {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_literal(expr: &ScalarExpr<String>) -> Option<&Literal> {
+    match expr {
+        ScalarExpr::Literal(lit) => Some(lit),
+        _ => None,
+    }
+}
+
+fn literal_to_plan_value_for_join(literal: &Literal) -> Option<PlanValue> {
+    match literal {
+        Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
+        Literal::Float(v) => Some(PlanValue::Float(*v)),
+        Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
+        Literal::String(v) => Some(PlanValue::String(v.clone())),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -4526,16 +5611,19 @@ mod tests {
             schema: schema_a,
             batches: vec![batch_a],
             column_counts: vec![1],
+            table_indices: vec![0],
         };
         let data_b = TableCrossProductData {
             schema: schema_b,
             batches: vec![batch_b],
             column_counts: vec![1],
+            table_indices: vec![1],
         };
         let data_c = TableCrossProductData {
             schema: schema_c,
             batches: vec![batch_c],
             column_counts: vec![1],
+            table_indices: vec![2],
         };
 
         let ab = cross_join_table_batches(data_a, data_b).expect("two-table product");

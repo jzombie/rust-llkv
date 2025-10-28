@@ -11,7 +11,7 @@ use arrow::array::Array;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 
-use llkv_executor::SelectExecution;
+use llkv_executor::{SelectExecution, push_query_label};
 use llkv_expr::literal::Literal;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
@@ -402,6 +402,9 @@ where
     }
 
     fn execute_statement(&self, statement: Statement) -> SqlResult<RuntimeStatementResult<P>> {
+        let statement_sql = statement.to_string();
+        let _query_label_guard = push_query_label(statement_sql.clone());
+        tracing::debug!("SQL execute_statement: {}", statement_sql.trim());
         tracing::trace!(
             "DEBUG SQL execute_statement: {:?}",
             match &statement {
