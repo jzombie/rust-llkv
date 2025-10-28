@@ -90,6 +90,20 @@ fn infer_computed_data_type(
                 Ok(DataType::Int64)
             }
         }
+        ScalarExpr::Coalesce(items) => {
+            let mut uses_float = false;
+            for item in items {
+                if expression_uses_float(schema, item)? {
+                    uses_float = true;
+                    break;
+                }
+            }
+            if uses_float {
+                Ok(DataType::Float64)
+            } else {
+                Ok(DataType::Int64)
+            }
+        }
         ScalarExpr::ScalarSubquery(_) => {
             // TODO: Infer type from subquery result
             Ok(DataType::Utf8)
@@ -179,6 +193,14 @@ fn expression_uses_float(
                 && expression_uses_float(schema, inner)?
             {
                 return Ok(true);
+            }
+            Ok(false)
+        }
+        ScalarExpr::Coalesce(items) => {
+            for item in items {
+                if expression_uses_float(schema, item)? {
+                    return Ok(true);
+                }
             }
             Ok(false)
         }

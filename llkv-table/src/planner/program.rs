@@ -538,6 +538,11 @@ fn collect_fields<'expr>(
                     stack.push(inner);
                 }
             }
+            ScalarExpr::Coalesce(items) => {
+                for item in items {
+                    stack.push(item);
+                }
+            }
             ScalarExpr::ScalarSubquery(_) => {
                 // Scalar subqueries are resolved separately at planning time
             }

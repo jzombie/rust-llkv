@@ -178,6 +178,7 @@ where
                         .map(Self::expr_contains_aggregate)
                         .unwrap_or(false)
             }
+            ScalarExpr::Coalesce(items) => items.iter().any(Self::expr_contains_aggregate),
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => false,
             ScalarExpr::ScalarSubquery(_) => false,
         }
@@ -1492,6 +1493,11 @@ where
                     Self::collect_aggregates(inner, aggregates);
                 }
             }
+            ScalarExpr::Coalesce(items) => {
+                for item in items {
+                    Self::collect_aggregates(item, aggregates);
+                }
+            }
             ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
             ScalarExpr::ScalarSubquery(_) => {}
         }
@@ -1763,6 +1769,9 @@ where
             )),
             ScalarExpr::Case { .. } => Err(Error::InvalidArgumentError(
                 "CASE not supported in aggregate-only expressions".into(),
+            )),
+            ScalarExpr::Coalesce(_) => Err(Error::InvalidArgumentError(
+                "COALESCE not supported in aggregate-only expressions".into(),
             )),
             ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
                 "Scalar subqueries not supported in aggregate-only expressions".into(),
@@ -2537,6 +2546,7 @@ impl CrossProductExpressionContext {
                 Ok(casted)
             }
             ScalarExpr::Case { .. } => self.evaluate_numeric(expr, batch),
+            ScalarExpr::Coalesce(_) => self.evaluate_numeric(expr, batch),
             ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
                 "scalar subqueries are not supported in cross product filters".into(),
             )),
@@ -2593,6 +2603,11 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             }
             if let Some(inner) = else_expr.as_deref() {
                 collect_field_ids(inner, out);
+            }
+        }
+        ScalarExpr::Coalesce(items) => {
+            for item in items {
+                collect_field_ids(item, out);
             }
         }
         ScalarExpr::Literal(_) => {}
@@ -2828,6 +2843,13 @@ fn bind_scalar_expr(
                 branches: bound_branches,
                 else_expr: bound_else,
             })
+        }
+        ScalarExpr::Coalesce(items) => {
+            let mut bound_items = Vec::with_capacity(items.len());
+            for item in items {
+                bound_items.push(bind_scalar_expr(item, bindings)?);
+            }
+            Ok(ScalarExpr::Coalesce(bound_items))
         }
         ScalarExpr::ScalarSubquery(sub) => Ok(ScalarExpr::ScalarSubquery(sub.clone())),
     }
@@ -3181,6 +3203,11 @@ fn collect_scalar_subquery_ids(expr: &ScalarExpr<FieldId>, ids: &mut FxHashSet<S
                 collect_scalar_subquery_ids(else_expr, ids);
             }
         }
+        ScalarExpr::Coalesce(items) => {
+            for item in items {
+                collect_scalar_subquery_ids(item, ids);
+            }
+        }
         ScalarExpr::Aggregate(_) | ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
     }
 }
@@ -3233,6 +3260,12 @@ fn rewrite_scalar_expr_for_subqueries(
                 .as_ref()
                 .map(|expr| Box::new(rewrite_scalar_expr_for_subqueries(expr, mapping))),
         },
+        ScalarExpr::Coalesce(items) => ScalarExpr::Coalesce(
+            items
+                .iter()
+                .map(|item| rewrite_scalar_expr_for_subqueries(item, mapping))
+                .collect(),
+        ),
         ScalarExpr::Aggregate(_) | ScalarExpr::Column(_) | ScalarExpr::Literal(_) => expr.clone(),
     }
 }

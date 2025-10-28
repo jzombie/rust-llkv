@@ -4868,6 +4868,9 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
                     .map(expr_contains_aggregate)
                     .unwrap_or(false)
         }
+        llkv_expr::expr::ScalarExpr::Coalesce(items) => {
+            items.iter().any(expr_contains_aggregate)
+        }
         llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
         llkv_expr::expr::ScalarExpr::ScalarSubquery(_) => false,
     }
@@ -5738,6 +5741,7 @@ fn translate_scalar_internal(
     #[derive(Clone, Copy)]
     enum BuiltinScalarFunction {
         Abs,
+        Coalesce,
     }
 
     type ScalarFrame<'a> =
@@ -5976,6 +5980,51 @@ fn translate_scalar_internal(
                                 work_stack.push(ScalarFrame::Enter(arg_expr));
                                 continue;
                             }
+                            "coalesce" => {
+                                let args_slice: &[FunctionArg] = match &func.args {
+                                    FunctionArguments::List(list) => {
+                                        if list.duplicate_treatment.is_some()
+                                            || !list.clauses.is_empty()
+                                        {
+                                            return Err(Error::InvalidArgumentError(
+                                                "COALESCE does not support qualifiers".into(),
+                                            ));
+                                        }
+                                        &list.args
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "COALESCE requires at least one argument".into(),
+                                        ));
+                                    }
+                                };
+
+                                if args_slice.is_empty() {
+                                    return Err(Error::InvalidArgumentError(
+                                        "COALESCE requires at least one argument".into(),
+                                    ));
+                                }
+
+                                work_stack.push(ScalarFrame::Exit(
+                                    ScalarExitContext::BuiltinFunction {
+                                        func: BuiltinScalarFunction::Coalesce,
+                                        arg_count: args_slice.len(),
+                                    },
+                                ));
+
+                                for arg in args_slice.iter().rev() {
+                                    let arg_expr = match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                                        _ => {
+                                            return Err(Error::InvalidArgumentError(
+                                                "COALESCE arguments must be expressions".into(),
+                                            ));
+                                        }
+                                    };
+                                    work_stack.push(ScalarFrame::Enter(arg_expr));
+                                }
+                                continue;
+                            }
                             _ => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "unsupported function in scalar expression: {:?}",
@@ -6113,6 +6162,9 @@ fn translate_scalar_internal(
                         BuiltinScalarFunction::Abs => {
                             debug_assert_eq!(args.len(), 1);
                             build_abs_case_expr(args.pop().expect("ABS expects one argument"))
+                        }
+                        BuiltinScalarFunction::Coalesce => {
+                            llkv_expr::expr::ScalarExpr::coalesce(args)
                         }
                     };
 

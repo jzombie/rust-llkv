@@ -298,6 +298,18 @@ where
                 else_expr: translated_else.map(Box::new),
             })
         }
+        ScalarExpr::Coalesce(items) => {
+            let mut translated_items = Vec::with_capacity(items.len());
+            for item in items {
+                translated_items.push(translate_scalar_with(
+                    item,
+                    schema,
+                    unknown_column,
+                    unknown_aggregate,
+                )?);
+            }
+            Ok(ScalarExpr::Coalesce(translated_items))
+        }
         ScalarExpr::ScalarSubquery(subquery) => Ok(ScalarExpr::ScalarSubquery(subquery.clone())),
     }
 }

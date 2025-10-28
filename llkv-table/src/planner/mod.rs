@@ -747,6 +747,12 @@ where
             return Ok(Vec::new());
         }
 
+        let expected = self
+            .table
+            .store()
+            .total_rows_for_table(self.table.table_id())
+            .unwrap_or_default();
+
         // Optimization: Try scanning the dedicated row_id shadow column first.
         // This is significantly faster than scanning multiple user columns because:
         // 1. It's a single column scan instead of multiple
@@ -754,43 +760,53 @@ where
         // 3. The shadow column is guaranteed to have all row IDs for the table
         //
         // We use the first user field to construct the shadow column ID.
-        if let Some(&first_field) = fields.first() {
-            let rid_shadow = rowid_fid(first_field);
-            let mut collector = RowIdScanCollector::default();
+        if expected > 0 {
+            if let Some(&first_field) = fields.first() {
+                let rid_shadow = rowid_fid(first_field);
+                let mut collector = RowIdScanCollector::default();
 
-            // Try to scan the row_id shadow column
-            match ScanBuilder::new(self.table.store(), rid_shadow)
-                .options(ScanOptions {
-                    with_row_ids: true,
-                    ..Default::default()
-                })
-                .run(&mut collector)
-            {
-                Ok(_) => {
-                    // Success! We got all row IDs from the shadow column
-                    let mut row_ids = collector.into_inner();
-                    row_ids.sort_unstable();
-                    tracing::trace!(
-                        "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
-                        row_ids.len(),
-                        self.table.table_id()
-                    );
-                    return Ok(row_ids);
-                }
-                Err(llkv_result::Error::NotFound) => {
-                    // Shadow column doesn't exist, fall back to multi-column scan
-                    tracing::trace!(
-                        "[PERF] Shadow column not found for table {}, using multi-column scan",
-                        self.table.table_id()
-                    );
-                }
-                Err(e) => {
-                    // Other error, fall back but log it
-                    tracing::debug!(
-                        "[PERF] Error scanning shadow column for table {}: {}, falling back to multi-column scan",
-                        self.table.table_id(),
-                        e
-                    );
+                // Try to scan the row_id shadow column
+                match ScanBuilder::new(self.table.store(), rid_shadow)
+                    .options(ScanOptions {
+                        with_row_ids: true,
+                        ..Default::default()
+                    })
+                    .run(&mut collector)
+                {
+                    Ok(_) => {
+                        // Success! We got all row IDs from the shadow column
+                        let mut row_ids = collector.into_inner();
+                        row_ids.sort_unstable();
+                        tracing::trace!(
+                            "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
+                            row_ids.len(),
+                            self.table.table_id()
+                        );
+                        if row_ids.len() as u64 == expected {
+                            return Ok(row_ids);
+                        }
+                        tracing::debug!(
+                            "[PERF] Shadow column for table {} returned {} row_ids but expected {}; falling back",
+                            self.table.table_id(),
+                            row_ids.len(),
+                            expected
+                        );
+                    }
+                    Err(llkv_result::Error::NotFound) => {
+                        // Shadow column doesn't exist, fall back to multi-column scan
+                        tracing::trace!(
+                            "[PERF] Shadow column not found for table {}, using multi-column scan",
+                            self.table.table_id()
+                        );
+                    }
+                    Err(e) => {
+                        // Other error, fall back but log it
+                        tracing::debug!(
+                            "[PERF] Error scanning shadow column for table {}: {}, falling back to multi-column scan",
+                            self.table.table_id(),
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -800,16 +816,10 @@ where
         // - The shadow column doesn't exist (for whatever reason)
         // - Columns may have different row_id sets (sparse columns)
         // - We need the union of all visible rows
-        let expected = self
-            .table
-            .store()
-            .total_rows_for_table(self.table.table_id())
-            .unwrap_or_default();
-
         let mut seen: FxHashSet<RowId> = FxHashSet::default();
         let mut collected: Vec<RowId> = Vec::new();
 
-        for lfid in fields {
+        for lfid in fields.clone() {
             let mut collector = RowIdScanCollector::default();
             ScanBuilder::new(self.table.store(), lfid)
                 .options(ScanOptions {
@@ -817,7 +827,8 @@ where
                     ..Default::default()
                 })
                 .run(&mut collector)?;
-            for rid in collector.into_inner() {
+            let rows = collector.into_inner();
+            for rid in rows {
                 if seen.insert(rid) {
                     collected.push(rid);
                 }
@@ -1142,7 +1153,8 @@ where
                             ScalarExpr::Cast { data_type, .. } => data_type.clone(),
                             ScalarExpr::Binary { .. }
                             | ScalarExpr::Compare { .. }
-                            | ScalarExpr::Case { .. } => {
+                            | ScalarExpr::Case { .. }
+                            | ScalarExpr::Coalesce(_) => {
                                 let mut resolver = |fid: FieldId| {
                                     let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
                                     lfid_dtypes
@@ -1681,31 +1693,51 @@ where
             };
         }
 
-        let mut domain: Option<Vec<RowId>> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
-        for fid in &ordered_fields {
-            let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
-            domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
-                None => rows,
-            });
-            if let Some(ref d) = domain
-                && d.is_empty()
-            {
-                return Ok(Vec::new());
+
+        let requires_full_scan =
+            scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right);
+
+        let domain = if requires_full_scan {
+            let mut seen: FxHashSet<RowId> = FxHashSet::default();
+            let mut union_rows: Vec<RowId> = Vec::new();
+            for fid in &ordered_fields {
+                let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
+                for rid in rows {
+                    if seen.insert(rid) {
+                        union_rows.push(rid);
+                    }
+                }
             }
-        }
-        if let Some(ref domain_rows) = domain {
-            tracing::debug!(
-                ?ordered_fields,
-                domain_len = domain_rows.len(),
-                "collect_row_ids_for_compare domain"
-            );
+            union_rows.sort_unstable();
+            union_rows
         } else {
-            tracing::debug!(?ordered_fields, "collect_row_ids_for_compare domain empty");
-        }
-        let domain = domain.unwrap_or_default();
+            let mut domain: Option<Vec<RowId>> = None;
+            for fid in &ordered_fields {
+                let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
+                domain = Some(match domain {
+                    Some(existing) => intersect_sorted(existing, rows),
+                    None => rows,
+                });
+                if let Some(ref d) = domain
+                    && d.is_empty()
+                {
+                    return Ok(Vec::new());
+                }
+            }
+            if let Some(ref domain_rows) = domain {
+                tracing::debug!(
+                    ?ordered_fields,
+                    domain_len = domain_rows.len(),
+                    "collect_row_ids_for_compare domain"
+                );
+            } else {
+                tracing::debug!(?ordered_fields, "collect_row_ids_for_compare domain empty");
+            }
+            domain.unwrap_or_default()
+        };
+
         if domain.is_empty() {
             return Ok(domain);
         }
@@ -2094,9 +2126,9 @@ where
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
-                let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
-                let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
-                on_row(row_id, left_val, right_val);
+            let left_val = NumericKernels::evaluate_value(left, offset, &numeric_arrays)?;
+            let right_val = NumericKernels::evaluate_value(right, offset, &numeric_arrays)?;
+            on_row(row_id, left_val, right_val);
             }
 
             Ok(())
@@ -2948,6 +2980,9 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
         ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
         ScalarExpr::Case { .. } => true,
+        ScalarExpr::Coalesce(items) => items
+            .iter()
+            .any(|child| computed_expr_requires_numeric(child)),
         ScalarExpr::ScalarSubquery(_) => false,
     }
 }
@@ -3015,7 +3050,49 @@ fn computed_expr_prefers_float(
             }
             Ok(false)
         }
+        ScalarExpr::Coalesce(items) => {
+            for item in items {
+                if computed_expr_prefers_float(item, table_id, lfid_dtypes)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         ScalarExpr::ScalarSubquery(_) => Ok(false),
+    }
+}
+
+fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
+    match expr {
+        ScalarExpr::Coalesce(_) => true,
+        ScalarExpr::Binary { left, right, .. }
+        | ScalarExpr::Compare { left, right, .. } => {
+            scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right)
+        }
+        ScalarExpr::Cast { expr, .. } => scalar_expr_contains_coalesce(expr),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_deref()
+                .map(scalar_expr_contains_coalesce)
+                .unwrap_or(false)
+                || branches.iter().any(|(when_expr, then_expr)| {
+                    scalar_expr_contains_coalesce(when_expr)
+                        || scalar_expr_contains_coalesce(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .map(scalar_expr_contains_coalesce)
+                    .unwrap_or(false)
+        }
+        ScalarExpr::GetField { base, .. } => scalar_expr_contains_coalesce(base),
+        ScalarExpr::Aggregate(_)
+        | ScalarExpr::Column(_)
+        | ScalarExpr::Literal(_)
+        | ScalarExpr::ScalarSubquery(_) => false,
     }
 }
 fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
@@ -3196,7 +3273,8 @@ fn synthesize_computed_literal_array(
         | ScalarExpr::Compare { .. }
         | ScalarExpr::Aggregate(_)
         | ScalarExpr::GetField { .. }
-        | ScalarExpr::Case { .. } => Ok(new_null_array(data_type, row_count)),
+        | ScalarExpr::Case { .. }
+        | ScalarExpr::Coalesce(_) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
     }
 }
@@ -3416,6 +3494,11 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                     traverse_stack.push(inner);
                 }
             }
+            Coalesce(items) => {
+                for item in items {
+                    traverse_stack.push(item);
+                }
+            }
             Column(_) | Literal(_) | Aggregate(_) => {}
             ScalarExpr::ScalarSubquery(_) => {}
         }
@@ -3482,6 +3565,14 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 }
                 parts.push("END".to_string());
                 result_stack.push(parts.join(" "));
+            }
+            Coalesce(items) => {
+                let mut args = Vec::with_capacity(items.len());
+                for _ in 0..items.len() {
+                    args.push(result_stack.pop().unwrap_or_default());
+                }
+                args.reverse();
+                result_stack.push(format!("COALESCE({})", args.join(", ")));
             }
             ScalarExpr::ScalarSubquery(sub) => {
                 result_stack.push(format!("(SCALAR_SUBQUERY#{})", sub.id.0));

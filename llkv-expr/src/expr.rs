@@ -107,6 +107,8 @@ pub enum ScalarExpr<F> {
         op: CompareOp,
         right: Box<ScalarExpr<F>>,
     },
+    /// First non-null expression in the provided list.
+    Coalesce(Vec<ScalarExpr<F>>),
     /// Scalar subquery evaluated per input row.
     ScalarSubquery(ScalarSubqueryExpr),
     /// SQL CASE expression with optional operand and ELSE branch.
@@ -179,6 +181,11 @@ impl<F> ScalarExpr<F> {
             op,
             right: Box::new(right),
         }
+    }
+
+    #[inline]
+    pub fn coalesce(exprs: Vec<Self>) -> Self {
+        Self::Coalesce(exprs)
     }
 
     #[inline]
