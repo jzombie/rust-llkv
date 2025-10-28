@@ -760,53 +760,53 @@ where
         // 3. The shadow column is guaranteed to have all row IDs for the table
         //
         // We use the first user field to construct the shadow column ID.
-        if expected > 0 {
-            if let Some(&first_field) = fields.first() {
-                let rid_shadow = rowid_fid(first_field);
-                let mut collector = RowIdScanCollector::default();
+        if expected > 0
+            && let Some(&first_field) = fields.first()
+        {
+            let rid_shadow = rowid_fid(first_field);
+            let mut collector = RowIdScanCollector::default();
 
-                // Try to scan the row_id shadow column
-                match ScanBuilder::new(self.table.store(), rid_shadow)
-                    .options(ScanOptions {
-                        with_row_ids: true,
-                        ..Default::default()
-                    })
-                    .run(&mut collector)
-                {
-                    Ok(_) => {
-                        // Success! We got all row IDs from the shadow column
-                        let mut row_ids = collector.into_inner();
-                        row_ids.sort_unstable();
-                        tracing::trace!(
-                            "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
-                            row_ids.len(),
-                            self.table.table_id()
-                        );
-                        if row_ids.len() as u64 == expected {
-                            return Ok(row_ids);
-                        }
-                        tracing::debug!(
-                            "[PERF] Shadow column for table {} returned {} row_ids but expected {}; falling back",
-                            self.table.table_id(),
-                            row_ids.len(),
-                            expected
-                        );
+            // Try to scan the row_id shadow column
+            match ScanBuilder::new(self.table.store(), rid_shadow)
+                .options(ScanOptions {
+                    with_row_ids: true,
+                    ..Default::default()
+                })
+                .run(&mut collector)
+            {
+                Ok(_) => {
+                    // Success! We got all row IDs from the shadow column
+                    let mut row_ids = collector.into_inner();
+                    row_ids.sort_unstable();
+                    tracing::trace!(
+                        "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
+                        row_ids.len(),
+                        self.table.table_id()
+                    );
+                    if row_ids.len() as u64 == expected {
+                        return Ok(row_ids);
                     }
-                    Err(llkv_result::Error::NotFound) => {
-                        // Shadow column doesn't exist, fall back to multi-column scan
-                        tracing::trace!(
-                            "[PERF] Shadow column not found for table {}, using multi-column scan",
-                            self.table.table_id()
-                        );
-                    }
-                    Err(e) => {
-                        // Other error, fall back but log it
-                        tracing::debug!(
-                            "[PERF] Error scanning shadow column for table {}: {}, falling back to multi-column scan",
-                            self.table.table_id(),
-                            e
-                        );
-                    }
+                    tracing::debug!(
+                        "[PERF] Shadow column for table {} returned {} row_ids but expected {}; falling back",
+                        self.table.table_id(),
+                        row_ids.len(),
+                        expected
+                    );
+                }
+                Err(llkv_result::Error::NotFound) => {
+                    // Shadow column doesn't exist, fall back to multi-column scan
+                    tracing::trace!(
+                        "[PERF] Shadow column not found for table {}, using multi-column scan",
+                        self.table.table_id()
+                    );
+                }
+                Err(e) => {
+                    // Other error, fall back but log it
+                    tracing::debug!(
+                        "[PERF] Error scanning shadow column for table {}: {}, falling back to multi-column scan",
+                        self.table.table_id(),
+                        e
+                    );
                 }
             }
         }
@@ -2980,9 +2980,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
         ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
         ScalarExpr::Case { .. } => true,
-        ScalarExpr::Coalesce(items) => items
-            .iter()
-            .any(|child| computed_expr_requires_numeric(child)),
+        ScalarExpr::Coalesce(items) => items.iter().any(computed_expr_requires_numeric),
         ScalarExpr::ScalarSubquery(_) => false,
     }
 }

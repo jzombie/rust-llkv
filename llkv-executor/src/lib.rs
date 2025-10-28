@@ -91,7 +91,7 @@ pub use utils::current_time_micros;
 // ============================================================================
 
 thread_local! {
-    static QUERY_LABEL_STACK: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    static QUERY_LABEL_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Guard object that pops the current query label when dropped.
@@ -3214,8 +3214,7 @@ fn rows_to_record_batch(
 
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_count);
     for (idx, field) in schema.fields().iter().enumerate() {
-        let array =
-            build_array_for_column(field.data_type(), &columns[idx]).map_err(Error::from)?;
+        let array = build_array_for_column(field.data_type(), &columns[idx])?;
         arrays.push(array);
     }
 
@@ -4400,8 +4399,7 @@ fn filter_batches_by_literal(
         }
 
         let column = batch.column(column_idx);
-        let mut keep_rows: Vec<u32> = Vec::new();
-        keep_rows.reserve(batch.num_rows());
+        let mut keep_rows: Vec<u32> = Vec::with_capacity(batch.num_rows());
 
         for row_idx in 0..batch.num_rows() {
             if array_value_equals_plan_value(column.as_ref(), row_idx, literal)? {
@@ -4632,14 +4630,12 @@ fn hash_join_table_batches(
         });
     }
 
-    let left_arrays =
-        gather_indices_from_batches(&left_batches, &left_matches).map_err(Error::from)?;
-    let right_arrays =
-        gather_indices_from_batches(&right_batches, &right_matches).map_err(Error::from)?;
+    let left_arrays = gather_indices_from_batches(&left_batches, &left_matches)?;
+    let right_arrays = gather_indices_from_batches(&right_batches, &right_matches)?;
 
     let mut combined_columns = Vec::with_capacity(left_arrays.len() + right_arrays.len());
-    combined_columns.extend(left_arrays.into_iter());
-    combined_columns.extend(right_arrays.into_iter());
+    combined_columns.extend(left_arrays);
+    combined_columns.extend(right_arrays);
 
     let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), combined_columns)
         .map_err(|err| Error::Internal(format!("failed to materialize hash join batch: {err}")))?;
@@ -4652,54 +4648,56 @@ fn hash_join_table_batches(
     })
 }
 
+/// Type alias for join match index pairs (batch_idx, row_idx)
+type JoinMatchIndices = Vec<(usize, usize)>;
+/// Type alias for hash table mapping join keys to row positions
+type JoinHashTable = FxHashMap<Vec<u8>, Vec<(usize, usize)>>;
+
 fn build_join_match_indices(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
     join_keys: &[(usize, usize)],
-) -> ExecutorResult<(Vec<(usize, usize)>, Vec<(usize, usize)>)> {
+) -> ExecutorResult<(JoinMatchIndices, JoinMatchIndices)> {
     let right_key_indices: Vec<usize> = join_keys.iter().map(|(_, right)| *right).collect();
 
     // Parallelize hash table build phase across batches
     // Each thread builds a local hash table for its batch(es), then we merge them
-    let hash_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> =
-        llkv_column_map::parallel::with_thread_pool(|| {
-            let local_tables: Vec<FxHashMap<Vec<u8>, Vec<(usize, usize)>>> = right_batches
-                .par_iter()
-                .enumerate()
-                .map(|(batch_idx, batch)| {
-                    let mut local_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> =
-                        FxHashMap::default();
-                    let mut key_buffer: Vec<u8> = Vec::new();
+    let hash_table: JoinHashTable = llkv_column_map::parallel::with_thread_pool(|| {
+        let local_tables: Vec<JoinHashTable> = right_batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_idx, batch)| {
+                let mut local_table: JoinHashTable = FxHashMap::default();
+                let mut key_buffer: Vec<u8> = Vec::new();
 
-                    for row_idx in 0..batch.num_rows() {
-                        key_buffer.clear();
-                        match build_join_key(batch, &right_key_indices, row_idx, &mut key_buffer)
-                        {
-                            Ok(true) => {
-                                local_table
-                                    .entry(key_buffer.clone())
-                                    .or_default()
-                                    .push((batch_idx, row_idx));
-                            }
-                            Ok(false) => continue,
-                            Err(_) => continue, // Skip rows with errors during parallel build
+                for row_idx in 0..batch.num_rows() {
+                    key_buffer.clear();
+                    match build_join_key(batch, &right_key_indices, row_idx, &mut key_buffer) {
+                        Ok(true) => {
+                            local_table
+                                .entry(key_buffer.clone())
+                                .or_default()
+                                .push((batch_idx, row_idx));
                         }
+                        Ok(false) => continue,
+                        Err(_) => continue, // Skip rows with errors during parallel build
                     }
-
-                    local_table
-                })
-                .collect();
-
-            // Merge all local hash tables into one
-            let mut merged_table: FxHashMap<Vec<u8>, Vec<(usize, usize)>> = FxHashMap::default();
-            for local_table in local_tables {
-                for (key, mut positions) in local_table {
-                    merged_table.entry(key).or_default().append(&mut positions);
                 }
-            }
 
-            merged_table
-        });
+                local_table
+            })
+            .collect();
+
+        // Merge all local hash tables into one
+        let mut merged_table: JoinHashTable = FxHashMap::default();
+        for local_table in local_tables {
+            for (key, mut positions) in local_table {
+                merged_table.entry(key).or_default().append(&mut positions);
+            }
+        }
+
+        merged_table
+    });
 
     if hash_table.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -4709,14 +4707,14 @@ fn build_join_match_indices(
 
     // Parallelize probe phase across left batches
     // Each thread probes its batch(es) against the shared hash table
-    let matches: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>)> =
+    let matches: Vec<(JoinMatchIndices, JoinMatchIndices)> =
         llkv_column_map::parallel::with_thread_pool(|| {
             left_batches
                 .par_iter()
                 .enumerate()
                 .map(|(batch_idx, batch)| {
-                    let mut local_left_matches: Vec<(usize, usize)> = Vec::new();
-                    let mut local_right_matches: Vec<(usize, usize)> = Vec::new();
+                    let mut local_left_matches: JoinMatchIndices = Vec::new();
+                    let mut local_right_matches: JoinMatchIndices = Vec::new();
                     let mut key_buffer: Vec<u8> = Vec::new();
 
                     for row_idx in 0..batch.num_rows() {
@@ -4741,8 +4739,8 @@ fn build_join_match_indices(
         });
 
     // Merge all match results
-    let mut left_matches: Vec<(usize, usize)> = Vec::new();
-    let mut right_matches: Vec<(usize, usize)> = Vec::new();
+    let mut left_matches: JoinMatchIndices = Vec::new();
+    let mut right_matches: JoinMatchIndices = Vec::new();
     for (mut left, mut right) in matches {
         left_matches.append(&mut left);
         right_matches.append(&mut right);
@@ -5254,7 +5252,11 @@ fn extract_join_constraints(
                 handled_conjuncts += 1;
                 break;
             }
-            LlkvExpr::Compare { left, op, right } if matches!(op, CompareOp::Eq) => {
+            LlkvExpr::Compare {
+                left,
+                op: CompareOp::Eq,
+                right,
+            } => {
                 match (
                     resolve_column_reference(left, table_infos),
                     resolve_column_reference(right, table_infos),
@@ -5268,21 +5270,21 @@ fn extract_join_constraints(
                         continue;
                     }
                     (Some(column), None) => {
-                        if let Some(literal) = extract_literal(right) {
-                            if let Some(value) = literal_to_plan_value_for_join(&literal) {
-                                literals.push(ColumnLiteral { column, value });
-                                handled_conjuncts += 1;
-                                continue;
-                            }
+                        if let Some(literal) = extract_literal(right)
+                            && let Some(value) = literal_to_plan_value_for_join(literal)
+                        {
+                            literals.push(ColumnLiteral { column, value });
+                            handled_conjuncts += 1;
+                            continue;
                         }
                     }
                     (None, Some(column)) => {
-                        if let Some(literal) = extract_literal(left) {
-                            if let Some(value) = literal_to_plan_value_for_join(&literal) {
-                                literals.push(ColumnLiteral { column, value });
-                                handled_conjuncts += 1;
-                                continue;
-                            }
+                        if let Some(literal) = extract_literal(left)
+                            && let Some(value) = literal_to_plan_value_for_join(literal)
+                        {
+                            literals.push(ColumnLiteral { column, value });
+                            handled_conjuncts += 1;
+                            continue;
                         }
                     }
                     _ => {}
@@ -5381,10 +5383,10 @@ fn matches_table_ident(table_ref: &llkv_plan::TableRef, ident: &str) -> bool {
     if ident.is_empty() {
         return false;
     }
-    if let Some(alias) = &table_ref.alias {
-        if alias.to_ascii_lowercase() == ident {
-            return true;
-        }
+    if let Some(alias) = &table_ref.alias
+        && alias.to_ascii_lowercase() == ident
+    {
+        return true;
     }
     if table_ref.table.to_ascii_lowercase() == ident {
         return true;
