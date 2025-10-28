@@ -50,11 +50,13 @@ use llkv_table::{NumericArray, NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID}
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::cell::RefCell;
 use std::convert::TryFrom;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+#[cfg(test)]
+use std::cell::RefCell;
 
 // ============================================================================
 // Module Declarations
@@ -90,6 +92,7 @@ pub use utils::current_time_micros;
 // Query Logging Helpers
 // ============================================================================
 
+#[cfg(test)]
 thread_local! {
     static QUERY_LABEL_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
@@ -101,11 +104,23 @@ pub struct QueryLogGuard {
 
 /// Install a query label for the current thread so that executor logs can
 /// annotate diagnostics with the originating SQL statement.
+#[cfg(test)]
 pub fn push_query_label(label: impl Into<String>) -> QueryLogGuard {
     QUERY_LABEL_STACK.with(|stack| stack.borrow_mut().push(label.into()));
     QueryLogGuard { _private: () }
 }
 
+/// Install a query label for the current thread so that executor logs can
+/// annotate diagnostics with the originating SQL statement.
+/// 
+/// No-op in non-test builds.
+#[cfg(not(test))]
+#[inline]
+pub fn push_query_label(_label: impl Into<String>) -> QueryLogGuard {
+    QueryLogGuard { _private: () }
+}
+
+#[cfg(test)]
 impl Drop for QueryLogGuard {
     fn drop(&mut self) {
         QUERY_LABEL_STACK.with(|stack| {
@@ -114,9 +129,27 @@ impl Drop for QueryLogGuard {
     }
 }
 
+#[cfg(not(test))]
+impl Drop for QueryLogGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // No-op in non-test builds
+    }
+}
+
 /// Fetch the innermost query label associated with the current execution thread.
+#[cfg(test)]
 pub fn current_query_label() -> Option<String> {
     QUERY_LABEL_STACK.with(|stack| stack.borrow().last().cloned())
+}
+
+/// Fetch the innermost query label associated with the current execution thread.
+/// 
+/// Always returns None in non-test builds.
+#[cfg(not(test))]
+#[inline]
+pub fn current_query_label() -> Option<String> {
+    None
 }
 
 // ============================================================================
