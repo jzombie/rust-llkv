@@ -25,6 +25,7 @@ In short: **Executor = SELECT-only query engine** | **Runtime = Full SQL coordin
 - The executor works with Arrow `RecordBatch` data and integrates with [`llkv-table`](../llkv-table/) scanning primitives.
 - Query execution is designed for streaming results to avoid materializing entire result sets in memory.
 - Invoked by [`llkv-runtime`](../llkv-runtime/) which provides the transaction context for row visibility filtering.
+- Scalar subqueries run through the same evaluation pipeline as other scalar expressions, using planner-supplied correlated column placeholders to pull outer values during execution.
 
 ## License
 
