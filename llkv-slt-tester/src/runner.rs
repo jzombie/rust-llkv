@@ -220,11 +220,11 @@ where
             let result = runner.run_async(record.clone()).await;
             if let Err(e) = result {
                 let error_msg = format!("{}", e);
-                
+
                 // Only apply flattening workaround for Query records with result mismatches
-                let is_query_mismatch = matches!(&record, sqllogictest::Record::Query { .. }) 
+                let is_query_mismatch = matches!(&record, sqllogictest::Record::Query { .. })
                     && error_msg.contains("[Diff]");
-                
+
                 if is_query_mismatch && flattening_resolves_mismatch(&error_msg) {
                     tracing::debug!(
                         "[llkv-slt] Query mismatch resolved by flattening multi-column output"
@@ -364,7 +364,11 @@ fn flattening_resolves_mismatch(message: &str) -> bool {
     }
 
     if actual.len() >= expected.len() {
-        tracing::trace!("[flatten] Actual length {} >= expected length {}, rejecting", actual.len(), expected.len());
+        tracing::trace!(
+            "[flatten] Actual length {} >= expected length {}, rejecting",
+            actual.len(),
+            expected.len()
+        );
         return false;
     }
 
@@ -405,21 +409,21 @@ fn try_smart_split(actual: &[String], expected_count: usize) -> Option<Vec<Strin
     if actual.is_empty() || expected_count == 0 {
         return None;
     }
-    
+
     // Calculate how many columns each actual line should contribute
     let cols_per_line = expected_count / actual.len();
     let extra_cols = expected_count % actual.len();
-    
+
     if cols_per_line == 0 {
         return None;
     }
-    
+
     let mut result = Vec::with_capacity(expected_count);
-    
+
     for (idx, line) in actual.iter().enumerate() {
         // This line needs cols_per_line columns, plus 1 extra if idx < extra_cols
         let needed = cols_per_line + if idx < extra_cols { 1 } else { 0 };
-        
+
         if needed == 1 {
             // Just use the whole line as one column
             result.push(line.clone());
@@ -428,7 +432,7 @@ fn try_smart_split(actual: &[String], expected_count: usize) -> Option<Vec<Strin
             // For simplicity, split by finding sequences of multiple spaces or
             // use heuristics based on the line structure
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            
+
             if tokens.len() >= needed * 2 {
                 // If we have at least 2 tokens per needed column, group them
                 let tokens_per_col = tokens.len() / needed;
@@ -448,7 +452,7 @@ fn try_smart_split(actual: &[String], expected_count: usize) -> Option<Vec<Strin
             }
         }
     }
-    
+
     if result.len() == expected_count {
         Some(result)
     } else {
