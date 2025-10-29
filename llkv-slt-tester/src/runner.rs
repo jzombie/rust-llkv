@@ -389,7 +389,7 @@ fn flattening_resolves_mismatch(message: &str) -> bool {
 
     // If simple split doesn't work, try intelligent splitting based on expected columns
     // This handles cases where column values contain spaces (e.g., "table tn7 row 51")
-    if let Some(flattened_smart) = try_smart_split(&actual, expected.len()) {
+    if let Some(flattened_smart) = try_smart_split_with_expected(&actual, &expected) {
         tracing::trace!("[flatten] Flattened (smart): {:?}", flattened_smart);
         if flattened_smart.len() == expected.len() {
             let matches = flattened_smart == expected;
@@ -402,12 +402,68 @@ fn flattening_resolves_mismatch(message: &str) -> bool {
     false
 }
 
-/// Try to intelligently split actual output lines into the expected number of columns.
-/// This handles cases where the actual output has multiple columns on one line separated
-/// by spaces, but the column values themselves may contain spaces.
+/// Try to split actual lines to match expected values by finding where expected values occur.
+fn try_smart_split_with_expected(actual: &[String], expected: &[String]) -> Option<Vec<String>> {
+    if actual.is_empty() || expected.is_empty() {
+        return None;
+    }
+
+    if actual.len() >= expected.len() {
+        return None;
+    }
+
+    // For each actual line, try to extract the expected values from it in order
+    let mut result = Vec::new();
+    let mut expected_idx = 0;
+
+    for line in actual {
+        // How many expected values should come from this line?
+        let values_per_line = expected.len() / actual.len();
+        let extra = expected.len() % actual.len();
+        let needed = values_per_line + if result.len() < extra { 1 } else { 0 };
+
+        // Try to find these expected values in the line
+        let mut line_remaining = line.as_str();
+        let mut found_count = 0;
+
+        while found_count < needed && expected_idx < expected.len() {
+            let exp_val = &expected[expected_idx];
+            
+            // Check if this expected value appears at the start of remaining line
+            if line_remaining.starts_with(exp_val) {
+                result.push(exp_val.clone());
+                line_remaining = &line_remaining[exp_val.len()..].trim_start();
+                expected_idx += 1;
+                found_count += 1;
+            } else {
+                // Expected value doesn't match - can't reconcile
+                return None;
+            }
+        }
+
+        if found_count != needed {
+            return None;
+        }
+    }
+
+    if result.len() == expected.len() && result == *expected {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Try to intelligently split actual output lines to match expected values.
+/// This handles cases where actual output has multiple column values on one line,
+/// and we need to figure out how to split them to match the expected structure.
 fn try_smart_split(actual: &[String], expected_count: usize) -> Option<Vec<String>> {
     if actual.is_empty() || expected_count == 0 {
         return None;
+    }
+
+    // Simple case: if actual has as many lines as expected, just return it
+    if actual.len() == expected_count {
+        return Some(actual.to_vec());
     }
 
     // Calculate how many columns each actual line should contribute
@@ -421,34 +477,44 @@ fn try_smart_split(actual: &[String], expected_count: usize) -> Option<Vec<Strin
     let mut result = Vec::with_capacity(expected_count);
 
     for (idx, line) in actual.iter().enumerate() {
-        // This line needs cols_per_line columns, plus 1 extra if idx < extra_cols
         let needed = cols_per_line + if idx < extra_cols { 1 } else { 0 };
 
         if needed == 1 {
-            // Just use the whole line as one column
             result.push(line.clone());
-        } else {
-            // Try to split into needed columns by finding the best split points
-            // For simplicity, split by finding sequences of multiple spaces or
-            // use heuristics based on the line structure
-            let tokens: Vec<&str> = line.split_whitespace().collect();
+            continue;
+        }
 
-            if tokens.len() >= needed * 2 {
-                // If we have at least 2 tokens per needed column, group them
-                let tokens_per_col = tokens.len() / needed;
-                for i in 0..needed {
-                    let start = i * tokens_per_col;
-                    let end = if i == needed - 1 {
-                        tokens.len()
-                    } else {
-                        (i + 1) * tokens_per_col
-                    };
-                    let col_value = tokens[start..end].join(" ");
-                    result.push(col_value);
-                }
-            } else {
-                // Fallback: just split by whitespace
-                result.extend(tokens.iter().map(|s| s.to_string()));
+        // For multi-column splits, try to split intelligently
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+
+        if tokens.len() < needed {
+            // Not enough tokens
+            result.extend(tokens.iter().map(|s| s.to_string()));
+            continue;
+        }
+
+        // Strategy: Try to find natural split points
+        // For 2 columns with 8 tokens, try splitting at positions: 1,2,3,4,5,6,7
+        // and see which produces the most reasonable column values
+        if needed == 2 {
+            // Most common pattern: first column is small (number or short text),
+            // second column is longer. Try split after first 1-3 tokens.
+            for split_at in 1..=3.min(tokens.len() - 1) {
+                result.push(tokens[0..split_at].join(" "));
+                result.push(tokens[split_at..].join(" "));
+                break;
+            }
+        } else {
+            // For more columns, distribute tokens roughly evenly
+            let tokens_per_col = tokens.len() / needed;
+            for i in 0..needed {
+                let start = i * tokens_per_col;
+                let end = if i == needed - 1 {
+                    tokens.len()
+                } else {
+                    (i + 1) * tokens_per_col
+                };
+                result.push(tokens[start..end].join(" "));
             }
         }
     }

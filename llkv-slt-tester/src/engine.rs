@@ -270,6 +270,11 @@ impl AsyncDB for EngineHarness {
                             vec![]
                         };
 
+                        tracing::debug!("[HARNESS] Returning {} rows with types {:?}", rows.len(), types);
+                        for (i, row) in rows.iter().enumerate() {
+                            tracing::debug!("[HARNESS] Row {}: {:?}", i, row);
+                        }
+
                         Ok(DBOutput::Rows { types, rows })
                     }
                     RuntimeStatementResult::Insert { rows_inserted, .. } => Ok(DBOutput::Rows {
