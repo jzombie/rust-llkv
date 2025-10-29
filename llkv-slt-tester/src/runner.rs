@@ -216,7 +216,25 @@ where
                 break;
             }
 
-            runner.run_async(record).await?;
+            // Run the record and handle per-query flattening fallback
+            let result = runner.run_async(record.clone()).await;
+            if let Err(e) = result {
+                let error_msg = format!("{}", e);
+                
+                // Only apply flattening workaround for Query records with result mismatches
+                let is_query_mismatch = matches!(&record, sqllogictest::Record::Query { .. }) 
+                    && error_msg.contains("[Diff]");
+                
+                if is_query_mismatch && flattening_resolves_mismatch(&error_msg) {
+                    tracing::debug!(
+                        "[llkv-slt] Query mismatch resolved by flattening multi-column output"
+                    );
+                    // Continue to next record instead of failing the entire test
+                } else {
+                    // Re-raise the error for actual failures
+                    return Err(e);
+                }
+            }
 
             if let Some(prev) = previous_hash_threshold {
                 runner.with_hash_threshold(prev);
@@ -235,14 +253,6 @@ where
     if let Err(e) = run_result {
         let (mapped, opt_line_info) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, origin);
-
-        if flattening_resolves_mismatch(&mapped) {
-            tracing::debug!(
-                "[llkv-slt] detected multi-column diff; flattened output matches expected"
-            );
-            drop(named);
-            return Ok(());
-        }
 
         // Persist the temp file for debugging when there's an error
         let persist_path = std::path::Path::new(LAST_FAILED_SLT_PATH);
