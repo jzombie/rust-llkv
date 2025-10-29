@@ -18,7 +18,7 @@ fn bench_select4_slturl(c: &mut Criterion) {
     group.warm_up_time(std::time::Duration::from_millis(100));
     group.measurement_time(std::time::Duration::from_secs(123));
 
-    group.bench_function("full_test_file", |b| {
+    group.bench_function("select4_full", |b| {
         b.iter(|| {
             let runner = LlkvSltRunner::in_memory();
             let path = PathBuf::from(SELECT4_PATH);
