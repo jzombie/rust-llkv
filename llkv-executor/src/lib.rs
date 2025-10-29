@@ -1401,15 +1401,19 @@ where
         );
 
         let mut literal_map: Vec<Vec<ColumnConstraint>> = vec![Vec::new(); tables_with_handles.len()];
-        for literal in &constraint_plan.literals {
-            if literal.column.table >= literal_map.len() {
+        for constraint in &constraint_plan.literals {
+            let table_idx = match constraint {
+                ColumnConstraint::Equality(lit) => lit.column.table,
+                ColumnConstraint::InList(in_list) => in_list.column.table,
+            };
+            if table_idx >= literal_map.len() {
                 tracing::debug!(
-                    "join_opt[{query_label}]: literal references unknown table index {}; falling back",
-                    literal.column.table
+                    "join_opt[{query_label}]: constraint references unknown table index {}; falling back",
+                    table_idx
                 );
                 return Ok(None);
             }
-            literal_map[literal.column.table].push(ColumnConstraint::Equality(literal.clone()));
+            literal_map[table_idx].push(constraint.clone());
         }
 
         let mut per_table: Vec<Option<TableCrossProductData>> =
@@ -5947,7 +5951,7 @@ enum ColumnConstraint {
 // TODO: Move `llkv-plan`?
 struct JoinConstraintPlan {
     equalities: Vec<ColumnEquality>,
-    literals: Vec<ColumnLiteral>,
+    literals: Vec<ColumnConstraint>,
     unsatisfiable: bool,
     /// Total number of conjuncts in the original WHERE clause
     total_conjuncts: usize,
@@ -6247,9 +6251,8 @@ fn extract_join_constraints(
     table_infos: &[TableInfo<'_>],
 ) -> Option<JoinConstraintPlan> {
     let mut conjuncts = Vec::new();
-    if !collect_conjuncts(expr, &mut conjuncts) {
-        return None;
-    }
+    // Use lenient collection to include OR clauses for potential conversion to IN lists
+    collect_conjuncts_lenient(expr, &mut conjuncts);
 
     let total_conjuncts = conjuncts.len();
     let mut equalities = Vec::new();
@@ -6288,7 +6291,7 @@ fn extract_join_constraints(
                         if let Some(literal) = extract_literal(right)
                             && let Some(value) = literal_to_plan_value_for_join(literal)
                         {
-                            literals.push(ColumnLiteral { column, value });
+                            literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                             handled_conjuncts += 1;
                             continue;
                         }
@@ -6297,7 +6300,7 @@ fn extract_join_constraints(
                         if let Some(literal) = extract_literal(left)
                             && let Some(value) = literal_to_plan_value_for_join(literal)
                         {
-                            literals.push(ColumnLiteral { column, value });
+                            literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                             handled_conjuncts += 1;
                             continue;
                         }
@@ -6305,6 +6308,46 @@ fn extract_join_constraints(
                     _ => {}
                 }
                 // Ignore this predicate - it will be handled by post-join filter
+            }
+            // Handle InList - these can be used for hash join build side filtering
+            LlkvExpr::InList {
+                expr: col_expr,
+                list,
+                negated: false,
+            } => {
+                if let Some(column) = resolve_column_reference(col_expr, table_infos) {
+                    // Extract all values from IN list
+                    let mut in_list_values = Vec::new();
+                    for item in list {
+                        if let Some(literal) = extract_literal(item)
+                            && let Some(value) = literal_to_plan_value_for_join(literal)
+                        {
+                            in_list_values.push(value);
+                        }
+                    }
+                    if !in_list_values.is_empty() {
+                        literals.push(ColumnConstraint::InList(ColumnInList {
+                            column,
+                            values: in_list_values,
+                        }));
+                        handled_conjuncts += 1;
+                        continue;
+                    }
+                }
+                // Ignore - will be handled by post-join filter
+            }
+            // Handle OR clauses that can be converted to IN lists
+            LlkvExpr::Or(or_children) => {
+                if let Some((column, values)) = try_extract_or_as_in_list(or_children, table_infos) {
+                    // Treat as IN list
+                    literals.push(ColumnConstraint::InList(ColumnInList {
+                        column,
+                        values,
+                    }));
+                    handled_conjuncts += 1;
+                    continue;
+                }
+                // OR clause couldn't be converted - ignore, will be handled by post-join filter
             }
             _ => {
                 // Ignore unsupported predicates - they will be handled by post-join filter

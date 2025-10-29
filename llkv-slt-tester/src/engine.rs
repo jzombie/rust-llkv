@@ -271,8 +271,9 @@ impl AsyncDB for EngineHarness {
                         };
 
                         tracing::debug!("[HARNESS] Returning {} rows with types {:?}", rows.len(), types);
+                        tracing::debug!("[HARNESS] Total values: {}", rows.len() * rows.first().map(|r| r.len()).unwrap_or(0));
                         for (i, row) in rows.iter().enumerate() {
-                            tracing::debug!("[HARNESS] Row {}: {:?}", i, row);
+                            tracing::debug!("[HARNESS] Row {}: {} columns = {:?}", i, row.len(), row);
                         }
 
                         Ok(DBOutput::Rows { types, rows })

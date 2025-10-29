@@ -363,6 +363,13 @@ fn flattening_resolves_mismatch(message: &str) -> bool {
         return false;
     }
 
+    // If expected is a hash result (e.g., "30 values hashing to abc123"), don't try to flatten
+    // The sqllogictest library should handle hash comparisons, not us
+    if expected.len() == 1 && expected[0].contains("hashing to") {
+        tracing::trace!("[flatten] Expected is a hash result, skipping flattening");
+        return false;
+    }
+
     if actual.len() >= expected.len() {
         tracing::trace!(
             "[flatten] Actual length {} >= expected length {}, rejecting",
