@@ -47,8 +47,7 @@ jobs:
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Test
-        # Tests run in release mode to decrease time to completion on CI
-        run: cargo test --release --workspace --all-features --lib --bins --tests --examples -- --include-ignored
+        run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
 
   test:
     name: test
