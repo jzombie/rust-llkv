@@ -25,10 +25,15 @@ tracing.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 indoc.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 
 [[test]]
 name = "slt_harness"
 path = "tests/slt_harness.rs"
+harness = false
+
+[[bench]]
+name = "select4_bench"
 harness = false

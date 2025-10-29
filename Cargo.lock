@@ -1573,6 +1573,7 @@ version = "0.5.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
+ "criterion",
  "indoc",
  "libtest-mimic",
  "llkv-result",
