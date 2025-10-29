@@ -1329,15 +1329,13 @@ where
             }
         };
 
-        tracing::debug!(
-            "join_opt[{query_label}]: constraint extraction succeeded - equalities={}, literals={}, handled={}/{} predicates",
-            constraint_plan.equalities.len(),
-            constraint_plan.literals.len(),
-            constraint_plan.handled_conjuncts,
-            constraint_plan.total_conjuncts
-        );
-
-        tracing::debug!(
+    tracing::debug!(
+        "join_opt[{query_label}]: constraint extraction succeeded - equalities={}, literals={}, handled={}/{} predicates",
+        constraint_plan.equalities.len(),
+        constraint_plan.literals.len(),
+        constraint_plan.handled_conjuncts,
+        constraint_plan.total_conjuncts
+    );        tracing::debug!(
             "join_opt[{query_label}]: attempting hash join with tables={:?} filter={:?}",
             plan.tables
                 .iter()
@@ -1413,6 +1411,11 @@ where
                 );
                 return Ok(None);
             }
+            tracing::debug!(
+                "join_opt[{query_label}]: mapping constraint to table_idx={} (table={})",
+                table_idx,
+                tables_with_handles[table_idx].0.qualified_name()
+            );
             literal_map[table_idx].push(constraint.clone());
         }
 
@@ -5758,9 +5761,10 @@ fn build_cross_product_column_lookup(
                     .or_insert(field_index);
             }
 
-            if column_occurrences.get(&column_name).copied().unwrap_or(0) == 1 {
-                lookup.entry(column_name.clone()).or_insert(field_index);
-            }
+            // Use first-match semantics for bare column names (matches SQLite behavior)
+            // This allows ambiguous column names to resolve to the first occurrence
+            // in FROM clause order
+            lookup.entry(column_name.clone()).or_insert(field_index);
 
             if table_keys.is_empty()
                 && let Some(pair) = table_column_suffix(field.name())
@@ -6146,7 +6150,7 @@ fn try_extract_or_as_in_list(
     let mut values = Vec::new();
 
     for child in or_children {
-        // Try to extract column = literal pattern
+        // Try to extract column = literal pattern from Compare expressions
         if let LlkvExpr::Compare {
             left,
             op: CompareOp::Eq,
@@ -6192,6 +6196,26 @@ fn try_extract_or_as_in_list(
                     }
                     values.push(value);
                     continue;
+                }
+            }
+        }
+        // Also handle Pred(Filter{...}) expressions with Equals operator
+        else if let LlkvExpr::Pred(filter) = child {
+            if let Operator::Equals(ref literal) = filter.op {
+                // Resolve the field_id (column name) to a ColumnRef
+                if let Some(column) = resolve_column_reference(
+                    &ScalarExpr::Column(filter.field_id.clone()),
+                    table_infos,
+                ) {
+                    if let Some(value) = literal_to_plan_value_for_join(literal) {
+                        match common_column {
+                            None => common_column = Some(column),
+                            Some(ref prev) if prev.table == column.table && prev.column == column.column => {}
+                            _ => return None,
+                        }
+                        values.push(value);
+                        continue;
+                    }
                 }
             }
         }
@@ -6349,6 +6373,24 @@ fn extract_join_constraints(
                 }
                 // OR clause couldn't be converted - ignore, will be handled by post-join filter
             }
+            // Handle Pred(Filter{...}) expressions - these are field-based predicates
+            LlkvExpr::Pred(filter) => {
+                // Try to extract equality constraints
+                if let Operator::Equals(ref literal) = filter.op {
+                    // Resolve field_id to a ColumnRef
+                    if let Some(column) = resolve_column_reference(
+                        &ScalarExpr::Column(filter.field_id.clone()),
+                        table_infos,
+                    ) {
+                        if let Some(value) = literal_to_plan_value_for_join(literal) {
+                            literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
+                            handled_conjuncts += 1;
+                            continue;
+                        }
+                    }
+                }
+                // Ignore other Pred expressions - will be handled by post-join filter
+            }
             _ => {
                 // Ignore unsupported predicates - they will be handled by post-join filter
             }
@@ -6406,19 +6448,18 @@ fn resolve_column_reference(
 
     let column_part = parts.pop()?.to_ascii_lowercase();
     if parts.is_empty() {
-        let mut candidate: Option<ColumnRef> = None;
+        // Use first-match semantics for bare column names (matches SQLite behavior)
+        // This allows ambiguous column names in WHERE clauses to resolve to the
+        // first occurrence in FROM clause order
         for info in table_infos {
             if let Some(&col_idx) = info.column_map.get(&column_part) {
-                if candidate.is_some() {
-                    return None;
-                }
-                candidate = Some(ColumnRef {
+                return Some(ColumnRef {
                     table: info.index,
                     column: col_idx,
                 });
             }
         }
-        return candidate;
+        return None;
     }
 
     let table_ident = parts.join(".").to_ascii_lowercase();
