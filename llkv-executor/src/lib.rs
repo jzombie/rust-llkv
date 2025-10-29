@@ -6023,23 +6023,21 @@ where
                 (Some(column), None) => {
                     if let Some(literal) = extract_literal(right)
                         && let Some(value) = literal_to_plan_value_for_join(literal)
+                        && column.table < constraints.len()
                     {
-                        if column.table < constraints.len() {
-                            constraints[column.table].push(ColumnConstraint::Equality(
-                                ColumnLiteral { column, value },
-                            ));
-                        }
+                        constraints[column.table].push(ColumnConstraint::Equality(
+                            ColumnLiteral { column, value },
+                        ));
                     }
                 }
                 (None, Some(column)) => {
                     if let Some(literal) = extract_literal(left)
                         && let Some(value) = literal_to_plan_value_for_join(literal)
+                        && column.table < constraints.len()
                     {
-                        if column.table < constraints.len() {
-                            constraints[column.table].push(ColumnConstraint::Equality(
-                                ColumnLiteral { column, value },
-                            ));
-                        }
+                        constraints[column.table].push(ColumnConstraint::Equality(
+                            ColumnLiteral { column, value },
+                        ));
                     }
                 }
                 _ => {}
@@ -6099,15 +6097,15 @@ where
             }
         }
         // Handle OR expressions: try to convert (col=v1 OR col=v2) into col IN (v1, v2)
-        else if let LlkvExpr::Or(or_children) = conjunct {
-            if let Some((column, values)) = try_extract_or_as_in_list(or_children, &table_infos) {
-                if !values.is_empty() && column.table < constraints.len() {
-                    constraints[column.table].push(ColumnConstraint::InList(ColumnInList {
-                        column,
-                        values,
-                    }));
-                }
-            }
+        else if let LlkvExpr::Or(or_children) = conjunct
+            && let Some((column, values)) = try_extract_or_as_in_list(or_children, &table_infos)
+            && !values.is_empty()
+            && column.table < constraints.len()
+        {
+            constraints[column.table].push(ColumnConstraint::InList(ColumnInList {
+                column,
+                values,
+            }));
         }
     }
 
@@ -6161,63 +6159,58 @@ fn try_extract_or_as_in_list(
             if let (Some(column), None) = (
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
-            ) {
-                if let Some(literal) = extract_literal(right)
-                    && let Some(value) = literal_to_plan_value_for_join(literal)
-                {
-                    // Check if this is the same column as previous OR branches
-                    match common_column {
-                        None => common_column = Some(column),
-                        Some(ref prev) if prev.table == column.table && prev.column == column.column => {
-                            // Same column, continue
-                        }
-                        _ => {
-                            // Different column - OR cannot be converted to IN list
-                            return None;
-                        }
+            )
+                && let Some(literal) = extract_literal(right)
+                && let Some(value) = literal_to_plan_value_for_join(literal)
+            {
+                // Check if this is the same column as previous OR branches
+                match common_column {
+                    None => common_column = Some(column),
+                    Some(ref prev) if prev.table == column.table && prev.column == column.column => {
+                        // Same column, continue
                     }
-                    values.push(value);
-                    continue;
+                    _ => {
+                        // Different column - OR cannot be converted to IN list
+                        return None;
+                    }
                 }
+                values.push(value);
+                continue;
             }
             
             // Try literal = col
             if let (None, Some(column)) = (
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
-            ) {
-                if let Some(literal) = extract_literal(left)
-                    && let Some(value) = literal_to_plan_value_for_join(literal)
-                {
-                    match common_column {
-                        None => common_column = Some(column),
-                        Some(ref prev) if prev.table == column.table && prev.column == column.column => {}
-                        _ => return None,
-                    }
-                    values.push(value);
-                    continue;
+            )
+                && let Some(literal) = extract_literal(left)
+                && let Some(value) = literal_to_plan_value_for_join(literal)
+            {
+                match common_column {
+                    None => common_column = Some(column),
+                    Some(ref prev) if prev.table == column.table && prev.column == column.column => {}
+                    _ => return None,
                 }
+                values.push(value);
+                continue;
             }
         }
         // Also handle Pred(Filter{...}) expressions with Equals operator
-        else if let LlkvExpr::Pred(filter) = child {
-            if let Operator::Equals(ref literal) = filter.op {
-                // Resolve the field_id (column name) to a ColumnRef
-                if let Some(column) = resolve_column_reference(
-                    &ScalarExpr::Column(filter.field_id.clone()),
-                    table_infos,
-                ) {
-                    if let Some(value) = literal_to_plan_value_for_join(literal) {
-                        match common_column {
-                            None => common_column = Some(column),
-                            Some(ref prev) if prev.table == column.table && prev.column == column.column => {}
-                            _ => return None,
-                        }
-                        values.push(value);
-                        continue;
-                    }
-                }
+        else if let LlkvExpr::Pred(filter) = child
+            && let Operator::Equals(ref literal) = filter.op
+            && let Some(column) = resolve_column_reference(
+                &ScalarExpr::Column(filter.field_id.clone()),
+                table_infos,
+            )
+            && let Some(value) = literal_to_plan_value_for_join(literal)
+        {
+            match common_column {
+                None => common_column = Some(column),
+                Some(ref prev) if prev.table == column.table && prev.column == column.column => {}
+                _ => return None,
             }
+            values.push(value);
+            continue;
         }
 
         // If any branch doesn't match the pattern, OR cannot be converted
@@ -6225,23 +6218,6 @@ fn try_extract_or_as_in_list(
     }
 
     common_column.map(|col| (col, values))
-}
-
-/// Attempt to convert an OR of column-to-literal equalities into an equivalent IN list.
-///
-/// Recognizes patterns like:
-/// - `(col=val1 OR col=val2 OR col=val3)` → `col IN (val1, val2, val3)`
-/// - `(val1=col OR val2=col)` → `col IN (val1, val2)`
-///
-/// Returns `None` if the OR cannot be converted (e.g., different columns, non-equality predicates).
-fn try_convert_or_to_in_list<'a>(
-    _or_children: &'a [LlkvExpr<'static, String>],
-) -> Option<&'a LlkvExpr<'static, String>> {
-    // This optimization requires synthesizing a new LlkvExpr::InList,
-    // but we can only return references to existing expressions.
-    // For now, OR clauses are left for post-join filtering.
-    // A better solution would modify the extraction API to allow owned expressions.
-    None
 }
 
 /// Extract join constraints from a WHERE clause predicate for hash join optimization.
@@ -6376,18 +6352,16 @@ fn extract_join_constraints(
             // Handle Pred(Filter{...}) expressions - these are field-based predicates
             LlkvExpr::Pred(filter) => {
                 // Try to extract equality constraints
-                if let Operator::Equals(ref literal) = filter.op {
-                    // Resolve field_id to a ColumnRef
-                    if let Some(column) = resolve_column_reference(
+                if let Operator::Equals(ref literal) = filter.op
+                    && let Some(column) = resolve_column_reference(
                         &ScalarExpr::Column(filter.field_id.clone()),
                         table_infos,
-                    ) {
-                        if let Some(value) = literal_to_plan_value_for_join(literal) {
-                            literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
-                            handled_conjuncts += 1;
-                            continue;
-                        }
-                    }
+                    )
+                    && let Some(value) = literal_to_plan_value_for_join(literal)
+                {
+                    literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
+                    handled_conjuncts += 1;
+                    continue;
                 }
                 // Ignore other Pred expressions - will be handled by post-join filter
             }
@@ -6404,27 +6378,6 @@ fn extract_join_constraints(
         total_conjuncts,
         handled_conjuncts,
     })
-}
-
-fn collect_conjuncts<'a>(
-    expr: &'a LlkvExpr<'static, String>,
-    out: &mut Vec<&'a LlkvExpr<'static, String>>,
-) -> bool {
-    match expr {
-        LlkvExpr::And(children) => {
-            for child in children {
-                if !collect_conjuncts(child, out) {
-                    return false;
-                }
-            }
-            true
-        }
-        LlkvExpr::Or(_) => false,
-        other => {
-            out.push(other);
-            true
-        }
-    }
 }
 
 fn resolve_column_reference(

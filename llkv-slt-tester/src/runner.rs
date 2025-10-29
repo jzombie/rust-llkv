@@ -457,7 +457,7 @@ fn try_smart_split_with_expected(actual: &[String], expected: &[String]) -> Opti
             // Check if this expected value appears at the start of remaining line
             if line_remaining.starts_with(exp_val) {
                 result.push(exp_val.clone());
-                line_remaining = &line_remaining[exp_val.len()..].trim_start();
+                line_remaining = line_remaining[exp_val.len()..].trim_start();
                 expected_idx += 1;
                 found_count += 1;
             } else {
