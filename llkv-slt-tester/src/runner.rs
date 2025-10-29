@@ -453,7 +453,7 @@ fn try_smart_split_with_expected(actual: &[String], expected: &[String]) -> Opti
 
         while found_count < needed && expected_idx < expected.len() {
             let exp_val = &expected[expected_idx];
-            
+
             // Check if this expected value appears at the start of remaining line
             if line_remaining.starts_with(exp_val) {
                 result.push(exp_val.clone());
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn test_flattening_resolves_mismatch_basic() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   1
@@ -782,7 +782,7 @@ mod tests {
     #[test]
     fn test_flattening_rejects_more_actual_than_expected() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   1
@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn test_flattening_with_quoted_strings() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   'hello world'
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn test_flattening_skips_hash_results() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   30 values hashing to abc123def456
@@ -832,7 +832,7 @@ mod tests {
     #[test]
     fn test_flattening_multi_column_spread() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   table tn7 row 51
@@ -849,7 +849,7 @@ mod tests {
     #[test]
     fn test_flattening_rejects_mismatched_values() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   1
@@ -866,7 +866,7 @@ mod tests {
     #[test]
     fn test_flattening_empty_diff() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             at line 42
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn test_flattening_partial_match() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   1
@@ -913,10 +913,7 @@ mod tests {
     /// Test smart split with uneven distribution (extra values in first line).
     #[test]
     fn test_smart_split_uneven_distribution() {
-        let actual = vec![
-            "a b c".to_string(),
-            "d e".to_string(),
-        ];
+        let actual = vec!["a b c".to_string(), "d e".to_string()];
         let expected = vec![
             "a".to_string(),
             "b".to_string(),
@@ -958,11 +955,7 @@ mod tests {
     /// Test smart split when actual has more lines than expected.
     #[test]
     fn test_smart_split_rejects_more_actual_lines() {
-        let actual = vec![
-            "1".to_string(),
-            "2".to_string(),
-            "3".to_string(),
-        ];
+        let actual = vec!["1".to_string(), "2".to_string(), "3".to_string()];
         let expected = vec!["1".to_string(), "2".to_string()];
 
         let result = try_smart_split_with_expected(&actual, &expected);
@@ -972,9 +965,7 @@ mod tests {
     /// Test smart split with complex multi-word values.
     #[test]
     fn test_smart_split_complex_multiword() {
-        let actual = vec![
-            "table tn7 row 51 42 foo bar".to_string(),
-        ];
+        let actual = vec!["table tn7 row 51 42 foo bar".to_string()];
         let expected = vec![
             "table tn7 row 51".to_string(),
             "42".to_string(),
@@ -990,10 +981,7 @@ mod tests {
     fn test_split_diff_values_escaped_quotes() {
         let line = "'can''t' 'won''t' 42";
         let result = split_diff_values(line);
-        assert_eq!(
-            result,
-            vec!["'can''t'", "'won''t'", "42"]
-        );
+        assert_eq!(result, vec!["'can''t'", "'won''t'", "42"]);
     }
 
     /// Test split_diff_values with mixed quoted and unquoted values.
@@ -1001,10 +989,7 @@ mod tests {
     fn test_split_diff_values_mixed() {
         let line = "42 'hello world' 100 'foo'";
         let result = split_diff_values(line);
-        assert_eq!(
-            result,
-            vec!["42", "'hello world'", "100", "'foo'"]
-        );
+        assert_eq!(result, vec!["42", "'hello world'", "100", "'foo'"]);
     }
 
     /// Test split_diff_values with leading/trailing spaces.
@@ -1047,7 +1032,7 @@ mod tests {
     #[test]
     fn test_flattening_real_world_example() {
         use indoc::indoc;
-        
+
         // Simulates a case where multi-column results are collapsed into fewer rows
         let message = indoc! {"
             Query failed: expected error, but query succeeded
@@ -1067,7 +1052,7 @@ mod tests {
     #[test]
     fn test_flattening_numeric_values() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   123
@@ -1084,7 +1069,7 @@ mod tests {
     #[test]
     fn test_flattening_null_values() {
         use indoc::indoc;
-        
+
         let message = indoc! {"
             [Diff]
             -   NULL

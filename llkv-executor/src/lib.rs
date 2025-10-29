@@ -685,10 +685,7 @@ where
             // Hash join not applicable - fall back to cartesian product
             // Extract literal constraints for pushdown even if hash join failed
             let constraint_map = if let Some(filter_wrapper) = remaining_filter.as_ref() {
-                extract_literal_pushdown_filters(
-                    &filter_wrapper.predicate,
-                    &tables_with_handles,
-                )
+                extract_literal_pushdown_filters(&filter_wrapper.predicate, &tables_with_handles)
             } else {
                 vec![Vec::new(); tables_with_handles.len()]
             };
@@ -698,7 +695,12 @@ where
                 Vec::with_capacity(tables_with_handles.len());
             for (idx, (table_ref, table)) in tables_with_handles.iter().enumerate() {
                 let constraints = constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
-                staged.push(collect_table_data(idx, table_ref, table.as_ref(), constraints)?);
+                staged.push(collect_table_data(
+                    idx,
+                    table_ref,
+                    table.as_ref(),
+                    constraints,
+                )?);
             }
             cross_join_all(staged)?
         };
@@ -1329,13 +1331,14 @@ where
             }
         };
 
-    tracing::debug!(
-        "join_opt[{query_label}]: constraint extraction succeeded - equalities={}, literals={}, handled={}/{} predicates",
-        constraint_plan.equalities.len(),
-        constraint_plan.literals.len(),
-        constraint_plan.handled_conjuncts,
-        constraint_plan.total_conjuncts
-    );        tracing::debug!(
+        tracing::debug!(
+            "join_opt[{query_label}]: constraint extraction succeeded - equalities={}, literals={}, handled={}/{} predicates",
+            constraint_plan.equalities.len(),
+            constraint_plan.literals.len(),
+            constraint_plan.handled_conjuncts,
+            constraint_plan.total_conjuncts
+        );
+        tracing::debug!(
             "join_opt[{query_label}]: attempting hash join with tables={:?} filter={:?}",
             plan.tables
                 .iter()
@@ -1398,7 +1401,8 @@ where
             constraint_plan.equalities.len()
         );
 
-        let mut literal_map: Vec<Vec<ColumnConstraint>> = vec![Vec::new(); tables_with_handles.len()];
+        let mut literal_map: Vec<Vec<ColumnConstraint>> =
+            vec![Vec::new(); tables_with_handles.len()];
         for constraint in &constraint_plan.literals {
             let table_idx = match constraint {
                 ColumnConstraint::Equality(lit) => lit.column.table,
@@ -4824,7 +4828,8 @@ fn apply_column_constraints_to_batches(
                 filtered = filter_batches_by_literal(filtered, lit.column.column, &lit.value)?;
             }
             ColumnConstraint::InList(in_list) => {
-                filtered = filter_batches_by_in_list(filtered, in_list.column.column, &in_list.values)?;
+                filtered =
+                    filter_batches_by_in_list(filtered, in_list.column.column, &in_list.values)?;
             }
         }
         if filtered.is_empty() {
@@ -4928,9 +4933,8 @@ fn filter_batches_by_in_list(
 
         for value in values {
             let comparison_mask = build_comparison_mask(column.as_ref(), value)?;
-            mask = or(&mask, &comparison_mask).map_err(|err| {
-                Error::Internal(format!("failed to OR comparison masks: {err}"))
-            })?;
+            mask = or(&mask, &comparison_mask)
+                .map_err(|err| Error::Internal(format!("failed to OR comparison masks: {err}")))?;
         }
 
         // Check if all rows match or no rows match for optimization
@@ -4956,10 +4960,7 @@ fn filter_batches_by_in_list(
 }
 
 /// Build a boolean mask for column == value comparison using vectorized operations.
-fn build_comparison_mask(
-    column: &dyn Array,
-    value: &PlanValue,
-) -> ExecutorResult<BooleanArray> {
+fn build_comparison_mask(column: &dyn Array, value: &PlanValue) -> ExecutorResult<BooleanArray> {
     use arrow::array::*;
     use arrow::datatypes::DataType;
 
@@ -4976,71 +4977,93 @@ fn build_comparison_mask(
             let mut builder = BooleanBuilder::with_capacity(column.len());
             match column.data_type() {
                 DataType::Int8 => {
-                    let arr = column.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to Int8Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Int8Array>()
+                        .ok_or_else(|| Error::Internal("failed to downcast to Int8Array".into()))?;
                     let target = *val as i8;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
                     }
                 }
                 DataType::Int16 => {
-                    let arr = column.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to Int16Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Int16Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to Int16Array".into())
+                        })?;
                     let target = *val as i16;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
                     }
                 }
                 DataType::Int32 => {
-                    let arr = column.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to Int32Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to Int32Array".into())
+                        })?;
                     let target = *val as i32;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
                     }
                 }
                 DataType::Int64 => {
-                    let arr = column.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to Int64Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to Int64Array".into())
+                        })?;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == *val);
                     }
                 }
                 DataType::UInt8 => {
-                    let arr = column.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to UInt8Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<UInt8Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to UInt8Array".into())
+                        })?;
                     let target = *val as u8;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
                     }
                 }
                 DataType::UInt16 => {
-                    let arr = column.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to UInt16Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<UInt16Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to UInt16Array".into())
+                        })?;
                     let target = *val as u16;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
                     }
                 }
                 DataType::UInt32 => {
-                    let arr = column.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to UInt32Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to UInt32Array".into())
+                        })?;
                     let target = *val as u32;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
                     }
                 }
                 DataType::UInt64 => {
-                    let arr = column.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to UInt64Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to UInt64Array".into())
+                        })?;
                     let target = *val as u64;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
@@ -5050,7 +5073,7 @@ fn build_comparison_mask(
                     return Err(Error::Internal(format!(
                         "unsupported integer type for IN list: {:?}",
                         column.data_type()
-                    )))
+                    )));
                 }
             }
             Ok(builder.finish())
@@ -5059,18 +5082,24 @@ fn build_comparison_mask(
             let mut builder = BooleanBuilder::with_capacity(column.len());
             match column.data_type() {
                 DataType::Float32 => {
-                    let arr = column.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to Float32Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to Float32Array".into())
+                        })?;
                     let target = *val as f32;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == target);
                     }
                 }
                 DataType::Float64 => {
-                    let arr = column.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                        Error::Internal("failed to downcast to Float64Array".into())
-                    })?;
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to Float64Array".into())
+                        })?;
                     for i in 0..arr.len() {
                         builder.append_value(!arr.is_null(i) && arr.value(i) == *val);
                     }
@@ -5079,16 +5108,17 @@ fn build_comparison_mask(
                     return Err(Error::Internal(format!(
                         "unsupported float type for IN list: {:?}",
                         column.data_type()
-                    )))
+                    )));
                 }
             }
             Ok(builder.finish())
         }
         PlanValue::String(val) => {
             let mut builder = BooleanBuilder::with_capacity(column.len());
-            let arr = column.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                Error::Internal("failed to downcast to StringArray".into())
-            })?;
+            let arr = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| Error::Internal("failed to downcast to StringArray".into()))?;
             for i in 0..arr.len() {
                 builder.append_value(!arr.is_null(i) && arr.value(i) == val.as_str());
             }
@@ -5966,7 +5996,7 @@ struct JoinConstraintPlan {
 /// Extract literal pushdown filters from a WHERE clause, even in the presence of OR clauses.
 ///
 /// Unlike `extract_join_constraints`, this function is more lenient and extracts column-to-literal
-/// comparisons and IN-list predicates regardless of OR clauses. This allows selective table scans 
+/// comparisons and IN-list predicates regardless of OR clauses. This allows selective table scans
 /// even when hash join optimization cannot be applied.
 ///
 /// # Strategy
@@ -6025,9 +6055,8 @@ where
                         && let Some(value) = literal_to_plan_value_for_join(literal)
                         && column.table < constraints.len()
                     {
-                        constraints[column.table].push(ColumnConstraint::Equality(
-                            ColumnLiteral { column, value },
-                        ));
+                        constraints[column.table]
+                            .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                     }
                 }
                 (None, Some(column)) => {
@@ -6035,9 +6064,8 @@ where
                         && let Some(value) = literal_to_plan_value_for_join(literal)
                         && column.table < constraints.len()
                     {
-                        constraints[column.table].push(ColumnConstraint::Equality(
-                            ColumnLiteral { column, value },
-                        ));
+                        constraints[column.table]
+                            .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                     }
                 }
                 _ => {}
@@ -6049,7 +6077,7 @@ where
             if let Operator::Equals(ref literal_val) = filter.op {
                 // field_id is the column name in string form
                 let field_name = filter.field_id.trim().to_ascii_lowercase();
-                
+
                 // Try to find which table this column belongs to
                 for info in &table_infos {
                     if let Some(&col_idx) = info.column_map.get(&field_name) {
@@ -6089,10 +6117,8 @@ where
                     }
                 }
                 if !values.is_empty() && column.table < constraints.len() {
-                    constraints[column.table].push(ColumnConstraint::InList(ColumnInList {
-                        column,
-                        values,
-                    }));
+                    constraints[column.table]
+                        .push(ColumnConstraint::InList(ColumnInList { column, values }));
                 }
             }
         }
@@ -6102,10 +6128,8 @@ where
             && !values.is_empty()
             && column.table < constraints.len()
         {
-            constraints[column.table].push(ColumnConstraint::InList(ColumnInList {
-                column,
-                values,
-            }));
+            constraints[column.table]
+                .push(ColumnConstraint::InList(ColumnInList { column, values }));
         }
     }
 
@@ -6159,14 +6183,15 @@ fn try_extract_or_as_in_list(
             if let (Some(column), None) = (
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
-            )
-                && let Some(literal) = extract_literal(right)
+            ) && let Some(literal) = extract_literal(right)
                 && let Some(value) = literal_to_plan_value_for_join(literal)
             {
                 // Check if this is the same column as previous OR branches
                 match common_column {
                     None => common_column = Some(column),
-                    Some(ref prev) if prev.table == column.table && prev.column == column.column => {
+                    Some(ref prev)
+                        if prev.table == column.table && prev.column == column.column =>
+                    {
                         // Same column, continue
                     }
                     _ => {
@@ -6177,18 +6202,18 @@ fn try_extract_or_as_in_list(
                 values.push(value);
                 continue;
             }
-            
+
             // Try literal = col
             if let (None, Some(column)) = (
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
-            )
-                && let Some(literal) = extract_literal(left)
+            ) && let Some(literal) = extract_literal(left)
                 && let Some(value) = literal_to_plan_value_for_join(literal)
             {
                 match common_column {
                     None => common_column = Some(column),
-                    Some(ref prev) if prev.table == column.table && prev.column == column.column => {}
+                    Some(ref prev)
+                        if prev.table == column.table && prev.column == column.column => {}
                     _ => return None,
                 }
                 values.push(value);
@@ -6198,10 +6223,8 @@ fn try_extract_or_as_in_list(
         // Also handle Pred(Filter{...}) expressions with Equals operator
         else if let LlkvExpr::Pred(filter) = child
             && let Operator::Equals(ref literal) = filter.op
-            && let Some(column) = resolve_column_reference(
-                &ScalarExpr::Column(filter.field_id.clone()),
-                table_infos,
-            )
+            && let Some(column) =
+                resolve_column_reference(&ScalarExpr::Column(filter.field_id.clone()), table_infos)
             && let Some(value) = literal_to_plan_value_for_join(literal)
         {
             match common_column {
@@ -6291,7 +6314,8 @@ fn extract_join_constraints(
                         if let Some(literal) = extract_literal(right)
                             && let Some(value) = literal_to_plan_value_for_join(literal)
                         {
-                            literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
+                            literals
+                                .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                             handled_conjuncts += 1;
                             continue;
                         }
@@ -6300,7 +6324,8 @@ fn extract_join_constraints(
                         if let Some(literal) = extract_literal(left)
                             && let Some(value) = literal_to_plan_value_for_join(literal)
                         {
-                            literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
+                            literals
+                                .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                             handled_conjuncts += 1;
                             continue;
                         }
@@ -6338,12 +6363,10 @@ fn extract_join_constraints(
             }
             // Handle OR clauses that can be converted to IN lists
             LlkvExpr::Or(or_children) => {
-                if let Some((column, values)) = try_extract_or_as_in_list(or_children, table_infos) {
+                if let Some((column, values)) = try_extract_or_as_in_list(or_children, table_infos)
+                {
                     // Treat as IN list
-                    literals.push(ColumnConstraint::InList(ColumnInList {
-                        column,
-                        values,
-                    }));
+                    literals.push(ColumnConstraint::InList(ColumnInList { column, values }));
                     handled_conjuncts += 1;
                     continue;
                 }
@@ -6467,9 +6490,7 @@ fn plan_value_from_operator_literal(op_value: &llkv_expr::literal::Literal) -> O
     match op_value {
         llkv_expr::literal::Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
         llkv_expr::literal::Literal::Float(v) => Some(PlanValue::Float(*v)),
-        llkv_expr::literal::Literal::Boolean(v) => {
-            Some(PlanValue::Integer(if *v { 1 } else { 0 }))
-        }
+        llkv_expr::literal::Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
         llkv_expr::literal::Literal::String(v) => Some(PlanValue::String(v.clone())),
         _ => None,
     }
