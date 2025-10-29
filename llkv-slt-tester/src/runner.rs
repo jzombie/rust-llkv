@@ -26,6 +26,24 @@ const LAST_FAILED_SLT_PATH: &str = "target/last_failed_slt.tmp";
 /// - Tests marked `skipif mysql/postgresql/etc` will be included
 const SLT_ENGINE_COMPAT: &[&str] = &["sqlite", "duckdb"];
 
+/// Thread stack size used when spawning test threads for running SLT files.
+///
+/// SLT files may contain deeply-nested SQL expressions and large generated
+/// test cases (for example after loop expansion). The default thread stack
+/// (≈2MB on many platforms) can be insufficient and lead to stack overflows
+/// or panics when executing complex tests. To avoid that, the SLT harness
+/// spawns a dedicated thread for each test with an increased stack size.
+///
+/// Value: 16 MiB — chosen as a conservative size that accommodates the
+/// real-world SLT files used in this repository while keeping memory usage
+/// reasonable when running multiple tests in parallel. If you encounter
+/// stack overflows for unusually large tests, increase this constant.
+///
+/// Note: This setting only applies to the test thread created by the SLT
+/// harness (see `run_slt_harness_with_args`). It does not change the global
+/// Tokio runtime configuration or other thread pools.
+const SLT_HARNESS_STACK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+
 /// Scope guard that installs expected column types before executing a query and
 /// clears thread-local state even if execution exits early.
 struct ColumnTypeExpectationGuard;
@@ -664,8 +682,7 @@ where
             // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
             // Default thread stack is ~2MB which is insufficient for complex SLT test queries
             std::thread::Builder::new()
-                // TODO: Make stack size configurable via env var or argument
-                .stack_size(16 * 1024 * 1024)
+                .stack_size(SLT_HARNESS_STACK_SIZE)
                 .spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
