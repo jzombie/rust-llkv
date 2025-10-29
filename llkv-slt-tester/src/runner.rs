@@ -26,6 +26,24 @@ const LAST_FAILED_SLT_PATH: &str = "target/last_failed_slt.tmp";
 /// - Tests marked `skipif mysql/postgresql/etc` will be included
 const SLT_ENGINE_COMPAT: &[&str] = &["sqlite", "duckdb"];
 
+/// Thread stack size used when spawning test threads for running SLT files.
+///
+/// SLT files may contain deeply-nested SQL expressions and large generated
+/// test cases (for example after loop expansion). The default thread stack
+/// (≈2MB on many platforms) can be insufficient and lead to stack overflows
+/// or panics when executing complex tests. To avoid that, the SLT harness
+/// spawns a dedicated thread for each test with an increased stack size.
+///
+/// Value: 16 MiB — chosen as a conservative size that accommodates the
+/// real-world SLT files used in this repository while keeping memory usage
+/// reasonable when running multiple tests in parallel. If you encounter
+/// stack overflows for unusually large tests, increase this constant.
+///
+/// Note: This setting only applies to the test thread created by the SLT
+/// harness (see `run_slt_harness_with_args`). It does not change the global
+/// Tokio runtime configuration or other thread pools.
+const SLT_HARNESS_STACK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+
 /// Scope guard that installs expected column types before executing a query and
 /// clears thread-local state even if execution exits early.
 struct ColumnTypeExpectationGuard;
@@ -216,7 +234,25 @@ where
                 break;
             }
 
-            runner.run_async(record).await?;
+            // Run the record and handle per-query flattening fallback
+            let result = runner.run_async(record.clone()).await;
+            if let Err(e) = result {
+                let error_msg = format!("{}", e);
+
+                // Only apply flattening workaround for Query records with result mismatches
+                let is_query_mismatch = matches!(&record, sqllogictest::Record::Query { .. })
+                    && error_msg.contains("[Diff]");
+
+                if is_query_mismatch && flattening_resolves_mismatch(&error_msg) {
+                    tracing::debug!(
+                        "[llkv-slt] Query mismatch resolved by flattening multi-column output"
+                    );
+                    // Continue to next record instead of failing the entire test
+                } else {
+                    // Re-raise the error for actual failures
+                    return Err(e);
+                }
+            }
 
             if let Some(prev) = previous_hash_threshold {
                 runner.with_hash_threshold(prev);
@@ -235,14 +271,6 @@ where
     if let Err(e) = run_result {
         let (mapped, opt_line_info) =
             map_temp_error_message(&format!("{}", e), &tmp, &normalized_lines, &mapping, origin);
-
-        if flattening_resolves_mismatch(&mapped) {
-            tracing::debug!(
-                "[llkv-slt] detected multi-column diff; flattened output matches expected"
-            );
-            drop(named);
-            return Ok(());
-        }
 
         // Persist the temp file for debugging when there's an error
         let persist_path = std::path::Path::new(LAST_FAILED_SLT_PATH);
@@ -349,23 +377,105 @@ fn flattening_resolves_mismatch(message: &str) -> bool {
     }
 
     if expected.is_empty() || actual.is_empty() {
+        tracing::trace!("[flatten] Empty expected or actual");
+        return false;
+    }
+
+    // If expected is a hash result (e.g., "30 values hashing to abc123"), don't try to flatten
+    // The sqllogictest library should handle hash comparisons, not us
+    if expected.len() == 1 && expected[0].contains("hashing to") {
+        tracing::trace!("[flatten] Expected is a hash result, skipping flattening");
         return false;
     }
 
     if actual.len() >= expected.len() {
+        tracing::trace!(
+            "[flatten] Actual length {} >= expected length {}, rejecting",
+            actual.len(),
+            expected.len()
+        );
         return false;
     }
 
+    // First, try the simple whitespace split for cases with quoted strings
     let flattened: Vec<String> = actual
         .iter()
         .flat_map(|line| split_diff_values(line))
         .collect();
 
-    if flattened.len() != expected.len() {
-        return false;
+    tracing::trace!("[flatten] Expected: {:?}", expected);
+    tracing::trace!("[flatten] Actual: {:?}", actual);
+    tracing::trace!("[flatten] Flattened (simple): {:?}", flattened);
+
+    if flattened.len() == expected.len() && flattened == expected {
+        tracing::trace!("[flatten] Match result: true (simple split)");
+        return true;
     }
 
-    flattened == expected
+    // If simple split doesn't work, try intelligent splitting based on expected columns
+    // This handles cases where column values contain spaces (e.g., "table tn7 row 51")
+    if let Some(flattened_smart) = try_smart_split_with_expected(&actual, &expected) {
+        tracing::trace!("[flatten] Flattened (smart): {:?}", flattened_smart);
+        if flattened_smart.len() == expected.len() {
+            let matches = flattened_smart == expected;
+            tracing::trace!("[flatten] Match result: {} (smart split)", matches);
+            return matches;
+        }
+    }
+
+    tracing::trace!("[flatten] No matching split found");
+    false
+}
+
+/// Try to split actual lines to match expected values by finding where expected values occur.
+fn try_smart_split_with_expected(actual: &[String], expected: &[String]) -> Option<Vec<String>> {
+    if actual.is_empty() || expected.is_empty() {
+        return None;
+    }
+
+    if actual.len() >= expected.len() {
+        return None;
+    }
+
+    // For each actual line, try to extract the expected values from it in order
+    let mut result = Vec::new();
+    let mut expected_idx = 0;
+
+    for line in actual {
+        // How many expected values should come from this line?
+        let values_per_line = expected.len() / actual.len();
+        let extra = expected.len() % actual.len();
+        let needed = values_per_line + if result.len() < extra { 1 } else { 0 };
+
+        // Try to find these expected values in the line
+        let mut line_remaining = line.as_str();
+        let mut found_count = 0;
+
+        while found_count < needed && expected_idx < expected.len() {
+            let exp_val = &expected[expected_idx];
+
+            // Check if this expected value appears at the start of remaining line
+            if line_remaining.starts_with(exp_val) {
+                result.push(exp_val.clone());
+                line_remaining = line_remaining[exp_val.len()..].trim_start();
+                expected_idx += 1;
+                found_count += 1;
+            } else {
+                // Expected value doesn't match - can't reconcile
+                return None;
+            }
+        }
+
+        if found_count != needed {
+            return None;
+        }
+    }
+
+    if result.len() == expected.len() && result == *expected {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 fn split_diff_values(line: &str) -> Vec<String> {
@@ -572,8 +682,7 @@ where
             // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
             // Default thread stack is ~2MB which is insufficient for complex SLT test queries
             std::thread::Builder::new()
-                // TODO: Make stack size configurable via env var or argument
-                .stack_size(16 * 1024 * 1024)
+                .stack_size(SLT_HARNESS_STACK_SIZE)
                 .spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -646,4 +755,330 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test basic flattening with simple whitespace-separated values.
+    #[test]
+    fn test_flattening_resolves_mismatch_basic() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   1
+            -   2
+            -   3
+            +   1 2 3
+            at line 42
+        "};
+
+        assert!(flattening_resolves_mismatch(message));
+    }
+
+    /// Test that flattening rejects when actual has more lines than expected.
+    #[test]
+    fn test_flattening_rejects_more_actual_than_expected() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   1
+            -   2
+            +   1
+            +   2
+            +   3
+            at line 42
+        "};
+
+        assert!(!flattening_resolves_mismatch(message));
+    }
+
+    /// Test flattening with quoted strings containing spaces.
+    #[test]
+    fn test_flattening_with_quoted_strings() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   'hello world'
+            -   42
+            -   'foo bar'
+            +   'hello world' 42 'foo bar'
+            at line 42
+        "};
+
+        assert!(flattening_resolves_mismatch(message));
+    }
+
+    /// Test that hash results are not flattened.
+    #[test]
+    fn test_flattening_skips_hash_results() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   30 values hashing to abc123def456
+            +   1 2 3
+            at line 42
+        "};
+
+        assert!(!flattening_resolves_mismatch(message));
+    }
+
+    /// Test flattening with multi-column values spread across rows.
+    #[test]
+    fn test_flattening_multi_column_spread() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   table tn7 row 51
+            -   42
+            -   100
+            +   table tn7 row 51 42 100
+            at line 42
+        "};
+
+        assert!(flattening_resolves_mismatch(message));
+    }
+
+    /// Test that mismatched values are rejected even if counts align.
+    #[test]
+    fn test_flattening_rejects_mismatched_values() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   1
+            -   2
+            -   3
+            +   4 5 6
+            at line 42
+        "};
+
+        assert!(!flattening_resolves_mismatch(message));
+    }
+
+    /// Test empty diff blocks.
+    #[test]
+    fn test_flattening_empty_diff() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            at line 42
+        "};
+
+        assert!(!flattening_resolves_mismatch(message));
+    }
+
+    /// Test partial matches where some values align but not all.
+    #[test]
+    fn test_flattening_partial_match() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   1
+            -   2
+            -   3
+            +   1 2 4
+            at line 42
+        "};
+
+        assert!(!flattening_resolves_mismatch(message));
+    }
+
+    /// Test smart split with evenly distributed columns.
+    #[test]
+    fn test_smart_split_even_distribution() {
+        let actual = vec![
+            "table tn7 row 51 42".to_string(),
+            "table tn8 row 52 43".to_string(),
+        ];
+        let expected = vec![
+            "table tn7 row 51".to_string(),
+            "42".to_string(),
+            "table tn8 row 52".to_string(),
+            "43".to_string(),
+        ];
+
+        let result = try_smart_split_with_expected(&actual, &expected);
+        assert_eq!(result, Some(expected.clone()));
+    }
+
+    /// Test smart split with uneven distribution (extra values in first line).
+    #[test]
+    fn test_smart_split_uneven_distribution() {
+        let actual = vec!["a b c".to_string(), "d e".to_string()];
+        let expected = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+        ];
+
+        let result = try_smart_split_with_expected(&actual, &expected);
+        assert_eq!(result, Some(expected.clone()));
+    }
+
+    /// Test smart split rejects when expected values don't match.
+    #[test]
+    fn test_smart_split_rejects_mismatched_values() {
+        let actual = vec!["1 2 3".to_string()];
+        let expected = vec!["4".to_string(), "5".to_string(), "6".to_string()];
+
+        let result = try_smart_split_with_expected(&actual, &expected);
+        assert_eq!(result, None);
+    }
+
+    /// Test smart split with empty inputs.
+    #[test]
+    fn test_smart_split_empty_inputs() {
+        let actual: Vec<String> = vec![];
+        let expected = vec!["1".to_string()];
+
+        let result = try_smart_split_with_expected(&actual, &expected);
+        assert_eq!(result, None);
+
+        let actual = vec!["1".to_string()];
+        let expected: Vec<String> = vec![];
+
+        let result = try_smart_split_with_expected(&actual, &expected);
+        assert_eq!(result, None);
+    }
+
+    /// Test smart split when actual has more lines than expected.
+    #[test]
+    fn test_smart_split_rejects_more_actual_lines() {
+        let actual = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+        let expected = vec!["1".to_string(), "2".to_string()];
+
+        let result = try_smart_split_with_expected(&actual, &expected);
+        assert_eq!(result, None);
+    }
+
+    /// Test smart split with complex multi-word values.
+    #[test]
+    fn test_smart_split_complex_multiword() {
+        let actual = vec!["table tn7 row 51 42 foo bar".to_string()];
+        let expected = vec![
+            "table tn7 row 51".to_string(),
+            "42".to_string(),
+            "foo bar".to_string(),
+        ];
+
+        let result = try_smart_split_with_expected(&actual, &expected);
+        assert_eq!(result, Some(expected.clone()));
+    }
+
+    /// Test split_diff_values with escaped quotes.
+    #[test]
+    fn test_split_diff_values_escaped_quotes() {
+        let line = "'can''t' 'won''t' 42";
+        let result = split_diff_values(line);
+        assert_eq!(result, vec!["'can''t'", "'won''t'", "42"]);
+    }
+
+    /// Test split_diff_values with mixed quoted and unquoted values.
+    #[test]
+    fn test_split_diff_values_mixed() {
+        let line = "42 'hello world' 100 'foo'";
+        let result = split_diff_values(line);
+        assert_eq!(result, vec!["42", "'hello world'", "100", "'foo'"]);
+    }
+
+    /// Test split_diff_values with leading/trailing spaces.
+    #[test]
+    fn test_split_diff_values_whitespace() {
+        let line = "  42   'hello'  100  ";
+        let result = split_diff_values(line);
+        assert_eq!(result, vec!["42", "'hello'", "100"]);
+    }
+
+    /// Test detect_expected_hash_values with valid hash line.
+    #[test]
+    fn test_detect_expected_hash_values_valid() {
+        let expected = vec!["30 values hashing to abc123def456".to_string()];
+        let result = detect_expected_hash_values(&expected);
+        assert_eq!(result, Some(30));
+    }
+
+    /// Test detect_expected_hash_values with invalid format.
+    #[test]
+    fn test_detect_expected_hash_values_invalid() {
+        let expected = vec!["some random text".to_string()];
+        let result = detect_expected_hash_values(&expected);
+        assert_eq!(result, None);
+
+        let expected = vec!["30 things hashing to abc123".to_string()];
+        let result = detect_expected_hash_values(&expected);
+        assert_eq!(result, None);
+    }
+
+    /// Test detect_expected_hash_values with empty input.
+    #[test]
+    fn test_detect_expected_hash_values_empty() {
+        let expected: Vec<String> = vec![];
+        let result = detect_expected_hash_values(&expected);
+        assert_eq!(result, None);
+    }
+
+    /// Test flattening integration: real-world example from select4.slturl.
+    #[test]
+    fn test_flattening_real_world_example() {
+        use indoc::indoc;
+
+        // Simulates a case where multi-column results are collapsed into fewer rows
+        let message = indoc! {"
+            Query failed: expected error, but query succeeded
+            [Diff]
+            -   NULL
+            -   NULL
+            -   NULL
+            -   0
+            +   NULL NULL NULL 0
+            at line 15234
+        "};
+
+        assert!(flattening_resolves_mismatch(message));
+    }
+
+    /// Test that flattening correctly handles numeric values.
+    #[test]
+    fn test_flattening_numeric_values() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   123
+            -   456
+            -   789
+            +   123 456 789
+            at line 100
+        "};
+
+        assert!(flattening_resolves_mismatch(message));
+    }
+
+    /// Test flattening with NULL values.
+    #[test]
+    fn test_flattening_null_values() {
+        use indoc::indoc;
+
+        let message = indoc! {"
+            [Diff]
+            -   NULL
+            -   42
+            -   NULL
+            +   NULL 42 NULL
+            at line 200
+        "};
+
+        assert!(flattening_resolves_mismatch(message));
+    }
 }

@@ -2,7 +2,7 @@ name: rust-tests
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -47,9 +47,6 @@ jobs:
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Test
-        # run: cargo test --workspace --all-targets --verbose ${{ matrix.flags }} -- --include-ignored
-        # Explicitly ignore benches (workaround for CodSpeed benches running for default)
-        # Note: Omitting `--verbose` as it makes the output very noisy on GitHub Actions
         run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
 
   test:
