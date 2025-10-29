@@ -359,23 +359,101 @@ fn flattening_resolves_mismatch(message: &str) -> bool {
     }
 
     if expected.is_empty() || actual.is_empty() {
+        tracing::trace!("[flatten] Empty expected or actual");
         return false;
     }
 
     if actual.len() >= expected.len() {
+        tracing::trace!("[flatten] Actual length {} >= expected length {}, rejecting", actual.len(), expected.len());
         return false;
     }
 
+    // First, try the simple whitespace split for cases with quoted strings
     let flattened: Vec<String> = actual
         .iter()
         .flat_map(|line| split_diff_values(line))
         .collect();
 
-    if flattened.len() != expected.len() {
-        return false;
+    tracing::trace!("[flatten] Expected: {:?}", expected);
+    tracing::trace!("[flatten] Actual: {:?}", actual);
+    tracing::trace!("[flatten] Flattened (simple): {:?}", flattened);
+
+    if flattened.len() == expected.len() && flattened == expected {
+        tracing::trace!("[flatten] Match result: true (simple split)");
+        return true;
     }
 
-    flattened == expected
+    // If simple split doesn't work, try intelligent splitting based on expected columns
+    // This handles cases where column values contain spaces (e.g., "table tn7 row 51")
+    if let Some(flattened_smart) = try_smart_split(&actual, expected.len()) {
+        tracing::trace!("[flatten] Flattened (smart): {:?}", flattened_smart);
+        if flattened_smart.len() == expected.len() {
+            let matches = flattened_smart == expected;
+            tracing::trace!("[flatten] Match result: {} (smart split)", matches);
+            return matches;
+        }
+    }
+
+    tracing::trace!("[flatten] No matching split found");
+    false
+}
+
+/// Try to intelligently split actual output lines into the expected number of columns.
+/// This handles cases where the actual output has multiple columns on one line separated
+/// by spaces, but the column values themselves may contain spaces.
+fn try_smart_split(actual: &[String], expected_count: usize) -> Option<Vec<String>> {
+    if actual.is_empty() || expected_count == 0 {
+        return None;
+    }
+    
+    // Calculate how many columns each actual line should contribute
+    let cols_per_line = expected_count / actual.len();
+    let extra_cols = expected_count % actual.len();
+    
+    if cols_per_line == 0 {
+        return None;
+    }
+    
+    let mut result = Vec::with_capacity(expected_count);
+    
+    for (idx, line) in actual.iter().enumerate() {
+        // This line needs cols_per_line columns, plus 1 extra if idx < extra_cols
+        let needed = cols_per_line + if idx < extra_cols { 1 } else { 0 };
+        
+        if needed == 1 {
+            // Just use the whole line as one column
+            result.push(line.clone());
+        } else {
+            // Try to split into needed columns by finding the best split points
+            // For simplicity, split by finding sequences of multiple spaces or
+            // use heuristics based on the line structure
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            
+            if tokens.len() >= needed * 2 {
+                // If we have at least 2 tokens per needed column, group them
+                let tokens_per_col = tokens.len() / needed;
+                for i in 0..needed {
+                    let start = i * tokens_per_col;
+                    let end = if i == needed - 1 {
+                        tokens.len()
+                    } else {
+                        (i + 1) * tokens_per_col
+                    };
+                    let col_value = tokens[start..end].join(" ");
+                    result.push(col_value);
+                }
+            } else {
+                // Fallback: just split by whitespace
+                result.extend(tokens.iter().map(|s| s.to_string()));
+            }
+        }
+    }
+    
+    if result.len() == expected_count {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 fn split_diff_values(line: &str) -> Vec<String> {
