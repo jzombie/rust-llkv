@@ -532,6 +532,7 @@ fn collect_fields<'expr>(
                 llkv_expr::expr::AggregateCall::CountStar => {}
                 llkv_expr::expr::AggregateCall::Count(fid)
                 | llkv_expr::expr::AggregateCall::Sum(fid)
+                | llkv_expr::expr::AggregateCall::Avg(fid)
                 | llkv_expr::expr::AggregateCall::Min(fid)
                 | llkv_expr::expr::AggregateCall::Max(fid)
                 | llkv_expr::expr::AggregateCall::CountNulls(fid) => {

@@ -1264,6 +1264,7 @@ where
                 }
                 AggregateCall::Count(column)
                 | AggregateCall::Sum(column)
+                | AggregateCall::Avg(column)
                 | AggregateCall::Min(column)
                 | AggregateCall::Max(column)
                 | AggregateCall::CountNulls(column) => {
@@ -1285,6 +1286,16 @@ where
                                 ));
                             }
                             AggregateKind::SumInt64 {
+                                field_id: column_index as u32,
+                            }
+                        }
+                        AggregateCall::Avg(_) => {
+                            if field.data_type() != &DataType::Int64 {
+                                return Err(Error::InvalidArgumentError(
+                                    "AVG currently supports only INTEGER columns".into(),
+                                ));
+                            }
+                            AggregateKind::AvgInt64 {
                                 field_id: column_index as u32,
                             }
                         }
@@ -2884,6 +2895,14 @@ where
                         field_id: col.field_id,
                     }
                 }
+                AggregateCall::Avg(col_name) => {
+                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
+                    })?;
+                    AggregateKind::AvgInt64 {
+                        field_id: col.field_id,
+                    }
+                }
                 AggregateCall::Min(col_name) => {
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
                         Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
@@ -3991,6 +4010,7 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             AggregateCall::CountStar => {}
             AggregateCall::Count(fid)
             | AggregateCall::Sum(fid)
+            | AggregateCall::Avg(fid)
             | AggregateCall::Min(fid)
             | AggregateCall::Max(fid)
             | AggregateCall::CountNulls(fid) => {

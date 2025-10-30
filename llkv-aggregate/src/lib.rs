@@ -32,6 +32,7 @@ pub enum AggregateKind {
     CountField { field_id: FieldId },
     CountDistinctField { field_id: FieldId },
     SumInt64 { field_id: FieldId },
+    AvgInt64 { field_id: FieldId },
     MinInt64 { field_id: FieldId },
     MaxInt64 { field_id: FieldId },
     CountNulls { field_id: FieldId },
@@ -45,6 +46,7 @@ impl AggregateKind {
             AggregateKind::CountField { field_id }
             | AggregateKind::CountDistinctField { field_id, .. }
             | AggregateKind::SumInt64 { field_id }
+            | AggregateKind::AvgInt64 { field_id }
             | AggregateKind::MinInt64 { field_id }
             | AggregateKind::MaxInt64 { field_id }
             | AggregateKind::CountNulls { field_id } => Some(*field_id),
@@ -76,6 +78,11 @@ pub enum AggregateAccumulator {
         column_index: usize,
         value: i64,
         saw_value: bool,
+    },
+    AvgInt64 {
+        column_index: usize,
+        sum: i64,
+        count: i64,
     },
     MinInt64 {
         column_index: usize,
@@ -210,6 +217,16 @@ impl AggregateAccumulator {
                     saw_value: false,
                 })
             }
+            AggregateKind::AvgInt64 { .. } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("AvgInt64 aggregate requires projection index".into())
+                })?;
+                Ok(AggregateAccumulator::AvgInt64 {
+                    column_index: idx,
+                    sum: 0,
+                    count: 0,
+                })
+            }
             AggregateKind::MinInt64 { .. } => {
                 let idx = projection_idx.ok_or_else(|| {
                     Error::Internal("MinInt64 aggregate requires projection index".into())
@@ -304,6 +321,33 @@ impl AggregateAccumulator {
                             )
                         })?;
                         *saw_value = true;
+                    }
+                }
+            }
+            AggregateAccumulator::AvgInt64 {
+                column_index,
+                sum,
+                count,
+            } => {
+                let array = batch.column(*column_index);
+                let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "AVG aggregate expected an INT column in execution".into(),
+                    )
+                })?;
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        let v = array.value(i);
+                        *sum = sum.checked_add(v).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "AVG aggregate sum exceeds i64 range".into(),
+                            )
+                        })?;
+                        *count = count.checked_add(1).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "AVG aggregate count exceeds i64 range".into(),
+                            )
+                        })?;
                     }
                 }
             }
@@ -414,6 +458,19 @@ impl AggregateAccumulator {
                 }
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("sum", DataType::Int64, true), array))
+            }
+            AggregateAccumulator::AvgInt64 { sum, count, .. } => {
+                use arrow::array::Float64Builder;
+                let mut builder = Float64Builder::with_capacity(1);
+                if count > 0 {
+                    // Compute average as floating-point for SQL standard compatibility
+                    let avg = (sum as f64) / (count as f64);
+                    builder.append_value(avg);
+                } else {
+                    builder.append_null();
+                }
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((Field::new("avg", DataType::Float64, true), array))
             }
             AggregateAccumulator::MinInt64 { value, .. } => {
                 let mut builder = Int64Builder::with_capacity(1);

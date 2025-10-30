@@ -236,6 +236,9 @@ where
                 AggregateCall::Sum(name) => {
                     AggregateCall::Sum(resolve_field_id(schema, name, unknown_aggregate)?)
                 }
+                AggregateCall::Avg(name) => {
+                    AggregateCall::Avg(resolve_field_id(schema, name, unknown_aggregate)?)
+                }
                 AggregateCall::Min(name) => {
                     AggregateCall::Min(resolve_field_id(schema, name, unknown_aggregate)?)
                 }

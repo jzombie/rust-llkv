@@ -135,6 +135,7 @@ pub enum AggregateCall<F> {
     CountStar,
     Count(F),
     Sum(F),
+    Avg(F),
     Min(F),
     Max(F),
     CountNulls(F),

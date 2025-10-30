@@ -5402,6 +5402,10 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
                 ))
             }
         }
+        // Handle unary + (no-op) by recursively resolving the inner expression
+        SqlExpr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Plus) => {
+            resolve_column_name(expr)
+        }
         _ => Err(Error::InvalidArgumentError(
             "aggregate arguments must be plain column identifiers".into(),
         )),
@@ -5587,6 +5591,23 @@ fn try_parse_aggregate_function(
             };
             let column = resolve_column_name(arg_expr)?;
             llkv_expr::expr::AggregateCall::Max(column)
+        }
+        "avg" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "AVG accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "AVG requires a column argument".into(),
+                    ));
+                }
+            };
+            let column = resolve_column_name(arg_expr)?;
+            llkv_expr::expr::AggregateCall::Avg(column)
         }
         _ => return Ok(None),
     };
