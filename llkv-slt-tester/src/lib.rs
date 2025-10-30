@@ -1,8 +1,8 @@
 //! SLT runner utilities for LLKV.
 
-pub mod slt_test_engine;
 mod parser;
 mod runner;
+pub mod slt_test_engine;
 
 pub use parser::{
     expand_loops_with_mapping, filter_conditional_blocks, map_temp_error_message,

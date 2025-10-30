@@ -178,7 +178,11 @@ impl SubqueryCorrelatedTrackerOptionExt for Option<&mut SubqueryCorrelatedColumn
 /// providing large batched inserts for throughput.
 const MAX_BUFFERED_INSERT_ROWS: usize = 8192;
 
-/// Buffer for accumulating INSERT VALUES statements across execute() calls.
+/// Accumulates literal `INSERT` payloads so multiple statements can be flushed together.
+///
+/// Each buffered statement tracks its individual row count while sharing a single literal
+/// payload vector. When the buffer flushes we can emit one `RuntimeStatementResult::Insert`
+/// per original statement without re-planning intermediate work.
 struct InsertBuffer {
     table_name: String,
     columns: Vec<String>,
@@ -218,6 +222,12 @@ impl InsertBuffer {
     }
 }
 
+/// Describes how a parsed `INSERT` should flow through the execution pipeline after we
+/// canonicalize the AST.
+///
+/// Literal `VALUES` payloads (including constant folds such as `SELECT 1`) are rewritten into
+/// [`PlanValue`] rows so they can be stitched together with other buffered statements before we
+/// hit the planner. Non-literal sources stay as full [`InsertPlan`]s and execute immediately.
 enum PreparedInsert {
     Values {
         table_name: String,
@@ -227,6 +237,8 @@ enum PreparedInsert {
     Immediate(InsertPlan),
 }
 
+/// Return value from [`SqlEngine::buffer_insert`], exposing any buffered flush results along with
+/// the row-count placeholder for the currently processed statement.
 struct BufferedInsertResult<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -241,8 +253,14 @@ where
 {
     engine: RuntimeEngine<P>,
     default_nulls_first: AtomicBool,
-    /// Buffer for batching INSERTs across execute() calls for massive performance gains
+    /// Buffer for batching INSERTs across execute() calls for massive performance gains.
     insert_buffer: RefCell<Option<InsertBuffer>>,
+    /// Tracks whether cross-statement INSERT buffering is enabled for this engine instance.
+    ///
+    /// Batch mode is disabled by default so unit tests and non-bulk ingest callers observe the
+    /// runtime's native per-statement semantics. Long-running workloads (for example, the SLT
+    /// harness) can opt in via [`SqlEngine::set_insert_buffering`] to trade immediate visibility
+    /// for much lower planning overhead.
     insert_buffering_enabled: AtomicBool,
 }
 
@@ -343,6 +361,10 @@ where
         })
     }
 
+    /// Construct a new engine backed by the provided pager with insert buffering disabled.
+    ///
+    /// Callers that intend to stream large amounts of literal `INSERT ... VALUES` input can
+    /// enable batching later using [`SqlEngine::set_insert_buffering`].
     pub fn new(pager: Arc<P>) -> Self {
         let engine = RuntimeEngine::new(pager);
         Self::from_runtime_engine(engine, false, false)
@@ -411,6 +433,7 @@ where
         self.engine.context()
     }
 
+    /// Construct an engine from an existing runtime context with insert buffering disabled.
     pub fn with_context(context: Arc<RuntimeContext<P>>, default_nulls_first: bool) -> Self {
         Self::from_runtime_engine(
             RuntimeEngine::from_context(context),
@@ -419,6 +442,17 @@ where
         )
     }
 
+    /// Toggle literal `INSERT` buffering for the engine.
+    ///
+    /// When enabled, consecutive `INSERT ... VALUES` statements that target the same table and
+    /// column list are accumulated and flushed together, dramatically lowering planning and
+    /// execution overhead for workloads that stream tens of thousands of literal inserts.
+    /// Disabling buffering reverts to SQLite-style immediate execution and is appropriate for
+    /// unit tests or workloads that rely on per-statement side effects (errors, triggers,
+    /// constraint violations) happening synchronously.
+    ///
+    /// Calling this method with `false` forces any pending batched rows to flush before
+    /// returning, guaranteeing that subsequent reads observe the latest state.
     pub fn set_insert_buffering(&self, enabled: bool) -> SqlResult<()> {
         if !enabled {
             let _ = self.flush_buffer_results()?;
@@ -508,12 +542,21 @@ where
         self.flush_buffer_results()
     }
 
-    /// Buffer an INSERT statement for cross-call batching.
+    /// Buffer an `INSERT` statement when batching is enabled, or execute it immediately
+    /// otherwise.
+    ///
+    /// The return value includes any flushed results (when a batch boundary is crossed) as well
+    /// as the per-statement placeholder that preserves the original `RuntimeStatementResult`
+    /// ordering expected by callers like the SLT harness.
     fn buffer_insert(
         &self,
         insert: sqlparser::ast::Insert,
         expectation: StatementExpectation,
     ) -> SqlResult<BufferedInsertResult<P>> {
+        // Expectations serve two purposes: (a) ensure we surface synchronous errors when the
+        // SLT harness anticipates them, and (b) force a flush when the harness is validating the
+        // rows-affected count. In both situations we bypass the buffer entirely so the runtime
+        // executes the statement immediately.
         let execute_immediately = matches!(
             expectation,
             StatementExpectation::Error | StatementExpectation::Count(_)
@@ -527,6 +570,9 @@ where
             });
         }
 
+        // When buffering is disabled for this engine (the default for unit tests and most
+        // production callers), short-circuit to immediate execution so callers see the results
+        // they expect without having to register additional expectations.
         if !self.insert_buffering_enabled.load(AtomicOrdering::Relaxed) {
             let flushed = self.flush_buffer_results()?;
             let current = self.handle_insert(insert)?;
@@ -668,6 +714,19 @@ where
         Ok(per_statement)
     }
 
+    /// Canonicalizes an `INSERT` statement so buffered workloads can share literal payloads while
+    /// complex sources still execute eagerly.
+    ///
+    /// The translation enforces dialect constraints up front, rewrites `VALUES` clauses (and any
+    /// constant `SELECT` forms) into `PlanValue` rows, and returns them under
+    /// [`PreparedInsert::Values`] so [`Self::buffer_insert`] can append them to the rolling
+    /// batch. Statements whose payload must be evaluated at runtime fall back to a fully planned
+    /// [`InsertPlan`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgumentError`] whenever the incoming AST uses syntactic forms we
+    /// do not currently support or when the literal payload is empty.
     fn prepare_insert(&self, stmt: sqlparser::ast::Insert) -> SqlResult<PreparedInsert> {
         let table_name_debug =
             Self::table_name_from_insert(&stmt).unwrap_or_else(|_| "unknown".to_string());

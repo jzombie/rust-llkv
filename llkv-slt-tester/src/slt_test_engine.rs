@@ -15,21 +15,26 @@ use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
 thread_local! {
+    /// Caches the column types declared by the current sqllogictest statement so we can format
+    /// the next result batch with the exact textual shape the harness expects.
     static EXPECTED_COLUMN_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = const { RefCell::new(None) };
 }
 
+/// Records the sqllogictest column type expectations for the next query result.
 pub(crate) fn set_expected_column_types(types: Vec<DefaultColumnType>) {
     EXPECTED_COLUMN_TYPES.with(|cell| {
         *cell.borrow_mut() = Some(types);
     });
 }
 
+/// Removes any pending column type overrides so future statements fall back to inference.
 pub(crate) fn clear_expected_column_types() {
     EXPECTED_COLUMN_TYPES.with(|cell| {
         cell.borrow_mut().take();
     });
 }
 
+/// Drains the cached sqllogictest column types, returning ownership to the caller if present.
 fn take_expected_column_types() -> Option<Vec<DefaultColumnType>> {
     EXPECTED_COLUMN_TYPES.with(|cell| cell.borrow_mut().take())
 }
@@ -42,6 +47,9 @@ pub struct EngineHarness {
 impl EngineHarness {
     pub fn new(engine: SqlEngine<MemPager>) -> Self {
         tracing::debug!("[HARNESS] new() created harness at {:p}", &engine);
+        // The SLT workload streams thousands of literal INSERTs. Enable cross-statement
+        // batching so we exercise the optimized ingestion path while keeping single-engine
+        // unit tests on the default immediate execution path.
         engine
             .set_insert_buffering(true)
             .expect("enable insert buffering");
