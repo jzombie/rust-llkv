@@ -6100,7 +6100,18 @@ where
                             "translate_condition: result stack underflow for Not".into(),
                         )
                     })?;
-                    result_stack.push(llkv_expr::expr::Expr::not(inner));
+                    // Optimize: NOT (expr IS NULL) -> expr IS NOT NULL by flipping negation
+                    match inner {
+                        llkv_expr::expr::Expr::IsNull { expr, negated } => {
+                            result_stack.push(llkv_expr::expr::Expr::IsNull {
+                                expr,
+                                negated: !negated,
+                            });
+                        }
+                        other => {
+                            result_stack.push(llkv_expr::expr::Expr::not(other));
+                        }
+                    }
                 }
                 ConditionExitContext::Nested => {
                     // Nested is a no-op - just pass through the inner expression
