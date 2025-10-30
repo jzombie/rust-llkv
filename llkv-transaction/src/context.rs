@@ -6,6 +6,7 @@
 //! - [`TransactionSession`]: Session-level transaction management
 //! - [`TransactionManager`]: Cross-session transaction coordination
 
+// TODO: Swap with `FxHashMap` and `FxHashSet` for performance?
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

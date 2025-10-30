@@ -14,6 +14,7 @@ This crate provides a small harness and API for running sqllogictest (`.slt`) su
 
 - The harness source file (`tests/slt_harness.rs`) implements a standalone test runner using `libtest-mimic` so the harness controls discovery and reporting.
 - Programmatic API is exposed via `LlkvSltRunner` for embedding SLT execution in other tooling.
+- sqllogictest files have an `.slt` extension.
 - `.slturl` pointer files are supported: a `.slturl` file contains a URL which will be fetched (via `reqwest`) and executed.
 
 ## Usage

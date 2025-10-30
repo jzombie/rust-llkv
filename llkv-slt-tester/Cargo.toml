@@ -35,5 +35,5 @@ path = "tests/slt_harness.rs"
 harness = false
 
 [[bench]]
-name = "select4_bench"
+name = "test_perf_regression_bench"
 harness = false

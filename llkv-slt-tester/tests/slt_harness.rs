@@ -19,7 +19,7 @@ fn main() {
     let args = Arguments::from_args();
     let conclusion = slt::run_slt_harness_with_args(
         SLT_DIR,
-        slt::engine::make_in_memory_factory_factory(),
+        slt::slt_test_engine::make_in_memory_factory_factory(),
         args,
     );
     conclusion.exit();
