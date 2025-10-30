@@ -11,7 +11,7 @@ const SELECT4_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/slt/sqlite/select4.slturl"
 );
-// ETA: Roughtly .5 ms
+// ETA: Roughly .5 ms
 const DELETE1000_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/slt/sqlite/index/delete/1000/slt_good_0.slturl"
