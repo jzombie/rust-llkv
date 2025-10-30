@@ -133,9 +133,9 @@ pub enum ScalarExpr<F> {
 #[derive(Clone, Debug)]
 pub enum AggregateCall<F> {
     CountStar,
-    Count(F),
-    Sum(F),
-    Avg(F),
+    Count { column: F, distinct: bool },
+    Sum { column: F, distinct: bool },
+    Avg { column: F, distinct: bool },
     Min(F),
     Max(F),
     CountNulls(F),

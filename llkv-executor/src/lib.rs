@@ -101,6 +101,13 @@ struct GroupState {
     row_idx: usize,
 }
 
+/// State for a group when computing aggregates
+struct GroupAggregateState {
+    batch: RecordBatch,
+    representative_row: usize,
+    row_indices: Vec<usize>,  // Track all rows belonging to this group
+}
+
 struct OutputColumn {
     field: Field,
     source: OutputSource,
@@ -1262,9 +1269,9 @@ where
                     });
                     spec_to_projection.push(None);
                 }
-                AggregateCall::Count(column)
-                | AggregateCall::Sum(column)
-                | AggregateCall::Avg(column)
+                AggregateCall::Count { column, .. }
+                | AggregateCall::Sum { column, .. }
+                | AggregateCall::Avg { column, .. }
                 | AggregateCall::Min(column)
                 | AggregateCall::Max(column)
                 | AggregateCall::CountNulls(column) => {
@@ -1276,10 +1283,10 @@ where
                     })?;
                     let field = combined_schema.field(column_index);
                     let kind = match agg {
-                        AggregateCall::Count(_) => AggregateKind::CountField {
+                        AggregateCall::Count { .. } => AggregateKind::CountField {
                             field_id: column_index as u32,
                         },
-                        AggregateCall::Sum(_) => {
+                        AggregateCall::Sum { .. } => {
                             if field.data_type() != &DataType::Int64 {
                                 return Err(Error::InvalidArgumentError(
                                     "SUM currently supports only INTEGER columns".into(),
@@ -1289,7 +1296,7 @@ where
                                 field_id: column_index as u32,
                             }
                         }
-                        AggregateCall::Avg(_) => {
+                        AggregateCall::Avg { .. } => {
                             if field.data_type() != &DataType::Int64 {
                                 return Err(Error::InvalidArgumentError(
                                     "AVG currently supports only INTEGER columns".into(),
@@ -2035,21 +2042,87 @@ where
             ));
         }
 
+        // Debug: check if we have aggregates in unexpected places
+        tracing::debug!(
+            "[GROUP BY] Original plan: projections={}, aggregates={}, has_filter={}, has_having={}",
+            plan.projections.len(),
+            plan.aggregates.len(),
+            plan.filter.is_some(),
+            plan.having.is_some()
+        );
+
+        // For GROUP BY with aggregates, we need a two-phase execution:
+        // 1. First phase: fetch all base table data (no projections, no aggregates)
+        // 2. Second phase: group rows and compute aggregates
         let mut base_plan = plan.clone();
         base_plan.projections.clear();
+        base_plan.aggregates.clear();
+        base_plan.scalar_subqueries.clear();
         base_plan.order_by.clear();
         base_plan.distinct = false;
         base_plan.group_by.clear();
         base_plan.value_table_mode = None;
         base_plan.having = None;
 
-        let execution = self.execute_projection(
-            Arc::clone(&table),
+        tracing::debug!(
+            "[GROUP BY] Base plan: projections={}, aggregates={}, has_filter={}, has_having={}",
+            base_plan.projections.len(),
+            base_plan.aggregates.len(),
+            base_plan.filter.is_some(),
+            base_plan.having.is_some()
+        );
+
+        // For base scan, we want all columns from the table
+        // We build wildcard projections directly to avoid any expression evaluation
+        let table_ref = table.as_ref();
+        let projections = build_wildcard_projections(table_ref);
+        let base_schema = schema_for_projections(table_ref, &projections)?;
+
+        // Build filter if present (should NOT contain aggregates)
+        tracing::debug!("[GROUP BY] Building base filter: has_filter={}", base_plan.filter.is_some());
+        let (filter_expr, full_table_scan) = match &base_plan.filter {
+            Some(filter_wrapper) => {
+                tracing::debug!("[GROUP BY] Translating filter predicate: {:?}", filter_wrapper.predicate);
+                let expr = crate::translation::expression::translate_predicate(
+                    filter_wrapper.predicate.clone(),
+                    table_ref.schema.as_ref(),
+                    |name| {
+                        Error::InvalidArgumentError(format!(
+                            "Binder Error: does not have a column named '{}'",
+                            name
+                        ))
+                    },
+                )?;
+                tracing::debug!("[GROUP BY] Translated filter expr: {:?}", expr);
+                (expr, false)
+            },
+            None => {
+                // Use first column as dummy for full table scan
+                let first_col = table_ref.schema.columns.first().ok_or_else(|| {
+                    Error::InvalidArgumentError("Table has no columns".into())
+                })?;
+                (full_table_scan_filter(first_col.field_id), true)
+            }
+        };
+
+        let options = ScanStreamOptions {
+            include_nulls: true,
+            order: None,
+            row_id_filter: row_filter.clone(),
+        };
+
+        let execution = SelectExecution::new_projection(
             display_name.clone(),
-            base_plan,
-            row_filter,
-        )?;
-        let base_schema = execution.schema();
+            Arc::clone(&base_schema),
+            Arc::clone(&table),
+            projections,
+            filter_expr,
+            options,
+            full_table_scan,
+            vec![],
+            false,
+        );
+
         let batches = execution.collect()?;
 
         let column_lookup_map = build_column_lookup_map(base_schema.as_ref());
@@ -2082,10 +2155,15 @@ where
             ));
         }
 
+        // If there are aggregates with GROUP BY, use a different execution path
         if !plan.aggregates.is_empty() || self.has_computed_aggregates(&plan) {
-            return Err(Error::InvalidArgumentError(
-                "GROUP BY with aggregates is not supported yet".into(),
-            ));
+            return self.execute_group_by_with_aggregates(
+                display_name,
+                plan,
+                base_schema,
+                batches,
+                column_lookup_map,
+            );
         }
 
         let mut key_indices = Vec::with_capacity(plan.group_by.len());
@@ -2261,12 +2339,14 @@ where
         ))
     }
 
+
+
     fn build_group_by_output_columns(
         &self,
         plan: &SelectPlan,
         base_schema: &Schema,
         column_lookup_map: &FxHashMap<String, usize>,
-        sample_batch: &RecordBatch,
+        _sample_batch: &RecordBatch,
     ) -> ExecutorResult<Vec<OutputColumn>> {
         let projections = if plan.projections.is_empty() {
             vec![SelectProjection::AllColumns]
@@ -2319,17 +2399,11 @@ where
                         source: OutputSource::TableColumn { index: *index },
                     });
                 }
-                SelectProjection::Computed { expr, alias } => {
-                    let mut context =
-                        CrossProductExpressionContext::new(base_schema, column_lookup_map.clone())?;
-                    context.reset();
-                    let evaluated = self.evaluate_projection_expression(
-                        &mut context,
-                        expr,
-                        sample_batch,
-                        &FxHashMap::default(),
-                    )?;
-                    let field = Field::new(alias.clone(), evaluated.data_type().clone(), true);
+                SelectProjection::Computed { expr: _, alias } => {
+                    // For GROUP BY with aggregates, we don't evaluate the expression here
+                    // because it may contain aggregate functions. We'll evaluate it later
+                    // per group. For now, assume Float64 as a conservative type.
+                    let field = Field::new(alias.clone(), DataType::Float64, true);
                     columns.push(OutputColumn {
                         field,
                         source: OutputSource::Computed {
@@ -2433,6 +2507,256 @@ where
         let projected_schema = Arc::new(Schema::new(selected_fields));
         RecordBatch::try_new(projected_schema, selected_columns)
             .map_err(|e| Error::Internal(format!("failed to apply projections: {}", e)))
+    }
+
+    /// Execute GROUP BY with aggregates - computes aggregates per group
+    fn execute_group_by_with_aggregates(
+        &self,
+        display_name: String,
+        plan: SelectPlan,
+        base_schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        column_lookup_map: FxHashMap<String, usize>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        use llkv_expr::expr::AggregateCall;
+
+        // Extract GROUP BY key indices
+        let mut key_indices = Vec::with_capacity(plan.group_by.len());
+        for column in &plan.group_by {
+            let key = column.to_ascii_lowercase();
+            let index = column_lookup_map.get(&key).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "column '{}' not found in GROUP BY input",
+                    column
+                ))
+            })?;
+            key_indices.push(*index);
+        }
+
+        // Extract all aggregates from computed projections
+        let mut aggregate_specs: Vec<(String, AggregateCall<String>)> = Vec::new();
+        for proj in &plan.projections {
+            if let SelectProjection::Computed { expr, .. } = proj {
+                Self::collect_aggregates(expr, &mut aggregate_specs);
+            }
+        }
+
+        // Build a hash map for groups - collect row indices per group
+        let mut group_index: FxHashMap<Vec<GroupKeyValue>, usize> = FxHashMap::default();
+        let mut group_states: Vec<GroupAggregateState> = Vec::new();
+
+        // First pass: collect all rows for each group
+        for batch in &batches {
+            for row_idx in 0..batch.num_rows() {
+                let key = build_group_key(batch, row_idx, &key_indices)?;
+                
+                if let Some(&group_idx) = group_index.get(&key) {
+                    // Add row to existing group
+                    group_states[group_idx].row_indices.push(row_idx);
+                } else {
+                    // New group
+                    let group_idx = group_states.len();
+                    group_index.insert(key, group_idx);
+                    group_states.push(GroupAggregateState {
+                        batch: batch.clone(),
+                        representative_row: row_idx,
+                        row_indices: vec![row_idx],
+                    });
+                }
+            }
+        }
+
+        // Second pass: compute aggregates for each group using proper AggregateState
+        let mut group_aggregate_values: Vec<FxHashMap<String, PlanValue>> =
+            Vec::with_capacity(group_states.len());
+
+        for group_state in &group_states {
+            // Create a mini-batch containing only rows from this group
+            let group_batch = {
+                let schema = group_state.batch.schema();
+                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+                
+                for col_idx in 0..schema.fields().len() {
+                    let source_array = group_state.batch.column(col_idx);
+                    // Use Arrow's take kernel to extract rows for this group
+                    let indices = arrow::array::UInt64Array::from(
+                        group_state
+                            .row_indices
+                            .iter()
+                            .map(|&i| i as u64)
+                            .collect::<Vec<_>>(),
+                    );
+                    let taken = arrow::compute::take(source_array.as_ref(), &indices, None)?;
+                    arrays.push(taken);
+                }
+                
+                RecordBatch::try_new(schema, arrays)?
+            };
+
+            // Create AggregateState for each aggregate and compute
+            let mut aggregate_values: FxHashMap<String, PlanValue> = FxHashMap::default();
+            
+            for (key, agg_call) in &aggregate_specs {
+                // Build the AggregateSpec and create accumulator
+                let spec = Self::build_aggregate_spec_from_call(
+                    agg_call,
+                    key.clone(),
+                    base_schema.as_ref(),
+                    &column_lookup_map,
+                )?;
+                
+                // For aggregates on columns, find the column index in the batch
+                let projection_idx = match agg_call {
+                    AggregateCall::CountStar => None,
+                    AggregateCall::Count { column: col_name, .. }
+                    | AggregateCall::Sum { column: col_name, .. }
+                    | AggregateCall::Avg { column: col_name, .. }
+                    | AggregateCall::Min(col_name)
+                    | AggregateCall::Max(col_name)
+                    | AggregateCall::CountNulls(col_name) => {
+                        column_lookup_map.get(&col_name.to_ascii_lowercase()).copied()
+                    }
+                };
+
+                let mut state = llkv_aggregate::AggregateState {
+                    alias: key.clone(),
+                    accumulator: llkv_aggregate::AggregateAccumulator::new_with_projection_index(
+                        &spec,
+                        projection_idx,
+                        None,
+                    )?,
+                    override_value: None,
+                };
+
+                // Update with the group's mini-batch
+                state.update(&group_batch)?;
+
+                // Finalize and extract value
+                let (_field, array) = state.finalize()?;
+                let value = llkv_plan::plan_value_from_array(&array, 0)?;
+                aggregate_values.insert(key.clone(), value);
+            }
+            
+            group_aggregate_values.push(aggregate_values);
+        }
+
+        // Build result rows
+        let output_columns = self.build_group_by_output_columns(
+            &plan,
+            base_schema.as_ref(),
+            &column_lookup_map,
+            batches.first().unwrap_or(&RecordBatch::new_empty(Arc::clone(&base_schema))),
+        )?;
+
+        let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(group_states.len());
+
+        for (group_idx, group_state) in group_states.iter().enumerate() {
+            let aggregate_values = &group_aggregate_values[group_idx];
+
+            let mut row: Vec<PlanValue> = Vec::with_capacity(output_columns.len());
+            for output in &output_columns {
+                match output.source {
+                    OutputSource::TableColumn { index } => {
+                        // Use the representative row from this group
+                        let value = llkv_plan::plan_value_from_array(
+                            group_state.batch.column(index),
+                            group_state.representative_row,
+                        )?;
+                        row.push(value);
+                    }
+                    OutputSource::Computed { projection_index } => {
+                        let expr = match &plan.projections[projection_index] {
+                            SelectProjection::Computed { expr, .. } => expr,
+                            _ => unreachable!("projection index mismatch for computed column"),
+                        };
+                        // Evaluate expression with aggregates substituted
+                        let value =
+                            Self::evaluate_expr_with_plan_value_aggregates(expr, &aggregate_values)?;
+                        row.push(value);
+                    }
+                }
+            }
+            rows.push(row);
+        }
+
+        // Apply HAVING clause if present
+        let filtered_rows = if let Some(having) = &plan.having {
+            let mut filtered = Vec::new();
+            for (row_idx, row) in rows.iter().enumerate() {
+                let aggregate_values = &group_aggregate_values[row_idx];
+                // Evaluate HAVING expression with aggregate values
+                let passes = match having {
+                    llkv_expr::expr::Expr::Compare { left, op, right } => {
+                        let left_val = Self::evaluate_expr_with_plan_value_aggregates(left, aggregate_values)?;
+                        let right_val = Self::evaluate_expr_with_plan_value_aggregates(right, aggregate_values)?;
+                        match (left_val, right_val) {
+                            (PlanValue::Null, _) | (_, PlanValue::Null) => false, // NULL comparisons are false
+                            (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                                use llkv_expr::expr::CompareOp;
+                                match op {
+                                    CompareOp::Eq => l == r,
+                                    CompareOp::NotEq => l != r,
+                                    CompareOp::Lt => l < r,
+                                    CompareOp::LtEq => l <= r,
+                                    CompareOp::Gt => l > r,
+                                    CompareOp::GtEq => l >= r,
+                                }
+                            }
+                            (PlanValue::Float(l), PlanValue::Float(r)) => {
+                                use llkv_expr::expr::CompareOp;
+                                match op {
+                                    CompareOp::Eq => l == r,
+                                    CompareOp::NotEq => l != r,
+                                    CompareOp::Lt => l < r,
+                                    CompareOp::LtEq => l <= r,
+                                    CompareOp::Gt => l > r,
+                                    CompareOp::GtEq => l >= r,
+                                }
+                            }
+                            _ => false,
+                        }
+                    }
+                    llkv_expr::expr::Expr::Literal(val) => *val,
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "Unsupported HAVING expression type".into(),
+                        ))
+                    }
+                };
+                if passes {
+                    filtered.push(row.clone());
+                }
+            }
+            filtered
+        } else {
+            rows
+        };
+
+        let fields: Vec<Field> = output_columns
+            .into_iter()
+            .map(|output| output.field)
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let mut batch = rows_to_record_batch(Arc::clone(&schema), &filtered_rows)?;
+
+        if plan.distinct && batch.num_rows() > 0 {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        if !plan.order_by.is_empty() && batch.num_rows() > 0 {
+            batch = sort_record_batch_with_order(&schema, &batch, &plan.order_by)?;
+        }
+
+        Ok(SelectExecution::new_single_batch(
+            display_name,
+            schema,
+            batch,
+        ))
     }
 
     fn execute_aggregates(
@@ -2807,6 +3131,118 @@ where
         ))
     }
 
+    /// Build an AggregateSpec from an AggregateCall
+    fn build_aggregate_spec_from_call(
+        agg_call: &llkv_expr::expr::AggregateCall<String>,
+        alias: String,
+        schema: &Schema,
+        column_lookup: &FxHashMap<String, usize>,
+    ) -> ExecutorResult<llkv_aggregate::AggregateSpec> {
+        use llkv_expr::expr::AggregateCall;
+
+        let kind = match agg_call {
+            AggregateCall::CountStar => llkv_aggregate::AggregateKind::CountStar,
+            AggregateCall::Count { column: col_name, .. } => {
+                let col_idx = column_lookup
+                    .get(&col_name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
+                    })?;
+                let field = schema.field(*col_idx);
+                let field_id = field
+                    .metadata()
+                    .get("field_id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        Error::Internal(format!("field_id not found for column '{}'", col_name))
+                    })?;
+                llkv_aggregate::AggregateKind::CountField { field_id }
+            }
+            AggregateCall::Sum { column: col_name, .. } => {
+                let col_idx = column_lookup
+                    .get(&col_name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
+                    })?;
+                let field = schema.field(*col_idx);
+                let field_id = field
+                    .metadata()
+                    .get("field_id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        Error::Internal(format!("field_id not found for column '{}'", col_name))
+                    })?;
+                llkv_aggregate::AggregateKind::SumInt64 { field_id }
+            }
+            AggregateCall::Avg { column: col_name, .. } => {
+                let col_idx = column_lookup
+                    .get(&col_name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
+                    })?;
+                let field = schema.field(*col_idx);
+                let field_id = field
+                    .metadata()
+                    .get("field_id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        Error::Internal(format!("field_id not found for column '{}'", col_name))
+                    })?;
+                llkv_aggregate::AggregateKind::AvgInt64 { field_id }
+            }
+            AggregateCall::Min(col_name) => {
+                let col_idx = column_lookup
+                    .get(&col_name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
+                    })?;
+                let field = schema.field(*col_idx);
+                let field_id = field
+                    .metadata()
+                    .get("field_id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        Error::Internal(format!("field_id not found for column '{}'", col_name))
+                    })?;
+                llkv_aggregate::AggregateKind::MinInt64 { field_id }
+            }
+            AggregateCall::Max(col_name) => {
+                let col_idx = column_lookup
+                    .get(&col_name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
+                    })?;
+                let field = schema.field(*col_idx);
+                let field_id = field
+                    .metadata()
+                    .get("field_id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        Error::Internal(format!("field_id not found for column '{}'", col_name))
+                    })?;
+                llkv_aggregate::AggregateKind::MaxInt64 { field_id }
+            }
+            AggregateCall::CountNulls(col_name) => {
+                let col_idx = column_lookup
+                    .get(&col_name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
+                    })?;
+                let field = schema.field(*col_idx);
+                let field_id = field
+                    .metadata()
+                    .get("field_id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        Error::Internal(format!("field_id not found for column '{}'", col_name))
+                    })?;
+                llkv_aggregate::AggregateKind::CountNulls { field_id }
+            }
+        };
+
+        Ok(llkv_aggregate::AggregateSpec { alias, kind })
+    }
+
     /// Collect all aggregate calls from an expression
     fn collect_aggregates(
         expr: &ScalarExpr<String>,
@@ -2879,7 +3315,7 @@ where
         for (key, agg) in aggregate_specs {
             let kind = match agg {
                 AggregateCall::CountStar => AggregateKind::CountStar,
-                AggregateCall::Count(col_name) => {
+                AggregateCall::Count { column: col_name, .. } => {
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
                         Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
                     })?;
@@ -2887,7 +3323,7 @@ where
                         field_id: col.field_id,
                     }
                 }
-                AggregateCall::Sum(col_name) => {
+                AggregateCall::Sum { column: col_name, .. } => {
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
                         Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
                     })?;
@@ -2895,7 +3331,7 @@ where
                         field_id: col.field_id,
                     }
                 }
-                AggregateCall::Avg(col_name) => {
+                AggregateCall::Avg { column: col_name, .. } => {
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
                         Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
                     })?;
@@ -3067,7 +3503,93 @@ where
         Ok(results)
     }
 
-    /// Evaluate an expression by substituting aggregate values
+    /// Evaluate expressions with PlanValue aggregates (for GROUP BY with aggregates)
+    fn evaluate_expr_with_plan_value_aggregates(
+        expr: &ScalarExpr<String>,
+        aggregates: &FxHashMap<String, PlanValue>,
+    ) -> ExecutorResult<PlanValue> {
+        use llkv_expr::expr::BinaryOp;
+        use llkv_expr::literal::Literal;
+
+        match expr {
+            ScalarExpr::Literal(Literal::Integer(v)) => Ok(PlanValue::Integer(*v as i64)),
+            ScalarExpr::Literal(Literal::Float(v)) => Ok(PlanValue::Float(*v)),
+            ScalarExpr::Literal(Literal::Boolean(v)) => {
+                Ok(PlanValue::Integer(if *v { 1 } else { 0 }))
+            }
+            ScalarExpr::Literal(Literal::String(s)) => Ok(PlanValue::String(s.clone())),
+            ScalarExpr::Literal(Literal::Null) => Ok(PlanValue::Null),
+            ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
+                "Struct literals not supported in aggregate expressions".into(),
+            )),
+            ScalarExpr::Column(_) => Err(Error::InvalidArgumentError(
+                "Column references not supported in aggregate-only expressions".into(),
+            )),
+            ScalarExpr::Compare { .. } => Err(Error::InvalidArgumentError(
+                "Comparisons not supported in aggregate-only expressions".into(),
+            )),
+            ScalarExpr::Aggregate(agg) => {
+                let key = format!("{:?}", agg);
+                aggregates
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| Error::Internal(format!("Aggregate value not found: {}", key)))
+            }
+            ScalarExpr::Binary { left, op, right } => {
+                let left_val = Self::evaluate_expr_with_plan_value_aggregates(left, aggregates)?;
+                let right_val =
+                    Self::evaluate_expr_with_plan_value_aggregates(right, aggregates)?;
+
+                // Convert to numeric values for binary operations
+                let left_num = match left_val {
+                    PlanValue::Integer(i) => i as f64,
+                    PlanValue::Float(f) => f,
+                    PlanValue::Null => return Ok(PlanValue::Null),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "Non-numeric value in binary operation".into(),
+                        ))
+                    }
+                };
+                let right_num = match right_val {
+                    PlanValue::Integer(i) => i as f64,
+                    PlanValue::Float(f) => f,
+                    PlanValue::Null => return Ok(PlanValue::Null),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "Non-numeric value in binary operation".into(),
+                        ))
+                    }
+                };
+
+                let result = match op {
+                    BinaryOp::Add => left_num + right_num,
+                    BinaryOp::Subtract => left_num - right_num,
+                    BinaryOp::Multiply => left_num * right_num,
+                    BinaryOp::Divide => {
+                        if right_num == 0.0 {
+                            return Err(Error::InvalidArgumentError("Division by zero".into()));
+                        }
+                        left_num / right_num
+                    }
+                    BinaryOp::Modulo => left_num % right_num,
+                };
+
+                // Return as float if either operand was float, otherwise as integer
+                if matches!(left_val, PlanValue::Float(_))
+                    || matches!(right_val, PlanValue::Float(_))
+                {
+                    Ok(PlanValue::Float(result))
+                } else {
+                    Ok(PlanValue::Integer(result as i64))
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(
+                "Expression type not supported in aggregate-only context".into(),
+            )),
+        }
+    }
+
     fn evaluate_expr_with_aggregates(
         expr: &ScalarExpr<String>,
         aggregates: &FxHashMap<String, i64>,
@@ -4008,9 +4530,9 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
         }
         ScalarExpr::Aggregate(call) => match call {
             AggregateCall::CountStar => {}
-            AggregateCall::Count(fid)
-            | AggregateCall::Sum(fid)
-            | AggregateCall::Avg(fid)
+            AggregateCall::Count { column: fid, .. }
+            | AggregateCall::Sum { column: fid, .. }
+            | AggregateCall::Avg { column: fid, .. }
             | AggregateCall::Min(fid)
             | AggregateCall::Max(fid)
             | AggregateCall::CountNulls(fid) => {

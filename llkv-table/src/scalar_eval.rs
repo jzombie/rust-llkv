@@ -361,9 +361,9 @@ impl NumericKernels {
                 // Collect fields referenced by the aggregate
                 match agg {
                     llkv_expr::expr::AggregateCall::CountStar => {}
-                    llkv_expr::expr::AggregateCall::Count(fid)
-                    | llkv_expr::expr::AggregateCall::Sum(fid)
-                    | llkv_expr::expr::AggregateCall::Avg(fid)
+                    llkv_expr::expr::AggregateCall::Count { column: fid, .. }
+                    | llkv_expr::expr::AggregateCall::Sum { column: fid, .. }
+                    | llkv_expr::expr::AggregateCall::Avg { column: fid, .. }
                     | llkv_expr::expr::AggregateCall::Min(fid)
                     | llkv_expr::expr::AggregateCall::Max(fid)
                     | llkv_expr::expr::AggregateCall::CountNulls(fid) => {

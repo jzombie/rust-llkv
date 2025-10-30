@@ -230,14 +230,23 @@ where
         ScalarExpr::Aggregate(agg) => {
             let translated = match agg {
                 AggregateCall::CountStar => AggregateCall::CountStar,
-                AggregateCall::Count(name) => {
-                    AggregateCall::Count(resolve_field_id(schema, name, unknown_aggregate)?)
+                AggregateCall::Count { column: name, distinct } => {
+                    AggregateCall::Count { 
+                        column: resolve_field_id(schema, name, unknown_aggregate)?,
+                        distinct: *distinct,
+                    }
                 }
-                AggregateCall::Sum(name) => {
-                    AggregateCall::Sum(resolve_field_id(schema, name, unknown_aggregate)?)
+                AggregateCall::Sum { column: name, distinct } => {
+                    AggregateCall::Sum { 
+                        column: resolve_field_id(schema, name, unknown_aggregate)?,
+                        distinct: *distinct,
+                    }
                 }
-                AggregateCall::Avg(name) => {
-                    AggregateCall::Avg(resolve_field_id(schema, name, unknown_aggregate)?)
+                AggregateCall::Avg { column: name, distinct } => {
+                    AggregateCall::Avg { 
+                        column: resolve_field_id(schema, name, unknown_aggregate)?,
+                        distinct: *distinct,
+                    }
                 }
                 AggregateCall::Min(name) => {
                     AggregateCall::Min(resolve_field_id(schema, name, unknown_aggregate)?)

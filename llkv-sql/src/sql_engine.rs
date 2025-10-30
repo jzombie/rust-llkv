@@ -5502,13 +5502,19 @@ fn try_parse_aggregate_function(
         return Ok(None);
     };
 
-    let args_slice: &[FunctionArg] = match &func.args {
+    // Check for DISTINCT modifier
+    let distinct = match &func.args {
         FunctionArguments::List(list) => {
-            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+            if !list.clauses.is_empty() {
                 return Ok(None);
             }
-            &list.args
+            list.duplicate_treatment.is_some()
         }
+        _ => false,
+    };
+
+    let args_slice: &[FunctionArg] = match &func.args {
+        FunctionArguments::List(list) => &list.args,
         FunctionArguments::None => &[],
         FunctionArguments::Subquery(_) => return Ok(None),
     };
@@ -5522,11 +5528,19 @@ fn try_parse_aggregate_function(
             }
             match &args_slice[0] {
                 FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                    if distinct {
+                        return Err(Error::InvalidArgumentError(
+                            "COUNT(DISTINCT *) is not supported".into(),
+                        ));
+                    }
                     llkv_expr::expr::AggregateCall::CountStar
                 }
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
                     let column = resolve_column_name(arg_expr)?;
-                    llkv_expr::expr::AggregateCall::Count(column)
+                    llkv_expr::expr::AggregateCall::Count {
+                        column,
+                        distinct,
+                    }
                 }
                 _ => {
                     return Err(Error::InvalidArgumentError(
@@ -5552,10 +5566,18 @@ fn try_parse_aggregate_function(
 
             // Check for COUNT(CASE ...) pattern
             if let Some(column) = parse_count_nulls_case(arg_expr)? {
+                if distinct {
+                    return Err(Error::InvalidArgumentError(
+                        "DISTINCT not supported for COUNT(CASE ...) pattern".into(),
+                    ));
+                }
                 llkv_expr::expr::AggregateCall::CountNulls(column)
             } else {
                 let column = resolve_column_name(arg_expr)?;
-                llkv_expr::expr::AggregateCall::Sum(column)
+                llkv_expr::expr::AggregateCall::Sum {
+                    column,
+                    distinct,
+                }
             }
         }
         "min" => {
@@ -5607,7 +5629,7 @@ fn try_parse_aggregate_function(
                 }
             };
             let column = resolve_column_name(arg_expr)?;
-            llkv_expr::expr::AggregateCall::Avg(column)
+            llkv_expr::expr::AggregateCall::Avg { column, distinct }
         }
         _ => return Ok(None),
     };
