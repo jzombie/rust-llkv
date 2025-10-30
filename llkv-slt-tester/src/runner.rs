@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::RuntimeKind;
-use crate::engine::{HarnessFactory, clear_expected_column_types, set_expected_column_types};
+use crate::slt_test_engine::{HarnessFactory, clear_expected_column_types, set_expected_column_types};
 use crate::parser::{
     expand_loops_with_mapping, filter_conditional_blocks, map_temp_error_message,
     normalize_inline_connections,

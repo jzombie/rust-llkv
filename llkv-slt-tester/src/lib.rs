@@ -1,6 +1,6 @@
 //! SLT runner utilities for LLKV.
 
-pub mod engine;
+pub mod slt_test_engine;
 mod parser;
 mod runner;
 
@@ -25,7 +25,7 @@ use llkv_result::Error;
 /// a Tokio runtime so callers do not need to be async-aware.
 #[derive(Clone)]
 pub struct LlkvSltRunner {
-    factory_factory: std::sync::Arc<dyn Fn() -> engine::HarnessFactory + Send + Sync>,
+    factory_factory: std::sync::Arc<dyn Fn() -> slt_test_engine::HarnessFactory + Send + Sync>,
     runtime_kind: RuntimeKind,
 }
 
@@ -40,13 +40,13 @@ pub enum RuntimeKind {
 impl LlkvSltRunner {
     /// Create a runner that executes against an in-memory `MemPager` backend.
     pub fn in_memory() -> Self {
-        Self::with_factory_factory(engine::make_in_memory_factory_factory())
+        Self::with_factory_factory(slt_test_engine::make_in_memory_factory_factory())
     }
 
     /// Create a runner that executes against a user-supplied factory factory.
     pub fn with_factory_factory<F>(factory_factory: F) -> Self
     where
-        F: Fn() -> engine::HarnessFactory + Send + Sync + 'static,
+        F: Fn() -> slt_test_engine::HarnessFactory + Send + Sync + 'static,
     {
         Self {
             factory_factory: std::sync::Arc::new(factory_factory),
