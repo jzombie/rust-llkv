@@ -4072,7 +4072,7 @@ where
         subqueries: &mut Vec<llkv_plan::FilterSubquery>,
         mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
     ) -> SqlResult<(SelectPlan, IdentifierContext)> {
-        let distinct = match &select.distinct {
+        let mut distinct = match &select.distinct {
             None => false,
             Some(Distinct::Distinct) => true,
             Some(Distinct::On(_)) => {
@@ -4081,6 +4081,15 @@ where
                 ));
             }
         };
+        if matches!(
+            select.value_table_mode,
+            Some(
+                sqlparser::ast::ValueTableMode::DistinctAsStruct
+                    | sqlparser::ast::ValueTableMode::DistinctAsValue
+            )
+        ) {
+            distinct = true;
+        }
         if select.top.is_some() {
             return Err(Error::InvalidArgumentError(
                 "SELECT TOP is not supported".into(),
@@ -4106,11 +4115,6 @@ where
                 "PREWHERE is not supported".into(),
             ));
         }
-        if !group_by_is_empty(&select.group_by) || select.value_table_mode.is_some() {
-            return Err(Error::InvalidArgumentError(
-                "GROUP BY and SELECT AS VALUE/STRUCT are not supported".into(),
-            ));
-        }
         if !select.cluster_by.is_empty()
             || !select.distribute_by.is_empty()
             || !select.sort_by.is_empty()
@@ -4119,8 +4123,7 @@ where
                 "CLUSTER/DISTRIBUTE/SORT BY clauses are not supported".into(),
             ));
         }
-        if select.having.is_some()
-            || !select.named_window.is_empty()
+        if !select.named_window.is_empty()
             || select.qualify.is_some()
             || select.connect_by.is_some()
         {
@@ -4145,7 +4148,13 @@ where
         let mut scalar_subqueries: Vec<llkv_plan::ScalarSubquery> = Vec::new();
         // Handle different FROM clause scenarios
         let catalog = self.engine.context().table_catalog();
+        let has_group_by = !group_by_is_empty(&select.group_by);
         let (mut plan, id_context) = if select.from.is_empty() {
+            if has_group_by {
+                return Err(Error::InvalidArgumentError(
+                    "GROUP BY requires a FROM clause".into(),
+                ));
+            }
             // No FROM clause - use empty string for table context (e.g., SELECT 42, SELECT {'a': 1} AS x)
             let mut p = SelectPlan::new("");
             let projections = self.build_projection_list(
@@ -4168,7 +4177,9 @@ where
             if let Some(alias) = table_alias.as_ref() {
                 validate_projection_alias_qualifiers(&select.projection, alias)?;
             }
-            if let Some(aggregates) = self.detect_simple_aggregates(&select.projection)? {
+            if !has_group_by
+                && let Some(aggregates) = self.detect_simple_aggregates(&select.projection)?
+            {
                 p = p.with_aggregates(aggregates);
             } else {
                 let projections = self.build_projection_list(
@@ -4230,6 +4241,21 @@ where
             )?);
         }
 
+        let having_expr = if let Some(having) = &select.having {
+            let materialized_expr = self.materialize_in_subquery(having.clone())?;
+            Some(translate_condition_with_context(
+                self,
+                resolver,
+                id_context.clone(),
+                &materialized_expr,
+                outer_scopes,
+                &mut all_subqueries,
+                correlated_tracker.reborrow(),
+            )?)
+        } else {
+            None
+        };
+
         subqueries.append(&mut all_subqueries);
 
         let filter = match filter_components.len() {
@@ -4248,8 +4274,19 @@ where
             }),
         };
         plan = plan.with_filter(filter);
+        plan = plan.with_having(having_expr);
         plan = plan.with_scalar_subqueries(std::mem::take(&mut scalar_subqueries));
         plan = plan.with_distinct(distinct);
+
+        let group_by_columns = if has_group_by {
+            self.translate_group_by_columns(resolver, id_context.clone(), &select.group_by)?
+        } else {
+            Vec::new()
+        };
+        plan = plan.with_group_by(group_by_columns);
+
+        let value_mode = select.value_table_mode.map(convert_value_table_mode);
+        plan = plan.with_value_table_mode(value_mode);
         Ok((plan, id_context))
     }
 
@@ -4365,6 +4402,50 @@ where
         }
 
         Ok(plans)
+    }
+
+    fn translate_group_by_columns(
+        &self,
+        resolver: &IdentifierResolver<'_>,
+        id_context: IdentifierContext,
+        group_by: &GroupByExpr,
+    ) -> SqlResult<Vec<String>> {
+        use sqlparser::ast::Expr as SqlExpr;
+
+        match group_by {
+            GroupByExpr::All(_) => Err(Error::InvalidArgumentError(
+                "GROUP BY ALL is not supported".into(),
+            )),
+            GroupByExpr::Expressions(exprs, modifiers) => {
+                if !modifiers.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "GROUP BY modifiers are not supported".into(),
+                    ));
+                }
+                let mut columns = Vec::with_capacity(exprs.len());
+                for expr in exprs {
+                    let parts: Vec<String> = match expr {
+                        SqlExpr::Identifier(ident) => vec![ident.value.clone()],
+                        SqlExpr::CompoundIdentifier(idents) => {
+                            idents.iter().map(|id| id.value.clone()).collect()
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgumentError(
+                                "GROUP BY expressions must be simple column references".into(),
+                            ));
+                        }
+                    };
+                    let resolution = resolver.resolve(&parts, id_context.clone())?;
+                    if !resolution.is_simple() {
+                        return Err(Error::InvalidArgumentError(
+                            "GROUP BY nested field references are not supported".into(),
+                        ));
+                    }
+                    columns.push(resolution.column().to_string());
+                }
+                Ok(columns)
+            }
+        }
     }
 
     fn resolve_simple_column_expr(
@@ -5816,11 +5897,25 @@ where
                                 },
                             )));
                         }
-                        _ => {
-                            return Err(Error::InvalidArgumentError(
-                                "IS NULL predicates currently support column references only"
-                                    .into(),
-                            ));
+                        llkv_expr::expr::ScalarExpr::Literal(literal) => {
+                            let result = matches!(literal, llkv_expr::literal::Literal::Null);
+                            work_stack
+                                .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(result)));
+                        }
+                        other => {
+                            if let Some(column) = extract_column_for_null_check(&other) {
+                                work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
+                                    llkv_expr::expr::Filter {
+                                        field_id: column,
+                                        op: llkv_expr::expr::Operator::IsNull,
+                                    },
+                                )));
+                            } else {
+                                return Err(Error::InvalidArgumentError(
+                                    "IS NULL predicates currently support column references only"
+                                        .into(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -5841,11 +5936,25 @@ where
                                 },
                             )));
                         }
-                        _ => {
-                            return Err(Error::InvalidArgumentError(
-                                "IS NOT NULL predicates currently support column references only"
-                                    .into(),
-                            ));
+                        llkv_expr::expr::ScalarExpr::Literal(literal) => {
+                            let result = !matches!(literal, llkv_expr::literal::Literal::Null);
+                            work_stack
+                                .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(result)));
+                        }
+                        other => {
+                            if let Some(column) = extract_column_for_null_check(&other) {
+                                work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
+                                    llkv_expr::expr::Filter {
+                                        field_id: column,
+                                        op: llkv_expr::expr::Operator::IsNotNull,
+                                    },
+                                )));
+                            } else {
+                                return Err(Error::InvalidArgumentError(
+                                    "IS NOT NULL predicates currently support column references only"
+                                        .into(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -6237,6 +6346,7 @@ fn translate_scalar_internal(
     enum BuiltinScalarFunction {
         Abs,
         Coalesce,
+        NullIf,
     }
 
     type ScalarFrame<'a> =
@@ -6520,6 +6630,51 @@ fn translate_scalar_internal(
                                 }
                                 continue;
                             }
+                            "nullif" => {
+                                let args_slice: &[FunctionArg] = match &func.args {
+                                    FunctionArguments::List(list) => {
+                                        if list.duplicate_treatment.is_some()
+                                            || !list.clauses.is_empty()
+                                        {
+                                            return Err(Error::InvalidArgumentError(
+                                                "NULLIF does not support qualifiers".into(),
+                                            ));
+                                        }
+                                        &list.args
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "NULLIF requires exactly two arguments".into(),
+                                        ));
+                                    }
+                                };
+
+                                if args_slice.len() != 2 {
+                                    return Err(Error::InvalidArgumentError(
+                                        "NULLIF requires exactly two arguments".into(),
+                                    ));
+                                }
+
+                                work_stack.push(ScalarFrame::Exit(
+                                    ScalarExitContext::BuiltinFunction {
+                                        func: BuiltinScalarFunction::NullIf,
+                                        arg_count: 2,
+                                    },
+                                ));
+
+                                for arg in args_slice.iter().rev() {
+                                    let arg_expr = match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                                        _ => {
+                                            return Err(Error::InvalidArgumentError(
+                                                "NULLIF arguments must be expressions".into(),
+                                            ));
+                                        }
+                                    };
+                                    work_stack.push(ScalarFrame::Enter(arg_expr));
+                                }
+                                continue;
+                            }
                             _ => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "unsupported function in scalar expression: {:?}",
@@ -6660,6 +6815,24 @@ fn translate_scalar_internal(
                         }
                         BuiltinScalarFunction::Coalesce => {
                             llkv_expr::expr::ScalarExpr::coalesce(args)
+                        }
+                        BuiltinScalarFunction::NullIf => {
+                            debug_assert_eq!(args.len(), 2);
+                            let left = args.remove(0);
+                            let right = args.remove(0);
+                            let condition = llkv_expr::expr::ScalarExpr::compare(
+                                left.clone(),
+                                llkv_expr::expr::CompareOp::Eq,
+                                right,
+                            );
+                            llkv_expr::expr::ScalarExpr::Case {
+                                operand: None,
+                                branches: vec![(
+                                    condition,
+                                    llkv_expr::expr::ScalarExpr::literal(Literal::Null),
+                                )],
+                                else_expr: Some(Box::new(left)),
+                            }
                         }
                     };
 
@@ -7373,6 +7546,48 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
         GroupByExpr::Expressions(exprs, modifiers)
             if exprs.is_empty() && modifiers.is_empty()
     )
+}
+
+fn convert_value_table_mode(mode: sqlparser::ast::ValueTableMode) -> llkv_plan::ValueTableMode {
+    use llkv_plan::ValueTableMode as PlanMode;
+    match mode {
+        sqlparser::ast::ValueTableMode::AsStruct => PlanMode::AsStruct,
+        sqlparser::ast::ValueTableMode::AsValue => PlanMode::AsValue,
+        sqlparser::ast::ValueTableMode::DistinctAsStruct => PlanMode::DistinctAsStruct,
+        sqlparser::ast::ValueTableMode::DistinctAsValue => PlanMode::DistinctAsValue,
+    }
+}
+
+fn extract_column_for_null_check(expr: &llkv_expr::expr::ScalarExpr<String>) -> Option<String> {
+    use llkv_expr::expr::BinaryOp;
+    use llkv_expr::literal::Literal;
+
+    match expr {
+        llkv_expr::expr::ScalarExpr::Column(column) => Some(column.clone()),
+        llkv_expr::expr::ScalarExpr::Literal(_) => None,
+        llkv_expr::expr::ScalarExpr::Binary { left, op, right } => {
+            let left_ref = left.as_ref();
+            let right_ref = right.as_ref();
+            let left_col = extract_column_for_null_check(left_ref);
+            let right_col = extract_column_for_null_check(right_ref);
+            let left_zero = matches!(left_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Integer(v)) if *v == 0)
+                || matches!(left_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Float(v)) if *v == 0.0);
+            let right_zero = matches!(right_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Integer(v)) if *v == 0)
+                || matches!(right_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Float(v)) if *v == 0.0);
+
+            match (op, left_col, right_col) {
+                (BinaryOp::Subtract, _, Some(col)) if left_zero => Some(col),
+                (BinaryOp::Add, _, Some(col)) if left_zero => Some(col),
+                (BinaryOp::Add, Some(col), _) if right_zero => Some(col),
+                (BinaryOp::Subtract, Some(col), _) if right_zero => Some(col),
+                (_, Some(col), None) | (_, None, Some(col)) => Some(col),
+                (_, Some(col1), Some(col2)) if col1 == col2 => Some(col1),
+                _ => None,
+            }
+        }
+        llkv_expr::expr::ScalarExpr::Cast { expr, .. } => extract_column_for_null_check(expr),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

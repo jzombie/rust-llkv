@@ -88,6 +88,29 @@ pub use types::{
 };
 pub use utils::current_time_micros;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum GroupKeyValue {
+    Null,
+    Int(i64),
+    Bool(bool),
+    String(String),
+}
+
+struct GroupState {
+    batch: RecordBatch,
+    row_idx: usize,
+}
+
+struct OutputColumn {
+    field: Field,
+    source: OutputSource,
+}
+
+enum OutputSource {
+    TableColumn { index: usize },
+    Computed { projection_index: usize },
+}
+
 // ============================================================================
 // Query Logging Helpers
 // ============================================================================
@@ -189,6 +212,16 @@ where
         // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
         if plan.tables.is_empty() {
             return self.execute_select_without_table(plan);
+        }
+
+        if !plan.group_by.is_empty() {
+            if plan.tables.len() > 1 {
+                return self.execute_cross_product(plan);
+            }
+            let table_ref = &plan.tables[0];
+            let table = self.provider.get_table(&table_ref.qualified_name())?;
+            let display_name = table_ref.qualified_name();
+            return self.execute_group_by_single_table(table, display_name, plan, row_filter);
         }
 
         // Handle multi-table queries (cross products/joins)
@@ -791,6 +824,16 @@ where
                 &column_lookup_map,
                 &plan,
                 &display_name,
+            );
+        }
+
+        if !plan.group_by.is_empty() {
+            return self.execute_group_by_from_batches(
+                display_name,
+                plan,
+                combined_schema,
+                combined_batches,
+                column_lookup_map,
             );
         }
 
@@ -1515,6 +1558,11 @@ where
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        if plan.having.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "HAVING requires GROUP BY".into(),
+            ));
+        }
         if plan
             .filter
             .as_ref()
@@ -1621,6 +1669,11 @@ where
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        if plan.having.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "HAVING requires GROUP BY".into(),
+            ));
+        }
         let table_ref = table.as_ref();
 
         let (output_scan_projections, effective_projections): (
@@ -1846,6 +1899,341 @@ where
             schema,
             result_batch,
         ))
+    }
+
+    fn execute_group_by_single_table(
+        &self,
+        table: Arc<ExecutorTable<P>>,
+        display_name: String,
+        plan: SelectPlan,
+        row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        if plan
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.subqueries.is_empty())
+            || !plan.scalar_subqueries.is_empty()
+        {
+            return Err(Error::InvalidArgumentError(
+                "GROUP BY with subqueries is not supported yet".into(),
+            ));
+        }
+
+        let mut base_plan = plan.clone();
+        base_plan.projections.clear();
+        base_plan.order_by.clear();
+        base_plan.distinct = false;
+        base_plan.group_by.clear();
+        base_plan.value_table_mode = None;
+        base_plan.having = None;
+
+        let execution = self.execute_projection(
+            Arc::clone(&table),
+            display_name.clone(),
+            base_plan,
+            row_filter,
+        )?;
+        let base_schema = execution.schema();
+        let batches = execution.collect()?;
+
+        let column_lookup_map = build_column_lookup_map(base_schema.as_ref());
+
+        self.execute_group_by_from_batches(
+            display_name,
+            plan,
+            base_schema,
+            batches,
+            column_lookup_map,
+        )
+    }
+
+    fn execute_group_by_from_batches(
+        &self,
+        display_name: String,
+        plan: SelectPlan,
+        base_schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        column_lookup_map: FxHashMap<String, usize>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        if plan
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.subqueries.is_empty())
+            || !plan.scalar_subqueries.is_empty()
+        {
+            return Err(Error::InvalidArgumentError(
+                "GROUP BY with subqueries is not supported yet".into(),
+            ));
+        }
+
+        if !plan.aggregates.is_empty() || self.has_computed_aggregates(&plan) {
+            return Err(Error::InvalidArgumentError(
+                "GROUP BY with aggregates is not supported yet".into(),
+            ));
+        }
+
+        let mut key_indices = Vec::with_capacity(plan.group_by.len());
+        for column in &plan.group_by {
+            let key = column.to_ascii_lowercase();
+            let index = column_lookup_map.get(&key).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "column '{}' not found in GROUP BY input",
+                    column
+                ))
+            })?;
+            key_indices.push(*index);
+        }
+
+        let sample_batch = batches
+            .first()
+            .cloned()
+            .unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(&base_schema)));
+
+        let output_columns = self.build_group_by_output_columns(
+            &plan,
+            base_schema.as_ref(),
+            &column_lookup_map,
+            &sample_batch,
+        )?;
+
+        let constant_having = plan
+            .having
+            .as_ref()
+            .and_then(|expr| evaluate_constant_predicate(expr));
+
+        if let Some(result) = constant_having {
+            if !result.unwrap_or(false) {
+                let fields: Vec<Field> = output_columns
+                    .iter()
+                    .map(|output| output.field.clone())
+                    .collect();
+                let schema = Arc::new(Schema::new(fields));
+                let batch = RecordBatch::new_empty(Arc::clone(&schema));
+                return Ok(SelectExecution::new_single_batch(
+                    display_name,
+                    schema,
+                    batch,
+                ));
+            }
+        }
+
+        let translated_having = if plan.having.is_some() && constant_having.is_none() {
+            let having = plan.having.clone().expect("checked above");
+            let temp_context = CrossProductExpressionContext::new(
+                base_schema.as_ref(),
+                column_lookup_map.clone(),
+            )?;
+            Some(translate_predicate(
+                having,
+                temp_context.schema(),
+                |name| {
+                    Error::InvalidArgumentError(format!(
+                        "column '{}' not found in GROUP BY result",
+                        name
+                    ))
+                },
+            )?)
+        } else {
+            None
+        };
+
+        let mut group_index: FxHashMap<Vec<GroupKeyValue>, usize> = FxHashMap::default();
+        let mut groups: Vec<GroupState> = Vec::new();
+
+        for batch in &batches {
+            for row_idx in 0..batch.num_rows() {
+                let key = build_group_key(batch, row_idx, &key_indices)?;
+                if group_index.contains_key(&key) {
+                    continue;
+                }
+                group_index.insert(key, groups.len());
+                groups.push(GroupState {
+                    batch: batch.clone(),
+                    row_idx,
+                });
+            }
+        }
+
+        let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(groups.len());
+
+        for group in &groups {
+            if let Some(predicate) = translated_having.as_ref() {
+                let mut context = CrossProductExpressionContext::new(
+                    group.batch.schema().as_ref(),
+                    column_lookup_map.clone(),
+                )?;
+                context.reset();
+                let mut eval = |_ctx: &mut CrossProductExpressionContext,
+                                _subquery_expr: &llkv_expr::SubqueryExpr,
+                                _row_idx: usize,
+                                _current_batch: &RecordBatch|
+                 -> ExecutorResult<Option<bool>> {
+                    Err(Error::InvalidArgumentError(
+                        "HAVING subqueries are not supported yet".into(),
+                    ))
+                };
+                let truths =
+                    context.evaluate_predicate_truths(predicate, &group.batch, &mut eval)?;
+                let passes = truths
+                    .get(group.row_idx)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(false);
+                if !passes {
+                    continue;
+                }
+            }
+
+            let mut row: Vec<PlanValue> = Vec::with_capacity(output_columns.len());
+            for output in &output_columns {
+                match output.source {
+                    OutputSource::TableColumn { index } => {
+                        let value = llkv_plan::plan_value_from_array(
+                            group.batch.column(index),
+                            group.row_idx,
+                        )?;
+                        row.push(value);
+                    }
+                    OutputSource::Computed { projection_index } => {
+                        let expr = match &plan.projections[projection_index] {
+                            SelectProjection::Computed { expr, .. } => expr,
+                            _ => unreachable!("projection index mismatch for computed column"),
+                        };
+                        let mut context = CrossProductExpressionContext::new(
+                            group.batch.schema().as_ref(),
+                            column_lookup_map.clone(),
+                        )?;
+                        context.reset();
+                        let evaluated = self.evaluate_projection_expression(
+                            &mut context,
+                            expr,
+                            &group.batch,
+                            &FxHashMap::default(),
+                        )?;
+                        let value = llkv_plan::plan_value_from_array(&evaluated, group.row_idx)?;
+                        row.push(value);
+                    }
+                }
+            }
+            rows.push(row);
+        }
+
+        let fields: Vec<Field> = output_columns
+            .into_iter()
+            .map(|output| output.field)
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let mut batch = rows_to_record_batch(Arc::clone(&schema), &rows)?;
+
+        if plan.distinct && batch.num_rows() > 0 {
+            let mut state = DistinctState::default();
+            batch = match distinct_filter_batch(batch, &mut state)? {
+                Some(filtered) => filtered,
+                None => RecordBatch::new_empty(Arc::clone(&schema)),
+            };
+        }
+
+        if !plan.order_by.is_empty() && batch.num_rows() > 0 {
+            batch = sort_record_batch_with_order(&schema, &batch, &plan.order_by)?;
+        }
+
+        Ok(SelectExecution::new_single_batch(
+            display_name,
+            schema,
+            batch,
+        ))
+    }
+
+    fn build_group_by_output_columns(
+        &self,
+        plan: &SelectPlan,
+        base_schema: &Schema,
+        column_lookup_map: &FxHashMap<String, usize>,
+        sample_batch: &RecordBatch,
+    ) -> ExecutorResult<Vec<OutputColumn>> {
+        let projections = if plan.projections.is_empty() {
+            vec![SelectProjection::AllColumns]
+        } else {
+            plan.projections.clone()
+        };
+
+        let mut columns: Vec<OutputColumn> = Vec::new();
+
+        for (proj_idx, projection) in projections.iter().enumerate() {
+            match projection {
+                SelectProjection::AllColumns => {
+                    for (index, field) in base_schema.fields().iter().enumerate() {
+                        columns.push(OutputColumn {
+                            field: (**field).clone(),
+                            source: OutputSource::TableColumn { index },
+                        });
+                    }
+                }
+                SelectProjection::AllColumnsExcept { exclude } => {
+                    let exclude_lower: FxHashSet<String> = exclude
+                        .iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect();
+                    for (index, field) in base_schema.fields().iter().enumerate() {
+                        if !exclude_lower.contains(&field.name().to_ascii_lowercase()) {
+                            columns.push(OutputColumn {
+                                field: (**field).clone(),
+                                source: OutputSource::TableColumn { index },
+                            });
+                        }
+                    }
+                }
+                SelectProjection::Column { name, alias } => {
+                    let lookup_key = name.to_ascii_lowercase();
+                    let index = column_lookup_map.get(&lookup_key).ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "column '{}' not found in GROUP BY result",
+                            name
+                        ))
+                    })?;
+                    let field = base_schema.field(*index);
+                    let field = Field::new(
+                        alias.as_ref().unwrap_or(name).clone(),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    );
+                    columns.push(OutputColumn {
+                        field,
+                        source: OutputSource::TableColumn { index: *index },
+                    });
+                }
+                SelectProjection::Computed { expr, alias } => {
+                    let mut context =
+                        CrossProductExpressionContext::new(base_schema, column_lookup_map.clone())?;
+                    context.reset();
+                    let evaluated = self.evaluate_projection_expression(
+                        &mut context,
+                        expr,
+                        sample_batch,
+                        &FxHashMap::default(),
+                    )?;
+                    let field = Field::new(alias.clone(), evaluated.data_type().clone(), true);
+                    columns.push(OutputColumn {
+                        field,
+                        source: OutputSource::Computed {
+                            projection_index: proj_idx,
+                        },
+                    });
+                }
+            }
+        }
+
+        if columns.is_empty() {
+            for (index, field) in base_schema.fields().iter().enumerate() {
+                columns.push(OutputColumn {
+                    field: (**field).clone(),
+                    source: OutputSource::TableColumn { index },
+                });
+            }
+        }
+
+        Ok(columns)
     }
 
     fn project_record_batch(
@@ -3530,11 +3918,14 @@ fn bind_select_plan(
             tables: Vec::new(),
             projections: Vec::new(),
             filter: None,
+            having: None,
             aggregates: Vec::new(),
             order_by: plan.order_by.clone(),
             distinct: false,
             scalar_subqueries: Vec::new(),
             compound: Some(bound_compound),
+            group_by: Vec::new(),
+            value_table_mode: None,
         });
     }
 
@@ -3542,11 +3933,14 @@ fn bind_select_plan(
         tables: plan.tables.clone(),
         projections,
         filter,
+        having: plan.having.clone(),
         aggregates,
         order_by: Vec::new(),
         distinct: plan.distinct,
         scalar_subqueries,
         compound: None,
+        group_by: plan.group_by.clone(),
+        value_table_mode: plan.value_table_mode.clone(),
     })
 }
 
@@ -3674,6 +4068,207 @@ fn rows_to_record_batch(
     RecordBatch::try_new(schema, arrays).map_err(|err| {
         Error::InvalidArgumentError(format!("failed to materialize compound SELECT: {err}"))
     })
+}
+
+fn build_column_lookup_map(schema: &Schema) -> FxHashMap<String, usize> {
+    let mut lookup = FxHashMap::default();
+    for (idx, field) in schema.fields().iter().enumerate() {
+        lookup.insert(field.name().to_ascii_lowercase(), idx);
+    }
+    lookup
+}
+
+fn build_group_key(
+    batch: &RecordBatch,
+    row_idx: usize,
+    key_indices: &[usize],
+) -> ExecutorResult<Vec<GroupKeyValue>> {
+    let mut values = Vec::with_capacity(key_indices.len());
+    for &index in key_indices {
+        values.push(group_key_value(batch.column(index), row_idx)?);
+    }
+    Ok(values)
+}
+
+fn group_key_value(array: &ArrayRef, row_idx: usize) -> ExecutorResult<GroupKeyValue> {
+    if !array.is_valid(row_idx) {
+        return Ok(GroupKeyValue::Null);
+    }
+
+    match array.data_type() {
+        DataType::Int8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to Int8Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
+        }
+        DataType::Int16 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to Int16Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
+        }
+        DataType::Int32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to Int32Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
+        }
+        DataType::Int64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to Int64Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx)))
+        }
+        DataType::UInt8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to UInt8Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
+        }
+        DataType::UInt16 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to UInt16Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
+        }
+        DataType::UInt32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to UInt32Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
+        }
+        DataType::UInt64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to UInt64Array".into()))?;
+            let value = values.value(row_idx);
+            if value > i64::MAX as u64 {
+                return Err(Error::InvalidArgumentError(
+                    "GROUP BY value exceeds supported integer range".into(),
+                ));
+            }
+            Ok(GroupKeyValue::Int(value as i64))
+        }
+        DataType::Boolean => {
+            let values = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| Error::Internal("failed to downcast to BooleanArray".into()))?;
+            Ok(GroupKeyValue::Bool(values.value(row_idx)))
+        }
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| Error::Internal("failed to downcast to StringArray".into()))?;
+            Ok(GroupKeyValue::String(values.value(row_idx).to_string()))
+        }
+        other => Err(Error::InvalidArgumentError(format!(
+            "GROUP BY does not support column type {:?}",
+            other
+        ))),
+    }
+}
+
+fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Option<bool>> {
+    match expr {
+        LlkvExpr::Literal(value) => Some(Some(*value)),
+        LlkvExpr::Not(inner) => {
+            let inner_val = evaluate_constant_predicate(inner)?;
+            Some(truth_not(inner_val))
+        }
+        LlkvExpr::And(children) => {
+            let mut acc = Some(true);
+            for child in children {
+                let child_val = evaluate_constant_predicate(child)?;
+                acc = truth_and(acc, child_val);
+            }
+            Some(acc)
+        }
+        LlkvExpr::Or(children) => {
+            let mut acc = Some(false);
+            for child in children {
+                let child_val = evaluate_constant_predicate(child)?;
+                acc = truth_or(acc, child_val);
+            }
+            Some(acc)
+        }
+        LlkvExpr::Compare { left, op, right } => {
+            let left_literal = evaluate_constant_scalar(left)?;
+            let right_literal = evaluate_constant_scalar(right)?;
+            Some(compare_literals(*op, &left_literal, &right_literal))
+        }
+        _ => None,
+    }
+}
+
+fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
+    match expr {
+        ScalarExpr::Literal(lit) => Some(lit.clone()),
+        _ => None,
+    }
+}
+
+fn compare_literals(op: CompareOp, left: &Literal, right: &Literal) -> Option<bool> {
+    use std::cmp::Ordering;
+
+    match (left, right) {
+        (Literal::Null, _) | (_, Literal::Null) => None,
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            let ord = lhs.cmp(rhs);
+            Some(match op {
+                CompareOp::Eq => ord == Ordering::Equal,
+                CompareOp::NotEq => ord != Ordering::Equal,
+                CompareOp::Lt => ord == Ordering::Less,
+                CompareOp::LtEq => ord != Ordering::Greater,
+                CompareOp::Gt => ord == Ordering::Greater,
+                CompareOp::GtEq => ord != Ordering::Less,
+            })
+        }
+        (Literal::Float(lhs), Literal::Float(rhs)) => Some(match op {
+            CompareOp::Eq => lhs == rhs,
+            CompareOp::NotEq => lhs != rhs,
+            CompareOp::Lt => lhs < rhs,
+            CompareOp::LtEq => lhs <= rhs,
+            CompareOp::Gt => lhs > rhs,
+            CompareOp::GtEq => lhs >= rhs,
+        }),
+        (Literal::Integer(lhs), Literal::Float(_rhs)) => {
+            compare_literals(op, &Literal::Float(*lhs as f64), right)
+        }
+        (Literal::Float(_lhs), Literal::Integer(rhs)) => {
+            compare_literals(op, left, &Literal::Float(*rhs as f64))
+        }
+        (Literal::Boolean(lhs), Literal::Boolean(rhs)) => Some(match op {
+            CompareOp::Eq => lhs == rhs,
+            CompareOp::NotEq => lhs != rhs,
+            CompareOp::Lt => (*lhs as u8) < (*rhs as u8),
+            CompareOp::LtEq => (*lhs as u8) <= (*rhs as u8),
+            CompareOp::Gt => (*lhs as u8) > (*rhs as u8),
+            CompareOp::GtEq => (*lhs as u8) >= (*rhs as u8),
+        }),
+        (Literal::String(lhs), Literal::String(rhs)) => {
+            let ord = lhs.cmp(rhs);
+            Some(match op {
+                CompareOp::Eq => ord == Ordering::Equal,
+                CompareOp::NotEq => ord != Ordering::Equal,
+                CompareOp::Lt => ord == Ordering::Less,
+                CompareOp::LtEq => ord != Ordering::Greater,
+                CompareOp::Gt => ord == Ordering::Greater,
+                CompareOp::GtEq => ord != Ordering::Less,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn bind_select_filter(

@@ -628,6 +628,8 @@ pub struct SelectPlan {
     pub projections: Vec<SelectProjection>,
     /// Optional WHERE predicate plus dependent correlated subqueries.
     pub filter: Option<SelectFilter>,
+    /// Optional HAVING predicate applied after grouping.
+    pub having: Option<llkv_expr::expr::Expr<'static, String>>,
     /// Scalar subqueries referenced by projections, keyed by `SubqueryId`.
     pub scalar_subqueries: Vec<ScalarSubquery>,
     pub aggregates: Vec<AggregateExpr>,
@@ -635,6 +637,10 @@ pub struct SelectPlan {
     pub distinct: bool,
     /// Optional compound (set-operation) plan.
     pub compound: Option<CompoundSelectPlan>,
+    /// Columns used in GROUP BY clauses (canonical names).
+    pub group_by: Vec<String>,
+    /// Optional value table output mode (BigQuery style).
+    pub value_table_mode: Option<ValueTableMode>,
 }
 
 impl SelectPlan {
@@ -658,11 +664,14 @@ impl SelectPlan {
             tables,
             projections: Vec::new(),
             filter: None,
+            having: None,
             scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
             compound: None,
+            group_by: Vec::new(),
+            value_table_mode: None,
         }
     }
 
@@ -672,11 +681,14 @@ impl SelectPlan {
             tables,
             projections: Vec::new(),
             filter: None,
+            having: None,
             scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
             compound: None,
+            group_by: Vec::new(),
+            value_table_mode: None,
         }
     }
 
@@ -687,6 +699,11 @@ impl SelectPlan {
 
     pub fn with_filter(mut self, filter: Option<SelectFilter>) -> Self {
         self.filter = filter;
+        self
+    }
+
+    pub fn with_having(mut self, having: Option<llkv_expr::expr::Expr<'static, String>>) -> Self {
+        self.having = having;
         self
     }
 
@@ -714,6 +731,16 @@ impl SelectPlan {
     /// Attach a compound (set operation) plan.
     pub fn with_compound(mut self, compound: CompoundSelectPlan) -> Self {
         self.compound = Some(compound);
+        self
+    }
+
+    pub fn with_group_by(mut self, group_by: Vec<String>) -> Self {
+        self.group_by = group_by;
+        self
+    }
+
+    pub fn with_value_table_mode(mut self, mode: Option<ValueTableMode>) -> Self {
+        self.value_table_mode = mode;
         self
     }
 }
@@ -785,6 +812,15 @@ pub enum SelectProjection {
         expr: llkv_expr::expr::ScalarExpr<String>,
         alias: String,
     },
+}
+
+/// Value table output modes (BigQuery-style).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueTableMode {
+    AsStruct,
+    AsValue,
+    DistinctAsStruct,
+    DistinctAsValue,
 }
 
 // ============================================================================
