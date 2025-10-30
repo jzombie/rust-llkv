@@ -8,7 +8,13 @@ use crate::parser::{
 };
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
+use llkv_sql::{
+    StatementExpectation as SqlStatementExpectation,
+    clear_pending_statement_expectations,
+    register_statement_expectation,
+};
 use sqllogictest::{AsyncDB, DefaultColumnType, QueryExpect, Runner};
+use sqllogictest::{Record, StatementExpect};
 
 /// Path where the last failed SLT test content is persisted for debugging.
 ///
@@ -192,6 +198,17 @@ where
     let run_result = async {
         let mut current_hash_threshold: usize = 256;
         for record in records {
+            if let Record::Statement { expected, .. } = &record {
+                match expected {
+                    StatementExpect::Error(_) => {
+                        register_statement_expectation(SqlStatementExpectation::Error);
+                    }
+                    StatementExpect::Count(count) => {
+                        register_statement_expectation(SqlStatementExpectation::Count(*count));
+                    }
+                    StatementExpect::Ok => {}
+                }
+            }
             let hash_threshold_update = match &record {
                 sqllogictest::Record::HashThreshold { threshold, .. } => Some(*threshold as usize),
                 _ => None,
@@ -236,6 +253,7 @@ where
 
             // Run the record and handle per-query flattening fallback
             let result = runner.run_async(record.clone()).await;
+            clear_pending_statement_expectations();
             if let Err(e) = result {
                 let error_msg = format!("{}", e);
 

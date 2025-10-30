@@ -144,7 +144,19 @@ impl AsyncDB for EngineHarness {
                 if results.is_empty() {
                     return Ok(DBOutput::StatementComplete(0));
                 }
-                let result = results.remove(0);
+                let mut result = results.remove(0);
+                let in_query_context = EXPECTED_COLUMN_TYPES.with(|cell| cell.borrow().is_some());
+                if in_query_context {
+                    if let RuntimeStatementResult::Insert { rows_inserted, .. } = &result {
+                        if *rows_inserted == 0 {
+                            if let Ok(flushed) = self.engine.flush_pending_inserts() {
+                                if let Some(first) = flushed.into_iter().next() {
+                                    result = first;
+                                }
+                            }
+                        }
+                    }
+                }
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
@@ -290,18 +302,42 @@ impl AsyncDB for EngineHarness {
 
                         Ok(DBOutput::Rows { types, rows })
                     }
-                    RuntimeStatementResult::Insert { rows_inserted, .. } => Ok(DBOutput::Rows {
-                        types: vec![DefaultColumnType::Integer],
-                        rows: vec![vec![rows_inserted.to_string()]],
-                    }),
-                    RuntimeStatementResult::Update { rows_updated, .. } => Ok(DBOutput::Rows {
-                        types: vec![DefaultColumnType::Integer],
-                        rows: vec![vec![rows_updated.to_string()]],
-                    }),
-                    RuntimeStatementResult::Delete { rows_deleted, .. } => Ok(DBOutput::Rows {
-                        types: vec![DefaultColumnType::Integer],
-                        rows: vec![vec![rows_deleted.to_string()]],
-                    }),
+                    RuntimeStatementResult::Insert { rows_inserted, .. } => {
+                        if in_query_context {
+                            let types = take_expected_column_types()
+                                .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
+                            Ok(DBOutput::Rows {
+                                types,
+                                rows: vec![vec![rows_inserted.to_string()]],
+                            })
+                        } else {
+                            Ok(DBOutput::StatementComplete(rows_inserted as u64))
+                        }
+                    }
+                    RuntimeStatementResult::Update { rows_updated, .. } => {
+                        if in_query_context {
+                            let types = take_expected_column_types()
+                                .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
+                            Ok(DBOutput::Rows {
+                                types,
+                                rows: vec![vec![rows_updated.to_string()]],
+                            })
+                        } else {
+                            Ok(DBOutput::StatementComplete(rows_updated as u64))
+                        }
+                    }
+                    RuntimeStatementResult::Delete { rows_deleted, .. } => {
+                        if in_query_context {
+                            let types = take_expected_column_types()
+                                .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
+                            Ok(DBOutput::Rows {
+                                types,
+                                rows: vec![vec![rows_deleted.to_string()]],
+                            })
+                        } else {
+                            Ok(DBOutput::StatementComplete(rows_deleted as u64))
+                        }
+                    }
                     RuntimeStatementResult::CreateTable { .. }
                     | RuntimeStatementResult::CreateIndex { .. }
                     | RuntimeStatementResult::Transaction { .. }
