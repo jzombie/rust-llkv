@@ -46,6 +46,10 @@ pub(crate) enum EvalOp {
         list: Vec<ScalarExpr<FieldId>>,
         negated: bool,
     },
+    PushIsNull {
+        expr: ScalarExpr<FieldId>,
+        negated: bool,
+    },
     PushLiteral(bool),
     FusedAnd {
         field_id: FieldId,
@@ -234,6 +238,11 @@ pub(crate) enum DomainOp {
         fields: Vec<FieldId>,
         negated: bool,
     },
+    PushIsNullDomain {
+        expr: ScalarExpr<FieldId>,
+        fields: Vec<FieldId>,
+        negated: bool,
+    },
     PushLiteralFalse,
     PushAllRows,
     Union {
@@ -350,6 +359,12 @@ fn compile_eval<'expr>(
                         negated: *negated,
                     });
                 }
+                Expr::IsNull { expr, negated } => {
+                    ops.push(EvalOp::PushIsNull {
+                        expr: expr.clone(),
+                        negated: *negated,
+                    });
+                }
                 Expr::Literal(value) => ops.push(EvalOp::PushLiteral(*value)),
                 Expr::And(children) => ops.push(EvalOp::And {
                     child_count: children.len(),
@@ -450,6 +465,13 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                         expr: expr.clone(),
                         list: list.clone(),
                         fields: collect_fields(exprs),
+                        negated: *negated,
+                    });
+                }
+                Expr::IsNull { expr, negated } => {
+                    ops.push(DomainOp::PushIsNullDomain {
+                        expr: expr.clone(),
+                        fields: collect_fields([expr]),
                         negated: *negated,
                     });
                 }

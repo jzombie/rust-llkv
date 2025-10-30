@@ -5908,6 +5908,7 @@ where
                     )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
+                            // Optimize simple column checks to use Filter
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
                                 llkv_expr::expr::Filter {
                                     field_id: column,
@@ -5921,19 +5922,11 @@ where
                                 .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(result)));
                         }
                         other => {
-                            if let Some(column) = extract_column_for_null_check(&other) {
-                                work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
-                                    llkv_expr::expr::Filter {
-                                        field_id: column,
-                                        op: llkv_expr::expr::Operator::IsNull,
-                                    },
-                                )));
-                            } else {
-                                return Err(Error::InvalidArgumentError(
-                                    "IS NULL predicates currently support column references only"
-                                        .into(),
-                                ));
-                            }
+                            // For complex expressions, use the IsNull variant
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::IsNull {
+                                expr: other,
+                                negated: false,
+                            }));
                         }
                     }
                 }
@@ -5947,6 +5940,7 @@ where
                     )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
+                            // Optimize simple column checks to use Filter
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
                                 llkv_expr::expr::Filter {
                                     field_id: column,
@@ -5960,19 +5954,11 @@ where
                                 .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(result)));
                         }
                         other => {
-                            if let Some(column) = extract_column_for_null_check(&other) {
-                                work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Pred(
-                                    llkv_expr::expr::Filter {
-                                        field_id: column,
-                                        op: llkv_expr::expr::Operator::IsNotNull,
-                                    },
-                                )));
-                            } else {
-                                return Err(Error::InvalidArgumentError(
-                                    "IS NOT NULL predicates currently support column references only"
-                                        .into(),
-                                ));
-                            }
+                            // For complex expressions, use the IsNull variant with negation
+                            work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::IsNull {
+                                expr: other,
+                                negated: true,
+                            }));
                         }
                     }
                 }
@@ -7621,47 +7607,6 @@ fn convert_value_table_mode(mode: sqlparser::ast::ValueTableMode) -> llkv_plan::
         sqlparser::ast::ValueTableMode::DistinctAsValue => PlanMode::DistinctAsValue,
     }
 }
-
-fn extract_column_for_null_check(expr: &llkv_expr::expr::ScalarExpr<String>) -> Option<String> {
-    use llkv_expr::expr::BinaryOp;
-    use llkv_expr::literal::Literal;
-
-    match expr {
-        llkv_expr::expr::ScalarExpr::Column(column) => Some(column.clone()),
-        llkv_expr::expr::ScalarExpr::Literal(_) => None,
-        llkv_expr::expr::ScalarExpr::Binary { left, op, right } => {
-            let left_ref = left.as_ref();
-            let right_ref = right.as_ref();
-            let left_col = extract_column_for_null_check(left_ref);
-            let right_col = extract_column_for_null_check(right_ref);
-            let left_zero = matches!(left_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Integer(v)) if *v == 0)
-                || matches!(left_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Float(v)) if *v == 0.0);
-            let right_zero = matches!(right_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Integer(v)) if *v == 0)
-                || matches!(right_ref, llkv_expr::expr::ScalarExpr::Literal(Literal::Float(v)) if *v == 0.0);
-
-            match (op, left_col, right_col) {
-                (BinaryOp::Subtract, _, Some(col)) if left_zero => Some(col),
-                (BinaryOp::Add, _, Some(col)) if left_zero => Some(col),
-                (BinaryOp::Add, Some(col), _) if right_zero => Some(col),
-                (BinaryOp::Subtract, Some(col), _) if right_zero => Some(col),
-                (_, Some(col), None) | (_, None, Some(col)) => Some(col),
-                (_, Some(col1), Some(col2)) if column_names_match(&col1, &col2) => Some(col1),
-                _ => None,
-            }
-        }
-        llkv_expr::expr::ScalarExpr::Cast { expr, .. } => extract_column_for_null_check(expr),
-        _ => None,
-    }
-}
-
-fn column_names_match(left: &str, right: &str) -> bool {
-    fn normalize(name: &str) -> String {
-        name.split('.').last().unwrap_or(name).to_ascii_lowercase()
-    }
-
-    normalize(left) == normalize(right)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

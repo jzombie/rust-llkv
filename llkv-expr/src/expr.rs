@@ -28,6 +28,13 @@ pub enum Expr<'a, F> {
         list: Vec<ScalarExpr<F>>,
         negated: bool,
     },
+    /// Check if a scalar expression IS NULL or IS NOT NULL.
+    /// For simple column references, prefer `Pred(Filter { op: IsNull/IsNotNull })` for optimization.
+    /// This variant handles complex expressions like `(col1 + col2) IS NULL`.
+    IsNull {
+        expr: ScalarExpr<F>,
+        negated: bool,
+    },
     /// A literal boolean value (true/false).
     /// Used for conditions that are always true or always false (e.g., empty IN lists).
     Literal(bool),

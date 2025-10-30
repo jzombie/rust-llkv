@@ -3528,6 +3528,9 @@ impl CrossProductExpressionContext {
                 list,
                 negated,
             } => self.evaluate_in_list_truths(target, list, *negated, batch),
+            LlkvExpr::IsNull { expr, negated } => {
+                self.evaluate_is_null_truths(expr, *negated, batch)
+            }
             LlkvExpr::Exists(subquery_expr) => {
                 let mut values = Vec::with_capacity(batch.num_rows());
                 for row_idx in 0..batch.num_rows() {
@@ -3682,6 +3685,67 @@ impl CrossProductExpressionContext {
             _ => Err(Error::InvalidArgumentError(
                 "unsupported comparison between mismatched types in cross product filter".into(),
             )),
+        }
+    }
+
+    fn evaluate_is_null_truths(
+        &mut self,
+        expr: &ScalarExpr<FieldId>,
+        negated: bool,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<Vec<Option<bool>>> {
+        let values = self.materialize_value_array(expr, batch)?;
+        let len = values.len();
+        
+        match &values {
+            ValueArray::Null(len) => {
+                // All values are NULL
+                let result = if negated {
+                    Some(false) // IS NOT NULL on NULL column
+                } else {
+                    Some(true) // IS NULL on NULL column
+                };
+                Ok(vec![result; *len])
+            }
+            ValueArray::Numeric(arr) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    let is_null = arr.value(idx).is_none();
+                    let result = if negated {
+                        !is_null // IS NOT NULL
+                    } else {
+                        is_null // IS NULL
+                    };
+                    out.push(Some(result));
+                }
+                Ok(out)
+            }
+            ValueArray::Boolean(arr) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    let is_null = arr.is_null(idx);
+                    let result = if negated {
+                        !is_null
+                    } else {
+                        is_null
+                    };
+                    out.push(Some(result));
+                }
+                Ok(out)
+            }
+            ValueArray::Utf8(arr) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    let is_null = arr.is_null(idx);
+                    let result = if negated {
+                        !is_null
+                    } else {
+                        is_null
+                    };
+                    out.push(Some(result));
+                }
+                Ok(out)
+            }
         }
     }
 
@@ -3979,6 +4043,10 @@ fn strip_exists(expr: &LlkvExpr<'static, FieldId>) -> LlkvExpr<'static, FieldId>
         } => LlkvExpr::InList {
             expr: expr.clone(),
             list: list.clone(),
+            negated: *negated,
+        },
+        LlkvExpr::IsNull { expr, negated } => LlkvExpr::IsNull {
+            expr: expr.clone(),
             negated: *negated,
         },
         LlkvExpr::Literal(value) => LlkvExpr::Literal(*value),
@@ -4595,6 +4663,10 @@ fn bind_predicate_expr(
                 negated: *negated,
             })
         }
+        LlkvExpr::IsNull { expr, negated } => Ok(LlkvExpr::IsNull {
+            expr: bind_scalar_expr(expr, bindings)?,
+            negated: *negated,
+        }),
         LlkvExpr::Literal(value) => Ok(LlkvExpr::Literal(*value)),
         LlkvExpr::Exists(subquery) => Ok(LlkvExpr::Exists(subquery.clone())),
     }

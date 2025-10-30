@@ -124,6 +124,14 @@ where
                         negated,
                     }));
                 }
+                LlkvExpr::IsNull { expr: target, negated } => {
+                    let translated_target =
+                        translate_scalar_with(&target, schema, unknown_column, unknown_aggregate)?;
+                    owned_stack.push(OwnedFrame::Leaf(LlkvExpr::IsNull {
+                        expr: translated_target,
+                        negated,
+                    }));
+                }
                 LlkvExpr::Literal(value) => {
                     owned_stack.push(OwnedFrame::Leaf(LlkvExpr::Literal(value)));
                 }

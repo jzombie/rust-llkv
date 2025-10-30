@@ -542,6 +542,7 @@ impl PredicateFusionCache {
                 Expr::Not(inner) => stack.push(inner),
                 Expr::Compare { .. } => {}
                 Expr::InList { .. } => {}
+                Expr::IsNull { .. } => {}
                 Expr::Literal(_) => {}
                 Expr::Exists(_) => {}
             }
@@ -1802,6 +1803,18 @@ where
         }
     }
 
+    fn evaluate_constant_is_null(
+        &self,
+        expr: &ScalarExpr<FieldId>,
+        negated: bool,
+        _all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<bool> {
+        let arrays: NumericArrayMap = FxHashMap::default();
+        let value = NumericKernels::evaluate_value(expr, 0, &arrays)?;
+        let is_null = value.is_none();
+        Ok(if negated { !is_null } else { is_null })
+    }
+
     fn evaluate_in_list_over_rows(
         &self,
         row_ids: &[RowId],
@@ -2007,6 +2020,186 @@ where
         Ok(matched)
     }
 
+    fn collect_row_ids_for_is_null(
+        &self,
+        expr: &ScalarExpr<FieldId>,
+        negated: bool,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
+        let mut fields = FxHashSet::default();
+        NumericKernels::collect_fields(expr, &mut fields);
+
+        if fields.is_empty() {
+            // Constant expression
+            match expr {
+                ScalarExpr::Literal(lit) => {
+                    let is_null = matches!(lit, Literal::Null);
+                    let matches = if negated { !is_null } else { is_null };
+                    if matches {
+                        return self.collect_all_row_ids(all_rows_cache);
+                    } else {
+                        return Ok(Vec::new());
+                    }
+                }
+                _ => {
+                    // Other constant expressions (shouldn't happen in practice)
+                    return Err(Error::Internal(
+                        "IS NULL on constant non-literal expression not supported".into(),
+                    ));
+                }
+            }
+        }
+
+        // Build domain from all referenced fields
+        let mut domain: Option<Vec<RowId>> = None;
+        let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
+        ordered_fields.sort_unstable();
+        for fid in &ordered_fields {
+            let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
+            domain = Some(match domain {
+                Some(existing) => intersect_sorted(existing, rows),
+                None => rows,
+            });
+            if let Some(ref d) = domain
+                && d.is_empty()
+            {
+                return Ok(Vec::new());
+            }
+        }
+
+        let domain_rows = domain.unwrap_or_default();
+        if domain_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Evaluate IS NULL over the domain rows using the same pattern as in_list
+        self.evaluate_is_null_over_rows(&domain_rows, &ordered_fields, expr, negated)
+    }
+
+    fn evaluate_is_null_over_rows(
+        &self,
+        row_ids: &[RowId],
+        fields: &[FieldId],
+        expr: &ScalarExpr<FieldId>,
+        negated: bool,
+    ) -> LlkvResult<Vec<RowId>> {
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Follow the exact same pattern as evaluate_in_list_over_rows
+        let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
+        let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
+
+        let table_id = self.table.table_id();
+        let store = self.table.store();
+
+        let physical_fields: Vec<FieldId> = fields
+            .iter()
+            .copied()
+            .filter(|fid| *fid != ROW_ID_FIELD_ID)
+            .collect();
+
+        let schema = self.table.schema()?;
+        let cached_schema = CachedSchema::new(Arc::clone(&schema));
+
+        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(physical_fields.len());
+        let mut output_fields: Vec<Field> = Vec::with_capacity(physical_fields.len());
+        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
+
+        for (idx, field_id) in physical_fields.iter().copied().enumerate() {
+            let schema_idx = cached_schema.index_of_field_id(field_id).ok_or_else(|| {
+                Error::InvalidArgumentError(format!(
+                    "field_id {} missing from table schema",
+                    field_id
+                ))
+            })?;
+            let field = schema.field(schema_idx).clone();
+            let lfid = LogicalFieldId::for_user(table_id, field_id);
+            projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                logical_field_id: lfid,
+                data_type: field.data_type().clone(),
+                output_name: field.name().to_string(),
+            }));
+            output_fields.push(field);
+            unique_index.insert(lfid, idx);
+        }
+
+        let logical_fields: Vec<LogicalFieldId> = physical_fields
+            .iter()
+            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
+            .collect();
+        let logical_fields_for_arrays = logical_fields.clone();
+
+        let requires_numeric = !numeric_fields.is_empty();
+        let numeric_fields_arc = Arc::new(numeric_fields);
+
+        let out_schema = Arc::new(Schema::new(output_fields));
+        let unique_lfids_arc = Arc::new(logical_fields.clone());
+        let projection_evals_arc = Arc::new(projection_evals);
+        let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
+        let unique_index_arc = Arc::new(unique_index);
+
+        let mut matched_rows: Vec<RowId> = Vec::with_capacity(row_ids.len());
+
+        let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
+            if window.is_empty() {
+                return Ok(());
+            }
+
+            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
+                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
+            } else {
+                NumericKernels::prepare_numeric_arrays(
+                    &logical_fields_for_arrays,
+                    columns,
+                    numeric_fields_arc.as_ref(),
+                )?
+            };
+
+            if has_row_id {
+                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
+                let array = Float64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
+            }
+
+            for (offset, &row_id) in window.iter().enumerate() {
+                let value = NumericKernels::evaluate_value(expr, offset, &numeric_arrays)?;
+                let is_null = value.is_none();
+                let matches = if negated { !is_null } else { is_null };
+                if matches {
+                    matched_rows.push(row_id);
+                }
+            }
+
+            Ok(())
+        };
+
+        let mut row_stream = RowStreamBuilder::new(
+            store,
+            self.table.table_id(),
+            Arc::clone(&out_schema),
+            Arc::clone(&unique_lfids_arc),
+            Arc::clone(&projection_evals_arc),
+            Arc::clone(&passthrough_fields_arc),
+            Arc::clone(&unique_index_arc),
+            Arc::clone(&numeric_fields_arc),
+            requires_numeric,
+            GatherNullPolicy::IncludeNulls,
+            row_ids.to_vec(),
+            STREAM_BATCH_ROWS,
+        )
+        .build()?;
+
+        while let Some(chunk) = row_stream.next_chunk()? {
+            let window = chunk.row_ids.values();
+            let batch = chunk.to_record_batch();
+            process_chunk(window, batch.columns())?;
+        }
+
+        Ok(matched_rows)
+    }
+
     fn evaluate_compare_over_rows(
         &self,
         row_ids: &[RowId],
@@ -2201,6 +2394,10 @@ where
                         *negated,
                         all_rows_cache,
                     )?;
+                    stack.push(rows);
+                }
+                EvalOp::PushIsNull { expr, negated } => {
+                    let rows = self.collect_row_ids_for_is_null(expr, *negated, all_rows_cache)?;
                     stack.push(rows);
                 }
                 EvalOp::PushLiteral(value) => {
@@ -2401,6 +2598,19 @@ where
                     )?;
                     stack.push(rows);
                 }
+                DomainOp::PushIsNullDomain {
+                    expr,
+                    fields,
+                    negated,
+                } => {
+                    let rows = self.collect_is_null_domain_rows(
+                        expr,
+                        fields.as_slice(),
+                        *negated,
+                        all_rows_cache,
+                    )?;
+                    stack.push(rows);
+                }
                 DomainOp::PushLiteralFalse => stack.push(Vec::new()),
                 DomainOp::PushAllRows => stack.push(self.collect_all_row_ids(all_rows_cache)?),
                 DomainOp::Union { child_count } => {
@@ -2551,6 +2761,50 @@ where
 
         let (_, determined) =
             self.evaluate_in_list_over_rows(&candidate_rows, &ordered_fields, expr, list, negated)?;
+        Ok(determined)
+    }
+
+    fn collect_is_null_domain_rows(
+        &self,
+        expr: &ScalarExpr<FieldId>,
+        fields: &[FieldId],
+        negated: bool,
+        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+    ) -> LlkvResult<Vec<RowId>> {
+        if fields.is_empty() {
+            // Constant expression: evaluate once
+            let is_constant_null = self.evaluate_constant_is_null(expr, negated, all_rows_cache)?;
+            if is_constant_null {
+                return self.collect_all_row_ids(all_rows_cache);
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+
+        let mut domain: Option<Vec<RowId>> = None;
+        let mut ordered_fields: Vec<FieldId> = fields.to_vec();
+        ordered_fields.sort_unstable();
+        ordered_fields.dedup();
+
+        for fid in &ordered_fields {
+            let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
+            domain = Some(match domain {
+                Some(existing) => intersect_sorted(existing, rows),
+                None => rows,
+            });
+            if let Some(ref d) = domain
+                && d.is_empty()
+            {
+                break;
+            }
+        }
+
+        let candidate_rows = domain.unwrap_or_default();
+        if candidate_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let determined = self.evaluate_is_null_over_rows(&candidate_rows, &ordered_fields, expr, negated)?;
         Ok(determined)
     }
 
@@ -3314,7 +3568,7 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
                 }
             }
             Not(inner) => traverse_stack.push(inner),
-            Pred(_) | Compare { .. } | InList { .. } | Literal(_) | Exists(_) => {}
+            Pred(_) | Compare { .. } | InList { .. } | IsNull { .. } | Literal(_) | Exists(_) => {}
         }
     }
 
@@ -3372,6 +3626,11 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
                 }
                 let keyword = if *negated { "NOT IN" } else { "IN" };
                 result_stack.push(format!("{} {} ({})", expr_str, keyword, parts.join(", ")));
+            }
+            IsNull { expr, negated } => {
+                let expr_str = format_scalar_expr(expr);
+                let keyword = if *negated { "IS NOT NULL" } else { "IS NULL" };
+                result_stack.push(format!("{} {}", expr_str, keyword));
             }
             Literal(value) => {
                 result_stack.push(if *value {
