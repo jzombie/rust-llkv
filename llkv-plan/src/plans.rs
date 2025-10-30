@@ -619,12 +619,52 @@ impl TableRef {
     }
 }
 
+// ============================================================================
+// Join Metadata
+// ============================================================================
+
+/// Type of join operation for query planning.
+///
+/// This is a plan-layer type that mirrors `llkv_join::JoinType` but exists
+/// separately to avoid circular dependencies (llkv-join depends on llkv-table
+/// which depends on llkv-plan). The executor converts `JoinPlan` to `llkv_join::JoinType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinPlan {
+    /// Emit only matching row pairs.
+    Inner,
+    /// Emit all left rows; unmatched left rows have NULL right columns.
+    Left,
+    /// Emit all right rows; unmatched right rows have NULL left columns.
+    Right,
+    /// Emit all rows from both sides; unmatched rows have NULLs.
+    Full,
+}
+
+/// Metadata describing a join between consecutive tables in the FROM clause.
+///
+/// Tracks the join type and optional ON condition filter for each join.
+/// The join connects table at index `left_table_index` with `left_table_index + 1`.
+#[derive(Clone, Debug)]
+pub struct JoinMetadata {
+    /// Index of the left table in the `SelectPlan.tables` vector.
+    pub left_table_index: usize,
+    /// Type of join (INNER, LEFT, RIGHT, etc.).
+    pub join_type: JoinPlan,
+    /// Optional ON condition filter expression (already included in `SelectFilter` if present).
+    /// This is tracked separately to enable join-specific optimizations.
+    pub on_condition: Option<llkv_expr::expr::Expr<'static, String>>,
+}
+
 /// Logical query plan for SELECT operations.
 #[derive(Clone, Debug)]
 pub struct SelectPlan {
     /// Tables to query. Empty vec means no FROM clause (e.g., SELECT 42).
     /// Single element for simple queries, multiple for joins/cross products.
     pub tables: Vec<TableRef>,
+    /// Join metadata describing how tables are joined.
+    /// If empty, all tables are implicitly cross-joined (Cartesian product).
+    /// Each entry describes a join between table[i] and table[i+1].
+    pub joins: Vec<JoinMetadata>,
     pub projections: Vec<SelectProjection>,
     /// Optional WHERE predicate plus dependent correlated subqueries.
     pub filter: Option<SelectFilter>,
@@ -662,6 +702,7 @@ impl SelectPlan {
 
         Self {
             tables,
+            joins: Vec::new(),
             projections: Vec::new(),
             filter: None,
             having: None,
@@ -679,6 +720,7 @@ impl SelectPlan {
     pub fn with_tables(tables: Vec<TableRef>) -> Self {
         Self {
             tables,
+            joins: Vec::new(),
             projections: Vec::new(),
             filter: None,
             having: None,
@@ -725,6 +767,12 @@ impl SelectPlan {
 
     pub fn with_distinct(mut self, distinct: bool) -> Self {
         self.distinct = distinct;
+        self
+    }
+
+    /// Attach join metadata describing how tables are connected.
+    pub fn with_joins(mut self, joins: Vec<JoinMetadata>) -> Self {
+        self.joins = joins;
         self
     }
 

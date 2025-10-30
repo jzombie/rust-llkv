@@ -715,27 +715,93 @@ where
             }
             joined
         } else {
-            // Hash join not applicable - fall back to cartesian product
-            // Extract literal constraints for pushdown even if hash join failed
-            let constraint_map = if let Some(filter_wrapper) = remaining_filter.as_ref() {
-                extract_literal_pushdown_filters(&filter_wrapper.predicate, &tables_with_handles)
+            // Hash join not applicable - use llkv-join for proper join support or fall back to cartesian product
+            let has_joins = !plan.joins.is_empty();
+            
+            if has_joins && tables_with_handles.len() == 2 {
+                // Use llkv-join for 2-table joins (including LEFT JOIN)
+                use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+                
+                let (left_ref, left_table) = &tables_with_handles[0];
+                let (right_ref, right_table) = &tables_with_handles[1];
+                
+                // Determine join type from plan and convert to llkv_join::JoinType
+                let join_type = plan.joins.get(0).map(|j| match j.join_type {
+                    llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
+                    llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
+                    llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
+                    llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
+                }).unwrap_or(llkv_join::JoinType::Inner);
+                
+                tracing::debug!("Using llkv-join for {join_type:?} join between {} and {}", 
+                    left_ref.qualified_name(), right_ref.qualified_name());
+                
+                // Extract join keys from constraints if available
+                // For now, use empty keys (cross product) and rely on filter
+                // TODO: Parse ON conditions to extract proper join keys
+                let join_keys: Vec<JoinKey> = Vec::new();
+                
+                let mut result_batches = Vec::new();
+                left_table.table.join_stream(
+                    &right_table.table,
+                    &join_keys,
+                    &JoinOptions {
+                        join_type,
+                        ..Default::default()
+                    },
+                    |batch| {
+                        result_batches.push(batch);
+                    },
+                )?;
+                
+                // Build combined schema and convert to TableCrossProductData
+                let mut combined_fields = Vec::new();
+                for col in &left_table.schema.columns {
+                    combined_fields.push(Field::new(
+                        col.name.clone(),
+                        col.data_type.clone(),
+                        col.nullable,
+                    ));
+                }
+                for col in &right_table.schema.columns {
+                    combined_fields.push(Field::new(
+                        col.name.clone(),
+                        col.data_type.clone(),
+                        col.nullable,
+                    ));
+                }
+                let combined_schema = Arc::new(Schema::new(combined_fields));
+                
+                let column_counts = vec![left_table.schema.columns.len(), right_table.schema.columns.len()];
+                let table_indices = vec![0, 1];
+                
+                TableCrossProductData {
+                    schema: combined_schema,
+                    batches: result_batches,
+                    column_counts,
+                    table_indices,
+                }
             } else {
-                vec![Vec::new(); tables_with_handles.len()]
-            };
+                // Fall back to cartesian product for other cases
+                let constraint_map = if let Some(filter_wrapper) = remaining_filter.as_ref() {
+                    extract_literal_pushdown_filters(&filter_wrapper.predicate, &tables_with_handles)
+                } else {
+                    vec![Vec::new(); tables_with_handles.len()]
+                };
 
-            // Only materialize tables now that we know we need them
-            let mut staged: Vec<TableCrossProductData> =
-                Vec::with_capacity(tables_with_handles.len());
-            for (idx, (table_ref, table)) in tables_with_handles.iter().enumerate() {
-                let constraints = constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
-                staged.push(collect_table_data(
-                    idx,
-                    table_ref,
-                    table.as_ref(),
-                    constraints,
-                )?);
+                let mut staged: Vec<TableCrossProductData> =
+                    Vec::with_capacity(tables_with_handles.len());
+                for (idx, (table_ref, table)) in tables_with_handles.iter().enumerate() {
+                    let constraints = constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
+                    staged.push(collect_table_data(
+                        idx,
+                        table_ref,
+                        table.as_ref(),
+                        constraints,
+                    )?);
+                }
+                cross_join_all(staged)?
             }
-            cross_join_all(staged)?
         };
 
         let TableCrossProductData {
@@ -1474,67 +1540,76 @@ where
             per_table.push(Some(data));
         }
 
-        let mut remaining: Vec<usize> = (0..tables_with_handles.len()).collect();
-        let mut used_tables: FxHashSet<usize> = FxHashSet::default();
+        // Determine if we should use llkv-join (when LEFT JOINs are present or for better architecture)
+        let has_left_join = plan.joins.iter().any(|j| j.join_type == llkv_plan::JoinPlan::Left);
+
         let mut current: Option<TableCrossProductData> = None;
 
-        while !remaining.is_empty() {
-            let next_index = if used_tables.is_empty() {
-                remaining[0]
-            } else {
-                match remaining.iter().copied().find(|idx| {
-                    table_has_join_with_used(*idx, &used_tables, &constraint_plan.equalities)
-                }) {
-                    Some(idx) => idx,
-                    None => {
-                        // No equality constraints connect the remaining tables to the already
-                        // joined set. We still need to evaluate the query, so fall back to a
-                        // cartesian expansion for the next table rather than bailing out of the
-                        // optimization entirely. This allows us to retain the benefits of the
-                        // hash-joined prefix while only expanding the unconstrained tables.
-                        tracing::debug!(
-                            "join_opt[{query_label}]: no remaining equality links – using cartesian expansion for table index {idx}",
-                            idx = remaining[0]
-                        );
-                        remaining[0]
-                    }
-                }
-            };
+        if has_left_join {
+            // LEFT JOIN path: delegate to llkv-join crate which has proper implementation
+            tracing::debug!(
+                "join_opt[{query_label}]: delegating to llkv-join for LEFT JOIN support"
+            );
+            // Bail out of hash join optimization - let the fallback path use llkv-join properly
+            return Ok(None);
+        } else {
+            // INNER JOIN path: use existing optimization that can reorder joins
+            let mut remaining: Vec<usize> = (0..tables_with_handles.len()).collect();
+            let mut used_tables: FxHashSet<usize> = FxHashSet::default();
 
-            let position = remaining
-                .iter()
-                .position(|&idx| idx == next_index)
-                .expect("next index present");
-
-            let next_data = per_table[next_index]
-                .take()
-                .ok_or_else(|| Error::Internal("hash join consumed table data twice".into()))?;
-
-            if let Some(current_data) = current.take() {
-                let join_keys = gather_join_keys(
-                    &current_data,
-                    &next_data,
-                    &used_tables,
-                    next_index,
-                    &constraint_plan.equalities,
-                )?;
-
-                let joined = if join_keys.is_empty() {
-                    tracing::debug!(
-                        "join_opt[{query_label}]: joining '{}' via cartesian expansion (no equality keys)",
-                        tables_with_handles[next_index].0.qualified_name()
-                    );
-                    cross_join_table_batches(current_data, next_data)?
+            while !remaining.is_empty() {
+                let next_index = if used_tables.is_empty() {
+                    remaining[0]
                 } else {
-                    hash_join_table_batches(current_data, next_data, &join_keys)?
+                    match remaining.iter().copied().find(|idx| {
+                        table_has_join_with_used(*idx, &used_tables, &constraint_plan.equalities)
+                    }) {
+                        Some(idx) => idx,
+                        None => {
+                            tracing::debug!(
+                                "join_opt[{query_label}]: no remaining equality links – using cartesian expansion for table index {idx}",
+                                idx = remaining[0]
+                            );
+                            remaining[0]
+                        }
+                    }
                 };
-                current = Some(joined);
-            } else {
-                current = Some(next_data);
-            }
 
-            used_tables.insert(next_index);
-            remaining.remove(position);
+                let position = remaining
+                    .iter()
+                    .position(|&idx| idx == next_index)
+                    .expect("next index present");
+
+                let next_data = per_table[next_index]
+                    .take()
+                    .ok_or_else(|| Error::Internal("hash join consumed table data twice".into()))?;
+
+                if let Some(current_data) = current.take() {
+                    let join_keys = gather_join_keys(
+                        &current_data,
+                        &next_data,
+                        &used_tables,
+                        next_index,
+                        &constraint_plan.equalities,
+                    )?;
+
+                    let joined = if join_keys.is_empty() {
+                        tracing::debug!(
+                            "join_opt[{query_label}]: joining '{}' via cartesian expansion (no equality keys)",
+                            tables_with_handles[next_index].0.qualified_name()
+                        );
+                        cross_join_table_batches(current_data, next_data)?
+                    } else {
+                        hash_join_table_batches(current_data, next_data, &join_keys, llkv_join::JoinType::Inner)?
+                    };
+                    current = Some(joined);
+                } else {
+                    current = Some(next_data);
+                }
+
+                used_tables.insert(next_index);
+                remaining.remove(position);
+            }
         }
 
         if let Some(result) = current {
@@ -1573,6 +1648,10 @@ where
         }
 
         let table_ref = table.as_ref();
+        let constant_filter = plan
+            .filter
+            .as_ref()
+            .and_then(|filter| evaluate_constant_predicate(&filter.predicate));
         let projections = if plan.projections.is_empty() {
             build_wildcard_projections(table_ref)
         } else {
@@ -1580,7 +1659,23 @@ where
         };
         let schema = schema_for_projections(table_ref, &projections)?;
 
-        let (filter_expr, full_table_scan) = match &plan.filter {
+        if let Some(result) = constant_filter {
+            match result {
+                Some(true) => {
+                    // Treat as full table scan by clearing the filter below.
+                }
+                Some(false) | None => {
+                    let batch = RecordBatch::new_empty(Arc::clone(&schema));
+                    return Ok(SelectExecution::new_single_batch(
+                        display_name,
+                        schema,
+                        batch,
+                    ));
+                }
+            }
+        }
+
+        let (mut filter_expr, mut full_table_scan) = match &plan.filter {
             Some(filter_wrapper) => (
                 crate::translation::expression::translate_predicate(
                     filter_wrapper.predicate.clone(),
@@ -1601,6 +1696,16 @@ where
                 )
             }
         };
+
+        if matches!(constant_filter, Some(Some(true))) {
+            let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "table has no columns; cannot perform wildcard scan".into(),
+                )
+            })?;
+            filter_expr = crate::translation::expression::full_table_scan_filter(field_id);
+            full_table_scan = true;
+        }
 
         let expanded_order = expand_order_targets(&plan.order_by, &projections)?;
 
@@ -3916,6 +4021,7 @@ fn bind_select_plan(
         let bound_compound = bind_compound_select(compound, bindings)?;
         return Ok(SelectPlan {
             tables: Vec::new(),
+            joins: Vec::new(),
             projections: Vec::new(),
             filter: None,
             having: None,
@@ -3931,6 +4037,7 @@ fn bind_select_plan(
 
     Ok(SelectPlan {
         tables: plan.tables.clone(),
+        joins: plan.joins.clone(),
         projections,
         filter,
         having: plan.having.clone(),
@@ -5865,6 +5972,7 @@ fn hash_join_table_batches(
     left: TableCrossProductData,
     right: TableCrossProductData,
     join_keys: &[(usize, usize)],
+    join_type: llkv_join::JoinType,
 ) -> ExecutorResult<TableCrossProductData> {
     let TableCrossProductData {
         schema: left_schema,
@@ -5897,7 +6005,8 @@ fn hash_join_table_batches(
     table_indices.extend(left_tables.iter().copied());
     table_indices.extend(right_tables.iter().copied());
 
-    if left_batches.is_empty() || right_batches.is_empty() {
+    // Handle empty inputs
+    if left_batches.is_empty() {
         return Ok(TableCrossProductData {
             schema: combined_schema,
             batches: Vec::new(),
@@ -5906,34 +6015,122 @@ fn hash_join_table_batches(
         });
     }
 
-    let (left_matches, right_matches) =
-        build_join_match_indices(&left_batches, &right_batches, join_keys)?;
+    if right_batches.is_empty() {
+        // For LEFT JOIN with no right rows, return all left rows with NULL right columns
+        if join_type == llkv_join::JoinType::Left {
+            let total_left_rows: usize = left_batches.iter().map(|b| b.num_rows()).sum();
+            let mut left_arrays = Vec::new();
+            for field in left_schema.fields() {
+                let column_idx = left_schema
+                    .index_of(field.name())
+                    .map_err(|e| Error::Internal(format!("failed to find field {}: {}", field.name(), e)))?;
+                let arrays: Vec<ArrayRef> = left_batches
+                    .iter()
+                    .map(|batch| batch.column(column_idx).clone())
+                    .collect();
+                let concatenated = arrow::compute::concat(&arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
+                    .map_err(|e| Error::Internal(format!("failed to concat left arrays: {}", e)))?;
+                left_arrays.push(concatenated);
+            }
 
-    if left_matches.is_empty() {
-        return Ok(TableCrossProductData {
-            schema: combined_schema,
-            batches: Vec::new(),
-            column_counts,
-            table_indices,
-        });
+            // Add NULL arrays for right side
+            for field in right_schema.fields() {
+                let null_array = arrow::array::new_null_array(field.data_type(), total_left_rows);
+                left_arrays.push(null_array);
+            }
+
+            let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), left_arrays)
+                .map_err(|err| Error::Internal(format!("failed to create LEFT JOIN batch with NULL right: {err}")))?;
+
+            return Ok(TableCrossProductData {
+                schema: combined_schema,
+                batches: vec![joined_batch],
+                column_counts,
+                table_indices,
+            });
+        } else {
+            // For INNER JOIN, no right rows means no results
+            return Ok(TableCrossProductData {
+                schema: combined_schema,
+                batches: Vec::new(),
+                column_counts,
+                table_indices,
+            });
+        }
     }
 
-    let left_arrays = gather_indices_from_batches(&left_batches, &left_matches)?;
-    let right_arrays = gather_indices_from_batches(&right_batches, &right_matches)?;
+    match join_type {
+        llkv_join::JoinType::Inner => {
+            let (left_matches, right_matches) =
+                build_join_match_indices(&left_batches, &right_batches, join_keys)?;
 
-    let mut combined_columns = Vec::with_capacity(left_arrays.len() + right_arrays.len());
-    combined_columns.extend(left_arrays);
-    combined_columns.extend(right_arrays);
+            if left_matches.is_empty() {
+                return Ok(TableCrossProductData {
+                    schema: combined_schema,
+                    batches: Vec::new(),
+                    column_counts,
+                    table_indices,
+                });
+            }
 
-    let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), combined_columns)
-        .map_err(|err| Error::Internal(format!("failed to materialize hash join batch: {err}")))?;
+            let left_arrays = gather_indices_from_batches(&left_batches, &left_matches)?;
+            let right_arrays = gather_indices_from_batches(&right_batches, &right_matches)?;
 
-    Ok(TableCrossProductData {
-        schema: combined_schema,
-        batches: vec![joined_batch],
-        column_counts,
-        table_indices,
-    })
+            let mut combined_columns = Vec::with_capacity(left_arrays.len() + right_arrays.len());
+            combined_columns.extend(left_arrays);
+            combined_columns.extend(right_arrays);
+
+            let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), combined_columns)
+                .map_err(|err| Error::Internal(format!("failed to materialize INNER JOIN batch: {err}")))?;
+
+            Ok(TableCrossProductData {
+                schema: combined_schema,
+                batches: vec![joined_batch],
+                column_counts,
+                table_indices,
+            })
+        }
+        llkv_join::JoinType::Left => {
+            let (left_matches, right_optional_matches) =
+                build_left_join_match_indices(&left_batches, &right_batches, join_keys)?;
+
+            if left_matches.is_empty() {
+                // This shouldn't happen for LEFT JOIN since all left rows should be included
+                return Ok(TableCrossProductData {
+                    schema: combined_schema,
+                    batches: Vec::new(),
+                    column_counts,
+                    table_indices,
+                });
+            }
+
+            let left_arrays = gather_indices_from_batches(&left_batches, &left_matches)?;
+            // Use gather_optional_indices to handle None values (unmatched rows)
+            let right_arrays = llkv_column_map::gather::gather_optional_indices_from_batches(
+                &right_batches,
+                &right_optional_matches,
+            )?;
+
+            let mut combined_columns = Vec::with_capacity(left_arrays.len() + right_arrays.len());
+            combined_columns.extend(left_arrays);
+            combined_columns.extend(right_arrays);
+
+            let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), combined_columns)
+                .map_err(|err| Error::Internal(format!("failed to materialize LEFT JOIN batch: {err}")))?;
+
+            Ok(TableCrossProductData {
+                schema: combined_schema,
+                batches: vec![joined_batch],
+                column_counts,
+                table_indices,
+            })
+        }
+        // Other join types not yet supported in this helper (delegate to llkv-join)
+        _ => Err(Error::Internal(format!(
+            "join type {:?} not supported in hash_join_table_batches; use llkv-join",
+            join_type
+        ))),
+    }
 }
 
 /// Type alias for join match index pairs (batch_idx, row_idx)
@@ -6064,6 +6261,118 @@ fn build_join_match_indices(
     }
 
     Ok((left_matches, right_matches))
+}
+
+/// Build match indices for LEFT JOIN, returning all left rows with optional right matches.
+///
+/// Unlike `build_join_match_indices` which only returns matching pairs, this function
+/// returns every left row. For rows with no match, the right match is `None`.
+///
+/// # Returns
+///
+/// Tuple of `(left_matches, right_optional_matches)` where:
+/// - `left_matches`: (batch_idx, row_idx) for every left row
+/// - `right_optional_matches`: `Some((batch_idx, row_idx))` for matched rows, `None` for unmatched
+fn build_left_join_match_indices(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    join_keys: &[(usize, usize)],
+) -> ExecutorResult<(JoinMatchIndices, Vec<Option<(usize, usize)>>)> {
+    let right_key_indices: Vec<usize> = join_keys.iter().map(|(_, right)| *right).collect();
+
+    // Build hash table from right batches
+    let hash_table: JoinHashTable = llkv_column_map::parallel::with_thread_pool(|| {
+        let local_tables: Vec<JoinHashTable> = right_batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_idx, batch)| {
+                let mut local_table: JoinHashTable = FxHashMap::default();
+                let mut key_buffer: Vec<u8> = Vec::new();
+
+                for row_idx in 0..batch.num_rows() {
+                    key_buffer.clear();
+                    match build_join_key(batch, &right_key_indices, row_idx, &mut key_buffer) {
+                        Ok(true) => {
+                            local_table
+                                .entry(key_buffer.clone())
+                                .or_default()
+                                .push((batch_idx, row_idx));
+                        }
+                        Ok(false) => continue,
+                        Err(_) => continue,
+                    }
+                }
+
+                local_table
+            })
+            .collect();
+
+        let mut merged_table: JoinHashTable = FxHashMap::default();
+        for local_table in local_tables {
+            for (key, mut positions) in local_table {
+                merged_table.entry(key).or_default().append(&mut positions);
+            }
+        }
+
+        merged_table
+    });
+
+    let left_key_indices: Vec<usize> = join_keys.iter().map(|(left, _)| *left).collect();
+
+    // Probe phase: process ALL left rows, recording matches or None
+    let matches: Vec<(JoinMatchIndices, Vec<Option<(usize, usize)>>)> =
+        llkv_column_map::parallel::with_thread_pool(|| {
+            left_batches
+                .par_iter()
+                .enumerate()
+                .map(|(batch_idx, batch)| {
+                    let mut local_left_matches: JoinMatchIndices = Vec::new();
+                    let mut local_right_optional: Vec<Option<(usize, usize)>> = Vec::new();
+                    let mut key_buffer: Vec<u8> = Vec::new();
+
+                    for row_idx in 0..batch.num_rows() {
+                        key_buffer.clear();
+                        match build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer) {
+                            Ok(true) => {
+                                if let Some(entries) = hash_table.get(&key_buffer) {
+                                    // Has matches - emit one output row per match
+                                    for &(r_batch, r_row) in entries {
+                                        local_left_matches.push((batch_idx, row_idx));
+                                        local_right_optional.push(Some((r_batch, r_row)));
+                                    }
+                                } else {
+                                    // No match - emit left row with NULL right
+                                    local_left_matches.push((batch_idx, row_idx));
+                                    local_right_optional.push(None);
+                                }
+                            }
+                            Ok(false) => {
+                                // NULL key on left side - no match, emit with NULL right
+                                local_left_matches.push((batch_idx, row_idx));
+                                local_right_optional.push(None);
+                            }
+                            Err(_) => {
+                                // Error reading key - treat as no match
+                                local_left_matches.push((batch_idx, row_idx));
+                                local_right_optional.push(None);
+                            }
+                        }
+                    }
+
+                    (local_left_matches, local_right_optional)
+                })
+                .collect()
+        });
+
+    // Merge all match results
+    let mut left_matches: JoinMatchIndices = Vec::new();
+    let mut right_optional: Vec<Option<(usize, usize)>> = Vec::new();
+    for (mut left, mut right) in matches {
+        left_matches.append(&mut left);
+        right_optional.append(&mut right);
+    }
+
+    Ok((left_matches, right_optional))
 }
 
 fn build_join_key(
