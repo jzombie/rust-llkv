@@ -421,6 +421,26 @@ where
         })
     }
 
+    /// Recursively check if a predicate expression contains aggregates
+    fn predicate_contains_aggregate(expr: &llkv_expr::expr::Expr<String>) -> bool {
+        match expr {
+            llkv_expr::expr::Expr::And(exprs) | llkv_expr::expr::Expr::Or(exprs) => {
+                exprs.iter().any(Self::predicate_contains_aggregate)
+            }
+            llkv_expr::expr::Expr::Not(inner) => Self::predicate_contains_aggregate(inner),
+            llkv_expr::expr::Expr::Compare { left, right, .. } => {
+                Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
+            }
+            llkv_expr::expr::Expr::InList { expr, list, .. } => {
+                Self::expr_contains_aggregate(expr) || list.iter().any(|e| Self::expr_contains_aggregate(e))
+            }
+            llkv_expr::expr::Expr::IsNull { expr, .. } => Self::expr_contains_aggregate(expr),
+            llkv_expr::expr::Expr::Literal(_) => false,
+            llkv_expr::expr::Expr::Pred(_) => false,
+            llkv_expr::expr::Expr::Exists(_) => false,
+        }
+    }
+
     /// Recursively check if a scalar expression contains aggregates
     fn expr_contains_aggregate(expr: &ScalarExpr<String>) -> bool {
         match expr {
@@ -2207,8 +2227,11 @@ where
             ));
         }
 
-        // If there are aggregates with GROUP BY, use a different execution path
-        if !plan.aggregates.is_empty() || self.has_computed_aggregates(&plan) {
+        // If there are aggregates with GROUP BY, OR if HAVING contains aggregates, use aggregates path
+        // Must check HAVING because aggregates can appear in HAVING even if not in SELECT projections
+        let having_has_aggregates = plan.having.as_ref().map(|h| Self::predicate_contains_aggregate(h)).unwrap_or(false);
+        
+        if !plan.aggregates.is_empty() || self.has_computed_aggregates(&plan) || having_has_aggregates {
             return self.execute_group_by_with_aggregates(
                 display_name,
                 plan,
@@ -2265,20 +2288,26 @@ where
 
         let translated_having = if plan.having.is_some() && constant_having.is_none() {
             let having = plan.having.clone().expect("checked above");
-            let temp_context = CrossProductExpressionContext::new(
-                base_schema.as_ref(),
-                column_lookup_map.clone(),
-            )?;
-            Some(translate_predicate(
-                having,
-                temp_context.schema(),
-                |name| {
-                    Error::InvalidArgumentError(format!(
-                        "column '{}' not found in GROUP BY result",
-                        name
-                    ))
-                },
-            )?)
+            // Only translate HAVING if it doesn't contain aggregates
+            // Aggregates must be evaluated after GROUP BY aggregation
+            if Self::predicate_contains_aggregate(&having) {
+                None
+            } else {
+                let temp_context = CrossProductExpressionContext::new(
+                    base_schema.as_ref(),
+                    column_lookup_map.clone(),
+                )?;
+                Some(translate_predicate(
+                    having,
+                    temp_context.schema(),
+                    |name| {
+                        Error::InvalidArgumentError(format!(
+                            "column '{}' not found in GROUP BY result",
+                            name
+                        ))
+                    },
+                )?)
+            }
         } else {
             None
         };
@@ -2592,6 +2621,11 @@ where
                 Self::collect_aggregates(expr, &mut aggregate_specs);
             }
         }
+        
+        // Also extract aggregates from HAVING clause
+        if let Some(having_expr) = &plan.having {
+            Self::collect_aggregates_from_predicate(having_expr, &mut aggregate_specs);
+        }
 
         // Build a hash map for groups - collect row indices per group
         let mut group_index: FxHashMap<Vec<GroupKeyValue>, usize> = FxHashMap::default();
@@ -2740,57 +2774,14 @@ where
             for (row_idx, row) in rows.iter().enumerate() {
                 let aggregate_values = &group_aggregate_values[row_idx];
                 let group_state = &group_states[row_idx];
-                // Evaluate HAVING expression with aggregate values and row context
-                let passes = match having {
-                    llkv_expr::expr::Expr::Compare { left, op, right } => {
-                        let left_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
-                            left,
-                            aggregate_values,
-                            Some(&group_state.batch),
-                            Some(&column_lookup_map),
-                            group_state.representative_row,
-                        )?;
-                        let right_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
-                            right,
-                            aggregate_values,
-                            Some(&group_state.batch),
-                            Some(&column_lookup_map),
-                            group_state.representative_row,
-                        )?;
-                        match (left_val, right_val) {
-                            (PlanValue::Null, _) | (_, PlanValue::Null) => false, // NULL comparisons are false
-                            (PlanValue::Integer(l), PlanValue::Integer(r)) => {
-                                use llkv_expr::expr::CompareOp;
-                                match op {
-                                    CompareOp::Eq => l == r,
-                                    CompareOp::NotEq => l != r,
-                                    CompareOp::Lt => l < r,
-                                    CompareOp::LtEq => l <= r,
-                                    CompareOp::Gt => l > r,
-                                    CompareOp::GtEq => l >= r,
-                                }
-                            }
-                            (PlanValue::Float(l), PlanValue::Float(r)) => {
-                                use llkv_expr::expr::CompareOp;
-                                match op {
-                                    CompareOp::Eq => l == r,
-                                    CompareOp::NotEq => l != r,
-                                    CompareOp::Lt => l < r,
-                                    CompareOp::LtEq => l <= r,
-                                    CompareOp::Gt => l > r,
-                                    CompareOp::GtEq => l >= r,
-                                }
-                            }
-                            _ => false,
-                        }
-                    }
-                    llkv_expr::expr::Expr::Literal(val) => *val,
-                    _ => {
-                        return Err(Error::InvalidArgumentError(
-                            "Unsupported HAVING expression type".into(),
-                        ))
-                    }
-                };
+                // Evaluate HAVING expression recursively
+                let passes = Self::evaluate_having_expr(
+                    having,
+                    aggregate_values,
+                    &group_state.batch,
+                    &column_lookup_map,
+                    group_state.representative_row,
+                )?;
                 if passes {
                     filtered.push(row.clone());
                 }
@@ -3434,6 +3425,39 @@ where
         }
     }
 
+    /// Collect aggregates from predicate expressions (Expr, not ScalarExpr)
+    fn collect_aggregates_from_predicate(
+        expr: &llkv_expr::expr::Expr<String>,
+        aggregates: &mut Vec<(String, llkv_expr::expr::AggregateCall<String>)>,
+    ) {
+        match expr {
+            llkv_expr::expr::Expr::Compare { left, right, .. } => {
+                Self::collect_aggregates(left, aggregates);
+                Self::collect_aggregates(right, aggregates);
+            }
+            llkv_expr::expr::Expr::And(exprs) | llkv_expr::expr::Expr::Or(exprs) => {
+                for e in exprs {
+                    Self::collect_aggregates_from_predicate(e, aggregates);
+                }
+            }
+            llkv_expr::expr::Expr::Not(inner) => {
+                Self::collect_aggregates_from_predicate(inner, aggregates);
+            }
+            llkv_expr::expr::Expr::InList { expr: test_expr, list, .. } => {
+                Self::collect_aggregates(test_expr, aggregates);
+                for item in list {
+                    Self::collect_aggregates(item, aggregates);
+                }
+            }
+            llkv_expr::expr::Expr::IsNull { expr, .. } => {
+                Self::collect_aggregates(expr, aggregates);
+            }
+            llkv_expr::expr::Expr::Literal(_) => {}
+            llkv_expr::expr::Expr::Pred(_) => {}
+            llkv_expr::expr::Expr::Exists(_) => {}
+        }
+    }
+
     /// Compute the actual values for the aggregates
     fn compute_aggregate_values(
         &self,
@@ -3681,6 +3705,176 @@ where
         aggregates: &FxHashMap<String, PlanValue>,
     ) -> ExecutorResult<PlanValue> {
         Self::evaluate_expr_with_plan_value_aggregates_and_row(expr, aggregates, None, None, 0)
+    }
+
+    fn evaluate_having_expr(
+        expr: &llkv_expr::expr::Expr<String>,
+        aggregates: &FxHashMap<String, PlanValue>,
+        row_batch: &RecordBatch,
+        column_lookup: &FxHashMap<String, usize>,
+        row_idx: usize,
+    ) -> ExecutorResult<bool> {
+        match expr {
+            llkv_expr::expr::Expr::Compare { left, op, right } => {
+                let left_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    left,
+                    aggregates,
+                    Some(row_batch),
+                    Some(column_lookup),
+                    row_idx,
+                )?;
+                let right_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    right,
+                    aggregates,
+                    Some(row_batch),
+                    Some(column_lookup),
+                    row_idx,
+                )?;
+                
+                // Coerce numeric types for comparison
+                let (left_val, right_val) = match (&left_val, &right_val) {
+                    (PlanValue::Integer(i), PlanValue::Float(_)) => {
+                        (PlanValue::Float(*i as f64), right_val)
+                    }
+                    (PlanValue::Float(_), PlanValue::Integer(i)) => {
+                        (left_val, PlanValue::Float(*i as f64))
+                    }
+                    _ => (left_val, right_val),
+                };
+
+                match (left_val, right_val) {
+                    (PlanValue::Null, _) | (_, PlanValue::Null) => Ok(false),
+                    (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        Ok(match op {
+                            CompareOp::Eq => l == r,
+                            CompareOp::NotEq => l != r,
+                            CompareOp::Lt => l < r,
+                            CompareOp::LtEq => l <= r,
+                            CompareOp::Gt => l > r,
+                            CompareOp::GtEq => l >= r,
+                        })
+                    }
+                    (PlanValue::Float(l), PlanValue::Float(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        Ok(match op {
+                            CompareOp::Eq => l == r,
+                            CompareOp::NotEq => l != r,
+                            CompareOp::Lt => l < r,
+                            CompareOp::LtEq => l <= r,
+                            CompareOp::Gt => l > r,
+                            CompareOp::GtEq => l >= r,
+                        })
+                    }
+                    _ => Ok(false),
+                }
+            }
+            llkv_expr::expr::Expr::Not(inner) => {
+                Ok(!Self::evaluate_having_expr(inner, aggregates, row_batch, column_lookup, row_idx)?)
+            }
+            llkv_expr::expr::Expr::InList { expr: test_expr, list, negated } => {
+                let test_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    test_expr,
+                    aggregates,
+                    Some(row_batch),
+                    Some(column_lookup),
+                    row_idx,
+                )?;
+                
+                // SQL semantics: test_value IN (NULL, ...) handling
+                // - If test_val is NULL, result is always NULL (false for filtering)
+                if matches!(test_val, PlanValue::Null) {
+                    return Ok(false);
+                }
+                
+                let mut found = false;
+                let mut has_null = false;
+                
+                for list_item in list {
+                    let list_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                        list_item,
+                        aggregates,
+                        Some(row_batch),
+                        Some(column_lookup),
+                        row_idx,
+                    )?;
+                    
+                    // Track if list contains NULL
+                    if matches!(list_val, PlanValue::Null) {
+                        has_null = true;
+                        continue;
+                    }
+                    
+                    // Coerce for comparison
+                    let matches = match (&test_val, &list_val) {
+                        (PlanValue::Integer(a), PlanValue::Integer(b)) => a == b,
+                        (PlanValue::Float(a), PlanValue::Float(b)) => a == b,
+                        (PlanValue::Integer(a), PlanValue::Float(b)) => (*a as f64) == *b,
+                        (PlanValue::Float(a), PlanValue::Integer(b)) => *a == (*b as f64),
+                        (PlanValue::String(a), PlanValue::String(b)) => a == b,
+                        _ => false,
+                    };
+                    
+                    if matches {
+                        found = true;
+                        break;
+                    }
+                }
+                
+                // SQL semantics for IN/NOT IN with NULL:
+                // - value IN (...): true if match found, false if no match and no NULLs, NULL if no match but has NULLs
+                // - value NOT IN (...): false if match found, true if no match and no NULLs, NULL if no match but has NULLs
+                // - NULL is treated as false in WHERE/HAVING (filters the row out)
+                if *negated {
+                    // NOT IN: false if match found, true if no match and no NULLs, false if no match but has NULLs
+                    Ok(if found {
+                        false
+                    } else if has_null {
+                        false // NULL in list makes NOT IN return NULL (false for filtering)
+                    } else {
+                        true
+                    })
+                } else {
+                    // IN: true if match found, false otherwise (NULL in list returns NULL/false)
+                    Ok(if found {
+                        true
+                    } else {
+                        false
+                    })
+                }
+            }
+            llkv_expr::expr::Expr::IsNull { expr, negated } => {
+                let val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    expr,
+                    aggregates,
+                    Some(row_batch),
+                    Some(column_lookup),
+                    row_idx,
+                )?;
+                let is_null = matches!(val, PlanValue::Null);
+                Ok(if *negated { !is_null } else { is_null })
+            }
+            llkv_expr::expr::Expr::Literal(val) => Ok(*val),
+            llkv_expr::expr::Expr::And(exprs) => {
+                for e in exprs {
+                    if !Self::evaluate_having_expr(e, aggregates, row_batch, column_lookup, row_idx)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            llkv_expr::expr::Expr::Or(exprs) => {
+                for e in exprs {
+                    if Self::evaluate_having_expr(e, aggregates, row_batch, column_lookup, row_idx)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Err(Error::InvalidArgumentError(
+                "Unsupported HAVING expression type".into(),
+            )),
+        }
     }
 
     fn evaluate_expr_with_plan_value_aggregates_and_row(
