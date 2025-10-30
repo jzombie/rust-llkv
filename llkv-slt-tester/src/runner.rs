@@ -9,8 +9,7 @@ use crate::parser::{
 use libtest_mimic::{Arguments, Conclusion, Failed, Trial};
 use llkv_result::Error;
 use llkv_sql::{
-    StatementExpectation as SqlStatementExpectation,
-    clear_pending_statement_expectations,
+    StatementExpectation as SqlStatementExpectation, clear_pending_statement_expectations,
     register_statement_expectation,
 };
 use sqllogictest::{AsyncDB, DefaultColumnType, QueryExpect, Runner};

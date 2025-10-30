@@ -30,10 +30,8 @@ pub type SqlResult<T> = llkv_result::Result<T>;
 
 mod sql_engine;
 pub use sql_engine::{
-	SqlEngine,
-	StatementExpectation,
-	clear_pending_statement_expectations,
-	register_statement_expectation,
+    SqlEngine, StatementExpectation, clear_pending_statement_expectations,
+    register_statement_expectation,
 };
 
 mod sql_value;

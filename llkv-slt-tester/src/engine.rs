@@ -42,6 +42,9 @@ pub struct EngineHarness {
 impl EngineHarness {
     pub fn new(engine: SqlEngine<MemPager>) -> Self {
         tracing::debug!("[HARNESS] new() created harness at {:p}", &engine);
+        engine
+            .set_insert_buffering(true)
+            .expect("enable insert buffering");
         Self { engine }
     }
 }

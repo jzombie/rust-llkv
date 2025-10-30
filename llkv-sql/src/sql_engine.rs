@@ -243,6 +243,7 @@ where
     default_nulls_first: AtomicBool,
     /// Buffer for batching INSERTs across execute() calls for massive performance gains
     insert_buffer: RefCell<Option<InsertBuffer>>,
+    insert_buffering_enabled: AtomicBool,
 }
 
 const DROPPED_TABLE_TRANSACTION_ERR: &str = "another transaction has dropped this table";
@@ -274,6 +275,9 @@ where
                 self.default_nulls_first.load(AtomicOrdering::Relaxed),
             ),
             insert_buffer: RefCell::new(None),
+            insert_buffering_enabled: AtomicBool::new(
+                self.insert_buffering_enabled.load(AtomicOrdering::Relaxed),
+            ),
         }
     }
 }
@@ -283,6 +287,19 @@ impl<P> SqlEngine<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
+    fn from_runtime_engine(
+        engine: RuntimeEngine<P>,
+        default_nulls_first: bool,
+        insert_buffering_enabled: bool,
+    ) -> Self {
+        Self {
+            engine,
+            default_nulls_first: AtomicBool::new(default_nulls_first),
+            insert_buffer: RefCell::new(None),
+            insert_buffering_enabled: AtomicBool::new(insert_buffering_enabled),
+        }
+    }
+
     fn map_table_error(table_name: &str, err: Error) -> Error {
         match err {
             Error::NotFound => Self::table_not_found_error(table_name),
@@ -328,11 +345,7 @@ where
 
     pub fn new(pager: Arc<P>) -> Self {
         let engine = RuntimeEngine::new(pager);
-        Self {
-            engine,
-            default_nulls_first: AtomicBool::new(false),
-            insert_buffer: RefCell::new(None),
-        }
+        Self::from_runtime_engine(engine, false, false)
     }
 
     /// Preprocess SQL to handle qualified names in EXCLUDE clauses
@@ -399,11 +412,20 @@ where
     }
 
     pub fn with_context(context: Arc<RuntimeContext<P>>, default_nulls_first: bool) -> Self {
-        Self {
-            engine: RuntimeEngine::from_context(context),
-            default_nulls_first: AtomicBool::new(default_nulls_first),
-            insert_buffer: RefCell::new(None),
+        Self::from_runtime_engine(
+            RuntimeEngine::from_context(context),
+            default_nulls_first,
+            false,
+        )
+    }
+
+    pub fn set_insert_buffering(&self, enabled: bool) -> SqlResult<()> {
+        if !enabled {
+            let _ = self.flush_buffer_results()?;
         }
+        self.insert_buffering_enabled
+            .store(enabled, AtomicOrdering::Relaxed);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -492,8 +514,20 @@ where
         insert: sqlparser::ast::Insert,
         expectation: StatementExpectation,
     ) -> SqlResult<BufferedInsertResult<P>> {
-        let execute_immediately = matches!(expectation, StatementExpectation::Error | StatementExpectation::Count(_));
+        let execute_immediately = matches!(
+            expectation,
+            StatementExpectation::Error | StatementExpectation::Count(_)
+        );
         if execute_immediately {
+            let flushed = self.flush_buffer_results()?;
+            let current = self.handle_insert(insert)?;
+            return Ok(BufferedInsertResult {
+                flushed,
+                current: Some(current),
+            });
+        }
+
+        if !self.insert_buffering_enabled.load(AtomicOrdering::Relaxed) {
             let flushed = self.flush_buffer_results()?;
             let current = self.handle_insert(insert)?;
             return Ok(BufferedInsertResult {
@@ -510,6 +544,7 @@ where
                 rows,
             } => {
                 let mut flushed = Vec::new();
+                let statement_rows = rows.len();
                 let mut buf = self.insert_buffer.borrow_mut();
                 match buf.as_mut() {
                     Some(buffer) if buffer.can_accept(&table_name, &columns) => {
@@ -526,7 +561,7 @@ where
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
                                 table_name,
-                                rows_inserted: 0,
+                                rows_inserted: statement_rows,
                             }),
                         });
                     }
@@ -539,7 +574,7 @@ where
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
                                 table_name,
-                                rows_inserted: 0,
+                                rows_inserted: statement_rows,
                             }),
                         });
                     }
@@ -549,7 +584,7 @@ where
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
                                 table_name,
-                                rows_inserted: 0,
+                                rows_inserted: statement_rows,
                             }),
                         });
                     }
@@ -790,13 +825,15 @@ where
     /// ```
     pub fn sql(&self, sql: &str) -> SqlResult<Vec<RecordBatch>> {
         let mut results = self.execute(sql)?;
-        if results.len() != 1 {
+        if results.is_empty() {
             return Err(Error::InvalidArgumentError(
-                "SqlEngine::sql expects exactly one SQL statement".into(),
+                "SqlEngine::sql expects a SELECT statement".into(),
             ));
         }
 
-        match results.pop().expect("checked length above") {
+        let primary = results.remove(0);
+
+        match primary {
             RuntimeStatementResult::Select { execution, .. } => execution.collect(),
             other => Err(Error::InvalidArgumentError(format!(
                 "SqlEngine::sql requires a SELECT statement, got {other:?}",
@@ -7315,12 +7352,17 @@ mod tests {
         engine.execute("INSERT INTO test VALUES (2)").unwrap();
 
         // SELECT will flush the buffer - result will have [INSERT, SELECT]
-        let mut result = engine.execute("SELECT * FROM test ORDER BY id").unwrap();
-        // Last result should be the SELECT
-        let batches = match result.pop().unwrap() {
-            RuntimeStatementResult::Select { execution, .. } => execution.collect().unwrap(),
-            other => panic!("Expected SELECT result, got {:?}", other),
-        };
+        let result = engine.execute("SELECT * FROM test ORDER BY id").unwrap();
+        let select_result = result
+            .into_iter()
+            .find_map(|res| match res {
+                RuntimeStatementResult::Select { execution, .. } => {
+                    Some(execution.collect().unwrap())
+                }
+                _ => None,
+            })
+            .expect("expected SELECT result in response");
+        let batches = select_result;
         assert_eq!(
             batches[0].num_rows(),
             2,
