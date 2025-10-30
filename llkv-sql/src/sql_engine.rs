@@ -7260,6 +7260,8 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
         ));
     }
     let item = &from[0];
+
+    // TODO: Joins are supported; should `extract_single_table` be updated to use `extract_tables` instead?
     if !item.joins.is_empty() {
         return Err(Error::InvalidArgumentError(
             "JOIN clauses are not supported yet".into(),
