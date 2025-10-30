@@ -603,36 +603,36 @@ where
                                 current: None,
                             });
                         }
-                        return Ok(BufferedInsertResult {
+                        Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
                                 table_name,
                                 rows_inserted: statement_rows,
                             }),
-                        });
+                        })
                     }
                     Some(_) => {
                         drop(buf);
                         flushed = self.flush_buffer_results()?;
                         let mut buf = self.insert_buffer.borrow_mut();
                         *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows));
-                        return Ok(BufferedInsertResult {
+                        Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
                                 table_name,
                                 rows_inserted: statement_rows,
                             }),
-                        });
+                        })
                     }
                     None => {
                         *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows));
-                        return Ok(BufferedInsertResult {
+                        Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
                                 table_name,
                                 rows_inserted: statement_rows,
                             }),
-                        });
+                        })
                     }
                 }
             }
