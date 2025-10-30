@@ -6101,12 +6101,16 @@ where
                         )
                     })?;
                     // Optimize: NOT (expr IS NULL) -> expr IS NOT NULL by flipping negation
+                    // Optimize: NOT Literal(bool) -> Literal(!bool) by constant folding
                     match inner {
                         llkv_expr::expr::Expr::IsNull { expr, negated } => {
                             result_stack.push(llkv_expr::expr::Expr::IsNull {
                                 expr,
                                 negated: !negated,
                             });
+                        }
+                        llkv_expr::expr::Expr::Literal(value) => {
+                            result_stack.push(llkv_expr::expr::Expr::Literal(!value));
                         }
                         other => {
                             result_stack.push(llkv_expr::expr::Expr::not(other));
