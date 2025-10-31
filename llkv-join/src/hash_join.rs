@@ -1433,27 +1433,28 @@ fn synthesize_left_join_nulls(
     output_schema: &Arc<Schema>,
 ) -> LlkvResult<RecordBatch> {
     use arrow::array::new_null_array;
-    
+
     let left_col_count = left_batch.num_columns();
     let right_col_count = output_schema.fields().len() - left_col_count;
     let row_count = left_batch.num_rows();
-    
+
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
-    
+
     // Copy left columns as-is
     for col in left_batch.columns() {
         columns.push(Arc::clone(col));
     }
-    
+
     // Append NULL arrays for right columns
     for field_idx in left_col_count..(left_col_count + right_col_count) {
         let field = output_schema.field(field_idx);
         let null_array = new_null_array(field.data_type(), row_count);
         columns.push(null_array);
     }
-    
-    RecordBatch::try_new(Arc::clone(output_schema), columns)
-        .map_err(|err| Error::InvalidArgumentError(format!("Failed to create LEFT JOIN null batch: {}", err)))
+
+    RecordBatch::try_new(Arc::clone(output_schema), columns).map_err(|err| {
+        Error::InvalidArgumentError(format!("Failed to create LEFT JOIN null batch: {}", err))
+    })
 }
 
 /// Cross product (Cartesian product) implementation for empty join keys
@@ -1492,8 +1493,9 @@ where
 
     // For INNER JOIN: if right side is empty, no results
     // For LEFT JOIN: if right side is empty, emit all left rows with NULL right columns
-    let right_is_empty = right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0);
-    
+    let right_is_empty =
+        right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0);
+
     if right_is_empty && options.join_type == JoinType::Inner {
         return Ok(());
     }

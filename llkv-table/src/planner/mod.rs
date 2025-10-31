@@ -63,6 +63,7 @@ use self::plan_graph::{
 };
 use self::program::{
     DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler, ProgramSet,
+    normalize_predicate,
 };
 use crate::stream::{RowStream, RowStreamBuilder};
 
@@ -614,9 +615,9 @@ where
         }
 
         let projections_vec = projections.to_vec();
-        let filter_arc = Arc::new(filter_expr.clone());
-        let plan_graph =
-            self.build_plan_graph(&projections_vec, filter_arc.as_ref(), options.clone())?;
+        let normalized_filter = normalize_predicate(filter_expr.clone());
+        let filter_arc = Arc::new(normalized_filter);
+        let plan_graph = self.build_plan_graph(&projections_vec, filter_expr, options.clone())?;
         let programs = ProgramCompiler::new(Arc::clone(&filter_arc)).compile()?;
 
         Ok(PlannedScan {
@@ -1152,6 +1153,7 @@ where
                                 DataType::Struct(struct_fields.into())
                             }
                             ScalarExpr::Cast { data_type, .. } => data_type.clone(),
+                            ScalarExpr::Not(_) => DataType::Int64,
                             ScalarExpr::Binary { .. }
                             | ScalarExpr::Compare { .. }
                             | ScalarExpr::Case { .. }
@@ -2035,24 +2037,11 @@ where
         NumericKernels::collect_fields(expr, &mut fields);
 
         if fields.is_empty() {
-            // Constant expression - simplify to fold any arithmetic operations
-            let simplified = NumericKernels::simplify(expr);
-            match simplified {
-                ScalarExpr::Literal(lit) => {
-                    let is_null = matches!(lit, Literal::Null);
-                    let matches = if negated { !is_null } else { is_null };
-                    if matches {
-                        return self.collect_all_row_ids(all_rows_cache);
-                    } else {
-                        return Ok(Vec::new());
-                    }
-                }
-                _ => {
-                    // Other constant expressions (shouldn't happen in practice)
-                    return Err(Error::Internal(
-                        "IS NULL on constant non-literal expression not supported".into(),
-                    ));
-                }
+            let matches = self.evaluate_constant_is_null(expr, negated, all_rows_cache)?;
+            if matches {
+                return self.collect_all_row_ids(all_rows_cache);
+            } else {
+                return Ok(Vec::new());
             }
         }
 
@@ -2810,7 +2799,8 @@ where
             return Ok(Vec::new());
         }
 
-        let determined = self.evaluate_is_null_over_rows(&candidate_rows, &ordered_fields, expr, negated)?;
+        let determined =
+            self.evaluate_is_null_over_rows(&candidate_rows, &ordered_fields, expr, negated)?;
         Ok(determined)
     }
 
@@ -3239,6 +3229,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
         ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
+        ScalarExpr::Not(expr) => computed_expr_requires_numeric(expr),
         ScalarExpr::Case { .. } => true,
         ScalarExpr::Coalesce(items) => items.iter().any(computed_expr_requires_numeric),
         ScalarExpr::ScalarSubquery(_) => false,
@@ -3284,6 +3275,7 @@ fn computed_expr_prefers_float(
                 computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)
             }
         }
+        ScalarExpr::Not(expr) => computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes),
         ScalarExpr::Case {
             operand,
             branches,
@@ -3326,6 +3318,7 @@ fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
             scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right)
         }
+        ScalarExpr::Not(expr) => scalar_expr_contains_coalesce(expr),
         ScalarExpr::Cast { expr, .. } => scalar_expr_contains_coalesce(expr),
         ScalarExpr::Case {
             operand,
@@ -3530,6 +3523,7 @@ fn synthesize_computed_literal_array(
         | ScalarExpr::Compare { .. }
         | ScalarExpr::Aggregate(_)
         | ScalarExpr::GetField { .. }
+        | ScalarExpr::Not(_)
         | ScalarExpr::Case { .. }
         | ScalarExpr::Coalesce(_) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
@@ -3740,6 +3734,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             }
             GetField { base, .. } => traverse_stack.push(base),
             Cast { expr, .. } => traverse_stack.push(expr),
+            Not(expr) => traverse_stack.push(expr),
             Case {
                 operand,
                 branches,
@@ -3789,6 +3784,10 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 let right = result_stack.pop().unwrap_or_default();
                 let left = result_stack.pop().unwrap_or_default();
                 result_stack.push(format!("({} {} {})", left, format_compare_op(*op), right));
+            }
+            Not(_) => {
+                let operand = result_stack.pop().unwrap_or_default();
+                result_stack.push(format!("(NOT {})", operand));
             }
             Case {
                 operand,

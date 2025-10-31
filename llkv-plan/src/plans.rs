@@ -121,7 +121,7 @@ impl From<i32> for PlanValue {
 /// such as in HAVING clauses or filter expressions.
 pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanValue> {
     use llkv_expr::Literal;
-    
+
     match literal {
         Literal::Null => Ok(PlanValue::Null),
         Literal::Integer(i) => {

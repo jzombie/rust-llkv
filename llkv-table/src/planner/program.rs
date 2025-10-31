@@ -283,6 +283,127 @@ impl<'expr> ProgramCompiler<'expr> {
     }
 }
 
+pub(crate) fn normalize_predicate<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
+    normalize_expr(expr)
+}
+
+fn normalize_expr<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
+    match expr {
+        Expr::And(children) => {
+            let mut normalized = Vec::with_capacity(children.len());
+            for child in children {
+                let child = normalize_expr(child);
+                match child {
+                    Expr::And(nested) => normalized.extend(nested),
+                    other => normalized.push(other),
+                }
+            }
+            Expr::And(normalized)
+        }
+        Expr::Or(children) => {
+            let mut normalized = Vec::with_capacity(children.len());
+            for child in children {
+                let child = normalize_expr(child);
+                match child {
+                    Expr::Or(nested) => normalized.extend(nested),
+                    other => normalized.push(other),
+                }
+            }
+            Expr::Or(normalized)
+        }
+        Expr::Not(inner) => normalize_negated(*inner),
+        other => other,
+    }
+}
+
+fn normalize_negated<'expr>(inner: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
+    match inner {
+        Expr::Not(nested) => normalize_expr(*nested),
+        Expr::And(children) => {
+            let mapped = children
+                .into_iter()
+                .map(|child| normalize_expr(Expr::Not(Box::new(child))))
+                .collect();
+            Expr::Or(mapped)
+        }
+        Expr::Or(children) => {
+            let mapped = children
+                .into_iter()
+                .map(|child| normalize_expr(Expr::Not(Box::new(child))))
+                .collect();
+            Expr::And(mapped)
+        }
+        Expr::Literal(value) => Expr::Literal(!value),
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr,
+            negated: !negated,
+        },
+        other => Expr::Not(Box::new(normalize_expr(other))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llkv_expr::literal::Literal;
+
+    #[test]
+    fn normalize_not_between_expands_to_or() {
+        let field: FieldId = 7;
+        let column = ScalarExpr::column(field);
+        let lower = ScalarExpr::literal(5_i64);
+        let upper = ScalarExpr::literal(Literal::Null);
+
+        let between = Expr::And(vec![
+            Expr::Compare {
+                left: column.clone(),
+                op: CompareOp::GtEq,
+                right: lower,
+            },
+            Expr::Compare {
+                left: column.clone(),
+                op: CompareOp::LtEq,
+                right: upper,
+            },
+        ]);
+
+        let normalized = normalize_predicate(Expr::Not(Box::new(between)));
+
+        let Expr::Or(children) = normalized else {
+            panic!("expected OR after normalization");
+        };
+        assert_eq!(children.len(), 2);
+
+        match &children[0] {
+            Expr::Not(inner) => match inner.as_ref() {
+                Expr::Compare {
+                    op: CompareOp::GtEq,
+                    ..
+                } => {}
+                other => panic!("unexpected left branch: {other:?}"),
+            },
+            other => panic!("left branch should be NOT(compare), got {other:?}"),
+        }
+
+        match &children[1] {
+            Expr::Not(inner) => match inner.as_ref() {
+                Expr::Compare {
+                    op: CompareOp::LtEq,
+                    ..
+                } => {}
+                other => panic!("unexpected right branch: {other:?}"),
+            },
+            other => panic!("right branch should be NOT(compare), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_flips_literal_bool() {
+        let normalized = normalize_predicate(Expr::Not(Box::new(Expr::Literal(true))));
+        assert!(matches!(normalized, Expr::Literal(false)));
+    }
+}
+
 #[derive(Clone, Copy)]
 enum EvalVisit<'expr> {
     Enter(&'expr Expr<'expr, FieldId>),
@@ -543,6 +664,9 @@ fn collect_fields<'expr>(
                 stack.push(base);
             }
             ScalarExpr::Cast { expr, .. } => {
+                stack.push(expr.as_ref());
+            }
+            ScalarExpr::Not(expr) => {
                 stack.push(expr.as_ref());
             }
             ScalarExpr::Case {

@@ -93,6 +93,8 @@ pub enum ScalarExpr<F> {
         op: BinaryOp,
         right: Box<ScalarExpr<F>>,
     },
+    /// Logical NOT returning 1 for falsey inputs, 0 for truthy inputs, and NULL for NULL inputs.
+    Not(Box<ScalarExpr<F>>),
     /// Aggregate function call (e.g., COUNT(*), SUM(col), etc.)
     /// This is used in expressions like COUNT(*) + 1
     Aggregate(AggregateCall<F>),
@@ -136,9 +138,18 @@ pub enum ScalarExpr<F> {
 #[derive(Clone, Debug)]
 pub enum AggregateCall<F> {
     CountStar,
-    Count { expr: Box<ScalarExpr<F>>, distinct: bool },
-    Sum { expr: Box<ScalarExpr<F>>, distinct: bool },
-    Avg { expr: Box<ScalarExpr<F>>, distinct: bool },
+    Count {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+    },
+    Sum {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+    },
+    Avg {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+    },
     Min(Box<ScalarExpr<F>>),
     Max(Box<ScalarExpr<F>>),
     CountNulls(Box<ScalarExpr<F>>),
@@ -162,6 +173,11 @@ impl<F> ScalarExpr<F> {
             op,
             right: Box::new(right),
         }
+    }
+
+    #[inline]
+    pub fn not(expr: Self) -> Self {
+        Self::Not(Box::new(expr))
     }
 
     #[inline]

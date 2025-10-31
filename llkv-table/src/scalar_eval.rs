@@ -358,6 +358,9 @@ impl NumericKernels {
                 Self::collect_fields(left, acc);
                 Self::collect_fields(right, acc);
             }
+            ScalarExpr::Not(inner) => {
+                Self::collect_fields(inner, acc);
+            }
             ScalarExpr::Aggregate(agg) => {
                 // Collect fields referenced by the aggregate expression
                 match agg {
@@ -455,6 +458,16 @@ impl NumericKernels {
                         Ok(Some(NumericValue::Integer(result as i64)))
                     }
                     _ => Ok(None),
+                }
+            }
+            ScalarExpr::Not(inner) => {
+                let value = Self::evaluate_value(inner, idx, arrays)?;
+                match value {
+                    Some(v) => {
+                        let is_truthy = Self::truthy_numeric(v);
+                        Ok(Some(NumericValue::Integer(if is_truthy { 0 } else { 1 })))
+                    }
+                    None => Ok(None),
                 }
             }
             ScalarExpr::Aggregate(_) => Err(Error::Internal(
@@ -600,6 +613,7 @@ impl NumericKernels {
                 }
             }
             ScalarExpr::Compare { .. } => Ok(None),
+            ScalarExpr::Not(_) => Ok(None),
             ScalarExpr::Aggregate(_) => Err(Error::Internal(
                 "Aggregate expressions should not appear in row-level evaluation".into(),
             )),
@@ -824,6 +838,25 @@ impl NumericKernels {
                 let right_s = Self::simplify(right);
                 ScalarExpr::compare(left_s, *op, right_s)
             }
+            ScalarExpr::Not(inner) => {
+                let simplified_inner = Self::simplify(inner);
+                match &simplified_inner {
+                    ScalarExpr::Literal(lit) => match lit {
+                        Literal::Null => ScalarExpr::literal(Literal::Null),
+                        Literal::Integer(v) => {
+                            ScalarExpr::literal(Literal::Integer(if *v == 0 { 1 } else { 0 }))
+                        }
+                        Literal::Float(v) => {
+                            ScalarExpr::literal(Literal::Integer(if *v == 0.0 { 1 } else { 0 }))
+                        }
+                        Literal::Boolean(v) => {
+                            ScalarExpr::literal(Literal::Integer(if *v { 0 } else { 1 }))
+                        }
+                        _ => ScalarExpr::not(simplified_inner),
+                    },
+                    _ => ScalarExpr::not(simplified_inner),
+                }
+            }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
                 // Casting NULL to any type yields NULL
@@ -901,6 +934,7 @@ impl NumericKernels {
                 }
             }
             ScalarExpr::Compare { .. } => None,
+            ScalarExpr::Not(_) => None,
             ScalarExpr::Cast { expr, .. } => Self::affine_state(expr),
             ScalarExpr::Case { .. } => None,
             ScalarExpr::Coalesce(_) => None,
@@ -1142,6 +1176,7 @@ impl NumericKernels {
                 Self::binary_result_kind(*op, left_kind, right_kind)
             }
             ScalarExpr::Compare { .. } => NumericKind::Integer,
+            ScalarExpr::Not(_) => NumericKind::Integer,
             ScalarExpr::Aggregate(_) => NumericKind::Float,
             ScalarExpr::GetField { .. } => NumericKind::Float,
             ScalarExpr::Cast { expr, data_type } => {
@@ -1202,6 +1237,7 @@ impl NumericKernels {
                 Some(Self::binary_result_kind(*op, left_kind, right_kind))
             }
             ScalarExpr::Compare { .. } => Some(NumericKind::Integer),
+            ScalarExpr::Not(_) => Some(NumericKind::Integer),
             ScalarExpr::Aggregate(_) => Some(NumericKind::Float),
             ScalarExpr::GetField { .. } => None,
             ScalarExpr::Cast { expr, data_type } => {

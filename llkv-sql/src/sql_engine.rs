@@ -4231,7 +4231,7 @@ where
         // Add join conditions to filter, but be careful with LEFT JOIN ON conditions
         // For INNER JOIN, ON conditions can be moved to WHERE clause (same semantics)
         // For LEFT JOIN, ON conditions must NOT filter out unmatched left rows
-        // Since we're not yet extracting join keys from ON conditions, and LEFT JOIN 
+        // Since we're not yet extracting join keys from ON conditions, and LEFT JOIN
         // ON conditions have different semantics, we skip adding them to WHERE for now
         // TODO: Properly parse ON conditions to extract join keys and handle non-equality conditions
         for (idx, join_expr) in join_conditions.iter().enumerate() {
@@ -4241,7 +4241,7 @@ where
                 .get(idx)
                 .map(|j| j.join_type == llkv_plan::JoinPlan::Left)
                 .unwrap_or(false);
-            
+
             if !is_left_join_condition {
                 // For INNER JOIN, ON condition can safely go in WHERE
                 let materialized_expr = self.materialize_in_subquery(join_expr.clone())?;
@@ -5404,7 +5404,9 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
             }
         }
         // Handle unary +/- by recursively resolving the inner expression
-        SqlExpr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) => {
+        SqlExpr::UnaryOp { op, expr }
+            if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) =>
+        {
             resolve_column_name(expr)
         }
         _ => Err(Error::InvalidArgumentError(
@@ -5450,6 +5452,7 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
         llkv_expr::expr::ScalarExpr::Compare { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
+        llkv_expr::expr::ScalarExpr::Not(inner) => expr_contains_aggregate(inner),
         llkv_expr::expr::ScalarExpr::GetField { base, .. } => expr_contains_aggregate(base),
         llkv_expr::expr::ScalarExpr::Cast { expr, .. } => expr_contains_aggregate(expr),
         llkv_expr::expr::ScalarExpr::Case {
@@ -5541,7 +5544,14 @@ fn try_parse_aggregate_function(
                     llkv_expr::expr::AggregateCall::CountStar
                 }
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
-                    let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
+                    let expr = translate_scalar_internal(
+                        arg_expr,
+                        resolver,
+                        context,
+                        outer_scopes,
+                        tracker,
+                        None,
+                    )?;
                     llkv_expr::expr::AggregateCall::Count {
                         expr: Box::new(expr),
                         distinct,
@@ -5576,9 +5586,18 @@ fn try_parse_aggregate_function(
                         "DISTINCT not supported for COUNT(CASE ...) pattern".into(),
                     ));
                 }
-                llkv_expr::expr::AggregateCall::CountNulls(Box::new(llkv_expr::expr::ScalarExpr::column(column)))
+                llkv_expr::expr::AggregateCall::CountNulls(Box::new(
+                    llkv_expr::expr::ScalarExpr::column(column),
+                ))
             } else {
-                let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
+                let expr = translate_scalar_internal(
+                    arg_expr,
+                    resolver,
+                    context,
+                    outer_scopes,
+                    tracker,
+                    None,
+                )?;
                 llkv_expr::expr::AggregateCall::Sum {
                     expr: Box::new(expr),
                     distinct,
@@ -5599,7 +5618,14 @@ fn try_parse_aggregate_function(
                     ));
                 }
             };
-            let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
+            let expr = translate_scalar_internal(
+                arg_expr,
+                resolver,
+                context,
+                outer_scopes,
+                tracker,
+                None,
+            )?;
             llkv_expr::expr::AggregateCall::Min(Box::new(expr))
         }
         "max" => {
@@ -5616,7 +5642,14 @@ fn try_parse_aggregate_function(
                     ));
                 }
             };
-            let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
+            let expr = translate_scalar_internal(
+                arg_expr,
+                resolver,
+                context,
+                outer_scopes,
+                tracker,
+                None,
+            )?;
             llkv_expr::expr::AggregateCall::Max(Box::new(expr))
         }
         "avg" => {
@@ -5633,8 +5666,18 @@ fn try_parse_aggregate_function(
                     ));
                 }
             };
-            let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
-            llkv_expr::expr::AggregateCall::Avg { expr: Box::new(expr), distinct }
+            let expr = translate_scalar_internal(
+                arg_expr,
+                resolver,
+                context,
+                outer_scopes,
+                tracker,
+                None,
+            )?;
+            llkv_expr::expr::AggregateCall::Avg {
+                expr: Box::new(expr),
+                distinct,
+            }
         }
         _ => return Ok(None),
     };
@@ -6382,6 +6425,7 @@ fn translate_scalar_internal(
         Compare {
             op: llkv_expr::expr::CompareOp,
         },
+        UnaryNot,
         UnaryMinus,
         UnaryPlus,
         Nested,
@@ -6506,6 +6550,13 @@ fn translate_scalar_internal(
                     }
                 },
                 SqlExpr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: inner,
+                } => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::UnaryNot));
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::UnaryOp {
                     op: UnaryOperator::Minus,
                     expr: inner,
                 } => {
@@ -6555,7 +6606,13 @@ fn translate_scalar_internal(
                     }
                 }
                 SqlExpr::Function(func) => {
-                    if let Some(agg_call) = try_parse_aggregate_function(func, resolver, context, outer_scopes, tracker)? {
+                    if let Some(agg_call) = try_parse_aggregate_function(
+                        func,
+                        resolver,
+                        context,
+                        outer_scopes,
+                        tracker,
+                    )? {
                         work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::aggregate(
                             agg_call,
                         )));
@@ -6939,6 +6996,14 @@ fn translate_scalar_internal(
                             ));
                         }
                     }
+                }
+                ScalarExitContext::UnaryNot => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for UnaryNot".into(),
+                        )
+                    })?;
+                    result_stack.push(llkv_expr::expr::ScalarExpr::not(inner));
                 }
                 ScalarExitContext::UnaryPlus => {
                     // Unary plus is a no-op - just pass through
@@ -7608,7 +7673,8 @@ fn extract_tables(
                 | JoinOperator::Anti(_)
                 | JoinOperator::StraightJoin(_) => {
                     return Err(Error::InvalidArgumentError(
-                        "only INNER JOIN and LEFT JOIN with optional ON constraints are supported".into(),
+                        "only INNER JOIN and LEFT JOIN with optional ON constraints are supported"
+                            .into(),
                     ));
                 }
                 other => {

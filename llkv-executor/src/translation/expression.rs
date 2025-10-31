@@ -124,7 +124,10 @@ where
                         negated,
                     }));
                 }
-                LlkvExpr::IsNull { expr: target, negated } => {
+                LlkvExpr::IsNull {
+                    expr: target,
+                    negated,
+                } => {
                     let translated_target =
                         translate_scalar_with(&target, schema, unknown_column, unknown_aggregate)?;
                     owned_stack.push(OwnedFrame::Leaf(LlkvExpr::IsNull {
@@ -212,6 +215,12 @@ where
                 unknown_aggregate,
             )?),
         }),
+        ScalarExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(translate_scalar_with(
+            inner,
+            schema,
+            unknown_column,
+            unknown_aggregate,
+        )?))),
         ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
             left: Box::new(translate_scalar_with(
                 left,
@@ -228,36 +237,46 @@ where
             )?),
         }),
         ScalarExpr::Aggregate(agg) => {
-            let translated = match agg {
-                AggregateCall::CountStar => AggregateCall::CountStar,
-                AggregateCall::Count { expr, distinct } => {
-                    AggregateCall::Count { 
-                        expr: Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?),
+            let translated =
+                match agg {
+                    AggregateCall::CountStar => AggregateCall::CountStar,
+                    AggregateCall::Count { expr, distinct } => AggregateCall::Count {
+                        expr: Box::new(translate_scalar_with(
+                            expr,
+                            schema,
+                            unknown_column,
+                            unknown_aggregate,
+                        )?),
                         distinct: *distinct,
-                    }
-                }
-                AggregateCall::Sum { expr, distinct } => {
-                    AggregateCall::Sum { 
-                        expr: Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?),
+                    },
+                    AggregateCall::Sum { expr, distinct } => AggregateCall::Sum {
+                        expr: Box::new(translate_scalar_with(
+                            expr,
+                            schema,
+                            unknown_column,
+                            unknown_aggregate,
+                        )?),
                         distinct: *distinct,
-                    }
-                }
-                AggregateCall::Avg { expr, distinct } => {
-                    AggregateCall::Avg { 
-                        expr: Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?),
+                    },
+                    AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
+                        expr: Box::new(translate_scalar_with(
+                            expr,
+                            schema,
+                            unknown_column,
+                            unknown_aggregate,
+                        )?),
                         distinct: *distinct,
-                    }
-                }
-                AggregateCall::Min(expr) => {
-                    AggregateCall::Min(Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?))
-                }
-                AggregateCall::Max(expr) => {
-                    AggregateCall::Max(Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?))
-                }
-                AggregateCall::CountNulls(expr) => {
-                    AggregateCall::CountNulls(Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?))
-                }
-            };
+                    },
+                    AggregateCall::Min(expr) => AggregateCall::Min(Box::new(
+                        translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?,
+                    )),
+                    AggregateCall::Max(expr) => AggregateCall::Max(Box::new(
+                        translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?,
+                    )),
+                    AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(
+                        translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?,
+                    )),
+                };
             Ok(ScalarExpr::Aggregate(translated))
         }
         ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {

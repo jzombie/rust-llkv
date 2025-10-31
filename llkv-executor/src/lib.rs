@@ -28,7 +28,9 @@ use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::SubqueryId;
-use llkv_expr::expr::{AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
+use llkv_expr::expr::{
+    AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
+};
 use llkv_expr::literal::Literal;
 use llkv_expr::typed_predicate::{
     build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -132,7 +134,7 @@ struct GroupState {
 struct GroupAggregateState {
     batch: RecordBatch,
     representative_row: usize,
-    row_indices: Vec<usize>,  // Track all rows belonging to this group
+    row_indices: Vec<usize>, // Track all rows belonging to this group
 }
 
 struct OutputColumn {
@@ -217,7 +219,7 @@ pub fn current_query_label() -> Option<String> {
 /// Extract a simple column name from a ScalarExpr when possible.
 ///
 /// Returns `Some(column_name)` if the expression is a plain column reference
-/// (possibly wrapped in unary + or - operators), otherwise returns `None` 
+/// (possibly wrapped in unary + or - operators), otherwise returns `None`
 /// (indicating a complex expression that needs full evaluation).
 ///
 /// This handles common cases like `col`, `+col`, `-col`, `++col`, etc.
@@ -269,7 +271,7 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
 /// The array type is inferred from the first non-null value.
 fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> {
     use arrow::array::{Float64Array, Int64Array, StringArray};
-    
+
     // Infer type from first non-null value
     let mut value_type = None;
     for v in values {
@@ -278,7 +280,7 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
             break;
         }
     }
-    
+
     match value_type {
         Some(PlanValue::Integer(_)) => {
             let int_values: Vec<Option<i64>> = values
@@ -335,15 +337,19 @@ fn resolve_column_name_to_index(
     column_lookup_map: &FxHashMap<String, usize>,
 ) -> Option<usize> {
     let col_lower = col_name.to_ascii_lowercase();
-    
+
     // Try exact match first
     if let Some(&idx) = column_lookup_map.get(&col_lower) {
         return Some(idx);
     }
-    
+
     // Try matching just the column name without table qualifier
     // e.g., "cor0.col0" should match a field ending in ".col0" or exactly "col0"
-    let unqualified = col_name.rsplit('.').next().unwrap_or(col_name).to_ascii_lowercase();
+    let unqualified = col_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(col_name)
+        .to_ascii_lowercase();
     column_lookup_map
         .iter()
         .find(|(k, _)| k.ends_with(&format!(".{}", unqualified)) || k == &&unqualified)
@@ -568,7 +574,8 @@ where
                 Self::expr_contains_aggregate(left) || Self::expr_contains_aggregate(right)
             }
             llkv_expr::expr::Expr::InList { expr, list, .. } => {
-                Self::expr_contains_aggregate(expr) || list.iter().any(|e| Self::expr_contains_aggregate(e))
+                Self::expr_contains_aggregate(expr)
+                    || list.iter().any(|e| Self::expr_contains_aggregate(e))
             }
             llkv_expr::expr::Expr::IsNull { expr, .. } => Self::expr_contains_aggregate(expr),
             llkv_expr::expr::Expr::Literal(_) => false,
@@ -589,6 +596,7 @@ where
             }
             ScalarExpr::GetField { base, .. } => Self::expr_contains_aggregate(base),
             ScalarExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),
+            ScalarExpr::Not(expr) => Self::expr_contains_aggregate(expr),
             ScalarExpr::Case {
                 operand,
                 branches,
@@ -907,30 +915,37 @@ where
         } else {
             // Hash join not applicable - use llkv-join for proper join support or fall back to cartesian product
             let has_joins = !plan.joins.is_empty();
-            
+
             if has_joins && tables_with_handles.len() == 2 {
                 // Use llkv-join for 2-table joins (including LEFT JOIN)
                 use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
-                
+
                 let (left_ref, left_table) = &tables_with_handles[0];
                 let (right_ref, right_table) = &tables_with_handles[1];
-                
+
                 // Determine join type from plan and convert to llkv_join::JoinType
-                let join_type = plan.joins.get(0).map(|j| match j.join_type {
-                    llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
-                    llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
-                    llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
-                    llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
-                }).unwrap_or(llkv_join::JoinType::Inner);
-                
-                tracing::debug!("Using llkv-join for {join_type:?} join between {} and {}", 
-                    left_ref.qualified_name(), right_ref.qualified_name());
-                
+                let join_type = plan
+                    .joins
+                    .get(0)
+                    .map(|j| match j.join_type {
+                        llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
+                        llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
+                        llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
+                        llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
+                    })
+                    .unwrap_or(llkv_join::JoinType::Inner);
+
+                tracing::debug!(
+                    "Using llkv-join for {join_type:?} join between {} and {}",
+                    left_ref.qualified_name(),
+                    right_ref.qualified_name()
+                );
+
                 // Extract join keys from constraints if available
                 // For now, use empty keys (cross product) and rely on filter
                 // TODO: Parse ON conditions to extract proper join keys
                 let join_keys: Vec<JoinKey> = Vec::new();
-                
+
                 let mut result_batches = Vec::new();
                 left_table.table.join_stream(
                     &right_table.table,
@@ -943,7 +958,7 @@ where
                         result_batches.push(batch);
                     },
                 )?;
-                
+
                 // Build combined schema and convert to TableCrossProductData
                 let mut combined_fields = Vec::new();
                 for col in &left_table.schema.columns {
@@ -961,10 +976,13 @@ where
                     ));
                 }
                 let combined_schema = Arc::new(Schema::new(combined_fields));
-                
-                let column_counts = vec![left_table.schema.columns.len(), right_table.schema.columns.len()];
+
+                let column_counts = vec![
+                    left_table.schema.columns.len(),
+                    right_table.schema.columns.len(),
+                ];
                 let table_indices = vec![0, 1];
-                
+
                 TableCrossProductData {
                     schema: combined_schema,
                     batches: result_batches,
@@ -974,7 +992,10 @@ where
             } else {
                 // Fall back to cartesian product for other cases
                 let constraint_map = if let Some(filter_wrapper) = remaining_filter.as_ref() {
-                    extract_literal_pushdown_filters(&filter_wrapper.predicate, &tables_with_handles)
+                    extract_literal_pushdown_filters(
+                        &filter_wrapper.predicate,
+                        &tables_with_handles,
+                    )
                 } else {
                     vec![Vec::new(); tables_with_handles.len()]
                 };
@@ -1463,7 +1484,8 @@ where
                     // Complex expressions in aggregates need expression evaluation support
                     let column = try_extract_simple_column(expr).ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "complex expressions in aggregates not yet supported in this context".into()
+                            "complex expressions in aggregates not yet supported in this context"
+                                .into(),
                         )
                     })?;
                     let key_lower = column.to_ascii_lowercase();
@@ -1561,7 +1583,7 @@ where
         let mut results = FxHashMap::default();
         for state in states {
             let (field, array) = state.finalize()?;
-            
+
             // Try Int64Array first
             if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                 if int_array.len() != 1 {
@@ -1576,7 +1598,7 @@ where
                     AggregateValue::Int64(int_array.value(0))
                 };
                 results.insert(field.name().to_string(), value);
-            } 
+            }
             // Try Float64Array for AVG
             else if let Some(float_array) = array.as_any().downcast_ref::<Float64Array>() {
                 if float_array.len() != 1 {
@@ -1774,7 +1796,10 @@ where
         }
 
         // Determine if we should use llkv-join (when LEFT JOINs are present or for better architecture)
-        let has_left_join = plan.joins.iter().any(|j| j.join_type == llkv_plan::JoinPlan::Left);
+        let has_left_join = plan
+            .joins
+            .iter()
+            .any(|j| j.join_type == llkv_plan::JoinPlan::Left);
 
         let mut current: Option<TableCrossProductData> = None;
 
@@ -1833,7 +1858,12 @@ where
                         );
                         cross_join_table_batches(current_data, next_data)?
                     } else {
-                        hash_join_table_batches(current_data, next_data, &join_keys, llkv_join::JoinType::Inner)?
+                        hash_join_table_batches(
+                            current_data,
+                            next_data,
+                            &join_keys,
+                            llkv_join::JoinType::Inner,
+                        )?
                     };
                     current = Some(joined);
                 } else {
@@ -2294,10 +2324,16 @@ where
         let base_schema = schema_for_projections(table_ref, &projections)?;
 
         // Build filter if present (should NOT contain aggregates)
-        tracing::debug!("[GROUP BY] Building base filter: has_filter={}", base_plan.filter.is_some());
+        tracing::debug!(
+            "[GROUP BY] Building base filter: has_filter={}",
+            base_plan.filter.is_some()
+        );
         let (filter_expr, full_table_scan) = match &base_plan.filter {
             Some(filter_wrapper) => {
-                tracing::debug!("[GROUP BY] Translating filter predicate: {:?}", filter_wrapper.predicate);
+                tracing::debug!(
+                    "[GROUP BY] Translating filter predicate: {:?}",
+                    filter_wrapper.predicate
+                );
                 let expr = crate::translation::expression::translate_predicate(
                     filter_wrapper.predicate.clone(),
                     table_ref.schema.as_ref(),
@@ -2310,12 +2346,13 @@ where
                 )?;
                 tracing::debug!("[GROUP BY] Translated filter expr: {:?}", expr);
                 (expr, false)
-            },
+            }
             None => {
                 // Use first column as dummy for full table scan
-                let first_col = table_ref.schema.columns.first().ok_or_else(|| {
-                    Error::InvalidArgumentError("Table has no columns".into())
-                })?;
+                let first_col =
+                    table_ref.schema.columns.first().ok_or_else(|| {
+                        Error::InvalidArgumentError("Table has no columns".into())
+                    })?;
                 (full_table_scan_filter(first_col.field_id), true)
             }
         };
@@ -2372,16 +2409,23 @@ where
 
         // If there are aggregates with GROUP BY, OR if HAVING contains aggregates, use aggregates path
         // Must check HAVING because aggregates can appear in HAVING even if not in SELECT projections
-        let having_has_aggregates = plan.having.as_ref().map(|h| Self::predicate_contains_aggregate(h)).unwrap_or(false);
-        
+        let having_has_aggregates = plan
+            .having
+            .as_ref()
+            .map(|h| Self::predicate_contains_aggregate(h))
+            .unwrap_or(false);
+
         tracing::debug!(
             "[GROUP BY PATH] aggregates={}, has_computed={}, having_has_agg={}",
             plan.aggregates.len(),
             self.has_computed_aggregates(&plan),
             having_has_aggregates
         );
-        
-        if !plan.aggregates.is_empty() || self.has_computed_aggregates(&plan) || having_has_aggregates {
+
+        if !plan.aggregates.is_empty()
+            || self.has_computed_aggregates(&plan)
+            || having_has_aggregates
+        {
             tracing::debug!("[GROUP BY PATH] Taking aggregates path");
             return self.execute_group_by_with_aggregates(
                 display_name,
@@ -2570,8 +2614,6 @@ where
             batch,
         ))
     }
-
-
 
     fn build_group_by_output_columns(
         &self,
@@ -2772,7 +2814,7 @@ where
                 Self::collect_aggregates(expr, &mut aggregate_specs);
             }
         }
-        
+
         // Also extract aggregates from HAVING clause
         if let Some(having_expr) = &plan.having {
             Self::collect_aggregates_from_predicate(having_expr, &mut aggregate_specs);
@@ -2786,7 +2828,7 @@ where
         for batch in &batches {
             for row_idx in 0..batch.num_rows() {
                 let key = build_group_key(batch, row_idx, &key_indices)?;
-                
+
                 if let Some(&group_idx) = group_index.get(&key) {
                     // Add row to existing group
                     group_states[group_idx].row_indices.push(row_idx);
@@ -2812,7 +2854,7 @@ where
             let group_batch = {
                 let schema = group_state.batch.schema();
                 let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-                
+
                 for col_idx in 0..schema.fields().len() {
                     let source_array = group_state.batch.column(col_idx);
                     // Use Arrow's take kernel to extract rows for this group
@@ -2826,17 +2868,17 @@ where
                     let taken = arrow::compute::take(source_array.as_ref(), &indices, None)?;
                     arrays.push(taken);
                 }
-                
+
                 RecordBatch::try_new(schema, arrays)?
             };
 
             // Create AggregateState for each aggregate and compute
             let mut aggregate_values: FxHashMap<String, PlanValue> = FxHashMap::default();
-            
+
             // We might need to add computed columns to the batch for complex aggregate expressions
             let mut working_batch = group_batch.clone();
             let mut next_temp_col_idx = working_batch.num_columns();
-            
+
             for (key, agg_call) in &aggregate_specs {
                 // For aggregates on columns, find the column index in the batch
                 let (projection_idx, _needs_cleanup) = match agg_call {
@@ -2865,37 +2907,35 @@ where
                                 )?;
                                 computed_values.push(value);
                             }
-                            
+
                             // Convert PlanValues to Arrow array
                             let computed_array = plan_values_to_arrow_array(&computed_values)?;
-                            
+
                             // Add this as a new column to the working batch
                             let mut new_columns: Vec<ArrayRef> = working_batch.columns().to_vec();
                             new_columns.push(computed_array);
-                            
+
                             let temp_field = Arc::new(Field::new(
                                 format!("__temp_agg_expr_{}", next_temp_col_idx),
                                 arrow::datatypes::DataType::Int64, // TODO: infer from expr
                                 true,
                             ));
-                            let mut new_fields: Vec<Arc<Field>> = working_batch.schema().fields().iter().cloned().collect();
+                            let mut new_fields: Vec<Arc<Field>> =
+                                working_batch.schema().fields().iter().cloned().collect();
                             new_fields.push(temp_field);
                             let new_schema = Arc::new(Schema::new(new_fields));
-                            
+
                             working_batch = RecordBatch::try_new(new_schema, new_columns)?;
-                            
+
                             let col_idx = next_temp_col_idx;
                             next_temp_col_idx += 1;
                             (Some(col_idx), true)
                         }
                     }
                 };
-                
+
                 // Build the AggregateSpec - use dummy field_id since projection_idx will override it
-                let spec = Self::build_aggregate_spec_for_cross_product(
-                    agg_call,
-                    key.clone(),
-                )?;
+                let spec = Self::build_aggregate_spec_for_cross_product(agg_call, key.clone())?;
 
                 let mut state = llkv_aggregate::AggregateState {
                     alias: key.clone(),
@@ -2915,7 +2955,7 @@ where
                 let value = llkv_plan::plan_value_from_array(&array, 0)?;
                 aggregate_values.insert(key.clone(), value);
             }
-            
+
             group_aggregate_values.push(aggregate_values);
         }
 
@@ -2924,7 +2964,9 @@ where
             &plan,
             base_schema.as_ref(),
             &column_lookup_map,
-            batches.first().unwrap_or(&RecordBatch::new_empty(Arc::clone(&base_schema))),
+            batches
+                .first()
+                .unwrap_or(&RecordBatch::new_empty(Arc::clone(&base_schema))),
         )?;
 
         let mut rows: Vec<Vec<PlanValue>> = Vec::with_capacity(group_states.len());
@@ -3406,7 +3448,7 @@ where
             } => {
                 let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                     Error::InvalidArgumentError(
-                        "complex expressions in COUNT not yet fully supported".into()
+                        "complex expressions in COUNT not yet fully supported".into(),
                     )
                 })?;
                 let col_idx = column_lookup
@@ -3433,7 +3475,7 @@ where
             } => {
                 let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                     Error::InvalidArgumentError(
-                        "complex expressions in SUM not yet fully supported".into()
+                        "complex expressions in SUM not yet fully supported".into(),
                     )
                 })?;
                 let col_idx = column_lookup
@@ -3461,7 +3503,7 @@ where
             } => {
                 let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                     Error::InvalidArgumentError(
-                        "complex expressions in AVG not yet fully supported".into()
+                        "complex expressions in AVG not yet fully supported".into(),
                     )
                 })?;
                 let col_idx = column_lookup
@@ -3486,7 +3528,7 @@ where
             AggregateCall::Min(col_expr) => {
                 let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                     Error::InvalidArgumentError(
-                        "complex expressions in MIN not yet fully supported".into()
+                        "complex expressions in MIN not yet fully supported".into(),
                     )
                 })?;
                 let col_idx = column_lookup
@@ -3510,7 +3552,7 @@ where
             AggregateCall::Max(col_expr) => {
                 let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                     Error::InvalidArgumentError(
-                        "complex expressions in MAX not yet fully supported".into()
+                        "complex expressions in MAX not yet fully supported".into(),
                     )
                 })?;
                 let col_idx = column_lookup
@@ -3534,7 +3576,7 @@ where
             AggregateCall::CountNulls(col_expr) => {
                 let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                     Error::InvalidArgumentError(
-                        "complex expressions in CountNulls not yet fully supported".into()
+                        "complex expressions in CountNulls not yet fully supported".into(),
                     )
                 })?;
                 let col_idx = column_lookup
@@ -3592,7 +3634,9 @@ where
                 field_id: 0,
                 data_type: DataType::Int64,
             },
-            AggregateCall::CountNulls(_) => llkv_aggregate::AggregateKind::CountNulls { field_id: 0 },
+            AggregateCall::CountNulls(_) => {
+                llkv_aggregate::AggregateKind::CountNulls { field_id: 0 }
+            }
         };
 
         Ok(llkv_aggregate::AggregateSpec { alias, kind })
@@ -3623,6 +3667,9 @@ where
                 Self::collect_aggregates(base, aggregates);
             }
             ScalarExpr::Cast { expr, .. } => {
+                Self::collect_aggregates(expr, aggregates);
+            }
+            ScalarExpr::Not(expr) => {
                 Self::collect_aggregates(expr, aggregates);
             }
             ScalarExpr::Case {
@@ -3669,7 +3716,11 @@ where
             llkv_expr::expr::Expr::Not(inner) => {
                 Self::collect_aggregates_from_predicate(inner, aggregates);
             }
-            llkv_expr::expr::Expr::InList { expr: test_expr, list, .. } => {
+            llkv_expr::expr::Expr::InList {
+                expr: test_expr,
+                list,
+                ..
+            } => {
                 Self::collect_aggregates(test_expr, aggregates);
                 for item in list {
                     Self::collect_aggregates(item, aggregates);
@@ -3712,7 +3763,7 @@ where
                 } => {
                     let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "complex expressions in COUNT not yet fully supported".into()
+                            "complex expressions in COUNT not yet fully supported".into(),
                         )
                     })?;
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
@@ -3729,7 +3780,7 @@ where
                 } => {
                     let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "complex expressions in SUM not yet fully supported".into()
+                            "complex expressions in SUM not yet fully supported".into(),
                         )
                     })?;
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
@@ -3747,7 +3798,7 @@ where
                 } => {
                     let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "complex expressions in AVG not yet fully supported".into()
+                            "complex expressions in AVG not yet fully supported".into(),
                         )
                     })?;
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
@@ -3762,7 +3813,7 @@ where
                 AggregateCall::Min(col_expr) => {
                     let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "complex expressions in MIN not yet fully supported".into()
+                            "complex expressions in MIN not yet fully supported".into(),
                         )
                     })?;
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
@@ -3776,7 +3827,7 @@ where
                 AggregateCall::Max(col_expr) => {
                     let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "complex expressions in MAX not yet fully supported".into()
+                            "complex expressions in MAX not yet fully supported".into(),
                         )
                     })?;
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
@@ -3790,7 +3841,7 @@ where
                 AggregateCall::CountNulls(col_expr) => {
                     let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "complex expressions in CountNulls not yet fully supported".into()
+                            "complex expressions in CountNulls not yet fully supported".into(),
                         )
                     })?;
                     let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
@@ -3931,7 +3982,9 @@ where
                 results.insert(alias, value);
             }
             // Try Float64Array for AVG
-            else if let Some(float64_array) = array.as_any().downcast_ref::<arrow::array::Float64Array>() {
+            else if let Some(float64_array) =
+                array.as_any().downcast_ref::<arrow::array::Float64Array>()
+            {
                 if float64_array.len() != 1 {
                     return Err(Error::Internal(format!(
                         "Expected single value from aggregate, got {}",
@@ -3986,7 +4039,7 @@ where
                     Some(column_lookup),
                     row_idx,
                 )?;
-                
+
                 // Coerce numeric types for comparison
                 let (left_val, right_val) = match (&left_val, &right_val) {
                     (PlanValue::Integer(i), PlanValue::Float(_)) => {
@@ -4028,12 +4081,22 @@ where
             }
             llkv_expr::expr::Expr::Not(inner) => {
                 // NOT NULL = NULL, NOT TRUE = FALSE, NOT FALSE = TRUE
-                match Self::evaluate_having_expr(inner, aggregates, row_batch, column_lookup, row_idx)? {
+                match Self::evaluate_having_expr(
+                    inner,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )? {
                     Some(b) => Ok(Some(!b)),
                     None => Ok(None), // NOT NULL = NULL
                 }
             }
-            llkv_expr::expr::Expr::InList { expr: test_expr, list, negated } => {
+            llkv_expr::expr::Expr::InList {
+                expr: test_expr,
+                list,
+                negated,
+            } => {
                 let test_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
                     test_expr,
                     aggregates,
@@ -4041,16 +4104,16 @@ where
                     Some(column_lookup),
                     row_idx,
                 )?;
-                
+
                 // SQL semantics: test_value IN (NULL, ...) handling
                 // - If test_val is NULL, result is always NULL
                 if matches!(test_val, PlanValue::Null) {
                     return Ok(None);
                 }
-                
+
                 let mut found = false;
                 let mut has_null = false;
-                
+
                 for list_item in list {
                     let list_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
                         list_item,
@@ -4059,13 +4122,13 @@ where
                         Some(column_lookup),
                         row_idx,
                     )?;
-                    
+
                     // Track if list contains NULL
                     if matches!(list_val, PlanValue::Null) {
                         has_null = true;
                         continue;
                     }
-                    
+
                     // Coerce for comparison
                     let matches = match (&test_val, &list_val) {
                         (PlanValue::Integer(a), PlanValue::Integer(b)) => a == b,
@@ -4075,13 +4138,13 @@ where
                         (PlanValue::String(a), PlanValue::String(b)) => a == b,
                         _ => false,
                     };
-                    
+
                     if matches {
                         found = true;
                         break;
                     }
                 }
-                
+
                 // SQL semantics for IN/NOT IN with NULL:
                 // - value IN (...): TRUE if match found, FALSE if no match and no NULLs, NULL if no match but has NULLs
                 // - value NOT IN (...): FALSE if match found, TRUE if no match and no NULLs, NULL if no match but has NULLs
@@ -4114,7 +4177,7 @@ where
                     Some(column_lookup),
                     row_idx,
                 )?;
-                
+
                 // IS NULL / IS NOT NULL returns a boolean (not NULL) even when testing NULL
                 // NULL IS NULL = TRUE
                 // NULL IS NOT NULL = FALSE
@@ -4126,7 +4189,13 @@ where
                 // AND with NULL: FALSE AND anything = FALSE, TRUE AND NULL = NULL, NULL AND TRUE = NULL
                 let mut has_null = false;
                 for e in exprs {
-                    match Self::evaluate_having_expr(e, aggregates, row_batch, column_lookup, row_idx)? {
+                    match Self::evaluate_having_expr(
+                        e,
+                        aggregates,
+                        row_batch,
+                        column_lookup,
+                        row_idx,
+                    )? {
                         Some(false) => return Ok(Some(false)), // Short-circuit on FALSE
                         None => has_null = true,
                         Some(true) => {} // Continue
@@ -4138,7 +4207,13 @@ where
                 // OR with NULL: TRUE OR anything = TRUE, FALSE OR NULL = NULL, NULL OR FALSE = NULL
                 let mut has_null = false;
                 for e in exprs {
-                    match Self::evaluate_having_expr(e, aggregates, row_batch, column_lookup, row_idx)? {
+                    match Self::evaluate_having_expr(
+                        e,
+                        aggregates,
+                        row_batch,
+                        column_lookup,
+                        row_idx,
+                    )? {
                         Some(true) => return Ok(Some(true)), // Short-circuit on TRUE
                         None => has_null = true,
                         Some(false) => {} // Continue
@@ -4150,14 +4225,19 @@ where
                 // Handle Filter predicates (e.g., column IS NULL, column IS NOT NULL)
                 // In HAVING context, filters reference columns in the grouped result
                 use llkv_expr::expr::Operator;
-                
+
                 let col_name = &filter.field_id;
-                let col_idx = column_lookup.get(&col_name.to_ascii_lowercase()).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!("column '{}' not found in HAVING context", col_name))
-                })?;
-                
+                let col_idx = column_lookup
+                    .get(&col_name.to_ascii_lowercase())
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(format!(
+                            "column '{}' not found in HAVING context",
+                            col_name
+                        ))
+                    })?;
+
                 let value = llkv_plan::plan_value_from_array(row_batch.column(*col_idx), row_idx)?;
-                
+
                 match &filter.op {
                     Operator::IsNull => Ok(Some(matches!(value, PlanValue::Null))),
                     Operator::IsNotNull => Ok(Some(!matches!(value, PlanValue::Null))),
@@ -4183,11 +4263,9 @@ where
                     }
                 }
             }
-            llkv_expr::expr::Expr::Exists(_) => {
-                Err(Error::InvalidArgumentError(
-                    "EXISTS subqueries not supported in HAVING clause".into(),
-                ))
-            }
+            llkv_expr::expr::Expr::Exists(_) => Err(Error::InvalidArgumentError(
+                "EXISTS subqueries not supported in HAVING clause".into(),
+            )),
         }
     }
 
@@ -4241,12 +4319,12 @@ where
                     column_lookup,
                     row_idx,
                 )?;
-                
+
                 // Handle NULL comparisons (return NULL as 0 for integer context)
                 if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
                     return Ok(PlanValue::Integer(0));
                 }
-                
+
                 // Coerce types for comparison
                 let (left_val, right_val) = match (&left_val, &right_val) {
                     (PlanValue::Integer(i), PlanValue::Float(_)) => {
@@ -4257,7 +4335,7 @@ where
                     }
                     _ => (left_val, right_val),
                 };
-                
+
                 // Perform the comparison
                 let result = match (&left_val, &right_val) {
                     (PlanValue::Integer(l), PlanValue::Integer(r)) => {
@@ -4295,9 +4373,26 @@ where
                     }
                     _ => false,
                 };
-                
+
                 // Return 1 for true, 0 for false (integer representation of boolean)
                 Ok(PlanValue::Integer(if result { 1 } else { 0 }))
+            }
+            ScalarExpr::Not(inner) => {
+                let value = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    inner,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )?;
+                match value {
+                    PlanValue::Integer(v) => Ok(PlanValue::Integer(if v != 0 { 0 } else { 1 })),
+                    PlanValue::Float(v) => Ok(PlanValue::Integer(if v != 0.0 { 0 } else { 1 })),
+                    PlanValue::Null => Ok(PlanValue::Null),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "logical NOT does not support value {other:?}"
+                    ))),
+                }
             }
             ScalarExpr::Aggregate(agg) => {
                 let key = format!("{:?}", agg);
@@ -4307,9 +4402,20 @@ where
                     .ok_or_else(|| Error::Internal(format!("Aggregate value not found: {}", key)))
             }
             ScalarExpr::Binary { left, op, right } => {
-                let left_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(left, aggregates, row_batch, column_lookup, row_idx)?;
-                let right_val =
-                    Self::evaluate_expr_with_plan_value_aggregates_and_row(right, aggregates, row_batch, column_lookup, row_idx)?;
+                let left_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    left,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )?;
+                let right_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    right,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )?;
 
                 // Convert to numeric values for binary operations
                 let left_num = match left_val {
@@ -4319,7 +4425,7 @@ where
                     _ => {
                         return Err(Error::InvalidArgumentError(
                             "Non-numeric value in binary operation".into(),
-                        ))
+                        ));
                     }
                 };
                 let right_num = match right_val {
@@ -4329,7 +4435,7 @@ where
                     _ => {
                         return Err(Error::InvalidArgumentError(
                             "Non-numeric value in binary operation".into(),
-                        ))
+                        ));
                     }
                 };
 
@@ -4364,12 +4470,12 @@ where
                     column_lookup,
                     row_idx,
                 )?;
-                
+
                 // Handle NULL values
                 if matches!(value, PlanValue::Null) {
                     return Ok(PlanValue::Null);
                 }
-                
+
                 // Cast to the target type
                 match data_type {
                     DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
@@ -4377,9 +4483,12 @@ where
                             PlanValue::Integer(i) => Ok(PlanValue::Integer(i)),
                             PlanValue::Float(f) => Ok(PlanValue::Integer(f as i64)),
                             PlanValue::String(s) => {
-                                s.parse::<i64>()
-                                    .map(PlanValue::Integer)
-                                    .map_err(|_| Error::InvalidArgumentError(format!("Cannot cast '{}' to integer", s)))
+                                s.parse::<i64>().map(PlanValue::Integer).map_err(|_| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Cannot cast '{}' to integer",
+                                        s
+                                    ))
+                                })
                             }
                             _ => Err(Error::InvalidArgumentError(format!(
                                 "Cannot cast {:?} to integer",
@@ -4387,39 +4496,39 @@ where
                             ))),
                         }
                     }
-                    DataType::Float64 | DataType::Float32 => {
-                        match value {
-                            PlanValue::Integer(i) => Ok(PlanValue::Float(i as f64)),
-                            PlanValue::Float(f) => Ok(PlanValue::Float(f)),
-                            PlanValue::String(s) => {
-                                s.parse::<f64>()
-                                    .map(PlanValue::Float)
-                                    .map_err(|_| Error::InvalidArgumentError(format!("Cannot cast '{}' to float", s)))
-                            }
-                            _ => Err(Error::InvalidArgumentError(format!(
-                                "Cannot cast {:?} to float",
-                                value
-                            ))),
+                    DataType::Float64 | DataType::Float32 => match value {
+                        PlanValue::Integer(i) => Ok(PlanValue::Float(i as f64)),
+                        PlanValue::Float(f) => Ok(PlanValue::Float(f)),
+                        PlanValue::String(s) => {
+                            s.parse::<f64>().map(PlanValue::Float).map_err(|_| {
+                                Error::InvalidArgumentError(format!("Cannot cast '{}' to float", s))
+                            })
                         }
-                    }
-                    DataType::Utf8 | DataType::LargeUtf8 => {
-                        match value {
-                            PlanValue::String(s) => Ok(PlanValue::String(s)),
-                            PlanValue::Integer(i) => Ok(PlanValue::String(i.to_string())),
-                            PlanValue::Float(f) => Ok(PlanValue::String(f.to_string())),
-                            _ => Err(Error::InvalidArgumentError(format!(
-                                "Cannot cast {:?} to string",
-                                value
-                            ))),
-                        }
-                    }
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Cannot cast {:?} to float",
+                            value
+                        ))),
+                    },
+                    DataType::Utf8 | DataType::LargeUtf8 => match value {
+                        PlanValue::String(s) => Ok(PlanValue::String(s)),
+                        PlanValue::Integer(i) => Ok(PlanValue::String(i.to_string())),
+                        PlanValue::Float(f) => Ok(PlanValue::String(f.to_string())),
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Cannot cast {:?} to string",
+                            value
+                        ))),
+                    },
                     _ => Err(Error::InvalidArgumentError(format!(
                         "CAST to {:?} not supported in aggregate expressions",
                         data_type
                     ))),
                 }
             }
-            ScalarExpr::Case { operand, branches, else_expr } => {
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
                 // Evaluate the operand if present (for simple CASE)
                 let operand_value = if let Some(op) = operand {
                     Some(Self::evaluate_expr_with_plan_value_aggregates_and_row(
@@ -4432,7 +4541,7 @@ where
                 } else {
                     None
                 };
-                
+
                 // Evaluate each WHEN/THEN branch
                 for (when_expr, then_expr) in branches {
                     let matches = if let Some(ref op_val) = operand_value {
@@ -4462,7 +4571,7 @@ where
                             _ => false,
                         }
                     };
-                    
+
                     if matches {
                         return Self::evaluate_expr_with_plan_value_aggregates_and_row(
                             then_expr,
@@ -4473,7 +4582,7 @@ where
                         );
                     }
                 }
-                
+
                 // No branch matched, evaluate ELSE or return NULL
                 if let Some(else_e) = else_expr {
                     Self::evaluate_expr_with_plan_value_aggregates_and_row(
@@ -4545,6 +4654,10 @@ where
                 })?;
                 // Convert to i64 for arithmetic (truncates floats)
                 Ok(value.to_i64())
+            }
+            ScalarExpr::Not(inner) => {
+                let value = Self::evaluate_expr_with_aggregates(inner, aggregates)?;
+                Ok(if value != 0 { 0 } else { 1 })
             }
             ScalarExpr::Binary { left, op, right } => {
                 let left_val = Self::evaluate_expr_with_aggregates(left, aggregates)?;
@@ -5161,7 +5274,7 @@ impl CrossProductExpressionContext {
     ) -> ExecutorResult<Vec<Option<bool>>> {
         let values = self.materialize_value_array(expr, batch)?;
         let len = values.len();
-        
+
         match &values {
             ValueArray::Null(len) => {
                 // All values are NULL
@@ -5189,11 +5302,7 @@ impl CrossProductExpressionContext {
                 let mut out = Vec::with_capacity(len);
                 for idx in 0..len {
                     let is_null = arr.is_null(idx);
-                    let result = if negated {
-                        !is_null
-                    } else {
-                        is_null
-                    };
+                    let result = if negated { !is_null } else { is_null };
                     out.push(Some(result));
                 }
                 Ok(out)
@@ -5202,11 +5311,7 @@ impl CrossProductExpressionContext {
                 let mut out = Vec::with_capacity(len);
                 for idx in 0..len {
                     let is_null = arr.is_null(idx);
-                    let result = if negated {
-                        !is_null
-                    } else {
-                        is_null
-                    };
+                    let result = if negated { !is_null } else { is_null };
                     out.push(Some(result));
                 }
                 Ok(out)
@@ -5407,6 +5512,7 @@ impl CrossProductExpressionContext {
             ScalarExpr::Literal(literal) => literal_to_constant_array(literal, batch.num_rows()),
             ScalarExpr::Binary { .. } => self.evaluate_numeric(expr, batch),
             ScalarExpr::Compare { .. } => self.evaluate_numeric(expr, batch),
+            ScalarExpr::Not(_) => self.evaluate_numeric(expr, batch),
             ScalarExpr::Aggregate(_) => Err(Error::InvalidArgumentError(
                 "aggregate expressions are not supported in cross product filters".into(),
             )),
@@ -5465,6 +5571,7 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
         },
         ScalarExpr::GetField { base, .. } => collect_field_ids(base, out),
         ScalarExpr::Cast { expr, .. } => collect_field_ids(expr, out),
+        ScalarExpr::Not(expr) => collect_field_ids(expr, out),
         ScalarExpr::Case {
             operand,
             branches,
@@ -6081,6 +6188,9 @@ fn bind_scalar_expr(
             }
             Ok(ScalarExpr::Coalesce(bound_items))
         }
+        ScalarExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(bind_scalar_expr(
+            inner, bindings,
+        )?))),
         ScalarExpr::ScalarSubquery(sub) => Ok(ScalarExpr::ScalarSubquery(sub.clone())),
     }
 }
@@ -6421,6 +6531,9 @@ fn collect_scalar_subquery_ids(expr: &ScalarExpr<FieldId>, ids: &mut FxHashSet<S
         ScalarExpr::Cast { expr, .. } => {
             collect_scalar_subquery_ids(expr, ids);
         }
+        ScalarExpr::Not(expr) => {
+            collect_scalar_subquery_ids(expr, ids);
+        }
         ScalarExpr::Case {
             operand,
             branches,
@@ -6473,6 +6586,9 @@ fn rewrite_scalar_expr_for_subqueries(
             expr: Box::new(rewrite_scalar_expr_for_subqueries(expr, mapping)),
             data_type: data_type.clone(),
         },
+        ScalarExpr::Not(expr) => {
+            ScalarExpr::Not(Box::new(rewrite_scalar_expr_for_subqueries(expr, mapping)))
+        }
         ScalarExpr::Case {
             operand,
             branches,
@@ -7559,15 +7675,18 @@ fn hash_join_table_batches(
             let total_left_rows: usize = left_batches.iter().map(|b| b.num_rows()).sum();
             let mut left_arrays = Vec::new();
             for field in left_schema.fields() {
-                let column_idx = left_schema
-                    .index_of(field.name())
-                    .map_err(|e| Error::Internal(format!("failed to find field {}: {}", field.name(), e)))?;
+                let column_idx = left_schema.index_of(field.name()).map_err(|e| {
+                    Error::Internal(format!("failed to find field {}: {}", field.name(), e))
+                })?;
                 let arrays: Vec<ArrayRef> = left_batches
                     .iter()
                     .map(|batch| batch.column(column_idx).clone())
                     .collect();
-                let concatenated = arrow::compute::concat(&arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
-                    .map_err(|e| Error::Internal(format!("failed to concat left arrays: {}", e)))?;
+                let concatenated =
+                    arrow::compute::concat(&arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
+                        .map_err(|e| {
+                            Error::Internal(format!("failed to concat left arrays: {}", e))
+                        })?;
                 left_arrays.push(concatenated);
             }
 
@@ -7578,7 +7697,11 @@ fn hash_join_table_batches(
             }
 
             let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), left_arrays)
-                .map_err(|err| Error::Internal(format!("failed to create LEFT JOIN batch with NULL right: {err}")))?;
+                .map_err(|err| {
+                    Error::Internal(format!(
+                        "failed to create LEFT JOIN batch with NULL right: {err}"
+                    ))
+                })?;
 
             return Ok(TableCrossProductData {
                 schema: combined_schema,
@@ -7619,7 +7742,9 @@ fn hash_join_table_batches(
             combined_columns.extend(right_arrays);
 
             let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), combined_columns)
-                .map_err(|err| Error::Internal(format!("failed to materialize INNER JOIN batch: {err}")))?;
+                .map_err(|err| {
+                    Error::Internal(format!("failed to materialize INNER JOIN batch: {err}"))
+                })?;
 
             Ok(TableCrossProductData {
                 schema: combined_schema,
@@ -7654,7 +7779,9 @@ fn hash_join_table_batches(
             combined_columns.extend(right_arrays);
 
             let joined_batch = RecordBatch::try_new(Arc::clone(&combined_schema), combined_columns)
-                .map_err(|err| Error::Internal(format!("failed to materialize LEFT JOIN batch: {err}")))?;
+                .map_err(|err| {
+                    Error::Internal(format!("failed to materialize LEFT JOIN batch: {err}"))
+                })?;
 
             Ok(TableCrossProductData {
                 schema: combined_schema,
