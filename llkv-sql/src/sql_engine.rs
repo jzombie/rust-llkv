@@ -3881,7 +3881,7 @@ where
         }
 
         let select_plan = self.build_select_plan(query)?;
-        self.execute_plan_statement(PlanStatement::Select(select_plan))
+        self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)))
     }
 
     fn build_select_plan(&self, query: Query) -> SqlResult<SelectPlan> {
@@ -5404,11 +5404,10 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
             }
         }
         // Handle unary +/- by recursively resolving the inner expression
-        SqlExpr::UnaryOp { op, expr }
-            if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) =>
-        {
-            resolve_column_name(expr)
-        }
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus | UnaryOperator::Minus,
+            expr,
+        } => resolve_column_name(expr),
         _ => Err(Error::InvalidArgumentError(
             "aggregate arguments must be plain column identifiers".into(),
         )),
@@ -5734,37 +5733,10 @@ fn is_integer_literal(expr: &SqlExpr, expected: i64) -> bool {
     }
 }
 
-fn sql_expr_is_null_literal(expr: &SqlExpr) -> bool {
-    match expr {
-        SqlExpr::Value(ValueWithSpan {
-            value: Value::Null, ..
-        }) => true,
-        SqlExpr::Nested(inner) => sql_expr_is_null_literal(inner),
-        _ => false,
-    }
-}
-
 fn strip_sql_expr_nesting(expr: &SqlExpr) -> &SqlExpr {
     match expr {
         SqlExpr::Nested(inner) => strip_sql_expr_nesting(inner),
         other => other,
-    }
-}
-
-fn comparison_involves_null(expr: &SqlExpr) -> bool {
-    match expr {
-        SqlExpr::BinaryOp {
-            left,
-            op:
-                BinaryOperator::Eq
-                | BinaryOperator::NotEq
-                | BinaryOperator::Lt
-                | BinaryOperator::LtEq
-                | BinaryOperator::Gt
-                | BinaryOperator::GtEq,
-            right,
-        } => sql_expr_is_null_literal(left) || sql_expr_is_null_literal(right),
-        _ => false,
     }
 }
 
@@ -6251,23 +6223,19 @@ fn flatten_or(
     }
 }
 
-fn peel_unparenthesized_not_chain<'a>(expr: &'a SqlExpr) -> (usize, &'a SqlExpr) {
+fn peel_unparenthesized_not_chain(expr: &SqlExpr) -> (usize, &SqlExpr) {
     let mut count: usize = 0;
     let mut current = expr;
-    loop {
-        match current {
-            SqlExpr::UnaryOp {
-                op: UnaryOperator::Not,
-                expr: inner,
-            } => {
-                if matches!(inner.as_ref(), SqlExpr::Nested(_)) {
-                    break;
-                }
-                count += 1;
-                current = inner;
-            }
-            _ => break,
+    while let SqlExpr::UnaryOp {
+        op: UnaryOperator::Not,
+        expr: inner,
+    } = current
+    {
+        if matches!(inner.as_ref(), SqlExpr::Nested(_)) {
+            break;
         }
+        count += 1;
+        current = inner.as_ref();
     }
     (count, current)
 }
@@ -7092,7 +7060,7 @@ fn translate_scalar_internal(
                             "translate_scalar: result stack underflow for UnaryNot".into(),
                         )
                     })?;
-                    result_stack.push(llkv_expr::expr::ScalarExpr::not(inner));
+                    result_stack.push(llkv_expr::expr::ScalarExpr::logical_not(inner));
                 }
                 ScalarExitContext::UnaryPlus => {
                     // Unary plus is a no-op - just pass through
@@ -7158,7 +7126,7 @@ fn translate_scalar_internal(
                     let else_expr = Some(llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0)));
                     let in_result = llkv_expr::expr::ScalarExpr::case(None, branches, else_expr);
                     let final_expr = if negated {
-                        llkv_expr::expr::ScalarExpr::not(in_result)
+                        llkv_expr::expr::ScalarExpr::logical_not(in_result)
                     } else {
                         in_result
                     };
@@ -7251,7 +7219,7 @@ fn translate_scalar_internal(
                         upper_cmp,
                     );
                     if negated {
-                        result_stack.push(llkv_expr::expr::ScalarExpr::not(between_expr));
+                        result_stack.push(llkv_expr::expr::ScalarExpr::logical_not(between_expr));
                     } else {
                         result_stack.push(between_expr);
                     }

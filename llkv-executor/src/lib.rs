@@ -134,7 +134,7 @@ struct GroupState {
 struct GroupAggregateState {
     representative_batch_idx: usize,
     representative_row: usize,
-    row_locations: Vec<(usize, usize)>, // (batch_idx, row_idx) for every row in the group
+    row_locations: Vec<(usize, usize)>,
 }
 
 struct OutputColumn {
@@ -927,7 +927,7 @@ where
                 // Determine join type from plan and convert to llkv_join::JoinType
                 let join_type = plan
                     .joins
-                    .get(0)
+                    .first()
                     .map(|j| match j.join_type {
                         llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
                         llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
@@ -2461,25 +2461,22 @@ where
             &sample_batch,
         )?;
 
-        let constant_having = plan
-            .having
-            .as_ref()
-            .and_then(|expr| evaluate_constant_predicate(expr));
+        let constant_having = plan.having.as_ref().and_then(evaluate_constant_predicate);
 
-        if let Some(result) = constant_having {
-            if !result.unwrap_or(false) {
-                let fields: Vec<Field> = output_columns
-                    .iter()
-                    .map(|output| output.field.clone())
-                    .collect();
-                let schema = Arc::new(Schema::new(fields));
-                let batch = RecordBatch::new_empty(Arc::clone(&schema));
-                return Ok(SelectExecution::new_single_batch(
-                    display_name,
-                    schema,
-                    batch,
-                ));
-            }
+        if let Some(result) = constant_having
+            && !result.unwrap_or(false)
+        {
+            let fields: Vec<Field> = output_columns
+                .iter()
+                .map(|output| output.field.clone())
+                .collect();
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::new_empty(Arc::clone(&schema));
+            return Ok(SelectExecution::new_single_batch(
+                display_name,
+                schema,
+                batch,
+            ));
         }
 
         let translated_having = if plan.having.is_some() && constant_having.is_none() {
@@ -3002,7 +2999,11 @@ where
                 // Finalize and extract value
                 let (_field, array) = state.finalize()?;
                 let value = llkv_plan::plan_value_from_array(&array, 0)?;
-                tracing::debug!("[GROUP BY] aggregate result key={:?} value={:?}", key, value);
+                tracing::debug!(
+                    "[GROUP BY] aggregate result key={:?} value={:?}",
+                    key,
+                    value
+                );
                 aggregate_values.insert(key.clone(), value);
             }
 
@@ -3044,7 +3045,7 @@ where
                         // Evaluate expression with aggregates and row context
                         let value = Self::evaluate_expr_with_plan_value_aggregates_and_row(
                             expr,
-                            &aggregate_values,
+                            aggregate_values,
                             Some(representative_batch),
                             Some(&column_lookup_map),
                             group_state.representative_row,
@@ -3478,193 +3479,6 @@ where
             schema,
             batch,
         ))
-    }
-
-    /// Build an AggregateSpec from an AggregateCall
-    fn build_aggregate_spec_from_call(
-        agg_call: &llkv_expr::expr::AggregateCall<String>,
-        alias: String,
-        schema: &Schema,
-        column_lookup: &FxHashMap<String, usize>,
-    ) -> ExecutorResult<llkv_aggregate::AggregateSpec> {
-        use llkv_expr::expr::AggregateCall;
-
-        let kind = match agg_call {
-            AggregateCall::CountStar => llkv_aggregate::AggregateKind::Count {
-                field_id: None,
-                distinct: false,
-            },
-            AggregateCall::Count {
-                expr: col_expr,
-                distinct,
-            } => {
-                let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "complex expressions in COUNT not yet fully supported".into(),
-                    )
-                })?;
-                let col_idx = column_lookup
-                    .get(&col_name.to_ascii_lowercase())
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
-                    })?;
-                let field = schema.field(*col_idx);
-                let field_id = field
-                    .metadata()
-                    .get("field_id")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        Error::Internal(format!("field_id not found for column '{}'", col_name))
-                    })?;
-                llkv_aggregate::AggregateKind::Count {
-                    field_id: Some(field_id),
-                    distinct: *distinct,
-                }
-            }
-            AggregateCall::Sum {
-                expr: col_expr,
-                distinct,
-            } => {
-                let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "complex expressions in SUM not yet fully supported".into(),
-                    )
-                })?;
-                let col_idx = column_lookup
-                    .get(&col_name.to_ascii_lowercase())
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
-                    })?;
-                let field = schema.field(*col_idx);
-                let field_id = field
-                    .metadata()
-                    .get("field_id")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        Error::Internal(format!("field_id not found for column '{}'", col_name))
-                    })?;
-                llkv_aggregate::AggregateKind::Sum {
-                    field_id,
-                    data_type: Self::validate_aggregate_type(
-                        Some(field.data_type().clone()),
-                        "SUM",
-                        &[DataType::Int64, DataType::Float64],
-                    )?,
-                    distinct: *distinct,
-                }
-            }
-            AggregateCall::Avg {
-                expr: col_expr,
-                distinct,
-            } => {
-                let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "complex expressions in AVG not yet fully supported".into(),
-                    )
-                })?;
-                let col_idx = column_lookup
-                    .get(&col_name.to_ascii_lowercase())
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
-                    })?;
-                let field = schema.field(*col_idx);
-                let field_id = field
-                    .metadata()
-                    .get("field_id")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        Error::Internal(format!("field_id not found for column '{}'", col_name))
-                    })?;
-                llkv_aggregate::AggregateKind::Avg {
-                    field_id,
-                    data_type: Self::validate_aggregate_type(
-                        Some(field.data_type().clone()),
-                        "AVG",
-                        &[DataType::Int64, DataType::Float64],
-                    )?,
-                    distinct: *distinct,
-                }
-            }
-            AggregateCall::Min(col_expr) => {
-                let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "complex expressions in MIN not yet fully supported".into(),
-                    )
-                })?;
-                let col_idx = column_lookup
-                    .get(&col_name.to_ascii_lowercase())
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
-                    })?;
-                let field = schema.field(*col_idx);
-                let field_id = field
-                    .metadata()
-                    .get("field_id")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        Error::Internal(format!("field_id not found for column '{}'", col_name))
-                    })?;
-                llkv_aggregate::AggregateKind::Min {
-                    field_id,
-                    data_type: Self::validate_aggregate_type(
-                        Some(field.data_type().clone()),
-                        "MIN",
-                        &[DataType::Int64, DataType::Float64],
-                    )?,
-                }
-            }
-            AggregateCall::Max(col_expr) => {
-                let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "complex expressions in MAX not yet fully supported".into(),
-                    )
-                })?;
-                let col_idx = column_lookup
-                    .get(&col_name.to_ascii_lowercase())
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
-                    })?;
-                let field = schema.field(*col_idx);
-                let field_id = field
-                    .metadata()
-                    .get("field_id")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        Error::Internal(format!("field_id not found for column '{}'", col_name))
-                    })?;
-                llkv_aggregate::AggregateKind::Max {
-                    field_id,
-                    data_type: Self::validate_aggregate_type(
-                        Some(field.data_type().clone()),
-                        "MAX",
-                        &[DataType::Int64, DataType::Float64],
-                    )?,
-                }
-            }
-            AggregateCall::CountNulls(col_expr) => {
-                let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "complex expressions in CountNulls not yet fully supported".into(),
-                    )
-                })?;
-                let col_idx = column_lookup
-                    .get(&col_name.to_ascii_lowercase())
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("column '{}' not found", col_name))
-                    })?;
-                let field = schema.field(*col_idx);
-                let field_id = field
-                    .metadata()
-                    .get("field_id")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        Error::Internal(format!("field_id not found for column '{}'", col_name))
-                    })?;
-                llkv_aggregate::AggregateKind::CountNulls { field_id }
-            }
-        };
-
-        Ok(llkv_aggregate::AggregateSpec { alias, kind })
     }
 
     /// Build an AggregateSpec for cross product GROUP BY (no field_id metadata required).
@@ -4130,14 +3944,6 @@ where
         }
 
         Ok(results)
-    }
-
-    /// Evaluate expressions with PlanValue aggregates (for GROUP BY with aggregates)
-    fn evaluate_expr_with_plan_value_aggregates(
-        expr: &ScalarExpr<String>,
-        aggregates: &FxHashMap<String, PlanValue>,
-    ) -> ExecutorResult<PlanValue> {
-        Self::evaluate_expr_with_plan_value_aggregates_and_row(expr, aggregates, None, None, 0)
     }
 
     fn evaluate_having_expr(
@@ -8037,6 +7843,12 @@ fn hash_join_table_batches(
 type JoinMatchIndices = Vec<(usize, usize)>;
 /// Type alias for hash table mapping join keys to row positions
 type JoinHashTable = FxHashMap<Vec<u8>, Vec<(usize, usize)>>;
+/// Type alias for complete match pairs for inner-style joins
+type JoinMatchPairs = (JoinMatchIndices, JoinMatchIndices);
+/// Type alias for optional matches produced by LEFT joins
+type OptionalJoinMatches = Vec<Option<(usize, usize)>>;
+/// Type alias for LEFT join match outputs
+type LeftJoinMatchPairs = (JoinMatchIndices, OptionalJoinMatches);
 
 /// Build hash join match indices using parallel hash table construction and probing.
 ///
@@ -8071,7 +7883,7 @@ fn build_join_match_indices(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
     join_keys: &[(usize, usize)],
-) -> ExecutorResult<(JoinMatchIndices, JoinMatchIndices)> {
+) -> ExecutorResult<JoinMatchPairs> {
     let right_key_indices: Vec<usize> = join_keys.iter().map(|(_, right)| *right).collect();
 
     // Parallelize hash table build phase across batches
@@ -8121,36 +7933,35 @@ fn build_join_match_indices(
 
     // Parallelize probe phase across left batches
     // Each thread probes its batch(es) against the shared hash table
-    let matches: Vec<(JoinMatchIndices, JoinMatchIndices)> =
-        llkv_column_map::parallel::with_thread_pool(|| {
-            left_batches
-                .par_iter()
-                .enumerate()
-                .map(|(batch_idx, batch)| {
-                    let mut local_left_matches: JoinMatchIndices = Vec::new();
-                    let mut local_right_matches: JoinMatchIndices = Vec::new();
-                    let mut key_buffer: Vec<u8> = Vec::new();
+    let matches: Vec<JoinMatchPairs> = llkv_column_map::parallel::with_thread_pool(|| {
+        left_batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_idx, batch)| {
+                let mut local_left_matches: JoinMatchIndices = Vec::new();
+                let mut local_right_matches: JoinMatchIndices = Vec::new();
+                let mut key_buffer: Vec<u8> = Vec::new();
 
-                    for row_idx in 0..batch.num_rows() {
-                        key_buffer.clear();
-                        match build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer) {
-                            Ok(true) => {
-                                if let Some(entries) = hash_table.get(&key_buffer) {
-                                    for &(r_batch, r_row) in entries {
-                                        local_left_matches.push((batch_idx, row_idx));
-                                        local_right_matches.push((r_batch, r_row));
-                                    }
+                for row_idx in 0..batch.num_rows() {
+                    key_buffer.clear();
+                    match build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer) {
+                        Ok(true) => {
+                            if let Some(entries) = hash_table.get(&key_buffer) {
+                                for &(r_batch, r_row) in entries {
+                                    local_left_matches.push((batch_idx, row_idx));
+                                    local_right_matches.push((r_batch, r_row));
                                 }
                             }
-                            Ok(false) => continue,
-                            Err(_) => continue, // Skip rows with errors during parallel probe
                         }
+                        Ok(false) => continue,
+                        Err(_) => continue, // Skip rows with errors during parallel probe
                     }
+                }
 
-                    (local_left_matches, local_right_matches)
-                })
-                .collect()
-        });
+                (local_left_matches, local_right_matches)
+            })
+            .collect()
+    });
 
     // Merge all match results
     let mut left_matches: JoinMatchIndices = Vec::new();
@@ -8177,7 +7988,7 @@ fn build_left_join_match_indices(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
     join_keys: &[(usize, usize)],
-) -> ExecutorResult<(JoinMatchIndices, Vec<Option<(usize, usize)>>)> {
+) -> ExecutorResult<LeftJoinMatchPairs> {
     let right_key_indices: Vec<usize> = join_keys.iter().map(|(_, right)| *right).collect();
 
     // Build hash table from right batches
@@ -8220,49 +8031,48 @@ fn build_left_join_match_indices(
     let left_key_indices: Vec<usize> = join_keys.iter().map(|(left, _)| *left).collect();
 
     // Probe phase: process ALL left rows, recording matches or None
-    let matches: Vec<(JoinMatchIndices, Vec<Option<(usize, usize)>>)> =
-        llkv_column_map::parallel::with_thread_pool(|| {
-            left_batches
-                .par_iter()
-                .enumerate()
-                .map(|(batch_idx, batch)| {
-                    let mut local_left_matches: JoinMatchIndices = Vec::new();
-                    let mut local_right_optional: Vec<Option<(usize, usize)>> = Vec::new();
-                    let mut key_buffer: Vec<u8> = Vec::new();
+    let matches: Vec<LeftJoinMatchPairs> = llkv_column_map::parallel::with_thread_pool(|| {
+        left_batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_idx, batch)| {
+                let mut local_left_matches: JoinMatchIndices = Vec::new();
+                let mut local_right_optional: Vec<Option<(usize, usize)>> = Vec::new();
+                let mut key_buffer: Vec<u8> = Vec::new();
 
-                    for row_idx in 0..batch.num_rows() {
-                        key_buffer.clear();
-                        match build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer) {
-                            Ok(true) => {
-                                if let Some(entries) = hash_table.get(&key_buffer) {
-                                    // Has matches - emit one output row per match
-                                    for &(r_batch, r_row) in entries {
-                                        local_left_matches.push((batch_idx, row_idx));
-                                        local_right_optional.push(Some((r_batch, r_row)));
-                                    }
-                                } else {
-                                    // No match - emit left row with NULL right
+                for row_idx in 0..batch.num_rows() {
+                    key_buffer.clear();
+                    match build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer) {
+                        Ok(true) => {
+                            if let Some(entries) = hash_table.get(&key_buffer) {
+                                // Has matches - emit one output row per match
+                                for &(r_batch, r_row) in entries {
                                     local_left_matches.push((batch_idx, row_idx));
-                                    local_right_optional.push(None);
+                                    local_right_optional.push(Some((r_batch, r_row)));
                                 }
-                            }
-                            Ok(false) => {
-                                // NULL key on left side - no match, emit with NULL right
-                                local_left_matches.push((batch_idx, row_idx));
-                                local_right_optional.push(None);
-                            }
-                            Err(_) => {
-                                // Error reading key - treat as no match
+                            } else {
+                                // No match - emit left row with NULL right
                                 local_left_matches.push((batch_idx, row_idx));
                                 local_right_optional.push(None);
                             }
                         }
+                        Ok(false) => {
+                            // NULL key on left side - no match, emit with NULL right
+                            local_left_matches.push((batch_idx, row_idx));
+                            local_right_optional.push(None);
+                        }
+                        Err(_) => {
+                            // Error reading key - treat as no match
+                            local_left_matches.push((batch_idx, row_idx));
+                            local_right_optional.push(None);
+                        }
                     }
+                }
 
-                    (local_left_matches, local_right_optional)
-                })
-                .collect()
-        });
+                (local_left_matches, local_right_optional)
+            })
+            .collect()
+    });
 
     // Merge all match results
     let mut left_matches: JoinMatchIndices = Vec::new();

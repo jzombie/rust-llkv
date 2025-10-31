@@ -188,7 +188,7 @@ pub fn translate_scalar_with<F, G>(
     expr: &ScalarExpr<String>,
     schema: &ExecutorSchema,
     unknown_column: F,
-    unknown_aggregate: G,
+    _unknown_aggregate: G,
 ) -> ExecutorResult<ScalarExpr<FieldId>>
 where
     F: Fn(&str) -> Error + Copy,
@@ -205,28 +205,28 @@ where
                 left,
                 schema,
                 unknown_column,
-                unknown_aggregate,
+                _unknown_aggregate,
             )?),
             op: *op,
             right: Box::new(translate_scalar_with(
                 right,
                 schema,
                 unknown_column,
-                unknown_aggregate,
+                _unknown_aggregate,
             )?),
         }),
         ScalarExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(translate_scalar_with(
             inner,
             schema,
             unknown_column,
-            unknown_aggregate,
+            _unknown_aggregate,
         )?))),
         ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
             expr: Box::new(translate_scalar_with(
                 expr,
                 schema,
                 unknown_column,
-                unknown_aggregate,
+                _unknown_aggregate,
             )?),
             negated: *negated,
         }),
@@ -235,14 +235,14 @@ where
                 left,
                 schema,
                 unknown_column,
-                unknown_aggregate,
+                _unknown_aggregate,
             )?),
             op: *op,
             right: Box::new(translate_scalar_with(
                 right,
                 schema,
                 unknown_column,
-                unknown_aggregate,
+                _unknown_aggregate,
             )?),
         }),
         ScalarExpr::Aggregate(agg) => {
@@ -254,7 +254,7 @@ where
                             expr,
                             schema,
                             unknown_column,
-                            unknown_aggregate,
+                            _unknown_aggregate,
                         )?),
                         distinct: *distinct,
                     },
@@ -263,7 +263,7 @@ where
                             expr,
                             schema,
                             unknown_column,
-                            unknown_aggregate,
+                            _unknown_aggregate,
                         )?),
                         distinct: *distinct,
                     },
@@ -272,18 +272,18 @@ where
                             expr,
                             schema,
                             unknown_column,
-                            unknown_aggregate,
+                            _unknown_aggregate,
                         )?),
                         distinct: *distinct,
                     },
                     AggregateCall::Min(expr) => AggregateCall::Min(Box::new(
-                        translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?,
+                        translate_scalar_with(expr, schema, unknown_column, _unknown_aggregate)?,
                     )),
                     AggregateCall::Max(expr) => AggregateCall::Max(Box::new(
-                        translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?,
+                        translate_scalar_with(expr, schema, unknown_column, _unknown_aggregate)?,
                     )),
                     AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(
-                        translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?,
+                        translate_scalar_with(expr, schema, unknown_column, _unknown_aggregate)?,
                     )),
                 };
             Ok(ScalarExpr::Aggregate(translated))
@@ -293,7 +293,7 @@ where
                 base,
                 schema,
                 unknown_column,
-                unknown_aggregate,
+                _unknown_aggregate,
             )?),
             field_name: field_name.clone(),
         }),
@@ -302,7 +302,7 @@ where
                 expr,
                 schema,
                 unknown_column,
-                unknown_aggregate,
+                _unknown_aggregate,
             )?),
             data_type: data_type.clone(),
         }),
@@ -316,7 +316,7 @@ where
                     inner,
                     schema,
                     unknown_column,
-                    unknown_aggregate,
+                    _unknown_aggregate,
                 )?),
                 None => None,
             };
@@ -324,9 +324,9 @@ where
             let mut translated_branches = Vec::with_capacity(branches.len());
             for (when_expr, then_expr) in branches {
                 let translated_when =
-                    translate_scalar_with(when_expr, schema, unknown_column, unknown_aggregate)?;
+                    translate_scalar_with(when_expr, schema, unknown_column, _unknown_aggregate)?;
                 let translated_then =
-                    translate_scalar_with(then_expr, schema, unknown_column, unknown_aggregate)?;
+                    translate_scalar_with(then_expr, schema, unknown_column, _unknown_aggregate)?;
                 translated_branches.push((translated_when, translated_then));
             }
 
@@ -335,7 +335,7 @@ where
                     inner,
                     schema,
                     unknown_column,
-                    unknown_aggregate,
+                    _unknown_aggregate,
                 )?),
                 None => None,
             };
@@ -353,7 +353,7 @@ where
                     item,
                     schema,
                     unknown_column,
-                    unknown_aggregate,
+                    _unknown_aggregate,
                 )?);
             }
             Ok(ScalarExpr::Coalesce(translated_items))

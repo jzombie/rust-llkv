@@ -1,6 +1,6 @@
 //! Table abstraction and system catalog for LLKV.
 //!
-//! This crate provides the [`Table`] type, which builds on [`llkv-column-map`]'s
+//! This crate provides the [`Table`] type, which builds on `llkv-column-map`'s
 //! columnar storage to offer a higher-level, schema-aware interface. It includes:
 //!
 //! - **[`Table`]**: Schema-aware table abstraction with append, scan, and schema operations

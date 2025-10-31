@@ -182,7 +182,7 @@ impl<F> ScalarExpr<F> {
     }
 
     #[inline]
-    pub fn not(expr: Self) -> Self {
+    pub fn logical_not(expr: Self) -> Self {
         Self::Not(Box::new(expr))
     }
 

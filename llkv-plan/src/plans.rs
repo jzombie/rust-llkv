@@ -324,16 +324,11 @@ impl AlterTablePlan {
 // FOREIGN KEY Plan Structures
 // ============================================================================
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ForeignKeyAction {
+    #[default]
     NoAction,
     Restrict,
-}
-
-impl Default for ForeignKeyAction {
-    fn default() -> Self {
-        Self::NoAction
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -697,7 +692,7 @@ pub struct SelectPlan {
     pub tables: Vec<TableRef>,
     /// Join metadata describing how tables are joined.
     /// If empty, all tables are implicitly cross-joined (Cartesian product).
-    /// Each entry describes a join between table[i] and table[i+1].
+    /// Each entry describes a join between `tables[i]` and `tables[i + 1]`.
     pub joins: Vec<JoinMetadata>,
     pub projections: Vec<SelectProjection>,
     /// Optional WHERE predicate plus dependent correlated subqueries.
@@ -1090,7 +1085,7 @@ pub enum PlanOperation {
     Update(UpdatePlan),
     Delete(DeletePlan),
     Truncate(TruncatePlan),
-    Select(SelectPlan),
+    Select(Box<SelectPlan>),
 }
 
 /// Top-level plan statements that can be executed against a `Session`.
@@ -1108,5 +1103,5 @@ pub enum PlanStatement {
     Update(UpdatePlan),
     Delete(DeletePlan),
     Truncate(TruncatePlan),
-    Select(SelectPlan),
+    Select(Box<SelectPlan>),
 }

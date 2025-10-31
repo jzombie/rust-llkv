@@ -672,11 +672,12 @@ where
                     }
                 }
             }
-            PlanOperation::Select(ref plan) => {
+            PlanOperation::Select(plan) => {
                 // SELECT is read-only, not tracked for replay
                 // But still fails if transaction is aborted (already checked above)
-                let table_name = select_plan_table_name(plan).unwrap_or_default();
-                match self.execute_select(plan.clone()) {
+                let plan_ref = plan.as_ref();
+                let table_name = select_plan_table_name(plan_ref).unwrap_or_default();
+                match self.execute_select(plan_ref.clone()) {
                     Ok(staging_execution) => {
                         // Collect staging execution into batches
                         let schema = staging_execution.schema();

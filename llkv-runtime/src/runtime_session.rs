@@ -636,7 +636,7 @@ where
         if self.has_active_transaction() {
             let tx_result = match self
                 .inner
-                .execute_operation(PlanOperation::Select(plan.clone()))
+                .execute_operation(PlanOperation::Select(Box::new(plan.clone())))
             {
                 Ok(result) => result,
                 Err(e) => {

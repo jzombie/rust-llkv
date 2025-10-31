@@ -874,9 +874,9 @@ impl NumericKernels {
                         Literal::Boolean(v) => {
                             ScalarExpr::literal(Literal::Integer(if *v { 0 } else { 1 }))
                         }
-                        _ => ScalarExpr::not(simplified_inner),
+                        _ => ScalarExpr::logical_not(simplified_inner),
                     },
-                    _ => ScalarExpr::not(simplified_inner),
+                    _ => ScalarExpr::logical_not(simplified_inner),
                 }
             }
             ScalarExpr::IsNull { expr, negated } => {
