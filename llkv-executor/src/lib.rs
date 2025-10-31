@@ -2911,6 +2911,7 @@ where
 
                             // Convert PlanValues to Arrow array
                             let computed_array = plan_values_to_arrow_array(&computed_values)?;
+                            let computed_type = computed_array.data_type().clone();
 
                             // Add this as a new column to the working batch
                             let mut new_columns: Vec<ArrayRef> = working_batch.columns().to_vec();
@@ -2918,7 +2919,7 @@ where
 
                             let temp_field = Arc::new(Field::new(
                                 format!("__temp_agg_expr_{}", next_temp_col_idx),
-                                arrow::datatypes::DataType::Int64, // TODO: infer from expr
+                                computed_type,
                                 true,
                             ));
                             let mut new_fields: Vec<Arc<Field>> =
