@@ -4445,11 +4445,16 @@ where
                     BinaryOp::Multiply => left_num * right_num,
                     BinaryOp::Divide => {
                         if right_num == 0.0 {
-                            return Err(Error::InvalidArgumentError("Division by zero".into()));
+                            return Ok(PlanValue::Null);
                         }
                         left_num / right_num
                     }
-                    BinaryOp::Modulo => left_num % right_num,
+                    BinaryOp::Modulo => {
+                        if right_num == 0.0 {
+                            return Ok(PlanValue::Null);
+                        }
+                        left_num % right_num
+                    }
                 };
 
                 // Return as float if either operand was float, otherwise as integer
