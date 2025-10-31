@@ -4225,9 +4225,80 @@ where
                     ))
                 }
             }
-            ScalarExpr::Compare { .. } => Err(Error::InvalidArgumentError(
-                "Comparisons not supported in aggregate-only expressions".into(),
-            )),
+            ScalarExpr::Compare { left, op, right } => {
+                // Evaluate both sides of the comparison
+                let left_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    left,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )?;
+                let right_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    right,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )?;
+                
+                // Handle NULL comparisons (return NULL as 0 for integer context)
+                if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
+                    return Ok(PlanValue::Integer(0));
+                }
+                
+                // Coerce types for comparison
+                let (left_val, right_val) = match (&left_val, &right_val) {
+                    (PlanValue::Integer(i), PlanValue::Float(_)) => {
+                        (PlanValue::Float(*i as f64), right_val)
+                    }
+                    (PlanValue::Float(_), PlanValue::Integer(i)) => {
+                        (left_val, PlanValue::Float(*i as f64))
+                    }
+                    _ => (left_val, right_val),
+                };
+                
+                // Perform the comparison
+                let result = match (&left_val, &right_val) {
+                    (PlanValue::Integer(l), PlanValue::Integer(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        match op {
+                            CompareOp::Eq => l == r,
+                            CompareOp::NotEq => l != r,
+                            CompareOp::Lt => l < r,
+                            CompareOp::LtEq => l <= r,
+                            CompareOp::Gt => l > r,
+                            CompareOp::GtEq => l >= r,
+                        }
+                    }
+                    (PlanValue::Float(l), PlanValue::Float(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        match op {
+                            CompareOp::Eq => l == r,
+                            CompareOp::NotEq => l != r,
+                            CompareOp::Lt => l < r,
+                            CompareOp::LtEq => l <= r,
+                            CompareOp::Gt => l > r,
+                            CompareOp::GtEq => l >= r,
+                        }
+                    }
+                    (PlanValue::String(l), PlanValue::String(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        match op {
+                            CompareOp::Eq => l == r,
+                            CompareOp::NotEq => l != r,
+                            CompareOp::Lt => l < r,
+                            CompareOp::LtEq => l <= r,
+                            CompareOp::Gt => l > r,
+                            CompareOp::GtEq => l >= r,
+                        }
+                    }
+                    _ => false,
+                };
+                
+                // Return 1 for true, 0 for false (integer representation of boolean)
+                Ok(PlanValue::Integer(if result { 1 } else { 0 }))
+            }
             ScalarExpr::Aggregate(agg) => {
                 let key = format!("{:?}", agg);
                 aggregates
@@ -4284,8 +4355,159 @@ where
                     Ok(PlanValue::Integer(result as i64))
                 }
             }
-            _ => Err(Error::InvalidArgumentError(
-                "Expression type not supported in aggregate-only context".into(),
+            ScalarExpr::Cast { expr, data_type } => {
+                // Evaluate the inner expression and cast it to the target type
+                let value = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    expr,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )?;
+                
+                // Handle NULL values
+                if matches!(value, PlanValue::Null) {
+                    return Ok(PlanValue::Null);
+                }
+                
+                // Cast to the target type
+                match data_type {
+                    DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                        match value {
+                            PlanValue::Integer(i) => Ok(PlanValue::Integer(i)),
+                            PlanValue::Float(f) => Ok(PlanValue::Integer(f as i64)),
+                            PlanValue::String(s) => {
+                                s.parse::<i64>()
+                                    .map(PlanValue::Integer)
+                                    .map_err(|_| Error::InvalidArgumentError(format!("Cannot cast '{}' to integer", s)))
+                            }
+                            _ => Err(Error::InvalidArgumentError(format!(
+                                "Cannot cast {:?} to integer",
+                                value
+                            ))),
+                        }
+                    }
+                    DataType::Float64 | DataType::Float32 => {
+                        match value {
+                            PlanValue::Integer(i) => Ok(PlanValue::Float(i as f64)),
+                            PlanValue::Float(f) => Ok(PlanValue::Float(f)),
+                            PlanValue::String(s) => {
+                                s.parse::<f64>()
+                                    .map(PlanValue::Float)
+                                    .map_err(|_| Error::InvalidArgumentError(format!("Cannot cast '{}' to float", s)))
+                            }
+                            _ => Err(Error::InvalidArgumentError(format!(
+                                "Cannot cast {:?} to float",
+                                value
+                            ))),
+                        }
+                    }
+                    DataType::Utf8 | DataType::LargeUtf8 => {
+                        match value {
+                            PlanValue::String(s) => Ok(PlanValue::String(s)),
+                            PlanValue::Integer(i) => Ok(PlanValue::String(i.to_string())),
+                            PlanValue::Float(f) => Ok(PlanValue::String(f.to_string())),
+                            _ => Err(Error::InvalidArgumentError(format!(
+                                "Cannot cast {:?} to string",
+                                value
+                            ))),
+                        }
+                    }
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "CAST to {:?} not supported in aggregate expressions",
+                        data_type
+                    ))),
+                }
+            }
+            ScalarExpr::Case { operand, branches, else_expr } => {
+                // Evaluate the operand if present (for simple CASE)
+                let operand_value = if let Some(op) = operand {
+                    Some(Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                        op,
+                        aggregates,
+                        row_batch,
+                        column_lookup,
+                        row_idx,
+                    )?)
+                } else {
+                    None
+                };
+                
+                // Evaluate each WHEN/THEN branch
+                for (when_expr, then_expr) in branches {
+                    let matches = if let Some(ref op_val) = operand_value {
+                        // Simple CASE: compare operand with WHEN value
+                        let when_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                            when_expr,
+                            aggregates,
+                            row_batch,
+                            column_lookup,
+                            row_idx,
+                        )?;
+                        op_val == &when_val
+                    } else {
+                        // Searched CASE: evaluate WHEN as boolean condition
+                        let when_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                            when_expr,
+                            aggregates,
+                            row_batch,
+                            column_lookup,
+                            row_idx,
+                        )?;
+                        // Treat non-zero as true
+                        match when_val {
+                            PlanValue::Integer(i) => i != 0,
+                            PlanValue::Float(f) => f != 0.0,
+                            PlanValue::Null => false,
+                            _ => false,
+                        }
+                    };
+                    
+                    if matches {
+                        return Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                            then_expr,
+                            aggregates,
+                            row_batch,
+                            column_lookup,
+                            row_idx,
+                        );
+                    }
+                }
+                
+                // No branch matched, evaluate ELSE or return NULL
+                if let Some(else_e) = else_expr {
+                    Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                        else_e,
+                        aggregates,
+                        row_batch,
+                        column_lookup,
+                        row_idx,
+                    )
+                } else {
+                    Ok(PlanValue::Null)
+                }
+            }
+            ScalarExpr::Coalesce(exprs) => {
+                // Return the first non-NULL value
+                for expr in exprs {
+                    let value = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                        expr,
+                        aggregates,
+                        row_batch,
+                        column_lookup,
+                        row_idx,
+                    )?;
+                    if !matches!(value, PlanValue::Null) {
+                        return Ok(value);
+                    }
+                }
+                Ok(PlanValue::Null)
+            }
+            ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
+                "GetField not supported in aggregate expressions".into(),
+            )),
+            ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
+                "Scalar subqueries not supported in aggregate expressions".into(),
             )),
         }
     }
