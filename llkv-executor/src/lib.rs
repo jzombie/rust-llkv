@@ -4027,6 +4027,44 @@ where
         column_lookup: &FxHashMap<String, usize>,
         row_idx: usize,
     ) -> ExecutorResult<Option<bool>> {
+        fn compare_plan_values_for_pred(
+            left: &PlanValue,
+            right: &PlanValue,
+        ) -> Option<std::cmp::Ordering> {
+            match (left, right) {
+                (PlanValue::Integer(l), PlanValue::Integer(r)) => Some(l.cmp(r)),
+                (PlanValue::Float(l), PlanValue::Float(r)) => l.partial_cmp(r),
+                (PlanValue::Integer(l), PlanValue::Float(r)) => (*l as f64).partial_cmp(r),
+                (PlanValue::Float(l), PlanValue::Integer(r)) => l.partial_cmp(&(*r as f64)),
+                (PlanValue::String(l), PlanValue::String(r)) => Some(l.cmp(r)),
+                _ => None,
+            }
+        }
+
+        fn evaluate_ordering_predicate<F>(
+            value: &PlanValue,
+            literal: &Literal,
+            predicate: F,
+        ) -> ExecutorResult<Option<bool>>
+        where
+            F: Fn(std::cmp::Ordering) -> bool,
+        {
+            if matches!(value, PlanValue::Null) {
+                return Ok(None);
+            }
+            let expected = llkv_plan::plan_value_from_literal(literal)?;
+            if matches!(expected, PlanValue::Null) {
+                return Ok(None);
+            }
+
+            match compare_plan_values_for_pred(value, &expected) {
+                Some(ordering) => Ok(Some(predicate(ordering))),
+                None => Err(Error::InvalidArgumentError(
+                    "unsupported HAVING comparison between column value and literal".into(),
+                )),
+            }
+        }
+
         match expr {
             llkv_expr::expr::Expr::Compare { left, op, right } => {
                 let left_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
@@ -4256,6 +4294,28 @@ where
                             return Ok(None);
                         }
                         Ok(Some(value == expected_value))
+                    }
+                    Operator::GreaterThan(expected) => {
+                        evaluate_ordering_predicate(&value, expected, |ordering| {
+                            ordering == std::cmp::Ordering::Greater
+                        })
+                    }
+                    Operator::GreaterThanOrEquals(expected) => {
+                        evaluate_ordering_predicate(&value, expected, |ordering| {
+                            ordering == std::cmp::Ordering::Greater
+                                || ordering == std::cmp::Ordering::Equal
+                        })
+                    }
+                    Operator::LessThan(expected) => {
+                        evaluate_ordering_predicate(&value, expected, |ordering| {
+                            ordering == std::cmp::Ordering::Less
+                        })
+                    }
+                    Operator::LessThanOrEquals(expected) => {
+                        evaluate_ordering_predicate(&value, expected, |ordering| {
+                            ordering == std::cmp::Ordering::Less
+                                || ordering == std::cmp::Ordering::Equal
+                        })
                     }
                     _ => {
                         // For other operators, fall back to a general error

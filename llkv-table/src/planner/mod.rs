@@ -1600,34 +1600,34 @@ where
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-    ) -> LlkvResult<bool> {
+    ) -> LlkvResult<Option<bool>> {
         use llkv_expr::literal::Literal;
 
-        // Simplify expressions first to fold any constant arithmetic operations
-        let left_simplified = NumericKernels::simplify(left);
-        let right_simplified = NumericKernels::simplify(right);
-
-        // Extract literal values
-        let left_lit = match &left_simplified {
-            ScalarExpr::Literal(lit) => lit,
-            _ => {
-                return Err(Error::InvalidArgumentError(
-                    "constant comparison requires literal expressions".into(),
-                ));
+        fn evaluate_constant_literal(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
+            let simplified = NumericKernels::simplify(expr);
+            if let ScalarExpr::Literal(lit) = &simplified {
+                return Ok(Some(lit.clone()));
             }
-        };
-        let right_lit = match &right_simplified {
-            ScalarExpr::Literal(lit) => lit,
-            _ => {
-                return Err(Error::InvalidArgumentError(
-                    "constant comparison requires literal expressions".into(),
-                ));
-            }
-        };
 
-        if matches!(left_lit, Literal::Null) || matches!(right_lit, Literal::Null) {
-            return Ok(false);
+            let arrays = NumericArrayMap::default();
+            match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
+                Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
+                Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
+                None => Ok(None),
+            }
         }
+
+        let left_lit_opt = evaluate_constant_literal(left)?;
+        let right_lit_opt = evaluate_constant_literal(right)?;
+
+        let left_lit = match left_lit_opt {
+            Some(Literal::Null) | None => return Ok(None),
+            Some(lit) => lit,
+        };
+        let right_lit = match right_lit_opt {
+            Some(Literal::Null) | None => return Ok(None),
+            Some(lit) => lit,
+        };
 
         // Helper to compare literals
         fn compare_literals(left: &Literal, right: &Literal) -> Option<std::cmp::Ordering> {
@@ -1647,22 +1647,22 @@ where
             CompareOp::Eq => left_lit == right_lit,
             CompareOp::NotEq => left_lit != right_lit,
             CompareOp::Lt => {
-                compare_literals(left_lit, right_lit) == Some(std::cmp::Ordering::Less)
+                compare_literals(&left_lit, &right_lit) == Some(std::cmp::Ordering::Less)
             }
             CompareOp::LtEq => matches!(
-                compare_literals(left_lit, right_lit),
+                compare_literals(&left_lit, &right_lit),
                 Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
             ),
             CompareOp::Gt => {
-                compare_literals(left_lit, right_lit) == Some(std::cmp::Ordering::Greater)
+                compare_literals(&left_lit, &right_lit) == Some(std::cmp::Ordering::Greater)
             }
             CompareOp::GtEq => matches!(
-                compare_literals(left_lit, right_lit),
+                compare_literals(&left_lit, &right_lit),
                 Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
             ),
         };
 
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Collect all row IDs from the table.
@@ -1692,13 +1692,9 @@ where
         // These are comparisons like "5 IN (1,2,3)" with no column references
         if fields.is_empty() {
             // Evaluate the constant comparison
-            let result = Self::evaluate_constant_compare(left, op, right)?;
-
-            // If true, return all rows; if false, return empty
-            return if result {
-                self.collect_all_row_ids(all_rows_cache)
-            } else {
-                Ok(Vec::new())
+            return match Self::evaluate_constant_compare(left, op, right)? {
+                Some(true) => self.collect_all_row_ids(all_rows_cache),
+                Some(false) | None => Ok(Vec::new()),
             };
         }
 
@@ -2673,10 +2669,10 @@ where
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
     ) -> LlkvResult<Vec<RowId>> {
         if fields.is_empty() {
-            if Self::evaluate_constant_compare(left, op, right)? {
-                return self.collect_all_row_ids(all_rows_cache);
-            }
-            return Ok(Vec::new());
+            return match Self::evaluate_constant_compare(left, op, right)? {
+                Some(_) => self.collect_all_row_ids(all_rows_cache),
+                None => Ok(Vec::new()),
+            };
         }
 
         let mut ordered_fields: Vec<FieldId> = fields.to_vec();

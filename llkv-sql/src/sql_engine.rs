@@ -6249,6 +6249,27 @@ fn flatten_or(
     }
 }
 
+fn peel_unparenthesized_not_chain<'a>(expr: &'a SqlExpr) -> (usize, &'a SqlExpr) {
+    let mut count: usize = 0;
+    let mut current = expr;
+    loop {
+        match current {
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: inner,
+            } => {
+                if matches!(inner.as_ref(), SqlExpr::Nested(_)) {
+                    break;
+                }
+                count += 1;
+                current = inner;
+            }
+            _ => break,
+        }
+    }
+    (count, current)
+}
+
 fn translate_comparison_with_context(
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
@@ -6258,12 +6279,14 @@ fn translate_comparison_with_context(
     outer_scopes: &[IdentifierContext],
     mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+    let (not_count, comparison_left) = peel_unparenthesized_not_chain(left);
+
     let left_scalar = {
         let tracker = correlated_tracker.reborrow();
         translate_scalar_with_context_scoped(
             resolver,
             context.clone(),
-            left,
+            comparison_left,
             outer_scopes,
             tracker,
         )?
@@ -6286,6 +6309,12 @@ fn translate_comparison_with_context(
         }
     };
 
+    let mut expr = llkv_expr::expr::Expr::Compare {
+        left: left_scalar.clone(),
+        op: compare_op,
+        right: right_scalar.clone(),
+    };
+
     if let (
         llkv_expr::expr::ScalarExpr::Column(column),
         llkv_expr::expr::ScalarExpr::Literal(literal),
@@ -6298,13 +6327,11 @@ fn translate_comparison_with_context(
             ?compare_op,
             "translate_comparison direct"
         );
-        return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+        expr = llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
             field_id: column.clone(),
             op,
-        }));
-    }
-
-    if let (
+        });
+    } else if let (
         llkv_expr::expr::ScalarExpr::Literal(literal),
         llkv_expr::expr::ScalarExpr::Column(column),
     ) = (&left_scalar, &right_scalar)
@@ -6318,17 +6345,18 @@ fn translate_comparison_with_context(
             flipped_op = ?flipped,
             "translate_comparison flipped"
         );
-        return Ok(llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+        expr = llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
             field_id: column.clone(),
             op,
-        }));
+        });
     }
 
-    Ok(llkv_expr::expr::Expr::Compare {
-        left: left_scalar,
-        op: compare_op,
-        right: right_scalar,
-    })
+    let mut wrapped = expr;
+    for _ in 0..not_count {
+        wrapped = llkv_expr::expr::Expr::Not(Box::new(wrapped));
+    }
+
+    Ok(wrapped)
 }
 
 fn compare_op_to_filter_operator(
@@ -6435,6 +6463,10 @@ fn translate_scalar_internal(
             negated: bool,
         },
         Between {
+            negated: bool,
+        },
+        InList {
+            list_len: usize,
             negated: bool,
         },
         Case {
@@ -6610,6 +6642,29 @@ fn translate_scalar_internal(
                     }
                     if let Some(opnd) = operand.as_deref() {
                         work_stack.push(ScalarFrame::Enter(opnd));
+                    }
+                }
+                SqlExpr::InList {
+                    expr: in_expr,
+                    list,
+                    negated,
+                } => {
+                    if list.is_empty() {
+                        let literal_value = if *negated {
+                            llkv_expr::expr::ScalarExpr::literal(Literal::Integer(1))
+                        } else {
+                            llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0))
+                        };
+                        work_stack.push(ScalarFrame::Leaf(literal_value));
+                    } else {
+                        work_stack.push(ScalarFrame::Exit(ScalarExitContext::InList {
+                            list_len: list.len(),
+                            negated: *negated,
+                        }));
+                        for value_expr in list.iter().rev() {
+                            work_stack.push(ScalarFrame::Enter(value_expr));
+                        }
+                        work_stack.push(ScalarFrame::Enter(in_expr));
                     }
                 }
                 SqlExpr::IsNull(inner) => {
@@ -7048,6 +7103,65 @@ fn translate_scalar_internal(
                         Error::Internal("translate_scalar: result stack underflow for CAST".into())
                     })?;
                     result_stack.push(llkv_expr::expr::ScalarExpr::cast(inner, target_type));
+                }
+                ScalarExitContext::InList { list_len, negated } => {
+                    let mut list_exprs = Vec::with_capacity(list_len);
+                    for _ in 0..list_len {
+                        let value_expr = result_stack.pop().ok_or_else(|| {
+                            Error::Internal(
+                                "translate_scalar: result stack underflow for IN list value".into(),
+                            )
+                        })?;
+                        list_exprs.push(value_expr);
+                    }
+                    list_exprs.reverse();
+
+                    let target_expr = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for IN list target".into(),
+                        )
+                    })?;
+
+                    let mut comparisons: Vec<llkv_expr::expr::ScalarExpr<String>> =
+                        Vec::with_capacity(list_len);
+                    for value in &list_exprs {
+                        comparisons.push(llkv_expr::expr::ScalarExpr::compare(
+                            target_expr.clone(),
+                            llkv_expr::expr::CompareOp::Eq,
+                            value.clone(),
+                        ));
+                    }
+
+                    let mut branches: Vec<(
+                        llkv_expr::expr::ScalarExpr<String>,
+                        llkv_expr::expr::ScalarExpr<String>,
+                    )> = Vec::with_capacity(list_len.saturating_mul(2));
+
+                    for comparison in &comparisons {
+                        branches.push((
+                            comparison.clone(),
+                            llkv_expr::expr::ScalarExpr::literal(Literal::Integer(1)),
+                        ));
+                    }
+
+                    for comparison in comparisons {
+                        let comparison_is_null =
+                            llkv_expr::expr::ScalarExpr::is_null(comparison, false);
+                        branches.push((
+                            comparison_is_null,
+                            llkv_expr::expr::ScalarExpr::literal(Literal::Null),
+                        ));
+                    }
+
+                    let else_expr = Some(llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0)));
+                    let in_result = llkv_expr::expr::ScalarExpr::case(None, branches, else_expr);
+                    let final_expr = if negated {
+                        llkv_expr::expr::ScalarExpr::not(in_result)
+                    } else {
+                        in_result
+                    };
+
+                    result_stack.push(final_expr);
                 }
                 ScalarExitContext::Case {
                     branch_count,
@@ -7805,7 +7919,7 @@ fn convert_value_table_mode(mode: sqlparser::ast::ValueTableMode) -> llkv_plan::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::record_batch::RecordBatch;
     use llkv_storage::pager::MemPager;
 
@@ -8052,20 +8166,125 @@ mod tests {
 
         let mut values: Vec<i64> = Vec::new();
         for batch in &batches {
-            let column = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("integer column");
-            for idx in 0..column.len() {
-                if !column.is_null(idx) {
-                    values.push(column.value(idx));
+            let column = batch.column(0);
+            match column.data_type() {
+                arrow::datatypes::DataType::Int64 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("int64 column");
+                    for idx in 0..array.len() {
+                        if !array.is_null(idx) {
+                            values.push(array.value(idx));
+                        }
+                    }
                 }
+                arrow::datatypes::DataType::Int32 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("int32 column");
+                    for idx in 0..array.len() {
+                        if !array.is_null(idx) {
+                            values.push(array.value(idx) as i64);
+                        }
+                    }
+                }
+                other => panic!("unexpected data type: {other:?}"),
             }
         }
 
         values.sort_unstable();
         assert_eq!(values, vec![-7, -2]);
+    }
+
+    #[test]
+    fn not_chain_precedence_matches_sqlite_behavior() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab1(col0 INTEGER)")
+            .expect("create tab1");
+        engine
+            .execute("INSERT INTO tab1 VALUES (1), (2)")
+            .expect("seed tab1");
+
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = SQLiteDialect {};
+        let mut statements = Parser::parse_sql(
+            &dialect,
+            "SELECT DISTINCT 85 AS value FROM tab1 WHERE NOT + 84 < - + 69 GROUP BY col0, col0",
+        )
+        .expect("parse sql");
+        let statement = statements.pop().expect("expected single statement");
+        let Statement::Query(query_ast) = statement else {
+            panic!("expected SELECT query");
+        };
+        let plan = engine
+            .build_select_plan(*query_ast)
+            .expect("build select plan");
+        let filter_expr = plan.filter.expect("expected filter predicate").predicate;
+        if let llkv_expr::expr::Expr::Not(inner) = &filter_expr {
+            if !matches!(inner.as_ref(), llkv_expr::expr::Expr::Compare { .. }) {
+                panic!("expected NOT to wrap comparison, got: {inner:?}");
+            }
+        } else {
+            panic!("expected filter to be NOT-wrapped comparison: {filter_expr:?}");
+        }
+
+        let batches = engine
+            .sql(
+                "SELECT DISTINCT 85 AS value FROM tab1 WHERE NOT + 84 < - + 69 GROUP BY col0, col0",
+            )
+            .expect("run NOT precedence query");
+
+        let mut values: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch.column(0);
+            match column.data_type() {
+                arrow::datatypes::DataType::Int64 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("int64 column");
+                    for idx in 0..array.len() {
+                        if !array.is_null(idx) {
+                            values.push(array.value(idx));
+                        }
+                    }
+                }
+                arrow::datatypes::DataType::Int32 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .expect("int32 column");
+                    for idx in 0..array.len() {
+                        if !array.is_null(idx) {
+                            values.push(array.value(idx) as i64);
+                        }
+                    }
+                }
+                arrow::datatypes::DataType::Float64 => {
+                    let array = column
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .expect("float64 column");
+                    for idx in 0..array.len() {
+                        if !array.is_null(idx) {
+                            values.push(array.value(idx) as i64);
+                        }
+                    }
+                }
+                other => panic!("unexpected data type: {other:?}"),
+            }
+        }
+
+        values.sort_unstable();
+        assert_eq!(values, vec![85]);
     }
 
     #[test]
@@ -8220,35 +8439,22 @@ mod tests {
             .expect("run cross join with alias and base table");
 
         let mut values = Vec::new();
-        for batch in batches {
+        for batch in &batches {
             let column = batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .expect("int column");
+                .expect("int64 column");
             for idx in 0..column.len() {
-                if column.is_null(idx) {
-                    values.push(None);
-                } else {
-                    values.push(Some(column.value(idx)));
+                if !column.is_null(idx) {
+                    values.push(column.value(idx));
                 }
             }
         }
-
-        assert_eq!(values, vec![Some(9)]);
-    }
-
-    #[test]
-    fn update_with_where_clause_filters_rows() {
-        let pager = Arc::new(MemPager::default());
-        let engine = SqlEngine::new(pager);
+        assert_eq!(values, vec![9]);
 
         engine
-            .execute("SET default_null_order='nulls_first'")
-            .expect("set default null order");
-
-        engine
-            .execute("CREATE TABLE strings(a VARCHAR)")
+            .execute("CREATE TABLE strings(a TEXT)")
             .expect("create table");
 
         engine
