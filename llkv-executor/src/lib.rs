@@ -4148,9 +4148,48 @@ where
                 }
                 Ok(if has_null { None } else { Some(false) })
             }
-            _ => Err(Error::InvalidArgumentError(
-                "Unsupported HAVING expression type".into(),
-            )),
+            llkv_expr::expr::Expr::Pred(filter) => {
+                // Handle Filter predicates (e.g., column IS NULL, column IS NOT NULL)
+                // In HAVING context, filters reference columns in the grouped result
+                use llkv_expr::expr::Operator;
+                
+                let col_name = &filter.field_id;
+                let col_idx = column_lookup.get(&col_name.to_ascii_lowercase()).ok_or_else(|| {
+                    Error::InvalidArgumentError(format!("column '{}' not found in HAVING context", col_name))
+                })?;
+                
+                let value = llkv_plan::plan_value_from_array(row_batch.column(*col_idx), row_idx)?;
+                
+                match &filter.op {
+                    Operator::IsNull => Ok(Some(matches!(value, PlanValue::Null))),
+                    Operator::IsNotNull => Ok(Some(!matches!(value, PlanValue::Null))),
+                    Operator::Equals(expected) => {
+                        // NULL comparisons return NULL
+                        if matches!(value, PlanValue::Null) {
+                            return Ok(None);
+                        }
+                        // Compare the value with the expected literal
+                        let expected_value = llkv_plan::plan_value_from_literal(expected)?;
+                        if matches!(expected_value, PlanValue::Null) {
+                            return Ok(None);
+                        }
+                        Ok(Some(value == expected_value))
+                    }
+                    _ => {
+                        // For other operators, fall back to a general error
+                        // These should ideally be translated to Compare expressions instead of Pred
+                        Err(Error::InvalidArgumentError(format!(
+                            "Operator {:?} not supported for column predicates in HAVING clause",
+                            filter.op
+                        )))
+                    }
+                }
+            }
+            llkv_expr::expr::Expr::Exists(_) => {
+                Err(Error::InvalidArgumentError(
+                    "EXISTS subqueries not supported in HAVING clause".into(),
+                ))
+            }
         }
     }
 

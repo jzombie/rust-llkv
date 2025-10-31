@@ -115,6 +115,40 @@ impl From<i32> for PlanValue {
     }
 }
 
+/// Convert a `Literal` from llkv-expr into a `PlanValue`.
+///
+/// This is useful for evaluating predicates that contain literal values,
+/// such as in HAVING clauses or filter expressions.
+pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanValue> {
+    use llkv_expr::Literal;
+    
+    match literal {
+        Literal::Null => Ok(PlanValue::Null),
+        Literal::Integer(i) => {
+            // Convert i128 to i64, checking for overflow
+            if *i > i64::MAX as i128 || *i < i64::MIN as i128 {
+                Err(Error::InvalidArgumentError(format!(
+                    "Integer literal {} out of range for i64",
+                    i
+                )))
+            } else {
+                Ok(PlanValue::Integer(*i as i64))
+            }
+        }
+        Literal::Float(f) => Ok(PlanValue::Float(*f)),
+        Literal::String(s) => Ok(PlanValue::String(s.clone())),
+        Literal::Boolean(b) => Ok(PlanValue::from(*b)),
+        Literal::Struct(fields) => {
+            let mut map = std::collections::HashMap::new();
+            for (name, value) in fields {
+                let plan_value = plan_value_from_literal(value)?;
+                map.insert(name.clone(), plan_value);
+            }
+            Ok(PlanValue::Struct(map))
+        }
+    }
+}
+
 // ============================================================================
 // CREATE TABLE Plan
 // ============================================================================
