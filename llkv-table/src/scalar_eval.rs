@@ -358,16 +358,16 @@ impl NumericKernels {
                 Self::collect_fields(right, acc);
             }
             ScalarExpr::Aggregate(agg) => {
-                // Collect fields referenced by the aggregate
+                // Collect fields referenced by the aggregate expression
                 match agg {
                     llkv_expr::expr::AggregateCall::CountStar => {}
-                    llkv_expr::expr::AggregateCall::Count { column: fid, .. }
-                    | llkv_expr::expr::AggregateCall::Sum { column: fid, .. }
-                    | llkv_expr::expr::AggregateCall::Avg { column: fid, .. }
-                    | llkv_expr::expr::AggregateCall::Min(fid)
-                    | llkv_expr::expr::AggregateCall::Max(fid)
-                    | llkv_expr::expr::AggregateCall::CountNulls(fid) => {
-                        acc.insert(*fid);
+                    llkv_expr::expr::AggregateCall::Count { expr, .. }
+                    | llkv_expr::expr::AggregateCall::Sum { expr, .. }
+                    | llkv_expr::expr::AggregateCall::Avg { expr, .. }
+                    | llkv_expr::expr::AggregateCall::Min(expr)
+                    | llkv_expr::expr::AggregateCall::Max(expr)
+                    | llkv_expr::expr::AggregateCall::CountNulls(expr) => {
+                        Self::collect_fields(expr, acc);
                     }
                 }
             }

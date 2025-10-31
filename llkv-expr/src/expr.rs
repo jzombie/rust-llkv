@@ -129,16 +129,19 @@ pub enum ScalarExpr<F> {
     },
 }
 
-/// Aggregate function call within a scalar expression
+/// Aggregate function call within a scalar expression.
+///
+/// Each variant (except `CountStar`) operates on an expression rather than just a column.
+/// This allows aggregates like `AVG(col1 + col2)` or `SUM(-col1)` to work correctly.
 #[derive(Clone, Debug)]
 pub enum AggregateCall<F> {
     CountStar,
-    Count { column: F, distinct: bool },
-    Sum { column: F, distinct: bool },
-    Avg { column: F, distinct: bool },
-    Min(F),
-    Max(F),
-    CountNulls(F),
+    Count { expr: Box<ScalarExpr<F>>, distinct: bool },
+    Sum { expr: Box<ScalarExpr<F>>, distinct: bool },
+    Avg { expr: Box<ScalarExpr<F>>, distinct: bool },
+    Min(Box<ScalarExpr<F>>),
+    Max(Box<ScalarExpr<F>>),
+    CountNulls(Box<ScalarExpr<F>>),
 }
 
 impl<F> ScalarExpr<F> {

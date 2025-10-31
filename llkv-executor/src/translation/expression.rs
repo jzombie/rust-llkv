@@ -230,32 +230,32 @@ where
         ScalarExpr::Aggregate(agg) => {
             let translated = match agg {
                 AggregateCall::CountStar => AggregateCall::CountStar,
-                AggregateCall::Count { column: name, distinct } => {
+                AggregateCall::Count { expr, distinct } => {
                     AggregateCall::Count { 
-                        column: resolve_field_id(schema, name, unknown_aggregate)?,
+                        expr: Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?),
                         distinct: *distinct,
                     }
                 }
-                AggregateCall::Sum { column: name, distinct } => {
+                AggregateCall::Sum { expr, distinct } => {
                     AggregateCall::Sum { 
-                        column: resolve_field_id(schema, name, unknown_aggregate)?,
+                        expr: Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?),
                         distinct: *distinct,
                     }
                 }
-                AggregateCall::Avg { column: name, distinct } => {
+                AggregateCall::Avg { expr, distinct } => {
                     AggregateCall::Avg { 
-                        column: resolve_field_id(schema, name, unknown_aggregate)?,
+                        expr: Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?),
                         distinct: *distinct,
                     }
                 }
-                AggregateCall::Min(name) => {
-                    AggregateCall::Min(resolve_field_id(schema, name, unknown_aggregate)?)
+                AggregateCall::Min(expr) => {
+                    AggregateCall::Min(Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?))
                 }
-                AggregateCall::Max(name) => {
-                    AggregateCall::Max(resolve_field_id(schema, name, unknown_aggregate)?)
+                AggregateCall::Max(expr) => {
+                    AggregateCall::Max(Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?))
                 }
-                AggregateCall::CountNulls(name) => {
-                    AggregateCall::CountNulls(resolve_field_id(schema, name, unknown_aggregate)?)
+                AggregateCall::CountNulls(expr) => {
+                    AggregateCall::CountNulls(Box::new(translate_scalar_with(expr, schema, unknown_column, unknown_aggregate)?))
                 }
             };
             Ok(ScalarExpr::Aggregate(translated))

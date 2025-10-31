@@ -4261,7 +4261,7 @@ where
 
         let having_expr = if let Some(having) = &select.having {
             let materialized_expr = self.materialize_in_subquery(having.clone())?;
-            Some(translate_condition_with_context(
+            let translated = translate_condition_with_context(
                 self,
                 resolver,
                 id_context.clone(),
@@ -4269,7 +4269,8 @@ where
                 outer_scopes,
                 &mut all_subqueries,
                 correlated_tracker.reborrow(),
-            )?)
+            )?;
+            Some(translated)
         } else {
             None
         };
@@ -5402,8 +5403,8 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
                 ))
             }
         }
-        // Handle unary + (no-op) by recursively resolving the inner expression
-        SqlExpr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Plus) => {
+        // Handle unary +/- by recursively resolving the inner expression
+        SqlExpr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Plus | UnaryOperator::Minus) => {
             resolve_column_name(expr)
         }
         _ => Err(Error::InvalidArgumentError(
@@ -5476,6 +5477,10 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
 
 fn try_parse_aggregate_function(
     func: &sqlparser::ast::Function,
+    resolver: Option<&IdentifierResolver<'_>>,
+    context: Option<&IdentifierContext>,
+    outer_scopes: &[IdentifierContext],
+    tracker: &mut SubqueryCorrelatedTracker<'_>,
 ) -> SqlResult<Option<llkv_expr::expr::AggregateCall<String>>> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart};
 
@@ -5536,9 +5541,9 @@ fn try_parse_aggregate_function(
                     llkv_expr::expr::AggregateCall::CountStar
                 }
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
-                    let column = resolve_column_name(arg_expr)?;
+                    let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
                     llkv_expr::expr::AggregateCall::Count {
-                        column,
+                        expr: Box::new(expr),
                         distinct,
                     }
                 }
@@ -5571,11 +5576,11 @@ fn try_parse_aggregate_function(
                         "DISTINCT not supported for COUNT(CASE ...) pattern".into(),
                     ));
                 }
-                llkv_expr::expr::AggregateCall::CountNulls(column)
+                llkv_expr::expr::AggregateCall::CountNulls(Box::new(llkv_expr::expr::ScalarExpr::column(column)))
             } else {
-                let column = resolve_column_name(arg_expr)?;
+                let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
                 llkv_expr::expr::AggregateCall::Sum {
-                    column,
+                    expr: Box::new(expr),
                     distinct,
                 }
             }
@@ -5594,8 +5599,8 @@ fn try_parse_aggregate_function(
                     ));
                 }
             };
-            let column = resolve_column_name(arg_expr)?;
-            llkv_expr::expr::AggregateCall::Min(column)
+            let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
+            llkv_expr::expr::AggregateCall::Min(Box::new(expr))
         }
         "max" => {
             if args_slice.len() != 1 {
@@ -5611,8 +5616,8 @@ fn try_parse_aggregate_function(
                     ));
                 }
             };
-            let column = resolve_column_name(arg_expr)?;
-            llkv_expr::expr::AggregateCall::Max(column)
+            let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
+            llkv_expr::expr::AggregateCall::Max(Box::new(expr))
         }
         "avg" => {
             if args_slice.len() != 1 {
@@ -5628,8 +5633,8 @@ fn try_parse_aggregate_function(
                     ));
                 }
             };
-            let column = resolve_column_name(arg_expr)?;
-            llkv_expr::expr::AggregateCall::Avg { column, distinct }
+            let expr = translate_scalar_internal(arg_expr, resolver, context, outer_scopes, tracker, None)?;
+            llkv_expr::expr::AggregateCall::Avg { expr: Box::new(expr), distinct }
         }
         _ => return Ok(None),
     };
@@ -5925,15 +5930,9 @@ where
                         work_stack.push(ConditionFrame::Leaf(between_expr_result));
                         continue;
                     }
-                    if comparison_involves_null(inner_stripped) {
-                        tracing::debug!(
-                            expr = ?inner,
-                            "short-circuit NOT comparison due to NULL literal",
-                        );
-                        work_stack
-                            .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(false)));
-                        continue;
-                    }
+                    // Note: Do not short-circuit NOT on NULL comparisons.
+                    // NULL comparisons evaluate to NULL, and NOT NULL should also be NULL,
+                    // not FALSE. Let the normal evaluation handle NULL propagation.
                     work_stack.push(ConditionFrame::Exit(ConditionExitContext::Not));
                     work_stack.push(ConditionFrame::Enter(inner));
                 }
@@ -5959,13 +5958,12 @@ where
                                 },
                             )));
                         }
-                        llkv_expr::expr::ScalarExpr::Literal(literal) => {
-                            let result = matches!(literal, llkv_expr::literal::Literal::Null);
-                            work_stack
-                                .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(result)));
-                        }
+                        // NOTE: Do NOT constant-fold IsNull(Literal(Null)) to Literal(true).
+                        // While technically correct (NULL IS NULL = TRUE), it breaks NULL
+                        // propagation in boolean expressions like NOT (NOT NULL = NULL).
+                        // The executor's evaluate_having_expr handles these correctly.
                         other => {
-                            // For complex expressions, use the IsNull variant
+                            // For all expressions including literals, use the IsNull variant
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::IsNull {
                                 expr: other,
                                 negated: false,
@@ -5991,13 +5989,12 @@ where
                                 },
                             )));
                         }
-                        llkv_expr::expr::ScalarExpr::Literal(literal) => {
-                            let result = !matches!(literal, llkv_expr::literal::Literal::Null);
-                            work_stack
-                                .push(ConditionFrame::Leaf(llkv_expr::expr::Expr::Literal(result)));
-                        }
+                        // NOTE: Do NOT constant-fold IsNotNull(Literal(Null)) to Literal(false).
+                        // While technically correct (NULL IS NOT NULL = FALSE), it breaks NULL
+                        // propagation in boolean expressions like NOT (NOT NULL = NULL).
+                        // The executor's evaluate_having_expr handles these correctly.
                         other => {
-                            // For complex expressions, use the IsNull variant with negation
+                            // For all expressions including literals, use the IsNull variant with negation
                             work_stack.push(ConditionFrame::Leaf(llkv_expr::expr::Expr::IsNull {
                                 expr: other,
                                 negated: true,
@@ -6144,16 +6141,12 @@ where
                         )
                     })?;
                     // Optimize: NOT (expr IS NULL) -> expr IS NOT NULL by flipping negation
-                    // Optimize: NOT Literal(bool) -> Literal(!bool) by constant folding
                     match inner {
                         llkv_expr::expr::Expr::IsNull { expr, negated } => {
                             result_stack.push(llkv_expr::expr::Expr::IsNull {
                                 expr,
                                 negated: !negated,
                             });
-                        }
-                        llkv_expr::expr::Expr::Literal(value) => {
-                            result_stack.push(llkv_expr::expr::Expr::Literal(!value));
                         }
                         other => {
                             result_stack.push(llkv_expr::expr::Expr::not(other));
@@ -6562,7 +6555,7 @@ fn translate_scalar_internal(
                     }
                 }
                 SqlExpr::Function(func) => {
-                    if let Some(agg_call) = try_parse_aggregate_function(func)? {
+                    if let Some(agg_call) = try_parse_aggregate_function(func, resolver, context, outer_scopes, tracker)? {
                         work_stack.push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::aggregate(
                             agg_call,
                         )));
