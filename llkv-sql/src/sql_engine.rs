@@ -7745,7 +7745,7 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
 ///
 /// Returns (tables, join_metadata, join_filters) where:
 /// - `tables`: list of all table references in order
-/// - `join_metadata`: metadata for each join operation  
+/// - `join_metadata`: [`llkv_plan::JoinMetadata`] entries pairing consecutive tables
 /// - `join_filters`: ON conditions to be merged into WHERE clause
 fn extract_tables(
     from: &[TableWithJoins],

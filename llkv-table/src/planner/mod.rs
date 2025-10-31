@@ -1595,7 +1595,9 @@ where
     ///
     /// Used for comparisons with no column references, such as those produced
     /// by materializing IN (SELECT ...) subqueries or constant expressions in
-    /// WHERE clauses like `WHERE NULL BETWEEN NULL AND (16 / -28)`.
+    /// WHERE clauses like `WHERE NULL BETWEEN NULL AND (16 / -28)`. Returns
+    /// `Ok(Some(_))` when the predicate resolves to a concrete boolean and
+    /// `Ok(None)` when NULL-propagation makes the outcome indeterminate.
     fn evaluate_constant_compare(
         left: &ScalarExpr<FieldId>,
         op: CompareOp,

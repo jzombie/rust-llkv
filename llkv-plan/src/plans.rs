@@ -673,18 +673,27 @@ pub enum JoinPlan {
 ///
 /// Tracks the join type and optional ON condition filter for each join.
 /// The join connects table at index `left_table_index` with `left_table_index + 1`.
+/// Replaces the older `join_types`/`join_filters` vectors so executors can
+/// inspect a single compact structure when coordinating join evaluation.
 #[derive(Clone, Debug)]
 pub struct JoinMetadata {
     /// Index of the left table in the `SelectPlan.tables` vector.
     pub left_table_index: usize,
     /// Type of join (INNER, LEFT, RIGHT, etc.).
     pub join_type: JoinPlan,
-    /// Optional ON condition filter expression (already included in `SelectFilter` if present).
-    /// This is tracked separately to enable join-specific optimizations.
+    /// Optional ON condition filter expression. Translators also thread this
+    /// predicate through [`SelectPlan::filter`] so the optimizer can merge it
+    /// with other WHERE clauses, but keeping it here enables join-specific
+    /// rewrites (e.g., push-down or hash join pruning).
     pub on_condition: Option<llkv_expr::expr::Expr<'static, String>>,
 }
 
 /// Logical query plan for SELECT operations.
+///
+/// The `tables` collection preserves the FROM clause order while [`Self::joins`]
+/// captures how adjacent tables are connected via [`JoinMetadata`]. This keeps
+/// join semantics alongside table references instead of parallel vectors and
+/// mirrors what the executor expects when materialising join pipelines.
 #[derive(Clone, Debug)]
 pub struct SelectPlan {
     /// Tables to query. Empty vec means no FROM clause (e.g., SELECT 42).
@@ -746,6 +755,10 @@ impl SelectPlan {
     }
 
     /// Create a SelectPlan with multiple tables for cross product/joins.
+    ///
+    /// The returned plan leaves [`Self::joins`] empty, which means any
+    /// evaluation engine should treat the tables as a Cartesian product until
+    /// [`Self::with_joins`] populates concrete join relationships.
     pub fn with_tables(tables: Vec<TableRef>) -> Self {
         Self {
             tables,
@@ -800,6 +813,11 @@ impl SelectPlan {
     }
 
     /// Attach join metadata describing how tables are connected.
+    ///
+    /// Each [`JoinMetadata`] entry pairs `tables[i]` with `tables[i + 1]`. The
+    /// builder should supply exactly `tables.len().saturating_sub(1)` entries
+    /// when explicit joins are required; otherwise consumers fall back to a
+    /// Cartesian product.
     pub fn with_joins(mut self, joins: Vec<JoinMetadata>) -> Self {
         self.joins = joins;
         self
