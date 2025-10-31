@@ -34,10 +34,11 @@ jobs:
 
       - name: Capture rustc commit hash
         id: rustc
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           rustc -Vv
-          echo "hash=$(rustc -Vv | sed -n 's/^commit-hash: //p')" >> $GITHUB_OUTPUT
+          echo "hash=$(rustc -Vv | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
 
       # Added caching step to speed up dependency builds.
       - name: Cache Cargo dependencies
