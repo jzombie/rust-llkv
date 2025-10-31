@@ -32,6 +32,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Capture rustc commit hash
+        id: rustc
+        run: |
+          set -e
+          rustc -Vv
+          echo "hash=$(rustc -Vv | sed -n 's/^commit-hash: //p')" >> $GITHUB_OUTPUT
+
       # Added caching step to speed up dependency builds.
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -42,9 +49,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
+          key: ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Test
         run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
