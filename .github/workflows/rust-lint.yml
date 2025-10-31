@@ -18,6 +18,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Capture rustc commit hash
+        id: rustc
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -Vv
+          echo "hash=$(rustc -Vv | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+
+      # Added caching step to speed up dependency builds.
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
@@ -27,9 +36,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-lint-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
           restore-keys: |
-            ${{ runner.os }}-lint-
+            ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-
 
       # Note: This is a workaround for an issue that just started appearing in lint checks
       # and I'm not yet sure if it's due to GitHub Actions having updated something behind
