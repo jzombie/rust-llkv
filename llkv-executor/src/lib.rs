@@ -4106,13 +4106,7 @@ where
                 }
             }
             llkv_expr::expr::Expr::IsNull { expr, negated } => {
-                // Special case: IS NULL / IS NOT NULL on a NULL literal
-                // This happens when sqlparser parses "NOT NULL = NULL" as "IsNull(NULL)"
-                // In that case, we should return NULL (unknown) instead of a boolean
-                if matches!(expr, llkv_expr::expr::ScalarExpr::Literal(llkv_expr::Literal::Null)) {
-                    return Ok(None); // NULL
-                }
-                
+                // Evaluate the expression to get its value
                 let val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
                     expr,
                     aggregates,
@@ -4120,6 +4114,10 @@ where
                     Some(column_lookup),
                     row_idx,
                 )?;
+                
+                // IS NULL / IS NOT NULL returns a boolean (not NULL) even when testing NULL
+                // NULL IS NULL = TRUE
+                // NULL IS NOT NULL = FALSE
                 let is_null = matches!(val, PlanValue::Null);
                 Ok(Some(if *negated { !is_null } else { is_null }))
             }
