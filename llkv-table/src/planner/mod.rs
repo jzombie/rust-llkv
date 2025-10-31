@@ -2671,9 +2671,14 @@ where
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
     ) -> LlkvResult<Vec<RowId>> {
         if fields.is_empty() {
+            // Domain evaluation only cares whether rows might satisfy the predicate.
+            // Constant comparisons therefore mark every row as determined (even if
+            // the eventual evaluation returns false) so higher-level unions and
+            // intersections preserve the correct row sets. Only a NULL outcome
+            // indicates "unknown", which leaves the domain empty.
             return match Self::evaluate_constant_compare(left, op, right)? {
-                Some(true) => self.collect_all_row_ids(all_rows_cache),
-                Some(false) | None => Ok(Vec::new()),
+                Some(_) => self.collect_all_row_ids(all_rows_cache),
+                None => Ok(Vec::new()),
             };
         }
 
