@@ -132,9 +132,9 @@ struct GroupState {
 
 /// State for a group when computing aggregates
 struct GroupAggregateState {
-    batch: RecordBatch,
+    representative_batch_idx: usize,
     representative_row: usize,
-    row_indices: Vec<usize>, // Track all rows belonging to this group
+    row_locations: Vec<(usize, usize)>, // (batch_idx, row_idx) for every row in the group
 }
 
 struct OutputColumn {
@@ -1281,37 +1281,37 @@ where
                             distinct: *distinct,
                         },
                         AggregateFunction::SumInt64 => {
-                            if field.data_type() != &DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "SUM currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "SUM",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Sum {
                                 field_id: column_index as u32,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                                 distinct: *distinct,
                             }
                         }
                         AggregateFunction::MinInt64 => {
-                            if field.data_type() != &DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MIN currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "MIN",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Min {
                                 field_id: column_index as u32,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                             }
                         }
                         AggregateFunction::MaxInt64 => {
-                            if field.data_type() != &DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MAX currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "MAX",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Max {
                                 field_id: column_index as u32,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                             }
                         }
                         AggregateFunction::CountNulls => AggregateKind::CountNulls {
@@ -1502,49 +1502,49 @@ where
                             distinct: *distinct,
                         },
                         AggregateCall::Sum { distinct, .. } => {
-                            if field.data_type() != &DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "SUM currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "SUM",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Sum {
                                 field_id: column_index as u32,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                                 distinct: *distinct,
                             }
                         }
                         AggregateCall::Avg { distinct, .. } => {
-                            if field.data_type() != &DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "AVG currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "AVG",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Avg {
                                 field_id: column_index as u32,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                                 distinct: *distinct,
                             }
                         }
                         AggregateCall::Min(_) => {
-                            if field.data_type() != &DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MIN currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "MIN",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Min {
                                 field_id: column_index as u32,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                             }
                         }
                         AggregateCall::Max(_) => {
-                            if field.data_type() != &DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MAX currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "MAX",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Max {
                                 field_id: column_index as u32,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                             }
                         }
                         AggregateCall::CountNulls(_) => AggregateKind::CountNulls {
@@ -2826,21 +2826,23 @@ where
         let mut group_states: Vec<GroupAggregateState> = Vec::new();
 
         // First pass: collect all rows for each group
-        for batch in &batches {
+        for (batch_idx, batch) in batches.iter().enumerate() {
             for row_idx in 0..batch.num_rows() {
                 let key = build_group_key(batch, row_idx, &key_indices)?;
 
                 if let Some(&group_idx) = group_index.get(&key) {
                     // Add row to existing group
-                    group_states[group_idx].row_indices.push(row_idx);
+                    group_states[group_idx]
+                        .row_locations
+                        .push((batch_idx, row_idx));
                 } else {
                     // New group
                     let group_idx = group_states.len();
                     group_index.insert(key, group_idx);
                     group_states.push(GroupAggregateState {
-                        batch: batch.clone(),
+                        representative_batch_idx: batch_idx,
                         representative_row: row_idx,
-                        row_indices: vec![row_idx],
+                        row_locations: vec![(batch_idx, row_idx)],
                     });
                 }
             }
@@ -2851,26 +2853,64 @@ where
             Vec::with_capacity(group_states.len());
 
         for group_state in &group_states {
+            tracing::debug!(
+                "[GROUP BY] aggregate group rows={:?}",
+                group_state.row_locations
+            );
             // Create a mini-batch containing only rows from this group
             let group_batch = {
-                let schema = group_state.batch.schema();
+                let representative_batch = &batches[group_state.representative_batch_idx];
+                let schema = representative_batch.schema();
+
+                // Collect row indices per batch while preserving scan order
+                let mut per_batch_indices: Vec<(usize, Vec<u64>)> = Vec::new();
+                for &(batch_idx, row_idx) in &group_state.row_locations {
+                    if let Some((_, indices)) = per_batch_indices
+                        .iter_mut()
+                        .find(|(idx, _)| *idx == batch_idx)
+                    {
+                        indices.push(row_idx as u64);
+                    } else {
+                        per_batch_indices.push((batch_idx, vec![row_idx as u64]));
+                    }
+                }
+
+                let mut row_index_arrays: Vec<(usize, ArrayRef)> =
+                    Vec::with_capacity(per_batch_indices.len());
+                for (batch_idx, indices) in per_batch_indices {
+                    let index_array: ArrayRef = Arc::new(arrow::array::UInt64Array::from(indices));
+                    row_index_arrays.push((batch_idx, index_array));
+                }
+
                 let mut arrays: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
                 for col_idx in 0..schema.fields().len() {
-                    let source_array = group_state.batch.column(col_idx);
-                    // Use Arrow's take kernel to extract rows for this group
-                    let indices = arrow::array::UInt64Array::from(
-                        group_state
-                            .row_indices
-                            .iter()
-                            .map(|&i| i as u64)
-                            .collect::<Vec<_>>(),
-                    );
-                    let taken = arrow::compute::take(source_array.as_ref(), &indices, None)?;
-                    arrays.push(taken);
+                    let column_array = if row_index_arrays.len() == 1 {
+                        let (batch_idx, indices) = &row_index_arrays[0];
+                        let source_array = batches[*batch_idx].column(col_idx);
+                        arrow::compute::take(source_array.as_ref(), indices.as_ref(), None)?
+                    } else {
+                        let mut partial_arrays: Vec<ArrayRef> =
+                            Vec::with_capacity(row_index_arrays.len());
+                        for (batch_idx, indices) in &row_index_arrays {
+                            let source_array = batches[*batch_idx].column(col_idx);
+                            let taken = arrow::compute::take(
+                                source_array.as_ref(),
+                                indices.as_ref(),
+                                None,
+                            )?;
+                            partial_arrays.push(taken);
+                        }
+                        let slices: Vec<&dyn arrow::array::Array> =
+                            partial_arrays.iter().map(|arr| arr.as_ref()).collect();
+                        arrow::compute::concat(&slices)?
+                    };
+                    arrays.push(column_array);
                 }
 
-                RecordBatch::try_new(schema, arrays)?
+                let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
+                tracing::debug!("[GROUP BY] group batch rows={}", batch.num_rows());
+                batch
             };
 
             // Create AggregateState for each aggregate and compute
@@ -2881,27 +2921,32 @@ where
             let mut next_temp_col_idx = working_batch.num_columns();
 
             for (key, agg_call) in &aggregate_specs {
-                // For aggregates on columns, find the column index in the batch
-                let (projection_idx, _needs_cleanup) = match agg_call {
-                    AggregateCall::CountStar => (None, false),
+                // Determine the column index and Arrow type that backs this aggregate input
+                let (projection_idx, value_type) = match agg_call {
+                    AggregateCall::CountStar => (None, None),
                     AggregateCall::Count { expr, .. }
                     | AggregateCall::Sum { expr, .. }
                     | AggregateCall::Avg { expr, .. }
                     | AggregateCall::Min(expr)
                     | AggregateCall::Max(expr)
                     | AggregateCall::CountNulls(expr) => {
-                        // Try to extract a simple column name first
                         if let Some(col_name) = try_extract_simple_column(expr) {
-                            let idx = resolve_column_name_to_index(col_name, &column_lookup_map);
-                            (idx, false)
+                            let idx = resolve_column_name_to_index(col_name, &column_lookup_map)
+                                .ok_or_else(|| {
+                                    Error::InvalidArgumentError(format!(
+                                        "column '{}' not found for aggregate",
+                                        col_name
+                                    ))
+                                })?;
+                            let field_type = working_batch.schema().field(idx).data_type().clone();
+                            (Some(idx), Some(field_type))
                         } else {
                             // Complex expression - evaluate it and add as temporary column
-                            // Evaluate the expression for each row in the working batch
                             let mut computed_values = Vec::with_capacity(working_batch.num_rows());
                             for row_idx in 0..working_batch.num_rows() {
                                 let value = Self::evaluate_expr_with_plan_value_aggregates_and_row(
                                     expr,
-                                    &FxHashMap::default(), // No aggregates during expression eval
+                                    &FxHashMap::default(),
                                     Some(&working_batch),
                                     Some(&column_lookup_map),
                                     row_idx,
@@ -2909,17 +2954,15 @@ where
                                 computed_values.push(value);
                             }
 
-                            // Convert PlanValues to Arrow array
                             let computed_array = plan_values_to_arrow_array(&computed_values)?;
                             let computed_type = computed_array.data_type().clone();
 
-                            // Add this as a new column to the working batch
                             let mut new_columns: Vec<ArrayRef> = working_batch.columns().to_vec();
                             new_columns.push(computed_array);
 
                             let temp_field = Arc::new(Field::new(
                                 format!("__temp_agg_expr_{}", next_temp_col_idx),
-                                computed_type,
+                                computed_type.clone(),
                                 true,
                             ));
                             let mut new_fields: Vec<Arc<Field>> =
@@ -2931,13 +2974,17 @@ where
 
                             let col_idx = next_temp_col_idx;
                             next_temp_col_idx += 1;
-                            (Some(col_idx), true)
+                            (Some(col_idx), Some(computed_type))
                         }
                     }
                 };
 
                 // Build the AggregateSpec - use dummy field_id since projection_idx will override it
-                let spec = Self::build_aggregate_spec_for_cross_product(agg_call, key.clone())?;
+                let spec = Self::build_aggregate_spec_for_cross_product(
+                    agg_call,
+                    key.clone(),
+                    value_type.clone(),
+                )?;
 
                 let mut state = llkv_aggregate::AggregateState {
                     alias: key.clone(),
@@ -2955,6 +3002,7 @@ where
                 // Finalize and extract value
                 let (_field, array) = state.finalize()?;
                 let value = llkv_plan::plan_value_from_array(&array, 0)?;
+                tracing::debug!("[GROUP BY] aggregate result key={:?} value={:?}", key, value);
                 aggregate_values.insert(key.clone(), value);
             }
 
@@ -2975,6 +3023,7 @@ where
 
         for (group_idx, group_state) in group_states.iter().enumerate() {
             let aggregate_values = &group_aggregate_values[group_idx];
+            let representative_batch = &batches[group_state.representative_batch_idx];
 
             let mut row: Vec<PlanValue> = Vec::with_capacity(output_columns.len());
             for output in &output_columns {
@@ -2982,7 +3031,7 @@ where
                     OutputSource::TableColumn { index } => {
                         // Use the representative row from this group
                         let value = llkv_plan::plan_value_from_array(
-                            group_state.batch.column(index),
+                            representative_batch.column(index),
                             group_state.representative_row,
                         )?;
                         row.push(value);
@@ -2996,7 +3045,7 @@ where
                         let value = Self::evaluate_expr_with_plan_value_aggregates_and_row(
                             expr,
                             &aggregate_values,
-                            Some(&group_state.batch),
+                            Some(representative_batch),
                             Some(&column_lookup_map),
                             group_state.representative_row,
                         )?;
@@ -3013,11 +3062,12 @@ where
             for (row_idx, row) in rows.iter().enumerate() {
                 let aggregate_values = &group_aggregate_values[row_idx];
                 let group_state = &group_states[row_idx];
+                let representative_batch = &batches[group_state.representative_batch_idx];
                 // Evaluate HAVING expression recursively
                 let passes = Self::evaluate_having_expr(
                     having,
                     aggregate_values,
-                    &group_state.batch,
+                    representative_batch,
                     &column_lookup_map,
                     group_state.representative_row,
                 )?;
@@ -3098,37 +3148,37 @@ where
                             distinct,
                         },
                         AggregateFunction::SumInt64 => {
-                            if col.data_type != DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "SUM currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(col.data_type.clone()),
+                                "SUM",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Sum {
                                 field_id: col.field_id,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                                 distinct,
                             }
                         }
                         AggregateFunction::MinInt64 => {
-                            if col.data_type != DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MIN currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(col.data_type.clone()),
+                                "MIN",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Min {
                                 field_id: col.field_id,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                             }
                         }
                         AggregateFunction::MaxInt64 => {
-                            if col.data_type != DataType::Int64 {
-                                return Err(Error::InvalidArgumentError(
-                                    "MAX currently supports only INTEGER columns".into(),
-                                ));
-                            }
+                            let input_type = Self::validate_aggregate_type(
+                                Some(col.data_type.clone()),
+                                "MAX",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
                             AggregateKind::Max {
                                 field_id: col.field_id,
-                                data_type: DataType::Int64,
+                                data_type: input_type,
                             }
                         }
                         AggregateFunction::CountNulls => {
@@ -3495,7 +3545,11 @@ where
                     })?;
                 llkv_aggregate::AggregateKind::Sum {
                     field_id,
-                    data_type: DataType::Int64,
+                    data_type: Self::validate_aggregate_type(
+                        Some(field.data_type().clone()),
+                        "SUM",
+                        &[DataType::Int64, DataType::Float64],
+                    )?,
                     distinct: *distinct,
                 }
             }
@@ -3523,7 +3577,11 @@ where
                     })?;
                 llkv_aggregate::AggregateKind::Avg {
                     field_id,
-                    data_type: DataType::Int64,
+                    data_type: Self::validate_aggregate_type(
+                        Some(field.data_type().clone()),
+                        "AVG",
+                        &[DataType::Int64, DataType::Float64],
+                    )?,
                     distinct: *distinct,
                 }
             }
@@ -3548,7 +3606,11 @@ where
                     })?;
                 llkv_aggregate::AggregateKind::Min {
                     field_id,
-                    data_type: DataType::Int64,
+                    data_type: Self::validate_aggregate_type(
+                        Some(field.data_type().clone()),
+                        "MIN",
+                        &[DataType::Int64, DataType::Float64],
+                    )?,
                 }
             }
             AggregateCall::Max(col_expr) => {
@@ -3572,7 +3634,11 @@ where
                     })?;
                 llkv_aggregate::AggregateKind::Max {
                     field_id,
-                    data_type: DataType::Int64,
+                    data_type: Self::validate_aggregate_type(
+                        Some(field.data_type().clone()),
+                        "MAX",
+                        &[DataType::Int64, DataType::Float64],
+                    )?,
                 }
             }
             AggregateCall::CountNulls(col_expr) => {
@@ -3606,6 +3672,7 @@ where
     fn build_aggregate_spec_for_cross_product(
         agg_call: &llkv_expr::expr::AggregateCall<String>,
         alias: String,
+        data_type: Option<DataType>,
     ) -> ExecutorResult<llkv_aggregate::AggregateSpec> {
         use llkv_expr::expr::AggregateCall;
 
@@ -3620,21 +3687,37 @@ where
             },
             AggregateCall::Sum { distinct, .. } => llkv_aggregate::AggregateKind::Sum {
                 field_id: 0,
-                data_type: DataType::Int64,
+                data_type: Self::validate_aggregate_type(
+                    data_type.clone(),
+                    "SUM",
+                    &[DataType::Int64, DataType::Float64],
+                )?,
                 distinct: *distinct,
             },
             AggregateCall::Avg { distinct, .. } => llkv_aggregate::AggregateKind::Avg {
                 field_id: 0,
-                data_type: DataType::Int64,
+                data_type: Self::validate_aggregate_type(
+                    data_type.clone(),
+                    "AVG",
+                    &[DataType::Int64, DataType::Float64],
+                )?,
                 distinct: *distinct,
             },
             AggregateCall::Min(_) => llkv_aggregate::AggregateKind::Min {
                 field_id: 0,
-                data_type: DataType::Int64,
+                data_type: Self::validate_aggregate_type(
+                    data_type.clone(),
+                    "MIN",
+                    &[DataType::Int64, DataType::Float64],
+                )?,
             },
             AggregateCall::Max(_) => llkv_aggregate::AggregateKind::Max {
                 field_id: 0,
-                data_type: DataType::Int64,
+                data_type: Self::validate_aggregate_type(
+                    data_type.clone(),
+                    "MAX",
+                    &[DataType::Int64, DataType::Float64],
+                )?,
             },
             AggregateCall::CountNulls(_) => {
                 llkv_aggregate::AggregateKind::CountNulls { field_id: 0 }
@@ -3642,6 +3725,26 @@ where
         };
 
         Ok(llkv_aggregate::AggregateSpec { alias, kind })
+    }
+
+    fn validate_aggregate_type(
+        data_type: Option<DataType>,
+        func_name: &str,
+        allowed: &[DataType],
+    ) -> ExecutorResult<DataType> {
+        let dt = data_type.ok_or_else(|| {
+            Error::Internal(format!(
+                "missing input type metadata for {func_name} aggregate"
+            ))
+        })?;
+        if allowed.iter().any(|candidate| candidate == &dt) {
+            Ok(dt)
+        } else {
+            Err(Error::InvalidArgumentError(format!(
+                "{func_name} aggregate not supported for column type {:?}",
+                dt
+            )))
+        }
     }
 
     /// Collect all aggregate calls from an expression
@@ -3793,7 +3896,11 @@ where
                     })?;
                     AggregateKind::Sum {
                         field_id: col.field_id,
-                        data_type: DataType::Int64,
+                        data_type: Self::validate_aggregate_type(
+                            Some(col.data_type.clone()),
+                            "SUM",
+                            &[DataType::Int64, DataType::Float64],
+                        )?,
                         distinct: *distinct,
                     }
                 }
@@ -3811,7 +3918,11 @@ where
                     })?;
                     AggregateKind::Avg {
                         field_id: col.field_id,
-                        data_type: DataType::Int64,
+                        data_type: Self::validate_aggregate_type(
+                            Some(col.data_type.clone()),
+                            "AVG",
+                            &[DataType::Int64, DataType::Float64],
+                        )?,
                         distinct: *distinct,
                     }
                 }
@@ -3826,7 +3937,11 @@ where
                     })?;
                     AggregateKind::Min {
                         field_id: col.field_id,
-                        data_type: DataType::Int64,
+                        data_type: Self::validate_aggregate_type(
+                            Some(col.data_type.clone()),
+                            "MIN",
+                            &[DataType::Int64, DataType::Float64],
+                        )?,
                     }
                 }
                 AggregateCall::Max(col_expr) => {
@@ -3840,7 +3955,11 @@ where
                     })?;
                     AggregateKind::Max {
                         field_id: col.field_id,
-                        data_type: DataType::Int64,
+                        data_type: Self::validate_aggregate_type(
+                            Some(col.data_type.clone()),
+                            "MAX",
+                            &[DataType::Int64, DataType::Float64],
+                        )?,
                     }
                 }
                 AggregateCall::CountNulls(col_expr) => {
@@ -4385,9 +4504,9 @@ where
                     row_idx,
                 )?;
 
-                // Handle NULL comparisons (return NULL as 0 for integer context)
+                // SQL three-valued logic: comparisons involving NULL yield NULL.
                 if matches!(left_val, PlanValue::Null) || matches!(right_val, PlanValue::Null) {
-                    return Ok(PlanValue::Integer(0));
+                    return Ok(PlanValue::Null);
                 }
 
                 // Coerce types for comparison
@@ -4627,7 +4746,7 @@ where
                 // Evaluate each WHEN/THEN branch
                 for (when_expr, then_expr) in branches {
                     let matches = if let Some(ref op_val) = operand_value {
-                        // Simple CASE: compare operand with WHEN value
+                        // Simple CASE compares using SQL equality semantics: NULL never matches.
                         let when_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
                             when_expr,
                             aggregates,
@@ -4635,7 +4754,7 @@ where
                             column_lookup,
                             row_idx,
                         )?;
-                        op_val == &when_val
+                        Self::simple_case_branch_matches(op_val, &when_val)
                     } else {
                         // Searched CASE: evaluate WHEN as boolean condition
                         let when_val = Self::evaluate_expr_with_plan_value_aggregates_and_row(
@@ -4700,6 +4819,22 @@ where
             ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
                 "Scalar subqueries not supported in aggregate expressions".into(),
             )),
+        }
+    }
+
+    fn simple_case_branch_matches(operand: &PlanValue, candidate: &PlanValue) -> bool {
+        if matches!(operand, PlanValue::Null) || matches!(candidate, PlanValue::Null) {
+            return false;
+        }
+
+        match (operand, candidate) {
+            (PlanValue::Integer(left), PlanValue::Integer(right)) => left == right,
+            (PlanValue::Integer(left), PlanValue::Float(right)) => (*left as f64) == *right,
+            (PlanValue::Float(left), PlanValue::Integer(right)) => *left == (*right as f64),
+            (PlanValue::Float(left), PlanValue::Float(right)) => left == right,
+            (PlanValue::String(left), PlanValue::String(right)) => left == right,
+            (PlanValue::Struct(left), PlanValue::Struct(right)) => left == right,
+            _ => operand == candidate,
         }
     }
 

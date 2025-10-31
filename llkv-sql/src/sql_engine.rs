@@ -5486,7 +5486,9 @@ fn try_parse_aggregate_function(
     outer_scopes: &[IdentifierContext],
     tracker: &mut SubqueryCorrelatedTracker<'_>,
 ) -> SqlResult<Option<llkv_expr::expr::AggregateCall<String>>> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart};
+    use sqlparser::ast::{
+        DuplicateTreatment, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart,
+    };
 
     if func.uses_odbc_syntax {
         return Ok(None);
@@ -5517,7 +5519,7 @@ fn try_parse_aggregate_function(
             if !list.clauses.is_empty() {
                 return Ok(None);
             }
-            list.duplicate_treatment.is_some()
+            matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
         }
         _ => false,
     };
