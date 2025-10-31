@@ -1591,7 +1591,8 @@ where
     /// Evaluate a constant-only comparison expression.
     ///
     /// Used for comparisons with no column references, such as those produced
-    /// by materializing IN (SELECT ...) subqueries.
+    /// by materializing IN (SELECT ...) subqueries or constant expressions in
+    /// WHERE clauses like `WHERE NULL BETWEEN NULL AND (16 / -28)`.
     fn evaluate_constant_compare(
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
@@ -1599,8 +1600,12 @@ where
     ) -> LlkvResult<bool> {
         use llkv_expr::literal::Literal;
 
+        // Simplify expressions first to fold any constant arithmetic operations
+        let left_simplified = NumericKernels::simplify(left);
+        let right_simplified = NumericKernels::simplify(right);
+
         // Extract literal values
-        let left_lit = match left {
+        let left_lit = match &left_simplified {
             ScalarExpr::Literal(lit) => lit,
             _ => {
                 return Err(Error::InvalidArgumentError(
@@ -1608,7 +1613,7 @@ where
                 ));
             }
         };
-        let right_lit = match right {
+        let right_lit = match &right_simplified {
             ScalarExpr::Literal(lit) => lit,
             _ => {
                 return Err(Error::InvalidArgumentError(
@@ -2030,8 +2035,9 @@ where
         NumericKernels::collect_fields(expr, &mut fields);
 
         if fields.is_empty() {
-            // Constant expression
-            match expr {
+            // Constant expression - simplify to fold any arithmetic operations
+            let simplified = NumericKernels::simplify(expr);
+            match simplified {
                 ScalarExpr::Literal(lit) => {
                     let is_null = matches!(lit, Literal::Null);
                     let matches = if negated { !is_null } else { is_null };

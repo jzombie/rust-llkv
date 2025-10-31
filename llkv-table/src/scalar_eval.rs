@@ -10,6 +10,7 @@ use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
+use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -771,6 +772,13 @@ impl NumericKernels {
                 let left_s = Self::simplify(left);
                 let right_s = Self::simplify(right);
 
+                // Any binary operation involving NULL yields NULL
+                if matches!(left_s, ScalarExpr::Literal(Literal::Null))
+                    || matches!(right_s, ScalarExpr::Literal(Literal::Null))
+                {
+                    return ScalarExpr::literal(Literal::Null);
+                }
+
                 if let (Some(lv), Some(rv)) = (
                     Self::literal_numeric_value(&left_s),
                     Self::literal_numeric_value(&right_s),
@@ -818,6 +826,10 @@ impl NumericKernels {
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
+                // Casting NULL to any type yields NULL
+                if matches!(inner, ScalarExpr::Literal(Literal::Null)) {
+                    return ScalarExpr::literal(Literal::Null);
+                }
                 ScalarExpr::cast(inner, data_type.clone())
             }
             ScalarExpr::Case {
