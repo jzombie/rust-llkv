@@ -46,6 +46,10 @@ pub(crate) enum EvalOp {
         list: Vec<ScalarExpr<FieldId>>,
         negated: bool,
     },
+    PushIsNull {
+        expr: ScalarExpr<FieldId>,
+        negated: bool,
+    },
     PushLiteral(bool),
     FusedAnd {
         field_id: FieldId,
@@ -234,6 +238,11 @@ pub(crate) enum DomainOp {
         fields: Vec<FieldId>,
         negated: bool,
     },
+    PushIsNullDomain {
+        expr: ScalarExpr<FieldId>,
+        fields: Vec<FieldId>,
+        negated: bool,
+    },
     PushLiteralFalse,
     PushAllRows,
     Union {
@@ -271,6 +280,127 @@ impl<'expr> ProgramCompiler<'expr> {
             domains,
             _root_expr: root,
         })
+    }
+}
+
+pub(crate) fn normalize_predicate<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
+    normalize_expr(expr)
+}
+
+fn normalize_expr<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
+    match expr {
+        Expr::And(children) => {
+            let mut normalized = Vec::with_capacity(children.len());
+            for child in children {
+                let child = normalize_expr(child);
+                match child {
+                    Expr::And(nested) => normalized.extend(nested),
+                    other => normalized.push(other),
+                }
+            }
+            Expr::And(normalized)
+        }
+        Expr::Or(children) => {
+            let mut normalized = Vec::with_capacity(children.len());
+            for child in children {
+                let child = normalize_expr(child);
+                match child {
+                    Expr::Or(nested) => normalized.extend(nested),
+                    other => normalized.push(other),
+                }
+            }
+            Expr::Or(normalized)
+        }
+        Expr::Not(inner) => normalize_negated(*inner),
+        other => other,
+    }
+}
+
+fn normalize_negated<'expr>(inner: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
+    match inner {
+        Expr::Not(nested) => normalize_expr(*nested),
+        Expr::And(children) => {
+            let mapped = children
+                .into_iter()
+                .map(|child| normalize_expr(Expr::Not(Box::new(child))))
+                .collect();
+            Expr::Or(mapped)
+        }
+        Expr::Or(children) => {
+            let mapped = children
+                .into_iter()
+                .map(|child| normalize_expr(Expr::Not(Box::new(child))))
+                .collect();
+            Expr::And(mapped)
+        }
+        Expr::Literal(value) => Expr::Literal(!value),
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr,
+            negated: !negated,
+        },
+        other => Expr::Not(Box::new(normalize_expr(other))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llkv_expr::literal::Literal;
+
+    #[test]
+    fn normalize_not_between_expands_to_or() {
+        let field: FieldId = 7;
+        let column = ScalarExpr::column(field);
+        let lower = ScalarExpr::literal(5_i64);
+        let upper = ScalarExpr::literal(Literal::Null);
+
+        let between = Expr::And(vec![
+            Expr::Compare {
+                left: column.clone(),
+                op: CompareOp::GtEq,
+                right: lower,
+            },
+            Expr::Compare {
+                left: column.clone(),
+                op: CompareOp::LtEq,
+                right: upper,
+            },
+        ]);
+
+        let normalized = normalize_predicate(Expr::Not(Box::new(between)));
+
+        let Expr::Or(children) = normalized else {
+            panic!("expected OR after normalization");
+        };
+        assert_eq!(children.len(), 2);
+
+        match &children[0] {
+            Expr::Not(inner) => match inner.as_ref() {
+                Expr::Compare {
+                    op: CompareOp::GtEq,
+                    ..
+                } => {}
+                other => panic!("unexpected left branch: {other:?}"),
+            },
+            other => panic!("left branch should be NOT(compare), got {other:?}"),
+        }
+
+        match &children[1] {
+            Expr::Not(inner) => match inner.as_ref() {
+                Expr::Compare {
+                    op: CompareOp::LtEq,
+                    ..
+                } => {}
+                other => panic!("unexpected right branch: {other:?}"),
+            },
+            other => panic!("right branch should be NOT(compare), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_flips_literal_bool() {
+        let normalized = normalize_predicate(Expr::Not(Box::new(Expr::Literal(true))));
+        assert!(matches!(normalized, Expr::Literal(false)));
     }
 }
 
@@ -347,6 +477,12 @@ fn compile_eval<'expr>(
                     ops.push(EvalOp::PushInList {
                         expr: expr.clone(),
                         list: list.clone(),
+                        negated: *negated,
+                    });
+                }
+                Expr::IsNull { expr, negated } => {
+                    ops.push(EvalOp::PushIsNull {
+                        expr: expr.clone(),
                         negated: *negated,
                     });
                 }
@@ -453,6 +589,13 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                         negated: *negated,
                     });
                 }
+                Expr::IsNull { expr, negated } => {
+                    ops.push(DomainOp::PushIsNullDomain {
+                        expr: expr.clone(),
+                        fields: collect_fields([expr]),
+                        negated: *negated,
+                    });
+                }
                 Expr::Literal(value) => {
                     if *value {
                         ops.push(DomainOp::PushAllRows);
@@ -508,18 +651,25 @@ fn collect_fields<'expr>(
             }
             ScalarExpr::Aggregate(agg) => match agg {
                 llkv_expr::expr::AggregateCall::CountStar => {}
-                llkv_expr::expr::AggregateCall::Count(fid)
-                | llkv_expr::expr::AggregateCall::Sum(fid)
-                | llkv_expr::expr::AggregateCall::Min(fid)
-                | llkv_expr::expr::AggregateCall::Max(fid)
-                | llkv_expr::expr::AggregateCall::CountNulls(fid) => {
-                    seen.insert(*fid);
+                llkv_expr::expr::AggregateCall::Count { expr, .. }
+                | llkv_expr::expr::AggregateCall::Sum { expr, .. }
+                | llkv_expr::expr::AggregateCall::Avg { expr, .. }
+                | llkv_expr::expr::AggregateCall::Min(expr)
+                | llkv_expr::expr::AggregateCall::Max(expr)
+                | llkv_expr::expr::AggregateCall::CountNulls(expr) => {
+                    stack.push(expr.as_ref());
                 }
             },
             ScalarExpr::GetField { base, .. } => {
                 stack.push(base);
             }
             ScalarExpr::Cast { expr, .. } => {
+                stack.push(expr.as_ref());
+            }
+            ScalarExpr::Not(expr) => {
+                stack.push(expr.as_ref());
+            }
+            ScalarExpr::IsNull { expr, .. } => {
                 stack.push(expr.as_ref());
             }
             ScalarExpr::Case {

@@ -1426,6 +1426,37 @@ impl_integer_fast_path!(
     null_sentinel: u64::MAX
 );
 
+/// Synthesize a LEFT JOIN result batch when right side is empty:
+/// Take all left columns and append NULL arrays for right columns.
+fn synthesize_left_join_nulls(
+    left_batch: &RecordBatch,
+    output_schema: &Arc<Schema>,
+) -> LlkvResult<RecordBatch> {
+    use arrow::array::new_null_array;
+
+    let left_col_count = left_batch.num_columns();
+    let right_col_count = output_schema.fields().len() - left_col_count;
+    let row_count = left_batch.num_rows();
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    // Copy left columns as-is
+    for col in left_batch.columns() {
+        columns.push(Arc::clone(col));
+    }
+
+    // Append NULL arrays for right columns
+    for field_idx in left_col_count..(left_col_count + right_col_count) {
+        let field = output_schema.field(field_idx);
+        let null_array = new_null_array(field.data_type(), row_count);
+        columns.push(null_array);
+    }
+
+    RecordBatch::try_new(Arc::clone(output_schema), columns).map_err(|err| {
+        Error::InvalidArgumentError(format!("Failed to create LEFT JOIN null batch: {}", err))
+    })
+}
+
 /// Cross product (Cartesian product) implementation for empty join keys
 fn cross_product_stream<P, F>(
     left: &Table<P>,
@@ -1460,7 +1491,12 @@ where
         )?;
     }
 
-    if right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0) {
+    // For INNER JOIN: if right side is empty, no results
+    // For LEFT JOIN: if right side is empty, emit all left rows with NULL right columns
+    let right_is_empty =
+        right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0);
+
+    if right_is_empty && options.join_type == JoinType::Inner {
         return Ok(());
     }
 
@@ -1477,6 +1513,17 @@ where
         ScanStreamOptions::default(),
         |left_batch| {
             if error.is_some() || left_batch.num_rows() == 0 {
+                return;
+            }
+
+            // For LEFT JOIN with empty right side: emit left rows with NULL right columns
+            if right_is_empty && options.join_type == JoinType::Left {
+                match synthesize_left_join_nulls(&left_batch, &output_schema) {
+                    Ok(result) => on_batch(result),
+                    Err(err) => {
+                        error = Some(err);
+                    }
+                }
                 return;
             }
 

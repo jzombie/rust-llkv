@@ -115,6 +115,40 @@ impl From<i32> for PlanValue {
     }
 }
 
+/// Convert a `Literal` from llkv-expr into a `PlanValue`.
+///
+/// This is useful for evaluating predicates that contain literal values,
+/// such as in HAVING clauses or filter expressions.
+pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanValue> {
+    use llkv_expr::Literal;
+
+    match literal {
+        Literal::Null => Ok(PlanValue::Null),
+        Literal::Integer(i) => {
+            // Convert i128 to i64, checking for overflow
+            if *i > i64::MAX as i128 || *i < i64::MIN as i128 {
+                Err(Error::InvalidArgumentError(format!(
+                    "Integer literal {} out of range for i64",
+                    i
+                )))
+            } else {
+                Ok(PlanValue::Integer(*i as i64))
+            }
+        }
+        Literal::Float(f) => Ok(PlanValue::Float(*f)),
+        Literal::String(s) => Ok(PlanValue::String(s.clone())),
+        Literal::Boolean(b) => Ok(PlanValue::from(*b)),
+        Literal::Struct(fields) => {
+            let mut map = std::collections::HashMap::new();
+            for (name, value) in fields {
+                let plan_value = plan_value_from_literal(value)?;
+                map.insert(name.clone(), plan_value);
+            }
+            Ok(PlanValue::Struct(map))
+        }
+    }
+}
+
 // ============================================================================
 // CREATE TABLE Plan
 // ============================================================================
@@ -290,16 +324,11 @@ impl AlterTablePlan {
 // FOREIGN KEY Plan Structures
 // ============================================================================
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ForeignKeyAction {
+    #[default]
     NoAction,
     Restrict,
-}
-
-impl Default for ForeignKeyAction {
-    fn default() -> Self {
-        Self::NoAction
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -619,15 +648,66 @@ impl TableRef {
     }
 }
 
+// ============================================================================
+// Join Metadata
+// ============================================================================
+
+/// Type of join operation for query planning.
+///
+/// This is a plan-layer type that mirrors `llkv_join::JoinType` but exists
+/// separately to avoid circular dependencies (llkv-join depends on llkv-table
+/// which depends on llkv-plan). The executor converts `JoinPlan` to `llkv_join::JoinType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinPlan {
+    /// Emit only matching row pairs.
+    Inner,
+    /// Emit all left rows; unmatched left rows have NULL right columns.
+    Left,
+    /// Emit all right rows; unmatched right rows have NULL left columns.
+    Right,
+    /// Emit all rows from both sides; unmatched rows have NULLs.
+    Full,
+}
+
+/// Metadata describing a join between consecutive tables in the FROM clause.
+///
+/// Tracks the join type and optional ON condition filter for each join.
+/// The join connects table at index `left_table_index` with `left_table_index + 1`.
+/// Replaces the older `join_types`/`join_filters` vectors so executors can
+/// inspect a single compact structure when coordinating join evaluation.
+#[derive(Clone, Debug)]
+pub struct JoinMetadata {
+    /// Index of the left table in the `SelectPlan.tables` vector.
+    pub left_table_index: usize,
+    /// Type of join (INNER, LEFT, RIGHT, etc.).
+    pub join_type: JoinPlan,
+    /// Optional ON condition filter expression. Translators also thread this
+    /// predicate through [`SelectPlan::filter`] so the optimizer can merge it
+    /// with other WHERE clauses, but keeping it here enables join-specific
+    /// rewrites (e.g., push-down or hash join pruning).
+    pub on_condition: Option<llkv_expr::expr::Expr<'static, String>>,
+}
+
 /// Logical query plan for SELECT operations.
+///
+/// The `tables` collection preserves the FROM clause order while [`Self::joins`]
+/// captures how adjacent tables are connected via [`JoinMetadata`]. This keeps
+/// join semantics alongside table references instead of parallel vectors and
+/// mirrors what the executor expects when materialising join pipelines.
 #[derive(Clone, Debug)]
 pub struct SelectPlan {
     /// Tables to query. Empty vec means no FROM clause (e.g., SELECT 42).
     /// Single element for simple queries, multiple for joins/cross products.
     pub tables: Vec<TableRef>,
+    /// Join metadata describing how tables are joined.
+    /// If empty, all tables are implicitly cross-joined (Cartesian product).
+    /// Each entry describes a join between `tables[i]` and `tables[i + 1]`.
+    pub joins: Vec<JoinMetadata>,
     pub projections: Vec<SelectProjection>,
     /// Optional WHERE predicate plus dependent correlated subqueries.
     pub filter: Option<SelectFilter>,
+    /// Optional HAVING predicate applied after grouping.
+    pub having: Option<llkv_expr::expr::Expr<'static, String>>,
     /// Scalar subqueries referenced by projections, keyed by `SubqueryId`.
     pub scalar_subqueries: Vec<ScalarSubquery>,
     pub aggregates: Vec<AggregateExpr>,
@@ -635,6 +715,10 @@ pub struct SelectPlan {
     pub distinct: bool,
     /// Optional compound (set-operation) plan.
     pub compound: Option<CompoundSelectPlan>,
+    /// Columns used in GROUP BY clauses (canonical names).
+    pub group_by: Vec<String>,
+    /// Optional value table output mode (BigQuery style).
+    pub value_table_mode: Option<ValueTableMode>,
 }
 
 impl SelectPlan {
@@ -656,27 +740,39 @@ impl SelectPlan {
 
         Self {
             tables,
+            joins: Vec::new(),
             projections: Vec::new(),
             filter: None,
+            having: None,
             scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
             compound: None,
+            group_by: Vec::new(),
+            value_table_mode: None,
         }
     }
 
     /// Create a SelectPlan with multiple tables for cross product/joins.
+    ///
+    /// The returned plan leaves [`Self::joins`] empty, which means any
+    /// evaluation engine should treat the tables as a Cartesian product until
+    /// [`Self::with_joins`] populates concrete join relationships.
     pub fn with_tables(tables: Vec<TableRef>) -> Self {
         Self {
             tables,
+            joins: Vec::new(),
             projections: Vec::new(),
             filter: None,
+            having: None,
             scalar_subqueries: Vec::new(),
             aggregates: Vec::new(),
             order_by: Vec::new(),
             distinct: false,
             compound: None,
+            group_by: Vec::new(),
+            value_table_mode: None,
         }
     }
 
@@ -687,6 +783,11 @@ impl SelectPlan {
 
     pub fn with_filter(mut self, filter: Option<SelectFilter>) -> Self {
         self.filter = filter;
+        self
+    }
+
+    pub fn with_having(mut self, having: Option<llkv_expr::expr::Expr<'static, String>>) -> Self {
+        self.having = having;
         self
     }
 
@@ -711,9 +812,30 @@ impl SelectPlan {
         self
     }
 
+    /// Attach join metadata describing how tables are connected.
+    ///
+    /// Each [`JoinMetadata`] entry pairs `tables[i]` with `tables[i + 1]`. The
+    /// builder should supply exactly `tables.len().saturating_sub(1)` entries
+    /// when explicit joins are required; otherwise consumers fall back to a
+    /// Cartesian product.
+    pub fn with_joins(mut self, joins: Vec<JoinMetadata>) -> Self {
+        self.joins = joins;
+        self
+    }
+
     /// Attach a compound (set operation) plan.
     pub fn with_compound(mut self, compound: CompoundSelectPlan) -> Self {
         self.compound = Some(compound);
+        self
+    }
+
+    pub fn with_group_by(mut self, group_by: Vec<String>) -> Self {
+        self.group_by = group_by;
+        self
+    }
+
+    pub fn with_value_table_mode(mut self, mode: Option<ValueTableMode>) -> Self {
+        self.value_table_mode = mode;
         self
     }
 }
@@ -785,6 +907,15 @@ pub enum SelectProjection {
         expr: llkv_expr::expr::ScalarExpr<String>,
         alias: String,
     },
+}
+
+/// Value table output modes (BigQuery-style).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueTableMode {
+    AsStruct,
+    AsValue,
+    DistinctAsStruct,
+    DistinctAsValue,
 }
 
 // ============================================================================
@@ -972,7 +1103,7 @@ pub enum PlanOperation {
     Update(UpdatePlan),
     Delete(DeletePlan),
     Truncate(TruncatePlan),
-    Select(SelectPlan),
+    Select(Box<SelectPlan>),
 }
 
 /// Top-level plan statements that can be executed against a `Session`.
@@ -990,5 +1121,5 @@ pub enum PlanStatement {
     Update(UpdatePlan),
     Delete(DeletePlan),
     Truncate(TruncatePlan),
-    Select(SelectPlan),
+    Select(Box<SelectPlan>),
 }

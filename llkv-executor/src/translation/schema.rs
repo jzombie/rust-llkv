@@ -76,6 +76,8 @@ fn infer_computed_data_type(
                 Ok(DataType::Int64)
             }
         }
+        ScalarExpr::Not(_) => Ok(DataType::Int64),
+        ScalarExpr::IsNull { .. } => Ok(DataType::Int64),
         ScalarExpr::Compare { .. } => Ok(DataType::Int64),
         ScalarExpr::Aggregate(_) => Ok(DataType::Int64),
         ScalarExpr::GetField { base, field_name } => {
@@ -157,6 +159,12 @@ fn expression_uses_float(
                 return Ok(true);
             }
             expression_uses_float(schema, right)
+        }
+        ScalarExpr::Not(expr) => expression_uses_float(schema, expr),
+        ScalarExpr::IsNull { expr, .. } => {
+            // IS NULL produces an integer boolean indicator regardless of operand type.
+            let _ = expression_uses_float(schema, expr)?;
+            Ok(false)
         }
         ScalarExpr::Compare { left, right, .. } => {
             let left_float = expression_uses_float(schema, left)?;

@@ -28,6 +28,13 @@ pub enum Expr<'a, F> {
         list: Vec<ScalarExpr<F>>,
         negated: bool,
     },
+    /// Check if a scalar expression IS NULL or IS NOT NULL.
+    /// For simple column references, prefer `Pred(Filter { op: IsNull/IsNotNull })` for optimization.
+    /// This variant handles complex expressions like `(col1 + col2) IS NULL`.
+    IsNull {
+        expr: ScalarExpr<F>,
+        negated: bool,
+    },
     /// A literal boolean value (true/false).
     /// Used for conditions that are always true or always false (e.g., empty IN lists).
     Literal(bool),
@@ -86,6 +93,14 @@ pub enum ScalarExpr<F> {
         op: BinaryOp,
         right: Box<ScalarExpr<F>>,
     },
+    /// Logical NOT returning 1 for falsey inputs, 0 for truthy inputs, and NULL for NULL inputs.
+    Not(Box<ScalarExpr<F>>),
+    /// NULL test returning 1 when the operand is NULL (or NOT NULL when `negated` is true) and 0 otherwise.
+    /// Returns NULL when the operand cannot be determined.
+    IsNull {
+        expr: Box<ScalarExpr<F>>,
+        negated: bool,
+    },
     /// Aggregate function call (e.g., COUNT(*), SUM(col), etc.)
     /// This is used in expressions like COUNT(*) + 1
     Aggregate(AggregateCall<F>),
@@ -122,15 +137,28 @@ pub enum ScalarExpr<F> {
     },
 }
 
-/// Aggregate function call within a scalar expression
+/// Aggregate function call within a scalar expression.
+///
+/// Each variant (except `CountStar`) operates on an expression rather than just a column.
+/// This allows aggregates like `AVG(col1 + col2)` or `SUM(-col1)` to work correctly.
 #[derive(Clone, Debug)]
 pub enum AggregateCall<F> {
     CountStar,
-    Count(F),
-    Sum(F),
-    Min(F),
-    Max(F),
-    CountNulls(F),
+    Count {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+    },
+    Sum {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+    },
+    Avg {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+    },
+    Min(Box<ScalarExpr<F>>),
+    Max(Box<ScalarExpr<F>>),
+    CountNulls(Box<ScalarExpr<F>>),
 }
 
 impl<F> ScalarExpr<F> {
@@ -150,6 +178,19 @@ impl<F> ScalarExpr<F> {
             left: Box::new(left),
             op,
             right: Box::new(right),
+        }
+    }
+
+    #[inline]
+    pub fn logical_not(expr: Self) -> Self {
+        Self::Not(Box::new(expr))
+    }
+
+    #[inline]
+    pub fn is_null(expr: Self, negated: bool) -> Self {
+        Self::IsNull {
+            expr: Box::new(expr),
+            negated,
         }
     }
 

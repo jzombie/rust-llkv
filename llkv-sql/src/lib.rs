@@ -11,7 +11,7 @@
 //! The SQL engine:
 //! 1. Parses SQL using [`sqlparser`]
 //! 2. Converts AST to execution plans
-//! 3. Delegates to [`llkv-runtime`] for execution
+//! 3. Delegates to `llkv-runtime` for execution
 //! 4. Returns results as Arrow `RecordBatch` instances or row counts
 //!
 //! # Transactions
