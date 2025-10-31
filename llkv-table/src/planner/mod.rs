@@ -1154,6 +1154,7 @@ where
                             }
                             ScalarExpr::Cast { data_type, .. } => data_type.clone(),
                             ScalarExpr::Not(_) => DataType::Int64,
+                            ScalarExpr::IsNull { .. } => DataType::Int64,
                             ScalarExpr::Binary { .. }
                             | ScalarExpr::Compare { .. }
                             | ScalarExpr::Case { .. }
@@ -3230,6 +3231,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
         ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
         ScalarExpr::Not(expr) => computed_expr_requires_numeric(expr),
+        ScalarExpr::IsNull { expr, .. } => computed_expr_requires_numeric(expr),
         ScalarExpr::Case { .. } => true,
         ScalarExpr::Coalesce(items) => items.iter().any(computed_expr_requires_numeric),
         ScalarExpr::ScalarSubquery(_) => false,
@@ -3276,6 +3278,10 @@ fn computed_expr_prefers_float(
             }
         }
         ScalarExpr::Not(expr) => computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes),
+        ScalarExpr::IsNull { expr, .. } => {
+            let _ = computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)?;
+            Ok(false)
+        }
         ScalarExpr::Case {
             operand,
             branches,
@@ -3319,6 +3325,7 @@ fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
             scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right)
         }
         ScalarExpr::Not(expr) => scalar_expr_contains_coalesce(expr),
+        ScalarExpr::IsNull { expr, .. } => scalar_expr_contains_coalesce(expr),
         ScalarExpr::Cast { expr, .. } => scalar_expr_contains_coalesce(expr),
         ScalarExpr::Case {
             operand,
@@ -3524,6 +3531,7 @@ fn synthesize_computed_literal_array(
         | ScalarExpr::Aggregate(_)
         | ScalarExpr::GetField { .. }
         | ScalarExpr::Not(_)
+        | ScalarExpr::IsNull { .. }
         | ScalarExpr::Case { .. }
         | ScalarExpr::Coalesce(_) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
@@ -3735,6 +3743,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             GetField { base, .. } => traverse_stack.push(base),
             Cast { expr, .. } => traverse_stack.push(expr),
             Not(expr) => traverse_stack.push(expr),
+            ScalarExpr::IsNull { expr, .. } => traverse_stack.push(expr),
             Case {
                 operand,
                 branches,
@@ -3788,6 +3797,14 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             Not(_) => {
                 let operand = result_stack.pop().unwrap_or_default();
                 result_stack.push(format!("(NOT {})", operand));
+            }
+            ScalarExpr::IsNull { negated, .. } => {
+                let operand = result_stack.pop().unwrap_or_default();
+                if *negated {
+                    result_stack.push(format!("({operand} IS NOT NULL)"));
+                } else {
+                    result_stack.push(format!("({operand} IS NULL)"));
+                }
             }
             Case {
                 operand,

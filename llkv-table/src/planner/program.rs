@@ -669,6 +669,9 @@ fn collect_fields<'expr>(
             ScalarExpr::Not(expr) => {
                 stack.push(expr.as_ref());
             }
+            ScalarExpr::IsNull { expr, .. } => {
+                stack.push(expr.as_ref());
+            }
             ScalarExpr::Case {
                 operand,
                 branches,

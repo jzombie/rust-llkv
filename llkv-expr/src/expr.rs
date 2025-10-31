@@ -95,6 +95,12 @@ pub enum ScalarExpr<F> {
     },
     /// Logical NOT returning 1 for falsey inputs, 0 for truthy inputs, and NULL for NULL inputs.
     Not(Box<ScalarExpr<F>>),
+    /// NULL test returning 1 when the operand is NULL (or NOT NULL when `negated` is true) and 0 otherwise.
+    /// Returns NULL when the operand cannot be determined.
+    IsNull {
+        expr: Box<ScalarExpr<F>>,
+        negated: bool,
+    },
     /// Aggregate function call (e.g., COUNT(*), SUM(col), etc.)
     /// This is used in expressions like COUNT(*) + 1
     Aggregate(AggregateCall<F>),
@@ -178,6 +184,14 @@ impl<F> ScalarExpr<F> {
     #[inline]
     pub fn not(expr: Self) -> Self {
         Self::Not(Box::new(expr))
+    }
+
+    #[inline]
+    pub fn is_null(expr: Self, negated: bool) -> Self {
+        Self::IsNull {
+            expr: Box::new(expr),
+            negated,
+        }
     }
 
     #[inline]

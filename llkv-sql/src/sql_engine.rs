@@ -5453,6 +5453,7 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
         llkv_expr::expr::ScalarExpr::Not(inner) => expr_contains_aggregate(inner),
+        llkv_expr::expr::ScalarExpr::IsNull { expr, .. } => expr_contains_aggregate(expr),
         llkv_expr::expr::ScalarExpr::GetField { base, .. } => expr_contains_aggregate(base),
         llkv_expr::expr::ScalarExpr::Cast { expr, .. } => expr_contains_aggregate(expr),
         llkv_expr::expr::ScalarExpr::Case {
@@ -6430,6 +6431,12 @@ fn translate_scalar_internal(
         UnaryPlus,
         Nested,
         Cast(DataType),
+        IsNull {
+            negated: bool,
+        },
+        Between {
+            negated: bool,
+        },
         Case {
             branch_count: usize,
             has_operand: bool,
@@ -6604,6 +6611,31 @@ fn translate_scalar_internal(
                     if let Some(opnd) = operand.as_deref() {
                         work_stack.push(ScalarFrame::Enter(opnd));
                     }
+                }
+                SqlExpr::IsNull(inner) => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::IsNull {
+                        negated: false,
+                    }));
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::IsNotNull(inner) => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::IsNull {
+                        negated: true,
+                    }));
+                    work_stack.push(ScalarFrame::Enter(inner));
+                }
+                SqlExpr::Between {
+                    expr: between_expr,
+                    negated,
+                    low,
+                    high,
+                } => {
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::Between {
+                        negated: *negated,
+                    }));
+                    work_stack.push(ScalarFrame::Enter(high));
+                    work_stack.push(ScalarFrame::Enter(low));
+                    work_stack.push(ScalarFrame::Enter(between_expr));
                 }
                 SqlExpr::Function(func) => {
                     if let Some(agg_call) = try_parse_aggregate_function(
@@ -7061,6 +7093,52 @@ fn translate_scalar_internal(
                     let case_expr =
                         llkv_expr::expr::ScalarExpr::case(operand_expr, branches_rev, else_expr);
                     result_stack.push(case_expr);
+                }
+                ScalarExitContext::IsNull { negated } => {
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for IS NULL operand".into(),
+                        )
+                    })?;
+                    result_stack.push(llkv_expr::expr::ScalarExpr::is_null(inner, negated));
+                }
+                ScalarExitContext::Between { negated } => {
+                    let high = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for BETWEEN upper".into(),
+                        )
+                    })?;
+                    let low = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for BETWEEN lower".into(),
+                        )
+                    })?;
+                    let expr_value = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for BETWEEN operand".into(),
+                        )
+                    })?;
+
+                    let lower_cmp = llkv_expr::expr::ScalarExpr::compare(
+                        expr_value.clone(),
+                        llkv_expr::expr::CompareOp::GtEq,
+                        low,
+                    );
+                    let upper_cmp = llkv_expr::expr::ScalarExpr::compare(
+                        expr_value,
+                        llkv_expr::expr::CompareOp::LtEq,
+                        high,
+                    );
+                    let between_expr = llkv_expr::expr::ScalarExpr::binary(
+                        lower_cmp,
+                        llkv_expr::expr::BinaryOp::Multiply,
+                        upper_cmp,
+                    );
+                    if negated {
+                        result_stack.push(llkv_expr::expr::ScalarExpr::not(between_expr));
+                    } else {
+                        result_stack.push(between_expr);
+                    }
                 }
             },
         }

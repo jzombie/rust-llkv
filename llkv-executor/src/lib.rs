@@ -597,6 +597,7 @@ where
             ScalarExpr::GetField { base, .. } => Self::expr_contains_aggregate(base),
             ScalarExpr::Cast { expr, .. } => Self::expr_contains_aggregate(expr),
             ScalarExpr::Not(expr) => Self::expr_contains_aggregate(expr),
+            ScalarExpr::IsNull { expr, .. } => Self::expr_contains_aggregate(expr),
             ScalarExpr::Case {
                 operand,
                 branches,
@@ -3672,6 +3673,9 @@ where
             ScalarExpr::Not(expr) => {
                 Self::collect_aggregates(expr, aggregates);
             }
+            ScalarExpr::IsNull { expr, .. } => {
+                Self::collect_aggregates(expr, aggregates);
+            }
             ScalarExpr::Case {
                 operand,
                 branches,
@@ -4394,6 +4398,18 @@ where
                     ))),
                 }
             }
+            ScalarExpr::IsNull { expr, negated } => {
+                let value = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                    expr,
+                    aggregates,
+                    row_batch,
+                    column_lookup,
+                    row_idx,
+                )?;
+                let is_null = matches!(value, PlanValue::Null);
+                let condition = if is_null { !negated } else { *negated };
+                Ok(PlanValue::Integer(if condition { 1 } else { 0 }))
+            }
             ScalarExpr::Aggregate(agg) => {
                 let key = format!("{:?}", agg);
                 aggregates
@@ -4663,6 +4679,11 @@ where
             ScalarExpr::Not(inner) => {
                 let value = Self::evaluate_expr_with_aggregates(inner, aggregates)?;
                 Ok(if value != 0 { 0 } else { 1 })
+            }
+            ScalarExpr::IsNull { expr, negated } => {
+                // Aggregates normalize NULL results to zero-length arrays which we treat as not null.
+                let _ = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
+                Ok(if *negated { 1 } else { 0 })
             }
             ScalarExpr::Binary { left, op, right } => {
                 let left_val = Self::evaluate_expr_with_aggregates(left, aggregates)?;
@@ -5518,6 +5539,7 @@ impl CrossProductExpressionContext {
             ScalarExpr::Binary { .. } => self.evaluate_numeric(expr, batch),
             ScalarExpr::Compare { .. } => self.evaluate_numeric(expr, batch),
             ScalarExpr::Not(_) => self.evaluate_numeric(expr, batch),
+            ScalarExpr::IsNull { .. } => self.evaluate_numeric(expr, batch),
             ScalarExpr::Aggregate(_) => Err(Error::InvalidArgumentError(
                 "aggregate expressions are not supported in cross product filters".into(),
             )),
@@ -5577,6 +5599,7 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
         ScalarExpr::GetField { base, .. } => collect_field_ids(base, out),
         ScalarExpr::Cast { expr, .. } => collect_field_ids(expr, out),
         ScalarExpr::Not(expr) => collect_field_ids(expr, out),
+        ScalarExpr::IsNull { expr, .. } => collect_field_ids(expr, out),
         ScalarExpr::Case {
             operand,
             branches,
@@ -6196,6 +6219,10 @@ fn bind_scalar_expr(
         ScalarExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(bind_scalar_expr(
             inner, bindings,
         )?))),
+        ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(bind_scalar_expr(expr, bindings)?),
+            negated: *negated,
+        }),
         ScalarExpr::ScalarSubquery(sub) => Ok(ScalarExpr::ScalarSubquery(sub.clone())),
     }
 }
@@ -6539,6 +6566,9 @@ fn collect_scalar_subquery_ids(expr: &ScalarExpr<FieldId>, ids: &mut FxHashSet<S
         ScalarExpr::Not(expr) => {
             collect_scalar_subquery_ids(expr, ids);
         }
+        ScalarExpr::IsNull { expr, .. } => {
+            collect_scalar_subquery_ids(expr, ids);
+        }
         ScalarExpr::Case {
             operand,
             branches,
@@ -6594,6 +6624,10 @@ fn rewrite_scalar_expr_for_subqueries(
         ScalarExpr::Not(expr) => {
             ScalarExpr::Not(Box::new(rewrite_scalar_expr_for_subqueries(expr, mapping)))
         }
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(rewrite_scalar_expr_for_subqueries(expr, mapping)),
+            negated: *negated,
+        },
         ScalarExpr::Case {
             operand,
             branches,

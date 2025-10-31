@@ -221,6 +221,15 @@ where
             unknown_column,
             unknown_aggregate,
         )?))),
+        ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(translate_scalar_with(
+                expr,
+                schema,
+                unknown_column,
+                unknown_aggregate,
+            )?),
+            negated: *negated,
+        }),
         ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
             left: Box::new(translate_scalar_with(
                 left,
