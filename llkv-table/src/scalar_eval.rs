@@ -476,7 +476,8 @@ impl NumericKernels {
             ScalarExpr::IsNull { expr, negated } => {
                 let value = Self::evaluate_value(expr, idx, arrays)?;
                 let is_null = value.is_none();
-                let condition_holds = if is_null { !negated } else { *negated };
+                // XOR-style comparison keeps negated IS NULL readable.
+                let condition_holds = is_null != *negated;
                 Ok(Some(NumericValue::Integer(if condition_holds {
                     1
                 } else {

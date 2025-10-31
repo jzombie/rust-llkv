@@ -675,9 +675,9 @@ where
             PlanOperation::Select(plan) => {
                 // SELECT is read-only, not tracked for replay
                 // But still fails if transaction is aborted (already checked above)
-                let plan_ref = plan.as_ref();
-                let table_name = select_plan_table_name(plan_ref).unwrap_or_default();
-                match self.execute_select(plan_ref.clone()) {
+                let table_name = select_plan_table_name(plan.as_ref()).unwrap_or_default();
+                let plan = *plan;
+                match self.execute_select(plan) {
                     Ok(staging_execution) => {
                         // Collect staging execution into batches
                         let schema = staging_execution.schema();

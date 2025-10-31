@@ -2672,8 +2672,8 @@ where
     ) -> LlkvResult<Vec<RowId>> {
         if fields.is_empty() {
             return match Self::evaluate_constant_compare(left, op, right)? {
-                Some(_) => self.collect_all_row_ids(all_rows_cache),
-                None => Ok(Vec::new()),
+                Some(true) => self.collect_all_row_ids(all_rows_cache),
+                Some(false) | None => Ok(Vec::new()),
             };
         }
 
