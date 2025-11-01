@@ -49,7 +49,7 @@ where
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn infer_computed_data_type(
+pub fn infer_computed_data_type(
     schema: &ExecutorSchema,
     expr: &ScalarExpr<FieldId>,
 ) -> ExecutorResult<DataType> {

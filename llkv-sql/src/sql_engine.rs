@@ -4143,7 +4143,7 @@ where
         let has_joins = select
             .from
             .iter()
-            .any(|table_with_joins| !table_with_joins.joins.is_empty());
+            .any(|table_with_joins| table_with_joins_has_join(table_with_joins));
         let mut join_conditions: Vec<SqlExpr> = Vec::new();
         let mut scalar_subqueries: Vec<llkv_plan::ScalarSubquery> = Vec::new();
         // Handle different FROM clause scenarios
@@ -7716,8 +7716,7 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
     }
     let item = &from[0];
 
-    // TODO: Joins are supported; should `extract_single_table` be updated to use `extract_tables` instead?
-    if !item.joins.is_empty() {
+    if table_with_joins_has_join(item) {
         return Err(Error::InvalidArgumentError(
             "JOIN clauses are not supported yet".into(),
         ));
@@ -7734,9 +7733,25 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
             let canonical = table_name.to_ascii_lowercase();
             Ok((table_name, canonical))
         }
+        TableFactor::NestedJoin { .. } => Err(Error::InvalidArgumentError(
+            "JOIN clauses are not supported yet".into(),
+        )),
         _ => Err(Error::InvalidArgumentError(
             "queries require a plain table name or derived table".into(),
         )),
+    }
+}
+
+// TODO: Rename for clarity?  i.e. "...nested_joins" or something?
+fn table_with_joins_has_join(item: &TableWithJoins) -> bool {
+    if !item.joins.is_empty() {
+        return true;
+    }
+    match &item.relation {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => table_with_joins_has_join(table_with_joins.as_ref()),
+        _ => false,
     }
 }
 
@@ -7759,99 +7774,18 @@ fn extract_tables(
     let mut join_filters = Vec::new();
 
     for item in from {
-        push_table_factor(&item.relation, &mut tables)?;
-
-        for join in &item.joins {
-            let left_table_index = tables.len() - 1;
-
-            match &join.join_operator {
-                JoinOperator::CrossJoin(JoinConstraint::None)
-                | JoinOperator::Join(JoinConstraint::None)
-                | JoinOperator::Inner(JoinConstraint::None) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Inner,
-                        on_condition: None,
-                    });
-                }
-                JoinOperator::Join(JoinConstraint::On(condition))
-                | JoinOperator::Inner(JoinConstraint::On(condition)) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_filters.push(condition.clone());
-                    // Store ON condition separately for join optimization
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Inner,
-                        on_condition: None, // Will be translated later if needed
-                    });
-                }
-                JoinOperator::Left(JoinConstraint::On(condition))
-                | JoinOperator::LeftOuter(JoinConstraint::On(condition)) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_filters.push(condition.clone());
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Left,
-                        on_condition: None,
-                    });
-                }
-                JoinOperator::Left(JoinConstraint::None)
-                | JoinOperator::LeftOuter(JoinConstraint::None) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Left,
-                        on_condition: None,
-                    });
-                }
-                JoinOperator::CrossJoin(_) => {
-                    return Err(Error::InvalidArgumentError(
-                        "CROSS JOIN with constraints is not supported".into(),
-                    ));
-                }
-                JoinOperator::Join(JoinConstraint::Using(_))
-                | JoinOperator::Inner(JoinConstraint::Using(_))
-                | JoinOperator::Left(JoinConstraint::Using(_))
-                | JoinOperator::LeftOuter(JoinConstraint::Using(_)) => {
-                    return Err(Error::InvalidArgumentError(
-                        "JOIN ... USING (...) is not supported yet".into(),
-                    ));
-                }
-                JoinOperator::Join(JoinConstraint::Natural)
-                | JoinOperator::Inner(JoinConstraint::Natural)
-                | JoinOperator::Left(JoinConstraint::Natural)
-                | JoinOperator::LeftOuter(JoinConstraint::Natural)
-                | JoinOperator::Right(_)
-                | JoinOperator::RightOuter(_)
-                | JoinOperator::FullOuter(_)
-                | JoinOperator::Semi(_)
-                | JoinOperator::LeftSemi(_)
-                | JoinOperator::LeftAnti(_)
-                | JoinOperator::RightSemi(_)
-                | JoinOperator::RightAnti(_)
-                | JoinOperator::CrossApply
-                | JoinOperator::OuterApply
-                | JoinOperator::Anti(_)
-                | JoinOperator::StraightJoin(_) => {
-                    return Err(Error::InvalidArgumentError(
-                        "only INNER JOIN and LEFT JOIN with optional ON constraints are supported"
-                            .into(),
-                    ));
-                }
-                other => {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported JOIN clause: {other:?}"
-                    )));
-                }
-            }
-        }
+        flatten_table_with_joins(item, &mut tables, &mut join_metadata, &mut join_filters)?;
     }
 
     Ok((tables, join_metadata, join_filters))
 }
 
-fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>) -> SqlResult<()> {
+fn push_table_factor(
+    factor: &TableFactor,
+    tables: &mut Vec<llkv_plan::TableRef>,
+    join_metadata: &mut Vec<llkv_plan::JoinMetadata>,
+    join_filters: &mut Vec<SqlExpr>,
+) -> SqlResult<()> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
             let (schema_opt, table) = parse_schema_qualified_name(name)?;
@@ -7860,6 +7794,22 @@ fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>
             tables.push(llkv_plan::TableRef::with_alias(schema, table, alias_name));
             Ok(())
         }
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            if alias.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "parenthesized JOINs with aliases are not supported yet".into(),
+                ));
+            }
+            flatten_table_with_joins(
+                table_with_joins.as_ref(),
+                tables,
+                join_metadata,
+                join_filters,
+            )
+        }
         TableFactor::Derived { .. } => Err(Error::InvalidArgumentError(
             "JOIN clauses require base tables; derived tables are not supported".into(),
         )),
@@ -7867,6 +7817,102 @@ fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>
             "queries require a plain table name".into(),
         )),
     }
+}
+
+fn flatten_table_with_joins(
+    item: &TableWithJoins,
+    tables: &mut Vec<llkv_plan::TableRef>,
+    join_metadata: &mut Vec<llkv_plan::JoinMetadata>,
+    join_filters: &mut Vec<SqlExpr>,
+) -> SqlResult<()> {
+    push_table_factor(&item.relation, tables, join_metadata, join_filters)?;
+
+    for join in &item.joins {
+        let left_table_index = tables.len() - 1;
+
+        match &join.join_operator {
+            JoinOperator::CrossJoin(JoinConstraint::None)
+            | JoinOperator::Join(JoinConstraint::None)
+            | JoinOperator::Inner(JoinConstraint::None) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Inner,
+                    on_condition: None,
+                });
+            }
+            JoinOperator::Join(JoinConstraint::On(condition))
+            | JoinOperator::Inner(JoinConstraint::On(condition)) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_filters.push(condition.clone());
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Inner,
+                    on_condition: None,
+                });
+            }
+            JoinOperator::Left(JoinConstraint::On(condition))
+            | JoinOperator::LeftOuter(JoinConstraint::On(condition)) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_filters.push(condition.clone());
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Left,
+                    on_condition: None,
+                });
+            }
+            JoinOperator::Left(JoinConstraint::None)
+            | JoinOperator::LeftOuter(JoinConstraint::None) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Left,
+                    on_condition: None,
+                });
+            }
+            JoinOperator::CrossJoin(_) => {
+                return Err(Error::InvalidArgumentError(
+                    "CROSS JOIN with constraints is not supported".into(),
+                ));
+            }
+            JoinOperator::Join(JoinConstraint::Using(_))
+            | JoinOperator::Inner(JoinConstraint::Using(_))
+            | JoinOperator::Left(JoinConstraint::Using(_))
+            | JoinOperator::LeftOuter(JoinConstraint::Using(_)) => {
+                return Err(Error::InvalidArgumentError(
+                    "JOIN ... USING (...) is not supported yet".into(),
+                ));
+            }
+            JoinOperator::Join(JoinConstraint::Natural)
+            | JoinOperator::Inner(JoinConstraint::Natural)
+            | JoinOperator::Left(JoinConstraint::Natural)
+            | JoinOperator::LeftOuter(JoinConstraint::Natural)
+            | JoinOperator::Right(_)
+            | JoinOperator::RightOuter(_)
+            | JoinOperator::FullOuter(_)
+            | JoinOperator::Semi(_)
+            | JoinOperator::LeftSemi(_)
+            | JoinOperator::LeftAnti(_)
+            | JoinOperator::RightSemi(_)
+            | JoinOperator::RightAnti(_)
+            | JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::Anti(_)
+            | JoinOperator::StraightJoin(_) => {
+                return Err(Error::InvalidArgumentError(
+                    "only INNER JOIN and LEFT JOIN with optional ON constraints are supported"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unsupported JOIN clause: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn group_by_is_empty(expr: &GroupByExpr) -> bool {
