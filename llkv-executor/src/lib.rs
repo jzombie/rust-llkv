@@ -1101,7 +1101,87 @@ where
 
                 let mut staged: Vec<TableCrossProductData> =
                     Vec::with_capacity(tables_with_handles.len());
-                for (idx, (table_ref, table)) in tables_with_handles.iter().enumerate() {
+                let join_lookup: FxHashMap<usize, &llkv_plan::JoinMetadata> = plan
+                    .joins
+                    .iter()
+                    .map(|join| (join.left_table_index, join))
+                    .collect();
+
+                let mut idx = 0usize;
+                while idx < tables_with_handles.len() {
+                    if let Some(join_metadata) = join_lookup.get(&idx) {
+                        if idx + 1 >= tables_with_handles.len() {
+                            return Err(Error::Internal(
+                                "join metadata references table beyond FROM list".into(),
+                            ));
+                        }
+
+                        // Only apply the no-match optimisation when the ON predicate is provably false
+                        // and the right-hand table is not the start of another join chain. This keeps the
+                        // fallback semantics aligned with two-table joins without interfering with more
+                        // complex join graphs (which are still handled by the cartesian product path).
+                        let overlaps_next_join = join_lookup.contains_key(&(idx + 1));
+                        if let Some(condition) = join_metadata.on_condition.as_ref() {
+                            let (left_ref, left_table) = &tables_with_handles[idx];
+                            let (right_ref, right_table) = &tables_with_handles[idx + 1];
+                            let join_plan = build_join_keys_from_condition(
+                                condition,
+                                left_ref,
+                                left_table.as_ref(),
+                                right_ref,
+                                right_table.as_ref(),
+                            )?;
+                            if join_plan.always_false && !overlaps_next_join {
+                                let join_type = match join_metadata.join_type {
+                                    llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
+                                    llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
+                                    llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
+                                    llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
+                                };
+
+                                let left_col_count = left_table.schema.columns.len();
+                                let right_col_count = right_table.schema.columns.len();
+
+                                let mut combined_fields =
+                                    Vec::with_capacity(left_col_count + right_col_count);
+                                for col in &left_table.schema.columns {
+                                    combined_fields.push(Field::new(
+                                        col.name.clone(),
+                                        col.data_type.clone(),
+                                        col.nullable,
+                                    ));
+                                }
+                                for col in &right_table.schema.columns {
+                                    combined_fields.push(Field::new(
+                                        col.name.clone(),
+                                        col.data_type.clone(),
+                                        col.nullable,
+                                    ));
+                                }
+
+                                let combined_schema = Arc::new(Schema::new(combined_fields));
+                                let batches = build_no_match_join_batches(
+                                    join_type,
+                                    left_ref,
+                                    left_table.as_ref(),
+                                    right_ref,
+                                    right_table.as_ref(),
+                                    Arc::clone(&combined_schema),
+                                )?;
+
+                                staged.push(TableCrossProductData {
+                                    schema: combined_schema,
+                                    batches,
+                                    column_counts: vec![left_col_count, right_col_count],
+                                    table_indices: vec![idx, idx + 1],
+                                });
+                                idx += 2;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let (table_ref, table) = &tables_with_handles[idx];
                     let constraints = constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
                     staged.push(collect_table_data(
                         idx,
@@ -1109,7 +1189,9 @@ where
                         table.as_ref(),
                         constraints,
                     )?);
+                    idx += 1;
                 }
+
                 cross_join_all(staged)?
             }
         };
@@ -1814,6 +1896,32 @@ mod join_condition_tests {
         let expr = LlkvExpr::IsNull {
             expr: ScalarExpr::Literal(Literal::Null),
             negated: true,
+        };
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+
+    #[test]
+    fn analyze_handles_not_applied_to_is_not_null() {
+        let expr = LlkvExpr::Not(Box::new(LlkvExpr::IsNull {
+            expr: ScalarExpr::Literal(Literal::Integer(86)),
+            negated: true,
+        }));
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+
+    #[test]
+    fn analyze_literal_is_null_is_always_false() {
+        let expr = LlkvExpr::IsNull {
+            expr: ScalarExpr::Literal(Literal::Integer(1)),
+            negated: false,
         };
 
         assert!(matches!(

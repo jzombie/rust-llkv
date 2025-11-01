@@ -8445,6 +8445,100 @@ mod tests {
     }
 
     #[test]
+    fn left_join_not_is_not_null_on_literal_flips_to_is_null() {
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute(
+                "CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER);\
+                 CREATE TABLE tab1(col0 INTEGER, col1 INTEGER, col2 INTEGER);",
+            )
+            .expect("create tables");
+
+        let sql = "SELECT DISTINCT * FROM tab1 AS cor0 LEFT JOIN tab1 AS cor1 ON NOT 86 IS NOT NULL, tab0 AS cor2";
+        let dialect = SQLiteDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse sql");
+        let statement = statements.pop().expect("expected statement");
+        let Statement::Query(query) = statement else {
+            panic!("expected SELECT query");
+        };
+
+        let plan = engine
+            .build_select_plan(*query)
+            .expect("build select plan");
+
+    assert_eq!(plan.joins.len(), 1, "expected single explicit join entry");
+
+    let left_join = &plan.joins[0];
+        let on_condition = left_join
+            .on_condition
+            .as_ref()
+            .expect("left join should preserve ON predicate");
+
+        match on_condition {
+            llkv_expr::expr::Expr::IsNull { expr, negated } => {
+                assert!(!negated, "expected NOT to flip into IS NULL");
+                assert!(matches!(
+                    expr,
+                    llkv_expr::expr::ScalarExpr::Literal(llkv_expr::literal::Literal::Integer(86))
+                ));
+            }
+            other => panic!("unexpected ON predicate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn left_join_constant_false_preserves_left_rows_with_null_right() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute(
+                "CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER);\
+                 CREATE TABLE tab1(col0 INTEGER, col1 INTEGER, col2 INTEGER);",
+            )
+            .expect("create tables");
+
+        engine
+            .execute(
+                "INSERT INTO tab0 VALUES (1, 2, 3), (4, 5, 6);\
+                 INSERT INTO tab1 VALUES (10, 11, 12), (13, 14, 15);",
+            )
+            .expect("seed rows");
+
+        let batches = engine
+            .sql(
+                "SELECT * FROM tab1 AS cor0 LEFT JOIN tab1 AS cor1 ON NOT 86 IS NOT NULL, tab0 AS cor2 ORDER BY cor0.col0, cor2.col0",
+            )
+            .expect("execute join query");
+
+        let mut total_rows = 0;
+        for batch in &batches {
+            total_rows += batch.num_rows();
+
+            // Columns 0-2 belong to cor0, 3-5 to cor1, 6-8 to cor2.
+            for row_idx in 0..batch.num_rows() {
+                for col_idx in 3..6 {
+                    assert!(
+                        batch.column(col_idx).is_null(row_idx),
+                        "expected right table column {} to be NULL in row {}",
+                        col_idx,
+                        row_idx
+                    );
+                }
+            }
+        }
+
+        // Two left rows cross two tab0 rows -> four total results.
+        assert_eq!(total_rows, 4, "expected Cartesian product with tab0 only");
+    }
+
+    #[test]
     fn cross_join_duplicate_table_name_resolves_columns() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
