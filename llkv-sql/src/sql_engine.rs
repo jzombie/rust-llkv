@@ -4581,6 +4581,9 @@ where
                             AggregateExpr::count_star(alias)
                         }
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
+                            if !is_simple_aggregate_column(arg_expr) {
+                                return Ok(None);
+                            }
                             let column = resolve_column_name(arg_expr)?;
                             if is_distinct {
                                 AggregateExpr::count_distinct_column(column, alias)
@@ -4633,10 +4636,16 @@ where
                         if let Some(column) = parse_count_nulls_case(arg_expr)? {
                             AggregateExpr::count_nulls(column, alias)
                         } else {
+                            if !is_simple_aggregate_column(arg_expr) {
+                                return Ok(None);
+                            }
                             let column = resolve_column_name(arg_expr)?;
                             AggregateExpr::sum_int64(column, alias)
                         }
                     } else {
+                        if !is_simple_aggregate_column(arg_expr) {
+                            return Ok(None);
+                        }
                         let column = resolve_column_name(arg_expr)?;
                         if func_name == "min" {
                             AggregateExpr::min_int64(column, alias)
@@ -5411,6 +5420,18 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
         _ => Err(Error::InvalidArgumentError(
             "aggregate arguments must be plain column identifiers".into(),
         )),
+    }
+}
+
+fn is_simple_aggregate_column(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => true,
+        SqlExpr::Nested(inner) => is_simple_aggregate_column(inner),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => is_simple_aggregate_column(expr),
+        _ => false,
     }
 }
 

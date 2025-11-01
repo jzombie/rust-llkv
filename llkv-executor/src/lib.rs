@@ -220,10 +220,12 @@ pub fn current_query_label() -> Option<String> {
 /// Extract a simple column name from a ScalarExpr when possible.
 ///
 /// Returns `Some(column_name)` if the expression is a plain column reference
-/// (possibly wrapped in unary + or - operators), otherwise returns `None`
+/// (optionally wrapped in additive identity operators like unary `+`), otherwise returns `None`
 /// (indicating a complex expression that needs full evaluation).
 ///
-/// This handles common cases like `col`, `+col`, `-col`, `++col`, etc.
+/// This handles common cases like `col`, `+col`, or `++col`. Unary negation (`-col`)
+/// is intentionally treated as a true expression so aggregates such as `SUM(-col)`
+/// evaluate the negated values instead of reading the base column directly.
 fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str> {
     match expr {
         ScalarExpr::Column(name) => Some(name.as_ref()),
@@ -243,13 +245,6 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
                 // Note: We do NOT handle Subtract here because 0 - col is NOT the same as col
                 // It needs to be evaluated as a negation
                 BinaryOp::Multiply => {
-                    // -col is represented as Multiply(-1, col)
-                    if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Integer(-1))) {
-                        return try_extract_simple_column(right);
-                    }
-                    if matches!(right.as_ref(), ScalarExpr::Literal(Literal::Integer(-1))) {
-                        return try_extract_simple_column(left);
-                    }
                     // +col might be Multiply(1, col)
                     if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Integer(1))) {
                         return try_extract_simple_column(right);
@@ -5047,9 +5042,10 @@ where
                     Error::InvalidArgumentError("Arithmetic overflow in expression".into())
                 })
             }
-            ScalarExpr::Cast { .. } => Err(Error::InvalidArgumentError(
-                "CAST is not supported in aggregate-only expressions".into(),
-            )),
+            ScalarExpr::Cast { expr, data_type } => {
+                let value = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
+                Self::cast_aggregate_value(value, data_type)
+            }
             ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
                 "GetField not supported in aggregate-only expressions".into(),
             )),
@@ -5062,6 +5058,46 @@ where
             ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
                 "Scalar subqueries not supported in aggregate-only expressions".into(),
             )),
+        }
+    }
+
+    fn cast_aggregate_value(value: i64, data_type: &DataType) -> ExecutorResult<i64> {
+        fn ensure_range(value: i64, min: i64, max: i64, ty: &DataType) -> ExecutorResult<i64> {
+            if value < min || value > max {
+                return Err(Error::InvalidArgumentError(format!(
+                    "value {} out of range for CAST target {:?}",
+                    value, ty
+                )));
+            }
+            Ok(value)
+        }
+
+        match data_type {
+            DataType::Int8 => ensure_range(value, i8::MIN as i64, i8::MAX as i64, data_type),
+            DataType::Int16 => ensure_range(value, i16::MIN as i64, i16::MAX as i64, data_type),
+            DataType::Int32 => ensure_range(value, i32::MIN as i64, i32::MAX as i64, data_type),
+            DataType::Int64 => Ok(value),
+            DataType::UInt8 => ensure_range(value, 0, u8::MAX as i64, data_type),
+            DataType::UInt16 => ensure_range(value, 0, u16::MAX as i64, data_type),
+            DataType::UInt32 => ensure_range(value, 0, u32::MAX as i64, data_type),
+            DataType::UInt64 => {
+                if value < 0 {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "value {} out of range for CAST target {:?}",
+                        value, data_type
+                    )));
+                }
+                Ok(value)
+            }
+            DataType::Float32 | DataType::Float64 => Ok(value),
+            DataType::Boolean => Ok(if value == 0 { 0 } else { 1 }),
+            DataType::Null => Err(Error::InvalidArgumentError(
+                "CAST to NULL is not supported in aggregate-only expressions".into(),
+            )),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "CAST to {:?} is not supported in aggregate-only expressions",
+                data_type
+            ))),
         }
     }
 }
@@ -9611,6 +9647,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use llkv_expr::expr::BinaryOp;
+    use llkv_storage::pager::MemPager;
     use std::sync::Arc;
 
     #[test]
@@ -9657,6 +9694,33 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 addition result");
         assert_eq!(added_array.values(), &[6, 7, 8]);
+    }
+
+    #[test]
+    fn aggregate_expr_allows_numeric_casts() {
+        let expr = ScalarExpr::Cast {
+            expr: Box::new(ScalarExpr::literal(31)),
+            data_type: DataType::Int32,
+        };
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("cast should succeed for in-range integral values");
+
+        assert_eq!(value, 31);
+    }
+
+    #[test]
+    fn aggregate_expr_cast_rejects_out_of_range_values() {
+        let expr = ScalarExpr::Cast {
+            expr: Box::new(ScalarExpr::literal(-1)),
+            data_type: DataType::UInt8,
+        };
+        let aggregates = FxHashMap::default();
+
+        let result = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates);
+
+        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
     }
 
     #[test]
