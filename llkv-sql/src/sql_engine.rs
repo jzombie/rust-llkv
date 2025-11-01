@@ -7274,26 +7274,40 @@ fn translate_scalar_internal(
                         )
                     })?;
 
-                    let lower_cmp = llkv_expr::expr::ScalarExpr::compare(
-                        expr_value.clone(),
-                        llkv_expr::expr::CompareOp::GtEq,
-                        low,
-                    );
-                    let upper_cmp = llkv_expr::expr::ScalarExpr::compare(
-                        expr_value,
-                        llkv_expr::expr::CompareOp::LtEq,
-                        high,
-                    );
-                    let between_expr = llkv_expr::expr::ScalarExpr::binary(
-                        lower_cmp,
-                        llkv_expr::expr::BinaryOp::Multiply,
-                        upper_cmp,
-                    );
-                    if negated {
-                        result_stack.push(llkv_expr::expr::ScalarExpr::logical_not(between_expr));
+                    let between_expr = if negated {
+                        let less_than = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value.clone(),
+                            llkv_expr::expr::CompareOp::Lt,
+                            low.clone(),
+                        );
+                        let greater_than = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value,
+                            llkv_expr::expr::CompareOp::Gt,
+                            high,
+                        );
+                        llkv_expr::expr::ScalarExpr::binary(
+                            less_than,
+                            llkv_expr::expr::BinaryOp::Or,
+                            greater_than,
+                        )
                     } else {
-                        result_stack.push(between_expr);
-                    }
+                        let greater_or_equal = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value.clone(),
+                            llkv_expr::expr::CompareOp::GtEq,
+                            low,
+                        );
+                        let less_or_equal = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value,
+                            llkv_expr::expr::CompareOp::LtEq,
+                            high,
+                        );
+                        llkv_expr::expr::ScalarExpr::binary(
+                            greater_or_equal,
+                            llkv_expr::expr::BinaryOp::And,
+                            less_or_equal,
+                        )
+                    };
+                    result_stack.push(between_expr);
                 }
             },
         }
