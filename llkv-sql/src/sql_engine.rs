@@ -6545,7 +6545,9 @@ fn translate_scalar_internal(
                     | BinaryOperator::Minus
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
-                    | BinaryOperator::Modulo => {
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::And
+                    | BinaryOperator::Or => {
                         work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp {
                             op: op.clone(),
                         }));
@@ -6951,21 +6953,69 @@ fn translate_scalar_internal(
                             "translate_scalar: result stack underflow for BinaryOp left".into(),
                         )
                     })?;
-                    let binary_op = match op {
-                        BinaryOperator::Plus => llkv_expr::expr::BinaryOp::Add,
-                        BinaryOperator::Minus => llkv_expr::expr::BinaryOp::Subtract,
-                        BinaryOperator::Multiply => llkv_expr::expr::BinaryOp::Multiply,
-                        BinaryOperator::Divide => llkv_expr::expr::BinaryOp::Divide,
-                        BinaryOperator::Modulo => llkv_expr::expr::BinaryOp::Modulo,
+                    match op {
+                        BinaryOperator::Plus => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::Add,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::Minus => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::Subtract,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::Multiply => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::Multiply,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::Divide => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::Divide,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::Modulo => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::Modulo,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::And => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::And,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::Or => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::Or,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
                         other => {
                             return Err(Error::InvalidArgumentError(format!(
                                 "unsupported scalar binary operator: {other:?}"
                             )));
                         }
-                    };
-                    result_stack.push(llkv_expr::expr::ScalarExpr::binary(
-                        left_expr, binary_op, right_expr,
-                    ));
+                    }
                 }
                 ScalarExitContext::Compare { op } => {
                     let right_expr = result_stack.pop().ok_or_else(|| {
@@ -7224,26 +7274,40 @@ fn translate_scalar_internal(
                         )
                     })?;
 
-                    let lower_cmp = llkv_expr::expr::ScalarExpr::compare(
-                        expr_value.clone(),
-                        llkv_expr::expr::CompareOp::GtEq,
-                        low,
-                    );
-                    let upper_cmp = llkv_expr::expr::ScalarExpr::compare(
-                        expr_value,
-                        llkv_expr::expr::CompareOp::LtEq,
-                        high,
-                    );
-                    let between_expr = llkv_expr::expr::ScalarExpr::binary(
-                        lower_cmp,
-                        llkv_expr::expr::BinaryOp::Multiply,
-                        upper_cmp,
-                    );
-                    if negated {
-                        result_stack.push(llkv_expr::expr::ScalarExpr::logical_not(between_expr));
+                    let between_expr = if negated {
+                        let less_than = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value.clone(),
+                            llkv_expr::expr::CompareOp::Lt,
+                            low.clone(),
+                        );
+                        let greater_than = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value,
+                            llkv_expr::expr::CompareOp::Gt,
+                            high,
+                        );
+                        llkv_expr::expr::ScalarExpr::binary(
+                            less_than,
+                            llkv_expr::expr::BinaryOp::Or,
+                            greater_than,
+                        )
                     } else {
-                        result_stack.push(between_expr);
-                    }
+                        let greater_or_equal = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value.clone(),
+                            llkv_expr::expr::CompareOp::GtEq,
+                            low,
+                        );
+                        let less_or_equal = llkv_expr::expr::ScalarExpr::compare(
+                            expr_value,
+                            llkv_expr::expr::CompareOp::LtEq,
+                            high,
+                        );
+                        llkv_expr::expr::ScalarExpr::binary(
+                            greater_or_equal,
+                            llkv_expr::expr::BinaryOp::And,
+                            less_or_equal,
+                        )
+                    };
+                    result_stack.push(between_expr);
                 }
             },
         }

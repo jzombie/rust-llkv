@@ -798,6 +798,55 @@ impl NumericKernels {
         }
     }
 
+    #[inline]
+    fn option_numeric_truthiness(value: Option<NumericValue>) -> Option<bool> {
+        value.map(Self::truthy_numeric)
+    }
+
+    #[inline]
+    fn evaluate_option_numeric_and(
+        lhs: Option<NumericValue>,
+        rhs: Option<NumericValue>,
+    ) -> Option<NumericValue> {
+        let left_truth = Self::option_numeric_truthiness(lhs);
+        if matches!(left_truth, Some(false)) {
+            return Some(NumericValue::Integer(0));
+        }
+
+        let right_truth = Self::option_numeric_truthiness(rhs);
+        if matches!(right_truth, Some(false)) {
+            return Some(NumericValue::Integer(0));
+        }
+
+        match (left_truth, right_truth) {
+            (Some(true), Some(true)) => Some(NumericValue::Integer(1)),
+            (Some(true), None) | (None, Some(true)) | (None, None) => None,
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn evaluate_option_numeric_or(
+        lhs: Option<NumericValue>,
+        rhs: Option<NumericValue>,
+    ) -> Option<NumericValue> {
+        let left_truth = Self::option_numeric_truthiness(lhs);
+        if matches!(left_truth, Some(true)) {
+            return Some(NumericValue::Integer(1));
+        }
+
+        let right_truth = Self::option_numeric_truthiness(rhs);
+        if matches!(right_truth, Some(true)) {
+            return Some(NumericValue::Integer(1));
+        }
+
+        match (left_truth, right_truth) {
+            (Some(false), Some(false)) => Some(NumericValue::Integer(0)),
+            (Some(false), None) | (None, Some(false)) | (None, None) => None,
+            _ => None,
+        }
+    }
+
     /// Recursively simplify the expression by folding literals and eliminating identity operations.
     pub fn simplify(expr: &ScalarExpr<FieldId>) -> ScalarExpr<FieldId> {
         match expr {
@@ -852,6 +901,28 @@ impl NumericKernels {
                         }
                     }
                     BinaryOp::Modulo => {}
+                    BinaryOp::And => {
+                        if Self::literal_is_zero(&left_s) || Self::literal_is_zero(&right_s) {
+                            return ScalarExpr::literal(0);
+                        }
+                        if Self::literal_is_one(&left_s) {
+                            return right_s;
+                        }
+                        if Self::literal_is_one(&right_s) {
+                            return left_s;
+                        }
+                    }
+                    BinaryOp::Or => {
+                        if Self::literal_is_one(&left_s) || Self::literal_is_one(&right_s) {
+                            return ScalarExpr::literal(1);
+                        }
+                        if Self::literal_is_zero(&left_s) {
+                            return right_s;
+                        }
+                        if Self::literal_is_zero(&right_s) {
+                            return left_s;
+                        }
+                    }
                 }
 
                 ScalarExpr::binary(left_s, *op, right_s)
@@ -963,7 +1034,7 @@ impl NumericKernels {
                     BinaryOp::Subtract => Self::affine_sub(left_state, right_state),
                     BinaryOp::Multiply => Self::affine_mul(left_state, right_state),
                     BinaryOp::Divide => Self::affine_div(left_state, right_state),
-                    BinaryOp::Modulo => None,
+                    BinaryOp::Modulo | BinaryOp::And | BinaryOp::Or => None,
                 }
             }
             ScalarExpr::Compare { .. } => None,
@@ -1040,6 +1111,14 @@ impl NumericKernels {
             BinaryOp::Multiply => Some(Self::literal_from_numeric(Self::mul_values(lhs, rhs))),
             BinaryOp::Divide => Self::div_values(lhs, rhs).map(Self::literal_from_numeric),
             BinaryOp::Modulo => Self::mod_values(lhs, rhs).map(Self::literal_from_numeric),
+            BinaryOp::And => {
+                let truthy = Self::truthy_numeric(lhs) && Self::truthy_numeric(rhs);
+                Some(ScalarExpr::literal(if truthy { 1 } else { 0 }))
+            }
+            BinaryOp::Or => {
+                let truthy = Self::truthy_numeric(lhs) || Self::truthy_numeric(rhs);
+                Some(ScalarExpr::literal(if truthy { 1 } else { 0 }))
+            }
         }
     }
 
@@ -1056,9 +1135,13 @@ impl NumericKernels {
         lhs: Option<NumericValue>,
         rhs: Option<NumericValue>,
     ) -> Option<NumericValue> {
-        match (lhs, rhs) {
-            (Some(lv), Some(rv)) => Self::apply_binary_values(op, lv, rv),
-            _ => None,
+        match op {
+            BinaryOp::And => Self::evaluate_option_numeric_and(lhs, rhs),
+            BinaryOp::Or => Self::evaluate_option_numeric_or(lhs, rhs),
+            _ => match (lhs, rhs) {
+                (Some(lv), Some(rv)) => Self::apply_binary_values(op, lv, rv),
+                _ => None,
+            },
         }
     }
 
@@ -1073,6 +1156,20 @@ impl NumericKernels {
             BinaryOp::Multiply => Some(Self::mul_values(lhs, rhs)),
             BinaryOp::Divide => Self::div_values(lhs, rhs),
             BinaryOp::Modulo => Self::mod_values(lhs, rhs),
+            BinaryOp::And => Some(NumericValue::Integer(
+                if Self::truthy_numeric(lhs) && Self::truthy_numeric(rhs) {
+                    1
+                } else {
+                    0
+                },
+            )),
+            BinaryOp::Or => Some(NumericValue::Integer(
+                if Self::truthy_numeric(lhs) || Self::truthy_numeric(rhs) {
+                    1
+                } else {
+                    0
+                },
+            )),
         }
     }
 
@@ -1114,7 +1211,11 @@ impl NumericKernels {
 
         match (lhs, rhs) {
             (NumericValue::Integer(li), NumericValue::Integer(ri)) => {
-                Some(NumericValue::Integer(li / ri))
+                if li == i64::MIN && ri == -1 {
+                    Some(NumericValue::Float(li as f64 / ri as f64))
+                } else {
+                    Some(NumericValue::Integer(li / ri))
+                }
             }
             _ => Some(NumericValue::Float(lhs.as_f64() / rhs.as_f64())),
         }

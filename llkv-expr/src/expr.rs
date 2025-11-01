@@ -256,6 +256,8 @@ pub enum BinaryOp {
     Multiply,
     Divide,
     Modulo,
+    And,
+    Or,
 }
 
 /// Comparison operator for scalar expressions.
