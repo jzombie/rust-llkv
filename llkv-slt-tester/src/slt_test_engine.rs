@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,30 +13,46 @@ use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
-thread_local! {
-    /// Caches the column types declared by the current sqllogictest statement so we can format
-    /// the next result batch with the exact textual shape the harness expects.
-    static EXPECTED_COLUMN_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = const { RefCell::new(None) };
+/// Thread-local storage for expected column types from sqllogictest directives.
+mod expectations {
+    use sqllogictest::DefaultColumnType;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Caches the column types declared by the current sqllogictest statement so we can format
+        /// the next result batch with the exact textual shape the harness expects.
+        static EXPECTED_COLUMN_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = const { RefCell::new(None) };
+    }
+
+    /// Records the sqllogictest column type expectations for the next query result.
+    pub(crate) fn set(types: Vec<DefaultColumnType>) {
+        EXPECTED_COLUMN_TYPES.with(|cell| {
+            *cell.borrow_mut() = Some(types);
+        });
+    }
+
+    /// Removes any pending column type overrides so future statements fall back to inference.
+    pub(crate) fn clear() {
+        EXPECTED_COLUMN_TYPES.with(|cell| {
+            cell.borrow_mut().take();
+        });
+    }
+
+    /// Check if column types are currently set without consuming them.
+    pub(super) fn is_set() -> bool {
+        EXPECTED_COLUMN_TYPES.with(|cell| cell.borrow().is_some())
+    }
+
+    /// Drains the cached sqllogictest column types, returning ownership to the caller if present.
+    pub(super) fn take() -> Option<Vec<DefaultColumnType>> {
+        EXPECTED_COLUMN_TYPES.with(|cell| cell.borrow_mut().take())
+    }
 }
 
-/// Records the sqllogictest column type expectations for the next query result.
-pub(crate) fn set_expected_column_types(types: Vec<DefaultColumnType>) {
-    EXPECTED_COLUMN_TYPES.with(|cell| {
-        *cell.borrow_mut() = Some(types);
-    });
-}
-
-/// Removes any pending column type overrides so future statements fall back to inference.
-pub(crate) fn clear_expected_column_types() {
-    EXPECTED_COLUMN_TYPES.with(|cell| {
-        cell.borrow_mut().take();
-    });
-}
-
-/// Drains the cached sqllogictest column types, returning ownership to the caller if present.
-fn take_expected_column_types() -> Option<Vec<DefaultColumnType>> {
-    EXPECTED_COLUMN_TYPES.with(|cell| cell.borrow_mut().take())
-}
+// Re-export the functions that the runner needs
+pub(crate) use expectations::{
+    clear as clear_expected_column_types, set as set_expected_column_types,
+};
 
 /// Tokio-agnostic harness that adapts `SqlEngine` to the `sqllogictest` runner.
 pub struct EngineHarness {
@@ -156,7 +171,7 @@ impl AsyncDB for EngineHarness {
                     return Ok(DBOutput::StatementComplete(0));
                 }
                 let mut result = results.remove(0);
-                let in_query_context = EXPECTED_COLUMN_TYPES.with(|cell| cell.borrow().is_some());
+                let in_query_context = expectations::is_set();
                 if in_query_context
                     && let RuntimeStatementResult::Insert { rows_inserted, .. } = &result
                     && *rows_inserted == 0
@@ -170,7 +185,7 @@ impl AsyncDB for EngineHarness {
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
                         let batches = execution.collect()?;
-                        let mut expected_types = take_expected_column_types();
+                        let mut expected_types = expectations::take();
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
                             for row_idx in 0..batch.num_rows() {
@@ -314,7 +329,7 @@ impl AsyncDB for EngineHarness {
                     }
                     RuntimeStatementResult::Insert { rows_inserted, .. } => {
                         if in_query_context {
-                            let types = take_expected_column_types()
+                            let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
                             Ok(DBOutput::Rows {
                                 types,
@@ -326,7 +341,7 @@ impl AsyncDB for EngineHarness {
                     }
                     RuntimeStatementResult::Update { rows_updated, .. } => {
                         if in_query_context {
-                            let types = take_expected_column_types()
+                            let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
                             Ok(DBOutput::Rows {
                                 types,
@@ -338,7 +353,7 @@ impl AsyncDB for EngineHarness {
                     }
                     RuntimeStatementResult::Delete { rows_deleted, .. } => {
                         if in_query_context {
-                            let types = take_expected_column_types()
+                            let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
                             Ok(DBOutput::Rows {
                                 types,
