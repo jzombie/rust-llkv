@@ -7507,7 +7507,7 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
         literal_to_i128_from_integer_like(right),
     ) {
         if rhs == 0 {
-            return None;
+            return Some(Literal::Null);
         }
 
         if lhs == i128::MIN && rhs == -1 {
@@ -7520,7 +7520,7 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     let lhs = literal_to_f64(left)?;
     let rhs = literal_to_f64(right)?;
     if rhs == 0.0 {
-        return None;
+        return Some(Literal::Null);
     }
     Some(Literal::Float(lhs / rhs))
 }
@@ -7529,7 +7529,7 @@ fn modulo_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     let lhs = literal_to_i128(left)?;
     let rhs = literal_to_i128(right)?;
     if rhs == 0 {
-        return None;
+        return Some(Literal::Null);
     }
     Some(Literal::Integer(lhs % rhs))
 }
