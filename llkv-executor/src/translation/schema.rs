@@ -182,8 +182,12 @@ fn expression_uses_float(
             ))
         }
         ScalarExpr::Cast { expr, data_type } => {
-            if matches!(normalized_numeric_type(data_type), DataType::Float64) {
+            let normalized = normalized_numeric_type(data_type);
+            if matches!(normalized, DataType::Float64) {
                 return Ok(true);
+            }
+            if matches!(normalized, DataType::Int64) {
+                return Ok(false);
             }
             expression_uses_float(schema, expr)
         }
