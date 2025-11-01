@@ -4144,7 +4144,7 @@ where
             .from
             .iter()
             .any(|table_with_joins| table_with_joins_has_join(table_with_joins));
-        let mut join_conditions: Vec<SqlExpr> = Vec::new();
+        let mut join_conditions: Vec<Option<SqlExpr>> = Vec::new();
         let mut scalar_subqueries: Vec<llkv_plan::ScalarSubquery> = Vec::new();
         // Handle different FROM clause scenarios
         let catalog = self.engine.context().table_catalog();
@@ -4228,35 +4228,38 @@ where
             )?);
         }
 
-        // Add join conditions to filter, but be careful with LEFT JOIN ON conditions
-        // For INNER JOIN, ON conditions can be moved to WHERE clause (same semantics)
-        // For LEFT JOIN, ON conditions must NOT filter out unmatched left rows
-        // Since we're not yet extracting join keys from ON conditions, and LEFT JOIN
-        // ON conditions have different semantics, we skip adding them to WHERE for now
-        // TODO: Properly parse ON conditions to extract join keys and handle non-equality conditions
-        for (idx, join_expr) in join_conditions.iter().enumerate() {
-            // Check if this is a LEFT JOIN ON condition
-            let is_left_join_condition = plan
+        // Translate JOIN ON predicates and attach them to the join metadata. INNER joins can
+        // safely push these predicates into the WHERE clause, while LEFT joins must retain
+        // them on the join so that unmatched left rows are preserved.
+        for (idx, join_expr_opt) in join_conditions.iter().enumerate() {
+            let Some(join_expr) = join_expr_opt else {
+                continue;
+            };
+
+            let materialized_expr = self.materialize_in_subquery(join_expr.clone())?;
+            let translated = translate_condition_with_context(
+                self,
+                resolver,
+                id_context.clone(),
+                &materialized_expr,
+                outer_scopes,
+                &mut all_subqueries,
+                correlated_tracker.reborrow(),
+            )?;
+
+            let is_left_join = plan
                 .joins
                 .get(idx)
                 .map(|j| j.join_type == llkv_plan::JoinPlan::Left)
                 .unwrap_or(false);
 
-            if !is_left_join_condition {
-                // For INNER JOIN, ON condition can safely go in WHERE
-                let materialized_expr = self.materialize_in_subquery(join_expr.clone())?;
-                filter_components.push(translate_condition_with_context(
-                    self,
-                    resolver,
-                    id_context.clone(),
-                    &materialized_expr,
-                    outer_scopes,
-                    &mut all_subqueries,
-                    correlated_tracker.reborrow(),
-                )?);
+            if let Some(join_meta) = plan.joins.get_mut(idx) {
+                join_meta.on_condition = Some(translated.clone());
             }
-            // For LEFT JOIN, skip adding to WHERE - will be handled by join executor
-            // (currently results in cross product since we don't extract keys yet)
+
+            if !is_left_join {
+                filter_components.push(translated);
+            }
         }
 
         let having_expr = if let Some(having) = &select.having {
@@ -7788,7 +7791,7 @@ fn extract_tables(
 ) -> SqlResult<(
     Vec<llkv_plan::TableRef>,
     Vec<llkv_plan::JoinMetadata>,
-    Vec<SqlExpr>,
+    Vec<Option<SqlExpr>>,
 )> {
     let mut tables = Vec::new();
     let mut join_metadata = Vec::new();
@@ -7805,7 +7808,7 @@ fn push_table_factor(
     factor: &TableFactor,
     tables: &mut Vec<llkv_plan::TableRef>,
     join_metadata: &mut Vec<llkv_plan::JoinMetadata>,
-    join_filters: &mut Vec<SqlExpr>,
+    join_filters: &mut Vec<Option<SqlExpr>>,
 ) -> SqlResult<()> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
@@ -7844,7 +7847,7 @@ fn flatten_table_with_joins(
     item: &TableWithJoins,
     tables: &mut Vec<llkv_plan::TableRef>,
     join_metadata: &mut Vec<llkv_plan::JoinMetadata>,
-    join_filters: &mut Vec<SqlExpr>,
+    join_filters: &mut Vec<Option<SqlExpr>>,
 ) -> SqlResult<()> {
     push_table_factor(&item.relation, tables, join_metadata, join_filters)?;
 
@@ -7861,11 +7864,12 @@ fn flatten_table_with_joins(
                     join_type: llkv_plan::JoinPlan::Inner,
                     on_condition: None,
                 });
+                join_filters.push(None);
             }
             JoinOperator::Join(JoinConstraint::On(condition))
             | JoinOperator::Inner(JoinConstraint::On(condition)) => {
                 push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
-                join_filters.push(condition.clone());
+                join_filters.push(Some(condition.clone()));
                 join_metadata.push(llkv_plan::JoinMetadata {
                     left_table_index,
                     join_type: llkv_plan::JoinPlan::Inner,
@@ -7875,7 +7879,7 @@ fn flatten_table_with_joins(
             JoinOperator::Left(JoinConstraint::On(condition))
             | JoinOperator::LeftOuter(JoinConstraint::On(condition)) => {
                 push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
-                join_filters.push(condition.clone());
+                join_filters.push(Some(condition.clone()));
                 join_metadata.push(llkv_plan::JoinMetadata {
                     left_table_index,
                     join_type: llkv_plan::JoinPlan::Left,
@@ -7890,6 +7894,7 @@ fn flatten_table_with_joins(
                     join_type: llkv_plan::JoinPlan::Left,
                     on_condition: None,
                 });
+                join_filters.push(None);
             }
             JoinOperator::CrossJoin(_) => {
                 return Err(Error::InvalidArgumentError(

@@ -47,5 +47,9 @@ fn sum_distinct_on_column_and_expression_supported() {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("downcast sum_distinct_const to Int64Array");
-    assert_eq!(sum_distinct_const.value(0), 52, "expected distinct constant sum");
+    assert_eq!(
+        sum_distinct_const.value(0),
+        52,
+        "expected distinct constant sum"
+    );
 }

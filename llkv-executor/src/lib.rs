@@ -981,22 +981,21 @@ where
 
             if has_joins && tables_with_handles.len() == 2 {
                 // Use llkv-join for 2-table joins (including LEFT JOIN)
-                use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+                use llkv_join::{JoinOptions, TableJoinExt};
 
                 let (left_ref, left_table) = &tables_with_handles[0];
                 let (right_ref, right_table) = &tables_with_handles[1];
 
-                // Determine join type from plan and convert to llkv_join::JoinType
-                let join_type = plan
-                    .joins
-                    .first()
-                    .map(|j| match j.join_type {
-                        llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
-                        llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
-                        llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
-                        llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
-                    })
-                    .unwrap_or(llkv_join::JoinType::Inner);
+                let join_metadata = plan.joins.first().ok_or_else(|| {
+                    Error::InvalidArgumentError("expected join metadata for two-table join".into())
+                })?;
+
+                let join_type = match join_metadata.join_type {
+                    llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
+                    llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
+                    llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
+                    llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
+                };
 
                 tracing::debug!(
                     "Using llkv-join for {join_type:?} join between {} and {}",
@@ -1004,26 +1003,10 @@ where
                     right_ref.qualified_name()
                 );
 
-                // Extract join keys from constraints if available
-                // For now, use empty keys (cross product) and rely on filter
-                // TODO: Parse ON conditions to extract proper join keys
-                let join_keys: Vec<JoinKey> = Vec::new();
+                let left_col_count = left_table.schema.columns.len();
+                let right_col_count = right_table.schema.columns.len();
 
-                let mut result_batches = Vec::new();
-                left_table.table.join_stream(
-                    &right_table.table,
-                    &join_keys,
-                    &JoinOptions {
-                        join_type,
-                        ..Default::default()
-                    },
-                    |batch| {
-                        result_batches.push(batch);
-                    },
-                )?;
-
-                // Build combined schema and convert to TableCrossProductData
-                let mut combined_fields = Vec::new();
+                let mut combined_fields = Vec::with_capacity(left_col_count + right_col_count);
                 for col in &left_table.schema.columns {
                     combined_fields.push(Field::new(
                         col.name.clone(),
@@ -1039,18 +1022,71 @@ where
                     ));
                 }
                 let combined_schema = Arc::new(Schema::new(combined_fields));
-
-                let column_counts = vec![
-                    left_table.schema.columns.len(),
-                    right_table.schema.columns.len(),
-                ];
+                let column_counts = vec![left_col_count, right_col_count];
                 let table_indices = vec![0, 1];
 
-                TableCrossProductData {
-                    schema: combined_schema,
-                    batches: result_batches,
-                    column_counts,
-                    table_indices,
+                let mut join_keys = Vec::new();
+                let mut condition_is_trivial = false;
+                let mut condition_is_impossible = false;
+
+                if let Some(condition) = join_metadata.on_condition.as_ref() {
+                    let plan = build_join_keys_from_condition(
+                        condition,
+                        left_ref,
+                        left_table.as_ref(),
+                        right_ref,
+                        right_table.as_ref(),
+                    )?;
+                    join_keys = plan.keys;
+                    condition_is_trivial = plan.always_true;
+                    condition_is_impossible = plan.always_false;
+                }
+
+                if condition_is_impossible {
+                    let batches = build_no_match_join_batches(
+                        join_type,
+                        left_ref,
+                        left_table.as_ref(),
+                        right_ref,
+                        right_table.as_ref(),
+                        Arc::clone(&combined_schema),
+                    )?;
+
+                    TableCrossProductData {
+                        schema: combined_schema,
+                        batches,
+                        column_counts,
+                        table_indices,
+                    }
+                } else {
+                    if !condition_is_trivial
+                        && join_metadata.on_condition.is_some()
+                        && join_keys.is_empty()
+                    {
+                        return Err(Error::InvalidArgumentError(
+                            "JOIN ON clause must include at least one equality predicate".into(),
+                        ));
+                    }
+
+                    let mut result_batches = Vec::new();
+                    left_table.table.join_stream(
+                        &right_table.table,
+                        &join_keys,
+                        &JoinOptions {
+                            join_type,
+                            ..Default::default()
+                        },
+                        |batch| {
+                            result_batches.push(batch);
+                        },
+                    )?;
+
+                    TableCrossProductData {
+                        schema: combined_schema,
+                        batches: result_batches,
+                        column_counts,
+                        table_indices,
+                    }
                 }
             } else {
                 // Fall back to cartesian product for other cases
@@ -1294,7 +1330,573 @@ where
             combined_batch,
         ))
     }
+}
 
+struct JoinKeyBuild {
+    keys: Vec<llkv_join::JoinKey>,
+    always_true: bool,
+    always_false: bool,
+}
+
+#[derive(Debug)]
+enum JoinConditionAnalysis {
+    AlwaysTrue,
+    AlwaysFalse,
+    EquiPairs(Vec<(String, String)>),
+}
+
+fn build_join_keys_from_condition<P>(
+    condition: &LlkvExpr<'static, String>,
+    left_ref: &llkv_plan::TableRef,
+    left_table: &ExecutorTable<P>,
+    right_ref: &llkv_plan::TableRef,
+    right_table: &ExecutorTable<P>,
+) -> ExecutorResult<JoinKeyBuild>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    match analyze_join_condition(condition)? {
+        JoinConditionAnalysis::AlwaysTrue => Ok(JoinKeyBuild {
+            keys: Vec::new(),
+            always_true: true,
+            always_false: false,
+        }),
+        JoinConditionAnalysis::AlwaysFalse => Ok(JoinKeyBuild {
+            keys: Vec::new(),
+            always_true: false,
+            always_false: true,
+        }),
+        JoinConditionAnalysis::EquiPairs(pairs) => {
+            let left_lookup = build_join_column_lookup(left_ref, left_table);
+            let right_lookup = build_join_column_lookup(right_ref, right_table);
+
+            let mut keys = Vec::with_capacity(pairs.len());
+            for (lhs, rhs) in pairs {
+                let (lhs_side, lhs_field) = resolve_join_column(&lhs, &left_lookup, &right_lookup)?;
+                let (rhs_side, rhs_field) = resolve_join_column(&rhs, &left_lookup, &right_lookup)?;
+
+                match (lhs_side, rhs_side) {
+                    (JoinColumnSide::Left, JoinColumnSide::Right) => {
+                        keys.push(llkv_join::JoinKey::new(lhs_field, rhs_field));
+                    }
+                    (JoinColumnSide::Right, JoinColumnSide::Left) => {
+                        keys.push(llkv_join::JoinKey::new(rhs_field, lhs_field));
+                    }
+                    (JoinColumnSide::Left, JoinColumnSide::Left) => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "JOIN condition compares two columns from '{}': '{}' and '{}'",
+                            left_ref.display_name(),
+                            lhs,
+                            rhs
+                        )));
+                    }
+                    (JoinColumnSide::Right, JoinColumnSide::Right) => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "JOIN condition compares two columns from '{}': '{}' and '{}'",
+                            right_ref.display_name(),
+                            lhs,
+                            rhs
+                        )));
+                    }
+                }
+            }
+
+            Ok(JoinKeyBuild {
+                keys,
+                always_true: false,
+                always_false: false,
+            })
+        }
+    }
+}
+
+fn analyze_join_condition(
+    expr: &LlkvExpr<'static, String>,
+) -> ExecutorResult<JoinConditionAnalysis> {
+    if let Some(constant) = evaluate_constant_join_expr(expr) {
+        return Ok(if constant {
+            JoinConditionAnalysis::AlwaysTrue
+        } else {
+            JoinConditionAnalysis::AlwaysFalse
+        });
+    }
+    match expr {
+        LlkvExpr::Literal(value) => {
+            if *value {
+                Ok(JoinConditionAnalysis::AlwaysTrue)
+            } else {
+                Ok(JoinConditionAnalysis::AlwaysFalse)
+            }
+        }
+        LlkvExpr::And(children) => {
+            let mut collected: Vec<(String, String)> = Vec::new();
+            for child in children {
+                match analyze_join_condition(child)? {
+                    JoinConditionAnalysis::AlwaysTrue => {}
+                    JoinConditionAnalysis::AlwaysFalse => {
+                        return Ok(JoinConditionAnalysis::AlwaysFalse);
+                    }
+                    JoinConditionAnalysis::EquiPairs(mut pairs) => {
+                        collected.append(&mut pairs);
+                    }
+                }
+            }
+
+            if collected.is_empty() {
+                Ok(JoinConditionAnalysis::AlwaysTrue)
+            } else {
+                Ok(JoinConditionAnalysis::EquiPairs(collected))
+            }
+        }
+        LlkvExpr::Compare { left, op, right } => {
+            if *op != CompareOp::Eq {
+                return Err(Error::InvalidArgumentError(
+                    "JOIN ON clause only supports '=' comparisons in optimized path".into(),
+                ));
+            }
+            let left_name = try_extract_simple_column(left).ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "JOIN ON clause requires plain column references".into(),
+                )
+            })?;
+            let right_name = try_extract_simple_column(right).ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "JOIN ON clause requires plain column references".into(),
+                )
+            })?;
+            Ok(JoinConditionAnalysis::EquiPairs(vec![(
+                left_name.to_string(),
+                right_name.to_string(),
+            )]))
+        }
+        _ => Err(Error::InvalidArgumentError(
+            "JOIN ON expressions must be conjunctions of column equality predicates".into(),
+        )),
+    }
+}
+
+fn evaluate_constant_join_expr(expr: &LlkvExpr<'static, String>) -> Option<bool> {
+    match expr {
+        LlkvExpr::Literal(value) => Some(*value),
+        LlkvExpr::And(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_constant_join_expr(child) {
+                    Some(false) => return Some(false),
+                    Some(true) => {}
+                    None => saw_unknown = true,
+                }
+            }
+            if saw_unknown { None } else { Some(true) }
+        }
+        LlkvExpr::Or(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_constant_join_expr(child) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => saw_unknown = true,
+                }
+            }
+            if saw_unknown { None } else { Some(false) }
+        }
+        LlkvExpr::Not(inner) => evaluate_constant_join_expr(inner).map(|value| !value),
+        LlkvExpr::Compare { left, op, right } => {
+            let left_lit = evaluate_constant_scalar(left)?;
+            let right_lit = evaluate_constant_scalar(right)?;
+            compare_literals_for_join(*op, &left_lit, &right_lit)
+        }
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = evaluate_constant_scalar(expr)?;
+            if matches!(needle, Literal::Null) {
+                return Some(false);
+            }
+
+            let mut saw_unknown = false;
+            for candidate in list {
+                let value = evaluate_constant_scalar(candidate)?;
+                match compare_literals_for_join(CompareOp::Eq, &needle, &value) {
+                    Some(true) => return Some(!*negated),
+                    Some(false) => {}
+                    None => saw_unknown = true,
+                }
+            }
+
+            if saw_unknown { None } else { Some(*negated) }
+        }
+        LlkvExpr::IsNull { expr, negated } => {
+            evaluate_constant_scalar(expr).map(|literal| match literal {
+                Literal::Null => !*negated,
+                _ => *negated,
+            })
+        }
+        _ => None,
+    }
+}
+
+enum NullComparisonBehavior {
+    ThreeValuedLogic,
+    NullIsFalse,
+}
+
+fn compare_literals_for_join(op: CompareOp, left: &Literal, right: &Literal) -> Option<bool> {
+    compare_literals_with_mode(op, left, right, NullComparisonBehavior::NullIsFalse)
+}
+
+fn compare_literals_with_mode(
+    op: CompareOp,
+    left: &Literal,
+    right: &Literal,
+    null_behavior: NullComparisonBehavior,
+) -> Option<bool> {
+    use std::cmp::Ordering;
+
+    fn ordering_result(ord: Ordering, op: CompareOp) -> bool {
+        match op {
+            CompareOp::Eq => ord == Ordering::Equal,
+            CompareOp::NotEq => ord != Ordering::Equal,
+            CompareOp::Lt => ord == Ordering::Less,
+            CompareOp::LtEq => ord != Ordering::Greater,
+            CompareOp::Gt => ord == Ordering::Greater,
+            CompareOp::GtEq => ord != Ordering::Less,
+        }
+    }
+
+    fn compare_f64(lhs: f64, rhs: f64, op: CompareOp) -> bool {
+        match op {
+            CompareOp::Eq => lhs == rhs,
+            CompareOp::NotEq => lhs != rhs,
+            CompareOp::Lt => lhs < rhs,
+            CompareOp::LtEq => lhs <= rhs,
+            CompareOp::Gt => lhs > rhs,
+            CompareOp::GtEq => lhs >= rhs,
+        }
+    }
+
+    match (left, right) {
+        (Literal::Null, _) | (_, Literal::Null) => match null_behavior {
+            NullComparisonBehavior::ThreeValuedLogic => None,
+            NullComparisonBehavior::NullIsFalse => Some(false),
+        },
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::Float(lhs), Literal::Float(rhs)) => Some(compare_f64(*lhs, *rhs, op)),
+        (Literal::Integer(lhs), Literal::Float(rhs)) => Some(compare_f64(*lhs as f64, *rhs, op)),
+        (Literal::Float(lhs), Literal::Integer(rhs)) => Some(compare_f64(*lhs, *rhs as f64, op)),
+        (Literal::Boolean(lhs), Literal::Boolean(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::String(lhs), Literal::String(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::Struct(_), _) | (_, Literal::Struct(_)) => None,
+        _ => None,
+    }
+}
+
+fn build_no_match_join_batches<P>(
+    join_type: llkv_join::JoinType,
+    left_ref: &llkv_plan::TableRef,
+    left_table: &ExecutorTable<P>,
+    right_ref: &llkv_plan::TableRef,
+    right_table: &ExecutorTable<P>,
+    combined_schema: Arc<Schema>,
+) -> ExecutorResult<Vec<RecordBatch>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    match join_type {
+        llkv_join::JoinType::Inner => Ok(Vec::new()),
+        llkv_join::JoinType::Left => {
+            let left_batches = scan_all_columns_for_join(left_ref, left_table)?;
+            let mut results = Vec::new();
+
+            for left_batch in left_batches {
+                let row_count = left_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                columns.extend(left_batch.columns().iter().cloned());
+                for column in &right_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!("failed to build LEFT JOIN fallback batch: {err}"))
+                    })?;
+                results.push(batch);
+            }
+
+            Ok(results)
+        }
+        llkv_join::JoinType::Right => {
+            let right_batches = scan_all_columns_for_join(right_ref, right_table)?;
+            let mut results = Vec::new();
+
+            for right_batch in right_batches {
+                let row_count = right_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                for column in &left_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+                columns.extend(right_batch.columns().iter().cloned());
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!("failed to build RIGHT JOIN fallback batch: {err}"))
+                    })?;
+                results.push(batch);
+            }
+
+            Ok(results)
+        }
+        llkv_join::JoinType::Full => {
+            let mut results = Vec::new();
+
+            let left_batches = scan_all_columns_for_join(left_ref, left_table)?;
+            for left_batch in left_batches {
+                let row_count = left_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                columns.extend(left_batch.columns().iter().cloned());
+                for column in &right_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!(
+                            "failed to build FULL JOIN left fallback batch: {err}"
+                        ))
+                    })?;
+                results.push(batch);
+            }
+
+            let right_batches = scan_all_columns_for_join(right_ref, right_table)?;
+            for right_batch in right_batches {
+                let row_count = right_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                for column in &left_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+                columns.extend(right_batch.columns().iter().cloned());
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!(
+                            "failed to build FULL JOIN right fallback batch: {err}"
+                        ))
+                    })?;
+                results.push(batch);
+            }
+
+            Ok(results)
+        }
+        other => Err(Error::InvalidArgumentError(format!(
+            "{other:?} join type is not supported when join predicate is unsatisfiable",
+        ))),
+    }
+}
+
+fn scan_all_columns_for_join<P>(
+    table_ref: &llkv_plan::TableRef,
+    table: &ExecutorTable<P>,
+) -> ExecutorResult<Vec<RecordBatch>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if table.schema.columns.is_empty() {
+        return Err(Error::InvalidArgumentError(format!(
+            "table '{}' has no columns; joins require at least one column",
+            table_ref.qualified_name()
+        )));
+    }
+
+    let mut projections = Vec::with_capacity(table.schema.columns.len());
+    for column in &table.schema.columns {
+        projections.push(ScanProjection::from(StoreProjection::with_alias(
+            LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+            column.name.clone(),
+        )));
+    }
+
+    let filter_field = table.schema.first_field_id().unwrap_or(ROW_ID_FIELD_ID);
+    let filter_expr = full_table_scan_filter(filter_field);
+
+    let mut batches = Vec::new();
+    table.table.scan_stream(
+        projections,
+        &filter_expr,
+        ScanStreamOptions {
+            include_nulls: true,
+            ..ScanStreamOptions::default()
+        },
+        |batch| {
+            batches.push(batch);
+        },
+    )?;
+
+    Ok(batches)
+}
+
+fn build_join_column_lookup<P>(
+    table_ref: &llkv_plan::TableRef,
+    table: &ExecutorTable<P>,
+) -> FxHashMap<String, FieldId>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut lookup = FxHashMap::default();
+    let table_lower = table_ref.table.to_ascii_lowercase();
+    let qualified_lower = table_ref.qualified_name().to_ascii_lowercase();
+    let display_lower = table_ref.display_name().to_ascii_lowercase();
+    let alias_lower = table_ref.alias.as_ref().map(|s| s.to_ascii_lowercase());
+    let schema_lower = if table_ref.schema.is_empty() {
+        None
+    } else {
+        Some(table_ref.schema.to_ascii_lowercase())
+    };
+
+    for column in &table.schema.columns {
+        let base = column.name.to_ascii_lowercase();
+        let short = base.rsplit('.').next().unwrap_or(base.as_str()).to_string();
+
+        lookup.entry(short.clone()).or_insert(column.field_id);
+        lookup.entry(base.clone()).or_insert(column.field_id);
+
+        lookup
+            .entry(format!("{table_lower}.{short}"))
+            .or_insert(column.field_id);
+
+        if display_lower != table_lower {
+            lookup
+                .entry(format!("{display_lower}.{short}"))
+                .or_insert(column.field_id);
+        }
+
+        if qualified_lower != table_lower {
+            lookup
+                .entry(format!("{qualified_lower}.{short}"))
+                .or_insert(column.field_id);
+        }
+
+        if let Some(schema) = &schema_lower {
+            lookup
+                .entry(format!("{schema}.{table_lower}.{short}"))
+                .or_insert(column.field_id);
+            if display_lower != table_lower {
+                lookup
+                    .entry(format!("{schema}.{display_lower}.{short}"))
+                    .or_insert(column.field_id);
+            }
+        }
+
+        if let Some(alias) = &alias_lower {
+            lookup
+                .entry(format!("{alias}.{short}"))
+                .or_insert(column.field_id);
+        }
+    }
+
+    lookup
+}
+
+#[derive(Clone, Copy)]
+enum JoinColumnSide {
+    Left,
+    Right,
+}
+
+fn resolve_join_column(
+    column: &str,
+    left_lookup: &FxHashMap<String, FieldId>,
+    right_lookup: &FxHashMap<String, FieldId>,
+) -> ExecutorResult<(JoinColumnSide, FieldId)> {
+    let key = column.to_ascii_lowercase();
+    match (left_lookup.get(&key), right_lookup.get(&key)) {
+        (Some(&field_id), None) => Ok((JoinColumnSide::Left, field_id)),
+        (None, Some(&field_id)) => Ok((JoinColumnSide::Right, field_id)),
+        (Some(_), Some(_)) => Err(Error::InvalidArgumentError(format!(
+            "join column '{column}' is ambiguous; qualify it with a table name or alias",
+        ))),
+        (None, None) => Err(Error::InvalidArgumentError(format!(
+            "join column '{column}' was not found in either table",
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod join_condition_tests {
+    use super::*;
+    use llkv_expr::expr::{CompareOp, ScalarExpr};
+    use llkv_expr::literal::Literal;
+
+    #[test]
+    fn analyze_detects_simple_equality() {
+        let expr = LlkvExpr::Compare {
+            left: ScalarExpr::Column("t1.col".into()),
+            op: CompareOp::Eq,
+            right: ScalarExpr::Column("t2.col".into()),
+        };
+
+        match analyze_join_condition(&expr).expect("analysis succeeds") {
+            JoinConditionAnalysis::EquiPairs(pairs) => {
+                assert_eq!(pairs, vec![("t1.col".to_string(), "t2.col".to_string())]);
+            }
+            other => panic!("unexpected analysis result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_handles_literal_true() {
+        let expr = LlkvExpr::Literal(true);
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysTrue
+        ));
+    }
+
+    #[test]
+    fn analyze_rejects_non_equality() {
+        let expr = LlkvExpr::Compare {
+            left: ScalarExpr::Column("t1.col".into()),
+            op: CompareOp::Gt,
+            right: ScalarExpr::Column("t2.col".into()),
+        };
+        assert!(analyze_join_condition(&expr).is_err());
+    }
+
+    #[test]
+    fn analyze_handles_constant_is_not_null() {
+        let expr = LlkvExpr::IsNull {
+            expr: ScalarExpr::Literal(Literal::Null),
+            negated: true,
+        };
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+}
+
+impl<P> QueryExecutor<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     fn execute_cross_product_aggregates(
         &self,
         combined_schema: Arc<Schema>,
@@ -4002,7 +4604,8 @@ where
                             )?;
                             tracing::debug!(
                                 "AVG aggregate expr={:?} inferred_type={:?}",
-                                expr, inferred_type
+                                expr,
+                                inferred_type
                             );
                             let field_id = u32::try_from(projection_index).map_err(|_| {
                                 Error::InvalidArgumentError(
@@ -6374,6 +6977,36 @@ fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Optio
             let right_literal = evaluate_constant_scalar(right)?;
             Some(compare_literals(*op, &left_literal, &right_literal))
         }
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = evaluate_constant_scalar(expr)?;
+            if matches!(needle, Literal::Null) {
+                return Some(None);
+            }
+
+            let mut saw_unknown = false;
+            for candidate in list {
+                let value = evaluate_constant_scalar(candidate)?;
+                match compare_literals(CompareOp::Eq, &needle, &value) {
+                    Some(true) => {
+                        return Some(if *negated { Some(false) } else { Some(true) });
+                    }
+                    Some(false) => {
+                        // keep searching
+                    }
+                    None => saw_unknown = true,
+                }
+            }
+
+            if saw_unknown {
+                Some(None)
+            } else {
+                Some(if *negated { Some(true) } else { Some(false) })
+            }
+        }
         _ => None,
     }
 }
@@ -6381,61 +7014,198 @@ fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Optio
 fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
     match expr {
         ScalarExpr::Literal(lit) => Some(lit.clone()),
+        ScalarExpr::Binary { left, op, right } => {
+            let left_value = evaluate_constant_scalar(left)?;
+            let right_value = evaluate_constant_scalar(right)?;
+            evaluate_binary_literal(*op, &left_value, &right_value)
+        }
+        ScalarExpr::Cast { expr, data_type } => {
+            let value = evaluate_constant_scalar(expr)?;
+            cast_literal_to_type(&value, data_type)
+        }
+        ScalarExpr::Not(inner) => {
+            let value = evaluate_constant_scalar(inner)?;
+            match literal_truthiness(&value) {
+                Some(true) => Some(Literal::Integer(0)),
+                Some(false) => Some(Literal::Integer(1)),
+                None => Some(Literal::Null),
+            }
+        }
+        ScalarExpr::IsNull { expr, negated } => {
+            let value = evaluate_constant_scalar(expr)?;
+            let is_null = matches!(value, Literal::Null);
+            Some(Literal::Boolean(if *negated { !is_null } else { is_null }))
+        }
+        ScalarExpr::Coalesce(items) => {
+            let mut saw_null = false;
+            for item in items {
+                match evaluate_constant_scalar(item) {
+                    Some(Literal::Null) => saw_null = true,
+                    Some(value) => return Some(value),
+                    None => return None,
+                }
+            }
+            if saw_null { Some(Literal::Null) } else { None }
+        }
+        ScalarExpr::Compare { left, op, right } => {
+            let left_value = evaluate_constant_scalar(left)?;
+            let right_value = evaluate_constant_scalar(right)?;
+            match compare_literals(*op, &left_value, &right_value) {
+                Some(flag) => Some(Literal::Boolean(flag)),
+                None => Some(Literal::Null),
+            }
+        }
+        ScalarExpr::Case { .. } => None,
+        ScalarExpr::Column(_) => None,
+        ScalarExpr::Aggregate(_) => None,
+        ScalarExpr::GetField { .. } => None,
+        ScalarExpr::ScalarSubquery(_) => None,
+    }
+}
+
+fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Option<Literal> {
+    if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
+        return Some(Literal::Null);
+    }
+
+    match op {
+        BinaryOp::Add => add_literals(left, right),
+        BinaryOp::Subtract => subtract_literals(left, right),
+        BinaryOp::Multiply => multiply_literals(left, right),
+        BinaryOp::Divide => divide_literals(left, right),
+        BinaryOp::Modulo => modulo_literals(left, right),
+    }
+}
+
+fn add_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    match (left, right) {
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_add(*rhs)))
+        }
+        _ => {
+            let lhs = literal_to_f64(left)?;
+            let rhs = literal_to_f64(right)?;
+            Some(Literal::Float(lhs + rhs))
+        }
+    }
+}
+
+fn subtract_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    match (left, right) {
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_sub(*rhs)))
+        }
+        _ => {
+            let lhs = literal_to_f64(left)?;
+            let rhs = literal_to_f64(right)?;
+            Some(Literal::Float(lhs - rhs))
+        }
+    }
+}
+
+fn multiply_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    match (left, right) {
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_mul(*rhs)))
+        }
+        _ => {
+            let lhs = literal_to_f64(left)?;
+            let rhs = literal_to_f64(right)?;
+            Some(Literal::Float(lhs * rhs))
+        }
+    }
+}
+
+fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    let lhs = literal_to_f64(left)?;
+    let rhs = literal_to_f64(right)?;
+    if rhs == 0.0 {
+        return None;
+    }
+    Some(Literal::Float(lhs / rhs))
+}
+
+fn modulo_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    let lhs = literal_to_i128(left)?;
+    let rhs = literal_to_i128(right)?;
+    if rhs == 0 {
+        return None;
+    }
+    Some(Literal::Integer(lhs % rhs))
+}
+
+fn literal_to_f64(literal: &Literal) -> Option<f64> {
+    match literal {
+        Literal::Integer(value) => Some(*value as f64),
+        Literal::Float(value) => Some(*value),
+        Literal::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+fn literal_to_i128(literal: &Literal) -> Option<i128> {
+    match literal {
+        Literal::Integer(value) => Some(*value),
+        Literal::Float(value) => Some(*value as i128),
+        Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
+        _ => None,
+    }
+}
+
+fn literal_truthiness(literal: &Literal) -> Option<bool> {
+    match literal {
+        Literal::Boolean(value) => Some(*value),
+        Literal::Integer(value) => Some(*value != 0),
+        Literal::Float(value) => Some(*value != 0.0),
+        Literal::Null => None,
+        _ => None,
+    }
+}
+
+fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Literal> {
+    if matches!(literal, Literal::Null) {
+        return Some(Literal::Null);
+    }
+
+    match data_type {
+        DataType::Boolean => literal_truthiness(literal).map(Literal::Boolean),
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            let value = literal_to_f64(literal)?;
+            Some(Literal::Float(value))
+        }
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => {
+            let value = literal_to_i128(literal)?;
+            Some(Literal::Integer(value))
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => Some(Literal::String(match literal {
+            Literal::String(text) => text.clone(),
+            Literal::Integer(value) => value.to_string(),
+            Literal::Float(value) => value.to_string(),
+            Literal::Boolean(value) => {
+                if *value {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            Literal::Struct(_) | Literal::Null => return None,
+        })),
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            literal_to_i128(literal).map(Literal::Integer)
+        }
         _ => None,
     }
 }
 
 fn compare_literals(op: CompareOp, left: &Literal, right: &Literal) -> Option<bool> {
-    use std::cmp::Ordering;
-
-    match (left, right) {
-        (Literal::Null, _) | (_, Literal::Null) => None,
-        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
-            let ord = lhs.cmp(rhs);
-            Some(match op {
-                CompareOp::Eq => ord == Ordering::Equal,
-                CompareOp::NotEq => ord != Ordering::Equal,
-                CompareOp::Lt => ord == Ordering::Less,
-                CompareOp::LtEq => ord != Ordering::Greater,
-                CompareOp::Gt => ord == Ordering::Greater,
-                CompareOp::GtEq => ord != Ordering::Less,
-            })
-        }
-        (Literal::Float(lhs), Literal::Float(rhs)) => Some(match op {
-            CompareOp::Eq => lhs == rhs,
-            CompareOp::NotEq => lhs != rhs,
-            CompareOp::Lt => lhs < rhs,
-            CompareOp::LtEq => lhs <= rhs,
-            CompareOp::Gt => lhs > rhs,
-            CompareOp::GtEq => lhs >= rhs,
-        }),
-        (Literal::Integer(lhs), Literal::Float(_rhs)) => {
-            compare_literals(op, &Literal::Float(*lhs as f64), right)
-        }
-        (Literal::Float(_lhs), Literal::Integer(rhs)) => {
-            compare_literals(op, left, &Literal::Float(*rhs as f64))
-        }
-        (Literal::Boolean(lhs), Literal::Boolean(rhs)) => Some(match op {
-            CompareOp::Eq => lhs == rhs,
-            CompareOp::NotEq => lhs != rhs,
-            CompareOp::Lt => (*lhs as u8) < (*rhs as u8),
-            CompareOp::LtEq => (*lhs as u8) <= (*rhs as u8),
-            CompareOp::Gt => (*lhs as u8) > (*rhs as u8),
-            CompareOp::GtEq => (*lhs as u8) >= (*rhs as u8),
-        }),
-        (Literal::String(lhs), Literal::String(rhs)) => {
-            let ord = lhs.cmp(rhs);
-            Some(match op {
-                CompareOp::Eq => ord == Ordering::Equal,
-                CompareOp::NotEq => ord != Ordering::Equal,
-                CompareOp::Lt => ord == Ordering::Less,
-                CompareOp::LtEq => ord != Ordering::Greater,
-                CompareOp::Gt => ord == Ordering::Greater,
-                CompareOp::GtEq => ord != Ordering::Less,
-            })
-        }
-        _ => None,
-    }
+    compare_literals_with_mode(op, left, right, NullComparisonBehavior::ThreeValuedLogic)
 }
 
 fn bind_select_filter(
