@@ -1413,12 +1413,14 @@ where
 fn analyze_join_condition(
     expr: &LlkvExpr<'static, String>,
 ) -> ExecutorResult<JoinConditionAnalysis> {
-    if let Some(constant) = evaluate_constant_join_expr(expr) {
-        return Ok(if constant {
-            JoinConditionAnalysis::AlwaysTrue
-        } else {
-            JoinConditionAnalysis::AlwaysFalse
-        });
+    match evaluate_constant_join_expr(expr) {
+        ConstantJoinEvaluation::Known(true) => {
+            return Ok(JoinConditionAnalysis::AlwaysTrue);
+        }
+        ConstantJoinEvaluation::Known(false) | ConstantJoinEvaluation::Unknown => {
+            return Ok(JoinConditionAnalysis::AlwaysFalse);
+        }
+        ConstantJoinEvaluation::NotConstant => {}
     }
     match expr {
         LlkvExpr::Literal(value) => {
@@ -1473,78 +1475,6 @@ fn analyze_join_condition(
             "JOIN ON expressions must be conjunctions of column equality predicates".into(),
         )),
     }
-}
-
-fn evaluate_constant_join_expr(expr: &LlkvExpr<'static, String>) -> Option<bool> {
-    match expr {
-        LlkvExpr::Literal(value) => Some(*value),
-        LlkvExpr::And(children) => {
-            let mut saw_unknown = false;
-            for child in children {
-                match evaluate_constant_join_expr(child) {
-                    Some(false) => return Some(false),
-                    Some(true) => {}
-                    None => saw_unknown = true,
-                }
-            }
-            if saw_unknown { None } else { Some(true) }
-        }
-        LlkvExpr::Or(children) => {
-            let mut saw_unknown = false;
-            for child in children {
-                match evaluate_constant_join_expr(child) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => saw_unknown = true,
-                }
-            }
-            if saw_unknown { None } else { Some(false) }
-        }
-        LlkvExpr::Not(inner) => evaluate_constant_join_expr(inner).map(|value| !value),
-        LlkvExpr::Compare { left, op, right } => {
-            let left_lit = evaluate_constant_scalar(left)?;
-            let right_lit = evaluate_constant_scalar(right)?;
-            compare_literals_for_join(*op, &left_lit, &right_lit)
-        }
-        LlkvExpr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let needle = evaluate_constant_scalar(expr)?;
-            if matches!(needle, Literal::Null) {
-                return Some(false);
-            }
-
-            let mut saw_unknown = false;
-            for candidate in list {
-                let value = evaluate_constant_scalar(candidate)?;
-                match compare_literals_for_join(CompareOp::Eq, &needle, &value) {
-                    Some(true) => return Some(!*negated),
-                    Some(false) => {}
-                    None => saw_unknown = true,
-                }
-            }
-
-            if saw_unknown { None } else { Some(*negated) }
-        }
-        LlkvExpr::IsNull { expr, negated } => {
-            evaluate_constant_scalar(expr).map(|literal| match literal {
-                Literal::Null => !*negated,
-                _ => *negated,
-            })
-        }
-        _ => None,
-    }
-}
-
-enum NullComparisonBehavior {
-    ThreeValuedLogic,
-    NullIsFalse,
-}
-
-fn compare_literals_for_join(op: CompareOp, left: &Literal, right: &Literal) -> Option<bool> {
-    compare_literals_with_mode(op, left, right, NullComparisonBehavior::NullIsFalse)
 }
 
 fn compare_literals_with_mode(
@@ -1885,6 +1815,20 @@ mod join_condition_tests {
             expr: ScalarExpr::Literal(Literal::Null),
             negated: true,
         };
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+
+    #[test]
+    fn analyze_not_null_comparison_is_always_false() {
+        let expr = LlkvExpr::Not(Box::new(LlkvExpr::Compare {
+            left: ScalarExpr::Literal(Literal::Null),
+            op: CompareOp::Lt,
+            right: ScalarExpr::Column("t2.col".into()),
+        }));
 
         assert!(matches!(
             analyze_join_condition(&expr).expect("analysis succeeds"),
@@ -6977,26 +6921,26 @@ fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Optio
             let right_literal = evaluate_constant_scalar(right)?;
             Some(compare_literals(*op, &left_literal, &right_literal))
         }
+        LlkvExpr::IsNull { expr, negated } => {
+            let literal = evaluate_constant_scalar(expr)?;
+            let is_null = matches!(literal, Literal::Null);
+            Some(Some(if *negated { !is_null } else { is_null }))
+        }
         LlkvExpr::InList {
             expr,
             list,
             negated,
         } => {
             let needle = evaluate_constant_scalar(expr)?;
-            if matches!(needle, Literal::Null) {
-                return Some(None);
-            }
-
             let mut saw_unknown = false;
+
             for candidate in list {
                 let value = evaluate_constant_scalar(candidate)?;
                 match compare_literals(CompareOp::Eq, &needle, &value) {
                     Some(true) => {
-                        return Some(if *negated { Some(false) } else { Some(true) });
+                        return Some(Some(if *negated { false } else { true }));
                     }
-                    Some(false) => {
-                        // keep searching
-                    }
+                    Some(false) => {}
                     None => saw_unknown = true,
                 }
             }
@@ -7004,11 +6948,138 @@ fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Optio
             if saw_unknown {
                 Some(None)
             } else {
-                Some(if *negated { Some(true) } else { Some(false) })
+                Some(Some(if *negated { true } else { false }))
             }
         }
         _ => None,
     }
+}
+
+enum ConstantJoinEvaluation {
+    Known(bool),
+    Unknown,
+    NotConstant,
+}
+
+fn evaluate_constant_join_expr(expr: &LlkvExpr<'static, String>) -> ConstantJoinEvaluation {
+    match expr {
+        LlkvExpr::Literal(value) => ConstantJoinEvaluation::Known(*value),
+        LlkvExpr::And(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_constant_join_expr(child) {
+                    ConstantJoinEvaluation::Known(false) => {
+                        return ConstantJoinEvaluation::Known(false);
+                    }
+                    ConstantJoinEvaluation::Known(true) => {}
+                    ConstantJoinEvaluation::Unknown => saw_unknown = true,
+                    ConstantJoinEvaluation::NotConstant => {
+                        return ConstantJoinEvaluation::NotConstant;
+                    }
+                }
+            }
+            if saw_unknown {
+                ConstantJoinEvaluation::Unknown
+            } else {
+                ConstantJoinEvaluation::Known(true)
+            }
+        }
+        LlkvExpr::Or(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_constant_join_expr(child) {
+                    ConstantJoinEvaluation::Known(true) => {
+                        return ConstantJoinEvaluation::Known(true);
+                    }
+                    ConstantJoinEvaluation::Known(false) => {}
+                    ConstantJoinEvaluation::Unknown => saw_unknown = true,
+                    ConstantJoinEvaluation::NotConstant => {
+                        return ConstantJoinEvaluation::NotConstant;
+                    }
+                }
+            }
+            if saw_unknown {
+                ConstantJoinEvaluation::Unknown
+            } else {
+                ConstantJoinEvaluation::Known(false)
+            }
+        }
+        LlkvExpr::Not(inner) => match evaluate_constant_join_expr(inner) {
+            ConstantJoinEvaluation::Known(value) => ConstantJoinEvaluation::Known(!value),
+            ConstantJoinEvaluation::Unknown => ConstantJoinEvaluation::Unknown,
+            ConstantJoinEvaluation::NotConstant => ConstantJoinEvaluation::NotConstant,
+        },
+        LlkvExpr::Compare { left, op, right } => {
+            let left_lit = evaluate_constant_scalar(left);
+            let right_lit = evaluate_constant_scalar(right);
+
+            if matches!(left_lit, Some(Literal::Null)) || matches!(right_lit, Some(Literal::Null)) {
+                // Per SQL three-valued logic, any comparison involving NULL yields UNKNOWN.
+                return ConstantJoinEvaluation::Unknown;
+            }
+
+            let (Some(left_lit), Some(right_lit)) = (left_lit, right_lit) else {
+                return ConstantJoinEvaluation::NotConstant;
+            };
+
+            match compare_literals(*op, &left_lit, &right_lit) {
+                Some(result) => ConstantJoinEvaluation::Known(result),
+                None => ConstantJoinEvaluation::Unknown,
+            }
+        }
+        LlkvExpr::IsNull { expr, negated } => match evaluate_constant_scalar(expr) {
+            Some(literal) => {
+                let is_null = matches!(literal, Literal::Null);
+                let value = if *negated { !is_null } else { is_null };
+                ConstantJoinEvaluation::Known(value)
+            }
+            None => ConstantJoinEvaluation::NotConstant,
+        },
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = match evaluate_constant_scalar(expr) {
+                Some(literal) => literal,
+                None => return ConstantJoinEvaluation::NotConstant,
+            };
+
+            if matches!(needle, Literal::Null) {
+                return ConstantJoinEvaluation::Unknown;
+            }
+
+            let mut saw_unknown = false;
+            for candidate in list {
+                let value = match evaluate_constant_scalar(candidate) {
+                    Some(literal) => literal,
+                    None => return ConstantJoinEvaluation::NotConstant,
+                };
+
+                match compare_literals(CompareOp::Eq, &needle, &value) {
+                    Some(true) => {
+                        let result = if *negated { false } else { true };
+                        return ConstantJoinEvaluation::Known(result);
+                    }
+                    Some(false) => {}
+                    None => saw_unknown = true,
+                }
+            }
+
+            if saw_unknown {
+                ConstantJoinEvaluation::Unknown
+            } else {
+                let result = if *negated { true } else { false };
+                ConstantJoinEvaluation::Known(result)
+            }
+        }
+        _ => ConstantJoinEvaluation::NotConstant,
+    }
+}
+
+enum NullComparisonBehavior {
+    ThreeValuedLogic,
+    NullIsFalse,
 }
 
 fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
