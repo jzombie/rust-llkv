@@ -4604,11 +4604,6 @@ where
                     }
                 }
                 "sum" | "min" | "max" => {
-                    if is_distinct {
-                        return Err(Error::InvalidArgumentError(
-                            "DISTINCT is not supported for this aggregate".into(),
-                        ));
-                    }
                     if args_slice.len() != 1 {
                         return Err(Error::InvalidArgumentError(format!(
                             "{} accepts exactly one argument",
@@ -4631,6 +4626,10 @@ where
                             )));
                         }
                     };
+
+                    if is_distinct {
+                        return Ok(None);
+                    }
 
                     if func_name == "sum" {
                         if let Some(column) = parse_count_nulls_case(arg_expr)? {
@@ -5412,6 +5411,7 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
                 ))
             }
         }
+        SqlExpr::Nested(inner) => resolve_column_name(inner),
         // Handle unary +/- by recursively resolving the inner expression
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus | UnaryOperator::Minus,

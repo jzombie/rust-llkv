@@ -5039,17 +5039,13 @@ where
                             BinaryOp::Multiply => lhs.checked_mul(rhs),
                             BinaryOp::Divide => {
                                 if rhs == 0 {
-                                    return Err(Error::InvalidArgumentError(
-                                        "Division by zero".into(),
-                                    ));
+                                    return Ok(None);
                                 }
                                 lhs.checked_div(rhs)
                             }
                             BinaryOp::Modulo => {
                                 if rhs == 0 {
-                                    return Err(Error::InvalidArgumentError(
-                                        "Modulo by zero".into(),
-                                    ));
+                                    return Ok(None);
                                 }
                                 lhs.checked_rem(rhs)
                             }
@@ -9758,6 +9754,36 @@ mod tests {
 
         let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
             .expect("expression should evaluate");
+
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn aggregate_expr_divide_by_zero_returns_null() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(10),
+            BinaryOp::Divide,
+            ScalarExpr::literal(0),
+        );
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("division should evaluate");
+
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn aggregate_expr_modulo_by_zero_returns_null() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(10),
+            BinaryOp::Modulo,
+            ScalarExpr::literal(0),
+        );
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("modulo should evaluate");
 
         assert_eq!(value, None);
     }
