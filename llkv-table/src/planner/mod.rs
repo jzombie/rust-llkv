@@ -1777,7 +1777,7 @@ where
             let value = NumericKernels::evaluate_value(value_expr, 0, &arrays)?;
             match value {
                 Some(v) => {
-                    if v == target_val {
+                    if NumericKernels::compare(CompareOp::Eq, v, target_val) {
                         matched = true;
                         break;
                     }
@@ -1922,7 +1922,7 @@ where
                         NumericKernels::evaluate_value(value_expr, offset, &numeric_arrays)?;
                     match value {
                         Some(v) => {
-                            if v == target_val {
+                            if NumericKernels::compare(CompareOp::Eq, v, target_val) {
                                 matched = true;
                                 break;
                             }

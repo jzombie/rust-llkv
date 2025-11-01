@@ -8160,6 +8160,41 @@ mod tests {
     }
 
     #[test]
+    fn not_in_with_cast_preserves_rows_for_self_comparison() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab2(col1 INTEGER, col2 INTEGER)")
+            .expect("create tab2");
+        engine
+            .execute("INSERT INTO tab2 VALUES (51, 51), (67, 67), (77, 77)")
+            .expect("seed tab2");
+
+        let batches = engine
+            .sql(
+                "SELECT col1 FROM tab2 WHERE NOT col2 NOT IN ( + CAST ( + + col2 AS REAL ) ) ORDER BY col1",
+            )
+            .expect("run NOT IN self comparison query");
+
+        let mut values: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    values.push(column.value(idx));
+                }
+            }
+        }
+
+        assert_eq!(values, vec![51, 67, 77]);
+    }
+
+    #[test]
     fn cross_join_not_null_comparison_filters_all_rows() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
