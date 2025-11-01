@@ -72,8 +72,10 @@ pub fn expand_loops_with_mapping(
 /// This allows a test marked `onlyif sqlite` OR `onlyif duckdb` to run if we're compatible
 /// with either engine, and a test marked `skipif sqlite` OR `skipif duckdb` to be skipped
 /// if we're compatible with either.
+///
+/// Internal helper used by the test runner.
 #[allow(clippy::type_complexity)]
-pub fn filter_conditional_blocks(
+pub(crate) fn filter_conditional_blocks(
     lines: Vec<String>,
     mapping: Vec<usize>,
     our_engines: &[&str],
@@ -151,8 +153,10 @@ fn skip_test_block(lines: &[String], start_idx: usize) -> usize {
 /// into explicit `connection` records so the upstream parser can understand them.
 /// Also ensures proper termination of statement error blocks by adding a blank line
 /// after ---- when there's no expected error pattern.
+///
+/// Internal helper used by the test runner.
 #[allow(clippy::type_complexity)]
-pub fn normalize_inline_connections(
+pub(crate) fn normalize_inline_connections(
     lines: Vec<String>,
     mapping: Vec<usize>,
 ) -> (Vec<String>, Vec<usize>) {
@@ -337,7 +341,9 @@ pub fn normalize_inline_connections(
 ///
 /// Returns the rewritten message plus an optional pair of line numbers in the
 /// form `(original_source_line, normalized_line)`.
-pub fn map_temp_error_message(
+///
+/// Internal helper used by the test runner.
+pub(crate) fn map_temp_error_message(
     err_msg: &str,
     tmp_path: &Path,
     expanded_lines: &[String],
