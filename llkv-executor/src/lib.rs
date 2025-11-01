@@ -76,6 +76,7 @@ pub mod utils;
 /// Result type for executor operations.
 pub type ExecutorResult<T> = Result<T, Error>;
 
+use crate::translation::schema::infer_computed_data_type;
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -102,25 +103,28 @@ enum GroupKeyValue {
 /// Different aggregates return different types (e.g., AVG returns Float64, COUNT returns Int64).
 #[derive(Clone, Debug, PartialEq)]
 enum AggregateValue {
+    Null,
     Int64(i64),
     Float64(f64),
 }
 
 impl AggregateValue {
-    /// Convert to i64, truncating floats if necessary
-    fn to_i64(&self) -> i64 {
+    /// Convert to i64, truncating floats when present.
+    fn as_i64(&self) -> Option<i64> {
         match self {
-            AggregateValue::Int64(v) => *v,
-            AggregateValue::Float64(v) => *v as i64,
+            AggregateValue::Null => None,
+            AggregateValue::Int64(v) => Some(*v),
+            AggregateValue::Float64(v) => Some(*v as i64),
         }
     }
 
-    /// Convert to f64, promoting integers if necessary
+    /// Convert to f64, promoting integers when necessary.
     #[allow(dead_code)]
-    fn to_f64(&self) -> f64 {
+    fn as_f64(&self) -> Option<f64> {
         match self {
-            AggregateValue::Int64(v) => *v as f64,
-            AggregateValue::Float64(v) => *v,
+            AggregateValue::Null => None,
+            AggregateValue::Int64(v) => Some(*v as f64),
+            AggregateValue::Float64(v) => Some(*v),
         }
     }
 }
@@ -219,10 +223,12 @@ pub fn current_query_label() -> Option<String> {
 /// Extract a simple column name from a ScalarExpr when possible.
 ///
 /// Returns `Some(column_name)` if the expression is a plain column reference
-/// (possibly wrapped in unary + or - operators), otherwise returns `None`
+/// (optionally wrapped in additive identity operators like unary `+`), otherwise returns `None`
 /// (indicating a complex expression that needs full evaluation).
 ///
-/// This handles common cases like `col`, `+col`, `-col`, `++col`, etc.
+/// This handles common cases like `col`, `+col`, or `++col`. Unary negation (`-col`)
+/// is intentionally treated as a true expression so aggregates such as `SUM(-col)`
+/// evaluate the negated values instead of reading the base column directly.
 fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str> {
     match expr {
         ScalarExpr::Column(name) => Some(name.as_ref()),
@@ -242,13 +248,6 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
                 // Note: We do NOT handle Subtract here because 0 - col is NOT the same as col
                 // It needs to be evaluated as a negation
                 BinaryOp::Multiply => {
-                    // -col is represented as Multiply(-1, col)
-                    if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Integer(-1))) {
-                        return try_extract_simple_column(right);
-                    }
-                    if matches!(right.as_ref(), ScalarExpr::Literal(Literal::Integer(-1))) {
-                        return try_extract_simple_column(left);
-                    }
                     // +col might be Multiply(1, col)
                     if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Integer(1))) {
                         return try_extract_simple_column(right);
@@ -324,6 +323,7 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
     }
 }
 
+// TODO: Does llkv-table resolvers already handle this (and similar)?
 /// Resolve a column name to its index using flexible name matching.
 ///
 /// This function handles various column name formats:
@@ -354,6 +354,68 @@ fn resolve_column_name_to_index(
         .iter()
         .find(|(k, _)| k.ends_with(&format!(".{}", unqualified)) || k == &&unqualified)
         .map(|(_, &idx)| idx)
+}
+
+/// Ensure a stored-column projection exists for the given field, reusing prior entries.
+fn get_or_insert_column_projection<P>(
+    projections: &mut Vec<ScanProjection>,
+    cache: &mut FxHashMap<FieldId, usize>,
+    table: &ExecutorTable<P>,
+    column: &ExecutorColumn,
+) -> usize
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if let Some(existing) = cache.get(&column.field_id) {
+        return *existing;
+    }
+
+    let projection_index = projections.len();
+    let alias = if column.name.is_empty() {
+        format!("col{}", column.field_id)
+    } else {
+        column.name.clone()
+    };
+    projections.push(ScanProjection::from(StoreProjection::with_alias(
+        LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+        alias,
+    )));
+    cache.insert(column.field_id, projection_index);
+    projection_index
+}
+
+/// Ensure a computed projection exists for the provided expression, returning its index and type.
+fn ensure_computed_projection<P>(
+    expr: &ScalarExpr<String>,
+    table: &ExecutorTable<P>,
+    projections: &mut Vec<ScanProjection>,
+    cache: &mut FxHashMap<String, (usize, DataType)>,
+    alias_counter: &mut usize,
+) -> ExecutorResult<(usize, DataType)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let key = format!("{:?}", expr);
+    if let Some((idx, dtype)) = cache.get(&key) {
+        return Ok((*idx, dtype.clone()));
+    }
+
+    let translated = translate_scalar(expr, table.schema.as_ref(), |name| {
+        Error::InvalidArgumentError(format!("unknown column '{}' in aggregate expression", name))
+    })?;
+    let data_type = infer_computed_data_type(table.schema.as_ref(), &translated)?;
+    if data_type == DataType::Null {
+        tracing::debug!(
+            "ensure_computed_projection inferred Null type for expr: {:?}",
+            expr
+        );
+    }
+    let alias = format!("__agg_expr_{}", *alias_counter);
+    *alias_counter += 1;
+    let projection_index = projections.len();
+    projections.push(ScanProjection::computed(translated, alias));
+    cache.insert(key, (projection_index, data_type.clone()));
+    Ok((projection_index, data_type))
 }
 
 /// Query executor that executes SELECT plans.
@@ -919,22 +981,21 @@ where
 
             if has_joins && tables_with_handles.len() == 2 {
                 // Use llkv-join for 2-table joins (including LEFT JOIN)
-                use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+                use llkv_join::{JoinOptions, TableJoinExt};
 
                 let (left_ref, left_table) = &tables_with_handles[0];
                 let (right_ref, right_table) = &tables_with_handles[1];
 
-                // Determine join type from plan and convert to llkv_join::JoinType
-                let join_type = plan
-                    .joins
-                    .first()
-                    .map(|j| match j.join_type {
-                        llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
-                        llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
-                        llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
-                        llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
-                    })
-                    .unwrap_or(llkv_join::JoinType::Inner);
+                let join_metadata = plan.joins.first().ok_or_else(|| {
+                    Error::InvalidArgumentError("expected join metadata for two-table join".into())
+                })?;
+
+                let join_type = match join_metadata.join_type {
+                    llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
+                    llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
+                    llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
+                    llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
+                };
 
                 tracing::debug!(
                     "Using llkv-join for {join_type:?} join between {} and {}",
@@ -942,26 +1003,10 @@ where
                     right_ref.qualified_name()
                 );
 
-                // Extract join keys from constraints if available
-                // For now, use empty keys (cross product) and rely on filter
-                // TODO: Parse ON conditions to extract proper join keys
-                let join_keys: Vec<JoinKey> = Vec::new();
+                let left_col_count = left_table.schema.columns.len();
+                let right_col_count = right_table.schema.columns.len();
 
-                let mut result_batches = Vec::new();
-                left_table.table.join_stream(
-                    &right_table.table,
-                    &join_keys,
-                    &JoinOptions {
-                        join_type,
-                        ..Default::default()
-                    },
-                    |batch| {
-                        result_batches.push(batch);
-                    },
-                )?;
-
-                // Build combined schema and convert to TableCrossProductData
-                let mut combined_fields = Vec::new();
+                let mut combined_fields = Vec::with_capacity(left_col_count + right_col_count);
                 for col in &left_table.schema.columns {
                     combined_fields.push(Field::new(
                         col.name.clone(),
@@ -977,18 +1022,71 @@ where
                     ));
                 }
                 let combined_schema = Arc::new(Schema::new(combined_fields));
-
-                let column_counts = vec![
-                    left_table.schema.columns.len(),
-                    right_table.schema.columns.len(),
-                ];
+                let column_counts = vec![left_col_count, right_col_count];
                 let table_indices = vec![0, 1];
 
-                TableCrossProductData {
-                    schema: combined_schema,
-                    batches: result_batches,
-                    column_counts,
-                    table_indices,
+                let mut join_keys = Vec::new();
+                let mut condition_is_trivial = false;
+                let mut condition_is_impossible = false;
+
+                if let Some(condition) = join_metadata.on_condition.as_ref() {
+                    let plan = build_join_keys_from_condition(
+                        condition,
+                        left_ref,
+                        left_table.as_ref(),
+                        right_ref,
+                        right_table.as_ref(),
+                    )?;
+                    join_keys = plan.keys;
+                    condition_is_trivial = plan.always_true;
+                    condition_is_impossible = plan.always_false;
+                }
+
+                if condition_is_impossible {
+                    let batches = build_no_match_join_batches(
+                        join_type,
+                        left_ref,
+                        left_table.as_ref(),
+                        right_ref,
+                        right_table.as_ref(),
+                        Arc::clone(&combined_schema),
+                    )?;
+
+                    TableCrossProductData {
+                        schema: combined_schema,
+                        batches,
+                        column_counts,
+                        table_indices,
+                    }
+                } else {
+                    if !condition_is_trivial
+                        && join_metadata.on_condition.is_some()
+                        && join_keys.is_empty()
+                    {
+                        return Err(Error::InvalidArgumentError(
+                            "JOIN ON clause must include at least one equality predicate".into(),
+                        ));
+                    }
+
+                    let mut result_batches = Vec::new();
+                    left_table.table.join_stream(
+                        &right_table.table,
+                        &join_keys,
+                        &JoinOptions {
+                            join_type,
+                            ..Default::default()
+                        },
+                        |batch| {
+                            result_batches.push(batch);
+                        },
+                    )?;
+
+                    TableCrossProductData {
+                        schema: combined_schema,
+                        batches: result_batches,
+                        column_counts,
+                        table_indices,
+                    }
                 }
             } else {
                 // Fall back to cartesian product for other cases
@@ -1003,7 +1101,87 @@ where
 
                 let mut staged: Vec<TableCrossProductData> =
                     Vec::with_capacity(tables_with_handles.len());
-                for (idx, (table_ref, table)) in tables_with_handles.iter().enumerate() {
+                let join_lookup: FxHashMap<usize, &llkv_plan::JoinMetadata> = plan
+                    .joins
+                    .iter()
+                    .map(|join| (join.left_table_index, join))
+                    .collect();
+
+                let mut idx = 0usize;
+                while idx < tables_with_handles.len() {
+                    if let Some(join_metadata) = join_lookup.get(&idx) {
+                        if idx + 1 >= tables_with_handles.len() {
+                            return Err(Error::Internal(
+                                "join metadata references table beyond FROM list".into(),
+                            ));
+                        }
+
+                        // Only apply the no-match optimisation when the ON predicate is provably false
+                        // and the right-hand table is not the start of another join chain. This keeps the
+                        // fallback semantics aligned with two-table joins without interfering with more
+                        // complex join graphs (which are still handled by the cartesian product path).
+                        let overlaps_next_join = join_lookup.contains_key(&(idx + 1));
+                        if let Some(condition) = join_metadata.on_condition.as_ref() {
+                            let (left_ref, left_table) = &tables_with_handles[idx];
+                            let (right_ref, right_table) = &tables_with_handles[idx + 1];
+                            let join_plan = build_join_keys_from_condition(
+                                condition,
+                                left_ref,
+                                left_table.as_ref(),
+                                right_ref,
+                                right_table.as_ref(),
+                            )?;
+                            if join_plan.always_false && !overlaps_next_join {
+                                let join_type = match join_metadata.join_type {
+                                    llkv_plan::JoinPlan::Inner => llkv_join::JoinType::Inner,
+                                    llkv_plan::JoinPlan::Left => llkv_join::JoinType::Left,
+                                    llkv_plan::JoinPlan::Right => llkv_join::JoinType::Right,
+                                    llkv_plan::JoinPlan::Full => llkv_join::JoinType::Full,
+                                };
+
+                                let left_col_count = left_table.schema.columns.len();
+                                let right_col_count = right_table.schema.columns.len();
+
+                                let mut combined_fields =
+                                    Vec::with_capacity(left_col_count + right_col_count);
+                                for col in &left_table.schema.columns {
+                                    combined_fields.push(Field::new(
+                                        col.name.clone(),
+                                        col.data_type.clone(),
+                                        col.nullable,
+                                    ));
+                                }
+                                for col in &right_table.schema.columns {
+                                    combined_fields.push(Field::new(
+                                        col.name.clone(),
+                                        col.data_type.clone(),
+                                        col.nullable,
+                                    ));
+                                }
+
+                                let combined_schema = Arc::new(Schema::new(combined_fields));
+                                let batches = build_no_match_join_batches(
+                                    join_type,
+                                    left_ref,
+                                    left_table.as_ref(),
+                                    right_ref,
+                                    right_table.as_ref(),
+                                    Arc::clone(&combined_schema),
+                                )?;
+
+                                staged.push(TableCrossProductData {
+                                    schema: combined_schema,
+                                    batches,
+                                    column_counts: vec![left_col_count, right_col_count],
+                                    table_indices: vec![idx, idx + 1],
+                                });
+                                idx += 2;
+                                continue;
+                            }
+                        }
+                    }
+
+                    let (table_ref, table) = &tables_with_handles[idx];
                     let constraints = constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
                     staged.push(collect_table_data(
                         idx,
@@ -1011,7 +1189,9 @@ where
                         table.as_ref(),
                         constraints,
                     )?);
+                    idx += 1;
                 }
+
                 cross_join_all(staged)?
             }
         };
@@ -1232,7 +1412,542 @@ where
             combined_batch,
         ))
     }
+}
 
+struct JoinKeyBuild {
+    keys: Vec<llkv_join::JoinKey>,
+    always_true: bool,
+    always_false: bool,
+}
+
+#[derive(Debug)]
+enum JoinConditionAnalysis {
+    AlwaysTrue,
+    AlwaysFalse,
+    EquiPairs(Vec<(String, String)>),
+}
+
+fn build_join_keys_from_condition<P>(
+    condition: &LlkvExpr<'static, String>,
+    left_ref: &llkv_plan::TableRef,
+    left_table: &ExecutorTable<P>,
+    right_ref: &llkv_plan::TableRef,
+    right_table: &ExecutorTable<P>,
+) -> ExecutorResult<JoinKeyBuild>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    match analyze_join_condition(condition)? {
+        JoinConditionAnalysis::AlwaysTrue => Ok(JoinKeyBuild {
+            keys: Vec::new(),
+            always_true: true,
+            always_false: false,
+        }),
+        JoinConditionAnalysis::AlwaysFalse => Ok(JoinKeyBuild {
+            keys: Vec::new(),
+            always_true: false,
+            always_false: true,
+        }),
+        JoinConditionAnalysis::EquiPairs(pairs) => {
+            let left_lookup = build_join_column_lookup(left_ref, left_table);
+            let right_lookup = build_join_column_lookup(right_ref, right_table);
+
+            let mut keys = Vec::with_capacity(pairs.len());
+            for (lhs, rhs) in pairs {
+                let (lhs_side, lhs_field) = resolve_join_column(&lhs, &left_lookup, &right_lookup)?;
+                let (rhs_side, rhs_field) = resolve_join_column(&rhs, &left_lookup, &right_lookup)?;
+
+                match (lhs_side, rhs_side) {
+                    (JoinColumnSide::Left, JoinColumnSide::Right) => {
+                        keys.push(llkv_join::JoinKey::new(lhs_field, rhs_field));
+                    }
+                    (JoinColumnSide::Right, JoinColumnSide::Left) => {
+                        keys.push(llkv_join::JoinKey::new(rhs_field, lhs_field));
+                    }
+                    (JoinColumnSide::Left, JoinColumnSide::Left) => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "JOIN condition compares two columns from '{}': '{}' and '{}'",
+                            left_ref.display_name(),
+                            lhs,
+                            rhs
+                        )));
+                    }
+                    (JoinColumnSide::Right, JoinColumnSide::Right) => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "JOIN condition compares two columns from '{}': '{}' and '{}'",
+                            right_ref.display_name(),
+                            lhs,
+                            rhs
+                        )));
+                    }
+                }
+            }
+
+            Ok(JoinKeyBuild {
+                keys,
+                always_true: false,
+                always_false: false,
+            })
+        }
+    }
+}
+
+fn analyze_join_condition(
+    expr: &LlkvExpr<'static, String>,
+) -> ExecutorResult<JoinConditionAnalysis> {
+    match evaluate_constant_join_expr(expr) {
+        ConstantJoinEvaluation::Known(true) => {
+            return Ok(JoinConditionAnalysis::AlwaysTrue);
+        }
+        ConstantJoinEvaluation::Known(false) | ConstantJoinEvaluation::Unknown => {
+            return Ok(JoinConditionAnalysis::AlwaysFalse);
+        }
+        ConstantJoinEvaluation::NotConstant => {}
+    }
+    match expr {
+        LlkvExpr::Literal(value) => {
+            if *value {
+                Ok(JoinConditionAnalysis::AlwaysTrue)
+            } else {
+                Ok(JoinConditionAnalysis::AlwaysFalse)
+            }
+        }
+        LlkvExpr::And(children) => {
+            let mut collected: Vec<(String, String)> = Vec::new();
+            for child in children {
+                match analyze_join_condition(child)? {
+                    JoinConditionAnalysis::AlwaysTrue => {}
+                    JoinConditionAnalysis::AlwaysFalse => {
+                        return Ok(JoinConditionAnalysis::AlwaysFalse);
+                    }
+                    JoinConditionAnalysis::EquiPairs(mut pairs) => {
+                        collected.append(&mut pairs);
+                    }
+                }
+            }
+
+            if collected.is_empty() {
+                Ok(JoinConditionAnalysis::AlwaysTrue)
+            } else {
+                Ok(JoinConditionAnalysis::EquiPairs(collected))
+            }
+        }
+        LlkvExpr::Compare { left, op, right } => {
+            if *op != CompareOp::Eq {
+                return Err(Error::InvalidArgumentError(
+                    "JOIN ON clause only supports '=' comparisons in optimized path".into(),
+                ));
+            }
+            let left_name = try_extract_simple_column(left).ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "JOIN ON clause requires plain column references".into(),
+                )
+            })?;
+            let right_name = try_extract_simple_column(right).ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "JOIN ON clause requires plain column references".into(),
+                )
+            })?;
+            Ok(JoinConditionAnalysis::EquiPairs(vec![(
+                left_name.to_string(),
+                right_name.to_string(),
+            )]))
+        }
+        _ => Err(Error::InvalidArgumentError(
+            "JOIN ON expressions must be conjunctions of column equality predicates".into(),
+        )),
+    }
+}
+
+fn compare_literals_with_mode(
+    op: CompareOp,
+    left: &Literal,
+    right: &Literal,
+    null_behavior: NullComparisonBehavior,
+) -> Option<bool> {
+    use std::cmp::Ordering;
+
+    fn ordering_result(ord: Ordering, op: CompareOp) -> bool {
+        match op {
+            CompareOp::Eq => ord == Ordering::Equal,
+            CompareOp::NotEq => ord != Ordering::Equal,
+            CompareOp::Lt => ord == Ordering::Less,
+            CompareOp::LtEq => ord != Ordering::Greater,
+            CompareOp::Gt => ord == Ordering::Greater,
+            CompareOp::GtEq => ord != Ordering::Less,
+        }
+    }
+
+    fn compare_f64(lhs: f64, rhs: f64, op: CompareOp) -> bool {
+        match op {
+            CompareOp::Eq => lhs == rhs,
+            CompareOp::NotEq => lhs != rhs,
+            CompareOp::Lt => lhs < rhs,
+            CompareOp::LtEq => lhs <= rhs,
+            CompareOp::Gt => lhs > rhs,
+            CompareOp::GtEq => lhs >= rhs,
+        }
+    }
+
+    match (left, right) {
+        (Literal::Null, _) | (_, Literal::Null) => match null_behavior {
+            NullComparisonBehavior::ThreeValuedLogic => None,
+        },
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::Float(lhs), Literal::Float(rhs)) => Some(compare_f64(*lhs, *rhs, op)),
+        (Literal::Integer(lhs), Literal::Float(rhs)) => Some(compare_f64(*lhs as f64, *rhs, op)),
+        (Literal::Float(lhs), Literal::Integer(rhs)) => Some(compare_f64(*lhs, *rhs as f64, op)),
+        (Literal::Boolean(lhs), Literal::Boolean(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::String(lhs), Literal::String(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::Struct(_), _) | (_, Literal::Struct(_)) => None,
+        _ => None,
+    }
+}
+
+fn build_no_match_join_batches<P>(
+    join_type: llkv_join::JoinType,
+    left_ref: &llkv_plan::TableRef,
+    left_table: &ExecutorTable<P>,
+    right_ref: &llkv_plan::TableRef,
+    right_table: &ExecutorTable<P>,
+    combined_schema: Arc<Schema>,
+) -> ExecutorResult<Vec<RecordBatch>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    match join_type {
+        llkv_join::JoinType::Inner => Ok(Vec::new()),
+        llkv_join::JoinType::Left => {
+            let left_batches = scan_all_columns_for_join(left_ref, left_table)?;
+            let mut results = Vec::new();
+
+            for left_batch in left_batches {
+                let row_count = left_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                columns.extend(left_batch.columns().iter().cloned());
+                for column in &right_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!("failed to build LEFT JOIN fallback batch: {err}"))
+                    })?;
+                results.push(batch);
+            }
+
+            Ok(results)
+        }
+        llkv_join::JoinType::Right => {
+            let right_batches = scan_all_columns_for_join(right_ref, right_table)?;
+            let mut results = Vec::new();
+
+            for right_batch in right_batches {
+                let row_count = right_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                for column in &left_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+                columns.extend(right_batch.columns().iter().cloned());
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!("failed to build RIGHT JOIN fallback batch: {err}"))
+                    })?;
+                results.push(batch);
+            }
+
+            Ok(results)
+        }
+        llkv_join::JoinType::Full => {
+            let mut results = Vec::new();
+
+            let left_batches = scan_all_columns_for_join(left_ref, left_table)?;
+            for left_batch in left_batches {
+                let row_count = left_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                columns.extend(left_batch.columns().iter().cloned());
+                for column in &right_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!(
+                            "failed to build FULL JOIN left fallback batch: {err}"
+                        ))
+                    })?;
+                results.push(batch);
+            }
+
+            let right_batches = scan_all_columns_for_join(right_ref, right_table)?;
+            for right_batch in right_batches {
+                let row_count = right_batch.num_rows();
+                if row_count == 0 {
+                    continue;
+                }
+
+                let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                for column in &left_table.schema.columns {
+                    columns.push(new_null_array(&column.data_type, row_count));
+                }
+                columns.extend(right_batch.columns().iter().cloned());
+
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(|err| {
+                        Error::Internal(format!(
+                            "failed to build FULL JOIN right fallback batch: {err}"
+                        ))
+                    })?;
+                results.push(batch);
+            }
+
+            Ok(results)
+        }
+        other => Err(Error::InvalidArgumentError(format!(
+            "{other:?} join type is not supported when join predicate is unsatisfiable",
+        ))),
+    }
+}
+
+fn scan_all_columns_for_join<P>(
+    table_ref: &llkv_plan::TableRef,
+    table: &ExecutorTable<P>,
+) -> ExecutorResult<Vec<RecordBatch>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if table.schema.columns.is_empty() {
+        return Err(Error::InvalidArgumentError(format!(
+            "table '{}' has no columns; joins require at least one column",
+            table_ref.qualified_name()
+        )));
+    }
+
+    let mut projections = Vec::with_capacity(table.schema.columns.len());
+    for column in &table.schema.columns {
+        projections.push(ScanProjection::from(StoreProjection::with_alias(
+            LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+            column.name.clone(),
+        )));
+    }
+
+    let filter_field = table.schema.first_field_id().unwrap_or(ROW_ID_FIELD_ID);
+    let filter_expr = full_table_scan_filter(filter_field);
+
+    let mut batches = Vec::new();
+    table.table.scan_stream(
+        projections,
+        &filter_expr,
+        ScanStreamOptions {
+            include_nulls: true,
+            ..ScanStreamOptions::default()
+        },
+        |batch| {
+            batches.push(batch);
+        },
+    )?;
+
+    Ok(batches)
+}
+
+fn build_join_column_lookup<P>(
+    table_ref: &llkv_plan::TableRef,
+    table: &ExecutorTable<P>,
+) -> FxHashMap<String, FieldId>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut lookup = FxHashMap::default();
+    let table_lower = table_ref.table.to_ascii_lowercase();
+    let qualified_lower = table_ref.qualified_name().to_ascii_lowercase();
+    let display_lower = table_ref.display_name().to_ascii_lowercase();
+    let alias_lower = table_ref.alias.as_ref().map(|s| s.to_ascii_lowercase());
+    let schema_lower = if table_ref.schema.is_empty() {
+        None
+    } else {
+        Some(table_ref.schema.to_ascii_lowercase())
+    };
+
+    for column in &table.schema.columns {
+        let base = column.name.to_ascii_lowercase();
+        let short = base.rsplit('.').next().unwrap_or(base.as_str()).to_string();
+
+        lookup.entry(short.clone()).or_insert(column.field_id);
+        lookup.entry(base.clone()).or_insert(column.field_id);
+
+        lookup
+            .entry(format!("{table_lower}.{short}"))
+            .or_insert(column.field_id);
+
+        if display_lower != table_lower {
+            lookup
+                .entry(format!("{display_lower}.{short}"))
+                .or_insert(column.field_id);
+        }
+
+        if qualified_lower != table_lower {
+            lookup
+                .entry(format!("{qualified_lower}.{short}"))
+                .or_insert(column.field_id);
+        }
+
+        if let Some(schema) = &schema_lower {
+            lookup
+                .entry(format!("{schema}.{table_lower}.{short}"))
+                .or_insert(column.field_id);
+            if display_lower != table_lower {
+                lookup
+                    .entry(format!("{schema}.{display_lower}.{short}"))
+                    .or_insert(column.field_id);
+            }
+        }
+
+        if let Some(alias) = &alias_lower {
+            lookup
+                .entry(format!("{alias}.{short}"))
+                .or_insert(column.field_id);
+        }
+    }
+
+    lookup
+}
+
+#[derive(Clone, Copy)]
+enum JoinColumnSide {
+    Left,
+    Right,
+}
+
+fn resolve_join_column(
+    column: &str,
+    left_lookup: &FxHashMap<String, FieldId>,
+    right_lookup: &FxHashMap<String, FieldId>,
+) -> ExecutorResult<(JoinColumnSide, FieldId)> {
+    let key = column.to_ascii_lowercase();
+    match (left_lookup.get(&key), right_lookup.get(&key)) {
+        (Some(&field_id), None) => Ok((JoinColumnSide::Left, field_id)),
+        (None, Some(&field_id)) => Ok((JoinColumnSide::Right, field_id)),
+        (Some(_), Some(_)) => Err(Error::InvalidArgumentError(format!(
+            "join column '{column}' is ambiguous; qualify it with a table name or alias",
+        ))),
+        (None, None) => Err(Error::InvalidArgumentError(format!(
+            "join column '{column}' was not found in either table",
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod join_condition_tests {
+    use super::*;
+    use llkv_expr::expr::{CompareOp, ScalarExpr};
+    use llkv_expr::literal::Literal;
+
+    #[test]
+    fn analyze_detects_simple_equality() {
+        let expr = LlkvExpr::Compare {
+            left: ScalarExpr::Column("t1.col".into()),
+            op: CompareOp::Eq,
+            right: ScalarExpr::Column("t2.col".into()),
+        };
+
+        match analyze_join_condition(&expr).expect("analysis succeeds") {
+            JoinConditionAnalysis::EquiPairs(pairs) => {
+                assert_eq!(pairs, vec![("t1.col".to_string(), "t2.col".to_string())]);
+            }
+            other => panic!("unexpected analysis result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_handles_literal_true() {
+        let expr = LlkvExpr::Literal(true);
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysTrue
+        ));
+    }
+
+    #[test]
+    fn analyze_rejects_non_equality() {
+        let expr = LlkvExpr::Compare {
+            left: ScalarExpr::Column("t1.col".into()),
+            op: CompareOp::Gt,
+            right: ScalarExpr::Column("t2.col".into()),
+        };
+        assert!(analyze_join_condition(&expr).is_err());
+    }
+
+    #[test]
+    fn analyze_handles_constant_is_not_null() {
+        let expr = LlkvExpr::IsNull {
+            expr: ScalarExpr::Literal(Literal::Null),
+            negated: true,
+        };
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+
+    #[test]
+    fn analyze_handles_not_applied_to_is_not_null() {
+        let expr = LlkvExpr::Not(Box::new(LlkvExpr::IsNull {
+            expr: ScalarExpr::Literal(Literal::Integer(86)),
+            negated: true,
+        }));
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+
+    #[test]
+    fn analyze_literal_is_null_is_always_false() {
+        let expr = LlkvExpr::IsNull {
+            expr: ScalarExpr::Literal(Literal::Integer(1)),
+            negated: false,
+        };
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+
+    #[test]
+    fn analyze_not_null_comparison_is_always_false() {
+        let expr = LlkvExpr::Not(Box::new(LlkvExpr::Compare {
+            left: ScalarExpr::Literal(Literal::Null),
+            op: CompareOp::Lt,
+            right: ScalarExpr::Column("t2.col".into()),
+        }));
+
+        assert!(matches!(
+            analyze_join_condition(&expr).expect("analysis succeeds"),
+            JoinConditionAnalysis::AlwaysFalse
+        ));
+    }
+}
+
+impl<P> QueryExecutor<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     fn execute_cross_product_aggregates(
         &self,
         combined_schema: Arc<Schema>,
@@ -1426,7 +2141,7 @@ where
         for projection in &plan.projections {
             if let SelectProjection::Computed { expr, alias } = projection {
                 let value = Self::evaluate_expr_with_aggregates(expr, &aggregate_values)?;
-                fields.push(Arc::new(Field::new(alias, DataType::Int64, false)));
+                fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
                 arrays.push(Arc::new(Int64Array::from(vec![value])) as ArrayRef);
             }
         }
@@ -1463,6 +2178,75 @@ where
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(aggregate_specs.len());
         let mut spec_to_projection: Vec<Option<usize>> = Vec::with_capacity(aggregate_specs.len());
 
+        let mut columns_per_batch: Option<Vec<Vec<ArrayRef>>> = None;
+        let mut augmented_fields: Option<Vec<Field>> = None;
+        let mut owned_batches: Option<Vec<RecordBatch>> = None;
+        let mut computed_projection_cache: FxHashMap<String, (usize, DataType)> =
+            FxHashMap::default();
+        let mut computed_alias_counter: usize = 0;
+        let mut expr_context = CrossProductExpressionContext::new(
+            combined_schema.as_ref(),
+            column_lookup_map.clone(),
+        )?;
+
+        let mut ensure_computed_column =
+            |expr: &ScalarExpr<String>| -> ExecutorResult<(usize, DataType)> {
+                let key = format!("{:?}", expr);
+                if let Some((idx, dtype)) = computed_projection_cache.get(&key) {
+                    return Ok((*idx, dtype.clone()));
+                }
+
+                if columns_per_batch.is_none() {
+                    let initial_columns: Vec<Vec<ArrayRef>> = batches
+                        .iter()
+                        .map(|batch| batch.columns().to_vec())
+                        .collect();
+                    columns_per_batch = Some(initial_columns);
+                }
+                if augmented_fields.is_none() {
+                    augmented_fields = Some(
+                        combined_schema
+                            .fields()
+                            .iter()
+                            .map(|field| field.as_ref().clone())
+                            .collect(),
+                    );
+                }
+
+                let translated = translate_scalar(expr, expr_context.schema(), |name| {
+                    Error::InvalidArgumentError(format!(
+                        "unknown column '{}' in aggregate expression",
+                        name
+                    ))
+                })?;
+                let data_type = infer_computed_data_type(expr_context.schema(), &translated)?;
+
+                if let Some(columns) = columns_per_batch.as_mut() {
+                    for (batch_idx, batch) in batches.iter().enumerate() {
+                        expr_context.reset();
+                        let array = expr_context.materialize_scalar_array(&translated, batch)?;
+                        if let Some(batch_columns) = columns.get_mut(batch_idx) {
+                            batch_columns.push(array);
+                        }
+                    }
+                }
+
+                let column_index = augmented_fields
+                    .as_ref()
+                    .map(|fields| fields.len())
+                    .unwrap_or_else(|| combined_schema.fields().len());
+
+                let alias = format!("__agg_expr_cp_{}", computed_alias_counter);
+                computed_alias_counter += 1;
+                augmented_fields
+                    .as_mut()
+                    .expect("augmented fields initialized")
+                    .push(Field::new(&alias, data_type.clone(), true));
+
+                computed_projection_cache.insert(key, (column_index, data_type.clone()));
+                Ok((column_index, data_type))
+            };
+
         for (key, agg) in aggregate_specs {
             match agg {
                 AggregateCall::CountStar => {
@@ -1481,75 +2265,108 @@ where
                 | AggregateCall::Min(expr)
                 | AggregateCall::Max(expr)
                 | AggregateCall::CountNulls(expr) => {
-                    // For now, we only support simple column references in aggregates at this level
-                    // Complex expressions in aggregates need expression evaluation support
-                    let column = try_extract_simple_column(expr).ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "complex expressions in aggregates not yet supported in this context"
-                                .into(),
-                        )
-                    })?;
-                    let key_lower = column.to_ascii_lowercase();
-                    let column_index = *column_lookup_map.get(&key_lower).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!(
-                            "unknown column '{column}' in aggregate"
-                        ))
-                    })?;
-                    let field = combined_schema.field(column_index);
+                    let (column_index, data_type_opt) = if let Some(column) =
+                        try_extract_simple_column(expr)
+                    {
+                        let key_lower = column.to_ascii_lowercase();
+                        let column_index = *column_lookup_map.get(&key_lower).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{column}' in aggregate"
+                            ))
+                        })?;
+                        let field = combined_schema.field(column_index);
+                        (column_index, Some(field.data_type().clone()))
+                    } else {
+                        let (index, dtype) = ensure_computed_column(expr)?;
+                        (index, Some(dtype))
+                    };
+
                     let kind = match agg {
-                        AggregateCall::Count { distinct, .. } => AggregateKind::Count {
-                            field_id: Some(column_index as u32),
-                            distinct: *distinct,
-                        },
+                        AggregateCall::Count { distinct, .. } => {
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            AggregateKind::Count {
+                                field_id: Some(field_id),
+                                distinct: *distinct,
+                            }
+                        }
                         AggregateCall::Sum { distinct, .. } => {
                             let input_type = Self::validate_aggregate_type(
-                                Some(field.data_type().clone()),
+                                data_type_opt.clone(),
                                 "SUM",
                                 &[DataType::Int64, DataType::Float64],
                             )?;
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
                             AggregateKind::Sum {
-                                field_id: column_index as u32,
+                                field_id,
                                 data_type: input_type,
                                 distinct: *distinct,
                             }
                         }
                         AggregateCall::Avg { distinct, .. } => {
                             let input_type = Self::validate_aggregate_type(
-                                Some(field.data_type().clone()),
+                                data_type_opt.clone(),
                                 "AVG",
                                 &[DataType::Int64, DataType::Float64],
                             )?;
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
                             AggregateKind::Avg {
-                                field_id: column_index as u32,
+                                field_id,
                                 data_type: input_type,
                                 distinct: *distinct,
                             }
                         }
                         AggregateCall::Min(_) => {
                             let input_type = Self::validate_aggregate_type(
-                                Some(field.data_type().clone()),
+                                data_type_opt.clone(),
                                 "MIN",
                                 &[DataType::Int64, DataType::Float64],
                             )?;
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
                             AggregateKind::Min {
-                                field_id: column_index as u32,
+                                field_id,
                                 data_type: input_type,
                             }
                         }
                         AggregateCall::Max(_) => {
                             let input_type = Self::validate_aggregate_type(
-                                Some(field.data_type().clone()),
+                                data_type_opt.clone(),
                                 "MAX",
                                 &[DataType::Int64, DataType::Float64],
                             )?;
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
                             AggregateKind::Max {
-                                field_id: column_index as u32,
+                                field_id,
                                 data_type: input_type,
                             }
                         }
-                        AggregateCall::CountNulls(_) => AggregateKind::CountNulls {
-                            field_id: column_index as u32,
-                        },
+                        AggregateCall::CountNulls(_) => {
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            AggregateKind::CountNulls { field_id }
+                        }
                         _ => unreachable!(),
                     };
 
@@ -1560,6 +2377,28 @@ where
                     spec_to_projection.push(Some(column_index));
                 }
             }
+        }
+
+        if let Some(columns) = columns_per_batch {
+            let fields = augmented_fields.unwrap_or_else(|| {
+                combined_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect()
+            });
+            let augmented_schema = Arc::new(Schema::new(fields));
+            let mut new_batches = Vec::with_capacity(columns.len());
+            for batch_columns in columns {
+                let batch = RecordBatch::try_new(Arc::clone(&augmented_schema), batch_columns)
+                    .map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "failed to materialize aggregate projections: {err}"
+                        ))
+                    })?;
+                new_batches.push(batch);
+            }
+            owned_batches = Some(new_batches);
         }
 
         let mut states = Vec::with_capacity(specs.len());
@@ -1575,7 +2414,13 @@ where
             });
         }
 
-        for batch in batches {
+        let batch_iter: &[RecordBatch] = if let Some(ref extended) = owned_batches {
+            extended.as_slice()
+        } else {
+            batches
+        };
+
+        for batch in batch_iter {
             for state in &mut states {
                 state.update(batch)?;
             }
@@ -1594,7 +2439,7 @@ where
                     )));
                 }
                 let value = if int_array.is_null(0) {
-                    AggregateValue::Int64(0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Int64(int_array.value(0))
                 };
@@ -1609,7 +2454,7 @@ where
                     )));
                 }
                 let value = if float_array.is_null(0) {
-                    AggregateValue::Float64(0.0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float_array.value(0))
                 };
@@ -3453,7 +4298,7 @@ where
                     // Evaluate the expression with aggregates substituted
                     let value = Self::evaluate_expr_with_aggregates(expr, &computed_aggregates)?;
 
-                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, false));
+                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
 
                     let array = Arc::new(Int64Array::from(vec![value])) as ArrayRef;
                     arrays.push(array);
@@ -3671,132 +4516,306 @@ where
         let mut results =
             FxHashMap::with_capacity_and_hasher(aggregate_specs.len(), Default::default());
 
-        // Build aggregate specs for the aggregator
-        let mut specs: Vec<AggregateSpec> = Vec::new();
+        let mut specs: Vec<AggregateSpec> = Vec::with_capacity(aggregate_specs.len());
+        let mut spec_to_projection: Vec<Option<usize>> = Vec::with_capacity(aggregate_specs.len());
+        let mut projections: Vec<ScanProjection> = Vec::new();
+        let mut column_projection_cache: FxHashMap<FieldId, usize> = FxHashMap::default();
+        let mut computed_projection_cache: FxHashMap<String, (usize, DataType)> =
+            FxHashMap::default();
+        let mut computed_alias_counter: usize = 0;
+
         for (key, agg) in aggregate_specs {
-            let kind = match agg {
-                AggregateCall::CountStar => AggregateKind::Count {
-                    field_id: None,
-                    distinct: false,
-                },
-                AggregateCall::Count {
-                    expr: col_expr,
-                    distinct,
-                } => {
-                    let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "complex expressions in COUNT not yet fully supported".into(),
-                        )
-                    })?;
-                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
-                    })?;
-                    AggregateKind::Count {
-                        field_id: Some(col.field_id),
-                        distinct: *distinct,
+            match agg {
+                AggregateCall::CountStar => {
+                    specs.push(AggregateSpec {
+                        alias: key.clone(),
+                        kind: AggregateKind::Count {
+                            field_id: None,
+                            distinct: false,
+                        },
+                    });
+                    spec_to_projection.push(None);
+                }
+                AggregateCall::Count { expr, distinct } => {
+                    if let Some(col_name) = try_extract_simple_column(expr) {
+                        let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::Count {
+                                field_id: Some(col.field_id),
+                                distinct: *distinct,
+                            },
+                        });
+                        spec_to_projection.push(Some(projection_index));
+                    } else {
+                        let (projection_index, _dtype) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::Count {
+                                field_id: Some(field_id),
+                                distinct: *distinct,
+                            },
+                        });
+                        spec_to_projection.push(Some(projection_index));
                     }
                 }
-                AggregateCall::Sum {
-                    expr: col_expr,
-                    distinct,
-                } => {
-                    let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "complex expressions in SUM not yet fully supported".into(),
-                        )
-                    })?;
-                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
-                    })?;
-                    AggregateKind::Sum {
-                        field_id: col.field_id,
-                        data_type: Self::validate_aggregate_type(
-                            Some(col.data_type.clone()),
-                            "SUM",
-                            &[DataType::Int64, DataType::Float64],
-                        )?,
-                        distinct: *distinct,
+                AggregateCall::Sum { expr, distinct } => {
+                    let (projection_index, data_type, field_id) =
+                        if let Some(col_name) = try_extract_simple_column(expr) {
+                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in aggregate",
+                                    col_name
+                                ))
+                            })?;
+                            let projection_index = get_or_insert_column_projection(
+                                &mut projections,
+                                &mut column_projection_cache,
+                                table_ref,
+                                col,
+                            );
+                            let data_type = col.data_type.clone();
+                            (projection_index, data_type, col.field_id)
+                        } else {
+                            let (projection_index, inferred_type) = ensure_computed_projection(
+                                expr,
+                                table_ref,
+                                &mut projections,
+                                &mut computed_projection_cache,
+                                &mut computed_alias_counter,
+                            )?;
+                            let field_id = u32::try_from(projection_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            (projection_index, inferred_type, field_id)
+                        };
+                    let normalized_type = Self::validate_aggregate_type(
+                        Some(data_type.clone()),
+                        "SUM",
+                        &[DataType::Int64, DataType::Float64],
+                    )?;
+                    specs.push(AggregateSpec {
+                        alias: key.clone(),
+                        kind: AggregateKind::Sum {
+                            field_id,
+                            data_type: normalized_type,
+                            distinct: *distinct,
+                        },
+                    });
+                    spec_to_projection.push(Some(projection_index));
+                }
+                AggregateCall::Avg { expr, distinct } => {
+                    let (projection_index, data_type, field_id) =
+                        if let Some(col_name) = try_extract_simple_column(expr) {
+                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in aggregate",
+                                    col_name
+                                ))
+                            })?;
+                            let projection_index = get_or_insert_column_projection(
+                                &mut projections,
+                                &mut column_projection_cache,
+                                table_ref,
+                                col,
+                            );
+                            let data_type = col.data_type.clone();
+                            (projection_index, data_type, col.field_id)
+                        } else {
+                            let (projection_index, inferred_type) = ensure_computed_projection(
+                                expr,
+                                table_ref,
+                                &mut projections,
+                                &mut computed_projection_cache,
+                                &mut computed_alias_counter,
+                            )?;
+                            tracing::debug!(
+                                "AVG aggregate expr={:?} inferred_type={:?}",
+                                expr,
+                                inferred_type
+                            );
+                            let field_id = u32::try_from(projection_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            (projection_index, inferred_type, field_id)
+                        };
+                    let normalized_type = Self::validate_aggregate_type(
+                        Some(data_type.clone()),
+                        "AVG",
+                        &[DataType::Int64, DataType::Float64],
+                    )?;
+                    specs.push(AggregateSpec {
+                        alias: key.clone(),
+                        kind: AggregateKind::Avg {
+                            field_id,
+                            data_type: normalized_type,
+                            distinct: *distinct,
+                        },
+                    });
+                    spec_to_projection.push(Some(projection_index));
+                }
+                AggregateCall::Min(expr) => {
+                    let (projection_index, data_type, field_id) =
+                        if let Some(col_name) = try_extract_simple_column(expr) {
+                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in aggregate",
+                                    col_name
+                                ))
+                            })?;
+                            let projection_index = get_or_insert_column_projection(
+                                &mut projections,
+                                &mut column_projection_cache,
+                                table_ref,
+                                col,
+                            );
+                            let data_type = col.data_type.clone();
+                            (projection_index, data_type, col.field_id)
+                        } else {
+                            let (projection_index, inferred_type) = ensure_computed_projection(
+                                expr,
+                                table_ref,
+                                &mut projections,
+                                &mut computed_projection_cache,
+                                &mut computed_alias_counter,
+                            )?;
+                            let field_id = u32::try_from(projection_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            (projection_index, inferred_type, field_id)
+                        };
+                    let normalized_type = Self::validate_aggregate_type(
+                        Some(data_type.clone()),
+                        "MIN",
+                        &[DataType::Int64, DataType::Float64],
+                    )?;
+                    specs.push(AggregateSpec {
+                        alias: key.clone(),
+                        kind: AggregateKind::Min {
+                            field_id,
+                            data_type: normalized_type,
+                        },
+                    });
+                    spec_to_projection.push(Some(projection_index));
+                }
+                AggregateCall::Max(expr) => {
+                    let (projection_index, data_type, field_id) =
+                        if let Some(col_name) = try_extract_simple_column(expr) {
+                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in aggregate",
+                                    col_name
+                                ))
+                            })?;
+                            let projection_index = get_or_insert_column_projection(
+                                &mut projections,
+                                &mut column_projection_cache,
+                                table_ref,
+                                col,
+                            );
+                            let data_type = col.data_type.clone();
+                            (projection_index, data_type, col.field_id)
+                        } else {
+                            let (projection_index, inferred_type) = ensure_computed_projection(
+                                expr,
+                                table_ref,
+                                &mut projections,
+                                &mut computed_projection_cache,
+                                &mut computed_alias_counter,
+                            )?;
+                            let field_id = u32::try_from(projection_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            (projection_index, inferred_type, field_id)
+                        };
+                    let normalized_type = Self::validate_aggregate_type(
+                        Some(data_type.clone()),
+                        "MAX",
+                        &[DataType::Int64, DataType::Float64],
+                    )?;
+                    specs.push(AggregateSpec {
+                        alias: key.clone(),
+                        kind: AggregateKind::Max {
+                            field_id,
+                            data_type: normalized_type,
+                        },
+                    });
+                    spec_to_projection.push(Some(projection_index));
+                }
+                AggregateCall::CountNulls(expr) => {
+                    if let Some(col_name) = try_extract_simple_column(expr) {
+                        let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::CountNulls {
+                                field_id: col.field_id,
+                            },
+                        });
+                        spec_to_projection.push(Some(projection_index));
+                    } else {
+                        let (projection_index, _dtype) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::CountNulls { field_id },
+                        });
+                        spec_to_projection.push(Some(projection_index));
                     }
                 }
-                AggregateCall::Avg {
-                    expr: col_expr,
-                    distinct,
-                } => {
-                    let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "complex expressions in AVG not yet fully supported".into(),
-                        )
-                    })?;
-                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
-                    })?;
-                    AggregateKind::Avg {
-                        field_id: col.field_id,
-                        data_type: Self::validate_aggregate_type(
-                            Some(col.data_type.clone()),
-                            "AVG",
-                            &[DataType::Int64, DataType::Float64],
-                        )?,
-                        distinct: *distinct,
-                    }
-                }
-                AggregateCall::Min(col_expr) => {
-                    let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "complex expressions in MIN not yet fully supported".into(),
-                        )
-                    })?;
-                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
-                    })?;
-                    AggregateKind::Min {
-                        field_id: col.field_id,
-                        data_type: Self::validate_aggregate_type(
-                            Some(col.data_type.clone()),
-                            "MIN",
-                            &[DataType::Int64, DataType::Float64],
-                        )?,
-                    }
-                }
-                AggregateCall::Max(col_expr) => {
-                    let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "complex expressions in MAX not yet fully supported".into(),
-                        )
-                    })?;
-                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
-                    })?;
-                    AggregateKind::Max {
-                        field_id: col.field_id,
-                        data_type: Self::validate_aggregate_type(
-                            Some(col.data_type.clone()),
-                            "MAX",
-                            &[DataType::Int64, DataType::Float64],
-                        )?,
-                    }
-                }
-                AggregateCall::CountNulls(col_expr) => {
-                    let col_name = try_extract_simple_column(col_expr).ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "complex expressions in CountNulls not yet fully supported".into(),
-                        )
-                    })?;
-                    let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
-                        Error::InvalidArgumentError(format!("unknown column '{}'", col_name))
-                    })?;
-                    AggregateKind::CountNulls {
-                        field_id: col.field_id,
-                    }
-                }
-            };
-            specs.push(AggregateSpec {
-                alias: key.clone(),
-                kind,
-            });
+            }
         }
 
-        // Prepare filter and projections
         let filter_expr = match filter {
             Some(expr) => crate::translation::expression::translate_predicate(
                 expr.clone(),
@@ -3812,26 +4831,6 @@ where
                 crate::translation::expression::full_table_scan_filter(field_id)
             }
         };
-
-        let mut projections: Vec<ScanProjection> = Vec::new();
-        let mut spec_to_projection: Vec<Option<usize>> = Vec::with_capacity(specs.len());
-        let count_star_override: Option<i64> = None;
-
-        for spec in &specs {
-            if let Some(field_id) = spec.kind.field_id() {
-                spec_to_projection.push(Some(projections.len()));
-                projections.push(ScanProjection::from(StoreProjection::with_alias(
-                    LogicalFieldId::for_user(table.table.table_id(), field_id),
-                    table
-                        .schema
-                        .column_by_field_id(field_id)
-                        .map(|c| c.name.clone())
-                        .unwrap_or_else(|| format!("col{field_id}")),
-                )));
-            } else {
-                spec_to_projection.push(None);
-            }
-        }
 
         if projections.is_empty() {
             let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
@@ -3854,6 +4853,8 @@ where
             order: None,
             row_id_filter: None,
         };
+
+        let count_star_override: Option<i64> = None;
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.iter().enumerate() {
@@ -3899,12 +4900,10 @@ where
             return Err(err);
         }
 
-        // Extract the computed values
         for state in states {
             let alias = state.alias.clone();
             let (_field, array) = state.finalize()?;
 
-            // Try Int64Array first
             if let Some(int64_array) = array.as_any().downcast_ref::<arrow::array::Int64Array>() {
                 if int64_array.len() != 1 {
                     return Err(Error::Internal(format!(
@@ -3913,14 +4912,12 @@ where
                     )));
                 }
                 let value = if int64_array.is_null(0) {
-                    AggregateValue::Int64(0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Int64(int64_array.value(0))
                 };
                 results.insert(alias, value);
-            }
-            // Try Float64Array for AVG
-            else if let Some(float64_array) =
+            } else if let Some(float64_array) =
                 array.as_any().downcast_ref::<arrow::array::Float64Array>()
             {
                 if float64_array.len() != 1 {
@@ -3930,7 +4927,7 @@ where
                     )));
                 }
                 let value = if float64_array.is_null(0) {
-                    AggregateValue::Float64(0.0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float64_array.value(0))
                 };
@@ -4647,20 +5644,18 @@ where
     fn evaluate_expr_with_aggregates(
         expr: &ScalarExpr<String>,
         aggregates: &FxHashMap<String, AggregateValue>,
-    ) -> ExecutorResult<i64> {
+    ) -> ExecutorResult<Option<i64>> {
         use llkv_expr::expr::BinaryOp;
         use llkv_expr::literal::Literal;
 
         match expr {
-            ScalarExpr::Literal(Literal::Integer(v)) => Ok(*v as i64),
-            ScalarExpr::Literal(Literal::Float(v)) => Ok(*v as i64),
-            ScalarExpr::Literal(Literal::Boolean(v)) => Ok(if *v { 1 } else { 0 }),
+            ScalarExpr::Literal(Literal::Integer(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Float(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Boolean(v)) => Ok(Some(if *v { 1 } else { 0 })),
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
-            ScalarExpr::Literal(Literal::Null) => Err(Error::InvalidArgumentError(
-                "NULL literals not supported in aggregate expressions".into(),
-            )),
+            ScalarExpr::Literal(Literal::Null) => Ok(None),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
             )),
@@ -4675,47 +5670,55 @@ where
                 let value = aggregates.get(&key).ok_or_else(|| {
                     Error::Internal(format!("Aggregate value not found for key: {}", key))
                 })?;
-                // Convert to i64 for arithmetic (truncates floats)
-                Ok(value.to_i64())
+                Ok(value.as_i64())
             }
             ScalarExpr::Not(inner) => {
                 let value = Self::evaluate_expr_with_aggregates(inner, aggregates)?;
-                Ok(if value != 0 { 0 } else { 1 })
+                Ok(value.map(|v| if v != 0 { 0 } else { 1 }))
             }
             ScalarExpr::IsNull { expr, negated } => {
-                // Aggregates normalize NULL results to zero-length arrays which we treat as not null.
-                let _ = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
-                Ok(if *negated { 1 } else { 0 })
+                let value = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
+                let is_null = value.is_none();
+                Ok(Some(if is_null != *negated { 1 } else { 0 }))
             }
             ScalarExpr::Binary { left, op, right } => {
                 let left_val = Self::evaluate_expr_with_aggregates(left, aggregates)?;
                 let right_val = Self::evaluate_expr_with_aggregates(right, aggregates)?;
 
-                let result = match op {
-                    BinaryOp::Add => left_val.checked_add(right_val),
-                    BinaryOp::Subtract => left_val.checked_sub(right_val),
-                    BinaryOp::Multiply => left_val.checked_mul(right_val),
-                    BinaryOp::Divide => {
-                        if right_val == 0 {
-                            return Err(Error::InvalidArgumentError("Division by zero".into()));
-                        }
-                        left_val.checked_div(right_val)
-                    }
-                    BinaryOp::Modulo => {
-                        if right_val == 0 {
-                            return Err(Error::InvalidArgumentError("Modulo by zero".into()));
-                        }
-                        left_val.checked_rem(right_val)
-                    }
-                };
+                match (left_val, right_val) {
+                    (Some(lhs), Some(rhs)) => {
+                        let result = match op {
+                            BinaryOp::Add => lhs.checked_add(rhs),
+                            BinaryOp::Subtract => lhs.checked_sub(rhs),
+                            BinaryOp::Multiply => lhs.checked_mul(rhs),
+                            BinaryOp::Divide => {
+                                if rhs == 0 {
+                                    return Ok(None);
+                                }
+                                lhs.checked_div(rhs)
+                            }
+                            BinaryOp::Modulo => {
+                                if rhs == 0 {
+                                    return Ok(None);
+                                }
+                                lhs.checked_rem(rhs)
+                            }
+                        };
 
-                result.ok_or_else(|| {
-                    Error::InvalidArgumentError("Arithmetic overflow in expression".into())
-                })
+                        result.map(Some).ok_or_else(|| {
+                            Error::InvalidArgumentError("Arithmetic overflow in expression".into())
+                        })
+                    }
+                    _ => Ok(None),
+                }
             }
-            ScalarExpr::Cast { .. } => Err(Error::InvalidArgumentError(
-                "CAST is not supported in aggregate-only expressions".into(),
-            )),
+            ScalarExpr::Cast { expr, data_type } => {
+                let value = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
+                match value {
+                    Some(v) => Self::cast_aggregate_value(v, data_type).map(Some),
+                    None => Ok(None),
+                }
+            }
             ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
                 "GetField not supported in aggregate-only expressions".into(),
             )),
@@ -4728,6 +5731,46 @@ where
             ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
                 "Scalar subqueries not supported in aggregate-only expressions".into(),
             )),
+        }
+    }
+
+    fn cast_aggregate_value(value: i64, data_type: &DataType) -> ExecutorResult<i64> {
+        fn ensure_range(value: i64, min: i64, max: i64, ty: &DataType) -> ExecutorResult<i64> {
+            if value < min || value > max {
+                return Err(Error::InvalidArgumentError(format!(
+                    "value {} out of range for CAST target {:?}",
+                    value, ty
+                )));
+            }
+            Ok(value)
+        }
+
+        match data_type {
+            DataType::Int8 => ensure_range(value, i8::MIN as i64, i8::MAX as i64, data_type),
+            DataType::Int16 => ensure_range(value, i16::MIN as i64, i16::MAX as i64, data_type),
+            DataType::Int32 => ensure_range(value, i32::MIN as i64, i32::MAX as i64, data_type),
+            DataType::Int64 => Ok(value),
+            DataType::UInt8 => ensure_range(value, 0, u8::MAX as i64, data_type),
+            DataType::UInt16 => ensure_range(value, 0, u16::MAX as i64, data_type),
+            DataType::UInt32 => ensure_range(value, 0, u32::MAX as i64, data_type),
+            DataType::UInt64 => {
+                if value < 0 {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "value {} out of range for CAST target {:?}",
+                        value, data_type
+                    )));
+                }
+                Ok(value)
+            }
+            DataType::Float32 | DataType::Float64 => Ok(value),
+            DataType::Boolean => Ok(if value == 0 { 0 } else { 1 }),
+            DataType::Null => Err(Error::InvalidArgumentError(
+                "CAST to NULL is not supported in aggregate-only expressions".into(),
+            )),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "CAST to {:?} is not supported in aggregate-only expressions",
+                data_type
+            ))),
         }
     }
 }
@@ -5985,68 +7028,361 @@ fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Optio
             let right_literal = evaluate_constant_scalar(right)?;
             Some(compare_literals(*op, &left_literal, &right_literal))
         }
+        LlkvExpr::IsNull { expr, negated } => {
+            let literal = evaluate_constant_scalar(expr)?;
+            let is_null = matches!(literal, Literal::Null);
+            Some(Some(if *negated { !is_null } else { is_null }))
+        }
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = evaluate_constant_scalar(expr)?;
+            let mut saw_unknown = false;
+
+            for candidate in list {
+                let value = evaluate_constant_scalar(candidate)?;
+                match compare_literals(CompareOp::Eq, &needle, &value) {
+                    Some(true) => {
+                        return Some(Some(!*negated));
+                    }
+                    Some(false) => {}
+                    None => saw_unknown = true,
+                }
+            }
+
+            if saw_unknown {
+                Some(None)
+            } else {
+                Some(Some(*negated))
+            }
+        }
         _ => None,
     }
+}
+
+enum ConstantJoinEvaluation {
+    Known(bool),
+    Unknown,
+    NotConstant,
+}
+
+fn evaluate_constant_join_expr(expr: &LlkvExpr<'static, String>) -> ConstantJoinEvaluation {
+    match expr {
+        LlkvExpr::Literal(value) => ConstantJoinEvaluation::Known(*value),
+        LlkvExpr::And(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_constant_join_expr(child) {
+                    ConstantJoinEvaluation::Known(false) => {
+                        return ConstantJoinEvaluation::Known(false);
+                    }
+                    ConstantJoinEvaluation::Known(true) => {}
+                    ConstantJoinEvaluation::Unknown => saw_unknown = true,
+                    ConstantJoinEvaluation::NotConstant => {
+                        return ConstantJoinEvaluation::NotConstant;
+                    }
+                }
+            }
+            if saw_unknown {
+                ConstantJoinEvaluation::Unknown
+            } else {
+                ConstantJoinEvaluation::Known(true)
+            }
+        }
+        LlkvExpr::Or(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match evaluate_constant_join_expr(child) {
+                    ConstantJoinEvaluation::Known(true) => {
+                        return ConstantJoinEvaluation::Known(true);
+                    }
+                    ConstantJoinEvaluation::Known(false) => {}
+                    ConstantJoinEvaluation::Unknown => saw_unknown = true,
+                    ConstantJoinEvaluation::NotConstant => {
+                        return ConstantJoinEvaluation::NotConstant;
+                    }
+                }
+            }
+            if saw_unknown {
+                ConstantJoinEvaluation::Unknown
+            } else {
+                ConstantJoinEvaluation::Known(false)
+            }
+        }
+        LlkvExpr::Not(inner) => match evaluate_constant_join_expr(inner) {
+            ConstantJoinEvaluation::Known(value) => ConstantJoinEvaluation::Known(!value),
+            ConstantJoinEvaluation::Unknown => ConstantJoinEvaluation::Unknown,
+            ConstantJoinEvaluation::NotConstant => ConstantJoinEvaluation::NotConstant,
+        },
+        LlkvExpr::Compare { left, op, right } => {
+            let left_lit = evaluate_constant_scalar(left);
+            let right_lit = evaluate_constant_scalar(right);
+
+            if matches!(left_lit, Some(Literal::Null)) || matches!(right_lit, Some(Literal::Null)) {
+                // Per SQL three-valued logic, any comparison involving NULL yields UNKNOWN.
+                return ConstantJoinEvaluation::Unknown;
+            }
+
+            let (Some(left_lit), Some(right_lit)) = (left_lit, right_lit) else {
+                return ConstantJoinEvaluation::NotConstant;
+            };
+
+            match compare_literals(*op, &left_lit, &right_lit) {
+                Some(result) => ConstantJoinEvaluation::Known(result),
+                None => ConstantJoinEvaluation::Unknown,
+            }
+        }
+        LlkvExpr::IsNull { expr, negated } => match evaluate_constant_scalar(expr) {
+            Some(literal) => {
+                let is_null = matches!(literal, Literal::Null);
+                let value = if *negated { !is_null } else { is_null };
+                ConstantJoinEvaluation::Known(value)
+            }
+            None => ConstantJoinEvaluation::NotConstant,
+        },
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = match evaluate_constant_scalar(expr) {
+                Some(literal) => literal,
+                None => return ConstantJoinEvaluation::NotConstant,
+            };
+
+            if matches!(needle, Literal::Null) {
+                return ConstantJoinEvaluation::Unknown;
+            }
+
+            let mut saw_unknown = false;
+            for candidate in list {
+                let value = match evaluate_constant_scalar(candidate) {
+                    Some(literal) => literal,
+                    None => return ConstantJoinEvaluation::NotConstant,
+                };
+
+                match compare_literals(CompareOp::Eq, &needle, &value) {
+                    Some(true) => {
+                        let result = !*negated;
+                        return ConstantJoinEvaluation::Known(result);
+                    }
+                    Some(false) => {}
+                    None => saw_unknown = true,
+                }
+            }
+
+            if saw_unknown {
+                ConstantJoinEvaluation::Unknown
+            } else {
+                let result = *negated;
+                ConstantJoinEvaluation::Known(result)
+            }
+        }
+        _ => ConstantJoinEvaluation::NotConstant,
+    }
+}
+
+enum NullComparisonBehavior {
+    ThreeValuedLogic,
 }
 
 fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
     match expr {
         ScalarExpr::Literal(lit) => Some(lit.clone()),
+        ScalarExpr::Binary { left, op, right } => {
+            let left_value = evaluate_constant_scalar(left)?;
+            let right_value = evaluate_constant_scalar(right)?;
+            evaluate_binary_literal(*op, &left_value, &right_value)
+        }
+        ScalarExpr::Cast { expr, data_type } => {
+            let value = evaluate_constant_scalar(expr)?;
+            cast_literal_to_type(&value, data_type)
+        }
+        ScalarExpr::Not(inner) => {
+            let value = evaluate_constant_scalar(inner)?;
+            match literal_truthiness(&value) {
+                Some(true) => Some(Literal::Integer(0)),
+                Some(false) => Some(Literal::Integer(1)),
+                None => Some(Literal::Null),
+            }
+        }
+        ScalarExpr::IsNull { expr, negated } => {
+            let value = evaluate_constant_scalar(expr)?;
+            let is_null = matches!(value, Literal::Null);
+            Some(Literal::Boolean(if *negated { !is_null } else { is_null }))
+        }
+        ScalarExpr::Coalesce(items) => {
+            let mut saw_null = false;
+            for item in items {
+                match evaluate_constant_scalar(item) {
+                    Some(Literal::Null) => saw_null = true,
+                    Some(value) => return Some(value),
+                    None => return None,
+                }
+            }
+            if saw_null { Some(Literal::Null) } else { None }
+        }
+        ScalarExpr::Compare { left, op, right } => {
+            let left_value = evaluate_constant_scalar(left)?;
+            let right_value = evaluate_constant_scalar(right)?;
+            match compare_literals(*op, &left_value, &right_value) {
+                Some(flag) => Some(Literal::Boolean(flag)),
+                None => Some(Literal::Null),
+            }
+        }
+        ScalarExpr::Case { .. } => None,
+        ScalarExpr::Column(_) => None,
+        ScalarExpr::Aggregate(_) => None,
+        ScalarExpr::GetField { .. } => None,
+        ScalarExpr::ScalarSubquery(_) => None,
+    }
+}
+
+fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Option<Literal> {
+    if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
+        return Some(Literal::Null);
+    }
+
+    match op {
+        BinaryOp::Add => add_literals(left, right),
+        BinaryOp::Subtract => subtract_literals(left, right),
+        BinaryOp::Multiply => multiply_literals(left, right),
+        BinaryOp::Divide => divide_literals(left, right),
+        BinaryOp::Modulo => modulo_literals(left, right),
+    }
+}
+
+fn add_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    match (left, right) {
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_add(*rhs)))
+        }
+        _ => {
+            let lhs = literal_to_f64(left)?;
+            let rhs = literal_to_f64(right)?;
+            Some(Literal::Float(lhs + rhs))
+        }
+    }
+}
+
+fn subtract_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    match (left, right) {
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_sub(*rhs)))
+        }
+        _ => {
+            let lhs = literal_to_f64(left)?;
+            let rhs = literal_to_f64(right)?;
+            Some(Literal::Float(lhs - rhs))
+        }
+    }
+}
+
+fn multiply_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    match (left, right) {
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_mul(*rhs)))
+        }
+        _ => {
+            let lhs = literal_to_f64(left)?;
+            let rhs = literal_to_f64(right)?;
+            Some(Literal::Float(lhs * rhs))
+        }
+    }
+}
+
+fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    let lhs = literal_to_f64(left)?;
+    let rhs = literal_to_f64(right)?;
+    if rhs == 0.0 {
+        return None;
+    }
+    Some(Literal::Float(lhs / rhs))
+}
+
+fn modulo_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    let lhs = literal_to_i128(left)?;
+    let rhs = literal_to_i128(right)?;
+    if rhs == 0 {
+        return None;
+    }
+    Some(Literal::Integer(lhs % rhs))
+}
+
+fn literal_to_f64(literal: &Literal) -> Option<f64> {
+    match literal {
+        Literal::Integer(value) => Some(*value as f64),
+        Literal::Float(value) => Some(*value),
+        Literal::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+fn literal_to_i128(literal: &Literal) -> Option<i128> {
+    match literal {
+        Literal::Integer(value) => Some(*value),
+        Literal::Float(value) => Some(*value as i128),
+        Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
+        _ => None,
+    }
+}
+
+fn literal_truthiness(literal: &Literal) -> Option<bool> {
+    match literal {
+        Literal::Boolean(value) => Some(*value),
+        Literal::Integer(value) => Some(*value != 0),
+        Literal::Float(value) => Some(*value != 0.0),
+        Literal::Null => None,
+        _ => None,
+    }
+}
+
+fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Literal> {
+    if matches!(literal, Literal::Null) {
+        return Some(Literal::Null);
+    }
+
+    match data_type {
+        DataType::Boolean => literal_truthiness(literal).map(Literal::Boolean),
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            let value = literal_to_f64(literal)?;
+            Some(Literal::Float(value))
+        }
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => {
+            let value = literal_to_i128(literal)?;
+            Some(Literal::Integer(value))
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => Some(Literal::String(match literal {
+            Literal::String(text) => text.clone(),
+            Literal::Integer(value) => value.to_string(),
+            Literal::Float(value) => value.to_string(),
+            Literal::Boolean(value) => {
+                if *value {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            Literal::Struct(_) | Literal::Null => return None,
+        })),
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
+            literal_to_i128(literal).map(Literal::Integer)
+        }
         _ => None,
     }
 }
 
 fn compare_literals(op: CompareOp, left: &Literal, right: &Literal) -> Option<bool> {
-    use std::cmp::Ordering;
-
-    match (left, right) {
-        (Literal::Null, _) | (_, Literal::Null) => None,
-        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
-            let ord = lhs.cmp(rhs);
-            Some(match op {
-                CompareOp::Eq => ord == Ordering::Equal,
-                CompareOp::NotEq => ord != Ordering::Equal,
-                CompareOp::Lt => ord == Ordering::Less,
-                CompareOp::LtEq => ord != Ordering::Greater,
-                CompareOp::Gt => ord == Ordering::Greater,
-                CompareOp::GtEq => ord != Ordering::Less,
-            })
-        }
-        (Literal::Float(lhs), Literal::Float(rhs)) => Some(match op {
-            CompareOp::Eq => lhs == rhs,
-            CompareOp::NotEq => lhs != rhs,
-            CompareOp::Lt => lhs < rhs,
-            CompareOp::LtEq => lhs <= rhs,
-            CompareOp::Gt => lhs > rhs,
-            CompareOp::GtEq => lhs >= rhs,
-        }),
-        (Literal::Integer(lhs), Literal::Float(_rhs)) => {
-            compare_literals(op, &Literal::Float(*lhs as f64), right)
-        }
-        (Literal::Float(_lhs), Literal::Integer(rhs)) => {
-            compare_literals(op, left, &Literal::Float(*rhs as f64))
-        }
-        (Literal::Boolean(lhs), Literal::Boolean(rhs)) => Some(match op {
-            CompareOp::Eq => lhs == rhs,
-            CompareOp::NotEq => lhs != rhs,
-            CompareOp::Lt => (*lhs as u8) < (*rhs as u8),
-            CompareOp::LtEq => (*lhs as u8) <= (*rhs as u8),
-            CompareOp::Gt => (*lhs as u8) > (*rhs as u8),
-            CompareOp::GtEq => (*lhs as u8) >= (*rhs as u8),
-        }),
-        (Literal::String(lhs), Literal::String(rhs)) => {
-            let ord = lhs.cmp(rhs);
-            Some(match op {
-                CompareOp::Eq => ord == Ordering::Equal,
-                CompareOp::NotEq => ord != Ordering::Equal,
-                CompareOp::Lt => ord == Ordering::Less,
-                CompareOp::LtEq => ord != Ordering::Greater,
-                CompareOp::Gt => ord == Ordering::Greater,
-                CompareOp::GtEq => ord != Ordering::Less,
-            })
-        }
-        _ => None,
-    }
+    compare_literals_with_mode(op, left, right, NullComparisonBehavior::ThreeValuedLogic)
 }
 
 fn bind_select_filter(
@@ -9277,6 +10613,8 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use llkv_expr::expr::BinaryOp;
+    use llkv_expr::literal::Literal;
+    use llkv_storage::pager::MemPager;
     use std::sync::Arc;
 
     #[test]
@@ -9323,6 +10661,78 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 addition result");
         assert_eq!(added_array.values(), &[6, 7, 8]);
+    }
+
+    #[test]
+    fn aggregate_expr_allows_numeric_casts() {
+        let expr = ScalarExpr::Cast {
+            expr: Box::new(ScalarExpr::literal(31)),
+            data_type: DataType::Int32,
+        };
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("cast should succeed for in-range integral values");
+
+        assert_eq!(value, Some(31));
+    }
+
+    #[test]
+    fn aggregate_expr_cast_rejects_out_of_range_values() {
+        let expr = ScalarExpr::Cast {
+            expr: Box::new(ScalarExpr::literal(-1)),
+            data_type: DataType::UInt8,
+        };
+        let aggregates = FxHashMap::default();
+
+        let result = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates);
+
+        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
+    }
+
+    #[test]
+    fn aggregate_expr_null_literal_remains_null() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(0),
+            BinaryOp::Subtract,
+            ScalarExpr::cast(ScalarExpr::literal(Literal::Null), DataType::Int64),
+        );
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("expression should evaluate");
+
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn aggregate_expr_divide_by_zero_returns_null() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(10),
+            BinaryOp::Divide,
+            ScalarExpr::literal(0),
+        );
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("division should evaluate");
+
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn aggregate_expr_modulo_by_zero_returns_null() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(10),
+            BinaryOp::Modulo,
+            ScalarExpr::literal(0),
+        );
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("modulo should evaluate");
+
+        assert_eq!(value, None);
     }
 
     #[test]

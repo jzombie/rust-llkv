@@ -4140,11 +4140,8 @@ where
                 _ => None,
             });
 
-        let has_joins = select
-            .from
-            .iter()
-            .any(|table_with_joins| !table_with_joins.joins.is_empty());
-        let mut join_conditions: Vec<SqlExpr> = Vec::new();
+        let has_joins = select.from.iter().any(table_with_joins_has_join);
+        let mut join_conditions: Vec<Option<SqlExpr>> = Vec::new();
         let mut scalar_subqueries: Vec<llkv_plan::ScalarSubquery> = Vec::new();
         // Handle different FROM clause scenarios
         let catalog = self.engine.context().table_catalog();
@@ -4228,35 +4225,38 @@ where
             )?);
         }
 
-        // Add join conditions to filter, but be careful with LEFT JOIN ON conditions
-        // For INNER JOIN, ON conditions can be moved to WHERE clause (same semantics)
-        // For LEFT JOIN, ON conditions must NOT filter out unmatched left rows
-        // Since we're not yet extracting join keys from ON conditions, and LEFT JOIN
-        // ON conditions have different semantics, we skip adding them to WHERE for now
-        // TODO: Properly parse ON conditions to extract join keys and handle non-equality conditions
-        for (idx, join_expr) in join_conditions.iter().enumerate() {
-            // Check if this is a LEFT JOIN ON condition
-            let is_left_join_condition = plan
+        // Translate JOIN ON predicates and attach them to the join metadata. INNER joins can
+        // safely push these predicates into the WHERE clause, while LEFT joins must retain
+        // them on the join so that unmatched left rows are preserved.
+        for (idx, join_expr_opt) in join_conditions.iter().enumerate() {
+            let Some(join_expr) = join_expr_opt else {
+                continue;
+            };
+
+            let materialized_expr = self.materialize_in_subquery(join_expr.clone())?;
+            let translated = translate_condition_with_context(
+                self,
+                resolver,
+                id_context.clone(),
+                &materialized_expr,
+                outer_scopes,
+                &mut all_subqueries,
+                correlated_tracker.reborrow(),
+            )?;
+
+            let is_left_join = plan
                 .joins
                 .get(idx)
                 .map(|j| j.join_type == llkv_plan::JoinPlan::Left)
                 .unwrap_or(false);
 
-            if !is_left_join_condition {
-                // For INNER JOIN, ON condition can safely go in WHERE
-                let materialized_expr = self.materialize_in_subquery(join_expr.clone())?;
-                filter_components.push(translate_condition_with_context(
-                    self,
-                    resolver,
-                    id_context.clone(),
-                    &materialized_expr,
-                    outer_scopes,
-                    &mut all_subqueries,
-                    correlated_tracker.reborrow(),
-                )?);
+            if let Some(join_meta) = plan.joins.get_mut(idx) {
+                join_meta.on_condition = Some(translated.clone());
             }
-            // For LEFT JOIN, skip adding to WHERE - will be handled by join executor
-            // (currently results in cross product since we don't extract keys yet)
+
+            if !is_left_join {
+                filter_components.push(translated);
+            }
         }
 
         let having_expr = if let Some(having) = &select.having {
@@ -4581,6 +4581,9 @@ where
                             AggregateExpr::count_star(alias)
                         }
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
+                            if !is_simple_aggregate_column(arg_expr) {
+                                return Ok(None);
+                            }
                             let column = resolve_column_name(arg_expr)?;
                             if is_distinct {
                                 AggregateExpr::count_distinct_column(column, alias)
@@ -4601,11 +4604,6 @@ where
                     }
                 }
                 "sum" | "min" | "max" => {
-                    if is_distinct {
-                        return Err(Error::InvalidArgumentError(
-                            "DISTINCT is not supported for this aggregate".into(),
-                        ));
-                    }
                     if args_slice.len() != 1 {
                         return Err(Error::InvalidArgumentError(format!(
                             "{} accepts exactly one argument",
@@ -4629,14 +4627,24 @@ where
                         }
                     };
 
+                    if is_distinct {
+                        return Ok(None);
+                    }
+
                     if func_name == "sum" {
                         if let Some(column) = parse_count_nulls_case(arg_expr)? {
                             AggregateExpr::count_nulls(column, alias)
                         } else {
+                            if !is_simple_aggregate_column(arg_expr) {
+                                return Ok(None);
+                            }
                             let column = resolve_column_name(arg_expr)?;
                             AggregateExpr::sum_int64(column, alias)
                         }
                     } else {
+                        if !is_simple_aggregate_column(arg_expr) {
+                            return Ok(None);
+                        }
                         let column = resolve_column_name(arg_expr)?;
                         if func_name == "min" {
                             AggregateExpr::min_int64(column, alias)
@@ -5403,6 +5411,7 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
                 ))
             }
         }
+        SqlExpr::Nested(inner) => resolve_column_name(inner),
         // Handle unary +/- by recursively resolving the inner expression
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus | UnaryOperator::Minus,
@@ -5411,6 +5420,18 @@ fn resolve_column_name(expr: &SqlExpr) -> SqlResult<String> {
         _ => Err(Error::InvalidArgumentError(
             "aggregate arguments must be plain column identifiers".into(),
         )),
+    }
+}
+
+fn is_simple_aggregate_column(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => true,
+        SqlExpr::Nested(inner) => is_simple_aggregate_column(inner),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => is_simple_aggregate_column(expr),
+        _ => false,
     }
 }
 
@@ -7716,8 +7737,7 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
     }
     let item = &from[0];
 
-    // TODO: Joins are supported; should `extract_single_table` be updated to use `extract_tables` instead?
-    if !item.joins.is_empty() {
+    if table_with_joins_has_join(item) {
         return Err(Error::InvalidArgumentError(
             "JOIN clauses are not supported yet".into(),
         ));
@@ -7734,124 +7754,59 @@ fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> 
             let canonical = table_name.to_ascii_lowercase();
             Ok((table_name, canonical))
         }
+        TableFactor::NestedJoin { .. } => Err(Error::InvalidArgumentError(
+            "JOIN clauses are not supported yet".into(),
+        )),
         _ => Err(Error::InvalidArgumentError(
             "queries require a plain table name or derived table".into(),
         )),
     }
 }
 
+// TODO: Rename for clarity?  i.e. "...nested_joins" or something?
+fn table_with_joins_has_join(item: &TableWithJoins) -> bool {
+    if !item.joins.is_empty() {
+        return true;
+    }
+    match &item.relation {
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => table_with_joins_has_join(table_with_joins.as_ref()),
+        _ => false,
+    }
+}
+
 /// Extract table references from a FROM clause, flattening supported JOINs and
 /// collecting any join predicates that must be applied as filters.
 ///
-/// Returns (tables, join_metadata, join_filters) where:
+type ExtractedJoinData = (
+    Vec<llkv_plan::TableRef>,
+    Vec<llkv_plan::JoinMetadata>,
+    Vec<Option<SqlExpr>>,
+);
+
+/// Returns [`ExtractedJoinData`] (tables, join metadata, join filters).
 /// - `tables`: list of all table references in order
 /// - `join_metadata`: [`llkv_plan::JoinMetadata`] entries pairing consecutive tables
 /// - `join_filters`: ON conditions to be merged into WHERE clause
-fn extract_tables(
-    from: &[TableWithJoins],
-) -> SqlResult<(
-    Vec<llkv_plan::TableRef>,
-    Vec<llkv_plan::JoinMetadata>,
-    Vec<SqlExpr>,
-)> {
+fn extract_tables(from: &[TableWithJoins]) -> SqlResult<ExtractedJoinData> {
     let mut tables = Vec::new();
     let mut join_metadata = Vec::new();
     let mut join_filters = Vec::new();
 
     for item in from {
-        push_table_factor(&item.relation, &mut tables)?;
-
-        for join in &item.joins {
-            let left_table_index = tables.len() - 1;
-
-            match &join.join_operator {
-                JoinOperator::CrossJoin(JoinConstraint::None)
-                | JoinOperator::Join(JoinConstraint::None)
-                | JoinOperator::Inner(JoinConstraint::None) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Inner,
-                        on_condition: None,
-                    });
-                }
-                JoinOperator::Join(JoinConstraint::On(condition))
-                | JoinOperator::Inner(JoinConstraint::On(condition)) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_filters.push(condition.clone());
-                    // Store ON condition separately for join optimization
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Inner,
-                        on_condition: None, // Will be translated later if needed
-                    });
-                }
-                JoinOperator::Left(JoinConstraint::On(condition))
-                | JoinOperator::LeftOuter(JoinConstraint::On(condition)) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_filters.push(condition.clone());
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Left,
-                        on_condition: None,
-                    });
-                }
-                JoinOperator::Left(JoinConstraint::None)
-                | JoinOperator::LeftOuter(JoinConstraint::None) => {
-                    push_table_factor(&join.relation, &mut tables)?;
-                    join_metadata.push(llkv_plan::JoinMetadata {
-                        left_table_index,
-                        join_type: llkv_plan::JoinPlan::Left,
-                        on_condition: None,
-                    });
-                }
-                JoinOperator::CrossJoin(_) => {
-                    return Err(Error::InvalidArgumentError(
-                        "CROSS JOIN with constraints is not supported".into(),
-                    ));
-                }
-                JoinOperator::Join(JoinConstraint::Using(_))
-                | JoinOperator::Inner(JoinConstraint::Using(_))
-                | JoinOperator::Left(JoinConstraint::Using(_))
-                | JoinOperator::LeftOuter(JoinConstraint::Using(_)) => {
-                    return Err(Error::InvalidArgumentError(
-                        "JOIN ... USING (...) is not supported yet".into(),
-                    ));
-                }
-                JoinOperator::Join(JoinConstraint::Natural)
-                | JoinOperator::Inner(JoinConstraint::Natural)
-                | JoinOperator::Left(JoinConstraint::Natural)
-                | JoinOperator::LeftOuter(JoinConstraint::Natural)
-                | JoinOperator::Right(_)
-                | JoinOperator::RightOuter(_)
-                | JoinOperator::FullOuter(_)
-                | JoinOperator::Semi(_)
-                | JoinOperator::LeftSemi(_)
-                | JoinOperator::LeftAnti(_)
-                | JoinOperator::RightSemi(_)
-                | JoinOperator::RightAnti(_)
-                | JoinOperator::CrossApply
-                | JoinOperator::OuterApply
-                | JoinOperator::Anti(_)
-                | JoinOperator::StraightJoin(_) => {
-                    return Err(Error::InvalidArgumentError(
-                        "only INNER JOIN and LEFT JOIN with optional ON constraints are supported"
-                            .into(),
-                    ));
-                }
-                other => {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported JOIN clause: {other:?}"
-                    )));
-                }
-            }
-        }
+        flatten_table_with_joins(item, &mut tables, &mut join_metadata, &mut join_filters)?;
     }
 
     Ok((tables, join_metadata, join_filters))
 }
 
-fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>) -> SqlResult<()> {
+fn push_table_factor(
+    factor: &TableFactor,
+    tables: &mut Vec<llkv_plan::TableRef>,
+    join_metadata: &mut Vec<llkv_plan::JoinMetadata>,
+    join_filters: &mut Vec<Option<SqlExpr>>,
+) -> SqlResult<()> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
             let (schema_opt, table) = parse_schema_qualified_name(name)?;
@@ -7860,6 +7815,22 @@ fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>
             tables.push(llkv_plan::TableRef::with_alias(schema, table, alias_name));
             Ok(())
         }
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            if alias.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "parenthesized JOINs with aliases are not supported yet".into(),
+                ));
+            }
+            flatten_table_with_joins(
+                table_with_joins.as_ref(),
+                tables,
+                join_metadata,
+                join_filters,
+            )
+        }
         TableFactor::Derived { .. } => Err(Error::InvalidArgumentError(
             "JOIN clauses require base tables; derived tables are not supported".into(),
         )),
@@ -7867,6 +7838,104 @@ fn push_table_factor(factor: &TableFactor, tables: &mut Vec<llkv_plan::TableRef>
             "queries require a plain table name".into(),
         )),
     }
+}
+
+fn flatten_table_with_joins(
+    item: &TableWithJoins,
+    tables: &mut Vec<llkv_plan::TableRef>,
+    join_metadata: &mut Vec<llkv_plan::JoinMetadata>,
+    join_filters: &mut Vec<Option<SqlExpr>>,
+) -> SqlResult<()> {
+    push_table_factor(&item.relation, tables, join_metadata, join_filters)?;
+
+    for join in &item.joins {
+        let left_table_index = tables.len() - 1;
+
+        match &join.join_operator {
+            JoinOperator::CrossJoin(JoinConstraint::None)
+            | JoinOperator::Join(JoinConstraint::None)
+            | JoinOperator::Inner(JoinConstraint::None) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Inner,
+                    on_condition: None,
+                });
+                join_filters.push(None);
+            }
+            JoinOperator::Join(JoinConstraint::On(condition))
+            | JoinOperator::Inner(JoinConstraint::On(condition)) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_filters.push(Some(condition.clone()));
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Inner,
+                    on_condition: None,
+                });
+            }
+            JoinOperator::Left(JoinConstraint::On(condition))
+            | JoinOperator::LeftOuter(JoinConstraint::On(condition)) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_filters.push(Some(condition.clone()));
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Left,
+                    on_condition: None,
+                });
+            }
+            JoinOperator::Left(JoinConstraint::None)
+            | JoinOperator::LeftOuter(JoinConstraint::None) => {
+                push_table_factor(&join.relation, tables, join_metadata, join_filters)?;
+                join_metadata.push(llkv_plan::JoinMetadata {
+                    left_table_index,
+                    join_type: llkv_plan::JoinPlan::Left,
+                    on_condition: None,
+                });
+                join_filters.push(None);
+            }
+            JoinOperator::CrossJoin(_) => {
+                return Err(Error::InvalidArgumentError(
+                    "CROSS JOIN with constraints is not supported".into(),
+                ));
+            }
+            JoinOperator::Join(JoinConstraint::Using(_))
+            | JoinOperator::Inner(JoinConstraint::Using(_))
+            | JoinOperator::Left(JoinConstraint::Using(_))
+            | JoinOperator::LeftOuter(JoinConstraint::Using(_)) => {
+                return Err(Error::InvalidArgumentError(
+                    "JOIN ... USING (...) is not supported yet".into(),
+                ));
+            }
+            JoinOperator::Join(JoinConstraint::Natural)
+            | JoinOperator::Inner(JoinConstraint::Natural)
+            | JoinOperator::Left(JoinConstraint::Natural)
+            | JoinOperator::LeftOuter(JoinConstraint::Natural)
+            | JoinOperator::Right(_)
+            | JoinOperator::RightOuter(_)
+            | JoinOperator::FullOuter(_)
+            | JoinOperator::Semi(_)
+            | JoinOperator::LeftSemi(_)
+            | JoinOperator::LeftAnti(_)
+            | JoinOperator::RightSemi(_)
+            | JoinOperator::RightAnti(_)
+            | JoinOperator::CrossApply
+            | JoinOperator::OuterApply
+            | JoinOperator::Anti(_)
+            | JoinOperator::StraightJoin(_) => {
+                return Err(Error::InvalidArgumentError(
+                    "only INNER JOIN and LEFT JOIN with optional ON constraints are supported"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "unsupported JOIN clause: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn group_by_is_empty(expr: &GroupByExpr) -> bool {
@@ -8085,6 +8154,41 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 0, "expected IN list filter to remove all rows");
+    }
+
+    #[test]
+    fn not_in_with_cast_preserves_rows_for_self_comparison() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab2(col1 INTEGER, col2 INTEGER)")
+            .expect("create tab2");
+        engine
+            .execute("INSERT INTO tab2 VALUES (51, 51), (67, 67), (77, 77)")
+            .expect("seed tab2");
+
+        let batches = engine
+            .sql(
+                "SELECT col1 FROM tab2 WHERE NOT col2 NOT IN ( + CAST ( + + col2 AS REAL ) ) ORDER BY col1",
+            )
+            .expect("run NOT IN self comparison query");
+
+        let mut values: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    values.push(column.value(idx));
+                }
+            }
+        }
+
+        assert_eq!(values, vec![51, 67, 77]);
     }
 
     #[test]
@@ -8370,6 +8474,98 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 0, "expected NOT < NULL to filter all rows");
+    }
+
+    #[test]
+    fn left_join_not_is_not_null_on_literal_flips_to_is_null() {
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute(
+                "CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER);\
+                 CREATE TABLE tab1(col0 INTEGER, col1 INTEGER, col2 INTEGER);",
+            )
+            .expect("create tables");
+
+        let sql = "SELECT DISTINCT * FROM tab1 AS cor0 LEFT JOIN tab1 AS cor1 ON NOT 86 IS NOT NULL, tab0 AS cor2";
+        let dialect = SQLiteDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse sql");
+        let statement = statements.pop().expect("expected statement");
+        let Statement::Query(query) = statement else {
+            panic!("expected SELECT query");
+        };
+
+        let plan = engine.build_select_plan(*query).expect("build select plan");
+
+        assert_eq!(plan.joins.len(), 1, "expected single explicit join entry");
+
+        let left_join = &plan.joins[0];
+        let on_condition = left_join
+            .on_condition
+            .as_ref()
+            .expect("left join should preserve ON predicate");
+
+        match on_condition {
+            llkv_expr::expr::Expr::IsNull { expr, negated } => {
+                assert!(!negated, "expected NOT to flip into IS NULL");
+                assert!(matches!(
+                    expr,
+                    llkv_expr::expr::ScalarExpr::Literal(llkv_expr::literal::Literal::Integer(86))
+                ));
+            }
+            other => panic!("unexpected ON predicate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn left_join_constant_false_preserves_left_rows_with_null_right() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute(
+                "CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER);\
+                 CREATE TABLE tab1(col0 INTEGER, col1 INTEGER, col2 INTEGER);",
+            )
+            .expect("create tables");
+
+        engine
+            .execute(
+                "INSERT INTO tab0 VALUES (1, 2, 3), (4, 5, 6);\
+                 INSERT INTO tab1 VALUES (10, 11, 12), (13, 14, 15);",
+            )
+            .expect("seed rows");
+
+        let batches = engine
+            .sql(
+                "SELECT * FROM tab1 AS cor0 LEFT JOIN tab1 AS cor1 ON NOT 86 IS NOT NULL, tab0 AS cor2 ORDER BY cor0.col0, cor2.col0",
+            )
+            .expect("execute join query");
+
+        let mut total_rows = 0;
+        for batch in &batches {
+            total_rows += batch.num_rows();
+
+            // Columns 0-2 belong to cor0, 3-5 to cor1, 6-8 to cor2.
+            for row_idx in 0..batch.num_rows() {
+                for col_idx in 3..6 {
+                    assert!(
+                        batch.column(col_idx).is_null(row_idx),
+                        "expected right table column {} to be NULL in row {}",
+                        col_idx,
+                        row_idx
+                    );
+                }
+            }
+        }
+
+        // Two left rows cross two tab0 rows -> four total results.
+        assert_eq!(total_rows, 4, "expected Cartesian product with tab0 only");
     }
 
     #[test]
