@@ -5423,20 +5423,19 @@ where
                             return Ok(PlanValue::Null);
                         }
 
-                        if matches!(op, BinaryOp::Divide) {
-                            if let (PlanValue::Integer(lhs), PlanValue::Integer(rhs)) =
+                        if matches!(op, BinaryOp::Divide)
+                            && let (PlanValue::Integer(lhs), PlanValue::Integer(rhs)) =
                                 (&left_val, &right_val)
-                            {
-                                if *rhs == 0 {
-                                    return Ok(PlanValue::Null);
-                                }
-
-                                if *lhs == i64::MIN && *rhs == -1 {
-                                    return Ok(PlanValue::Float((*lhs as f64) / (*rhs as f64)));
-                                }
-
-                                return Ok(PlanValue::Integer(lhs / rhs));
+                        {
+                            if *rhs == 0 {
+                                return Ok(PlanValue::Null);
                             }
+
+                            if *lhs == i64::MIN && *rhs == -1 {
+                                return Ok(PlanValue::Float((*lhs as f64) / (*rhs as f64)));
+                            }
+
+                            return Ok(PlanValue::Integer(lhs / rhs));
                         }
 
                         let left_is_float = matches!(&left_val, PlanValue::Float(_));
