@@ -894,10 +894,8 @@ impl NumericKernels {
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
-                // Casting NULL to any type yields NULL
-                if matches!(inner, ScalarExpr::Literal(Literal::Null)) {
-                    return ScalarExpr::literal(Literal::Null);
-                }
+                // Preserve explicit casts even when the operand is NULL so we keep the
+                // target type information for downstream consumers (e.g. aggregate typing).
                 ScalarExpr::cast(inner, data_type.clone())
             }
             ScalarExpr::Case {
@@ -1639,6 +1637,31 @@ mod tests {
         assert_eq!(result.value(0), 7.0);
         assert_eq!(result.value(1), 12.0);
         assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn zero_minus_cast_null_remains_null() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::DataType;
+
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(0),
+            BinaryOp::Subtract,
+            ScalarExpr::cast(ScalarExpr::literal(Literal::Null), DataType::Int64),
+        );
+
+        let arrays = NumericArrayMap::default();
+        let array = NumericKernels::evaluate_batch(&expr, 5, &arrays).unwrap();
+        let typed = array
+            .as_ref()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("expected Int64Array result");
+
+        assert_eq!(typed.null_count(), typed.len());
+        for idx in 0..typed.len() {
+            assert!(typed.is_null(idx), "value at {idx} should be NULL");
+        }
     }
 
     #[test]

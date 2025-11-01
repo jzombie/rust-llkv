@@ -103,25 +103,28 @@ enum GroupKeyValue {
 /// Different aggregates return different types (e.g., AVG returns Float64, COUNT returns Int64).
 #[derive(Clone, Debug, PartialEq)]
 enum AggregateValue {
+    Null,
     Int64(i64),
     Float64(f64),
 }
 
 impl AggregateValue {
-    /// Convert to i64, truncating floats if necessary
-    fn to_i64(&self) -> i64 {
+    /// Convert to i64, truncating floats when present.
+    fn as_i64(&self) -> Option<i64> {
         match self {
-            AggregateValue::Int64(v) => *v,
-            AggregateValue::Float64(v) => *v as i64,
+            AggregateValue::Null => None,
+            AggregateValue::Int64(v) => Some(*v),
+            AggregateValue::Float64(v) => Some(*v as i64),
         }
     }
 
-    /// Convert to f64, promoting integers if necessary
+    /// Convert to f64, promoting integers when necessary.
     #[allow(dead_code)]
-    fn to_f64(&self) -> f64 {
+    fn as_f64(&self) -> Option<f64> {
         match self {
-            AggregateValue::Int64(v) => *v as f64,
-            AggregateValue::Float64(v) => *v,
+            AggregateValue::Null => None,
+            AggregateValue::Int64(v) => Some(*v as f64),
+            AggregateValue::Float64(v) => Some(*v),
         }
     }
 }
@@ -320,6 +323,7 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
     }
 }
 
+// TODO: Does llkv-table resolvers already handle this (and similar)?
 /// Resolve a column name to its index using flexible name matching.
 ///
 /// This function handles various column name formats:
@@ -400,6 +404,12 @@ where
         Error::InvalidArgumentError(format!("unknown column '{}' in aggregate expression", name))
     })?;
     let data_type = infer_computed_data_type(table.schema.as_ref(), &translated)?;
+    if data_type == DataType::Null {
+        tracing::debug!(
+            "ensure_computed_projection inferred Null type for expr: {:?}",
+            expr
+        );
+    }
     let alias = format!("__agg_expr_{}", *alias_counter);
     *alias_counter += 1;
     let projection_index = projections.len();
@@ -1478,7 +1488,7 @@ where
         for projection in &plan.projections {
             if let SelectProjection::Computed { expr, alias } = projection {
                 let value = Self::evaluate_expr_with_aggregates(expr, &aggregate_values)?;
-                fields.push(Arc::new(Field::new(alias, DataType::Int64, false)));
+                fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
                 arrays.push(Arc::new(Int64Array::from(vec![value])) as ArrayRef);
             }
         }
@@ -1776,7 +1786,7 @@ where
                     )));
                 }
                 let value = if int_array.is_null(0) {
-                    AggregateValue::Int64(0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Int64(int_array.value(0))
                 };
@@ -1791,7 +1801,7 @@ where
                     )));
                 }
                 let value = if float_array.is_null(0) {
-                    AggregateValue::Float64(0.0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float_array.value(0))
                 };
@@ -3635,7 +3645,7 @@ where
                     // Evaluate the expression with aggregates substituted
                     let value = Self::evaluate_expr_with_aggregates(expr, &computed_aggregates)?;
 
-                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, false));
+                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
 
                     let array = Arc::new(Int64Array::from(vec![value])) as ArrayRef;
                     arrays.push(array);
@@ -3990,6 +4000,10 @@ where
                                 &mut computed_projection_cache,
                                 &mut computed_alias_counter,
                             )?;
+                            tracing::debug!(
+                                "AVG aggregate expr={:?} inferred_type={:?}",
+                                expr, inferred_type
+                            );
                             let field_id = u32::try_from(projection_index).map_err(|_| {
                                 Error::InvalidArgumentError(
                                     "aggregate projection index exceeds supported range".into(),
@@ -4244,7 +4258,7 @@ where
                     )));
                 }
                 let value = if int64_array.is_null(0) {
-                    AggregateValue::Int64(0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Int64(int64_array.value(0))
                 };
@@ -4259,7 +4273,7 @@ where
                     )));
                 }
                 let value = if float64_array.is_null(0) {
-                    AggregateValue::Float64(0.0)
+                    AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float64_array.value(0))
                 };
@@ -4976,20 +4990,18 @@ where
     fn evaluate_expr_with_aggregates(
         expr: &ScalarExpr<String>,
         aggregates: &FxHashMap<String, AggregateValue>,
-    ) -> ExecutorResult<i64> {
+    ) -> ExecutorResult<Option<i64>> {
         use llkv_expr::expr::BinaryOp;
         use llkv_expr::literal::Literal;
 
         match expr {
-            ScalarExpr::Literal(Literal::Integer(v)) => Ok(*v as i64),
-            ScalarExpr::Literal(Literal::Float(v)) => Ok(*v as i64),
-            ScalarExpr::Literal(Literal::Boolean(v)) => Ok(if *v { 1 } else { 0 }),
+            ScalarExpr::Literal(Literal::Integer(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Float(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Boolean(v)) => Ok(Some(if *v { 1 } else { 0 })),
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
-            ScalarExpr::Literal(Literal::Null) => Err(Error::InvalidArgumentError(
-                "NULL literals not supported in aggregate expressions".into(),
-            )),
+            ScalarExpr::Literal(Literal::Null) => Ok(None),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
             )),
@@ -5004,47 +5016,58 @@ where
                 let value = aggregates.get(&key).ok_or_else(|| {
                     Error::Internal(format!("Aggregate value not found for key: {}", key))
                 })?;
-                // Convert to i64 for arithmetic (truncates floats)
-                Ok(value.to_i64())
+                Ok(value.as_i64())
             }
             ScalarExpr::Not(inner) => {
                 let value = Self::evaluate_expr_with_aggregates(inner, aggregates)?;
-                Ok(if value != 0 { 0 } else { 1 })
+                Ok(value.map(|v| if v != 0 { 0 } else { 1 }))
             }
             ScalarExpr::IsNull { expr, negated } => {
-                // Aggregates normalize NULL results to zero-length arrays which we treat as not null.
-                let _ = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
-                Ok(if *negated { 1 } else { 0 })
+                let value = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
+                let is_null = value.is_none();
+                Ok(Some(if is_null != *negated { 1 } else { 0 }))
             }
             ScalarExpr::Binary { left, op, right } => {
                 let left_val = Self::evaluate_expr_with_aggregates(left, aggregates)?;
                 let right_val = Self::evaluate_expr_with_aggregates(right, aggregates)?;
 
-                let result = match op {
-                    BinaryOp::Add => left_val.checked_add(right_val),
-                    BinaryOp::Subtract => left_val.checked_sub(right_val),
-                    BinaryOp::Multiply => left_val.checked_mul(right_val),
-                    BinaryOp::Divide => {
-                        if right_val == 0 {
-                            return Err(Error::InvalidArgumentError("Division by zero".into()));
-                        }
-                        left_val.checked_div(right_val)
-                    }
-                    BinaryOp::Modulo => {
-                        if right_val == 0 {
-                            return Err(Error::InvalidArgumentError("Modulo by zero".into()));
-                        }
-                        left_val.checked_rem(right_val)
-                    }
-                };
+                match (left_val, right_val) {
+                    (Some(lhs), Some(rhs)) => {
+                        let result = match op {
+                            BinaryOp::Add => lhs.checked_add(rhs),
+                            BinaryOp::Subtract => lhs.checked_sub(rhs),
+                            BinaryOp::Multiply => lhs.checked_mul(rhs),
+                            BinaryOp::Divide => {
+                                if rhs == 0 {
+                                    return Err(Error::InvalidArgumentError(
+                                        "Division by zero".into(),
+                                    ));
+                                }
+                                lhs.checked_div(rhs)
+                            }
+                            BinaryOp::Modulo => {
+                                if rhs == 0 {
+                                    return Err(Error::InvalidArgumentError(
+                                        "Modulo by zero".into(),
+                                    ));
+                                }
+                                lhs.checked_rem(rhs)
+                            }
+                        };
 
-                result.ok_or_else(|| {
-                    Error::InvalidArgumentError("Arithmetic overflow in expression".into())
-                })
+                        result.map(Some).ok_or_else(|| {
+                            Error::InvalidArgumentError("Arithmetic overflow in expression".into())
+                        })
+                    }
+                    _ => Ok(None),
+                }
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let value = Self::evaluate_expr_with_aggregates(expr, aggregates)?;
-                Self::cast_aggregate_value(value, data_type)
+                match value {
+                    Some(v) => Self::cast_aggregate_value(v, data_type).map(Some),
+                    None => Ok(None),
+                }
             }
             ScalarExpr::GetField { .. } => Err(Error::InvalidArgumentError(
                 "GetField not supported in aggregate-only expressions".into(),
@@ -9647,6 +9670,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use llkv_expr::expr::BinaryOp;
+    use llkv_expr::literal::Literal;
     use llkv_storage::pager::MemPager;
     use std::sync::Arc;
 
@@ -9707,7 +9731,7 @@ mod tests {
         let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
             .expect("cast should succeed for in-range integral values");
 
-        assert_eq!(value, 31);
+        assert_eq!(value, Some(31));
     }
 
     #[test]
@@ -9721,6 +9745,21 @@ mod tests {
         let result = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates);
 
         assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
+    }
+
+    #[test]
+    fn aggregate_expr_null_literal_remains_null() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(0),
+            BinaryOp::Subtract,
+            ScalarExpr::cast(ScalarExpr::literal(Literal::Null), DataType::Int64),
+        );
+        let aggregates = FxHashMap::default();
+
+        let value = QueryExecutor::<MemPager>::evaluate_expr_with_aggregates(&expr, &aggregates)
+            .expect("expression should evaluate");
+
+        assert_eq!(value, None);
     }
 
     #[test]
