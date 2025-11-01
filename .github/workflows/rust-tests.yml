@@ -32,6 +32,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Free disk space on Linux runner
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+
       - name: Capture rustc commit hash
         id: rustc
         shell: bash
@@ -53,13 +60,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-
-
-      # Fix: rustc-LLVM ERROR: IO failure on output stream: No space left on device
-      - name: Configure Linux build footprint
-        if: runner.os == 'Linux'
-        run: |
-          echo "RUSTFLAGS=-Cdebuginfo=1 -Csplit-debuginfo=packed" >> "$GITHUB_ENV"
-          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
 
       - name: Test
         run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
