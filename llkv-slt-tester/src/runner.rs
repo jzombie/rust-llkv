@@ -497,10 +497,10 @@ impl LlkvSltRunner {
         }
 
         // Try smart split
-        if let Some(flattened_smart) = Self::try_smart_split_with_expected(&actual, &expected) {
-            if flattened_smart.len() == expected.len() {
-                return flattened_smart == expected;
-            }
+        if let Some(flattened_smart) = Self::try_smart_split_with_expected(&actual, &expected)
+            && flattened_smart.len() == expected.len()
+        {
+            return flattened_smart == expected;
         }
 
         false
