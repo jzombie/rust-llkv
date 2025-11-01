@@ -4140,10 +4140,7 @@ where
                 _ => None,
             });
 
-        let has_joins = select
-            .from
-            .iter()
-            .any(|table_with_joins| table_with_joins_has_join(table_with_joins));
+        let has_joins = select.from.iter().any(table_with_joins_has_join);
         let mut join_conditions: Vec<Option<SqlExpr>> = Vec::new();
         let mut scalar_subqueries: Vec<llkv_plan::ScalarSubquery> = Vec::new();
         // Handle different FROM clause scenarios
@@ -7782,17 +7779,17 @@ fn table_with_joins_has_join(item: &TableWithJoins) -> bool {
 /// Extract table references from a FROM clause, flattening supported JOINs and
 /// collecting any join predicates that must be applied as filters.
 ///
-/// Returns (tables, join_metadata, join_filters) where:
-/// - `tables`: list of all table references in order
-/// - `join_metadata`: [`llkv_plan::JoinMetadata`] entries pairing consecutive tables
-/// - `join_filters`: ON conditions to be merged into WHERE clause
-fn extract_tables(
-    from: &[TableWithJoins],
-) -> SqlResult<(
+type ExtractedJoinData = (
     Vec<llkv_plan::TableRef>,
     Vec<llkv_plan::JoinMetadata>,
     Vec<Option<SqlExpr>>,
-)> {
+);
+
+/// Returns [`ExtractedJoinData`] (tables, join metadata, join filters).
+/// - `tables`: list of all table references in order
+/// - `join_metadata`: [`llkv_plan::JoinMetadata`] entries pairing consecutive tables
+/// - `join_filters`: ON conditions to be merged into WHERE clause
+fn extract_tables(from: &[TableWithJoins]) -> SqlResult<ExtractedJoinData> {
     let mut tables = Vec::new();
     let mut join_metadata = Vec::new();
     let mut join_filters = Vec::new();
@@ -8503,13 +8500,11 @@ mod tests {
             panic!("expected SELECT query");
         };
 
-        let plan = engine
-            .build_select_plan(*query)
-            .expect("build select plan");
+        let plan = engine.build_select_plan(*query).expect("build select plan");
 
-    assert_eq!(plan.joins.len(), 1, "expected single explicit join entry");
+        assert_eq!(plan.joins.len(), 1, "expected single explicit join entry");
 
-    let left_join = &plan.joins[0];
+        let left_join = &plan.joins[0];
         let on_condition = left_join
             .on_condition
             .as_ref()

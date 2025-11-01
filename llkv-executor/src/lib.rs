@@ -1592,7 +1592,6 @@ fn compare_literals_with_mode(
     match (left, right) {
         (Literal::Null, _) | (_, Literal::Null) => match null_behavior {
             NullComparisonBehavior::ThreeValuedLogic => None,
-            NullComparisonBehavior::NullIsFalse => Some(false),
         },
         (Literal::Integer(lhs), Literal::Integer(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
         (Literal::Float(lhs), Literal::Float(rhs)) => Some(compare_f64(*lhs, *rhs, op)),
@@ -2200,7 +2199,7 @@ where
                 if columns_per_batch.is_none() {
                     let initial_columns: Vec<Vec<ArrayRef>> = batches
                         .iter()
-                        .map(|batch| batch.columns().iter().cloned().collect())
+                        .map(|batch| batch.columns().to_vec())
                         .collect();
                     columns_per_batch = Some(initial_columns);
                 }
@@ -7046,7 +7045,7 @@ fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Optio
                 let value = evaluate_constant_scalar(candidate)?;
                 match compare_literals(CompareOp::Eq, &needle, &value) {
                     Some(true) => {
-                        return Some(Some(if *negated { false } else { true }));
+                        return Some(Some(!*negated));
                     }
                     Some(false) => {}
                     None => saw_unknown = true,
@@ -7056,7 +7055,7 @@ fn evaluate_constant_predicate(expr: &LlkvExpr<'static, String>) -> Option<Optio
             if saw_unknown {
                 Some(None)
             } else {
-                Some(Some(if *negated { true } else { false }))
+                Some(Some(*negated))
             }
         }
         _ => None,
@@ -7166,7 +7165,7 @@ fn evaluate_constant_join_expr(expr: &LlkvExpr<'static, String>) -> ConstantJoin
 
                 match compare_literals(CompareOp::Eq, &needle, &value) {
                     Some(true) => {
-                        let result = if *negated { false } else { true };
+                        let result = !*negated;
                         return ConstantJoinEvaluation::Known(result);
                     }
                     Some(false) => {}
@@ -7177,7 +7176,7 @@ fn evaluate_constant_join_expr(expr: &LlkvExpr<'static, String>) -> ConstantJoin
             if saw_unknown {
                 ConstantJoinEvaluation::Unknown
             } else {
-                let result = if *negated { true } else { false };
+                let result = *negated;
                 ConstantJoinEvaluation::Known(result)
             }
         }
@@ -7187,7 +7186,6 @@ fn evaluate_constant_join_expr(expr: &LlkvExpr<'static, String>) -> ConstantJoin
 
 enum NullComparisonBehavior {
     ThreeValuedLogic,
-    NullIsFalse,
 }
 
 fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
