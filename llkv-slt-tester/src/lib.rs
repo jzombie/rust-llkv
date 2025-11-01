@@ -80,6 +80,7 @@ impl LlkvSltRunner {
         runner::run_slt_file_blocking_with_runtime(path, factory, self.runtime_kind)
     }
 
+    // TODO: Verify if this also runs `.slturl` files.
     /// Discover and execute all `.slt` files under the given directory.
     pub fn run_directory(&self, dir: &str) -> Result<(), Error> {
         let factory_factory = self.factory_factory.clone();
