@@ -3871,6 +3871,8 @@ fn format_binary_op(op: BinaryOp) -> &'static str {
         BinaryOp::Multiply => "*",
         BinaryOp::Divide => "/",
         BinaryOp::Modulo => "%",
+        BinaryOp::And => "AND",
+        BinaryOp::Or => "OR",
     }
 }
 

@@ -837,20 +837,15 @@ where
         for proj in &plan.projections {
             match proj {
                 SelectProjection::Computed { expr, alias } => {
-                    // Infer the data type from the expression
-                    let (field_name, dtype, array) = match expr {
-                        ScalarExpr::Literal(lit) => {
-                            let (dtype, array) = Self::literal_to_array(lit)?;
-                            (alias.clone(), dtype, array)
-                        }
-                        _ => {
-                            return Err(Error::InvalidArgumentError(
-                                "SELECT without FROM only supports literal expressions".into(),
-                            ));
-                        }
-                    };
+                    let literal =
+                        evaluate_constant_scalar_with_aggregates(expr).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "SELECT without FROM only supports constant expressions".into(),
+                            )
+                        })?;
+                    let (dtype, array) = Self::literal_to_array(&literal)?;
 
-                    fields.push(Field::new(field_name, dtype, true));
+                    fields.push(Field::new(alias.clone(), dtype, true));
                     arrays.push(array);
                 }
                 _ => {
@@ -5416,53 +5411,88 @@ where
                     row_idx,
                 )?;
 
-                // Convert to numeric values for binary operations
-                let left_num = match left_val {
-                    PlanValue::Integer(i) => i as f64,
-                    PlanValue::Float(f) => f,
-                    PlanValue::Null => return Ok(PlanValue::Null),
-                    _ => {
-                        return Err(Error::InvalidArgumentError(
-                            "Non-numeric value in binary operation".into(),
-                        ));
-                    }
-                };
-                let right_num = match right_val {
-                    PlanValue::Integer(i) => i as f64,
-                    PlanValue::Float(f) => f,
-                    PlanValue::Null => return Ok(PlanValue::Null),
-                    _ => {
-                        return Err(Error::InvalidArgumentError(
-                            "Non-numeric value in binary operation".into(),
-                        ));
-                    }
-                };
-
-                let result = match op {
-                    BinaryOp::Add => left_num + right_num,
-                    BinaryOp::Subtract => left_num - right_num,
-                    BinaryOp::Multiply => left_num * right_num,
-                    BinaryOp::Divide => {
-                        if right_num == 0.0 {
+                match op {
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo => {
+                        if matches!(&left_val, PlanValue::Null)
+                            || matches!(&right_val, PlanValue::Null)
+                        {
                             return Ok(PlanValue::Null);
                         }
-                        left_num / right_num
-                    }
-                    BinaryOp::Modulo => {
-                        if right_num == 0.0 {
-                            return Ok(PlanValue::Null);
-                        }
-                        left_num % right_num
-                    }
-                };
 
-                // Return as float if either operand was float, otherwise as integer
-                if matches!(left_val, PlanValue::Float(_))
-                    || matches!(right_val, PlanValue::Float(_))
-                {
-                    Ok(PlanValue::Float(result))
-                } else {
-                    Ok(PlanValue::Integer(result as i64))
+                        if matches!(op, BinaryOp::Divide)
+                            && let (PlanValue::Integer(lhs), PlanValue::Integer(rhs)) =
+                                (&left_val, &right_val)
+                        {
+                            if *rhs == 0 {
+                                return Ok(PlanValue::Null);
+                            }
+
+                            if *lhs == i64::MIN && *rhs == -1 {
+                                return Ok(PlanValue::Float((*lhs as f64) / (*rhs as f64)));
+                            }
+
+                            return Ok(PlanValue::Integer(lhs / rhs));
+                        }
+
+                        let left_is_float = matches!(&left_val, PlanValue::Float(_));
+                        let right_is_float = matches!(&right_val, PlanValue::Float(_));
+
+                        let left_num = match left_val {
+                            PlanValue::Integer(i) => i as f64,
+                            PlanValue::Float(f) => f,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Non-numeric value {:?} in binary operation",
+                                    other
+                                )));
+                            }
+                        };
+                        let right_num = match right_val {
+                            PlanValue::Integer(i) => i as f64,
+                            PlanValue::Float(f) => f,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Non-numeric value {:?} in binary operation",
+                                    other
+                                )));
+                            }
+                        };
+
+                        let result = match op {
+                            BinaryOp::Add => left_num + right_num,
+                            BinaryOp::Subtract => left_num - right_num,
+                            BinaryOp::Multiply => left_num * right_num,
+                            BinaryOp::Divide => {
+                                if right_num == 0.0 {
+                                    return Ok(PlanValue::Null);
+                                }
+                                left_num / right_num
+                            }
+                            BinaryOp::Modulo => {
+                                if right_num == 0.0 {
+                                    return Ok(PlanValue::Null);
+                                }
+                                left_num % right_num
+                            }
+                            BinaryOp::And | BinaryOp::Or => unreachable!(),
+                        };
+
+                        if matches!(op, BinaryOp::Divide) {
+                            return Ok(PlanValue::Float(result));
+                        }
+
+                        if left_is_float || right_is_float {
+                            Ok(PlanValue::Float(result))
+                        } else {
+                            Ok(PlanValue::Integer(result as i64))
+                        }
+                    }
+                    BinaryOp::And => Ok(evaluate_plan_value_logical_and(left_val, right_val)),
+                    BinaryOp::Or => Ok(evaluate_plan_value_logical_or(left_val, right_val)),
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
@@ -5685,31 +5715,42 @@ where
                 let left_val = Self::evaluate_expr_with_aggregates(left, aggregates)?;
                 let right_val = Self::evaluate_expr_with_aggregates(right, aggregates)?;
 
-                match (left_val, right_val) {
-                    (Some(lhs), Some(rhs)) => {
-                        let result = match op {
-                            BinaryOp::Add => lhs.checked_add(rhs),
-                            BinaryOp::Subtract => lhs.checked_sub(rhs),
-                            BinaryOp::Multiply => lhs.checked_mul(rhs),
-                            BinaryOp::Divide => {
-                                if rhs == 0 {
-                                    return Ok(None);
+                match op {
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo => match (left_val, right_val) {
+                        (Some(lhs), Some(rhs)) => {
+                            let result = match op {
+                                BinaryOp::Add => lhs.checked_add(rhs),
+                                BinaryOp::Subtract => lhs.checked_sub(rhs),
+                                BinaryOp::Multiply => lhs.checked_mul(rhs),
+                                BinaryOp::Divide => {
+                                    if rhs == 0 {
+                                        return Ok(None);
+                                    }
+                                    lhs.checked_div(rhs)
                                 }
-                                lhs.checked_div(rhs)
-                            }
-                            BinaryOp::Modulo => {
-                                if rhs == 0 {
-                                    return Ok(None);
+                                BinaryOp::Modulo => {
+                                    if rhs == 0 {
+                                        return Ok(None);
+                                    }
+                                    lhs.checked_rem(rhs)
                                 }
-                                lhs.checked_rem(rhs)
-                            }
-                        };
+                                BinaryOp::And | BinaryOp::Or => unreachable!(),
+                            };
 
-                        result.map(Some).ok_or_else(|| {
-                            Error::InvalidArgumentError("Arithmetic overflow in expression".into())
-                        })
-                    }
-                    _ => Ok(None),
+                            result.map(Some).ok_or_else(|| {
+                                Error::InvalidArgumentError(
+                                    "Arithmetic overflow in expression".into(),
+                                )
+                            })
+                        }
+                        _ => Ok(None),
+                    },
+                    BinaryOp::And => Ok(evaluate_option_logical_and(left_val, right_val)),
+                    BinaryOp::Or => Ok(evaluate_option_logical_or(left_val, right_val)),
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
@@ -7189,19 +7230,30 @@ enum NullComparisonBehavior {
 }
 
 fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
+    evaluate_constant_scalar_internal(expr, false)
+}
+
+fn evaluate_constant_scalar_with_aggregates(expr: &ScalarExpr<String>) -> Option<Literal> {
+    evaluate_constant_scalar_internal(expr, true)
+}
+
+fn evaluate_constant_scalar_internal(
+    expr: &ScalarExpr<String>,
+    allow_aggregates: bool,
+) -> Option<Literal> {
     match expr {
         ScalarExpr::Literal(lit) => Some(lit.clone()),
         ScalarExpr::Binary { left, op, right } => {
-            let left_value = evaluate_constant_scalar(left)?;
-            let right_value = evaluate_constant_scalar(right)?;
+            let left_value = evaluate_constant_scalar_internal(left, allow_aggregates)?;
+            let right_value = evaluate_constant_scalar_internal(right, allow_aggregates)?;
             evaluate_binary_literal(*op, &left_value, &right_value)
         }
         ScalarExpr::Cast { expr, data_type } => {
-            let value = evaluate_constant_scalar(expr)?;
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             cast_literal_to_type(&value, data_type)
         }
         ScalarExpr::Not(inner) => {
-            let value = evaluate_constant_scalar(inner)?;
+            let value = evaluate_constant_scalar_internal(inner, allow_aggregates)?;
             match literal_truthiness(&value) {
                 Some(true) => Some(Literal::Integer(0)),
                 Some(false) => Some(Literal::Integer(1)),
@@ -7209,14 +7261,14 @@ fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
             }
         }
         ScalarExpr::IsNull { expr, negated } => {
-            let value = evaluate_constant_scalar(expr)?;
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             let is_null = matches!(value, Literal::Null);
             Some(Literal::Boolean(if *negated { !is_null } else { is_null }))
         }
         ScalarExpr::Coalesce(items) => {
             let mut saw_null = false;
             for item in items {
-                match evaluate_constant_scalar(item) {
+                match evaluate_constant_scalar_internal(item, allow_aggregates) {
                     Some(Literal::Null) => saw_null = true,
                     Some(value) => return Some(value),
                     None => return None,
@@ -7225,32 +7277,179 @@ fn evaluate_constant_scalar(expr: &ScalarExpr<String>) -> Option<Literal> {
             if saw_null { Some(Literal::Null) } else { None }
         }
         ScalarExpr::Compare { left, op, right } => {
-            let left_value = evaluate_constant_scalar(left)?;
-            let right_value = evaluate_constant_scalar(right)?;
+            let left_value = evaluate_constant_scalar_internal(left, allow_aggregates)?;
+            let right_value = evaluate_constant_scalar_internal(right, allow_aggregates)?;
             match compare_literals(*op, &left_value, &right_value) {
                 Some(flag) => Some(Literal::Boolean(flag)),
                 None => Some(Literal::Null),
             }
         }
-        ScalarExpr::Case { .. } => None,
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand_expr) = operand {
+                let operand_value =
+                    evaluate_constant_scalar_internal(operand_expr, allow_aggregates)?;
+                for (when_expr, then_expr) in branches {
+                    let when_value =
+                        evaluate_constant_scalar_internal(when_expr, allow_aggregates)?;
+                    if let Some(true) = compare_literals(CompareOp::Eq, &operand_value, &when_value)
+                    {
+                        return evaluate_constant_scalar_internal(then_expr, allow_aggregates);
+                    }
+                }
+            } else {
+                for (condition_expr, result_expr) in branches {
+                    let condition_value =
+                        evaluate_constant_scalar_internal(condition_expr, allow_aggregates)?;
+                    match literal_truthiness(&condition_value) {
+                        Some(true) => {
+                            return evaluate_constant_scalar_internal(
+                                result_expr,
+                                allow_aggregates,
+                            );
+                        }
+                        Some(false) => {}
+                        None => {}
+                    }
+                }
+            }
+
+            if let Some(else_branch) = else_expr {
+                evaluate_constant_scalar_internal(else_branch, allow_aggregates)
+            } else {
+                Some(Literal::Null)
+            }
+        }
         ScalarExpr::Column(_) => None,
-        ScalarExpr::Aggregate(_) => None,
+        ScalarExpr::Aggregate(call) => {
+            if allow_aggregates {
+                evaluate_constant_aggregate(call, allow_aggregates)
+            } else {
+                None
+            }
+        }
         ScalarExpr::GetField { .. } => None,
         ScalarExpr::ScalarSubquery(_) => None,
     }
 }
 
+fn evaluate_constant_aggregate(
+    call: &AggregateCall<String>,
+    allow_aggregates: bool,
+) -> Option<Literal> {
+    match call {
+        AggregateCall::CountStar => Some(Literal::Integer(1)),
+        AggregateCall::Count { expr, .. } => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            if matches!(value, Literal::Null) {
+                Some(Literal::Integer(0))
+            } else {
+                Some(Literal::Integer(1))
+            }
+        }
+        AggregateCall::Sum { expr, .. } => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Null),
+                Literal::Integer(value) => Some(Literal::Integer(value)),
+                Literal::Float(value) => Some(Literal::Float(value)),
+                Literal::Boolean(flag) => Some(Literal::Integer(if flag { 1 } else { 0 })),
+                _ => None,
+            }
+        }
+        AggregateCall::Avg { expr, .. } => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Null),
+                other => {
+                    let numeric = literal_to_f64(&other)?;
+                    Some(Literal::Float(numeric))
+                }
+            }
+        }
+        AggregateCall::Min(expr) => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Null),
+                other => Some(other),
+            }
+        }
+        AggregateCall::Max(expr) => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Null),
+                other => Some(other),
+            }
+        }
+        AggregateCall::CountNulls(expr) => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            let count = if matches!(value, Literal::Null) { 1 } else { 0 };
+            Some(Literal::Integer(count))
+        }
+    }
+}
+
 fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Option<Literal> {
-    if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
-        return Some(Literal::Null);
+    match op {
+        BinaryOp::And => evaluate_literal_logical_and(left, right),
+        BinaryOp::Or => evaluate_literal_logical_or(left, right),
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Modulo => {
+            if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
+                return Some(Literal::Null);
+            }
+
+            match op {
+                BinaryOp::Add => add_literals(left, right),
+                BinaryOp::Subtract => subtract_literals(left, right),
+                BinaryOp::Multiply => multiply_literals(left, right),
+                BinaryOp::Divide => divide_literals(left, right),
+                BinaryOp::Modulo => modulo_literals(left, right),
+                BinaryOp::And | BinaryOp::Or => unreachable!(),
+            }
+        }
+    }
+}
+
+fn evaluate_literal_logical_and(left: &Literal, right: &Literal) -> Option<Literal> {
+    let left_truth = literal_truthiness(left);
+    if matches!(left_truth, Some(false)) {
+        return Some(Literal::Integer(0));
     }
 
-    match op {
-        BinaryOp::Add => add_literals(left, right),
-        BinaryOp::Subtract => subtract_literals(left, right),
-        BinaryOp::Multiply => multiply_literals(left, right),
-        BinaryOp::Divide => divide_literals(left, right),
-        BinaryOp::Modulo => modulo_literals(left, right),
+    let right_truth = literal_truthiness(right);
+    if matches!(right_truth, Some(false)) {
+        return Some(Literal::Integer(0));
+    }
+
+    match (left_truth, right_truth) {
+        (Some(true), Some(true)) => Some(Literal::Integer(1)),
+        (Some(true), None) | (None, Some(true)) | (None, None) => Some(Literal::Null),
+        _ => Some(Literal::Null),
+    }
+}
+
+fn evaluate_literal_logical_or(left: &Literal, right: &Literal) -> Option<Literal> {
+    let left_truth = literal_truthiness(left);
+    if matches!(left_truth, Some(true)) {
+        return Some(Literal::Integer(1));
+    }
+
+    let right_truth = literal_truthiness(right);
+    if matches!(right_truth, Some(true)) {
+        return Some(Literal::Integer(1));
+    }
+
+    match (left_truth, right_truth) {
+        (Some(false), Some(false)) => Some(Literal::Integer(0)),
+        (Some(false), None) | (None, Some(false)) | (None, None) => Some(Literal::Null),
+        _ => Some(Literal::Null),
     }
 }
 
@@ -7294,10 +7493,33 @@ fn multiply_literals(left: &Literal, right: &Literal) -> Option<Literal> {
 }
 
 fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
+    fn literal_to_i128_from_integer_like(literal: &Literal) -> Option<i128> {
+        match literal {
+            Literal::Integer(value) => Some(*value),
+            Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
+            _ => None,
+        }
+    }
+
+    if let (Some(lhs), Some(rhs)) = (
+        literal_to_i128_from_integer_like(left),
+        literal_to_i128_from_integer_like(right),
+    ) {
+        if rhs == 0 {
+            return Some(Literal::Null);
+        }
+
+        if lhs == i128::MIN && rhs == -1 {
+            return Some(Literal::Float((lhs as f64) / (rhs as f64)));
+        }
+
+        return Some(Literal::Integer(lhs / rhs));
+    }
+
     let lhs = literal_to_f64(left)?;
     let rhs = literal_to_f64(right)?;
     if rhs == 0.0 {
-        return None;
+        return Some(Literal::Null);
     }
     Some(Literal::Float(lhs / rhs))
 }
@@ -7306,7 +7528,7 @@ fn modulo_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     let lhs = literal_to_i128(left)?;
     let rhs = literal_to_i128(right)?;
     if rhs == 0 {
-        return None;
+        return Some(Literal::Null);
     }
     Some(Literal::Integer(lhs % rhs))
 }
@@ -7335,6 +7557,91 @@ fn literal_truthiness(literal: &Literal) -> Option<bool> {
         Literal::Integer(value) => Some(*value != 0),
         Literal::Float(value) => Some(*value != 0.0),
         Literal::Null => None,
+        _ => None,
+    }
+}
+
+fn plan_value_truthiness(value: &PlanValue) -> Option<bool> {
+    match value {
+        PlanValue::Integer(v) => Some(*v != 0),
+        PlanValue::Float(v) => Some(*v != 0.0),
+        PlanValue::Null => None,
+        _ => None,
+    }
+}
+
+fn option_i64_truthiness(value: Option<i64>) -> Option<bool> {
+    value.map(|v| v != 0)
+}
+
+fn evaluate_plan_value_logical_and(left: PlanValue, right: PlanValue) -> PlanValue {
+    let left_truth = plan_value_truthiness(&left);
+    if matches!(left_truth, Some(false)) {
+        return PlanValue::Integer(0);
+    }
+
+    let right_truth = plan_value_truthiness(&right);
+    if matches!(right_truth, Some(false)) {
+        return PlanValue::Integer(0);
+    }
+
+    match (left_truth, right_truth) {
+        (Some(true), Some(true)) => PlanValue::Integer(1),
+        (Some(true), None) | (None, Some(true)) | (None, None) => PlanValue::Null,
+        _ => PlanValue::Null,
+    }
+}
+
+fn evaluate_plan_value_logical_or(left: PlanValue, right: PlanValue) -> PlanValue {
+    let left_truth = plan_value_truthiness(&left);
+    if matches!(left_truth, Some(true)) {
+        return PlanValue::Integer(1);
+    }
+
+    let right_truth = plan_value_truthiness(&right);
+    if matches!(right_truth, Some(true)) {
+        return PlanValue::Integer(1);
+    }
+
+    match (left_truth, right_truth) {
+        (Some(false), Some(false)) => PlanValue::Integer(0),
+        (Some(false), None) | (None, Some(false)) | (None, None) => PlanValue::Null,
+        _ => PlanValue::Null,
+    }
+}
+
+fn evaluate_option_logical_and(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    let left_truth = option_i64_truthiness(left);
+    if matches!(left_truth, Some(false)) {
+        return Some(0);
+    }
+
+    let right_truth = option_i64_truthiness(right);
+    if matches!(right_truth, Some(false)) {
+        return Some(0);
+    }
+
+    match (left_truth, right_truth) {
+        (Some(true), Some(true)) => Some(1),
+        (Some(true), None) | (None, Some(true)) | (None, None) => None,
+        _ => None,
+    }
+}
+
+fn evaluate_option_logical_or(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    let left_truth = option_i64_truthiness(left);
+    if matches!(left_truth, Some(true)) {
+        return Some(1);
+    }
+
+    let right_truth = option_i64_truthiness(right);
+    if matches!(right_truth, Some(true)) {
+        return Some(1);
+    }
+
+    match (left_truth, right_truth) {
+        (Some(false), Some(false)) => Some(0),
+        (Some(false), None) | (None, Some(false)) | (None, None) => None,
         _ => None,
     }
 }
@@ -10733,6 +11040,20 @@ mod tests {
             .expect("modulo should evaluate");
 
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn constant_and_with_null_yields_null() {
+        let expr = ScalarExpr::binary(
+            ScalarExpr::literal(Literal::Null),
+            BinaryOp::And,
+            ScalarExpr::literal(1),
+        );
+
+        let value = evaluate_constant_scalar_with_aggregates(&expr)
+            .expect("expression should fold as constant");
+
+        assert!(matches!(value, Literal::Null));
     }
 
     #[test]
