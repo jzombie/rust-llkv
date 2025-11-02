@@ -275,6 +275,42 @@ where
         self.catalog_service.is_view(table_id)
     }
 
+    /// Drop a view, ignoring missing views when `if_exists` is true.
+    pub fn drop_view(&self, name: &str, if_exists: bool) -> Result<()> {
+        let (display_name, canonical_name) = canonical_table_name(name)?;
+
+        let table_id = match self.catalog.table_id(&canonical_name) {
+            Some(id) => id,
+            None => {
+                if if_exists {
+                    return Ok(());
+                }
+                return Err(Error::CatalogError(format!(
+                    "View '{}' does not exist",
+                    display_name
+                )));
+            }
+        };
+
+        if !self.catalog_service.is_view(table_id)? {
+            return Err(Error::CatalogError(format!(
+                "use DROP TABLE to delete table '{}'",
+                display_name
+            )));
+        }
+
+        self.catalog_service.drop_view(&canonical_name, table_id)?;
+
+        {
+            let mut tables = self.tables.write().unwrap();
+            tables.remove(&canonical_name);
+        }
+
+        self.dropped_tables.write().unwrap().insert(canonical_name);
+
+        Ok(())
+    }
+
     /// Resolve a type name to its base DataType, recursively following aliases.
     pub fn resolve_type(&self, data_type: &sqlparser::ast::DataType) -> sqlparser::ast::DataType {
         self.catalog_service.resolve_type(data_type)

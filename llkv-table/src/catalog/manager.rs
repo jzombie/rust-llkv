@@ -260,6 +260,21 @@ where
         }
     }
 
+    /// Drop a view by removing its metadata and catalog entry.
+    pub fn drop_view(&self, canonical_name: &str, table_id: TableId) -> LlkvResult<()> {
+        self.metadata.prepare_table_drop(table_id, &[])?;
+        self.metadata.flush_table(table_id)?;
+        self.metadata.remove_table_state(table_id);
+
+        if let Some(table_id_from_catalog) = self.catalog.table_id(canonical_name) {
+            let _ = self.catalog.unregister_table(table_id_from_catalog);
+        } else {
+            let _ = self.catalog.unregister_table(table_id);
+        }
+
+        Ok(())
+    }
+
     // ============================================================================
     // Table Creation
     // ============================================================================

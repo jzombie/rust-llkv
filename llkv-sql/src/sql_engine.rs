@@ -3046,6 +3046,20 @@ where
 
                 Ok(RuntimeStatementResult::NoOp)
             }
+            ObjectType::View => {
+                if cascade || restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP VIEW CASCADE/RESTRICT is not supported".into(),
+                    ));
+                }
+
+                for name in names {
+                    let view_name = Self::object_name_to_string(&name)?;
+                    self.engine.context().drop_view(&view_name, if_exists)?;
+                }
+
+                Ok(RuntimeStatementResult::NoOp)
+            }
             ObjectType::Index => {
                 if cascade || restrict {
                     return Err(Error::InvalidArgumentError(
