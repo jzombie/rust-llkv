@@ -1228,20 +1228,20 @@ where
                 .map(|spec| spec.name.to_ascii_lowercase())
                 .collect()),
             Ok(_) => {
-                if let Some(table_id) = context.catalog().table_id(&canonical_name) {
-                    if let Some(resolver) = context.catalog().field_resolver(table_id) {
-                        let fallback: HashSet<String> = resolver
-                            .field_names()
-                            .into_iter()
-                            .map(|name| name.to_ascii_lowercase())
-                            .collect();
-                        tracing::debug!(
-                            "collect_known_columns: using resolver fallback for '{}': {:?}",
-                            display_name,
-                            fallback
-                        );
-                        return Ok(fallback);
-                    }
+                if let Some(table_id) = context.catalog().table_id(&canonical_name)
+                    && let Some(resolver) = context.catalog().field_resolver(table_id)
+                {
+                    let fallback: HashSet<String> = resolver
+                        .field_names()
+                        .into_iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect();
+                    tracing::debug!(
+                        "collect_known_columns: using resolver fallback for '{}': {:?}",
+                        display_name,
+                        fallback
+                    );
+                    return Ok(fallback);
                 }
                 Ok(HashSet::default())
             }
@@ -4347,12 +4347,12 @@ where
             }
         });
 
-        if let Some(ref columns) = alias_columns {
-            if columns.len() != inner_schema.fields().len() {
-                return Err(Error::InvalidArgumentError(
-                    "Binder Error: derived table column alias count must match projection".into(),
-                ));
-            }
+        if let Some(ref columns) = alias_columns
+            && columns.len() != inner_schema.fields().len()
+        {
+            return Err(Error::InvalidArgumentError(
+                "Binder Error: derived table column alias count must match projection".into(),
+            ));
         }
 
         let alias_lower = alias_name.as_ref().map(|name| name.to_ascii_lowercase());
@@ -4363,7 +4363,7 @@ where
             Columns(Vec<(String, String)>),
         }
 
-        let mut resolve_compound_identifier = |parts: &[Ident]| -> SqlResult<String> {
+        let resolve_compound_identifier = |parts: &[Ident]| -> SqlResult<String> {
             if parts.is_empty() {
                 return Err(Error::InvalidArgumentError(
                     "Binder Error: empty identifier in derived table projection".into(),
@@ -4423,13 +4423,6 @@ where
                     SelectItem::UnnamedExpr(SqlExpr::CompoundIdentifier(parts)) => {
                         let column = resolve_compound_identifier(parts)?;
                         columns.push((column.clone(), column));
-                    }
-                    SelectItem::ExprWithAlias {
-                        expr: SqlExpr::CompoundIdentifier(parts),
-                        alias,
-                    } => {
-                        let column = resolve_compound_identifier(parts)?;
-                        columns.push((column, alias.value.clone()));
                     }
                     other => {
                         return Err(Error::InvalidArgumentError(format!(
@@ -4635,12 +4628,7 @@ where
             } => {
                 let left_result = self.evaluate_set_expr(left.as_ref(), visited_views)?;
                 let right_result = self.evaluate_set_expr(right.as_ref(), visited_views)?;
-                self.combine_set_results(
-                    left_result,
-                    right_result,
-                    op.clone(),
-                    set_quantifier.clone(),
-                )
+                self.combine_set_results(left_result, right_result, *op, *set_quantifier)
             }
             SetExpr::Query(subquery) => {
                 self.execute_query_with_view_support(*subquery.clone(), visited_views)
@@ -4790,7 +4778,7 @@ where
             .map(|field| SortField::new(field.data_type().clone()))
             .collect();
 
-        let mut converter = RowConverter::new(sort_fields)
+        let converter = RowConverter::new(sort_fields)
             .map_err(|err| Error::Internal(format!("failed to initialize row converter: {err}")))?;
         let rows = converter
             .convert_columns(batch.columns())
@@ -4800,7 +4788,7 @@ where
         let mut indices = Vec::new();
         let mut has_duplicates = false;
         for (idx, row) in rows.iter().enumerate() {
-            if seen.insert(row.clone()) {
+            if seen.insert(row) {
                 indices.push(idx as u32);
             } else {
                 has_duplicates = true;
