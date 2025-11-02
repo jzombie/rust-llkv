@@ -13,7 +13,7 @@ use llkv_column_map::store::ColumnStore;
 use llkv_executor::{ExecutorMultiColumnUnique, ExecutorTable};
 use llkv_plan::{
     AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateTableSource, DropIndexPlan,
-    DropTablePlan, RenameTablePlan,
+    DropTablePlan, PlanColumnSpec, RenameTablePlan, SelectPlan,
 };
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{MemPager, Pager};
@@ -262,11 +262,74 @@ where
         Ok(())
     }
 
-    /// Create a view by storing its SQL definition in the catalog.
-    /// The view will be registered as a table with a view_definition.
-    pub fn create_view(&self, display_name: &str, view_definition: String) -> Result<TableId> {
+    /// Create a view by executing its SELECT definition to derive projected columns
+    /// and persisting the metadata into the catalog. The view is registered as a
+    /// catalog entry with column names so subsequent binding can succeed without
+    /// reparsing the stored SQL in higher layers.
+    pub fn create_view(
+        self: &Arc<Self>,
+        display_name: &str,
+        view_definition: String,
+        select_plan: SelectPlan,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let (normalized_display, canonical_name) = canonical_table_name(display_name)?;
+
+        if let Some(existing_id) = self.catalog.table_id(&canonical_name) {
+            let is_view = self.catalog_service.is_view(existing_id)?;
+            if is_view && if_not_exists {
+                return Ok(());
+            }
+
+            let entity = if is_view { "View" } else { "Table" };
+            return Err(Error::CatalogError(format!(
+                "{} '{}' already exists",
+                entity, normalized_display
+            )));
+        }
+
+        let snapshot = self.default_snapshot();
+        let execution = self.execute_select(select_plan, snapshot)?;
+        let column_specs = {
+            let schema = execution.schema();
+            if schema.fields().is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE VIEW requires SELECT to project at least one column".into(),
+                ));
+            }
+
+            schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    PlanColumnSpec::new(
+                        field.name(),
+                        field.data_type().clone(),
+                        field.is_nullable(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        drop(execution);
+
         self.catalog_service
-            .create_view(display_name, view_definition)
+            .create_view(&normalized_display, view_definition, column_specs)?;
+
+        self.dropped_tables.write().unwrap().remove(&canonical_name);
+
+        Ok(())
+    }
+
+    /// Return the stored SQL definition for a view, if it exists.
+    pub fn view_definition(&self, canonical_name: &str) -> Result<Option<String>> {
+        let Some(table_id) = self.catalog.table_id(canonical_name) else {
+            return Ok(None);
+        };
+
+        match self.metadata.table_meta(table_id)? {
+            Some(meta) => Ok(meta.view_definition),
+            None => Ok(None),
+        }
     }
 
     /// Check if a table is actually a view by looking at its metadata.

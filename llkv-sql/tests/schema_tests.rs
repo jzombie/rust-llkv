@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use llkv_plan::plans::PlanValue;
 use llkv_runtime::RuntimeStatementResult;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
@@ -143,6 +144,32 @@ fn drop_view_if_exists_missing_noop() {
         .expect("drop view IF EXISTS succeeds");
     assert_eq!(results.len(), 1);
     assert!(matches!(results.remove(0), RuntimeStatementResult::NoOp));
+}
+
+#[test]
+fn select_from_view_uses_column_alias() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    engine
+        .execute("CREATE TABLE base(pk INTEGER, payload TEXT);")
+        .expect("create base table");
+    engine
+        .execute("INSERT INTO base VALUES (1, 'a');")
+        .expect("insert row");
+    engine
+        .execute("CREATE VIEW base_view(pk_alias) AS SELECT pk FROM base;")
+        .expect("create view with column alias");
+
+    let mut results = engine
+        .execute("SELECT pk_alias FROM base_view;")
+        .expect("select from view should succeed");
+    assert_eq!(results.len(), 1);
+    let RuntimeStatementResult::Select { execution, .. } = results.remove(0) else {
+        panic!("expected select result");
+    };
+    let batches = execution.collect_rows().expect("collect rows");
+    assert_eq!(batches.rows.len(), 1);
+    assert_eq!(batches.rows[0][0], PlanValue::Integer(1));
 }
 
 #[test]
