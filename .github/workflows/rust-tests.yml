@@ -62,7 +62,7 @@ jobs:
             ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-
 
       - name: Test
-        run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
+        run: LLKV_SLT_STATS=1 cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
 
   test:
     name: test

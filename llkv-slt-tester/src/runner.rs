@@ -721,6 +721,11 @@ where
     D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug + Send + 'static,
 {
+    // Enable statistics collection if requested
+    let stats_enabled = std::env::var("LLKV_SLT_STATS").is_ok();
+    if stats_enabled {
+        crate::slt_test_engine::enable_stats();
+    }
     let base = std::path::Path::new(slt_dir);
     let files = {
         let mut out = Vec::new();
@@ -817,7 +822,16 @@ where
         }));
     }
 
-    libtest_mimic::run(&args, trials)
+    let conclusion = libtest_mimic::run(&args, trials);
+
+    // Print statistics if enabled
+    if stats_enabled {
+        if let Some(stats) = crate::slt_test_engine::take_stats() {
+            stats.print_summary();
+        }
+    }
+
+    conclusion
 }
 
 #[cfg(test)]
