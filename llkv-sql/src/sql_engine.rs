@@ -5727,7 +5727,9 @@ where
                         }
                     }
                     _ => {
-                        let alias = format!("col{}", idx + 1);
+                        // Use the original SQL expression string as the alias for complex expressions.
+                        // This preserves operators like unary plus (e.g., "+ col2" rather than "col2").
+                        let alias = expr.to_string();
                         let normalized_expr = if matches!(expr, SqlExpr::Subquery(_)) {
                             expr.clone()
                         } else {
@@ -8114,7 +8116,15 @@ fn translate_scalar_internal(
                     result_stack.push(llkv_expr::expr::ScalarExpr::logical_not(inner));
                 }
                 ScalarExitContext::UnaryPlus => {
-                    // Unary plus is a no-op - just pass through
+                    // Unary plus is an identity operation in SQL - it returns the value unchanged.
+                    // Unlike unary minus, it does NOT force numeric conversion; it's purely syntactic.
+                    // SQLite treats `+col` identically to `col` in all contexts.
+                    let inner = result_stack.pop().ok_or_else(|| {
+                        Error::Internal(
+                            "translate_scalar: result stack underflow for UnaryPlus".into(),
+                        )
+                    })?;
+                    result_stack.push(inner);
                 }
                 ScalarExitContext::Nested => {
                     // Nested is a no-op - just pass through
