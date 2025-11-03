@@ -7,7 +7,7 @@
 //! [`SelectPlan`](crate::plans::SelectPlan).
 
 use crate::plans::CorrelatedColumn;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 
 /// Prefix applied to synthetic field placeholders injected for correlated columns.
@@ -36,7 +36,7 @@ impl OuterColumnKey {
 /// records the corresponding [`CorrelatedColumn`] metadata in encounter order.
 #[derive(Default)]
 pub struct SubqueryCorrelatedColumnTracker {
-    placeholders: HashMap<OuterColumnKey, usize>,
+    placeholders: FxHashMap<OuterColumnKey, usize>,
     columns: Vec<CorrelatedColumn>,
 }
 
