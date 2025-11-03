@@ -825,10 +825,10 @@ where
     let conclusion = libtest_mimic::run(&args, trials);
 
     // Print statistics if enabled
-    if stats_enabled {
-        if let Some(stats) = crate::slt_test_engine::take_stats() {
-            stats.print_summary();
-        }
+    if stats_enabled
+        && let Some(stats) = crate::slt_test_engine::take_stats()
+    {
+        stats.print_summary();
     }
 
     conclusion

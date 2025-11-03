@@ -27,7 +27,7 @@ pub use runner::{run_slt_harness, run_slt_harness_with_args};
 pub use slt_test_engine::make_in_memory_factory_factory;
 
 // Statistics API
-pub use slt_test_engine::{enable_stats, take_stats, QueryStats};
+pub use slt_test_engine::{QueryStats, enable_stats, take_stats};
 
 // Parser utilities - only exported for testing purposes
 pub use parser::expand_loops_with_mapping;

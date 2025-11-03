@@ -147,12 +147,11 @@ impl QueryStats {
         let queries: Vec<String> = slowest
             .iter()
             .map(|(sql, _, _)| {
-                let truncated = if sql.len() > 80 {
+                if sql.len() > 80 {
                     format!("{}...", &sql[..77])
                 } else {
                     sql.clone()
-                };
-                truncated
+                }
             })
             .collect();
 
@@ -175,8 +174,8 @@ impl QueryStats {
         .expect("failed to create record batch");
 
         // Pretty print using arrow's built-in utilities
-        let formatted = arrow::util::pretty::pretty_format_batches(&[batch])
-            .expect("failed to format table");
+        let formatted =
+            arrow::util::pretty::pretty_format_batches(&[batch]).expect("failed to format table");
         println!("{}", formatted);
     }
 }
@@ -420,8 +419,14 @@ impl AsyncDB for EngineHarness {
                                                 let text = a.value(row_idx);
                                                 // SQLite-style coercion: when test expects INTEGER output, parse text as number
                                                 // This only applies to SELECT output, not intermediate arithmetic operations
-                                                if matches!(expected_type, Some(DefaultColumnType::Integer)) {
-                                                    text.trim().parse::<i64>().unwrap_or(0).to_string()
+                                                if matches!(
+                                                    expected_type,
+                                                    Some(DefaultColumnType::Integer)
+                                                ) {
+                                                    text.trim()
+                                                        .parse::<i64>()
+                                                        .unwrap_or(0)
+                                                        .to_string()
                                                 } else {
                                                     text.to_string()
                                                 }
