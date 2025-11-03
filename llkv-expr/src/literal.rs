@@ -18,7 +18,7 @@ pub enum Literal {
     Boolean(bool),
     /// Struct literal with field names and nested literals
     Struct(Vec<(String, Box<Literal>)>),
-    // Other types like Bool, Bytes can be added here.
+    // Other types like Bytes, etc. can be added here.
 }
 
 macro_rules! impl_from_for_literal {

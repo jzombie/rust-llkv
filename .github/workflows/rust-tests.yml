@@ -63,6 +63,8 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
+        env:
+          LLKV_SLT_STATS: 1
 
   test:
     name: test
