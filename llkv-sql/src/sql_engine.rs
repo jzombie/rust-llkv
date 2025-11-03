@@ -432,6 +432,38 @@ where
         re.replace_all(sql, "$1)").to_string()
     }
 
+    /// Preprocess SQL to handle empty IN lists.
+    ///
+    /// SQLite permits `expr IN ()` and `expr NOT IN ()` as degenerate forms of IN expressions.
+    /// The sqlparser library rejects these, so we convert them to constant boolean expressions:
+    /// `expr IN ()` becomes `expr = NULL AND 0 = 1` (always false), and `expr NOT IN ()`
+    /// becomes `expr = NULL OR 1 = 1` (always true). The `expr = NULL` component ensures the
+    /// original expression is still evaluated (in case it has side effects), while the constant
+    /// comparison determines the final result.
+    fn preprocess_empty_in_lists(sql: &str) -> String {
+        static EMPTY_IN_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: expression NOT IN () or expression IN ()
+        // We need to capture the expression before the IN keyword to preserve it
+        // This pattern matches any expression followed by [NOT] IN ()
+        let re = EMPTY_IN_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)(\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*|\d+)\s+(NOT\s+)?IN\s*\(\s*\)")
+                .expect("valid empty IN regex")
+        });
+
+        re.replace_all(sql, |caps: &regex::Captures| {
+            let expr = &caps[1];
+            if caps.get(2).is_some() {
+                // expr NOT IN () → always true (but still evaluate expr)
+                format!("({} = NULL OR 1 = 1)", expr)
+            } else {
+                // expr IN () → always false (but still evaluate expr)
+                format!("({} = NULL AND 0 = 1)", expr)
+            }
+        })
+        .to_string()
+    }
+
     pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
         self.engine.context()
     }
@@ -498,6 +530,7 @@ where
         let processed_sql = Self::preprocess_create_type_syntax(sql);
         let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
         let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
+        let processed_sql = Self::preprocess_empty_in_lists(&processed_sql);
 
         let dialect = GenericDialect {};
         let statements = parse_sql_with_recursion_limit(&dialect, &processed_sql)
@@ -9208,6 +9241,109 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 0, "expected IN list filter to remove all rows");
+    }
+
+    #[test]
+    fn empty_in_list_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE test_table(col INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO test_table VALUES (1), (2), (3)")
+            .expect("insert rows");
+
+        let batches = engine
+            .sql("SELECT * FROM test_table WHERE col IN ()")
+            .expect("run empty IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "expected empty IN list to filter all rows");
+    }
+
+    #[test]
+    fn empty_not_in_list_preserves_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE test_table(col INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO test_table VALUES (1), (2), (3)")
+            .expect("insert rows");
+
+        let batches = engine
+            .sql("SELECT * FROM test_table WHERE col NOT IN () ORDER BY col")
+            .expect("run empty NOT IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 3,
+            "expected empty NOT IN list to preserve all rows"
+        );
+
+        let mut values: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    values.push(column.value(idx));
+                }
+            }
+        }
+
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn empty_in_list_with_constant_expression() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        let batches = engine
+            .sql("SELECT 1 IN ()")
+            .expect("run constant empty IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 1, "expected one result row");
+
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int column")
+            .value(0);
+
+        assert_eq!(value, 0, "expected 1 IN () to evaluate to 0 (false)");
+    }
+
+    #[test]
+    fn empty_not_in_list_with_constant_expression() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        let batches = engine
+            .sql("SELECT 1 NOT IN ()")
+            .expect("run constant empty NOT IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 1, "expected one result row");
+
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int column")
+            .value(0);
+
+        assert_eq!(value, 1, "expected 1 NOT IN () to evaluate to 1 (true)");
     }
 
     #[test]
