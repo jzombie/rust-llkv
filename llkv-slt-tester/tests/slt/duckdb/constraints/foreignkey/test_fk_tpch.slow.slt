@@ -183,7 +183,8 @@ SELECT R_REGIONKEY, R_NAME, R_COMMENT FROM region
 1	AMERICA	test region
 
 # Verify nation with foreign key reference to region
-query IITI
+# Note: DuckDB originally had this query type wrong, as `IITI`
+query ITTI
 SELECT N_NATIONKEY, N_NAME, N_COMMENT, N_REGIONKEY FROM nation
 ----
 1	UNITED STATES	test nation	1

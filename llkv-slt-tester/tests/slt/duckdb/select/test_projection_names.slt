@@ -9,7 +9,7 @@ CREATE TABLE integers("COL1" INTEGER, "COL2" INTEGER)
 statement ok
 CREATE TABLE tbl AS SELECT * FROM integers
 
-query I
+query T
 SELECT name FROM pragma_table_info('tbl') ORDER BY name
 ----
 COL1
@@ -22,7 +22,7 @@ DROP TABLE tbl
 statement ok
 CREATE TABLE tbl AS SELECT COL1, COL2 FROM integers
 
-query I
+query T
 SELECT name FROM pragma_table_info('tbl') ORDER BY name
 ----
 COL1
@@ -35,7 +35,7 @@ DROP TABLE tbl
 statement ok
 CREATE TABLE tbl AS SELECT integers.COL1, integers.COL2 FROM integers
 
-query I
+query T
 SELECT name FROM pragma_table_info('tbl') ORDER BY name
 ----
 COL1
@@ -54,7 +54,7 @@ CREATE TABLE s1.integers("COL1" INTEGER, "COL2" INTEGER)
 statement ok
 CREATE TABLE tbl AS SELECT s1.integers.COL1, s1.integers.COL2 FROM s1.integers
 
-query I
+query T
 SELECT name FROM pragma_table_info('tbl') ORDER BY name
 ----
 COL1

@@ -6,7 +6,7 @@
 
 use std::{convert::TryFrom, sync::Arc};
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
@@ -153,6 +153,25 @@ impl NumericArray {
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| Error::Internal("cast produced non-Int64 array".into()))?
                     .clone();
+                Ok(NumericArray::from_int(Arc::new(int_array)))
+            }
+            DataType::Utf8 => {
+                // SQLite-style coercion: TEXT to numeric, non-numeric becomes 0
+                let string_array = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| Error::Internal("expected StringArray".into()))?;
+                let mut int_values: Vec<Option<i64>> = Vec::with_capacity(string_array.len());
+                for i in 0..string_array.len() {
+                    if string_array.is_null(i) {
+                        int_values.push(None);
+                    } else {
+                        let text = string_array.value(i);
+                        let parsed = text.trim().parse::<i64>().unwrap_or(0);
+                        int_values.push(Some(parsed));
+                    }
+                }
+                let int_array = Int64Array::from(int_values);
                 Ok(NumericArray::from_int(Arc::new(int_array)))
             }
             DataType::Null => {

@@ -250,21 +250,15 @@ impl AsyncDB for EngineHarness {
                                                 .unwrap();
                                             if a.is_null(row_idx) {
                                                 "NULL".to_string()
-                                            } else if matches!(
-                                                expected_type,
-                                                Some(DefaultColumnType::Integer)
-                                            ) {
-                                                // SQLite-style numeric coercion for text in integer context:
-                                                // Parse leading numeric prefix, return 0 for non-numeric
-                                                let text = a.value(row_idx);
-                                                text.trim_start()
-                                                    .split(|c: char| !matches!(c, '0'..='9' | '-' | '+' | '.'))
-                                                    .next()
-                                                    .and_then(|s| s.parse::<f64>().ok())
-                                                    .map(|f| (f.trunc() as i64).to_string())
-                                                    .unwrap_or_else(|| "0".to_string())
                                             } else {
-                                                a.value(row_idx).to_string()
+                                                let text = a.value(row_idx);
+                                                // SQLite-style coercion: when test expects INTEGER output, parse text as number
+                                                // This only applies to SELECT output, not intermediate arithmetic operations
+                                                if matches!(expected_type, Some(DefaultColumnType::Integer)) {
+                                                    text.trim().parse::<i64>().unwrap_or(0).to_string()
+                                                } else {
+                                                    text.to_string()
+                                                }
                                             }
                                         }
                                         arrow::datatypes::DataType::Boolean => {
