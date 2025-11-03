@@ -27,3 +27,5 @@ out.txt
 .cargo_home/
 
 temp/
+
+vendor/

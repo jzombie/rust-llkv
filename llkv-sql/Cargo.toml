@@ -23,6 +23,7 @@ simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
 tracing = { workspace = true }
 llkv-plan.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }

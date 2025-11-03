@@ -1,5 +1,6 @@
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::sync::{
     Arc, OnceLock,
@@ -8,9 +9,11 @@ use std::sync::{
 
 use crate::SqlResult;
 use crate::SqlValue;
-use arrow::array::Array;
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::compute::{concat_batches, take};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow::row::{RowConverter, SortField};
 
 use llkv_executor::{SelectExecution, push_query_label};
 use llkv_expr::literal::Literal;
@@ -40,8 +43,8 @@ use sqlparser::ast::{
     FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
     JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
     OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, Set, SetExpr, SetQuantifier, SqlOption, Statement,
-    TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
+    SelectItemQualifiedWildcardKind, Set, SetExpr, SetOperator, SetQuantifier, SqlOption,
+    Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
     TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
@@ -1218,18 +1221,59 @@ where
         // Otherwise, look it up in the committed catalog
         let (_, canonical_name) = llkv_table::canonical_table_name(display_name)
             .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
+
         match context.catalog().table_column_specs(&canonical_name) {
-            Ok(specs) => Ok(specs
+            Ok(specs) if !specs.is_empty() => Ok(specs
                 .into_iter()
                 .map(|spec| spec.name.to_ascii_lowercase())
                 .collect()),
-            Err(err) => {
-                if !Self::is_table_missing_error(&err) {
-                    return Err(Self::map_table_error(display_name, err));
+            Ok(_) => {
+                if let Some(table_id) = context.catalog().table_id(&canonical_name)
+                    && let Some(resolver) = context.catalog().field_resolver(table_id)
+                {
+                    let fallback: HashSet<String> = resolver
+                        .field_names()
+                        .into_iter()
+                        .map(|name| name.to_ascii_lowercase())
+                        .collect();
+                    tracing::debug!(
+                        "collect_known_columns: using resolver fallback for '{}': {:?}",
+                        display_name,
+                        fallback
+                    );
+                    return Ok(fallback);
                 }
-
-                Ok(HashSet::new())
+                Ok(HashSet::default())
             }
+            Err(err) => {
+                if Self::is_table_missing_error(&err) {
+                    Ok(HashSet::default())
+                } else {
+                    Err(Self::map_table_error(display_name, err))
+                }
+            }
+        }
+    }
+
+    fn parse_view_query(sql: &str) -> SqlResult<Query> {
+        use sqlparser::ast::Statement;
+
+        let dialect = GenericDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).map_err(|err| {
+            Error::InvalidArgumentError(format!("failed to parse view definition: {}", err))
+        })?;
+
+        if statements.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "view definition must contain a single SELECT statement".into(),
+            ));
+        }
+
+        match statements.pop().unwrap() {
+            Statement::Query(query) => Ok(*query),
+            _ => Err(Error::InvalidArgumentError(
+                "view definition must be expressed as a SELECT query".into(),
+            )),
         }
     }
 
@@ -1335,7 +1379,7 @@ where
             .collect();
 
         let mut columns: Vec<PlanColumnSpec> = Vec::with_capacity(column_defs_ast.len());
-        let mut primary_key_columns: HashSet<String> = HashSet::new();
+        let mut primary_key_columns: HashSet<String> = HashSet::default();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
         let mut multi_column_uniques: Vec<MultiColumnUniqueSpec> = Vec::new();
 
@@ -1449,7 +1493,8 @@ where
 
         // Apply supported table-level constraints (e.g., PRIMARY KEY)
         if !constraints.is_empty() {
-            let mut column_lookup: HashMap<String, usize> = HashMap::with_capacity(columns.len());
+            let mut column_lookup: HashMap<String, usize> = HashMap::default();
+            column_lookup.reserve(columns.len());
             for (idx, column) in columns.iter().enumerate() {
                 column_lookup.insert(column.name.to_ascii_lowercase(), idx);
             }
@@ -1752,7 +1797,7 @@ where
         };
 
         let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
-        let mut seen_column_names: HashSet<String> = HashSet::new();
+        let mut seen_column_names: HashSet<String> = HashSet::default();
         for item in columns {
             // Check WITH FILL before calling helper (not part of standard validation)
             if item.column.with_fill.is_some() {
@@ -1992,7 +2037,7 @@ where
     fn handle_create_view(
         &self,
         name: ObjectName,
-        _columns: Vec<sqlparser::ast::ViewColumnDef>,
+        columns: Vec<sqlparser::ast::ViewColumnDef>,
         query: Box<sqlparser::ast::Query>,
         materialized: bool,
         or_replace: bool,
@@ -2063,12 +2108,79 @@ where
             )));
         }
 
-        // Convert query to SQL string for storage
-        let view_definition = query.to_string();
+        // Capture and normalize optional column list definitions.
+        let column_names: Vec<String> = columns
+            .into_iter()
+            .map(|column| column.name.value)
+            .collect();
 
-        // Create the view using the runtime context helper
+        if !column_names.is_empty() {
+            ensure_unique_case_insensitive(column_names.iter().map(|name| name.as_str()), |dup| {
+                format!("duplicate column name '{}' in CREATE VIEW column list", dup)
+            })?;
+        }
+
+        let mut query_ast = *query;
+
+        if !column_names.is_empty() {
+            let select = match query_ast.body.as_mut() {
+                sqlparser::ast::SetExpr::Select(select) => select,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "CREATE VIEW column list requires a SELECT query".into(),
+                    ));
+                }
+            };
+
+            for item in &select.projection {
+                if matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                ) {
+                    return Err(Error::InvalidArgumentError(
+                        "CREATE VIEW column lists with wildcard projections are not supported yet"
+                            .into(),
+                    ));
+                }
+            }
+
+            if select.projection.len() != column_names.len() {
+                return Err(Error::InvalidArgumentError(format!(
+                    "CREATE VIEW column list specifies {} column(s) but SELECT projection yields {}",
+                    column_names.len(),
+                    select.projection.len()
+                )));
+            }
+
+            for (item, column_name) in select.projection.iter_mut().zip(column_names.iter()) {
+                match item {
+                    SelectItem::ExprWithAlias { alias, .. } => {
+                        alias.value = column_name.clone();
+                    }
+                    SelectItem::UnnamedExpr(expr) => {
+                        *item = SelectItem::ExprWithAlias {
+                            expr: expr.clone(),
+                            alias: Ident::new(column_name.clone()),
+                        };
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "CREATE VIEW column list requires simple SELECT projections".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Validate the view SELECT plan after applying optional column aliases and capture it.
+        let select_plan = self.build_select_plan(query_ast.clone())?;
+
+        // Convert query to SQL string for storage (after applying column aliases when present)
+        let view_definition = query_ast.to_string();
+
+        // Create the view through the runtime context so catalog and metadata stay authoritative.
         let context = self.engine.context();
-        context.create_view(&display_name, view_definition)?;
+        context.create_view(&display_name, view_definition, select_plan, if_not_exists)?;
 
         tracing::debug!("Created view: {}", display_name);
         Ok(RuntimeStatementResult::NoOp)
@@ -2789,7 +2901,7 @@ where
         let table_id = catalog.table_id(&canonical_name);
 
         let mut column_assignments = Vec::with_capacity(assignments.len());
-        let mut seen: HashMap<String, ()> = HashMap::new();
+        let mut seen: HashMap<String, ()> = HashMap::default();
         for assignment in assignments {
             let column_name = resolve_assignment_column_name(&assignment.target)?;
             let normalized = column_name.to_ascii_lowercase();
@@ -3042,6 +3154,20 @@ where
 
                     self.execute_plan_statement(llkv_plan::PlanStatement::DropTable(plan))
                         .map_err(|err| Self::map_table_error(&table_name, err))?;
+                }
+
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            ObjectType::View => {
+                if cascade || restrict {
+                    return Err(Error::InvalidArgumentError(
+                        "DROP VIEW CASCADE/RESTRICT is not supported".into(),
+                    ));
+                }
+
+                for name in names {
+                    let view_name = Self::object_name_to_string(&name)?;
+                    self.engine.context().drop_view(&view_name, if_exists)?;
                 }
 
                 Ok(RuntimeStatementResult::NoOp)
@@ -3875,6 +4001,27 @@ where
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
+        let mut visited_views = HashSet::default();
+        self.execute_query_with_view_support(query, &mut visited_views)
+    }
+
+    fn execute_query_with_view_support(
+        &self,
+        query: Query,
+        visited_views: &mut HashSet<String>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        if let Some(result) = self.try_execute_simple_view_select(&query, visited_views)? {
+            return Ok(result);
+        }
+
+        if let Some(result) = self.try_execute_view_set_operation(&query, visited_views)? {
+            return Ok(result);
+        }
+
+        if let Some(result) = self.try_execute_simple_derived_select(&query, visited_views)? {
+            return Ok(result);
+        }
+
         // Check for pragma_table_info() table function first
         if let Some(result) = self.try_handle_pragma_table_info(&query)? {
             return Ok(result);
@@ -3882,6 +4029,839 @@ where
 
         let select_plan = self.build_select_plan(query)?;
         self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)))
+    }
+
+    fn try_execute_simple_view_select(
+        &self,
+        query: &Query,
+        visited_views: &mut HashSet<String>,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        use sqlparser::ast::SetExpr;
+
+        // Reject complex query forms upfront.
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return Ok(None);
+        }
+
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return Ok(None),
+        };
+
+        if select.distinct.is_some()
+            || select.selection.is_some()
+            || !group_by_is_empty(&select.group_by)
+            || select.having.is_some()
+            || !select.cluster_by.is_empty()
+            || !select.distribute_by.is_empty()
+            || !select.sort_by.is_empty()
+            || select.top.is_some()
+            || select.value_table_mode.is_some()
+            || !select.named_window.is_empty()
+            || select.qualify.is_some()
+            || select.connect_by.is_some()
+        {
+            return Ok(None);
+        }
+
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+
+        let table_with_joins = &select.from[0];
+        if table_with_joins_has_join(table_with_joins) {
+            return Ok(None);
+        }
+
+        let (view_display_name, view_canonical_name, table_alias) = match &table_with_joins.relation
+        {
+            TableFactor::Table { name, alias, .. } => {
+                let (display, canonical) = canonical_object_name(name)?;
+                let catalog = self.engine.context().table_catalog();
+                let Some(table_id) = catalog.table_id(&canonical) else {
+                    return Ok(None);
+                };
+                if !self.engine.context().is_view(table_id)? {
+                    return Ok(None);
+                }
+                let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+                (display, canonical, alias_name)
+            }
+            _ => return Ok(None),
+        };
+
+        // Gather projection mapping for simple column selection.
+        enum ProjectionKind {
+            All,
+            Columns(Vec<(String, String)>), // (source column, output name)
+        }
+
+        let projection = if select
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard(_)))
+        {
+            if select.projection.len() != 1 {
+                return Ok(None);
+            }
+            ProjectionKind::All
+        } else {
+            let mut columns = Vec::with_capacity(select.projection.len());
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => {
+                        let name = ident.value.clone();
+                        columns.push((name.clone(), name));
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        let source = match expr {
+                            SqlExpr::Identifier(ident) => ident.value.clone(),
+                            SqlExpr::CompoundIdentifier(idents) => {
+                                if idents.is_empty() {
+                                    return Ok(None);
+                                }
+                                idents.last().unwrap().value.clone()
+                            }
+                            _ => return Ok(None),
+                        };
+                        columns.push((source, alias.value.clone()));
+                    }
+                    SelectItem::UnnamedExpr(SqlExpr::CompoundIdentifier(parts)) => {
+                        if parts.is_empty() {
+                            return Ok(None);
+                        }
+                        // Allow optional table qualifier matching alias or view name.
+                        if parts.len() == 2 {
+                            let qualifier = parts[0].value.to_ascii_lowercase();
+                            if let Some(ref alias_name) = table_alias {
+                                if qualifier != alias_name.to_ascii_lowercase() {
+                                    return Ok(None);
+                                }
+                            } else if qualifier != view_display_name.to_ascii_lowercase() {
+                                return Ok(None);
+                            }
+                        } else if parts.len() != 1 {
+                            return Ok(None);
+                        }
+                        let column_name = parts.last().unwrap().value.clone();
+                        columns.push((column_name.clone(), column_name));
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            ProjectionKind::Columns(columns)
+        };
+
+        let context = self.engine.context();
+        let definition = context
+            .view_definition(&view_canonical_name)?
+            .ok_or_else(|| {
+                Error::CatalogError(format!(
+                    "Binder Error: view '{}' does not have a stored definition",
+                    view_display_name
+                ))
+            })?;
+
+        if !visited_views.insert(view_canonical_name.clone()) {
+            return Err(Error::CatalogError(format!(
+                "Binder Error: cyclic view reference involving '{}'",
+                view_display_name
+            )));
+        }
+
+        let view_query = Self::parse_view_query(&definition)?;
+        let view_result = self.execute_query_with_view_support(view_query, visited_views);
+        visited_views.remove(&view_canonical_name);
+        let view_result = view_result?;
+
+        let RuntimeStatementResult::Select {
+            execution: view_execution,
+            schema: view_schema,
+            ..
+        } = view_result
+        else {
+            return Err(Error::InvalidArgumentError(format!(
+                "view '{}' definition did not produce a SELECT result",
+                view_display_name
+            )));
+        };
+
+        match projection {
+            ProjectionKind::All => {
+                // Reuse the original execution and schema.
+                let select_result = RuntimeStatementResult::Select {
+                    execution: view_execution,
+                    table_name: view_display_name,
+                    schema: view_schema,
+                };
+                Ok(Some(select_result))
+            }
+            ProjectionKind::Columns(columns) => {
+                let exec = *view_execution;
+                let batches = exec.collect()?;
+                let view_fields = view_schema.fields();
+                let mut name_to_index = HashMap::default();
+                name_to_index.reserve(view_fields.len());
+                for (idx, field) in view_fields.iter().enumerate() {
+                    name_to_index.insert(field.name().to_ascii_lowercase(), idx);
+                }
+
+                let mut column_indices = Vec::with_capacity(columns.len());
+                let mut projected_fields = Vec::with_capacity(columns.len());
+
+                for (source, output) in columns {
+                    let lookup = source.to_ascii_lowercase();
+                    let Some(&idx) = name_to_index.get(&lookup) else {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Binder Error: view '{}' does not have a column named '{}'",
+                            view_display_name, source
+                        )));
+                    };
+                    column_indices.push(idx);
+                    let origin_field = view_fields[idx].clone();
+                    let projected_field = Field::new(
+                        &output,
+                        origin_field.data_type().clone(),
+                        origin_field.is_nullable(),
+                    )
+                    .with_metadata(origin_field.metadata().clone());
+                    projected_fields.push(projected_field);
+                }
+
+                let projected_schema = Arc::new(Schema::new(projected_fields));
+
+                let mut projected_batches = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_indices.len());
+                    for idx in &column_indices {
+                        arrays.push(Arc::clone(batch.column(*idx)));
+                    }
+                    let projected = RecordBatch::try_new(Arc::clone(&projected_schema), arrays)?;
+                    projected_batches.push(projected);
+                }
+
+                let combined_batch = if projected_batches.is_empty() {
+                    RecordBatch::new_empty(Arc::clone(&projected_schema))
+                } else if projected_batches.len() == 1 {
+                    projected_batches.remove(0)
+                } else {
+                    concat_batches(&projected_schema, projected_batches.iter())?
+                };
+
+                let select_execution = SelectExecution::from_batch(
+                    view_display_name.clone(),
+                    Arc::clone(&projected_schema),
+                    combined_batch,
+                );
+
+                Ok(Some(RuntimeStatementResult::Select {
+                    execution: Box::new(select_execution),
+                    table_name: view_display_name,
+                    schema: projected_schema,
+                }))
+            }
+        }
+    }
+
+    fn try_execute_simple_derived_select(
+        &self,
+        query: &Query,
+        visited_views: &mut HashSet<String>,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        use sqlparser::ast::{Expr as SqlExpr, SelectItem, SetExpr};
+
+        // Support only plain SELECT queries without WITH, ORDER BY, LIMIT, or FETCH clauses.
+        if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+            return Ok(None);
+        }
+        if query.fetch.is_some() {
+            return Ok(None);
+        }
+
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return Ok(None),
+        };
+
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+
+        let table_with_joins = &select.from[0];
+        let (subquery, alias, lateral) = match &table_with_joins.relation {
+            TableFactor::Derived {
+                subquery,
+                alias,
+                lateral,
+                ..
+            } => (subquery, alias.as_ref(), *lateral),
+            _ => return Ok(None),
+        };
+
+        if table_with_joins_has_join(table_with_joins) {
+            return Err(Error::InvalidArgumentError(
+                "Binder Error: derived table queries with JOINs are not supported yet".into(),
+            ));
+        }
+
+        if lateral {
+            return Err(Error::InvalidArgumentError(
+                "Binder Error: LATERAL derived tables are not supported yet".into(),
+            ));
+        }
+        if select.distinct.is_some()
+            || select.selection.is_some()
+            || !group_by_is_empty(&select.group_by)
+            || select.having.is_some()
+            || !select.cluster_by.is_empty()
+            || !select.distribute_by.is_empty()
+            || !select.sort_by.is_empty()
+            || select.top.is_some()
+            || select.value_table_mode.is_some()
+            || !select.named_window.is_empty()
+            || select.qualify.is_some()
+            || select.connect_by.is_some()
+        {
+            return Err(Error::InvalidArgumentError(
+                "Binder Error: advanced clauses are not supported for derived table queries yet"
+                    .into(),
+            ));
+        }
+
+        let inner_query = *subquery.clone();
+        let inner_result = self.execute_query_with_view_support(inner_query, visited_views)?;
+        let (inner_exec, inner_schema, inner_table_name) =
+            self.extract_select_result(inner_result)?;
+
+        let alias_name = alias.map(|a| a.name.value.clone());
+        let alias_columns = alias.and_then(|a| {
+            if a.columns.is_empty() {
+                None
+            } else {
+                Some(
+                    a.columns
+                        .iter()
+                        .map(|col| col.name.value.clone())
+                        .collect::<Vec<_>>(),
+                )
+            }
+        });
+
+        if let Some(ref columns) = alias_columns
+            && columns.len() != inner_schema.fields().len()
+        {
+            return Err(Error::InvalidArgumentError(
+                "Binder Error: derived table column alias count must match projection".into(),
+            ));
+        }
+
+        let alias_lower = alias_name.as_ref().map(|name| name.to_ascii_lowercase());
+        let inner_lower = inner_table_name.to_ascii_lowercase();
+
+        enum DerivedProjection {
+            All,
+            Columns(Vec<(String, String)>),
+        }
+
+        let resolve_compound_identifier = |parts: &[Ident]| -> SqlResult<String> {
+            if parts.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "Binder Error: empty identifier in derived table projection".into(),
+                ));
+            }
+            if parts.len() == 1 {
+                return Ok(parts[0].value.clone());
+            }
+            if parts.len() == 2 {
+                let qualifier_lower = parts[0].value.to_ascii_lowercase();
+                let qualifier_display = parts[0].value.clone();
+                if let Some(ref alias_lower) = alias_lower {
+                    if qualifier_lower != *alias_lower {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Binder Error: derived table qualifier '{}' does not match alias '{}'",
+                            qualifier_display,
+                            alias_name.as_deref().unwrap_or(""),
+                        )));
+                    }
+                } else if qualifier_lower != inner_lower {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: derived table qualifier '{}' does not match subquery name '{}'",
+                        qualifier_display, inner_table_name
+                    )));
+                }
+                return Ok(parts[1].value.clone());
+            }
+            Err(Error::InvalidArgumentError(
+                "Binder Error: multi-part qualified identifiers are not supported for derived tables yet"
+                    .into(),
+            ))
+        };
+
+        let build_projection_columns = |items: &[SelectItem]| -> SqlResult<Vec<(String, String)>> {
+            let mut columns = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => {
+                        let name = ident.value.clone();
+                        columns.push((name.clone(), name));
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        let source = match expr {
+                            SqlExpr::Identifier(ident) => ident.value.clone(),
+                            SqlExpr::CompoundIdentifier(parts) => {
+                                resolve_compound_identifier(parts)?
+                            }
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "Binder Error: complex expressions in derived table projections are not supported yet"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        columns.push((source, alias.value.clone()))
+                    }
+                    SelectItem::UnnamedExpr(SqlExpr::CompoundIdentifier(parts)) => {
+                        let column = resolve_compound_identifier(parts)?;
+                        columns.push((column.clone(), column));
+                    }
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Binder Error: unsupported derived table projection {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            Ok(columns)
+        };
+
+        let projection = if select.projection.len() == 1 {
+            match &select.projection[0] {
+                SelectItem::Wildcard(_) => DerivedProjection::All,
+                SelectItem::QualifiedWildcard(kind, _) => match kind {
+                    SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                        let qualifier = Self::object_name_to_string(name)?;
+                        let qualifier_lower = qualifier.to_ascii_lowercase();
+                        if let Some(ref alias_lower) = alias_lower {
+                            if qualifier_lower != *alias_lower {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Binder Error: derived table qualifier '{}' does not match alias '{}'",
+                                    qualifier,
+                                    alias_name.as_deref().unwrap_or(""),
+                                )));
+                            }
+                        } else if qualifier_lower != inner_lower {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "Binder Error: derived table qualifier '{}' does not match subquery name '{}'",
+                                qualifier, inner_table_name
+                            )));
+                        }
+                        DerivedProjection::All
+                    }
+                    SelectItemQualifiedWildcardKind::Expr(_) => {
+                        return Err(Error::InvalidArgumentError(
+                                "Binder Error: expression-qualified wildcards are not supported for derived tables yet"
+                                    .into(),
+                            ));
+                    }
+                },
+                _ => DerivedProjection::Columns(build_projection_columns(&select.projection)?),
+            }
+        } else {
+            if select.projection.iter().any(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                )
+            }) {
+                return Err(Error::InvalidArgumentError(
+                    "Binder Error: derived table projections cannot mix wildcards with explicit columns"
+                        .into(),
+                ));
+            }
+            DerivedProjection::Columns(build_projection_columns(&select.projection)?)
+        };
+
+        let mut batches = inner_exec.collect()?;
+        let output_table_name = alias_name.clone().unwrap_or(inner_table_name.clone());
+
+        let mut name_to_index = HashMap::default();
+        for (idx, field) in inner_schema.fields().iter().enumerate() {
+            name_to_index.insert(field.name().to_ascii_lowercase(), idx);
+        }
+        if let Some(ref columns) = alias_columns {
+            for (idx, alias_col) in columns.iter().enumerate() {
+                name_to_index.insert(alias_col.to_ascii_lowercase(), idx);
+            }
+        }
+
+        let mut build_projected_result = |column_mappings: Vec<(String, String)>| -> SqlResult<_> {
+            let mut column_indices = Vec::with_capacity(column_mappings.len());
+            let mut projected_fields = Vec::with_capacity(column_mappings.len());
+
+            for (source, output) in column_mappings {
+                let key = source.to_ascii_lowercase();
+                let Some(&idx) = name_to_index.get(&key) else {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: derived table does not provide a column named '{}'",
+                        source
+                    )));
+                };
+                column_indices.push(idx);
+                let origin_field = inner_schema.field(idx).clone();
+                let projected_field = Field::new(
+                    &output,
+                    origin_field.data_type().clone(),
+                    origin_field.is_nullable(),
+                )
+                .with_metadata(origin_field.metadata().clone());
+                projected_fields.push(projected_field);
+            }
+
+            let projected_schema = Arc::new(Schema::new(projected_fields));
+            let mut projected_batches = Vec::with_capacity(batches.len());
+            for batch in batches.drain(..) {
+                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(column_indices.len());
+                for idx in &column_indices {
+                    arrays.push(Arc::clone(batch.column(*idx)));
+                }
+                let projected = RecordBatch::try_new(Arc::clone(&projected_schema), arrays)
+                    .map_err(|err| {
+                        Error::Internal(format!(
+                            "failed to construct derived table projection batch: {err}"
+                        ))
+                    })?;
+                projected_batches.push(projected);
+            }
+
+            let combined_batch = if projected_batches.is_empty() {
+                RecordBatch::new_empty(Arc::clone(&projected_schema))
+            } else if projected_batches.len() == 1 {
+                projected_batches.remove(0)
+            } else {
+                concat_batches(&projected_schema, projected_batches.iter()).map_err(|err| {
+                    Error::Internal(format!(
+                        "failed to concatenate derived table batches: {err}"
+                    ))
+                })?
+            };
+
+            Ok((projected_schema, combined_batch))
+        };
+
+        let (final_schema, combined_batch) = match projection {
+            DerivedProjection::All => {
+                if let Some(columns) = alias_columns {
+                    let mappings = columns
+                        .iter()
+                        .map(|name| (name.clone(), name.clone()))
+                        .collect::<Vec<_>>();
+                    build_projected_result(mappings)?
+                } else {
+                    let schema = Arc::clone(&inner_schema);
+                    let combined = if batches.is_empty() {
+                        RecordBatch::new_empty(Arc::clone(&schema))
+                    } else if batches.len() == 1 {
+                        batches.remove(0)
+                    } else {
+                        concat_batches(&schema, batches.iter()).map_err(|err| {
+                            Error::Internal(format!(
+                                "failed to concatenate derived table batches: {err}"
+                            ))
+                        })?
+                    };
+                    (schema, combined)
+                }
+            }
+            DerivedProjection::Columns(mappings) => build_projected_result(mappings)?,
+        };
+
+        let execution = SelectExecution::from_batch(
+            output_table_name.clone(),
+            Arc::clone(&final_schema),
+            combined_batch,
+        );
+
+        Ok(Some(RuntimeStatementResult::Select {
+            execution: Box::new(execution),
+            table_name: output_table_name,
+            schema: final_schema,
+        }))
+    }
+
+    fn try_execute_view_set_operation(
+        &self,
+        query: &Query,
+        visited_views: &mut HashSet<String>,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        if !matches!(query.body.as_ref(), SetExpr::SetOperation { .. }) {
+            return Ok(None);
+        }
+
+        if query.with.is_some()
+            || query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || query.fetch.is_some()
+        {
+            return Ok(None);
+        }
+
+        if !self.set_expr_contains_view(query.body.as_ref())? {
+            return Ok(None);
+        }
+
+        let result = self.evaluate_set_expr(query.body.as_ref(), visited_views)?;
+        Ok(Some(result))
+    }
+
+    fn evaluate_set_expr(
+        &self,
+        expr: &SetExpr,
+        visited_views: &mut HashSet<String>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        match expr {
+            SetExpr::SetOperation {
+                left,
+                right,
+                op,
+                set_quantifier,
+            } => {
+                let left_result = self.evaluate_set_expr(left.as_ref(), visited_views)?;
+                let right_result = self.evaluate_set_expr(right.as_ref(), visited_views)?;
+                self.combine_set_results(left_result, right_result, *op, *set_quantifier)
+            }
+            SetExpr::Query(subquery) => {
+                self.execute_query_with_view_support(*subquery.clone(), visited_views)
+            }
+            _ => self.execute_setexpr_query(expr, visited_views),
+        }
+    }
+
+    fn execute_setexpr_query(
+        &self,
+        expr: &SetExpr,
+        visited_views: &mut HashSet<String>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let sql = expr.to_string();
+        let dialect = GenericDialect {};
+        let statements = parse_sql_with_recursion_limit(&dialect, &sql).map_err(|err| {
+            Error::InvalidArgumentError(format!(
+                "failed to parse expanded view query '{sql}': {err}"
+            ))
+        })?;
+
+        let mut iter = statements.into_iter();
+        let statement = iter.next().ok_or_else(|| {
+            Error::InvalidArgumentError("expanded view query did not produce a statement".into())
+        })?;
+        if iter.next().is_some() {
+            return Err(Error::InvalidArgumentError(
+                "expanded view query produced multiple statements".into(),
+            ));
+        }
+
+        let query = match statement {
+            Statement::Query(q) => *q,
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "expanded view query did not produce a SELECT statement: {other:?}"
+                )));
+            }
+        };
+
+        self.execute_query_with_view_support(query, visited_views)
+    }
+
+    fn combine_set_results(
+        &self,
+        left: RuntimeStatementResult<P>,
+        right: RuntimeStatementResult<P>,
+        op: SetOperator,
+        quantifier: SetQuantifier,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        match op {
+            SetOperator::Union => self.union_select_results(left, right, quantifier),
+            other => Err(Error::InvalidArgumentError(format!(
+                "Binder Error: unsupported set operator {other:?} in view query"
+            ))),
+        }
+    }
+
+    fn union_select_results(
+        &self,
+        left: RuntimeStatementResult<P>,
+        right: RuntimeStatementResult<P>,
+        quantifier: SetQuantifier,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let (left_exec, left_schema, left_name) = self.extract_select_result(left)?;
+        let (right_exec, right_schema, _) = self.extract_select_result(right)?;
+
+        self.ensure_schemas_compatible(&left_schema, &right_schema)?;
+
+        let mut batches = Vec::new();
+        batches.extend(left_exec.collect()?);
+        batches.extend(right_exec.collect()?);
+
+        let mut combined_batch = if batches.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&left_schema))
+        } else if batches.len() == 1 {
+            batches.pop().expect("length checked above")
+        } else {
+            concat_batches(&left_schema, batches.iter()).map_err(|err| {
+                Error::Internal(format!("failed to concatenate UNION batches: {err}"))
+            })?
+        };
+
+        if matches!(quantifier, SetQuantifier::Distinct) {
+            combined_batch = self.distinct_batch(&left_schema, combined_batch)?;
+        }
+
+        let execution = SelectExecution::from_batch(
+            left_name.clone(),
+            Arc::clone(&left_schema),
+            combined_batch,
+        );
+
+        Ok(RuntimeStatementResult::Select {
+            execution: Box::new(execution),
+            table_name: left_name,
+            schema: left_schema,
+        })
+    }
+
+    fn extract_select_result(
+        &self,
+        result: RuntimeStatementResult<P>,
+    ) -> SqlResult<(SelectExecution<P>, Arc<Schema>, String)> {
+        match result {
+            RuntimeStatementResult::Select {
+                execution,
+                schema,
+                table_name,
+            } => Ok((*execution, schema, table_name)),
+            _ => Err(Error::InvalidArgumentError(
+                "expected SELECT result while evaluating set operation".into(),
+            )),
+        }
+    }
+
+    fn ensure_schemas_compatible(&self, left: &Arc<Schema>, right: &Arc<Schema>) -> SqlResult<()> {
+        if left.fields().len() != right.fields().len() {
+            return Err(Error::InvalidArgumentError(
+                "Binder Error: UNION inputs project different column counts".into(),
+            ));
+        }
+
+        for (idx, (l_field, r_field)) in left.fields().iter().zip(right.fields().iter()).enumerate()
+        {
+            if l_field.data_type() != r_field.data_type() {
+                return Err(Error::InvalidArgumentError(format!(
+                    "Binder Error: UNION column {} type mismatch ({:?} vs {:?})",
+                    idx + 1,
+                    l_field.data_type(),
+                    r_field.data_type()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn distinct_batch(&self, schema: &Arc<Schema>, batch: RecordBatch) -> SqlResult<RecordBatch> {
+        if batch.num_rows() <= 1 {
+            return Ok(batch);
+        }
+
+        let sort_fields: Vec<SortField> = schema
+            .fields()
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect();
+
+        let converter = RowConverter::new(sort_fields)
+            .map_err(|err| Error::Internal(format!("failed to initialize row converter: {err}")))?;
+        let rows = converter
+            .convert_columns(batch.columns())
+            .map_err(|err| Error::Internal(format!("failed to row-encode union result: {err}")))?;
+
+        let mut seen = HashSet::default();
+        let mut indices = Vec::new();
+        let mut has_duplicates = false;
+        for (idx, row) in rows.iter().enumerate() {
+            if seen.insert(row) {
+                indices.push(idx as u32);
+            } else {
+                has_duplicates = true;
+            }
+        }
+
+        if !has_duplicates {
+            return Ok(batch);
+        }
+
+        let index_array = UInt32Array::from(indices);
+        let mut columns = Vec::with_capacity(batch.num_columns());
+        for column in batch.columns() {
+            let taken = take(column.as_ref(), &index_array, None).map_err(|err| {
+                Error::Internal(format!("failed to materialize DISTINCT rows: {err}"))
+            })?;
+            columns.push(taken);
+        }
+
+        RecordBatch::try_new(Arc::clone(schema), columns)
+            .map_err(|err| Error::Internal(format!("failed to build DISTINCT RecordBatch: {err}")))
+    }
+
+    fn set_expr_contains_view(&self, expr: &SetExpr) -> SqlResult<bool> {
+        match expr {
+            SetExpr::Select(select) => self.select_contains_view(select.as_ref()),
+            SetExpr::Query(query) => self.set_expr_contains_view(&query.body),
+            SetExpr::SetOperation { left, right, .. } => Ok(self
+                .set_expr_contains_view(left.as_ref())?
+                || self.set_expr_contains_view(right.as_ref())?),
+            _ => Ok(false),
+        }
+    }
+
+    fn select_contains_view(&self, select: &Select) -> SqlResult<bool> {
+        for from_item in &select.from {
+            if self.table_with_joins_contains_view(from_item)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn table_with_joins_contains_view(&self, table: &TableWithJoins) -> SqlResult<bool> {
+        if self.table_factor_contains_view(&table.relation)? {
+            return Ok(true);
+        }
+
+        for join in &table.joins {
+            if self.table_factor_contains_view(&join.relation)? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn table_factor_contains_view(&self, factor: &TableFactor) -> SqlResult<bool> {
+        match factor {
+            TableFactor::Table { name, .. } => {
+                let (_, canonical) = canonical_object_name(name)?;
+                let catalog = self.engine.context().table_catalog();
+                let Some(table_id) = catalog.table_id(&canonical) else {
+                    return Ok(false);
+                };
+                self.engine.context().is_view(table_id)
+            }
+            TableFactor::Derived { subquery, .. } => self.set_expr_contains_view(&subquery.body),
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => self.table_with_joins_contains_view(table_with_joins),
+            _ => Ok(false),
+        }
     }
 
     fn build_select_plan(&self, query: Query) -> SqlResult<SelectPlan> {

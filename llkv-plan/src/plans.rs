@@ -11,6 +11,7 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_expr::expr::SubqueryId;
 use llkv_result::Error;
+use rustc_hash::FxHashMap;
 
 /// Result type for plan operations.
 pub type PlanResult<T> = llkv_result::Result<T>;
@@ -71,7 +72,7 @@ pub enum PlanValue {
     Integer(i64),
     Float(f64),
     String(String),
-    Struct(std::collections::HashMap<String, PlanValue>),
+    Struct(FxHashMap<String, PlanValue>),
 }
 
 impl From<&str> for PlanValue {
@@ -139,7 +140,7 @@ pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanV
         Literal::String(s) => Ok(PlanValue::String(s.clone())),
         Literal::Boolean(b) => Ok(PlanValue::from(*b)),
         Literal::Struct(fields) => {
-            let mut map = std::collections::HashMap::new();
+            let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
             for (name, value) in fields {
                 let plan_value = plan_value_from_literal(value)?;
                 map.insert(name.clone(), plan_value);

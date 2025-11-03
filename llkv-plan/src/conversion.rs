@@ -5,6 +5,7 @@
 //! and range SELECT parsing.
 
 use llkv_result::{Error, Result};
+use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
     SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator, Value,
@@ -56,7 +57,7 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         } => plan_value_from_sql_expr(expr),
         SqlExpr::Nested(inner) => plan_value_from_sql_expr(inner),
         SqlExpr::Dictionary(fields) => {
-            let mut map = std::collections::HashMap::new();
+            let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
             for field in fields {
                 let key = field.key.value.clone();
                 let value = plan_value_from_sql_expr(&field.value)?;

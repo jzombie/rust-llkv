@@ -1,8 +1,8 @@
 use crate::SqlResult;
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
+use rustc_hash::FxHashMap;
 use sqlparser::ast::{Expr as SqlExpr, UnaryOperator, Value, ValueWithSpan};
-use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub(crate) enum SqlValue {
@@ -11,7 +11,7 @@ pub(crate) enum SqlValue {
     Float(f64),
     Boolean(bool),
     String(String),
-    Struct(HashMap<String, SqlValue>),
+    Struct(FxHashMap<String, SqlValue>),
 }
 
 impl SqlValue {
@@ -53,7 +53,7 @@ impl SqlValue {
     }
 
     fn from_dictionary(fields: &[sqlparser::ast::DictionaryField]) -> SqlResult<Self> {
-        let mut map = HashMap::new();
+        let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
         for field in fields {
             let key = field.key.value.clone();
             let value = match field.value.as_ref() {
@@ -106,7 +106,7 @@ impl From<SqlValue> for PlanValue {
             SqlValue::Boolean(v) => PlanValue::Integer(if v { 1 } else { 0 }),
             SqlValue::String(s) => PlanValue::String(s),
             SqlValue::Struct(fields) => {
-                let converted: HashMap<String, PlanValue> = fields
+                let converted: FxHashMap<String, PlanValue> = fields
                     .into_iter()
                     .map(|(k, v)| (k, PlanValue::from(v)))
                     .collect();

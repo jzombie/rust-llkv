@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use llkv_result::{Error, Result};
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 /// Ensure that a slice is not empty.
 pub fn ensure_non_empty<T, F>(items: &[T], make_error: F) -> Result<()>
@@ -26,7 +26,7 @@ where
     I: IntoIterator<Item = &'a str>,
     F: Fn(&str) -> String,
 {
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
     for name in names {
         let normalized = name.to_ascii_lowercase();
         if !seen.insert(normalized) {
@@ -39,7 +39,7 @@ where
 /// Ensure that every column in `columns` exists in `known_lower` (case-insensitive lookup).
 pub fn ensure_known_columns_case_insensitive<'a, I, F>(
     columns: I,
-    known_lower: &HashSet<String>,
+    known_lower: &FxHashSet<String>,
     make_error: F,
 ) -> Result<()>
 where

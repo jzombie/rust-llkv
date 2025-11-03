@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use llkv_plan::plans::PlanValue;
 use llkv_runtime::RuntimeStatementResult;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
@@ -106,4 +107,94 @@ fn create_table_with_table_level_primary_key() {
         .expect_err("primary key NULL should error");
     let err_str = format!("{err}").to_ascii_lowercase();
     assert!(err_str.contains("null"), "unexpected error: {err_str}");
+}
+
+#[test]
+fn drop_view_basic_flow() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    engine
+        .execute("CREATE TABLE base(value INTEGER);")
+        .expect("create base table");
+    let mut created = engine
+        .execute("CREATE VIEW base_view AS SELECT value FROM base;")
+        .expect("create view succeeds");
+    assert_eq!(created.len(), 1);
+    assert!(matches!(created.remove(0), RuntimeStatementResult::NoOp));
+
+    let mut dropped = engine
+        .execute("DROP VIEW base_view;")
+        .expect("drop view succeeds");
+    assert_eq!(dropped.len(), 1);
+    assert!(matches!(dropped.remove(0), RuntimeStatementResult::NoOp));
+
+    let mut recreated = engine
+        .execute("CREATE VIEW base_view AS SELECT value FROM base;")
+        .expect("recreate view succeeds");
+    assert_eq!(recreated.len(), 1);
+    assert!(matches!(recreated.remove(0), RuntimeStatementResult::NoOp));
+}
+
+#[test]
+fn drop_view_if_exists_missing_noop() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    let mut results = engine
+        .execute("DROP VIEW IF EXISTS missing_view;")
+        .expect("drop view IF EXISTS succeeds");
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results.remove(0), RuntimeStatementResult::NoOp));
+}
+
+#[test]
+fn select_from_view_uses_column_alias() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    engine
+        .execute("CREATE TABLE base(pk INTEGER, payload TEXT);")
+        .expect("create base table");
+    engine
+        .execute("INSERT INTO base VALUES (1, 'a');")
+        .expect("insert row");
+    engine
+        .execute("CREATE VIEW base_view(pk_alias) AS SELECT pk FROM base;")
+        .expect("create view with column alias");
+
+    let mut results = engine
+        .execute("SELECT pk_alias FROM base_view;")
+        .expect("select from view should succeed");
+    assert_eq!(results.len(), 1);
+    let RuntimeStatementResult::Select { execution, .. } = results.remove(0) else {
+        panic!("expected select result");
+    };
+    let batches = execution.collect_rows().expect("collect rows");
+    assert_eq!(batches.rows.len(), 1);
+    assert_eq!(batches.rows[0][0], PlanValue::Integer(1));
+}
+
+#[test]
+fn drop_view_errors_when_target_is_table() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    engine
+        .execute("CREATE TABLE base(value INTEGER);")
+        .expect("create base table");
+
+    let err = engine
+        .execute("DROP VIEW base;")
+        .expect_err("DROP VIEW should fail when target is a table");
+    let err_text = format!("{err}");
+    assert!(
+        err_text.contains("use DROP TABLE to delete table"),
+        "unexpected error: {err_text}"
+    );
+
+    let err_if_exists = engine
+        .execute("DROP VIEW IF EXISTS base;")
+        .expect_err("IF EXISTS does not downgrade table vs view mismatch");
+    let err_text_if_exists = format!("{err_if_exists}");
+    assert!(
+        err_text_if_exists.contains("use DROP TABLE to delete table"),
+        "unexpected error: {err_text_if_exists}"
+    );
 }

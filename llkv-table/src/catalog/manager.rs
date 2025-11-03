@@ -219,7 +219,14 @@ where
         &self,
         display_name: &str,
         view_definition: String,
+        column_specs: Vec<PlanColumnSpec>,
     ) -> LlkvResult<crate::types::TableId> {
+        if column_specs.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE VIEW requires at least one column".into(),
+            ));
+        }
+
         use crate::sys_catalog::TableMeta;
 
         // Reserve a new table ID for the view
@@ -240,12 +247,42 @@ where
             view_definition: Some(view_definition),
         };
 
+        let mut table_columns = Vec::with_capacity(column_specs.len());
+        for (idx, spec) in column_specs.iter().enumerate() {
+            let field_id = field_id_for_index(idx)?;
+            table_columns.push(TableColumn {
+                field_id,
+                name: spec.name.clone(),
+                data_type: spec.data_type.clone(),
+                nullable: spec.nullable,
+                primary_key: spec.primary_key,
+                unique: spec.unique,
+                check_expr: spec.check_expr.clone(),
+            });
+        }
+
         // Store the metadata and flush to disk
         self.metadata.set_table_meta(table_id, table_meta)?;
+        self.metadata
+            .apply_column_definitions(table_id, &table_columns, created_at_micros)?;
         self.metadata.flush_table(table_id)?;
 
         // Register the view in the catalog so it can be looked up by name
         self.catalog.register_table(display_name, table_id)?;
+
+        if let Some(field_resolver) = self.catalog.field_resolver(table_id) {
+            for column in &table_columns {
+                let definition = FieldDefinition::new(&column.name)
+                    .with_primary_key(column.primary_key)
+                    .with_unique(column.unique)
+                    .with_check_expr(column.check_expr.clone());
+                if let Err(err) = field_resolver.register_field(definition) {
+                    self.catalog.unregister_table(table_id);
+                    self.metadata.remove_table_state(table_id);
+                    return Err(err);
+                }
+            }
+        }
 
         tracing::debug!("Created view '{}' with table_id={}", display_name, table_id);
         Ok(table_id)
@@ -258,6 +295,22 @@ where
             Some(meta) => Ok(meta.view_definition.is_some()),
             None => Ok(false),
         }
+    }
+
+    /// Drop a view by removing its metadata and catalog entry.
+    pub fn drop_view(&self, canonical_name: &str, table_id: TableId) -> LlkvResult<()> {
+        let (_, field_ids) = self.sorted_user_fields(table_id);
+        self.metadata.prepare_table_drop(table_id, &field_ids)?;
+        self.metadata.flush_table(table_id)?;
+        self.metadata.remove_table_state(table_id);
+
+        if let Some(table_id_from_catalog) = self.catalog.table_id(canonical_name) {
+            let _ = self.catalog.unregister_table(table_id_from_catalog);
+        } else {
+            let _ = self.catalog.unregister_table(table_id);
+        }
+
+        Ok(())
     }
 
     // ============================================================================
