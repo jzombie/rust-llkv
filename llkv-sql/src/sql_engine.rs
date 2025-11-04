@@ -7698,7 +7698,9 @@ fn translate_scalar_internal(
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo
                     | BinaryOperator::And
-                    | BinaryOperator::Or => {
+                    | BinaryOperator::Or
+                    | BinaryOperator::PGBitwiseShiftLeft
+                    | BinaryOperator::PGBitwiseShiftRight => {
                         work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp {
                             op: op.clone(),
                         }));
@@ -8157,6 +8159,22 @@ fn translate_scalar_internal(
                             let expr = llkv_expr::expr::ScalarExpr::binary(
                                 left_expr,
                                 llkv_expr::expr::BinaryOp::Or,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::PGBitwiseShiftLeft => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::BitwiseShiftLeft,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::PGBitwiseShiftRight => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::BitwiseShiftRight,
                                 right_expr,
                             );
                             result_stack.push(expr);

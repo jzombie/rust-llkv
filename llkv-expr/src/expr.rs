@@ -267,6 +267,8 @@ pub enum BinaryOp {
     Modulo,
     And,
     Or,
+    BitwiseShiftLeft,
+    BitwiseShiftRight,
 }
 
 /// Comparison operator for scalar expressions.

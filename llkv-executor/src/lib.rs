@@ -5781,7 +5781,7 @@ where
                                 }
                                 left_num % right_num
                             }
-                            BinaryOp::And | BinaryOp::Or => unreachable!(),
+                            BinaryOp::And | BinaryOp::Or | BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => unreachable!(),
                         };
 
                         if matches!(op, BinaryOp::Divide) {
@@ -5796,6 +5796,44 @@ where
                     }
                     BinaryOp::And => Ok(evaluate_plan_value_logical_and(left_val, right_val)),
                     BinaryOp::Or => Ok(evaluate_plan_value_logical_or(left_val, right_val)),
+                    BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
+                        if matches!(&left_val, PlanValue::Null)
+                            || matches!(&right_val, PlanValue::Null)
+                        {
+                            return Ok(PlanValue::Null);
+                        }
+                        
+                        // Convert to integers
+                        let lhs = match left_val {
+                            PlanValue::Integer(i) => i,
+                            PlanValue::Float(f) => f as i64,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Non-numeric value {:?} in bitwise shift operation",
+                                    other
+                                )));
+                            }
+                        };
+                        let rhs = match right_val {
+                            PlanValue::Integer(i) => i,
+                            PlanValue::Float(f) => f as i64,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Non-numeric value {:?} in bitwise shift operation",
+                                    other
+                                )));
+                            }
+                        };
+                        
+                        // Use wrapping arithmetic like SQLite
+                        let result = match op {
+                            BinaryOp::BitwiseShiftLeft => lhs.wrapping_shl(rhs as u32),
+                            BinaryOp::BitwiseShiftRight => lhs.wrapping_shr(rhs as u32),
+                            _ => unreachable!(),
+                        };
+                        
+                        Ok(PlanValue::Integer(result))
+                    }
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
@@ -6041,7 +6079,7 @@ where
                                     }
                                     lhs.checked_rem(rhs)
                                 }
-                                BinaryOp::And | BinaryOp::Or => unreachable!(),
+                                BinaryOp::And | BinaryOp::Or | BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => unreachable!(),
                             };
 
                             result.map(Some).ok_or_else(|| {
@@ -6054,6 +6092,17 @@ where
                     },
                     BinaryOp::And => Ok(evaluate_option_logical_and(left_val, right_val)),
                     BinaryOp::Or => Ok(evaluate_option_logical_or(left_val, right_val)),
+                    BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => match (left_val, right_val) {
+                        (Some(lhs), Some(rhs)) => {
+                            let result = match op {
+                                BinaryOp::BitwiseShiftLeft => Some(lhs.wrapping_shl(rhs as u32)),
+                                BinaryOp::BitwiseShiftRight => Some(lhs.wrapping_shr(rhs as u32)),
+                                _ => unreachable!(),
+                            };
+                            Ok(result)
+                        }
+                        _ => Ok(None),
+                    },
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
@@ -7737,8 +7786,26 @@ fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Opt
                 BinaryOp::Multiply => multiply_literals(left, right),
                 BinaryOp::Divide => divide_literals(left, right),
                 BinaryOp::Modulo => modulo_literals(left, right),
-                BinaryOp::And | BinaryOp::Or => unreachable!(),
+                BinaryOp::And | BinaryOp::Or | BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => unreachable!(),
             }
+        }
+        BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
+            if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
+                return Some(Literal::Null);
+            }
+            
+            // Convert both operands to integers
+            let lhs = literal_to_i128(left)?;
+            let rhs = literal_to_i128(right)?;
+            
+            // SQLite uses wrapping arithmetic for shifts (operate on i64 then extend to i128)
+            let result = match op {
+                BinaryOp::BitwiseShiftLeft => (lhs as i64).wrapping_shl(rhs as u32) as i128,
+                BinaryOp::BitwiseShiftRight => (lhs as i64).wrapping_shr(rhs as u32) as i128,
+                _ => unreachable!(),
+            };
+            
+            Some(Literal::Integer(result))
         }
     }
 }

@@ -2,7 +2,7 @@ use crate::SqlResult;
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
-use sqlparser::ast::{Expr as SqlExpr, UnaryOperator, Value, ValueWithSpan};
+use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, UnaryOperator, Value, ValueWithSpan};
 
 #[derive(Clone, Debug)]
 pub(crate) enum SqlValue {
@@ -46,6 +46,42 @@ impl SqlValue {
             },
             SqlExpr::Nested(inner) => SqlValue::try_from_expr(inner),
             SqlExpr::Dictionary(fields) => SqlValue::from_dictionary(fields),
+            SqlExpr::BinaryOp { left, op, right } => {
+                // Support bitwise shifts for INSERT VALUES (e.g., 1<<63)
+                match op {
+                    BinaryOperator::PGBitwiseShiftLeft | BinaryOperator::PGBitwiseShiftRight => {
+                        let lhs = SqlValue::try_from_expr(left)?;
+                        let rhs = SqlValue::try_from_expr(right)?;
+                        
+                        let lhs_i64 = match lhs {
+                            SqlValue::Integer(i) => i,
+                            SqlValue::Float(f) => f as i64,
+                            _ => return Err(Error::InvalidArgumentError(
+                                "bitwise shift requires numeric operands".into()
+                            )),
+                        };
+                        
+                        let rhs_i64 = match rhs {
+                            SqlValue::Integer(i) => i,
+                            SqlValue::Float(f) => f as i64,
+                            _ => return Err(Error::InvalidArgumentError(
+                                "bitwise shift requires numeric operands".into()
+                            )),
+                        };
+                        
+                        let result = match op {
+                            BinaryOperator::PGBitwiseShiftLeft => lhs_i64.wrapping_shl(rhs_i64 as u32),
+                            BinaryOperator::PGBitwiseShiftRight => lhs_i64.wrapping_shr(rhs_i64 as u32),
+                            _ => unreachable!(),
+                        };
+                        
+                        Ok(SqlValue::Integer(result))
+                    }
+                    _ => Err(Error::InvalidArgumentError(
+                        "unsupported binary operation in literal expression".into()
+                    )),
+                }
+            }
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported literal expression: {other:?}"
             ))),
