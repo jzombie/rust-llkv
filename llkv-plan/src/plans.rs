@@ -942,6 +942,7 @@ pub enum AggregateExpr {
 pub enum AggregateFunction {
     Count,
     SumInt64,
+    TotalInt64,
     MinInt64,
     MaxInt64,
     CountNulls,
@@ -977,6 +978,15 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::SumInt64,
+            distinct: false,
+        }
+    }
+
+    pub fn total_int64(column: impl Into<String>, alias: impl Into<String>) -> Self {
+        Self::Column {
+            column: column.into(),
+            alias: alias.into(),
+            function: AggregateFunction::TotalInt64,
             distinct: false,
         }
     }

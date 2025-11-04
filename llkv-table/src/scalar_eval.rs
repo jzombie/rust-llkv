@@ -389,6 +389,7 @@ impl NumericKernels {
                     llkv_expr::expr::AggregateCall::CountStar => {}
                     llkv_expr::expr::AggregateCall::Count { expr, .. }
                     | llkv_expr::expr::AggregateCall::Sum { expr, .. }
+                    | llkv_expr::expr::AggregateCall::Total { expr, .. }
                     | llkv_expr::expr::AggregateCall::Avg { expr, .. }
                     | llkv_expr::expr::AggregateCall::Min(expr)
                     | llkv_expr::expr::AggregateCall::Max(expr)

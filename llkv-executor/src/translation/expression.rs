@@ -267,6 +267,15 @@ where
                         )?),
                         distinct: *distinct,
                     },
+                    AggregateCall::Total { expr, distinct } => AggregateCall::Total {
+                        expr: Box::new(translate_scalar_with(
+                            expr,
+                            schema,
+                            unknown_column,
+                            _unknown_aggregate,
+                        )?),
+                        distinct: *distinct,
+                    },
                     AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
                         expr: Box::new(translate_scalar_with(
                             expr,

@@ -2002,6 +2002,18 @@ where
                                 distinct: *distinct,
                             }
                         }
+                        AggregateFunction::TotalInt64 => {
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "TOTAL",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
+                            AggregateKind::Total {
+                                field_id: column_index as u32,
+                                data_type: input_type,
+                                distinct: *distinct,
+                            }
+                        }
                         AggregateFunction::MinInt64 => {
                             let input_type = Self::validate_aggregate_type(
                                 Some(field.data_type().clone()),
@@ -2256,6 +2268,7 @@ where
                 }
                 AggregateCall::Count { expr, .. }
                 | AggregateCall::Sum { expr, .. }
+                | AggregateCall::Total { expr, .. }
                 | AggregateCall::Avg { expr, .. }
                 | AggregateCall::Min(expr)
                 | AggregateCall::Max(expr)
@@ -2300,6 +2313,23 @@ where
                                 )
                             })?;
                             AggregateKind::Sum {
+                                field_id,
+                                data_type: input_type,
+                                distinct: *distinct,
+                            }
+                        }
+                        AggregateCall::Total { distinct, .. } => {
+                            let input_type = Self::validate_aggregate_type(
+                                data_type_opt.clone(),
+                                "TOTAL",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            AggregateKind::Total {
                                 field_id,
                                 data_type: input_type,
                                 distinct: *distinct,
@@ -3763,6 +3793,7 @@ where
                     AggregateCall::CountStar => (None, None),
                     AggregateCall::Count { expr, .. }
                     | AggregateCall::Sum { expr, .. }
+                    | AggregateCall::Total { expr, .. }
                     | AggregateCall::Avg { expr, .. }
                     | AggregateCall::Min(expr)
                     | AggregateCall::Max(expr)
@@ -3995,6 +4026,18 @@ where
                                 &[DataType::Int64, DataType::Float64],
                             )?;
                             AggregateKind::Sum {
+                                field_id: col.field_id,
+                                data_type: input_type,
+                                distinct,
+                            }
+                        }
+                        AggregateFunction::TotalInt64 => {
+                            let input_type = Self::validate_aggregate_type(
+                                Some(col.data_type.clone()),
+                                "TOTAL",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
+                            AggregateKind::Total {
                                 field_id: col.field_id,
                                 data_type: input_type,
                                 distinct,
@@ -4348,6 +4391,15 @@ where
                 )?,
                 distinct: *distinct,
             },
+            AggregateCall::Total { distinct, .. } => llkv_aggregate::AggregateKind::Total {
+                field_id: 0,
+                data_type: Self::validate_aggregate_type(
+                    data_type.clone(),
+                    "TOTAL",
+                    &[DataType::Int64, DataType::Float64],
+                )?,
+                distinct: *distinct,
+            },
             AggregateCall::Avg { distinct, .. } => llkv_aggregate::AggregateKind::Avg {
                 field_id: 0,
                 data_type: Self::validate_aggregate_type(
@@ -4616,6 +4668,53 @@ where
                     specs.push(AggregateSpec {
                         alias: key.clone(),
                         kind: AggregateKind::Sum {
+                            field_id,
+                            data_type: normalized_type,
+                            distinct: *distinct,
+                        },
+                    });
+                    spec_to_projection.push(Some(projection_index));
+                }
+                AggregateCall::Total { expr, distinct } => {
+                    let (projection_index, data_type, field_id) =
+                        if let Some(col_name) = try_extract_simple_column(expr) {
+                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in aggregate",
+                                    col_name
+                                ))
+                            })?;
+                            let projection_index = get_or_insert_column_projection(
+                                &mut projections,
+                                &mut column_projection_cache,
+                                table_ref,
+                                col,
+                            );
+                            let data_type = col.data_type.clone();
+                            (projection_index, data_type, col.field_id)
+                        } else {
+                            let (projection_index, inferred_type) = ensure_computed_projection(
+                                expr,
+                                table_ref,
+                                &mut projections,
+                                &mut computed_projection_cache,
+                                &mut computed_alias_counter,
+                            )?;
+                            let field_id = u32::try_from(projection_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            (projection_index, inferred_type, field_id)
+                        };
+                    let normalized_type = Self::validate_aggregate_type(
+                        Some(data_type.clone()),
+                        "TOTAL",
+                        &[DataType::Int64, DataType::Float64],
+                    )?;
+                    specs.push(AggregateSpec {
+                        alias: key.clone(),
+                        kind: AggregateKind::Total {
                             field_id,
                             data_type: normalized_type,
                             distinct: *distinct,
@@ -6675,6 +6774,7 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             AggregateCall::CountStar => {}
             AggregateCall::Count { expr, .. }
             | AggregateCall::Sum { expr, .. }
+            | AggregateCall::Total { expr, .. }
             | AggregateCall::Avg { expr, .. }
             | AggregateCall::Min(expr)
             | AggregateCall::Max(expr)
@@ -7354,6 +7454,16 @@ fn evaluate_constant_aggregate(
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             match value {
                 Literal::Null => Some(Literal::Null),
+                Literal::Integer(value) => Some(Literal::Integer(value)),
+                Literal::Float(value) => Some(Literal::Float(value)),
+                Literal::Boolean(flag) => Some(Literal::Integer(if flag { 1 } else { 0 })),
+                _ => None,
+            }
+        }
+        AggregateCall::Total { expr, .. } => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Integer(0)),
                 Literal::Integer(value) => Some(Literal::Integer(value)),
                 Literal::Float(value) => Some(Literal::Float(value)),
                 Literal::Boolean(flag) => Some(Literal::Integer(if flag { 1 } else { 0 })),

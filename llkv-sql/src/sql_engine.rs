@@ -6676,6 +6676,34 @@ fn try_parse_aggregate_function(
                 }
             }
         }
+        "total" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "TOTAL accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "TOTAL requires a column argument".into(),
+                    ));
+                }
+            };
+
+            let expr = translate_scalar_internal(
+                arg_expr,
+                resolver,
+                context,
+                outer_scopes,
+                tracker,
+                None,
+            )?;
+            llkv_expr::expr::AggregateCall::Total {
+                expr: Box::new(expr),
+                distinct,
+            }
+        }
         "min" => {
             if args_slice.len() != 1 {
                 return Err(Error::InvalidArgumentError(

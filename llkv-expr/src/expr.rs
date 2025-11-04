@@ -152,6 +152,10 @@ pub enum AggregateCall<F> {
         expr: Box<ScalarExpr<F>>,
         distinct: bool,
     },
+    Total {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+    },
     Avg {
         expr: Box<ScalarExpr<F>>,
         distinct: bool,
