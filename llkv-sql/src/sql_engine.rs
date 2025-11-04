@@ -444,10 +444,9 @@ where
         static EMPTY_IN_REGEX: OnceLock<Regex> = OnceLock::new();
 
         // Match: expression NOT IN () or expression IN ()
-        // We need to capture the expression before the IN keyword to preserve it
-        // This pattern matches any expression followed by [NOT] IN ()
+        // Matches: parenthesized expressions, quoted strings, hex literals, identifiers, or numbers
         let re = EMPTY_IN_REGEX.get_or_init(|| {
-            Regex::new(r"(?i)(\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*|\d+)\s+(NOT\s+)?IN\s*\(\s*\)")
+            Regex::new(r"(?i)(\([^)]*\)|x'[0-9a-fA-F]*'|'(?:[^']|'')*'|[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*|\d+(?:\.\d+)?)\s+(NOT\s+)?IN\s*\(\s*\)")
                 .expect("valid empty IN regex")
         });
 
@@ -459,6 +458,32 @@ where
             } else {
                 // expr IN () → always false (but still evaluate expr)
                 format!("({} = NULL AND 0 = 1)", expr)
+            }
+        })
+        .to_string()
+    }
+
+    /// Preprocess SQL to convert bare table names in IN clauses to subqueries.
+    ///
+    /// SQLite allows `expr IN tablename` as shorthand for `expr IN (SELECT * FROM tablename)`.
+    /// The sqlparser library requires parentheses, so we convert the shorthand form.
+    fn preprocess_bare_table_in_clauses(sql: &str) -> String {
+        static BARE_TABLE_IN_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: [NOT] IN identifier followed by whitespace/newline/end or specific punctuation
+        // Avoid matching "IN (" which is already a valid subquery
+        let re = BARE_TABLE_IN_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\b(NOT\s+)?IN\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)(\s|$|;|,|\))")
+                .expect("valid bare table IN regex")
+        });
+
+        re.replace_all(sql, |caps: &regex::Captures| {
+            let table_name = &caps[2];
+            let trailing = &caps[3];
+            if let Some(not_keyword) = caps.get(1) {
+                format!("{}IN (SELECT * FROM {}){}", not_keyword.as_str(), table_name, trailing)
+            } else {
+                format!("IN (SELECT * FROM {}){}", table_name, trailing)
             }
         })
         .to_string()
@@ -530,6 +555,7 @@ where
         let processed_sql = Self::preprocess_create_type_syntax(sql);
         let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
         let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
+        let processed_sql = Self::preprocess_bare_table_in_clauses(&processed_sql);
         let processed_sql = Self::preprocess_empty_in_lists(&processed_sql);
 
         let dialect = GenericDialect {};
