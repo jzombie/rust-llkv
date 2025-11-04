@@ -463,6 +463,25 @@ where
         .to_string()
     }
 
+    /// Strip SQLite index hints (INDEXED BY, NOT INDEXED) from table references.
+    ///
+    /// SQLite supports index hints like `FROM table INDEXED BY index_name` or `FROM table NOT INDEXED`.
+    /// These are query optimization hints that guide the query planner's index selection.
+    /// Since sqlparser doesn't support this syntax and our planner makes its own index decisions,
+    /// we strip these hints during preprocessing for compatibility with SQLite SQL Logic Tests.
+    fn preprocess_index_hints(sql: &str) -> String {
+        static INDEX_HINT_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: INDEXED BY index_name or NOT INDEXED
+        // Pattern captures the table reference and removes the index hint
+        let re = INDEX_HINT_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\s+(INDEXED\s+BY\s+[a-zA-Z_][a-zA-Z0-9_]*|NOT\s+INDEXED)\b")
+                .expect("valid index hint regex")
+        });
+
+        re.replace_all(sql, "").to_string()
+    }
+
     /// Preprocess SQL to convert bare table names in IN clauses to subqueries.
     ///
     /// SQLite allows `expr IN tablename` as shorthand for `expr IN (SELECT * FROM tablename)`.
@@ -557,6 +576,7 @@ where
         let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
         let processed_sql = Self::preprocess_bare_table_in_clauses(&processed_sql);
         let processed_sql = Self::preprocess_empty_in_lists(&processed_sql);
+        let processed_sql = Self::preprocess_index_hints(&processed_sql);
 
         let dialect = GenericDialect {};
         let statements = parse_sql_with_recursion_limit(&dialect, &processed_sql)
@@ -8958,6 +8978,8 @@ fn push_table_factor(
 ) -> SqlResult<()> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
+            // Note: Index hints (INDEXED BY, NOT INDEXED) are SQLite-specific query hints
+            // that are ignored by the `..` pattern. We accept them for compatibility.
             let (schema_opt, table) = parse_schema_qualified_name(name)?;
             let schema = schema_opt.unwrap_or_default();
             let alias_name = alias.as_ref().map(|a| a.name.value.clone());
