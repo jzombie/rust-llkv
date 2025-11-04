@@ -3838,6 +3838,14 @@ where
                                         if batch.num_columns() == 0 {
                                             continue;
                                         }
+                                        if batch.num_columns() > 1 {
+                                            return Err(Error::InvalidArgumentError(
+                                                format!(
+                                                    "IN subquery must return exactly one column, got {}",
+                                                    batch.num_columns()
+                                                ),
+                                            ));
+                                        }
                                         let column = batch.column(0);
 
                                         for row_idx in 0..column.len() {
