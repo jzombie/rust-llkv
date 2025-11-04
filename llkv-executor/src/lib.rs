@@ -106,6 +106,7 @@ enum AggregateValue {
     Null,
     Int64(i64),
     Float64(f64),
+    String(String),
 }
 
 impl AggregateValue {
@@ -115,6 +116,7 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v),
             AggregateValue::Float64(v) => Some(*v as i64),
+            AggregateValue::String(s) => s.parse().ok(),
         }
     }
 
@@ -125,6 +127,7 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v as f64),
             AggregateValue::Float64(v) => Some(*v),
+            AggregateValue::String(s) => s.parse().ok(),
         }
     }
 }
@@ -2039,6 +2042,11 @@ where
                         AggregateFunction::CountNulls => AggregateKind::CountNulls {
                             field_id: column_index as u32,
                         },
+                        AggregateFunction::GroupConcat => AggregateKind::GroupConcat {
+                            field_id: column_index as u32,
+                            distinct: *distinct,
+                            separator: ",".to_string(),
+                        },
                     };
 
                     specs.push(AggregateSpec {
@@ -2147,6 +2155,33 @@ where
 
         for projection in &plan.projections {
             if let SelectProjection::Computed { expr, alias } = projection {
+                // Check if this is a simple aggregate expression
+                if let ScalarExpr::Aggregate(agg) = expr {
+                    let key = format!("{:?}", agg);
+                    if let Some(agg_value) = aggregate_values.get(&key) {
+                        match agg_value {
+                            AggregateValue::Null => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
+                                arrays.push(Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef);
+                            }
+                            AggregateValue::Int64(v) => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
+                                arrays.push(Arc::new(Int64Array::from(vec![Some(*v)])) as ArrayRef);
+                            }
+                            AggregateValue::Float64(v) => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Float64, true)));
+                                arrays.push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
+                            }
+                            AggregateValue::String(s) => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Utf8, true)));
+                                arrays.push(Arc::new(StringArray::from(vec![Some(s.as_str())])) as ArrayRef);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                
+                // Complex expression - try to evaluate as integer
                 let value = Self::evaluate_expr_with_aggregates(expr, &aggregate_values)?;
                 fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
                 arrays.push(Arc::new(Int64Array::from(vec![value])) as ArrayRef);
@@ -2272,7 +2307,8 @@ where
                 | AggregateCall::Avg { expr, .. }
                 | AggregateCall::Min(expr)
                 | AggregateCall::Max(expr)
-                | AggregateCall::CountNulls(expr) => {
+                | AggregateCall::CountNulls(expr)
+                | AggregateCall::GroupConcat { expr, .. } => {
                     let (column_index, data_type_opt) = if let Some(column) =
                         try_extract_simple_column(expr)
                     {
@@ -2392,6 +2428,20 @@ where
                             })?;
                             AggregateKind::CountNulls { field_id }
                         }
+                        AggregateCall::GroupConcat {
+                            distinct, separator, ..
+                        } => {
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            AggregateKind::GroupConcat {
+                                field_id,
+                                distinct: *distinct,
+                                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+                            }
+                        }
                         _ => unreachable!(),
                     };
 
@@ -2482,6 +2532,21 @@ where
                     AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float_array.value(0))
+                };
+                results.insert(field.name().to_string(), value);
+            }
+            // Try StringArray for GROUP_CONCAT
+            else if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                if string_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        string_array.len()
+                    )));
+                }
+                let value = if string_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::String(string_array.value(0).to_string())
                 };
                 results.insert(field.name().to_string(), value);
             } else {
@@ -3797,7 +3862,8 @@ where
                     | AggregateCall::Avg { expr, .. }
                     | AggregateCall::Min(expr)
                     | AggregateCall::Max(expr)
-                    | AggregateCall::CountNulls(expr) => {
+                    | AggregateCall::CountNulls(expr)
+                    | AggregateCall::GroupConcat { expr, .. } => {
                         if let Some(col_name) = try_extract_simple_column(expr) {
                             let idx = resolve_column_name_to_index(col_name, &column_lookup_map)
                                 .ok_or_else(|| {
@@ -4075,6 +4141,11 @@ where
                                 field_id: col.field_id,
                             }
                         }
+                        AggregateFunction::GroupConcat => AggregateKind::GroupConcat {
+                            field_id: col.field_id,
+                            distinct,
+                            separator: ",".to_string(),
+                        },
                     };
                     specs.push(AggregateSpec { alias, kind });
                 }
@@ -4333,7 +4404,33 @@ where
                     ));
                 }
                 SelectProjection::Computed { expr, alias } => {
-                    // Evaluate the expression with aggregates substituted
+                    // Check if this is a simple aggregate expression
+                    if let ScalarExpr::Aggregate(agg) = expr {
+                        let key = format!("{:?}", agg);
+                        if let Some(agg_value) = computed_aggregates.get(&key) {
+                            match agg_value {
+                                AggregateValue::Null => {
+                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
+                                    arrays.push(Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef);
+                                }
+                                AggregateValue::Int64(v) => {
+                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
+                                    arrays.push(Arc::new(Int64Array::from(vec![Some(*v)])) as ArrayRef);
+                                }
+                                AggregateValue::Float64(v) => {
+                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Float64, true));
+                                    arrays.push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
+                                }
+                                AggregateValue::String(s) => {
+                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Utf8, true));
+                                    arrays.push(Arc::new(StringArray::from(vec![Some(s.as_str())])) as ArrayRef);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    
+                    // Complex expression - try to evaluate as integer
                     let value = Self::evaluate_expr_with_aggregates(expr, &computed_aggregates)?;
 
                     fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
@@ -4428,6 +4525,13 @@ where
             AggregateCall::CountNulls(_) => {
                 llkv_aggregate::AggregateKind::CountNulls { field_id: 0 }
             }
+            AggregateCall::GroupConcat {
+                distinct, separator, ..
+            } => llkv_aggregate::AggregateKind::GroupConcat {
+                field_id: 0,
+                distinct: *distinct,
+                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+            },
         };
 
         Ok(llkv_aggregate::AggregateSpec { alias, kind })
@@ -4907,6 +5011,57 @@ where
                         spec_to_projection.push(Some(projection_index));
                     }
                 }
+                AggregateCall::GroupConcat {
+                    expr,
+                    distinct,
+                    separator,
+                } => {
+                    if let Some(col_name) = try_extract_simple_column(expr) {
+                        let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::GroupConcat {
+                                field_id: col.field_id,
+                                distinct: *distinct,
+                                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+                            },
+                        });
+                        spec_to_projection.push(Some(projection_index));
+                    } else {
+                        let (projection_index, _dtype) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::GroupConcat {
+                                field_id,
+                                distinct: *distinct,
+                                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+                            },
+                        });
+                        spec_to_projection.push(Some(projection_index));
+                    }
+                }
             }
         }
 
@@ -5024,6 +5179,21 @@ where
                     AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float64_array.value(0))
+                };
+                results.insert(alias, value);
+            } else if let Some(string_array) =
+                array.as_any().downcast_ref::<arrow::array::StringArray>()
+            {
+                if string_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        string_array.len()
+                    )));
+                }
+                let value = if string_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::String(string_array.value(0).to_string())
                 };
                 results.insert(alias, value);
             } else {
@@ -6778,7 +6948,8 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             | AggregateCall::Avg { expr, .. }
             | AggregateCall::Min(expr)
             | AggregateCall::Max(expr)
-            | AggregateCall::CountNulls(expr) => {
+            | AggregateCall::CountNulls(expr)
+            | AggregateCall::GroupConcat { expr, .. } => {
                 collect_field_ids(expr, out);
             }
         },
@@ -7498,6 +7669,17 @@ fn evaluate_constant_aggregate(
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             let count = if matches!(value, Literal::Null) { 1 } else { 0 };
             Some(Literal::Integer(count))
+        }
+        AggregateCall::GroupConcat { expr, separator: _, .. } => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Null),
+                Literal::String(s) => Some(Literal::String(s)),
+                Literal::Integer(i) => Some(Literal::String(i.to_string())),
+                Literal::Float(f) => Some(Literal::String(f.to_string())),
+                Literal::Boolean(b) => Some(Literal::String(if b { "1" } else { "0" }.to_string())),
+                _ => None,
+            }
         }
     }
 }

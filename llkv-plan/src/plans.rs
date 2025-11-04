@@ -946,6 +946,7 @@ pub enum AggregateFunction {
     MinInt64,
     MaxInt64,
     CountNulls,
+    GroupConcat,
 }
 
 impl AggregateExpr {

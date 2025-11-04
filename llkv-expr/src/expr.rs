@@ -163,6 +163,11 @@ pub enum AggregateCall<F> {
     Min(Box<ScalarExpr<F>>),
     Max(Box<ScalarExpr<F>>),
     CountNulls(Box<ScalarExpr<F>>),
+    GroupConcat {
+        expr: Box<ScalarExpr<F>>,
+        distinct: bool,
+        separator: Option<String>,
+    },
 }
 
 impl<F> ScalarExpr<F> {

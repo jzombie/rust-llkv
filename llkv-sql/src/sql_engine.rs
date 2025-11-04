@@ -6799,6 +6799,57 @@ fn try_parse_aggregate_function(
                 distinct,
             }
         }
+        "group_concat" => {
+            if args_slice.is_empty() || args_slice.len() > 2 {
+                return Err(Error::InvalidArgumentError(
+                    "GROUP_CONCAT accepts one or two arguments".into(),
+                ));
+            }
+
+            // First argument is the column/expression
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "GROUP_CONCAT requires a column argument".into(),
+                    ));
+                }
+            };
+
+            let expr = translate_scalar_internal(
+                arg_expr,
+                resolver,
+                context,
+                outer_scopes,
+                tracker,
+                None,
+            )?;
+
+            // Second argument (optional) is the separator
+            let separator = if args_slice.len() == 2 {
+                match &args_slice[1] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(
+                        ValueWithSpan {
+                            value: sqlparser::ast::Value::SingleQuotedString(s),
+                            ..
+                        },
+                    ))) => Some(s.clone()),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "GROUP_CONCAT separator must be a string literal".into(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+
+            llkv_expr::expr::AggregateCall::GroupConcat {
+                expr: Box::new(expr),
+                distinct,
+                separator,
+            }
+        }
         _ => return Ok(None),
     };
 

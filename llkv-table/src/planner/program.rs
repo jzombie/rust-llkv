@@ -657,7 +657,8 @@ fn collect_fields<'expr>(
                 | llkv_expr::expr::AggregateCall::Avg { expr, .. }
                 | llkv_expr::expr::AggregateCall::Min(expr)
                 | llkv_expr::expr::AggregateCall::Max(expr)
-                | llkv_expr::expr::AggregateCall::CountNulls(expr) => {
+                | llkv_expr::expr::AggregateCall::CountNulls(expr)
+                | llkv_expr::expr::AggregateCall::GroupConcat { expr, .. } => {
                     stack.push(expr.as_ref());
                 }
             },

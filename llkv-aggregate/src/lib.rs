@@ -59,6 +59,11 @@ pub enum AggregateKind {
     CountNulls {
         field_id: FieldId,
     },
+    GroupConcat {
+        field_id: FieldId,
+        distinct: bool,
+        separator: String,
+    },
 }
 
 impl AggregateKind {
@@ -71,7 +76,8 @@ impl AggregateKind {
             | AggregateKind::Avg { field_id, .. }
             | AggregateKind::Min { field_id, .. }
             | AggregateKind::Max { field_id, .. }
-            | AggregateKind::CountNulls { field_id } => Some(*field_id),
+            | AggregateKind::CountNulls { field_id }
+            | AggregateKind::GroupConcat { field_id, .. } => Some(*field_id),
         }
     }
 }
@@ -175,6 +181,17 @@ pub enum AggregateAccumulator {
         non_null_rows: i64,
         total_rows_seen: i64,
     },
+    GroupConcat {
+        column_index: usize,
+        values: Vec<String>,
+        separator: String,
+    },
+    GroupConcatDistinct {
+        column_index: usize,
+        seen: FxHashSet<String>,
+        values: Vec<String>,
+        separator: String,
+    },
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -245,6 +262,64 @@ impl DistinctKey {
                 "COUNT(DISTINCT) is not supported for column type {other:?}"
             ))),
         }
+    }
+}
+
+/// Helper function to convert an array value to a string representation.
+///
+/// # Arguments
+///
+/// - `array`: The array to extract the value from
+/// - `index`: The row index
+///
+/// # Errors
+///
+/// Returns an error if the type is unsupported or conversion fails.
+fn array_value_to_string(array: &ArrayRef, index: usize) -> AggregateResult<String> {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("Expected String array".into())
+                })?;
+            Ok(arr.value(index).to_string())
+        }
+        DataType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("Expected Int64 array".into())
+                })?;
+            Ok(arr.value(index).to_string())
+        }
+        DataType::Float64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("Expected Float64 array".into())
+                })?;
+            Ok(arr.value(index).to_string())
+        }
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("Expected Boolean array".into())
+                })?;
+            Ok(if arr.value(index) {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            })
+        }
+        other => Err(Error::InvalidArgumentError(format!(
+            "group_concat does not support column type {other:?}"
+        ))),
     }
 }
 
@@ -435,6 +510,29 @@ impl AggregateAccumulator {
                     non_null_rows: 0,
                     total_rows_seen: 0,
                 })
+            }
+            AggregateKind::GroupConcat {
+                distinct,
+                separator,
+                ..
+            } => {
+                let idx = projection_idx.ok_or_else(|| {
+                    Error::Internal("GroupConcat aggregate requires projection index".into())
+                })?;
+                if *distinct {
+                    Ok(AggregateAccumulator::GroupConcatDistinct {
+                        column_index: idx,
+                        seen: FxHashSet::default(),
+                        values: Vec::new(),
+                        separator: separator.clone(),
+                    })
+                } else {
+                    Ok(AggregateAccumulator::GroupConcat {
+                        column_index: idx,
+                        values: Vec::new(),
+                        separator: separator.clone(),
+                    })
+                }
             }
         }
     }
@@ -916,6 +1014,35 @@ impl AggregateAccumulator {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
                 })?;
             }
+            AggregateAccumulator::GroupConcat {
+                column_index,
+                values,
+                separator: _,
+            } => {
+                let array = batch.column(*column_index);
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        let str_val = array_value_to_string(array, i)?;
+                        values.push(str_val);
+                    }
+                }
+            }
+            AggregateAccumulator::GroupConcatDistinct {
+                column_index,
+                seen,
+                values,
+                separator: _,
+            } => {
+                let array = batch.column(*column_index);
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        let str_val = array_value_to_string(array, i)?;
+                        if seen.insert(str_val.clone()) {
+                            values.push(str_val);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1122,6 +1249,40 @@ impl AggregateAccumulator {
                 builder.append_value(nulls);
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("count_nulls", DataType::Int64, false), array))
+            }
+            AggregateAccumulator::GroupConcat {
+                values, separator, ..
+            } => {
+                use arrow::array::StringBuilder;
+                let mut builder = StringBuilder::with_capacity(1, 256);
+                if values.is_empty() {
+                    builder.append_null();
+                } else {
+                    let result = values.join(&separator);
+                    builder.append_value(&result);
+                }
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((
+                    Field::new("group_concat", DataType::Utf8, true),
+                    array,
+                ))
+            }
+            AggregateAccumulator::GroupConcatDistinct {
+                values, separator, ..
+            } => {
+                use arrow::array::StringBuilder;
+                let mut builder = StringBuilder::with_capacity(1, 256);
+                if values.is_empty() {
+                    builder.append_null();
+                } else {
+                    let result = values.join(&separator);
+                    builder.append_value(&result);
+                }
+                let array = Arc::new(builder.finish()) as ArrayRef;
+                Ok((
+                    Field::new("group_concat", DataType::Utf8, true),
+                    array,
+                ))
             }
         }
     }
