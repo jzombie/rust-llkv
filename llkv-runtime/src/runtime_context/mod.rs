@@ -882,15 +882,17 @@ where
 
             index_name = Some(created_name.clone());
 
-            if let Some(updated_table) =
-                Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
-            {
-                self.tables
-                    .write()
-                    .unwrap()
-                    .insert(canonical_name.clone(), Arc::clone(&updated_table));
-            } else {
-                self.remove_table_entry(&canonical_name);
+            if plan.unique {
+                if let Some(updated_table) =
+                    Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
+                {
+                    self.tables
+                        .write()
+                        .unwrap()
+                        .insert(canonical_name.clone(), Arc::clone(&updated_table));
+                } else {
+                    self.remove_table_entry(&canonical_name);
+                }
             }
 
             drop(table);

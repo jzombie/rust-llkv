@@ -4537,6 +4537,20 @@ where
         Ok(llkv_aggregate::AggregateSpec { alias, kind })
     }
 
+    /// Validate or coerce input data type for aggregates with centralized, scalable type handling.
+    ///
+    /// For numeric aggregates (e.g. SUM, AVG, TOTAL):
+    /// - Implements SQLite-compatible type coercion automatically
+    /// - Int64 and Float64 are used directly
+    /// - Utf8 (strings), Boolean, and Date types are coerced to Float64
+    /// - String values will be parsed at runtime (non-numeric strings -> 0)
+    /// - **Ignores** the `allowed` parameter for these functions
+    ///
+    /// For other aggregates (e.g. MIN, MAX, COUNT, etc.):
+    /// - Only allows types in the `allowed` list
+    ///
+    /// This is the SINGLE centralized function for all aggregate type handling.
+    /// No need to update multiple call sites when adding type support.
     fn validate_aggregate_type(
         data_type: Option<DataType>,
         func_name: &str,
@@ -4547,13 +4561,33 @@ where
                 "missing input type metadata for {func_name} aggregate"
             ))
         })?;
-        if allowed.iter().any(|candidate| candidate == &dt) {
-            Ok(dt)
+        
+        // Numeric aggregates (SUM, AVG, TOTAL) and comparison aggregates (MIN, MAX)
+        // all support SQLite-style type coercion
+        if matches!(func_name, "SUM" | "AVG" | "TOTAL" | "MIN" | "MAX") {
+            match dt {
+                // Numeric types used directly
+                DataType::Int64 | DataType::Float64 => Ok(dt),
+                
+                // SQLite-compatible coercion: strings, booleans, dates -> Float64
+                // Actual conversion happens in llkv-aggregate::array_value_to_numeric
+                DataType::Utf8 | DataType::Boolean | DataType::Date32 => Ok(DataType::Float64),
+                
+                _ => Err(Error::InvalidArgumentError(format!(
+                    "{func_name} aggregate not supported for column type {:?}",
+                    dt
+                ))),
+            }
         } else {
-            Err(Error::InvalidArgumentError(format!(
-                "{func_name} aggregate not supported for column type {:?}",
-                dt
-            )))
+            // Other aggregates use explicit allowed list
+            if allowed.iter().any(|candidate| candidate == &dt) {
+                Ok(dt)
+            } else {
+                Err(Error::InvalidArgumentError(format!(
+                    "{func_name} aggregate not supported for column type {:?}",
+                    dt
+                )))
+            }
         }
     }
 
