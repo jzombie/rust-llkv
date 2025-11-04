@@ -6840,6 +6840,13 @@ fn try_parse_aggregate_function(
                 None
             };
 
+            // SQLite doesn't support DISTINCT with a custom separator
+            if distinct && separator.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "GROUP_CONCAT does not support DISTINCT with a custom separator".into(),
+                ));
+            }
+
             llkv_expr::expr::AggregateCall::GroupConcat {
                 expr: Box::new(expr),
                 distinct,
