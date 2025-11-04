@@ -2170,17 +2170,20 @@ where
                             }
                             AggregateValue::Float64(v) => {
                                 fields.push(Arc::new(Field::new(alias, DataType::Float64, true)));
-                                arrays.push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
+                                arrays
+                                    .push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
                             }
                             AggregateValue::String(s) => {
                                 fields.push(Arc::new(Field::new(alias, DataType::Utf8, true)));
-                                arrays.push(Arc::new(StringArray::from(vec![Some(s.as_str())])) as ArrayRef);
+                                arrays
+                                    .push(Arc::new(StringArray::from(vec![Some(s.as_str())]))
+                                        as ArrayRef);
                             }
                         }
                         continue;
                     }
                 }
-                
+
                 // Complex expression - try to evaluate as integer
                 let value = Self::evaluate_expr_with_aggregates(expr, &aggregate_values)?;
                 fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
@@ -2429,7 +2432,9 @@ where
                             AggregateKind::CountNulls { field_id }
                         }
                         AggregateCall::GroupConcat {
-                            distinct, separator, ..
+                            distinct,
+                            separator,
+                            ..
                         } => {
                             let field_id = u32::try_from(column_index).map_err(|_| {
                                 Error::InvalidArgumentError(
@@ -4410,26 +4415,50 @@ where
                         if let Some(agg_value) = computed_aggregates.get(&key) {
                             match agg_value {
                                 AggregateValue::Null => {
-                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
-                                    arrays.push(Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef);
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Int64,
+                                        true,
+                                    ));
+                                    arrays
+                                        .push(Arc::new(Int64Array::from(vec![None::<i64>]))
+                                            as ArrayRef);
                                 }
                                 AggregateValue::Int64(v) => {
-                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
-                                    arrays.push(Arc::new(Int64Array::from(vec![Some(*v)])) as ArrayRef);
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(
+                                        Arc::new(Int64Array::from(vec![Some(*v)])) as ArrayRef
+                                    );
                                 }
                                 AggregateValue::Float64(v) => {
-                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Float64, true));
-                                    arrays.push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Float64,
+                                        true,
+                                    ));
+                                    arrays
+                                        .push(Arc::new(Float64Array::from(vec![Some(*v)]))
+                                            as ArrayRef);
                                 }
                                 AggregateValue::String(s) => {
-                                    fields.push(arrow::datatypes::Field::new(alias, DataType::Utf8, true));
-                                    arrays.push(Arc::new(StringArray::from(vec![Some(s.as_str())])) as ArrayRef);
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Utf8,
+                                        true,
+                                    ));
+                                    arrays
+                                        .push(Arc::new(StringArray::from(vec![Some(s.as_str())]))
+                                            as ArrayRef);
                                 }
                             }
                             continue;
                         }
                     }
-                    
+
                     // Complex expression - try to evaluate as integer
                     let value = Self::evaluate_expr_with_aggregates(expr, &computed_aggregates)?;
 
@@ -4526,7 +4555,9 @@ where
                 llkv_aggregate::AggregateKind::CountNulls { field_id: 0 }
             }
             AggregateCall::GroupConcat {
-                distinct, separator, ..
+                distinct,
+                separator,
+                ..
             } => llkv_aggregate::AggregateKind::GroupConcat {
                 field_id: 0,
                 distinct: *distinct,
@@ -4561,18 +4592,18 @@ where
                 "missing input type metadata for {func_name} aggregate"
             ))
         })?;
-        
+
         // Numeric aggregates (SUM, AVG, TOTAL) and comparison aggregates (MIN, MAX)
         // all support SQLite-style type coercion
         if matches!(func_name, "SUM" | "AVG" | "TOTAL" | "MIN" | "MAX") {
             match dt {
                 // Numeric types used directly
                 DataType::Int64 | DataType::Float64 => Ok(dt),
-                
+
                 // SQLite-compatible coercion: strings, booleans, dates -> Float64
                 // Actual conversion happens in llkv-aggregate::array_value_to_numeric
                 DataType::Utf8 | DataType::Boolean | DataType::Date32 => Ok(DataType::Float64),
-                
+
                 _ => Err(Error::InvalidArgumentError(format!(
                     "{func_name} aggregate not supported for column type {:?}",
                     dt
@@ -5781,7 +5812,10 @@ where
                                 }
                                 left_num % right_num
                             }
-                            BinaryOp::And | BinaryOp::Or | BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => unreachable!(),
+                            BinaryOp::And
+                            | BinaryOp::Or
+                            | BinaryOp::BitwiseShiftLeft
+                            | BinaryOp::BitwiseShiftRight => unreachable!(),
                         };
 
                         if matches!(op, BinaryOp::Divide) {
@@ -5802,7 +5836,7 @@ where
                         {
                             return Ok(PlanValue::Null);
                         }
-                        
+
                         // Convert to integers
                         let lhs = match left_val {
                             PlanValue::Integer(i) => i,
@@ -5824,14 +5858,14 @@ where
                                 )));
                             }
                         };
-                        
+
                         // Use wrapping arithmetic like SQLite
                         let result = match op {
                             BinaryOp::BitwiseShiftLeft => lhs.wrapping_shl(rhs as u32),
                             BinaryOp::BitwiseShiftRight => lhs.wrapping_shr(rhs as u32),
                             _ => unreachable!(),
                         };
-                        
+
                         Ok(PlanValue::Integer(result))
                     }
                 }
@@ -6079,7 +6113,10 @@ where
                                     }
                                     lhs.checked_rem(rhs)
                                 }
-                                BinaryOp::And | BinaryOp::Or | BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => unreachable!(),
+                                BinaryOp::And
+                                | BinaryOp::Or
+                                | BinaryOp::BitwiseShiftLeft
+                                | BinaryOp::BitwiseShiftRight => unreachable!(),
                             };
 
                             result.map(Some).ok_or_else(|| {
@@ -6092,17 +6129,23 @@ where
                     },
                     BinaryOp::And => Ok(evaluate_option_logical_and(left_val, right_val)),
                     BinaryOp::Or => Ok(evaluate_option_logical_or(left_val, right_val)),
-                    BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => match (left_val, right_val) {
-                        (Some(lhs), Some(rhs)) => {
-                            let result = match op {
-                                BinaryOp::BitwiseShiftLeft => Some(lhs.wrapping_shl(rhs as u32)),
-                                BinaryOp::BitwiseShiftRight => Some(lhs.wrapping_shr(rhs as u32)),
-                                _ => unreachable!(),
-                            };
-                            Ok(result)
+                    BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
+                        match (left_val, right_val) {
+                            (Some(lhs), Some(rhs)) => {
+                                let result = match op {
+                                    BinaryOp::BitwiseShiftLeft => {
+                                        Some(lhs.wrapping_shl(rhs as u32))
+                                    }
+                                    BinaryOp::BitwiseShiftRight => {
+                                        Some(lhs.wrapping_shr(rhs as u32))
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                Ok(result)
+                            }
+                            _ => Ok(None),
                         }
-                        _ => Ok(None),
-                    },
+                    }
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
@@ -7753,7 +7796,9 @@ fn evaluate_constant_aggregate(
             let count = if matches!(value, Literal::Null) { 1 } else { 0 };
             Some(Literal::Integer(count))
         }
-        AggregateCall::GroupConcat { expr, separator: _, .. } => {
+        AggregateCall::GroupConcat {
+            expr, separator: _, ..
+        } => {
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             match value {
                 Literal::Null => Some(Literal::Null),
@@ -7786,25 +7831,28 @@ fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Opt
                 BinaryOp::Multiply => multiply_literals(left, right),
                 BinaryOp::Divide => divide_literals(left, right),
                 BinaryOp::Modulo => modulo_literals(left, right),
-                BinaryOp::And | BinaryOp::Or | BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => unreachable!(),
+                BinaryOp::And
+                | BinaryOp::Or
+                | BinaryOp::BitwiseShiftLeft
+                | BinaryOp::BitwiseShiftRight => unreachable!(),
             }
         }
         BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
             if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
                 return Some(Literal::Null);
             }
-            
+
             // Convert both operands to integers
             let lhs = literal_to_i128(left)?;
             let rhs = literal_to_i128(right)?;
-            
+
             // SQLite uses wrapping arithmetic for shifts (operate on i64 then extend to i128)
             let result = match op {
                 BinaryOp::BitwiseShiftLeft => (lhs as i64).wrapping_shl(rhs as u32) as i128,
                 BinaryOp::BitwiseShiftRight => (lhs as i64).wrapping_shr(rhs as u32) as i128,
                 _ => unreachable!(),
             };
-            
+
             Some(Literal::Integer(result))
         }
     }

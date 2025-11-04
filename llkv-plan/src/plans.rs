@@ -958,7 +958,11 @@ impl AggregateExpr {
         }
     }
 
-    pub fn count_column(column: impl Into<String>, alias: impl Into<String>, distinct: bool) -> Self {
+    pub fn count_column(
+        column: impl Into<String>,
+        alias: impl Into<String>,
+        distinct: bool,
+    ) -> Self {
         Self::Column {
             column: column.into(),
             alias: alias.into(),

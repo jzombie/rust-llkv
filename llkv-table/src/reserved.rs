@@ -187,6 +187,12 @@ pub const CATALOG_FIELD_SINGLE_COLUMN_INDEX_META_ID: u32 = 109;
 /// like DROP INDEX can resolve the owning table and affected fields.
 pub const CATALOG_FIELD_MULTI_COLUMN_INDEX_META_ID: u32 = 110;
 
+/// Catalog field for trigger metadata (Binary-encoded TableTriggerMeta).
+///
+/// Persisted trigger definitions keep CREATE TRIGGER/DROP TRIGGER operations durable and allow
+/// duplicate detection without scanning arbitrary SQL logs.
+pub const CATALOG_FIELD_TRIGGER_META_ID: u32 = 111;
+
 /// Catalog field for constraint metadata (Binary-encoded ConstraintRecord).
 pub const CATALOG_FIELD_CONSTRAINT_META_ID: u32 = 106;
 
@@ -215,6 +221,7 @@ pub fn is_catalog_internal_field(id: u32) -> bool {
             | CATALOG_FIELD_CUSTOM_TYPE_META_ID
             | CATALOG_FIELD_SINGLE_COLUMN_INDEX_META_ID
             | CATALOG_FIELD_MULTI_COLUMN_INDEX_META_ID
+            | CATALOG_FIELD_TRIGGER_META_ID
     )
 }
 
@@ -339,6 +346,7 @@ mod tests {
         assert!(is_catalog_internal_field(CATALOG_FIELD_CONSTRAINT_META_ID));
         assert!(is_catalog_internal_field(CATALOG_FIELD_CONSTRAINT_NAME_ID));
         assert!(is_catalog_internal_field(CATALOG_FIELD_CUSTOM_TYPE_META_ID));
+        assert!(is_catalog_internal_field(CATALOG_FIELD_TRIGGER_META_ID));
         assert!(!is_catalog_internal_field(2));
         assert!(!is_catalog_internal_field(200));
     }

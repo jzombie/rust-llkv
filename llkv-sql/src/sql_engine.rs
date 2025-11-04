@@ -32,20 +32,21 @@ use llkv_runtime::{
     extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
-use llkv_table::CatalogDdl;
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
+use llkv_table::{CatalogDdl, TriggerEventMeta, TriggerTimingMeta};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind,
-    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics,
-    DataType as SqlDataType, Delete, Distinct, ExceptionWhen, Expr as SqlExpr, FromTable,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics, CreateTrigger,
+    DataType as SqlDataType, Delete, Distinct, DropTrigger, ExceptionWhen, Expr as SqlExpr,
+    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
     JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
     OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, SetOperator, SetQuantifier, SqlOption,
     Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
-    TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    TransactionModifier, TriggerEvent, TriggerObject, TriggerPeriod, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -482,6 +483,95 @@ where
         re.replace_all(sql, "").to_string()
     }
 
+    /// Normalize SQLite trigger shorthand so sqlparser accepts the syntax.
+    ///
+    /// SQLite allows omitting the trigger timing (defaulting to AFTER) and the
+    /// `FOR EACH ROW` clause (defaulting to row-level triggers). sqlparser
+    /// requires both pieces to be explicit, so we inject them before parsing.
+    ///
+    /// # TODO
+    ///
+    /// This is a temporary workaround. The proper fix is to extend sqlparser's
+    /// `SQLiteDialect::parse_statement` to handle CREATE TRIGGER with optional
+    /// timing/FOR EACH ROW clauses, matching SQLite's actual grammar. That would
+    /// eliminate this fragile regex preprocessing entirely.
+    fn preprocess_sqlite_trigger_shorthand(sql: &str) -> String {
+        static IDENT_PATTERN: OnceLock<String> = OnceLock::new();
+        static COLUMN_IDENT_PATTERN: OnceLock<String> = OnceLock::new();
+        static TIMING_REGEX: OnceLock<Regex> = OnceLock::new();
+        static FOR_EACH_BEGIN_REGEX: OnceLock<Regex> = OnceLock::new();
+        static FOR_EACH_WHEN_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        IDENT_PATTERN.get_or_init(|| {
+            // Matches optional dotted identifiers with standard or quoted segments.
+            r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"#.to_string()
+        });
+        COLUMN_IDENT_PATTERN.get_or_init(|| {
+            r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)"#.to_string()
+        });
+
+        let timing_re = TIMING_REGEX.get_or_init(|| {
+            let event = format!(
+                "UPDATE(?:\\s+OF\\s+{col}(?:\\s*,\\s*{col})*)?|DELETE|INSERT",
+                col = COLUMN_IDENT_PATTERN
+                    .get()
+                    .expect("column ident pattern initialized")
+            );
+            let pattern = format!(
+                r"(?ix)(?P<head>CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?{ident})\s+(?P<event>{event})\s+ON",
+                ident = IDENT_PATTERN
+                    .get()
+                    .expect("ident pattern initialized"),
+                event = event
+            );
+            Regex::new(&pattern).expect("valid trigger timing regex")
+        });
+
+        let with_timing = timing_re
+            .replace_all(sql, |caps: &regex::Captures| {
+                let head = caps.name("head").unwrap().as_str();
+                let event = caps.name("event").unwrap().as_str().trim();
+                format!("{head} AFTER {event} ON")
+            })
+            .to_string();
+
+        let for_each_begin_re = FOR_EACH_BEGIN_REGEX.get_or_init(|| {
+            let pattern = format!(
+                r"(?ix)(?P<prefix>ON\s+{ident})\s+(?P<keyword>BEGIN\b)",
+                ident = IDENT_PATTERN
+                    .get()
+                    .expect("ident pattern initialized"),
+            );
+            Regex::new(&pattern).expect("valid trigger FOR EACH BEGIN regex")
+        });
+
+        let with_for_each_begin = for_each_begin_re
+            .replace_all(&with_timing, |caps: &regex::Captures| {
+                let prefix = caps.name("prefix").unwrap().as_str();
+                let keyword = caps.name("keyword").unwrap().as_str();
+                format!("{prefix} FOR EACH ROW {keyword}")
+            })
+            .to_string();
+
+        let for_each_when_re = FOR_EACH_WHEN_REGEX.get_or_init(|| {
+            let pattern = format!(
+                r"(?ix)(?P<prefix>ON\s+{ident})\s+(?P<keyword>WHEN\b)",
+                ident = IDENT_PATTERN
+                    .get()
+                    .expect("ident pattern initialized"),
+            );
+            Regex::new(&pattern).expect("valid trigger FOR EACH WHEN regex")
+        });
+
+        for_each_when_re
+            .replace_all(&with_for_each_begin, |caps: &regex::Captures| {
+                let prefix = caps.name("prefix").unwrap().as_str();
+                let keyword = caps.name("keyword").unwrap().as_str();
+                format!("{prefix} FOR EACH ROW {keyword}")
+            })
+            .to_string()
+    }
+
     /// Preprocess SQL to convert bare table names in IN clauses to subqueries.
     ///
     /// SQLite allows `expr IN tablename` as shorthand for `expr IN (SELECT * FROM tablename)`.
@@ -500,7 +590,12 @@ where
             let table_name = &caps[2];
             let trailing = &caps[3];
             if let Some(not_keyword) = caps.get(1) {
-                format!("{}IN (SELECT * FROM {}){}", not_keyword.as_str(), table_name, trailing)
+                format!(
+                    "{}IN (SELECT * FROM {}){}",
+                    not_keyword.as_str(),
+                    table_name,
+                    trailing
+                )
             } else {
                 format!("IN (SELECT * FROM {}){}", table_name, trailing)
             }
@@ -579,10 +674,22 @@ where
         let processed_sql = Self::preprocess_index_hints(&processed_sql);
 
         let dialect = GenericDialect {};
-        let statements = parse_sql_with_recursion_limit(&dialect, &processed_sql)
-            .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
-
-        let mut results = Vec::with_capacity(statements.len());
+        let statements = match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
+            Ok(stmts) => stmts,
+            Err(parse_err) => {
+                // SQLite allows omitting BEFORE/AFTER and FOR EACH ROW in CREATE TRIGGER.
+                // If parsing fails and the SQL contains CREATE TRIGGER, attempt to expand
+                // the shorthand form and retry. This is a workaround until sqlparser's
+                // SQLite dialect properly supports the abbreviated syntax.
+                if processed_sql.to_uppercase().contains("CREATE TRIGGER") {
+                    let expanded = Self::preprocess_sqlite_trigger_shorthand(&processed_sql);
+                    parse_sql_with_recursion_limit(&dialect, &expanded)
+                        .map_err(|_| Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}")))?
+                } else {
+                    return Err(Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}")));
+                }
+            }
+        };        let mut results = Vec::with_capacity(statements.len());
         for statement in statements.iter() {
             let statement_expectation = next_statement_expectation();
             match statement {
@@ -1103,6 +1210,10 @@ where
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateDomain");
                 self.handle_create_domain(create_domain)
             }
+            Statement::CreateTrigger(create_trigger) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTrigger");
+                self.handle_create_trigger(create_trigger)
+            }
             Statement::DropDomain(drop_domain) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: DropDomain");
                 self.handle_drop_domain(drop_domain)
@@ -1173,6 +1284,10 @@ where
                     purge,
                     temporary,
                 )
+            }
+            Statement::DropTrigger(drop_trigger) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: DropTrigger");
+                self.handle_drop_trigger(drop_trigger)
             }
             Statement::AlterTable {
                 name,
@@ -2304,6 +2419,138 @@ where
         Ok(RuntimeStatementResult::NoOp)
     }
 
+    fn handle_create_trigger(
+        &self,
+        create_trigger: CreateTrigger,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let CreateTrigger {
+            or_alter,
+            or_replace,
+            is_constraint,
+            name,
+            period,
+            period_before_table: _,
+            events,
+            table_name,
+            referenced_table_name,
+            referencing,
+            trigger_object,
+            include_each: _,
+            condition,
+            exec_body,
+            statements_as,
+            statements,
+            characteristics,
+        } = create_trigger;
+
+        if or_alter {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR ALTER TRIGGER is not supported".into(),
+            ));
+        }
+
+        if or_replace {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR REPLACE TRIGGER is not supported".into(),
+            ));
+        }
+
+        if is_constraint {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER ... CONSTRAINT is not supported".into(),
+            ));
+        }
+
+        if referenced_table_name.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER referencing another table is not supported".into(),
+            ));
+        }
+
+        if !referencing.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER REFERENCING clauses are not supported".into(),
+            ));
+        }
+
+        if characteristics.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER constraint characteristics are not supported".into(),
+            ));
+        }
+
+        if events.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER requires at least one event".into(),
+            ));
+        }
+
+        if events.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER currently supports exactly one trigger event".into(),
+            ));
+        }
+
+        let timing = match period {
+            TriggerPeriod::Before => TriggerTimingMeta::Before,
+            TriggerPeriod::After | TriggerPeriod::For => TriggerTimingMeta::After,
+            TriggerPeriod::InsteadOf => TriggerTimingMeta::InsteadOf,
+        };
+
+        let event_meta = match events.into_iter().next().expect("checked length") {
+            TriggerEvent::Insert => TriggerEventMeta::Insert,
+            TriggerEvent::Delete => TriggerEventMeta::Delete,
+            TriggerEvent::Update(columns) => TriggerEventMeta::Update {
+                columns: columns
+                    .into_iter()
+                    .map(|ident| ident.value.to_ascii_lowercase())
+                    .collect(),
+            },
+            TriggerEvent::Truncate => {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE TRIGGER for TRUNCATE events is not supported".into(),
+                ));
+            }
+        };
+
+        let (trigger_display_name, canonical_trigger_name) = canonical_object_name(&name)?;
+        let (table_display_name, canonical_table_name) = canonical_object_name(&table_name)?;
+
+        let condition_sql = condition.map(|expr| expr.to_string());
+
+        let body_sql = if let Some(exec_body) = exec_body {
+            format!("EXECUTE {exec_body}")
+        } else if let Some(statements) = statements {
+            let rendered = statements.to_string();
+            if statements_as {
+                format!("AS {rendered}")
+            } else {
+                rendered
+            }
+        } else {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER requires a trigger body".into(),
+            ));
+        };
+
+        let for_each_row = matches!(trigger_object, TriggerObject::Row);
+
+        self.engine.context().create_trigger(
+            &trigger_display_name,
+            &canonical_trigger_name,
+            &table_display_name,
+            &canonical_table_name,
+            timing,
+            event_meta,
+            for_each_row,
+            condition_sql,
+            body_sql,
+            false,
+        )?;
+
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
     fn handle_drop_domain(
         &self,
         drop_domain: sqlparser::ast::DropDomain,
@@ -2327,6 +2574,46 @@ where
 
             tracing::debug!("Dropped and removed from catalog type alias: {}", type_name);
         }
+
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn handle_drop_trigger(
+        &self,
+        drop_trigger: DropTrigger,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let DropTrigger {
+            if_exists,
+            trigger_name,
+            table_name,
+            option,
+        } = drop_trigger;
+
+        if option.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "DROP TRIGGER CASCADE/RESTRICT options are not supported".into(),
+            ));
+        }
+
+        let (trigger_display_name, canonical_trigger_name) = canonical_object_name(&trigger_name)?;
+
+        let (table_display, table_canonical) = if let Some(table_name) = table_name {
+            let (display, canonical) = canonical_object_name(&table_name)?;
+            (Some(display), Some(canonical))
+        } else {
+            (None, None)
+        };
+
+        let table_display_hint = table_display.as_deref();
+        let table_canonical_hint = table_canonical.as_deref();
+
+        self.engine.context().drop_trigger(
+            &trigger_display_name,
+            &canonical_trigger_name,
+            table_display_hint,
+            table_canonical_hint,
+            if_exists,
+        )?;
 
         Ok(RuntimeStatementResult::NoOp)
     }
@@ -3859,12 +4146,10 @@ where
                                             continue;
                                         }
                                         if batch.num_columns() > 1 {
-                                            return Err(Error::InvalidArgumentError(
-                                                format!(
-                                                    "IN subquery must return exactly one column, got {}",
-                                                    batch.num_columns()
-                                                ),
-                                            ));
+                                            return Err(Error::InvalidArgumentError(format!(
+                                                "IN subquery must return exactly one column, got {}",
+                                                batch.num_columns()
+                                            )));
                                         }
                                         let column = batch.column(0);
 

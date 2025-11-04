@@ -21,7 +21,8 @@ use llkv_table::catalog::TableCatalog;
 use llkv_table::{
     CatalogDdl, CatalogManager, ConstraintService, MetadataManager, MultiColumnUniqueRegistration,
     SingleColumnIndexDescriptor, SingleColumnIndexRegistration, SysCatalog, TableId,
-    ensure_multi_column_unique, ensure_single_column_unique, validate_alter_table_operation,
+    TriggerEventMeta, TriggerTimingMeta, ensure_multi_column_unique, ensure_single_column_unique,
+    validate_alter_table_operation,
 };
 use llkv_transaction::{TransactionManager, TransactionSnapshot, TxnId, TxnIdManager};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -318,6 +319,51 @@ where
         self.dropped_tables.write().unwrap().remove(&canonical_name);
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_trigger(
+        self: &Arc<Self>,
+        trigger_display_name: &str,
+        canonical_trigger_name: &str,
+        table_display_name: &str,
+        canonical_table_name: &str,
+        timing: TriggerTimingMeta,
+        event: TriggerEventMeta,
+        for_each_row: bool,
+        condition: Option<String>,
+        body_sql: String,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        self.catalog_service.create_trigger(
+            trigger_display_name,
+            canonical_trigger_name,
+            table_display_name,
+            canonical_table_name,
+            timing,
+            event,
+            for_each_row,
+            condition,
+            body_sql,
+            if_not_exists,
+        )
+    }
+
+    pub fn drop_trigger(
+        self: &Arc<Self>,
+        trigger_display_name: &str,
+        canonical_trigger_name: &str,
+        table_hint_display: Option<&str>,
+        table_hint_canonical: Option<&str>,
+        if_exists: bool,
+    ) -> Result<bool> {
+        self.catalog_service.drop_trigger(
+            trigger_display_name,
+            canonical_trigger_name,
+            table_hint_display,
+            table_hint_canonical,
+            if_exists,
+        )
     }
 
     /// Return the stored SQL definition for a view, if it exists.

@@ -342,6 +342,50 @@ pub struct TableMultiColumnIndexMeta {
     pub indexes: Vec<MultiColumnIndexEntryMeta>,
 }
 
+/// Timing information for a trigger (BEFORE, AFTER, INSTEAD OF).
+#[derive(Encode, Decode, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerTimingMeta {
+    Before,
+    After,
+    InsteadOf,
+}
+
+/// Trigger event metadata describing which operation fires the trigger.
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub enum TriggerEventMeta {
+    Insert,
+    Update { columns: Vec<String> },
+    Delete,
+}
+
+/// Persisted trigger definition stored alongside table metadata.
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub struct TriggerEntryMeta {
+    /// Display name preserving original casing.
+    pub name: String,
+    /// Canonical lowercase trigger name for case-insensitive lookups.
+    pub canonical_name: String,
+    /// Timing phase indicating when the trigger executes relative to the mutation.
+    pub timing: TriggerTimingMeta,
+    /// Mutation event that fires the trigger.
+    pub event: TriggerEventMeta,
+    /// Whether the trigger fires per affected row (true) or per statement (false).
+    pub for_each_row: bool,
+    /// Optional SQL expression from the WHEN clause.
+    pub condition: Option<String>,
+    /// Trigger body stored as SQL string (BEGIN/END block or single statement).
+    pub body_sql: String,
+}
+
+/// Collection of triggers registered for a table.
+#[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
+pub struct TableTriggerMeta {
+    /// Owning table identifier.
+    pub table_id: TableId,
+    /// Trigger definitions associated with the table.
+    pub triggers: Vec<TriggerEntryMeta>,
+}
+
 // ----- SysCatalog -----
 
 /// Interface to the system catalog (table 0).
@@ -716,6 +760,75 @@ where
         })?;
 
         Ok(meta.indexes)
+    }
+
+    /// Persist the trigger definitions for a table.
+    pub fn put_triggers(&self, table_id: TableId, triggers: &[TriggerEntryMeta]) -> LlkvResult<()> {
+        let lfid_val: u64 = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TRIGGER_META_ID).into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+            Field::new("meta", DataType::Binary, false).with_metadata(HashMap::from([(
+                crate::constants::FIELD_ID_META_KEY.to_string(),
+                lfid_val.to_string(),
+            )])),
+        ]));
+
+        let row_id = Arc::new(UInt64Array::from(vec![rid_table(table_id)]));
+        let meta = TableTriggerMeta {
+            table_id,
+            triggers: triggers.to_vec(),
+        };
+        let encoded = bitcode::encode(&meta);
+        let meta_bytes = Arc::new(BinaryArray::from(vec![encoded.as_slice()]));
+
+        let batch = RecordBatch::try_new(schema, vec![row_id, meta_bytes])?;
+        self.store.append(&batch)?;
+        Ok(())
+    }
+
+    /// Remove all trigger definitions for the provided table.
+    pub fn delete_triggers(&self, table_id: TableId) -> LlkvResult<()> {
+        let meta_field = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TRIGGER_META_ID);
+        let row_id = rid_table(table_id);
+        self.write_null_entries(meta_field, &[row_id])
+    }
+
+    /// Retrieve persisted trigger definitions for a table.
+    pub fn get_triggers(&self, table_id: TableId) -> LlkvResult<Vec<TriggerEntryMeta>> {
+        let lfid = lfid(CATALOG_TABLE_ID, CATALOG_FIELD_TRIGGER_META_ID);
+        let row_id = rid_table(table_id);
+        let batch = match self
+            .store
+            .gather_rows(&[lfid], &[row_id], GatherNullPolicy::IncludeNulls)
+        {
+            Ok(batch) => batch,
+            Err(llkv_result::Error::NotFound) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        if batch.num_columns() == 0 || batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                llkv_result::Error::Internal(
+                    "catalog trigger metadata column stored unexpected type".into(),
+                )
+            })?;
+
+        if array.is_null(0) {
+            return Ok(Vec::new());
+        }
+
+        let meta: TableTriggerMeta = bitcode::decode(array.value(0)).map_err(|err| {
+            llkv_result::Error::Internal(format!("failed to decode trigger metadata: {err}"))
+        })?;
+
+        Ok(meta.triggers)
     }
 
     /// Retrieve all persisted multi-column index definitions across tables.

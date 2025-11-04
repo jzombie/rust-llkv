@@ -247,7 +247,7 @@ impl LlkvSltRunner {
                 let expected_normalized = normalizer(expected_row);
 
                 let actual_joined = actual_normalized.join(" ");
-                
+
                 // Split both into tokens
                 let actual_tokens: Vec<&str> = actual_joined.split_whitespace().collect();
                 let expected_tokens: Vec<&str> = expected_normalized.split_whitespace().collect();
@@ -268,7 +268,7 @@ impl LlkvSltRunner {
                             // Use relative tolerance for large numbers, absolute for small
                             let abs_diff = (a_num - e_num).abs();
                             let max_val = a_num.abs().max(e_num.abs());
-                            
+
                             // For large numbers (>1e6), use relative tolerance of 1e-10
                             // For small numbers, use absolute tolerance of 1e-10
                             let tolerance = if max_val > 1e6 {
@@ -276,7 +276,7 @@ impl LlkvSltRunner {
                             } else {
                                 1e-10
                             };
-                            
+
                             if abs_diff > tolerance {
                                 return false;
                             }

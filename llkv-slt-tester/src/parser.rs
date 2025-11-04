@@ -184,20 +184,20 @@ pub(crate) fn normalize_inline_connections(
         while idx < lines.len() {
             let line = &lines[idx];
             let trimmed = line.trim();
-            
+
             // Stop at the separator
             if trimmed == "----" {
                 saw_separator = true;
                 idx += 1;
                 break;
             }
-            
+
             // Stop at blank lines - this terminates a statement error block
             // that has no expected error message/pattern
             if trimmed.is_empty() {
                 break;
             }
-            
+
             // Continue collecting SQL - includes multi-line statements and comments within SQL
             sql_lines.push((line.clone(), mapping[idx]));
             idx += 1;

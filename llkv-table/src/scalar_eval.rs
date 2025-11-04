@@ -1056,7 +1056,11 @@ impl NumericKernels {
                     BinaryOp::Subtract => Self::affine_sub(left_state, right_state),
                     BinaryOp::Multiply => Self::affine_mul(left_state, right_state),
                     BinaryOp::Divide => Self::affine_div(left_state, right_state),
-                    BinaryOp::Modulo | BinaryOp::And | BinaryOp::Or | BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => None,
+                    BinaryOp::Modulo
+                    | BinaryOp::And
+                    | BinaryOp::Or
+                    | BinaryOp::BitwiseShiftLeft
+                    | BinaryOp::BitwiseShiftRight => None,
                 }
             }
             ScalarExpr::Compare { .. } => None,

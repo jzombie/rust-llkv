@@ -281,36 +281,28 @@ fn array_value_to_string(array: &ArrayRef, index: usize) -> AggregateResult<Stri
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("Expected String array".into())
-                })?;
+                .ok_or_else(|| Error::InvalidArgumentError("Expected String array".into()))?;
             Ok(arr.value(index).to_string())
         }
         DataType::Int64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("Expected Int64 array".into())
-                })?;
+                .ok_or_else(|| Error::InvalidArgumentError("Expected Int64 array".into()))?;
             Ok(arr.value(index).to_string())
         }
         DataType::Float64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("Expected Float64 array".into())
-                })?;
+                .ok_or_else(|| Error::InvalidArgumentError("Expected Float64 array".into()))?;
             Ok(arr.value(index).to_string())
         }
         DataType::Boolean => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    Error::InvalidArgumentError("Expected Boolean array".into())
-                })?;
+                .ok_or_else(|| Error::InvalidArgumentError("Expected Boolean array".into()))?;
             Ok(if arr.value(index) {
                 "1".to_string()
             } else {
@@ -666,7 +658,9 @@ impl AggregateAccumulator {
                             Some(current) => Some(current.checked_add(v).ok_or_else(|| {
                                 Error::InvalidArgumentError("integer overflow".into())
                             })?),
-                            None => return Err(Error::InvalidArgumentError("integer overflow".into())),
+                            None => {
+                                return Err(Error::InvalidArgumentError("integer overflow".into()));
+                            }
                         };
                     }
                 }
@@ -690,10 +684,16 @@ impl AggregateAccumulator {
                             // Only add to sum if we haven't seen this value before
                             if let DistinctKey::Int(v) = key {
                                 *sum = match *sum {
-                                    Some(current) => Some(current.checked_add(v).ok_or_else(|| {
-                                        Error::InvalidArgumentError("integer overflow".into())
-                                    })?),
-                                    None => return Err(Error::InvalidArgumentError("integer overflow".into())),
+                                    Some(current) => {
+                                        Some(current.checked_add(v).ok_or_else(|| {
+                                            Error::InvalidArgumentError("integer overflow".into())
+                                        })?)
+                                    }
+                                    None => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "integer overflow".into(),
+                                        ));
+                                    }
                                 };
                             }
                         }
@@ -733,7 +733,13 @@ impl AggregateAccumulator {
                             DistinctKey::Float(bits) => f64::from_bits(bits),
                             DistinctKey::Int(int_val) => int_val as f64,
                             DistinctKey::Str(_) => array_value_to_numeric(column, i)?,
-                            DistinctKey::Bool(b) => if b { 1.0 } else { 0.0 },
+                            DistinctKey::Bool(b) => {
+                                if b {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
                             DistinctKey::Date(d) => d as f64,
                         };
                         *sum += v;
@@ -813,7 +819,13 @@ impl AggregateAccumulator {
                             DistinctKey::Float(bits) => f64::from_bits(bits),
                             DistinctKey::Int(int_val) => int_val as f64,
                             DistinctKey::Str(_) => array_value_to_numeric(column, i)?,
-                            DistinctKey::Bool(b) => if b { 1.0 } else { 0.0 },
+                            DistinctKey::Bool(b) => {
+                                if b {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
                             DistinctKey::Date(d) => d as f64,
                         };
                         *sum += v;
@@ -912,7 +924,13 @@ impl AggregateAccumulator {
                             DistinctKey::Float(bits) => f64::from_bits(bits),
                             DistinctKey::Int(int_val) => int_val as f64,
                             DistinctKey::Str(_) => array_value_to_numeric(column, i)?,
-                            DistinctKey::Bool(b) => if b { 1.0 } else { 0.0 },
+                            DistinctKey::Bool(b) => {
+                                if b {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
                             DistinctKey::Date(d) => d as f64,
                         };
                         *sum += v;
@@ -1083,16 +1101,14 @@ impl AggregateAccumulator {
                 Ok((Field::new("count_distinct", DataType::Int64, false), array))
             }
             AggregateAccumulator::SumInt64 {
-                value,
-                has_values,
-                ..
+                value, has_values, ..
             } => {
                 // If overflow occurred (value is None after seeing values), return error
                 // to match SQLite behavior where integer overflow in SUM throws exception
                 if has_values && value.is_none() {
                     return Err(Error::InvalidArgumentError("integer overflow".into()));
                 }
-                
+
                 let mut builder = Int64Builder::with_capacity(1);
                 if !has_values {
                     builder.append_null(); // No values seen
@@ -1150,7 +1166,10 @@ impl AggregateAccumulator {
                 let mut builder = Float64Builder::with_capacity(1);
                 builder.append_value(sum);
                 let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("total_distinct", DataType::Float64, false), array))
+                Ok((
+                    Field::new("total_distinct", DataType::Float64, false),
+                    array,
+                ))
             }
             AggregateAccumulator::TotalFloat64 { value, .. } => {
                 let mut builder = Float64Builder::with_capacity(1);
@@ -1162,7 +1181,10 @@ impl AggregateAccumulator {
                 let mut builder = Float64Builder::with_capacity(1);
                 builder.append_value(sum);
                 let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("total_distinct", DataType::Float64, false), array))
+                Ok((
+                    Field::new("total_distinct", DataType::Float64, false),
+                    array,
+                ))
             }
             AggregateAccumulator::AvgInt64 { sum, count, .. } => {
                 let mut builder = Float64Builder::with_capacity(1);
@@ -1279,10 +1301,7 @@ impl AggregateAccumulator {
                     builder.append_value(&result);
                 }
                 let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((
-                    Field::new("group_concat", DataType::Utf8, true),
-                    array,
-                ))
+                Ok((Field::new("group_concat", DataType::Utf8, true), array))
             }
             AggregateAccumulator::GroupConcatDistinct {
                 values, separator, ..
@@ -1296,10 +1315,7 @@ impl AggregateAccumulator {
                     builder.append_value(&result);
                 }
                 let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((
-                    Field::new("group_concat", DataType::Utf8, true),
-                    array,
-                ))
+                Ok((Field::new("group_concat", DataType::Utf8, true), array))
             }
         }
     }
