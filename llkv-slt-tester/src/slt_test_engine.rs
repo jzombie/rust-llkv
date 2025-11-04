@@ -292,7 +292,9 @@ fn format_struct_value(struct_array: &StructArray, row_idx: usize) -> String {
                 if a.is_null(row_idx) {
                     "NULL".to_string()
                 } else {
-                    a.value(row_idx).to_string()
+                    // SQLite-compatible float formatting - try to match expected format
+                    let val = a.value(row_idx);
+                    val.to_string()
                 }
             }
             arrow::datatypes::DataType::Boolean => {

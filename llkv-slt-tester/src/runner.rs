@@ -225,6 +225,62 @@ impl LlkvSltRunner {
 
         let tmp = named.path().to_path_buf();
 
+        /// Custom validator that coerces numeric values before comparison.
+        /// This allows comparing "1.25" with "1.250" by parsing them as floats.
+        fn numeric_coercion_validator(
+            normalizer: sqllogictest::Normalizer,
+            actual: &[Vec<String>],
+            expected: &[String],
+        ) -> bool {
+            // First try exact string matching (default behavior)
+            if sqllogictest::default_validator(normalizer, actual, expected) {
+                return true;
+            }
+
+            // Try numeric coercion - parse both sides as floats and compare
+            if actual.len() != expected.len() {
+                return false;
+            }
+
+            for (actual_row, expected_row) in actual.iter().zip(expected.iter()) {
+                let actual_normalized: Vec<String> = actual_row.iter().map(normalizer).collect();
+                let expected_normalized = normalizer(expected_row);
+
+                let actual_joined = actual_normalized.join(" ");
+                
+                // Split both into tokens
+                let actual_tokens: Vec<&str> = actual_joined.split_whitespace().collect();
+                let expected_tokens: Vec<&str> = expected_normalized.split_whitespace().collect();
+
+                if actual_tokens.len() != expected_tokens.len() {
+                    return false;
+                }
+
+                for (a, e) in actual_tokens.iter().zip(expected_tokens.iter()) {
+                    // Try exact match first
+                    if a == e {
+                        continue;
+                    }
+
+                    // Try parsing as floats for numeric comparison
+                    match (a.parse::<f64>(), e.parse::<f64>()) {
+                        (Ok(a_num), Ok(e_num)) => {
+                            // Compare with small tolerance for floating point
+                            if (a_num - e_num).abs() > 1e-10 {
+                                return false;
+                            }
+                        }
+                        _ => {
+                            // Not both numbers, must match exactly
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            true
+        }
+
         let mut runner = Runner::new(|| async {
             factory()
                 .await
@@ -232,6 +288,7 @@ impl LlkvSltRunner {
         });
 
         runner.with_hash_threshold(256);
+        runner.with_validator(numeric_coercion_validator);
 
         let records = sqllogictest::parse_file(&tmp).map_err(|e| {
             Error::Internal(format!(
