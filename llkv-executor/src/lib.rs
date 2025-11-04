@@ -1965,12 +1965,12 @@ where
 
         for aggregate in &plan.aggregates {
             match aggregate {
-                AggregateExpr::CountStar { alias } => {
+                AggregateExpr::CountStar { alias, distinct } => {
                     specs.push(AggregateSpec {
                         alias: alias.clone(),
                         kind: AggregateKind::Count {
                             field_id: None,
-                            distinct: false,
+                            distinct: *distinct,
                         },
                     });
                     spec_to_projection.push(None);
@@ -4058,12 +4058,12 @@ where
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
         for aggregate in plan.aggregates {
             match aggregate {
-                AggregateExpr::CountStar { alias } => {
+                AggregateExpr::CountStar { alias, distinct } => {
                     specs.push(AggregateSpec {
                         alias,
                         kind: AggregateKind::Count {
                             field_id: None,
-                            distinct: false,
+                            distinct,
                         },
                     });
                 }

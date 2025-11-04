@@ -5642,21 +5642,17 @@ where
                         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
                             if is_distinct {
                                 return Err(Error::InvalidArgumentError(
-                                    "COUNT(DISTINCT *) is not supported".into(),
+                                    "DISTINCT aggregates must be applied to columns not *, e.g. table columns like: 1,0,2,2".into(),
                                 ));
                             }
-                            AggregateExpr::count_star(alias)
+                            AggregateExpr::count_star(alias, false)
                         }
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
                             if !is_simple_aggregate_column(arg_expr) {
                                 return Ok(None);
                             }
                             let column = resolve_column_name(arg_expr)?;
-                            if is_distinct {
-                                AggregateExpr::count_distinct_column(column, alias)
-                            } else {
-                                AggregateExpr::count_column(column, alias)
-                            }
+                            AggregateExpr::count_column(column, alias, is_distinct)
                         }
                         FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
                             return Err(Error::InvalidArgumentError(

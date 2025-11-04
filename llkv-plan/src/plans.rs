@@ -928,6 +928,7 @@ pub enum ValueTableMode {
 pub enum AggregateExpr {
     CountStar {
         alias: String,
+        distinct: bool,
     },
     Column {
         column: String,
@@ -950,27 +951,19 @@ pub enum AggregateFunction {
 }
 
 impl AggregateExpr {
-    pub fn count_star(alias: impl Into<String>) -> Self {
+    pub fn count_star(alias: impl Into<String>, distinct: bool) -> Self {
         Self::CountStar {
             alias: alias.into(),
+            distinct,
         }
     }
 
-    pub fn count_column(column: impl Into<String>, alias: impl Into<String>) -> Self {
+    pub fn count_column(column: impl Into<String>, alias: impl Into<String>, distinct: bool) -> Self {
         Self::Column {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::Count,
-            distinct: false,
-        }
-    }
-
-    pub fn count_distinct_column(column: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self::Column {
-            column: column.into(),
-            alias: alias.into(),
-            function: AggregateFunction::Count,
-            distinct: true,
+            distinct,
         }
     }
 
