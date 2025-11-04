@@ -177,14 +177,28 @@ pub(crate) fn normalize_inline_connections(
         let mut idx = start;
         let mut saw_separator = false;
 
+        // Collect SQL lines for the statement error block.
+        // According to SLT format: SQL continues until we hit either:
+        // 1. A ---- separator (for error messages/patterns), or
+        // 2. A blank line (statement error with no expected message)
         while idx < lines.len() {
             let line = &lines[idx];
-            let trimmed = line.trim_start();
+            let trimmed = line.trim();
+            
+            // Stop at the separator
             if trimmed == "----" {
                 saw_separator = true;
                 idx += 1;
                 break;
             }
+            
+            // Stop at blank lines - this terminates a statement error block
+            // that has no expected error message/pattern
+            if trimmed.is_empty() {
+                break;
+            }
+            
+            // Continue collecting SQL - includes multi-line statements and comments within SQL
             sql_lines.push((line.clone(), mapping[idx]));
             idx += 1;
         }
