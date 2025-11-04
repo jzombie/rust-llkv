@@ -104,12 +104,12 @@ pub enum AggregateAccumulator {
     },
     SumInt64 {
         column_index: usize,
-        value: i64,
-        saw_value: bool,
+        value: Option<i64>, // None = overflow, Some = current sum or initial state
+        has_values: bool,   // Track whether we've seen any values
     },
     SumDistinctInt64 {
         column_index: usize,
-        sum: i64,
+        sum: Option<i64>, // None = overflow
         seen: FxHashSet<DistinctKey>,
     },
     SumFloat64 {
@@ -124,11 +124,11 @@ pub enum AggregateAccumulator {
     },
     TotalInt64 {
         column_index: usize,
-        value: i64,
+        value: f64, // TOTAL always returns float to avoid overflow
     },
     TotalDistinctInt64 {
         column_index: usize,
-        sum: i64,
+        sum: f64, // TOTAL always returns float to avoid overflow
         seen: FxHashSet<DistinctKey>,
     },
     TotalFloat64 {
@@ -422,13 +422,13 @@ impl AggregateAccumulator {
                 match (data_type, *distinct) {
                     (DataType::Int64, true) => Ok(AggregateAccumulator::SumDistinctInt64 {
                         column_index: idx,
-                        sum: 0,
+                        sum: Some(0),
                         seen: FxHashSet::default(),
                     }),
                     (DataType::Int64, false) => Ok(AggregateAccumulator::SumInt64 {
                         column_index: idx,
-                        value: 0,
-                        saw_value: false,
+                        value: Some(0),
+                        has_values: false,
                     }),
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
                     (DataType::Float64, true) | (DataType::Utf8, true) => {
@@ -462,12 +462,12 @@ impl AggregateAccumulator {
                 match (data_type, *distinct) {
                     (DataType::Int64, true) => Ok(AggregateAccumulator::TotalDistinctInt64 {
                         column_index: idx,
-                        sum: 0,
+                        sum: 0.0,
                         seen: FxHashSet::default(),
                     }),
                     (DataType::Int64, false) => Ok(AggregateAccumulator::TotalInt64 {
                         column_index: idx,
-                        value: 0,
+                        value: 0.0,
                     }),
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
                     (DataType::Float64, true) | (DataType::Utf8, true) => {
@@ -650,7 +650,7 @@ impl AggregateAccumulator {
             AggregateAccumulator::SumInt64 {
                 column_index,
                 value,
-                saw_value,
+                has_values,
             } => {
                 let array = batch.column(*column_index);
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
@@ -660,13 +660,14 @@ impl AggregateAccumulator {
                 })?;
                 for i in 0..array.len() {
                     if array.is_valid(i) {
+                        *has_values = true;
                         let v = array.value(i);
-                        *value = value.checked_add(v).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "SUM aggregate result exceeds i64 range".into(),
-                            )
-                        })?;
-                        *saw_value = true;
+                        *value = match *value {
+                            Some(current) => Some(current.checked_add(v).ok_or_else(|| {
+                                Error::InvalidArgumentError("integer overflow".into())
+                            })?),
+                            None => return Err(Error::InvalidArgumentError("integer overflow".into())),
+                        };
                     }
                 }
             }
@@ -688,11 +689,12 @@ impl AggregateAccumulator {
                         if seen.insert(key.clone()) {
                             // Only add to sum if we haven't seen this value before
                             if let DistinctKey::Int(v) = key {
-                                *sum = sum.checked_add(v).ok_or_else(|| {
-                                    Error::InvalidArgumentError(
-                                        "SUM(DISTINCT) aggregate result exceeds i64 range".into(),
-                                    )
-                                })?;
+                                *sum = match *sum {
+                                    Some(current) => Some(current.checked_add(v).ok_or_else(|| {
+                                        Error::InvalidArgumentError("integer overflow".into())
+                                    })?),
+                                    None => return Err(Error::InvalidArgumentError("integer overflow".into())),
+                                };
                             }
                         }
                     }
@@ -751,11 +753,8 @@ impl AggregateAccumulator {
                 for i in 0..array.len() {
                     if array.is_valid(i) {
                         let v = array.value(i);
-                        *value = value.checked_add(v).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "TOTAL aggregate result exceeds i64 range".into(),
-                            )
-                        })?;
+                        // TOTAL never overflows - accumulate as float
+                        *value += v as f64;
                     }
                 }
             }
@@ -776,12 +775,8 @@ impl AggregateAccumulator {
                         let key = DistinctKey::from_array(col_array, i)?;
                         if seen.insert(key.clone()) {
                             if let DistinctKey::Int(v) = key {
-                                *sum = sum.checked_add(v).ok_or_else(|| {
-                                    Error::InvalidArgumentError(
-                                        "TOTAL(DISTINCT) aggregate result exceeds i64 range"
-                                            .into(),
-                                    )
-                                })?;
+                                // TOTAL never overflows - accumulate as float
+                                *sum += v as f64;
                             }
                         }
                     }
@@ -1088,23 +1083,37 @@ impl AggregateAccumulator {
                 Ok((Field::new("count_distinct", DataType::Int64, false), array))
             }
             AggregateAccumulator::SumInt64 {
-                value, saw_value, ..
+                value,
+                has_values,
+                ..
             } => {
+                // If overflow occurred (value is None after seeing values), return error
+                // to match SQLite behavior where integer overflow in SUM throws exception
+                if has_values && value.is_none() {
+                    return Err(Error::InvalidArgumentError("integer overflow".into()));
+                }
+                
                 let mut builder = Int64Builder::with_capacity(1);
-                if saw_value {
-                    builder.append_value(value);
+                if !has_values {
+                    builder.append_null(); // No values seen
                 } else {
-                    builder.append_null();
+                    match value {
+                        Some(v) => builder.append_value(v),
+                        None => unreachable!(), // Already handled above
+                    }
                 }
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("sum", DataType::Int64, true), array))
             }
             AggregateAccumulator::SumDistinctInt64 { sum, seen, .. } => {
                 let mut builder = Int64Builder::with_capacity(1);
-                if !seen.is_empty() {
-                    builder.append_value(sum);
-                } else {
+                if seen.is_empty() {
                     builder.append_null();
+                } else {
+                    match sum {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(), // Overflow occurred
+                    }
                 }
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("sum_distinct", DataType::Int64, true), array))
@@ -1132,16 +1141,16 @@ impl AggregateAccumulator {
                 Ok((Field::new("sum_distinct", DataType::Float64, true), array))
             }
             AggregateAccumulator::TotalInt64 { value, .. } => {
-                let mut builder = Int64Builder::with_capacity(1);
+                let mut builder = Float64Builder::with_capacity(1);
                 builder.append_value(value);
                 let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("total", DataType::Int64, false), array))
+                Ok((Field::new("total", DataType::Float64, false), array))
             }
             AggregateAccumulator::TotalDistinctInt64 { sum, .. } => {
-                let mut builder = Int64Builder::with_capacity(1);
+                let mut builder = Float64Builder::with_capacity(1);
                 builder.append_value(sum);
                 let array = Arc::new(builder.finish()) as ArrayRef;
-                Ok((Field::new("total_distinct", DataType::Int64, false), array))
+                Ok((Field::new("total_distinct", DataType::Float64, false), array))
             }
             AggregateAccumulator::TotalFloat64 { value, .. } => {
                 let mut builder = Float64Builder::with_capacity(1);

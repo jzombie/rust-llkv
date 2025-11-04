@@ -78,7 +78,7 @@ impl SqlValue {
                         Ok(SqlValue::Integer(result))
                     }
                     _ => Err(Error::InvalidArgumentError(
-                        "unsupported binary operation in literal expression".into()
+                        "unsupported literal expression: binary operation".into()
                     )),
                 }
             }
