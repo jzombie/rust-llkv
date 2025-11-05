@@ -297,28 +297,46 @@ where
             "[SELECT] Reading from BASE with MVCC for existing table '{}'",
             table_name
         );
-        self.base_context.execute_select(plan).and_then(|exec| {
-            // Convert pager type from BaseCtx to StagingCtx
-            // This is a limitation of the current type system
-            // In practice, we're just collecting and re-packaging
-            let schema = exec.schema();
-            let batches = exec.collect().unwrap_or_default();
-            let combined = if batches.is_empty() {
-                RecordBatch::new_empty(Arc::clone(&schema))
-            } else if batches.len() == 1 {
-                batches.into_iter().next().unwrap()
-            } else {
-                let refs: Vec<&RecordBatch> = batches.iter().collect();
-                arrow::compute::concat_batches(&schema, refs).map_err(|err| {
-                    Error::Internal(format!("failed to concatenate batches: {err}"))
-                })?
-            };
-            Ok(SelectExecution::from_batch(
-                table_name,
-                Arc::clone(&schema),
-                combined,
-            ))
-        })
+        match self.base_context.execute_select(plan) {
+            Ok(exec) => {
+                // Convert pager type from BaseCtx to StagingCtx
+                // This is a limitation of the current type system
+                // In practice, we're just collecting and re-packaging
+                let schema = exec.schema();
+                let batches = exec.collect().unwrap_or_default();
+                let combined = if batches.is_empty() {
+                    RecordBatch::new_empty(Arc::clone(&schema))
+                } else if batches.len() == 1 {
+                    batches.into_iter().next().unwrap()
+                } else {
+                    let refs: Vec<&RecordBatch> = batches.iter().collect();
+                    arrow::compute::concat_batches(&schema, refs).map_err(|err| {
+                        Error::Internal(format!("failed to concatenate batches: {err}"))
+                    })?
+                };
+                Ok(SelectExecution::from_batch(
+                    table_name,
+                    Arc::clone(&schema),
+                    combined,
+                ))
+            }
+            Err(Error::NotFound) if self.catalog_snapshot.table_exists(&table_name) => {
+                // Table existed in our snapshot but has been dropped by another
+                // transaction. Return empty result; conflict will be detected at commit.
+                tracing::debug!(
+                    "[SELECT] Table '{}' not found in current catalog but exists in snapshot; returning empty result, deferring conflict to commit",
+                    table_name
+                );
+                // Get schema from the plan if possible, otherwise create a minimal schema
+                let schema = Arc::new(arrow::datatypes::Schema::empty());
+                Ok(SelectExecution::from_batch(
+                    table_name,
+                    schema.clone(),
+                    RecordBatch::new_empty(schema),
+                ))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Execute an operation in the transaction staging context
@@ -531,9 +549,22 @@ where
                         "[TX] UPDATE directly in BASE with txn_id={}",
                         self.snapshot.txn_id
                     );
-                    self.base_context
-                        .update(plan.clone())
-                        .and_then(|r| r.convert_pager_type())
+                    match self.base_context.update(plan.clone()) {
+                        Ok(r) => r.convert_pager_type(),
+                        Err(Error::NotFound) if self.catalog_snapshot.table_exists(&plan.table) => {
+                            // Table existed in our snapshot but has been dropped by another
+                            // transaction. Return zero rows updated; conflict will be detected at commit.
+                            tracing::debug!(
+                                "[UPDATE] Table '{}' not found in current catalog but exists in snapshot; deferring conflict to commit",
+                                plan.table
+                            );
+                            Ok(TransactionResult::Update {
+                                rows_matched: 0,
+                                rows_updated: 0,
+                            })
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
 
                 match result {
@@ -585,9 +616,19 @@ where
                         "[DELETE] Deleting from BASE with txn_id={}",
                         self.snapshot.txn_id
                     );
-                    self.base_context
-                        .delete(plan.clone())
-                        .and_then(|r| r.convert_pager_type())
+                    match self.base_context.delete(plan.clone()) {
+                        Ok(r) => r.convert_pager_type(),
+                        Err(Error::NotFound) if self.catalog_snapshot.table_exists(&plan.table) => {
+                            // Table existed in our snapshot but has been dropped by another
+                            // transaction. Return zero rows deleted; conflict will be detected at commit.
+                            tracing::debug!(
+                                "[DELETE] Table '{}' not found in current catalog but exists in snapshot; deferring conflict to commit",
+                                plan.table
+                            );
+                            Ok(TransactionResult::Delete { rows_deleted: 0 })
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
 
                 tracing::debug!(
