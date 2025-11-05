@@ -26,10 +26,11 @@ use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction, ForeignKeySpec,
-    IndexColumnPlan, InsertPlan, InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType,
-    OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan, RenameTablePlan,
-    RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
-    SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
+    IndexColumnPlan, InsertConflictAction, InsertPlan, InsertSource, MultiColumnUniqueSpec,
+    OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue,
+    ReindexPlan, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
+    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
+    extract_rows_from_range,
 };
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
@@ -197,6 +198,8 @@ const MAX_BUFFERED_INSERT_ROWS: usize = 8192;
 struct InsertBuffer {
     table_name: String,
     columns: Vec<String>,
+    /// Conflict resolution action
+    on_conflict: InsertConflictAction,
     /// Total literal rows gathered so far (sums `statement_row_counts`).
     total_rows: usize,
     /// Row counts for each original INSERT statement so we can emit per-statement results.
@@ -206,19 +209,20 @@ struct InsertBuffer {
 }
 
 impl InsertBuffer {
-    fn new(table_name: String, columns: Vec<String>, rows: Vec<Vec<PlanValue>>) -> Self {
+    fn new(table_name: String, columns: Vec<String>, rows: Vec<Vec<PlanValue>>, on_conflict: InsertConflictAction) -> Self {
         let row_count = rows.len();
         Self {
             table_name,
             columns,
+            on_conflict,
             total_rows: row_count,
             statement_row_counts: vec![row_count],
             rows,
         }
     }
 
-    fn can_accept(&self, table_name: &str, columns: &[String]) -> bool {
-        self.table_name == table_name && self.columns == columns
+    fn can_accept(&self, table_name: &str, columns: &[String], on_conflict: InsertConflictAction) -> bool {
+        self.table_name == table_name && self.columns == columns && self.on_conflict == on_conflict
     }
 
     fn push_statement(&mut self, rows: Vec<Vec<PlanValue>>) {
@@ -244,6 +248,7 @@ enum PreparedInsert {
         table_name: String,
         columns: Vec<String>,
         rows: Vec<Vec<PlanValue>>,
+        on_conflict: InsertConflictAction,
     },
     Immediate(InsertPlan),
 }
@@ -800,12 +805,13 @@ impl SqlEngine {
                 table_name,
                 columns,
                 rows,
+                on_conflict,
             } => {
                 let mut flushed = Vec::new();
                 let statement_rows = rows.len();
                 let mut buf = self.insert_buffer.borrow_mut();
                 match buf.as_mut() {
-                    Some(buffer) if buffer.can_accept(&table_name, &columns) => {
+                    Some(buffer) if buffer.can_accept(&table_name, &columns, on_conflict) => {
                         buffer.push_statement(rows);
                         if buffer.should_flush() {
                             drop(buf);
@@ -827,7 +833,7 @@ impl SqlEngine {
                         drop(buf);
                         flushed = self.flush_buffer_results()?;
                         let mut buf = self.insert_buffer.borrow_mut();
-                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows));
+                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows, on_conflict));
                         Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
@@ -837,7 +843,7 @@ impl SqlEngine {
                         })
                     }
                     None => {
-                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows));
+                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows, on_conflict));
                         Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
@@ -871,6 +877,7 @@ impl SqlEngine {
         let InsertBuffer {
             table_name,
             columns,
+            on_conflict,
             total_rows,
             statement_row_counts,
             rows,
@@ -884,6 +891,7 @@ impl SqlEngine {
             table: table_name.clone(),
             columns,
             source: InsertSource::Rows(rows),
+            on_conflict,
         };
 
         let executed = self.execute_plan_statement(PlanStatement::Insert(plan))?;
@@ -954,11 +962,25 @@ impl SqlEngine {
                 DROPPED_TABLE_TRANSACTION_ERR.into(),
             ));
         }
-        if stmt.replace_into || stmt.ignore || stmt.or.is_some() {
-            return Err(Error::InvalidArgumentError(
-                "non-standard INSERT forms are not supported".into(),
-            ));
-        }
+        
+        // Extract conflict resolution action
+        use sqlparser::ast::SqliteOnConflict;
+        let on_conflict = if stmt.replace_into {
+            InsertConflictAction::Replace
+        } else if stmt.ignore {
+            InsertConflictAction::Ignore
+        } else if let Some(or_clause) = stmt.or {
+            match or_clause {
+                SqliteOnConflict::Replace => InsertConflictAction::Replace,
+                SqliteOnConflict::Ignore => InsertConflictAction::Ignore,
+                SqliteOnConflict::Abort => InsertConflictAction::Abort,
+                SqliteOnConflict::Fail => InsertConflictAction::Fail,
+                SqliteOnConflict::Rollback => InsertConflictAction::Rollback,
+            }
+        } else {
+            InsertConflictAction::None
+        };
+        
         if stmt.overwrite {
             return Err(Error::InvalidArgumentError(
                 "INSERT OVERWRITE is not supported".into(),
@@ -1025,6 +1047,7 @@ impl SqlEngine {
                     table_name: display_name,
                     columns,
                     rows,
+                    on_conflict,
                 })
             }
             SetExpr::Select(select) => {
@@ -1033,6 +1056,7 @@ impl SqlEngine {
                         table_name: display_name,
                         columns,
                         rows,
+                        on_conflict,
                     });
                 }
                 if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
@@ -1040,6 +1064,7 @@ impl SqlEngine {
                         table_name: display_name,
                         columns,
                         rows: range_rows.into_rows(),
+                        on_conflict,
                     });
                 }
 
@@ -1050,6 +1075,7 @@ impl SqlEngine {
                     source: InsertSource::Select {
                         plan: Box::new(select_plan),
                     },
+                    on_conflict,
                 }))
             }
             _ => Err(Error::InvalidArgumentError(
@@ -2820,6 +2846,7 @@ impl SqlEngine {
                 table: display_name.to_string(),
                 columns: column_names,
                 source: InsertSource::Rows(rows),
+                on_conflict: InsertConflictAction::None,
             };
             self.execute_plan_statement(PlanStatement::Insert(insert_plan))?;
         }
@@ -3237,6 +3264,7 @@ impl SqlEngine {
                 table_name,
                 columns,
                 rows,
+                on_conflict,
             } => {
                 tracing::trace!(
                     "DEBUG SQL handle_insert executing buffered-values insert for table={}",
@@ -3246,6 +3274,7 @@ impl SqlEngine {
                     table: table_name,
                     columns,
                     source: InsertSource::Rows(rows),
+                    on_conflict,
                 };
                 self.execute_plan_statement(PlanStatement::Insert(plan))
             }

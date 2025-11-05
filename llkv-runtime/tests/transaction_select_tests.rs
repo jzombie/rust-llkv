@@ -1,7 +1,7 @@
 use llkv_plan::PlanValue;
 use llkv_runtime::{
-    AggregateExpr, CreateTablePlan, InsertPlan, InsertSource, PlanColumnSpec, RuntimeContext,
-    RuntimeStatementResult, SelectPlan,
+    AggregateExpr, CreateTablePlan, InsertConflictAction, InsertPlan, InsertSource,
+    PlanColumnSpec, RuntimeContext, RuntimeStatementResult, SelectPlan,
 };
 use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::CatalogDdl;
@@ -37,6 +37,7 @@ fn test_transaction_select() {
             vec![PlanValue::Integer(1), PlanValue::String("Alice".into())],
             vec![PlanValue::Integer(2), PlanValue::String("Bob".into())],
         ]),
+        on_conflict: InsertConflictAction::None,
     };
     session.execute_insert_plan(insert_plan).unwrap();
 
@@ -51,6 +52,7 @@ fn test_transaction_select() {
             PlanValue::Integer(3),
             PlanValue::String("Charlie".into()),
         ]]),
+        on_conflict: InsertConflictAction::None,
     };
     session.execute_insert_plan(insert_plan2).unwrap();
 
@@ -112,6 +114,7 @@ fn test_transaction_select_with_aggregates() {
             vec![PlanValue::Integer(1), PlanValue::Integer(100)],
             vec![PlanValue::Integer(2), PlanValue::Integer(200)],
         ]),
+        on_conflict: InsertConflictAction::None,
     };
     session.execute_insert_plan(insert_plan).unwrap();
 
@@ -123,6 +126,7 @@ fn test_transaction_select_with_aggregates() {
         table: "products".into(),
         columns: vec![],
         source: InsertSource::Rows(vec![vec![PlanValue::Integer(3), PlanValue::Integer(300)]]),
+        on_conflict: InsertConflictAction::None,
     };
     session.execute_insert_plan(insert_plan2).unwrap();
 

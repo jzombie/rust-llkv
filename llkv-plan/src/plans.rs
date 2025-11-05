@@ -610,12 +610,30 @@ pub enum CreateTableSource {
 // INSERT Plan
 // ============================================================================
 
+/// SQLite conflict resolution action for INSERT statements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertConflictAction {
+    /// Standard INSERT behavior - fail on constraint violation
+    None,
+    /// INSERT OR REPLACE - update existing row on conflict
+    Replace,
+    /// INSERT OR IGNORE - skip row on conflict
+    Ignore,
+    /// INSERT OR ABORT - abort transaction on conflict
+    Abort,
+    /// INSERT OR FAIL - fail statement on conflict (but don't rollback)
+    Fail,
+    /// INSERT OR ROLLBACK - rollback transaction on conflict
+    Rollback,
+}
+
 /// Plan for inserting data into a table.
 #[derive(Clone, Debug)]
 pub struct InsertPlan {
     pub table: String,
     pub columns: Vec<String>,
     pub source: InsertSource,
+    pub on_conflict: InsertConflictAction,
 }
 
 /// Source data for INSERT operations.

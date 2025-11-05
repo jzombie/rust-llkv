@@ -514,6 +514,7 @@ impl RuntimeSession {
             table,
             columns,
             source,
+            on_conflict,
         } = plan;
 
         match source {
@@ -524,6 +525,7 @@ impl RuntimeSession {
                         table,
                         columns,
                         source: InsertSource::Rows(rows),
+                        on_conflict,
                     },
                     count,
                 ))
@@ -535,6 +537,7 @@ impl RuntimeSession {
                         table,
                         columns,
                         source: InsertSource::Batches(batches),
+                        on_conflict,
                     },
                     count,
                 ))
@@ -555,6 +558,7 @@ impl RuntimeSession {
                         table,
                         columns,
                         source: InsertSource::Rows(rows),
+                        on_conflict,
                     },
                     count,
                 ))

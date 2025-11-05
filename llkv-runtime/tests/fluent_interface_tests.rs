@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use llkv_runtime::{
-    AggregateExpr, InsertPlan, InsertSource, PlanValue, RuntimeContext, RuntimeStatementResult,
-    TransactionKind, row,
+    AggregateExpr, InsertConflictAction, InsertPlan, InsertSource, PlanValue, RuntimeContext,
+    RuntimeStatementResult, TransactionKind, row,
 };
 use llkv_storage::pager::{BoxedPager, MemPager};
 
@@ -75,6 +75,7 @@ fn fluent_transaction_flow() {
         table: "numbers".into(),
         columns: vec![],
         source: InsertSource::Rows(vec![vec![PlanValue::Integer(41)]]),
+        on_conflict: InsertConflictAction::None,
     };
     let insert_result = session.execute_insert_plan(insert_plan).expect("insert");
     assert!(matches!(

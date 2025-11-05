@@ -61,10 +61,10 @@ pub use llkv_executor::SelectExecution;
 pub use llkv_plan::{
     AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, CreateIndexPlan,
     CreateTablePlan, CreateTableSource, CreateViewPlan, DeletePlan, DropIndexPlan, DropTablePlan,
-    DropViewPlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource,
-    IntoPlanColumnSpec, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget,
-    PlanColumnSpec, PlanOperation, PlanStatement, PlanValue, ReindexPlan, RenameTablePlan,
-    SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
+    DropViewPlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertConflictAction,
+    InsertPlan, InsertSource, IntoPlanColumnSpec, MultiColumnUniqueSpec, OrderByPlan,
+    OrderSortType, OrderTarget, PlanColumnSpec, PlanOperation, PlanStatement, PlanValue,
+    ReindexPlan, RenameTablePlan, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
 };
 use llkv_result::{Error, Result};
 use llkv_table::{CatalogDdl, canonical_table_name};
