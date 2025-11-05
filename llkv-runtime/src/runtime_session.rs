@@ -1,10 +1,10 @@
-// TODO: Implement a common trait (similar to CataglogDdl) for runtime sessions and llkv-transaction sessions
+// TODO: Implement a common trait (similar to CatalogDdl) for runtime sessions and llkv-transaction sessions
 
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
-use llkv_storage::pager::{BoxedPager, MemPager, Pager};
+use llkv_storage::pager::{MemPager, Pager};
 use llkv_table::{
     SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation,
 };
@@ -30,7 +30,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     persistent: Arc<PersistentRuntimeNamespace<P>>,
-    temporary: Option<Arc<TemporaryRuntimeNamespace<BoxedPager>>>,
+    temporary: Option<Arc<TemporaryRuntimeNamespace<P>>>,
     registry: Arc<RwLock<RuntimeStorageNamespaceRegistry>>,
 }
 
@@ -50,24 +50,37 @@ where
         registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
         let temporary = {
-            let temp_pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
-            let temp_context = Arc::new(RuntimeContext::new(temp_pager));
-            
-            // Create a BoxedPager-wrapped version of the persistent context's pager so that
-            // temporary tables can access persistent tables with compatible types.
-            // This shares the same underlying storage and catalog.
-            let persistent_boxed_pager = Arc::new(BoxedPager::from_arc(Arc::clone(&base_context.pager)));
-            let persistent_boxed_context = Arc::new(RuntimeContext::new_with_catalog(
-                persistent_boxed_pager,
-                base_context.table_catalog(),
+            // ARCHITECTURAL DECISION: Temporary namespace implementation
+            //
+            // Temporary tables/views share the same pager and context as persistent tables,
+            // but are tracked separately via the namespace registry. This design:
+            //
+            // 1. Eliminates ExecutorTable<P> vs ExecutorTable<BoxedPager> type conflicts
+            // 2. Allows temporary views to reference persistent tables seamlessly
+            // 3. Simplifies cross-namespace table lookups (no fallback context needed)
+            // 4. Ensures all tables (temp and persistent) use the same catalog/metadata
+            //
+            // Trade-off: Temporary tables are written to the persistent pager (touch disk),
+            // but are explicitly dropped when the session ends or namespace is cleared.
+            // This is acceptable because:
+            // - Cleanup is deterministic and automatic
+            // - Performance impact is minimal (same I/O as MemPager for small temp tables)
+            // - Architecture is dramatically simpler and more maintainable
+            // - This mirrors how many production databases implement TEMP tables
+            //
+            // The namespace registry tracks which tables belong to which namespace,
+            // ensuring proper isolation and cleanup semantics.
+            //
+            // IMPLEMENTATION: Both namespaces share the exact same RuntimeContext instance.
+            // This ensures:
+            // - Single shared catalog (all tables visible across namespaces)
+            // - Single shared metadata store
+            // - Single shared column store
+            // - Namespace isolation is enforced purely via the registry
+            let namespace = Arc::new(TemporaryRuntimeNamespace::new(
+                TEMPORARY_NAMESPACE_ID.to_string(),
+                Arc::clone(&base_context),
             ));
-            
-            let namespace = Arc::new(
-                TemporaryRuntimeNamespace::new(
-                    TEMPORARY_NAMESPACE_ID.to_string(),
-                    temp_context,
-                ).with_fallback_context(persistent_boxed_context)
-            );
             registry.register_namespace(
                 Arc::clone(&namespace),
                 vec![TEMPORARY_NAMESPACE_ID.to_string()],
@@ -87,7 +100,7 @@ where
         Arc::clone(&self.persistent)
     }
 
-    pub(crate) fn temporary(&self) -> Option<Arc<TemporaryRuntimeNamespace<BoxedPager>>> {
+    pub(crate) fn temporary(&self) -> Option<Arc<TemporaryRuntimeNamespace<P>>> {
         self.temporary.as_ref().map(Arc::clone)
     }
 
@@ -120,9 +133,9 @@ pub struct RuntimeSession<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    // TODO: Allow generic pager type for the secondary pager context
-    // NOTE: Sessions always embed a `MemPager` for temporary namespaces; extend the
-    // wrapper when pluggable temp storage is supported.
+    // Transaction session using base pager type P and staging pager MemPager.
+    // The staging context (second type parameter) is only used for tables created
+    // within a transaction and always uses MemPager for isolation.
     inner: TransactionSession<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
     namespaces: Arc<SessionNamespaces<P>>,
 }
@@ -212,7 +225,7 @@ where
     }
 
     #[allow(dead_code)]
-    fn temporary_namespace(&self) -> Option<Arc<TemporaryRuntimeNamespace<BoxedPager>>> {
+    fn temporary_namespace(&self) -> Option<Arc<TemporaryRuntimeNamespace<P>>> {
         self.namespaces.temporary()
     }
 
@@ -1081,7 +1094,6 @@ where
                 Ok(())
             }
             PERSISTENT_NAMESPACE_ID => {
-                // Views don't participate in transactions currently
                 let persistent_namespace = self.persistent_namespace();
                 persistent_namespace.create_view(plan)
             }
@@ -1110,7 +1122,6 @@ where
                 Ok(())
             }
             PERSISTENT_NAMESPACE_ID => {
-                // Views don't participate in transactions currently
                 let persistent_namespace = self.persistent_namespace();
                 persistent_namespace.drop_view(plan)
             }

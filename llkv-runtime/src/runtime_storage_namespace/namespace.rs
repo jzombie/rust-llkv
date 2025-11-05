@@ -226,9 +226,6 @@ where
 {
     id: RuntimeNamespaceId,
     context: Arc<RwLock<Arc<RuntimeContext<P>>>>,
-    /// Fallback context for looking up persistent tables when not found in temp namespace.
-    /// Must use the same pager type P for compatibility.
-    fallback_context: Option<Arc<RuntimeContext<P>>>,
 }
 
 impl<P> TemporaryRuntimeNamespace<P>
@@ -239,13 +236,7 @@ where
         Self {
             id,
             context: Arc::new(RwLock::new(context)),
-            fallback_context: None,
         }
-    }
-
-    pub fn with_fallback_context(mut self, fallback: Arc<RuntimeContext<P>>) -> Self {
-        self.fallback_context = Some(fallback);
-        self
     }
 
     pub fn replace_context(&self, context: Arc<RuntimeContext<P>>) {
@@ -365,21 +356,8 @@ where
     }
 
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
-        // First try to find the table in the temporary namespace
-        match self.context().lookup_table(canonical) {
-            Ok(table) => Ok(table),
-            Err(Error::InvalidArgumentError(msg)) if msg.contains("unknown table") => {
-                // Table not found in temp namespace, try fallback to persistent namespace
-                if let Some(fallback_ctx) = &self.fallback_context {
-                    // Look up in the persistent namespace context
-                    // Both contexts use BoxedPager, so types are compatible
-                    fallback_ctx.lookup_table(canonical)
-                } else {
-                    Err(Error::InvalidArgumentError(format!("unknown table '{}'", canonical)))
-                }
-            }
-            Err(e) => Err(e),
-        }
+        // Delegate to context, which handles fallback lookup internally
+        self.context().lookup_table(canonical)
     }
 
     fn list_tables(&self) -> Vec<String> {

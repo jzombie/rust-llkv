@@ -77,6 +77,9 @@ where
         TransactionManager<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
     txn_tables_with_new_rows: RwLock<FxHashMap<TxnId, FxHashSet<String>>>,
+    // Optional fallback context for table lookups (used by temporary namespaces to access
+    // persistent tables). Must use same pager type for compatibility.
+    fallback_lookup: Option<Arc<RuntimeContext<P>>>,
 }
 
 impl<P> RuntimeContext<P>
@@ -239,6 +242,7 @@ where
             transaction_manager,
             txn_manager,
             txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
+            fallback_lookup: None,
         }
     }
 
@@ -250,6 +254,13 @@ where
     /// Return the column store for catalog operations.
     pub fn store(&self) -> &Arc<ColumnStore<P>> {
         &self.store
+    }
+
+    /// Set a fallback context for table lookups. Used by temporary namespaces to access
+    /// persistent tables.
+    pub fn with_fallback_lookup(mut self, fallback: Arc<RuntimeContext<P>>) -> Self {
+        self.fallback_lookup = Some(fallback);
+        self
     }
 
     /// Register a custom type alias (CREATE TYPE/DOMAIN).

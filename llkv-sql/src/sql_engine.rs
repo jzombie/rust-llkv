@@ -355,7 +355,20 @@ where
         &self,
         statement: PlanStatement,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-        let table = llkv_runtime::statement_table_name(&statement).map(str::to_string);
+        // Don't apply table error mapping to CREATE VIEW or DROP VIEW statements
+        // because the "table" name is the view being created/dropped, not a referenced table.
+        // Any "unknown table" errors from CREATE VIEW are about tables referenced in the SELECT.
+        let should_map_error = !matches!(
+            &statement,
+            PlanStatement::CreateView(_) | PlanStatement::DropView(_)
+        );
+        
+        let table = if should_map_error {
+            llkv_runtime::statement_table_name(&statement).map(str::to_string)
+        } else {
+            None
+        };
+        
         self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
