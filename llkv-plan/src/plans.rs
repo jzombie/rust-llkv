@@ -218,6 +218,58 @@ impl DropTablePlan {
 }
 
 // ============================================================================
+// CREATE VIEW Plan
+// ============================================================================
+
+/// Plan for creating a view.
+#[derive(Clone, Debug)]
+pub struct CreateViewPlan {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub view_definition: String,
+    pub select_plan: Box<SelectPlan>,
+    /// Optional storage namespace for the view (e.g., "temp" for temporary views).
+    pub namespace: Option<String>,
+}
+
+impl CreateViewPlan {
+    pub fn new(name: impl Into<String>, view_definition: String, select_plan: SelectPlan) -> Self {
+        Self {
+            name: name.into(),
+            if_not_exists: false,
+            view_definition,
+            select_plan: Box::new(select_plan),
+            namespace: None,
+        }
+    }
+}
+
+// ============================================================================
+// DROP VIEW Plan
+// ============================================================================
+
+/// Plan for dropping a view.
+#[derive(Clone, Debug)]
+pub struct DropViewPlan {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+impl DropViewPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            if_exists: false,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
+// ============================================================================
 // RENAME TABLE Plan
 // ============================================================================
 
@@ -1123,6 +1175,8 @@ pub enum PlanStatement {
     RollbackTransaction,
     CreateTable(CreateTablePlan),
     DropTable(DropTablePlan),
+    CreateView(CreateViewPlan),
+    DropView(DropViewPlan),
     DropIndex(DropIndexPlan),
     AlterTable(AlterTablePlan),
     CreateIndex(CreateIndexPlan),

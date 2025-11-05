@@ -25,11 +25,11 @@ use llkv_result::Error;
 use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
-    CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec,
-    PlanStatement, PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
-    extract_rows_from_range,
+    CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction, ForeignKeySpec,
+    IndexColumnPlan, InsertPlan, InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType,
+    OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, RenameTablePlan, RuntimeContext,
+    RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan, SelectProjection,
+    TruncatePlan, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
@@ -2263,11 +2263,6 @@ where
                 "CREATE OR ALTER VIEW is not supported".into(),
             ));
         }
-        if temporary {
-            return Err(Error::InvalidArgumentError(
-                "TEMPORARY VIEWS are not supported".into(),
-            ));
-        }
 
         // Parse view name (same as table parsing)
         let (schema_name, view_name) = parse_schema_qualified_name(&name)?;
@@ -2372,9 +2367,22 @@ where
         // Convert query to SQL string for storage (after applying column aliases when present)
         let view_definition = query_ast.to_string();
 
-        // Create the view through the runtime context so catalog and metadata stay authoritative.
-        let context = self.engine.context();
-        context.create_view(&display_name, view_definition, select_plan, if_not_exists)?;
+        // Build CreateViewPlan with namespace routing (same pattern as CREATE TABLE)
+        let namespace = if temporary {
+            Some(TEMPORARY_NAMESPACE_ID.to_string())
+        } else {
+            None
+        };
+
+        let plan = CreateViewPlan {
+            name: display_name.clone(),
+            if_not_exists,
+            view_definition,
+            select_plan: Box::new(select_plan),
+            namespace,
+        };
+
+        self.execute_plan_statement(PlanStatement::CreateView(plan))?;
 
         tracing::debug!("Created view: {}", display_name);
         Ok(RuntimeStatementResult::NoOp)
@@ -3533,7 +3541,8 @@ where
 
                 for name in names {
                     let view_name = Self::object_name_to_string(&name)?;
-                    self.engine.context().drop_view(&view_name, if_exists)?;
+                    let plan = llkv_plan::DropViewPlan::new(view_name).if_exists(if_exists);
+                    self.execute_plan_statement(llkv_plan::PlanStatement::DropView(plan))?;
                 }
 
                 Ok(RuntimeStatementResult::NoOp)

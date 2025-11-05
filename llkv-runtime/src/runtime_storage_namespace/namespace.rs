@@ -11,8 +11,8 @@ use std::sync::{Arc, RwLock};
 
 use llkv_executor::ExecutorTable;
 use llkv_plan::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan, PlanOperation,
-    RenameTablePlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateViewPlan, DropIndexPlan,
+    DropTablePlan, DropViewPlan, PlanOperation, RenameTablePlan,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -72,6 +72,12 @@ pub trait RuntimeStorageNamespace: Send + Sync + 'static {
     /// Drop an index from this namespace by forwarding the request.
     fn drop_index(&self, plan: DropIndexPlan)
     -> crate::Result<Option<SingleColumnIndexDescriptor>>;
+
+    /// Create a view inside this namespace.
+    fn create_view(&self, plan: CreateViewPlan) -> crate::Result<()>;
+
+    /// Drop a view from this namespace by forwarding the planned request.
+    fn drop_view(&self, plan: DropViewPlan) -> crate::Result<()>;
 
     /// Execute a generic plan operation. Namespaces that do not yet support
     /// this entry point should override this method.
@@ -187,6 +193,22 @@ where
         CatalogDdl::drop_index(self.context.as_ref(), plan)
     }
 
+    fn create_view(&self, plan: CreateViewPlan) -> crate::Result<()> {
+        let view_definition = plan.view_definition.clone();
+        let select_plan = *plan.select_plan.clone();
+        let context_arc = Arc::clone(&self.context);
+        context_arc.create_view(
+            &plan.name,
+            view_definition,
+            select_plan,
+            plan.if_not_exists,
+        )
+    }
+
+    fn drop_view(&self, plan: DropViewPlan) -> crate::Result<()> {
+        self.context.drop_view(&plan.name, plan.if_exists)
+    }
+
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
         self.context.lookup_table(canonical)
     }
@@ -204,6 +226,9 @@ where
 {
     id: RuntimeNamespaceId,
     context: Arc<RwLock<Arc<RuntimeContext<P>>>>,
+    /// Fallback context for looking up persistent tables when not found in temp namespace.
+    /// Must use the same pager type P for compatibility.
+    fallback_context: Option<Arc<RuntimeContext<P>>>,
 }
 
 impl<P> TemporaryRuntimeNamespace<P>
@@ -214,7 +239,13 @@ where
         Self {
             id,
             context: Arc::new(RwLock::new(context)),
+            fallback_context: None,
         }
+    }
+
+    pub fn with_fallback_context(mut self, fallback: Arc<RuntimeContext<P>>) -> Self {
+        self.fallback_context = Some(fallback);
+        self
     }
 
     pub fn replace_context(&self, context: Arc<RuntimeContext<P>>) {
@@ -316,8 +347,39 @@ where
         CatalogDdl::drop_index(context.as_ref(), plan)
     }
 
+    fn create_view(&self, plan: CreateViewPlan) -> crate::Result<()> {
+        let context = self.context(); // This returns Arc<RuntimeContext>
+        let view_definition = plan.view_definition.clone();
+        let select_plan = *plan.select_plan.clone();
+        context.create_view(
+            &plan.name,
+            view_definition,
+            select_plan,
+            plan.if_not_exists,
+        )
+    }
+
+    fn drop_view(&self, plan: DropViewPlan) -> crate::Result<()> {
+        let context = self.context();
+        context.drop_view(&plan.name, plan.if_exists)
+    }
+
     fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
-        self.context().lookup_table(canonical)
+        // First try to find the table in the temporary namespace
+        match self.context().lookup_table(canonical) {
+            Ok(table) => Ok(table),
+            Err(Error::InvalidArgumentError(msg)) if msg.contains("unknown table") => {
+                // Table not found in temp namespace, try fallback to persistent namespace
+                if let Some(fallback_ctx) = &self.fallback_context {
+                    // Look up in the persistent namespace context
+                    // Both contexts use BoxedPager, so types are compatible
+                    fallback_ctx.lookup_table(canonical)
+                } else {
+                    Err(Error::InvalidArgumentError(format!("unknown table '{}'", canonical)))
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn list_tables(&self) -> Vec<String> {

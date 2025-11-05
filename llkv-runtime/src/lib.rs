@@ -60,11 +60,11 @@ pub use runtime_table::{
 pub use llkv_executor::SelectExecution;
 pub use llkv_plan::{
     AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, CreateIndexPlan,
-    CreateTablePlan, CreateTableSource, DeletePlan, DropIndexPlan, DropTablePlan, ForeignKeyAction,
-    ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource, IntoPlanColumnSpec,
-    MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanOperation,
-    PlanStatement, PlanValue, RenameTablePlan, SelectPlan, SelectProjection, TruncatePlan,
-    UpdatePlan,
+    CreateTablePlan, CreateTableSource, CreateViewPlan, DeletePlan, DropIndexPlan, DropTablePlan,
+    DropViewPlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource,
+    IntoPlanColumnSpec, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget,
+    PlanColumnSpec, PlanOperation, PlanStatement, PlanValue, RenameTablePlan, SelectPlan,
+    SelectProjection, TruncatePlan, UpdatePlan,
 };
 use llkv_result::{Error, Result};
 use llkv_table::{CatalogDdl, canonical_table_name};
@@ -86,6 +86,8 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
     match statement {
         PlanStatement::CreateTable(plan) => Some(plan.name.as_str()),
         PlanStatement::DropTable(plan) => Some(plan.name.as_str()),
+        PlanStatement::CreateView(plan) => Some(plan.name.as_str()),
+        PlanStatement::DropView(plan) => Some(plan.name.as_str()),
         PlanStatement::AlterTable(plan) => Some(plan.table_name.as_str()),
         PlanStatement::CreateIndex(plan) => Some(plan.table.as_str()),
         PlanStatement::Insert(plan) => Some(plan.table.as_str()),

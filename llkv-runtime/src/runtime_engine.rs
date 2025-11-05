@@ -60,6 +60,14 @@ where
             PlanStatement::RollbackTransaction => self.session.rollback_transaction(),
             PlanStatement::CreateTable(plan) => CatalogDdl::create_table(&self.session, plan),
             PlanStatement::DropTable(plan) => CatalogDdl::drop_table(&self.session, plan),
+            PlanStatement::CreateView(plan) => {
+                CatalogDdl::create_view(&self.session, plan)?;
+                Ok(RuntimeStatementResult::NoOp)
+            }
+            PlanStatement::DropView(plan) => {
+                CatalogDdl::drop_view(&self.session, plan)?;
+                Ok(RuntimeStatementResult::NoOp)
+            }
             PlanStatement::DropIndex(plan) => CatalogDdl::drop_index(&self.session, plan),
             PlanStatement::AlterTable(plan) => CatalogDdl::alter_table(&self.session, plan),
             PlanStatement::CreateIndex(plan) => CatalogDdl::create_index(&self.session, plan),

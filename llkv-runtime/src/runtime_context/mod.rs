@@ -12,8 +12,8 @@ use crate::{
 use llkv_column_map::store::ColumnStore;
 use llkv_executor::{ExecutorMultiColumnUnique, ExecutorTable};
 use llkv_plan::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateTableSource, DropIndexPlan,
-    DropTablePlan, PlanColumnSpec, RenameTablePlan, SelectPlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateTableSource, CreateViewPlan,
+    DropIndexPlan, DropTablePlan, DropViewPlan, PlanColumnSpec, RenameTablePlan, SelectPlan,
 };
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{MemPager, Pager};
@@ -263,16 +263,14 @@ where
         Ok(())
     }
 
-    /// Create a view by executing its SELECT definition to derive projected columns
-    /// and persisting the metadata into the catalog. The view is registered as a
-    /// catalog entry with column names so subsequent binding can succeed without
-    /// reparsing the stored SQL in higher layers.
-    pub fn create_view(
+    /// Internal helper for creating a view that can be called from CatalogDdl trait implementation.
+    fn create_view_internal(
         self: &Arc<Self>,
         display_name: &str,
         view_definition: String,
         select_plan: SelectPlan,
         if_not_exists: bool,
+        snapshot: TransactionSnapshot,
     ) -> Result<()> {
         let (normalized_display, canonical_name) = canonical_table_name(display_name)?;
 
@@ -289,7 +287,6 @@ where
             )));
         }
 
-        let snapshot = self.default_snapshot();
         let execution = self.execute_select(select_plan, snapshot)?;
         let column_specs = {
             let schema = execution.schema();
@@ -319,6 +316,21 @@ where
         self.dropped_tables.write().unwrap().remove(&canonical_name);
 
         Ok(())
+    }
+
+    /// Create a view by executing its SELECT definition to derive projected columns
+    /// and persisting the metadata into the catalog. The view is registered as a
+    /// catalog entry with column names so subsequent binding can succeed without
+    /// reparsing the stored SQL in higher layers.
+    pub fn create_view(
+        self: &Arc<Self>,
+        display_name: &str,
+        view_definition: String,
+        select_plan: SelectPlan,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let snapshot = self.default_snapshot();
+        self.create_view_internal(display_name, view_definition, select_plan, if_not_exists, snapshot)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1022,5 +1034,17 @@ where
         }
 
         Ok(descriptor)
+    }
+
+    fn create_view(&self, _plan: CreateViewPlan) -> Result<()> {
+        // This trait method should not be called directly on RuntimeContext.
+        // Views should be created through RuntimeSession which has the Arc<RuntimeContext>.
+        Err(Error::Internal(
+            "create_view on RuntimeContext should be called through RuntimeSession".into(),
+        ))
+    }
+
+    fn drop_view(&self, plan: DropViewPlan) -> Result<()> {
+        RuntimeContext::drop_view(self, &plan.name, plan.if_exists)
     }
 }

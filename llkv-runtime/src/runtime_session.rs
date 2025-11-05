@@ -11,11 +11,12 @@ use llkv_table::{
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
-    AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource, DeletePlan,
-    DropIndexPlan, DropTablePlan, InsertPlan, InsertSource, PlanColumnSpec, PlanOperation,
-    PlanValue, RenameTablePlan, RuntimeContext, RuntimeStatementResult, RuntimeTransactionContext,
-    SelectExecution, SelectPlan, SelectProjection, TransactionContext, TransactionKind,
-    TransactionResult, TransactionSession, UpdatePlan,
+    AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource,
+    CreateViewPlan, DeletePlan, DropIndexPlan, DropTablePlan, DropViewPlan, InsertPlan,
+    InsertSource, PlanColumnSpec, PlanOperation, PlanValue, RenameTablePlan, RuntimeContext,
+    RuntimeStatementResult, RuntimeTransactionContext, SelectExecution, SelectPlan,
+    SelectProjection, TransactionContext, TransactionKind, TransactionResult, TransactionSession,
+    UpdatePlan,
 };
 use crate::{
     PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace, RuntimeNamespaceId,
@@ -51,10 +52,22 @@ where
         let temporary = {
             let temp_pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
             let temp_context = Arc::new(RuntimeContext::new(temp_pager));
-            let namespace = Arc::new(TemporaryRuntimeNamespace::new(
-                TEMPORARY_NAMESPACE_ID.to_string(),
-                temp_context,
+            
+            // Create a BoxedPager-wrapped version of the persistent context's pager so that
+            // temporary tables can access persistent tables with compatible types.
+            // This shares the same underlying storage and catalog.
+            let persistent_boxed_pager = Arc::new(BoxedPager::from_arc(Arc::clone(&base_context.pager)));
+            let persistent_boxed_context = Arc::new(RuntimeContext::new_with_catalog(
+                persistent_boxed_pager,
+                base_context.table_catalog(),
             ));
+            
+            let namespace = Arc::new(
+                TemporaryRuntimeNamespace::new(
+                    TEMPORARY_NAMESPACE_ID.to_string(),
+                    temp_context,
+                ).with_fallback_context(persistent_boxed_context)
+            );
             registry.register_namespace(
                 Arc::clone(&namespace),
                 vec![TEMPORARY_NAMESPACE_ID.to_string()],
@@ -1037,6 +1050,69 @@ where
                     }
                     self.run_autocommit_drop_table(plan)
                 }
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn create_view(&self, plan: CreateViewPlan) -> Result<()> {
+        let target_namespace = plan
+            .namespace
+            .clone()
+            .unwrap_or_else(|| PERSISTENT_NAMESPACE_ID.to_string())
+            .to_ascii_lowercase();
+
+        match target_namespace.as_str() {
+            TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                let (_, canonical) = canonical_table_name(&plan.name)?;
+                temp_namespace.create_view(plan)?;
+                let namespace_id = temp_namespace.namespace_id().to_string();
+                let registry = self.namespace_registry();
+                registry
+                    .write()
+                    .expect("namespace registry poisoned")
+                    .register_table(&namespace_id, canonical);
+                Ok(())
+            }
+            PERSISTENT_NAMESPACE_ID => {
+                // Views don't participate in transactions currently
+                let persistent_namespace = self.persistent_namespace();
+                persistent_namespace.create_view(plan)
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "Unknown storage namespace '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn drop_view(&self, plan: DropViewPlan) -> Result<()> {
+        let (_, canonical_view) = canonical_table_name(&plan.name)?;
+        let namespace_id = self.resolve_namespace_for_table(&canonical_view);
+
+        match namespace_id.as_str() {
+            TEMPORARY_NAMESPACE_ID => {
+                let temp_namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                temp_namespace.drop_view(plan)?;
+                let registry = self.namespace_registry();
+                registry
+                    .write()
+                    .expect("namespace registry poisoned")
+                    .unregister_table(&canonical_view);
+                Ok(())
+            }
+            PERSISTENT_NAMESPACE_ID => {
+                // Views don't participate in transactions currently
+                let persistent_namespace = self.persistent_namespace();
+                persistent_namespace.drop_view(plan)
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "Unknown storage namespace '{}'",

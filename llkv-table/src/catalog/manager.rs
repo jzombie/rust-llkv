@@ -270,7 +270,7 @@ where
             .apply_column_definitions(table_id, &table_columns, created_at_micros)?;
         self.metadata.flush_table(table_id)?;
 
-        // Register the view in the catalog so it can be looked up by name
+        // Register the view in the catalog (no namespace prefix - namespacing handled at runtime session layer)
         self.catalog.register_table(display_name, table_id)?;
 
         if let Some(field_resolver) = self.catalog.field_resolver(table_id) {
