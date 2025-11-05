@@ -36,6 +36,14 @@ where
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
 
+        // Views are read-only - reject INSERT operations
+        if self.is_view(table.table.table_id())? {
+            return Err(Error::InvalidArgumentError(format!(
+                "cannot modify view '{}'",
+                display_name
+            )));
+        }
+
         // Targeted debug for 'keys' table only
         if display_name == "keys" {
             tracing::trace!(

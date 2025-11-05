@@ -44,6 +44,14 @@ where
         } = plan;
         let (display_name, canonical_name) = canonical_table_name(&table)?;
         let table = self.lookup_table(&canonical_name)?;
+
+        // Views are read-only - reject UPDATE operations
+        if self.is_view(table.table.table_id())? {
+            return Err(Error::InvalidArgumentError(format!(
+                "cannot modify view '{}'",
+                display_name
+            )));
+        }
         if let Some(filter) = filter {
             self.update_filtered_rows(
                 table.as_ref(),
