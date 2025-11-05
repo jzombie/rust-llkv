@@ -12,7 +12,7 @@ use arrow::array::{
 use llkv_result::Error;
 use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
 /// Thread-local storage for expected column types from sqllogictest directives.
@@ -218,11 +218,11 @@ fn record_statement(sql: &str, duration: Duration, result_type: &str) {
 
 /// Tokio-agnostic harness that adapts `SqlEngine` to the `sqllogictest` runner.
 pub struct EngineHarness {
-    engine: SqlEngine<MemPager>,
+    engine: SqlEngine,
 }
 
 impl EngineHarness {
-    pub fn new(engine: SqlEngine<MemPager>) -> Self {
+    pub fn new(engine: SqlEngine) -> Self {
         tracing::debug!("[HARNESS] new() created harness at {:p}", &engine);
         // The SLT workload streams thousands of literal INSERTs. Enable cross-statement
         // batching so we exercise the optimized ingestion path while keeping single-engine
@@ -236,7 +236,7 @@ impl EngineHarness {
 
 #[derive(Clone)]
 pub struct SharedContext {
-    context: Arc<RuntimeContext<MemPager>>,
+    context: Arc<RuntimeContext<BoxedPager>>,
 }
 
 impl Default for SharedContext {
@@ -247,12 +247,12 @@ impl Default for SharedContext {
 
 impl SharedContext {
     pub fn new() -> Self {
-        let pager = Arc::new(MemPager::default());
+        let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
         let context = Arc::new(RuntimeContext::new(pager));
         Self { context }
     }
 
-    pub fn make_engine(&self) -> SqlEngine<MemPager> {
+    pub fn make_engine(&self) -> SqlEngine {
         SqlEngine::with_context(Arc::clone(&self.context), false)
     }
 }
@@ -339,15 +339,18 @@ impl AsyncDB for EngineHarness {
                 }
                 let mut result = results.remove(0);
                 let in_query_context = expectations::is_set();
-                if in_query_context
-                    && let RuntimeStatementResult::Insert { rows_inserted, .. } = &result
-                    && *rows_inserted == 0
-                    && let Ok(flushed) = self.engine.flush_pending_inserts()
-                    && let Some(first) = flushed.into_iter().next()
-                {
-                    // When the current INSERT buffered zero rows we need to surface the first
-                    // newly flushed result so sqllogictest observes the expected row count.
-                    result = first;
+                if in_query_context {
+                    if let RuntimeStatementResult::Insert { rows_inserted, .. } = &result {
+                        if *rows_inserted == 0 {
+                            if let Ok(mut flushed) = self.engine.flush_pending_inserts() {
+                                if let Some(first) = flushed.into_iter().next() {
+                                    // When the current INSERT buffered zero rows we need to surface the first
+                                    // newly flushed result so sqllogictest observes the expected row count.
+                                    result = first;
+                                }
+                            }
+                        }
+                    }
                 }
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {

@@ -4,11 +4,10 @@ use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
-use llkv_storage::pager::{MemPager, Pager};
+use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::{
     SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation,
 };
-use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
     AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource,
@@ -25,20 +24,18 @@ use crate::{
 };
 use llkv_plan::TruncatePlan;
 
-pub(crate) struct SessionNamespaces<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    persistent: Arc<PersistentRuntimeNamespace<P>>,
-    temporary: Option<Arc<TemporaryRuntimeNamespace<P>>>,
+type StatementResult = RuntimeStatementResult<BoxedPager>;
+type TxnResult = TransactionResult<BoxedPager>;
+type BaseTxnContext = RuntimeTransactionContext<BoxedPager>;
+
+pub(crate) struct SessionNamespaces {
+    persistent: Arc<PersistentRuntimeNamespace>,
+    temporary: Option<Arc<TemporaryRuntimeNamespace>>,
     registry: Arc<RwLock<RuntimeStorageNamespaceRegistry>>,
 }
 
-impl<P> SessionNamespaces<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    pub(crate) fn new(base_context: Arc<RuntimeContext<P>>) -> Self {
+impl SessionNamespaces {
+    pub(crate) fn new(base_context: Arc<RuntimeContext<BoxedPager>>) -> Self {
         let persistent = Arc::new(PersistentRuntimeNamespace::new(
             PERSISTENT_NAMESPACE_ID.to_string(),
             Arc::clone(&base_context),
@@ -50,36 +47,32 @@ where
         registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
         let temporary = {
-            // ARCHITECTURAL DECISION: Temporary namespace implementation
+            // ARCHITECTURAL DECISION: Multi-pager arena via fallback lookup
             //
-            // Temporary tables/views share the same pager and context as persistent tables,
-            // but are tracked separately via the namespace registry. This design:
+            // Temporary tables use an isolated MemPager-backed ColumnStore while sharing the
+            // persistent namespace's catalog. When a temporary object references persistent
+            // data (e.g., CREATE TEMP VIEW ... FROM main.t1), the temporary context forwards
+            // lookups to the persistent context via fallback. This keeps temporary storage
+            // purely in-memory while preserving cross-namespace visibility.
             //
-            // 1. Eliminates ExecutorTable<P> vs ExecutorTable<BoxedPager> type conflicts
-            // 2. Allows temporary views to reference persistent tables seamlessly
-            // 3. Simplifies cross-namespace table lookups (no fallback context needed)
-            // 4. Ensures all tables (temp and persistent) use the same catalog/metadata
-            //
-            // Trade-off: Temporary tables are written to the persistent pager (touch disk),
-            // but are explicitly dropped when the session ends or namespace is cleared.
-            // This is acceptable because:
-            // - Cleanup is deterministic and automatic
-            // - Performance impact is minimal (same I/O as MemPager for small temp tables)
-            // - Architecture is dramatically simpler and more maintainable
-            // - This mirrors how many production databases implement TEMP tables
-            //
-            // The namespace registry tracks which tables belong to which namespace,
-            // ensuring proper isolation and cleanup semantics.
-            //
-            // IMPLEMENTATION: Both namespaces share the exact same RuntimeContext instance.
-            // This ensures:
-            // - Single shared catalog (all tables visible across namespaces)
-            // - Single shared metadata store
-            // - Single shared column store
-            // - Namespace isolation is enforced purely via the registry
+            // Implementation steps:
+            // 1. Wrap a fresh MemPager in BoxedPager so it uses the same runtime pager type
+            //    as the persistent context (BoxedPager).
+            // 2. Reuse the persistent catalog handle so both namespaces observe identical
+            //    table metadata.
+            // 3. Install the persistent context as the fallback lookup target so cache misses
+            //    in the temporary namespace transparently resolve to persistent tables.
+            let shared_catalog = base_context.table_catalog();
+            let temp_mem_pager = Arc::new(MemPager::default());
+            let temp_boxed_pager = Arc::new(BoxedPager::from_arc(temp_mem_pager));
+            let temp_context = Arc::new(
+                RuntimeContext::new_with_catalog(temp_boxed_pager, Arc::clone(&shared_catalog))
+                    .with_fallback_lookup(Arc::clone(&base_context)),
+            );
+
             let namespace = Arc::new(TemporaryRuntimeNamespace::new(
                 TEMPORARY_NAMESPACE_ID.to_string(),
-                Arc::clone(&base_context),
+                temp_context,
             ));
             registry.register_namespace(
                 Arc::clone(&namespace),
@@ -96,11 +89,11 @@ where
         }
     }
 
-    pub(crate) fn persistent(&self) -> Arc<PersistentRuntimeNamespace<P>> {
+    pub(crate) fn persistent(&self) -> Arc<PersistentRuntimeNamespace> {
         Arc::clone(&self.persistent)
     }
 
-    pub(crate) fn temporary(&self) -> Option<Arc<TemporaryRuntimeNamespace<P>>> {
+    pub(crate) fn temporary(&self) -> Option<Arc<TemporaryRuntimeNamespace>> {
         self.temporary.as_ref().map(Arc::clone)
     }
 
@@ -109,10 +102,7 @@ where
     }
 }
 
-impl<P> Drop for SessionNamespaces<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+impl Drop for SessionNamespaces {
     fn drop(&mut self) {
         if let Some(temp) = &self.temporary {
             let namespace_id = temp.namespace_id().to_string();
@@ -129,27 +119,22 @@ where
 ///
 /// This is a high-level wrapper around the transaction machinery that provides
 /// a clean API for users. Operations can be executed directly or within a transaction.
-pub struct RuntimeSession<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    // Transaction session using base pager type P and staging pager MemPager.
-    // The staging context (second type parameter) is only used for tables created
-    // within a transaction and always uses MemPager for isolation.
-    inner: TransactionSession<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
-    namespaces: Arc<SessionNamespaces<P>>,
+pub struct RuntimeSession {
+    // Transaction session using BoxedPager for base storage and MemPager for staging tables
+    inner: TransactionSession<
+        RuntimeTransactionContext<BoxedPager>,
+        RuntimeTransactionContext<MemPager>,
+    >,
+    namespaces: Arc<SessionNamespaces>,
 }
 
-impl<P> RuntimeSession<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+impl RuntimeSession {
     pub(crate) fn from_parts(
         inner: TransactionSession<
-            RuntimeTransactionContext<P>,
+            RuntimeTransactionContext<BoxedPager>,
             RuntimeTransactionContext<MemPager>,
         >,
-        namespaces: Arc<SessionNamespaces<P>>,
+        namespaces: Arc<SessionNamespaces>,
     ) -> Self {
         Self { inner, namespaces }
     }
@@ -184,7 +169,7 @@ where
         Some(self.resolve_namespace_for_table(&canonical))
     }
 
-    fn select_from_temporary(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
+    fn select_from_temporary(&self, plan: SelectPlan) -> Result<StatementResult> {
         let temp_namespace = self
             .temporary_namespace()
             .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
@@ -220,22 +205,22 @@ where
         })
     }
 
-    fn persistent_namespace(&self) -> Arc<PersistentRuntimeNamespace<P>> {
+    fn persistent_namespace(&self) -> Arc<PersistentRuntimeNamespace> {
         self.namespaces.persistent()
     }
 
     #[allow(dead_code)]
-    fn temporary_namespace(&self) -> Option<Arc<TemporaryRuntimeNamespace<P>>> {
+    fn temporary_namespace(&self) -> Option<Arc<TemporaryRuntimeNamespace>> {
         self.namespaces.temporary()
     }
 
-    fn base_transaction_context(&self) -> Arc<RuntimeTransactionContext<P>> {
+    fn base_transaction_context(&self) -> Arc<BaseTxnContext> {
         Arc::clone(self.inner.context())
     }
 
     fn with_autocommit_transaction_context<F, T>(&self, f: F) -> Result<T>
     where
-        F: FnOnce(&RuntimeTransactionContext<P>) -> Result<T>,
+        F: FnOnce(&BaseTxnContext) -> Result<T>,
     {
         let context = self.base_transaction_context();
         let default_snapshot = context.ctx().default_snapshot();
@@ -243,26 +228,23 @@ where
         f(context.as_ref())
     }
 
-    fn run_autocommit_insert(&self, plan: InsertPlan) -> Result<TransactionResult<P>> {
+    fn run_autocommit_insert(&self, plan: InsertPlan) -> Result<TxnResult> {
         self.with_autocommit_transaction_context(|ctx| TransactionContext::insert(ctx, plan))
     }
 
-    fn run_autocommit_update(&self, plan: UpdatePlan) -> Result<TransactionResult<P>> {
+    fn run_autocommit_update(&self, plan: UpdatePlan) -> Result<TxnResult> {
         self.with_autocommit_transaction_context(|ctx| TransactionContext::update(ctx, plan))
     }
 
-    fn run_autocommit_delete(&self, plan: DeletePlan) -> Result<TransactionResult<P>> {
+    fn run_autocommit_delete(&self, plan: DeletePlan) -> Result<TxnResult> {
         self.with_autocommit_transaction_context(|ctx| TransactionContext::delete(ctx, plan))
     }
 
-    fn run_autocommit_truncate(&self, plan: TruncatePlan) -> Result<TransactionResult<P>> {
+    fn run_autocommit_truncate(&self, plan: TruncatePlan) -> Result<TxnResult> {
         self.with_autocommit_transaction_context(|ctx| TransactionContext::truncate(ctx, plan))
     }
 
-    fn run_autocommit_create_table(
-        &self,
-        plan: CreateTablePlan,
-    ) -> Result<RuntimeStatementResult<P>> {
+    fn run_autocommit_create_table(&self, plan: CreateTablePlan) -> Result<StatementResult> {
         let result =
             self.with_autocommit_transaction_context(|ctx| CatalogDdl::create_table(ctx, plan))?;
         match result {
@@ -276,7 +258,7 @@ where
         }
     }
 
-    fn run_autocommit_drop_table(&self, plan: DropTablePlan) -> Result<RuntimeStatementResult<P>> {
+    fn run_autocommit_drop_table(&self, plan: DropTablePlan) -> Result<StatementResult> {
         self.with_autocommit_transaction_context(|ctx| CatalogDdl::drop_table(ctx, plan))?;
         Ok(RuntimeStatementResult::NoOp)
     }
@@ -285,10 +267,7 @@ where
         self.with_autocommit_transaction_context(|ctx| CatalogDdl::rename_table(ctx, plan))
     }
 
-    fn run_autocommit_alter_table(
-        &self,
-        plan: AlterTablePlan,
-    ) -> Result<RuntimeStatementResult<P>> {
+    fn run_autocommit_alter_table(&self, plan: AlterTablePlan) -> Result<StatementResult> {
         let result =
             self.with_autocommit_transaction_context(|ctx| CatalogDdl::alter_table(ctx, plan))?;
         match result {
@@ -309,10 +288,7 @@ where
         }
     }
 
-    fn run_autocommit_create_index(
-        &self,
-        plan: CreateIndexPlan,
-    ) -> Result<RuntimeStatementResult<P>> {
+    fn run_autocommit_create_index(&self, plan: CreateIndexPlan) -> Result<StatementResult> {
         let result =
             self.with_autocommit_transaction_context(|ctx| CatalogDdl::create_index(ctx, plan))?;
         match result {
@@ -340,7 +316,7 @@ where
     /// Begin a transaction in this session.
     /// Creates an empty staging context for new tables created within the transaction.
     /// Existing tables are accessed via MVCC visibility filtering - NO data copying occurs.
-    pub fn begin_transaction(&self) -> Result<RuntimeStatementResult<P>> {
+    pub fn begin_transaction(&self) -> Result<StatementResult> {
         let staging_pager = Arc::new(MemPager::default());
         tracing::trace!(
             "BEGIN_TRANSACTION: Created staging pager at {:p}",
@@ -401,7 +377,7 @@ where
 
     /// Commit the current transaction and apply changes to the base context.
     /// If the transaction was aborted, this acts as a ROLLBACK instead.
-    pub fn commit_transaction(&self) -> Result<RuntimeStatementResult<P>> {
+    pub fn commit_transaction(&self) -> Result<StatementResult> {
         tracing::trace!("Session::commit_transaction called");
         let (tx_result, operations) = self.inner.commit_transaction()?;
         tracing::trace!(
@@ -492,7 +468,7 @@ where
     }
 
     /// Rollback the current transaction, discarding all changes.
-    pub fn rollback_transaction(&self) -> Result<RuntimeStatementResult<P>> {
+    pub fn rollback_transaction(&self) -> Result<StatementResult> {
         self.inner.rollback_transaction()?;
         let base_ctx = self.inner.context();
         let default_snapshot = base_ctx.ctx().default_snapshot();
@@ -581,7 +557,7 @@ where
     }
 
     /// Insert rows (outside or inside transaction).
-    pub fn execute_insert_plan(&self, plan: InsertPlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_insert_plan(&self, plan: InsertPlan) -> Result<StatementResult> {
         tracing::trace!("Session::insert called for table={}", plan.table);
         let (plan, rows_inserted) = self.normalize_insert_plan(plan)?;
         let table_name = plan.table.clone();
@@ -652,7 +628,7 @@ where
     }
 
     /// Select rows (outside or inside transaction).
-    pub fn execute_select_plan(&self, plan: SelectPlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_select_plan(&self, plan: SelectPlan) -> Result<StatementResult> {
         if let Some(namespace_id) = self.namespace_for_select_plan(&plan)
             && namespace_id == TEMPORARY_NAMESPACE_ID
         {
@@ -738,7 +714,7 @@ where
         }
     }
 
-    pub fn execute_update_plan(&self, plan: UpdatePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_update_plan(&self, plan: UpdatePlan) -> Result<StatementResult> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -805,7 +781,7 @@ where
         }
     }
 
-    pub fn execute_delete_plan(&self, plan: DeletePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_delete_plan(&self, plan: DeletePlan) -> Result<StatementResult> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -870,7 +846,7 @@ where
         }
     }
 
-    pub fn execute_truncate_plan(&self, plan: TruncatePlan) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_truncate_plan(&self, plan: TruncatePlan) -> Result<StatementResult> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
 
@@ -939,16 +915,13 @@ where
 /// Implement [`CatalogDdl`] directly on the session so callers must import the trait
 /// to perform schema mutations. This keeps all runtime DDL entry points aligned with
 /// the shared contract used by contexts and storage namespaces.
-impl<P> CatalogDdl for RuntimeSession<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    type CreateTableOutput = RuntimeStatementResult<P>;
-    type DropTableOutput = RuntimeStatementResult<P>;
+impl CatalogDdl for RuntimeSession {
+    type CreateTableOutput = StatementResult;
+    type DropTableOutput = StatementResult;
     type RenameTableOutput = ();
-    type AlterTableOutput = RuntimeStatementResult<P>;
-    type CreateIndexOutput = RuntimeStatementResult<P>;
-    type DropIndexOutput = RuntimeStatementResult<P>;
+    type AlterTableOutput = StatementResult;
+    type CreateIndexOutput = StatementResult;
+    type DropIndexOutput = StatementResult;
 
     fn create_table(&self, plan: CreateTablePlan) -> Result<Self::CreateTableOutput> {
         let target_namespace = plan
@@ -974,7 +947,7 @@ where
                         .expect("namespace registry poisoned")
                         .register_table(&namespace_id, canonical);
                 }
-                result.convert_pager_type::<P>()
+                Ok(result)
             }
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
@@ -1200,7 +1173,7 @@ where
 
                 validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
 
-                temp_namespace.alter_table(plan)?.convert_pager_type::<P>()
+                Ok(temp_namespace.alter_table(plan)?)
             }
             PERSISTENT_NAMESPACE_ID => {
                 let persistent = self.persistent_namespace();
@@ -1245,7 +1218,7 @@ where
                 let temp_namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                temp_namespace.create_index(plan)?.convert_pager_type::<P>()
+                Ok(temp_namespace.create_index(plan)?)
             }
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {

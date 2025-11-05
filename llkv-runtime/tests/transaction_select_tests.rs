@@ -3,14 +3,14 @@ use llkv_runtime::{
     AggregateExpr, CreateTablePlan, InsertPlan, InsertSource, PlanColumnSpec, RuntimeContext,
     RuntimeStatementResult, SelectPlan,
 };
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::CatalogDdl;
 use std::sync::Arc;
 
 #[test]
 fn test_transaction_select() {
-    let pager = Arc::new(MemPager::default());
-    let ctx = Arc::new(RuntimeContext::new(pager));
+    let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+    let ctx = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
     let session = ctx.create_session();
 
     // Create table
@@ -84,8 +84,8 @@ fn test_transaction_select() {
 
 #[test]
 fn test_transaction_select_with_aggregates() {
-    let pager = Arc::new(MemPager::default());
-    let ctx = Arc::new(RuntimeContext::new(pager));
+    let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+    let ctx = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
     let session = ctx.create_session();
 
     // Create table

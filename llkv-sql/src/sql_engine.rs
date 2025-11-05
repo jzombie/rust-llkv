@@ -31,7 +31,7 @@ use llkv_runtime::{
     RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan, SelectProjection,
     TruncatePlan, UpdatePlan, extract_rows_from_range,
 };
-use llkv_storage::pager::Pager;
+use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use llkv_table::{CatalogDdl, TriggerEventMeta, TriggerTimingMeta};
 use regex::Regex;
@@ -51,6 +51,13 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Span;
+
+type SqlPager = BoxedPager;
+type SqlRuntimePager = SqlPager;
+type SqlStatementResult = RuntimeStatementResult<SqlPager>;
+type SqlContext = RuntimeContext<SqlPager>;
+type SqlSession = RuntimeSession;
+type P = SqlRuntimePager;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatementExpectation {
@@ -243,19 +250,13 @@ enum PreparedInsert {
 
 /// Return value from [`SqlEngine::buffer_insert`], exposing any buffered flush results along with
 /// the row-count placeholder for the currently processed statement.
-struct BufferedInsertResult<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    flushed: Vec<RuntimeStatementResult<P>>,
-    current: Option<RuntimeStatementResult<P>>,
+struct BufferedInsertResult {
+    flushed: Vec<SqlStatementResult>,
+    current: Option<SqlStatementResult>,
 }
 
-pub struct SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    engine: RuntimeEngine<P>,
+pub struct SqlEngine {
+    engine: RuntimeEngine,
     default_nulls_first: AtomicBool,
     /// Buffer for batching INSERTs across execute() calls for massive performance gains.
     insert_buffer: RefCell<Option<InsertBuffer>>,
@@ -270,10 +271,7 @@ where
 
 const DROPPED_TABLE_TRANSACTION_ERR: &str = "another transaction has dropped this table";
 
-impl<P> Drop for SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
+impl Drop for SqlEngine {
     fn drop(&mut self) {
         // Flush remaining INSERTs when engine is dropped
         if let Err(e) = self.flush_buffer_results() {
@@ -282,10 +280,7 @@ where
     }
 }
 
-impl<P> Clone for SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+impl Clone for SqlEngine {
     fn clone(&self) -> Self {
         tracing::warn!(
             "[SQL_ENGINE] SqlEngine::clone() called - will create new Engine with new session!"
@@ -305,12 +300,9 @@ where
 }
 
 #[allow(dead_code)]
-impl<P> SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+impl SqlEngine {
     fn from_runtime_engine(
-        engine: RuntimeEngine<P>,
+        engine: RuntimeEngine,
         default_nulls_first: bool,
         insert_buffering_enabled: bool,
     ) -> Self {
@@ -351,10 +343,7 @@ where
         }
     }
 
-    fn execute_plan_statement(
-        &self,
-        statement: PlanStatement,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
+    fn execute_plan_statement(&self, statement: PlanStatement) -> SqlResult<SqlStatementResult> {
         // Don't apply table error mapping to CREATE VIEW or DROP VIEW statements
         // because the "table" name is the view being created/dropped, not a referenced table.
         // Any "unknown table" errors from CREATE VIEW are about tables referenced in the SELECT.
@@ -362,13 +351,13 @@ where
             &statement,
             PlanStatement::CreateView(_) | PlanStatement::DropView(_)
         );
-        
+
         let table = if should_map_error {
             llkv_runtime::statement_table_name(&statement).map(str::to_string)
         } else {
             None
         };
-        
+
         self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
@@ -382,7 +371,10 @@ where
     ///
     /// Callers that intend to stream large amounts of literal `INSERT ... VALUES` input can
     /// enable batching later using [`SqlEngine::set_insert_buffering`].
-    pub fn new(pager: Arc<P>) -> Self {
+    pub fn new<Pg>(pager: Arc<Pg>) -> Self
+    where
+        Pg: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    {
         let engine = RuntimeEngine::new(pager);
         Self::from_runtime_engine(engine, false, false)
     }
@@ -517,11 +509,11 @@ where
 
         IDENT_PATTERN.get_or_init(|| {
             // Matches optional dotted identifiers with standard or quoted segments.
-            r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"#.to_string()
+            r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"#
+                .to_string()
         });
-        COLUMN_IDENT_PATTERN.get_or_init(|| {
-            r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)"#.to_string()
-        });
+        COLUMN_IDENT_PATTERN
+            .get_or_init(|| r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)"#.to_string());
 
         let timing_re = TIMING_REGEX.get_or_init(|| {
             let event = format!(
@@ -551,9 +543,7 @@ where
         let for_each_begin_re = FOR_EACH_BEGIN_REGEX.get_or_init(|| {
             let pattern = format!(
                 r"(?ix)(?P<prefix>ON\s+{ident})\s+(?P<keyword>BEGIN\b)",
-                ident = IDENT_PATTERN
-                    .get()
-                    .expect("ident pattern initialized"),
+                ident = IDENT_PATTERN.get().expect("ident pattern initialized"),
             );
             Regex::new(&pattern).expect("valid trigger FOR EACH BEGIN regex")
         });
@@ -569,9 +559,7 @@ where
         let for_each_when_re = FOR_EACH_WHEN_REGEX.get_or_init(|| {
             let pattern = format!(
                 r"(?ix)(?P<prefix>ON\s+{ident})\s+(?P<keyword>WHEN\b)",
-                ident = IDENT_PATTERN
-                    .get()
-                    .expect("ident pattern initialized"),
+                ident = IDENT_PATTERN.get().expect("ident pattern initialized"),
             );
             Regex::new(&pattern).expect("valid trigger FOR EACH WHEN regex")
         });
@@ -616,12 +604,11 @@ where
         .to_string()
     }
 
-    pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
+    pub(crate) fn context_arc(&self) -> Arc<SqlContext> {
         self.engine.context()
     }
 
-    /// Construct an engine from an existing runtime context with insert buffering disabled.
-    pub fn with_context(context: Arc<RuntimeContext<P>>, default_nulls_first: bool) -> Self {
+    pub fn with_context(context: Arc<SqlContext>, default_nulls_first: bool) -> Self {
         Self::from_runtime_engine(
             RuntimeEngine::from_context(context),
             default_nulls_first,
@@ -659,7 +646,7 @@ where
     }
 
     /// Get a reference to the underlying session (for advanced use like error handling in test harnesses).
-    pub fn session(&self) -> &RuntimeSession<P> {
+    pub fn session(&self) -> &SqlSession {
         self.engine.session()
     }
 
@@ -675,7 +662,7 @@ where
     /// output for you. `execute` remains the right tool for schema migrations, transactional
     /// scripts, or workflows that need to inspect the specific runtime response for each
     /// statement.
-    pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
+    pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
         // Preprocess SQL
@@ -696,13 +683,17 @@ where
                 // SQLite dialect properly supports the abbreviated syntax.
                 if processed_sql.to_uppercase().contains("CREATE TRIGGER") {
                     let expanded = Self::preprocess_sqlite_trigger_shorthand(&processed_sql);
-                    parse_sql_with_recursion_limit(&dialect, &expanded)
-                        .map_err(|_| Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}")))?
+                    parse_sql_with_recursion_limit(&dialect, &expanded).map_err(|_| {
+                        Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}"))
+                    })?
                 } else {
-                    return Err(Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}")));
+                    return Err(Error::InvalidArgumentError(format!(
+                        "failed to parse SQL: {parse_err}"
+                    )));
                 }
             }
-        };        let mut results = Vec::with_capacity(statements.len());
+        };
+        let mut results = Vec::with_capacity(statements.len());
         for statement in statements.iter() {
             let statement_expectation = next_statement_expectation();
             match statement {
@@ -740,7 +731,7 @@ where
     /// Workloads that stream many INSERT statements without interleaving reads can invoke this
     /// to force persistence without waiting for the next non-INSERT statement or the engine
     /// drop hook.
-    pub fn flush_pending_inserts(&self) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
+    pub fn flush_pending_inserts(&self) -> SqlResult<Vec<SqlStatementResult>> {
         self.flush_buffer_results()
     }
 
@@ -754,7 +745,7 @@ where
         &self,
         insert: sqlparser::ast::Insert,
         expectation: StatementExpectation,
-    ) -> SqlResult<BufferedInsertResult<P>> {
+    ) -> SqlResult<BufferedInsertResult> {
         // Expectations serve two purposes: (a) ensure we surface synchronous errors when the
         // SLT harness anticipates them, and (b) force a flush when the harness is validating the
         // rows-affected count. In both situations we bypass the buffer entirely so the runtime
@@ -850,7 +841,7 @@ where
     }
 
     /// Flush buffered INSERTs, returning one result per original statement.
-    fn flush_buffer_results(&self) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
+    fn flush_buffer_results(&self) -> SqlResult<Vec<SqlStatementResult>> {
         let mut buf = self.insert_buffer.borrow_mut();
         let buffer = match buf.take() {
             Some(b) => b,
@@ -1102,7 +1093,7 @@ where
         }
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<RuntimeStatementResult<P>> {
+    fn execute_statement(&self, statement: Statement) -> SqlResult<SqlStatementResult> {
         let statement_sql = statement.to_string();
         let _query_label_guard = push_query_label(statement_sql.clone());
         tracing::debug!("SQL execute_statement: {}", statement_sql.trim());
@@ -1152,7 +1143,7 @@ where
     fn execute_statement_non_transactional(
         &self,
         statement: Statement,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
+    ) -> SqlResult<SqlStatementResult> {
         tracing::trace!("DEBUG SQL execute_statement_non_transactional called");
         match statement {
             Statement::CreateTable(stmt) => {
@@ -1492,7 +1483,7 @@ where
     fn handle_create_table(
         &self,
         mut stmt: sqlparser::ast::CreateTable,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
+    ) -> SqlResult<SqlStatementResult> {
         validate_create_table_common(&stmt)?;
 
         let (mut schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
@@ -7327,8 +7318,8 @@ fn resolve_identifier_expr(
     }
 }
 
-fn translate_condition_with_context<P>(
-    engine: &SqlEngine<P>,
+fn translate_condition_with_context(
+    engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     expr: &SqlExpr,
@@ -7336,8 +7327,6 @@ fn translate_condition_with_context<P>(
     subqueries: &mut Vec<llkv_plan::FilterSubquery>,
     mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::TransformFrame documentation for pattern details.
@@ -8802,18 +8791,12 @@ fn translate_scalar_internal(
         .ok_or_else(|| Error::Internal("translate_scalar: empty result stack".into()))
 }
 
-struct ScalarSubqueryPlanner<'engine, 'vec, P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    engine: &'engine SqlEngine<P>,
+struct ScalarSubqueryPlanner<'engine, 'vec> {
+    engine: &'engine SqlEngine,
     scalar_subqueries: &'vec mut Vec<llkv_plan::ScalarSubquery>,
 }
 
-impl<'engine, 'vec, P> ScalarSubqueryResolver for ScalarSubqueryPlanner<'engine, 'vec, P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
+impl<'engine, 'vec> ScalarSubqueryResolver for ScalarSubqueryPlanner<'engine, 'vec> {
     fn handle_scalar_subquery(
         &mut self,
         subquery: &Query,

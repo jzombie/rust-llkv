@@ -205,14 +205,14 @@ where
         );
 
         // Check catalog first for table existence
-        tracing::info!(
+        tracing::debug!(
             "[CATALOG_LOOKUP] Looking up table '{}' in catalog @ {:p}",
             canonical_name,
             &*self.catalog
         );
         let catalog_table_id = match self.catalog.table_id(canonical_name) {
             Some(id) => {
-                tracing::info!(
+                tracing::debug!(
                     "[CATALOG_LOOKUP] Found table '{}' with id={} in catalog",
                     canonical_name,
                     id
@@ -220,7 +220,7 @@ where
                 id
             }
             None => {
-                tracing::info!(
+                tracing::debug!(
                     "[CATALOG_LOOKUP] Table '{}' NOT FOUND in catalog @ {:p}",
                     canonical_name,
                     &*self.catalog
@@ -233,12 +233,15 @@ where
                     );
                     return fallback.lookup_table(canonical_name);
                 }
-                return Err(Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name)));
+                return Err(Error::InvalidArgumentError(format!(
+                    "unknown table '{}'",
+                    canonical_name
+                )));
             }
         };
 
         let table_id = catalog_table_id;
-        
+
         // Try to load the table from our store. If it fails, try fallback context.
         let table = match Table::from_id_and_store(table_id, Arc::clone(&self.store)) {
             Ok(t) => t,
@@ -247,7 +250,8 @@ where
                 if let Some(fallback) = &self.fallback_lookup {
                     tracing::debug!(
                         "[LAZY_LOAD] Table '{}' found in catalog but not in store ({}), trying fallback context",
-                        canonical_name, e
+                        canonical_name,
+                        e
                     );
                     return fallback.lookup_table(canonical_name);
                 }
@@ -267,7 +271,7 @@ where
             constraint_records,
             multi_column_uniques,
         } = summary;
-        
+
         // If table_meta is None, the table metadata isn't in our context's store.
         // Try fallback context before erroring.
         let _table_meta = match table_meta {
@@ -280,7 +284,10 @@ where
                     );
                     return fallback.lookup_table(canonical_name);
                 }
-                return Err(Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name)));
+                return Err(Error::InvalidArgumentError(format!(
+                    "unknown table '{}'",
+                    canonical_name
+                )));
             }
         };
         let catalog_field_resolver = self.catalog.field_resolver(catalog_table_id);

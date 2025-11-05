@@ -16,7 +16,7 @@ use llkv_plan::{
     DropIndexPlan, DropTablePlan, DropViewPlan, PlanColumnSpec, RenameTablePlan, SelectPlan,
 };
 use llkv_result::{Error, Result};
-use llkv_storage::pager::{MemPager, Pager};
+use llkv_storage::pager::{BoxedPager, MemPager, Pager};
 use llkv_table::catalog::TableCatalog;
 use llkv_table::{
     CatalogDdl, CatalogManager, ConstraintService, MetadataManager, MultiColumnUniqueRegistration,
@@ -77,8 +77,9 @@ where
         TransactionManager<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
     txn_tables_with_new_rows: RwLock<FxHashMap<TxnId, FxHashSet<String>>>,
-    // Optional fallback context for table lookups (used by temporary namespaces to access
-    // persistent tables). Must use same pager type for compatibility.
+    // Optional fallback context for cross-namespace table lookups. Temporary namespaces use this
+    // to access persistent tables while maintaining separate storage. The fallback shares the
+    // same pager type as the primary context so executor tables can be reused without conversion.
     fallback_lookup: Option<Arc<RuntimeContext<P>>>,
 }
 
@@ -256,8 +257,9 @@ where
         &self.store
     }
 
-    /// Set a fallback context for table lookups. Used by temporary namespaces to access
-    /// persistent tables.
+    /// Set a fallback context for cross-pager table lookups. The fallback uses BoxedPager
+    /// to enable access across different underlying pager types (e.g., temporary MemPager
+    /// can fall back to persistent disk pager).
     pub fn with_fallback_lookup(mut self, fallback: Arc<RuntimeContext<P>>) -> Self {
         self.fallback_lookup = Some(fallback);
         self
@@ -341,7 +343,13 @@ where
         if_not_exists: bool,
     ) -> Result<()> {
         let snapshot = self.default_snapshot();
-        self.create_view_internal(display_name, view_definition, select_plan, if_not_exists, snapshot)
+        self.create_view_internal(
+            display_name,
+            view_definition,
+            select_plan,
+            if_not_exists,
+            snapshot,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -480,21 +488,6 @@ where
         &self.catalog_service
     }
 
-    /// Create a new session for transaction management.
-    /// Each session can have its own independent transaction.
-    pub fn create_session(self: &Arc<Self>) -> RuntimeSession<P> {
-        tracing::debug!("[SESSION] RuntimeContext::create_session called");
-        let namespaces = Arc::new(crate::runtime_session::SessionNamespaces::new(Arc::clone(
-            self,
-        )));
-        let wrapper = RuntimeTransactionContext::new(Arc::clone(self));
-        let inner = self.transaction_manager.create_session(Arc::new(wrapper));
-        tracing::debug!(
-            "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
-        );
-        RuntimeSession::from_parts(inner, namespaces)
-    }
-
     /// Get a handle to an existing table by name.
     pub fn table(self: &Arc<Self>, name: &str) -> Result<RuntimeTableHandle<P>> {
         RuntimeTableHandle::new(Arc::clone(self), name)
@@ -543,6 +536,23 @@ where
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
         // Use catalog for table names (single source of truth)
         self.catalog.table_names()
+    }
+}
+
+impl RuntimeContext<BoxedPager> {
+    /// Create a new session for transaction management.
+    /// Each session can have its own independent transaction.
+    pub fn create_session(self: &Arc<Self>) -> RuntimeSession {
+        tracing::debug!("[SESSION] RuntimeContext::create_session called");
+        let namespaces = Arc::new(crate::runtime_session::SessionNamespaces::new(Arc::clone(
+            self,
+        )));
+        let wrapper = RuntimeTransactionContext::new(Arc::clone(self));
+        let inner = self.transaction_manager.create_session(Arc::new(wrapper));
+        tracing::debug!(
+            "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
+        );
+        RuntimeSession::from_parts(inner, namespaces)
     }
 }
 

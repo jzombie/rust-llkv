@@ -6,14 +6,15 @@ use llkv_runtime::{
     CreateTablePlan, ForeignKeyAction, ForeignKeySpec, PlanColumnSpec, RuntimeContext,
     RuntimeStatementResult,
 };
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::{
     CatalogDdl, ConstraintKind, MetadataManager, PrimaryKeyConstraint, Table, UniqueConstraint,
 };
 
 #[test]
 fn primary_key_and_unique_constraints_reload_from_metadata() {
-    let pager = Arc::new(MemPager::default());
+    let mem_pager = Arc::new(MemPager::default());
+    let pager = Arc::new(BoxedPager::from_arc(Arc::clone(&mem_pager)));
 
     {
         let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
@@ -41,7 +42,7 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
         let email_spec = specs.iter().find(|spec| spec.name == "email").unwrap();
         assert!(!email_spec.primary_key);
         assert!(email_spec.unique);
-        assert_accounts_constraints(&pager);
+        assert_accounts_constraints(&mem_pager);
     }
 
     let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
@@ -53,7 +54,7 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
     );
     let (_, canonical_name) = llkv_table::canonical_table_name("accounts").unwrap();
     let specs_result = context.catalog().table_column_specs(&canonical_name);
-    assert_accounts_constraints(&pager);
+    assert_accounts_constraints(&mem_pager);
     let specs = specs_result.unwrap_or_else(|err| panic!("table specs after restart: {:?}", err));
     assert_eq!(specs.len(), 2);
     let id_spec = specs.iter().find(|spec| spec.name == "id").unwrap();
@@ -66,7 +67,8 @@ fn primary_key_and_unique_constraints_reload_from_metadata() {
 
 #[test]
 fn foreign_key_views_reload_from_metadata() {
-    let pager = Arc::new(MemPager::default());
+    let mem_pager = Arc::new(MemPager::default());
+    let pager = Arc::new(BoxedPager::from_arc(Arc::clone(&mem_pager)));
 
     {
         let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));

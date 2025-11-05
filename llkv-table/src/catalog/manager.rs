@@ -442,7 +442,7 @@ where
         let table = Table::from_id_and_store(table_id, Arc::clone(&self.store))?;
 
         // Register table in catalog using the table_id from metadata
-        tracing::info!(
+        tracing::debug!(
             "[CATALOG_REGISTER] Registering table '{}' (id={}) in catalog @ {:p}",
             display_name,
             table_id,
@@ -1322,7 +1322,7 @@ where
         &self,
         canonical_name: &str,
     ) -> LlkvResult<TableConstraintSummaryView> {
-        tracing::info!(
+        tracing::trace!(
             "[TABLE_CONSTRAINT_SUMMARY] Looking up table '{}' in catalog @ {:p}",
             canonical_name,
             &*self.catalog
@@ -1335,12 +1335,11 @@ where
             );
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
-        tracing::info!(
+        tracing::trace!(
             "[TABLE_CONSTRAINT_SUMMARY] Found table '{}' with id={} in catalog",
             canonical_name,
             table_id
         );
-
 
         let (_, field_ids) = self.sorted_user_fields(table_id);
         let table_meta = self.metadata.table_meta(table_id)?;

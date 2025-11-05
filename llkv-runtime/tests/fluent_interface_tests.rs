@@ -5,12 +5,12 @@ use llkv_runtime::{
     AggregateExpr, InsertPlan, InsertSource, PlanValue, RuntimeContext, RuntimeStatementResult,
     TransactionKind, row,
 };
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 
 #[test]
 fn fluent_create_insert_select() {
-    let pager = Arc::new(MemPager::default());
-    let context = Arc::new(RuntimeContext::new(pager));
+    let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+    let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
 
     let create_result = context
         .create_table_builder("people")
@@ -57,8 +57,8 @@ fn fluent_create_insert_select() {
 
 #[test]
 fn fluent_transaction_flow() {
-    let pager = Arc::new(MemPager::default());
-    let context = Arc::new(RuntimeContext::new(pager));
+    let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+    let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
     let session = context.create_session();
 
     context

@@ -1,23 +1,19 @@
 use std::sync::Arc;
 
 use llkv_result::Result;
-use llkv_storage::pager::Pager;
+use llkv_storage::pager::{BoxedPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{CatalogDdl, PlanStatement, RuntimeContext, RuntimeSession, RuntimeStatementResult};
 
-pub struct RuntimeEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    context: Arc<RuntimeContext<P>>,
-    session: RuntimeSession<P>,
+type StatementResult = RuntimeStatementResult<BoxedPager>;
+
+pub struct RuntimeEngine {
+    context: Arc<RuntimeContext<BoxedPager>>,
+    session: RuntimeSession,
 }
 
-impl<P> Clone for RuntimeEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+impl Clone for RuntimeEngine {
     fn clone(&self) -> Self {
         // IMPORTANT: Reuse the same session to maintain transaction state!
         // Creating a new session would break multi-statement transactions.
@@ -29,31 +25,37 @@ where
     }
 }
 
-impl<P> RuntimeEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    pub fn new(pager: Arc<P>) -> Self {
+impl RuntimeEngine {
+    pub fn new<P>(pager: Arc<P>) -> Self
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    {
+        let boxed = Arc::new(BoxedPager::from_arc(pager));
+        let context = Arc::new(RuntimeContext::new(boxed));
+        Self::from_context(context)
+    }
+
+    pub fn from_boxed_pager(pager: Arc<BoxedPager>) -> Self {
         let context = Arc::new(RuntimeContext::new(pager));
         Self::from_context(context)
     }
 
-    pub fn from_context(context: Arc<RuntimeContext<P>>) -> Self {
+    pub fn from_context(context: Arc<RuntimeContext<BoxedPager>>) -> Self {
         tracing::debug!("[ENGINE] RuntimeEngine::from_context - creating new session");
         let session = context.create_session();
         tracing::debug!("[ENGINE] RuntimeEngine::from_context - created session");
         Self { context, session }
     }
 
-    pub fn context(&self) -> Arc<RuntimeContext<P>> {
+    pub fn context(&self) -> Arc<RuntimeContext<BoxedPager>> {
         Arc::clone(&self.context)
     }
 
-    pub fn session(&self) -> &RuntimeSession<P> {
+    pub fn session(&self) -> &RuntimeSession {
         &self.session
     }
 
-    pub fn execute_statement(&self, statement: PlanStatement) -> Result<RuntimeStatementResult<P>> {
+    pub fn execute_statement(&self, statement: PlanStatement) -> Result<StatementResult> {
         match statement {
             PlanStatement::BeginTransaction => self.session.begin_transaction(),
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
@@ -79,7 +81,7 @@ where
         }
     }
 
-    pub fn execute_all<I>(&self, statements: I) -> Result<Vec<RuntimeStatementResult<P>>>
+    pub fn execute_all<I>(&self, statements: I) -> Result<Vec<StatementResult>>
     where
         I: IntoIterator<Item = PlanStatement>,
     {

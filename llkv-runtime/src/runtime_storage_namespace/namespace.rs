@@ -11,13 +11,12 @@ use std::sync::{Arc, RwLock};
 
 use llkv_executor::ExecutorTable;
 use llkv_plan::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateViewPlan, DropIndexPlan,
-    DropTablePlan, DropViewPlan, PlanOperation, RenameTablePlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateViewPlan, DropIndexPlan, DropTablePlan,
+    DropViewPlan, PlanOperation, RenameTablePlan,
 };
 use llkv_result::Error;
-use llkv_storage::pager::Pager;
+use llkv_storage::pager::BoxedPager;
 use llkv_transaction::TransactionResult;
-use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{RuntimeContext, RuntimeStatementResult};
 use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor};
@@ -37,19 +36,17 @@ pub const TEMPORARY_NAMESPACE_ID: &str = "temp";
 /// DDL/DML plan execution into the underlying context, but it does **not**
 /// perform storage allocation or manage physical pagers on its own.
 pub trait RuntimeStorageNamespace: Send + Sync + 'static {
-    type Pager: Pager<Blob = EntryHandle> + Send + Sync + 'static;
-
     /// Identifier used when resolving schemas (e.g. "main", "temp").
     fn namespace_id(&self) -> &RuntimeNamespaceId;
 
     /// Returns the runtime context bound to this namespace.
-    fn context(&self) -> Arc<RuntimeContext<Self::Pager>>;
+    fn context(&self) -> Arc<RuntimeContext<BoxedPager>>;
 
     /// Create a table inside this namespace.
     fn create_table(
         &self,
         plan: CreateTablePlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>>;
 
     /// Drop a table from this namespace by forwarding the planned request.
     fn drop_table(&self, plan: DropTablePlan) -> crate::Result<()>;
@@ -61,13 +58,13 @@ pub trait RuntimeStorageNamespace: Send + Sync + 'static {
     fn alter_table(
         &self,
         plan: AlterTablePlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>>;
 
     /// Create an index within this namespace.
     fn create_index(
         &self,
         plan: CreateIndexPlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>>;
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>>;
 
     /// Drop an index from this namespace by forwarding the request.
     fn drop_index(&self, plan: DropIndexPlan)
@@ -84,7 +81,7 @@ pub trait RuntimeStorageNamespace: Send + Sync + 'static {
     fn execute_operation(
         &self,
         operation: PlanOperation,
-    ) -> crate::Result<TransactionResult<Self::Pager>> {
+    ) -> crate::Result<TransactionResult<BoxedPager>> {
         let _ = operation;
         Err(Error::Internal(format!(
             "runtime namespace '{}' does not yet support execute_operation",
@@ -93,7 +90,7 @@ pub trait RuntimeStorageNamespace: Send + Sync + 'static {
     }
 
     /// Lookup a table by canonical name.
-    fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>>;
+    fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<BoxedPager>>>;
 
     /// List tables visible to this namespace.
     fn list_tables(&self) -> Vec<String>;
@@ -126,41 +123,30 @@ where
 
 /// Persistent runtime namespace wrapper.
 #[derive(Clone)]
-pub struct PersistentRuntimeNamespace<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+pub struct PersistentRuntimeNamespace {
     id: RuntimeNamespaceId,
-    context: Arc<RuntimeContext<P>>,
+    context: Arc<RuntimeContext<BoxedPager>>,
 }
 
-impl<P> PersistentRuntimeNamespace<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    pub fn new(id: RuntimeNamespaceId, context: Arc<RuntimeContext<P>>) -> Self {
+impl PersistentRuntimeNamespace {
+    pub fn new(id: RuntimeNamespaceId, context: Arc<RuntimeContext<BoxedPager>>) -> Self {
         Self { id, context }
     }
 }
 
-impl<P> RuntimeStorageNamespace for PersistentRuntimeNamespace<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    type Pager = P;
-
+impl RuntimeStorageNamespace for PersistentRuntimeNamespace {
     fn namespace_id(&self) -> &RuntimeNamespaceId {
         &self.id
     }
 
-    fn context(&self) -> Arc<RuntimeContext<Self::Pager>> {
+    fn context(&self) -> Arc<RuntimeContext<BoxedPager>> {
         Arc::clone(&self.context)
     }
 
     fn create_table(
         &self,
         plan: CreateTablePlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>> {
         CatalogDdl::create_table(self.context.as_ref(), plan)
     }
 
@@ -175,14 +161,14 @@ where
     fn alter_table(
         &self,
         plan: AlterTablePlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>> {
         CatalogDdl::alter_table(self.context.as_ref(), plan)
     }
 
     fn create_index(
         &self,
         plan: CreateIndexPlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>> {
         CatalogDdl::create_index(self.context.as_ref(), plan)
     }
 
@@ -197,19 +183,14 @@ where
         let view_definition = plan.view_definition.clone();
         let select_plan = *plan.select_plan.clone();
         let context_arc = Arc::clone(&self.context);
-        context_arc.create_view(
-            &plan.name,
-            view_definition,
-            select_plan,
-            plan.if_not_exists,
-        )
+        context_arc.create_view(&plan.name, view_definition, select_plan, plan.if_not_exists)
     }
 
     fn drop_view(&self, plan: DropViewPlan) -> crate::Result<()> {
         self.context.drop_view(&plan.name, plan.if_exists)
     }
 
-    fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
+    fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<BoxedPager>>> {
         self.context.lookup_table(canonical)
     }
 
@@ -220,26 +201,20 @@ where
 
 /// Temporary runtime namespace wrapper.
 #[derive(Clone)]
-pub struct TemporaryRuntimeNamespace<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+pub struct TemporaryRuntimeNamespace {
     id: RuntimeNamespaceId,
-    context: Arc<RwLock<Arc<RuntimeContext<P>>>>,
+    context: Arc<RwLock<Arc<RuntimeContext<BoxedPager>>>>,
 }
 
-impl<P> TemporaryRuntimeNamespace<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    pub fn new(id: RuntimeNamespaceId, context: Arc<RuntimeContext<P>>) -> Self {
+impl TemporaryRuntimeNamespace {
+    pub fn new(id: RuntimeNamespaceId, context: Arc<RuntimeContext<BoxedPager>>) -> Self {
         Self {
             id,
             context: Arc::new(RwLock::new(context)),
         }
     }
 
-    pub fn replace_context(&self, context: Arc<RuntimeContext<P>>) {
+    pub fn replace_context(&self, context: Arc<RuntimeContext<BoxedPager>>) {
         let mut guard = self
             .context
             .write()
@@ -269,7 +244,7 @@ where
         }
     }
 
-    pub fn context(&self) -> Arc<RuntimeContext<P>> {
+    pub fn context(&self) -> Arc<RuntimeContext<BoxedPager>> {
         Arc::clone(
             &self
                 .context
@@ -279,24 +254,19 @@ where
     }
 }
 
-impl<P> RuntimeStorageNamespace for TemporaryRuntimeNamespace<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    type Pager = P;
-
+impl RuntimeStorageNamespace for TemporaryRuntimeNamespace {
     fn namespace_id(&self) -> &RuntimeNamespaceId {
         &self.id
     }
 
-    fn context(&self) -> Arc<RuntimeContext<Self::Pager>> {
+    fn context(&self) -> Arc<RuntimeContext<BoxedPager>> {
         self.context()
     }
 
     fn create_table(
         &self,
         plan: CreateTablePlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>> {
         let context = self.context();
         let result = CatalogDdl::create_table(context.as_ref(), plan)?;
         Ok(result)
@@ -317,7 +287,7 @@ where
     fn alter_table(
         &self,
         plan: AlterTablePlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>> {
         let context = self.context();
         CatalogDdl::alter_table(context.as_ref(), plan)
     }
@@ -325,7 +295,7 @@ where
     fn create_index(
         &self,
         plan: CreateIndexPlan,
-    ) -> crate::Result<RuntimeStatementResult<Self::Pager>> {
+    ) -> crate::Result<RuntimeStatementResult<BoxedPager>> {
         let context = self.context();
         CatalogDdl::create_index(context.as_ref(), plan)
     }
@@ -342,12 +312,7 @@ where
         let context = self.context(); // This returns Arc<RuntimeContext>
         let view_definition = plan.view_definition.clone();
         let select_plan = *plan.select_plan.clone();
-        context.create_view(
-            &plan.name,
-            view_definition,
-            select_plan,
-            plan.if_not_exists,
-        )
+        context.create_view(&plan.name, view_definition, select_plan, plan.if_not_exists)
     }
 
     fn drop_view(&self, plan: DropViewPlan) -> crate::Result<()> {
@@ -355,7 +320,7 @@ where
         context.drop_view(&plan.name, plan.if_exists)
     }
 
-    fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<Self::Pager>>> {
+    fn lookup_table(&self, canonical: &str) -> crate::Result<Arc<ExecutorTable<BoxedPager>>> {
         // Delegate to context, which handles fallback lookup internally
         self.context().lookup_table(canonical)
     }
