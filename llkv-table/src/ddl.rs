@@ -6,7 +6,8 @@
 //! index) while letting each layer choose its own return types via associated outputs.
 
 use llkv_plan::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DropIndexPlan, DropTablePlan, RenameTablePlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateViewPlan, DropIndexPlan, DropTablePlan,
+    DropViewPlan, RenameTablePlan,
 };
 use llkv_result::Result;
 
@@ -36,6 +37,12 @@ pub trait CatalogDdl {
 
     /// Drops a table identified by the given plan.
     fn drop_table(&self, plan: DropTablePlan) -> Result<Self::DropTableOutput>;
+
+    /// Creates a view described by the given plan.
+    fn create_view(&self, plan: CreateViewPlan) -> Result<()>;
+
+    /// Drops a view identified by the given plan.
+    fn drop_view(&self, plan: DropViewPlan) -> Result<()>;
 
     /// Renames a table using the provided plan.
     fn rename_table(&self, plan: RenameTablePlan) -> Result<Self::RenameTableOutput>;

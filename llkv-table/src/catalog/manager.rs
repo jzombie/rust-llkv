@@ -23,7 +23,10 @@ use simd_r_drive_entry_handle::EntryHandle;
 use super::table_catalog::{FieldDefinition, TableCatalog};
 use crate::constraints::{ConstraintId, ConstraintKind};
 use crate::metadata::{MetadataManager, MultiColumnUniqueRegistration, SingleColumnIndexEntry};
-use crate::sys_catalog::{ColMeta, MultiColumnIndexEntryMeta, SysCatalog};
+use crate::sys_catalog::{
+    ColMeta, MultiColumnIndexEntryMeta, SysCatalog, TriggerEntryMeta, TriggerEventMeta,
+    TriggerTimingMeta,
+};
 use crate::table::Table;
 use crate::types::{FieldId, RowId, TableColumn, TableId};
 use crate::{
@@ -267,7 +270,7 @@ where
             .apply_column_definitions(table_id, &table_columns, created_at_micros)?;
         self.metadata.flush_table(table_id)?;
 
-        // Register the view in the catalog so it can be looked up by name
+        // Register the view in the catalog (no namespace prefix - namespacing handled at runtime session layer)
         self.catalog.register_table(display_name, table_id)?;
 
         if let Some(field_resolver) = self.catalog.field_resolver(table_id) {
@@ -439,6 +442,12 @@ where
         let table = Table::from_id_and_store(table_id, Arc::clone(&self.store))?;
 
         // Register table in catalog using the table_id from metadata
+        tracing::debug!(
+            "[CATALOG_REGISTER] Registering table '{}' (id={}) in catalog @ {:p}",
+            display_name,
+            table_id,
+            &*self.catalog
+        );
         if let Err(err) = self.catalog.register_table(display_name, table_id) {
             self.metadata.remove_table_state(table_id);
             return Err(err);
@@ -821,6 +830,140 @@ where
         Ok(registration)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_trigger(
+        &self,
+        trigger_display_name: &str,
+        canonical_trigger_name: &str,
+        table_display_name: &str,
+        canonical_table_name: &str,
+        timing: TriggerTimingMeta,
+        event: TriggerEventMeta,
+        for_each_row: bool,
+        condition: Option<String>,
+        body_sql: String,
+        if_not_exists: bool,
+    ) -> LlkvResult<bool> {
+        let Some(table_id) = self.catalog.table_id(canonical_table_name) else {
+            return Err(Error::CatalogError(format!(
+                "Table '{}' does not exist",
+                table_display_name
+            )));
+        };
+
+        let table_meta = self.metadata.table_meta(table_id)?;
+        let is_view = table_meta
+            .as_ref()
+            .and_then(|meta| meta.view_definition.as_ref())
+            .is_some();
+
+        match timing {
+            TriggerTimingMeta::InsteadOf => {
+                if !is_view {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "INSTEAD OF trigger '{}' requires a view target",
+                        trigger_display_name
+                    )));
+                }
+            }
+            _ => {
+                if is_view {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Trigger '{}' must use INSTEAD OF when targeting a view",
+                        trigger_display_name
+                    )));
+                }
+            }
+        }
+
+        if self
+            .metadata
+            .trigger(table_id, canonical_trigger_name)?
+            .is_some()
+        {
+            if if_not_exists {
+                return Ok(false);
+            }
+            return Err(Error::CatalogError(format!(
+                "Trigger '{}' already exists",
+                trigger_display_name
+            )));
+        }
+
+        let entry = TriggerEntryMeta {
+            name: trigger_display_name.to_string(),
+            canonical_name: canonical_trigger_name.to_string(),
+            timing,
+            event,
+            for_each_row,
+            condition,
+            body_sql,
+        };
+
+        self.metadata.insert_trigger(table_id, entry)?;
+        self.metadata.flush_table(table_id)?;
+        Ok(true)
+    }
+
+    pub fn drop_trigger(
+        &self,
+        trigger_display_name: &str,
+        canonical_trigger_name: &str,
+        table_hint_display: Option<&str>,
+        table_hint_canonical: Option<&str>,
+        if_exists: bool,
+    ) -> LlkvResult<bool> {
+        let mut candidate_tables: Vec<(TableId, String)> = Vec::new();
+
+        if let Some(canonical_table) = table_hint_canonical {
+            match self.catalog.table_id(canonical_table) {
+                Some(table_id) => candidate_tables.push((table_id, canonical_table.to_string())),
+                None => {
+                    if if_exists {
+                        return Ok(false);
+                    }
+                    let display = table_hint_display.unwrap_or(canonical_table);
+                    return Err(Error::CatalogError(format!(
+                        "Table '{}' does not exist",
+                        display
+                    )));
+                }
+            }
+        } else {
+            let snapshot = self.catalog.snapshot();
+            for canonical_table in snapshot.table_names() {
+                if let Some(table_id) = snapshot.table_id(&canonical_table) {
+                    candidate_tables.push((table_id, canonical_table));
+                }
+            }
+        }
+
+        for (table_id, canonical_table) in candidate_tables {
+            if self
+                .metadata
+                .remove_trigger(table_id, canonical_trigger_name)?
+            {
+                self.metadata.flush_table(table_id)?;
+                return Ok(true);
+            } else if table_hint_canonical.is_some()
+                && table_hint_canonical
+                    .unwrap()
+                    .eq_ignore_ascii_case(&canonical_table)
+            {
+                break;
+            }
+        }
+
+        if if_exists {
+            Ok(false)
+        } else {
+            Err(Error::CatalogError(format!(
+                "Trigger '{}' does not exist",
+                trigger_display_name
+            )))
+        }
+    }
+
     /// Register a multi-column index (unique or non-unique).
     ///
     /// Returns true if the index was created, false if it already exists.
@@ -1179,9 +1322,24 @@ where
         &self,
         canonical_name: &str,
     ) -> LlkvResult<TableConstraintSummaryView> {
+        tracing::trace!(
+            "[TABLE_CONSTRAINT_SUMMARY] Looking up table '{}' in catalog @ {:p}",
+            canonical_name,
+            &*self.catalog
+        );
         let table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
+            tracing::error!(
+                "[TABLE_CONSTRAINT_SUMMARY] Table '{}' NOT FOUND in catalog @ {:p}",
+                canonical_name,
+                &*self.catalog
+            );
             Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
         })?;
+        tracing::trace!(
+            "[TABLE_CONSTRAINT_SUMMARY] Found table '{}' with id={} in catalog",
+            canonical_name,
+            table_id
+        );
 
         let (_, field_ids) = self.sorted_user_fields(table_id);
         let table_meta = self.metadata.table_meta(table_id)?;

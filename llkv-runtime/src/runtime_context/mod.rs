@@ -12,16 +12,17 @@ use crate::{
 use llkv_column_map::store::ColumnStore;
 use llkv_executor::{ExecutorMultiColumnUnique, ExecutorTable};
 use llkv_plan::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateTableSource, DropIndexPlan,
-    DropTablePlan, PlanColumnSpec, RenameTablePlan, SelectPlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateTableSource, CreateViewPlan,
+    DropIndexPlan, DropTablePlan, DropViewPlan, PlanColumnSpec, RenameTablePlan, SelectPlan,
 };
 use llkv_result::{Error, Result};
-use llkv_storage::pager::{MemPager, Pager};
+use llkv_storage::pager::{BoxedPager, MemPager, Pager};
 use llkv_table::catalog::TableCatalog;
 use llkv_table::{
     CatalogDdl, CatalogManager, ConstraintService, MetadataManager, MultiColumnUniqueRegistration,
     SingleColumnIndexDescriptor, SingleColumnIndexRegistration, SysCatalog, TableId,
-    ensure_multi_column_unique, ensure_single_column_unique, validate_alter_table_operation,
+    TriggerEventMeta, TriggerTimingMeta, ensure_multi_column_unique, ensure_single_column_unique,
+    validate_alter_table_operation,
 };
 use llkv_transaction::{TransactionManager, TransactionSnapshot, TxnId, TxnIdManager};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -76,6 +77,10 @@ where
         TransactionManager<RuntimeTransactionContext<P>, RuntimeTransactionContext<MemPager>>,
     txn_manager: Arc<TxnIdManager>,
     txn_tables_with_new_rows: RwLock<FxHashMap<TxnId, FxHashSet<String>>>,
+    // Optional fallback context for cross-namespace table lookups. Temporary namespaces use this
+    // to access persistent tables while maintaining separate storage. The fallback shares the
+    // same pager type as the primary context so executor tables can be reused without conversion.
+    fallback_lookup: Option<Arc<RuntimeContext<P>>>,
 }
 
 impl<P> RuntimeContext<P>
@@ -238,6 +243,7 @@ where
             transaction_manager,
             txn_manager,
             txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
+            fallback_lookup: None,
         }
     }
 
@@ -251,6 +257,14 @@ where
         &self.store
     }
 
+    /// Set a fallback context for cross-pager table lookups. The fallback uses BoxedPager
+    /// to enable access across different underlying pager types (e.g., temporary MemPager
+    /// can fall back to persistent disk pager).
+    pub fn with_fallback_lookup(mut self, fallback: Arc<RuntimeContext<P>>) -> Self {
+        self.fallback_lookup = Some(fallback);
+        self
+    }
+
     /// Register a custom type alias (CREATE TYPE/DOMAIN).
     pub fn register_type(&self, name: String, data_type: sqlparser::ast::DataType) {
         self.catalog_service.register_type(name, data_type);
@@ -262,16 +276,20 @@ where
         Ok(())
     }
 
-    /// Create a view by executing its SELECT definition to derive projected columns
-    /// and persisting the metadata into the catalog. The view is registered as a
-    /// catalog entry with column names so subsequent binding can succeed without
-    /// reparsing the stored SQL in higher layers.
-    pub fn create_view(
+    /// Ensure the catalog's next_table_id counter is at least `minimum`.
+    pub fn ensure_next_table_id_at_least(&self, minimum: TableId) -> Result<()> {
+        self.metadata.ensure_next_table_id_at_least(minimum)?;
+        Ok(())
+    }
+
+    /// Internal helper for creating a view that can be called from CatalogDdl trait implementation.
+    fn create_view_internal(
         self: &Arc<Self>,
         display_name: &str,
         view_definition: String,
         select_plan: SelectPlan,
         if_not_exists: bool,
+        snapshot: TransactionSnapshot,
     ) -> Result<()> {
         let (normalized_display, canonical_name) = canonical_table_name(display_name)?;
 
@@ -288,7 +306,6 @@ where
             )));
         }
 
-        let snapshot = self.default_snapshot();
         let execution = self.execute_select(select_plan, snapshot)?;
         let column_specs = {
             let schema = execution.schema();
@@ -318,6 +335,72 @@ where
         self.dropped_tables.write().unwrap().remove(&canonical_name);
 
         Ok(())
+    }
+
+    /// Create a view by executing its SELECT definition to derive projected columns
+    /// and persisting the metadata into the catalog. The view is registered as a
+    /// catalog entry with column names so subsequent binding can succeed without
+    /// reparsing the stored SQL in higher layers.
+    pub fn create_view(
+        self: &Arc<Self>,
+        display_name: &str,
+        view_definition: String,
+        select_plan: SelectPlan,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let snapshot = self.default_snapshot();
+        self.create_view_internal(
+            display_name,
+            view_definition,
+            select_plan,
+            if_not_exists,
+            snapshot,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_trigger(
+        self: &Arc<Self>,
+        trigger_display_name: &str,
+        canonical_trigger_name: &str,
+        table_display_name: &str,
+        canonical_table_name: &str,
+        timing: TriggerTimingMeta,
+        event: TriggerEventMeta,
+        for_each_row: bool,
+        condition: Option<String>,
+        body_sql: String,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        self.catalog_service.create_trigger(
+            trigger_display_name,
+            canonical_trigger_name,
+            table_display_name,
+            canonical_table_name,
+            timing,
+            event,
+            for_each_row,
+            condition,
+            body_sql,
+            if_not_exists,
+        )
+    }
+
+    pub fn drop_trigger(
+        self: &Arc<Self>,
+        trigger_display_name: &str,
+        canonical_trigger_name: &str,
+        table_hint_display: Option<&str>,
+        table_hint_canonical: Option<&str>,
+        if_exists: bool,
+    ) -> Result<bool> {
+        self.catalog_service.drop_trigger(
+            trigger_display_name,
+            canonical_trigger_name,
+            table_hint_display,
+            table_hint_canonical,
+            if_exists,
+        )
     }
 
     /// Return the stored SQL definition for a view, if it exists.
@@ -411,21 +494,6 @@ where
         &self.catalog_service
     }
 
-    /// Create a new session for transaction management.
-    /// Each session can have its own independent transaction.
-    pub fn create_session(self: &Arc<Self>) -> RuntimeSession<P> {
-        tracing::debug!("[SESSION] RuntimeContext::create_session called");
-        let namespaces = Arc::new(crate::runtime_session::SessionNamespaces::new(Arc::clone(
-            self,
-        )));
-        let wrapper = RuntimeTransactionContext::new(Arc::clone(self));
-        let inner = self.transaction_manager.create_session(Arc::new(wrapper));
-        tracing::debug!(
-            "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
-        );
-        RuntimeSession::from_parts(inner, namespaces)
-    }
-
     /// Get a handle to an existing table by name.
     pub fn table(self: &Arc<Self>, name: &str) -> Result<RuntimeTableHandle<P>> {
         RuntimeTableHandle::new(Arc::clone(self), name)
@@ -474,6 +542,23 @@ where
     pub fn table_names(self: &Arc<Self>) -> Vec<String> {
         // Use catalog for table names (single source of truth)
         self.catalog.table_names()
+    }
+}
+
+impl RuntimeContext<BoxedPager> {
+    /// Create a new session for transaction management.
+    /// Each session can have its own independent transaction.
+    pub fn create_session(self: &Arc<Self>) -> RuntimeSession {
+        tracing::debug!("[SESSION] RuntimeContext::create_session called");
+        let namespaces = Arc::new(crate::runtime_session::SessionNamespaces::new(Arc::clone(
+            self,
+        )));
+        let wrapper = RuntimeTransactionContext::new(Arc::clone(self));
+        let inner = self.transaction_manager.create_session(Arc::new(wrapper));
+        tracing::debug!(
+            "[SESSION] Created TransactionSession with session_id (will be logged by transaction manager)"
+        );
+        RuntimeSession::from_parts(inner, namespaces)
     }
 }
 
@@ -596,6 +681,22 @@ where
 
         tracing::debug!("drop_table: attempting to drop table '{}'", canonical_name);
 
+        if self.is_table_marked_dropped(&canonical_name) {
+            tracing::debug!(
+                "drop_table: table '{}' already marked dropped; if_exists={}",
+                canonical_name,
+                if_exists
+            );
+            return if if_exists {
+                Ok(())
+            } else {
+                Err(Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' does not exist",
+                    display_name
+                )))
+            };
+        }
+
         let cached_entry = {
             let tables = self.tables.read().unwrap();
             tracing::debug!("drop_table: cache contains {} tables", tables.len());
@@ -675,6 +776,7 @@ where
             table_id
         );
 
+        self.remove_table_entry(&canonical_name);
         self.dropped_tables
             .write()
             .unwrap()
@@ -882,15 +984,17 @@ where
 
             index_name = Some(created_name.clone());
 
-            if let Some(updated_table) =
-                Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
-            {
-                self.tables
-                    .write()
-                    .unwrap()
-                    .insert(canonical_name.clone(), Arc::clone(&updated_table));
-            } else {
-                self.remove_table_entry(&canonical_name);
+            if plan.unique {
+                if let Some(updated_table) =
+                    Self::rebuild_executor_table_with_unique(table.as_ref(), field_id)
+                {
+                    self.tables
+                        .write()
+                        .unwrap()
+                        .insert(canonical_name.clone(), Arc::clone(&updated_table));
+                } else {
+                    self.remove_table_entry(&canonical_name);
+                }
             }
 
             drop(table);
@@ -974,5 +1078,62 @@ where
         }
 
         Ok(descriptor)
+    }
+
+    fn create_view(&self, _plan: CreateViewPlan) -> Result<()> {
+        // This trait method should not be called directly on RuntimeContext.
+        // Views should be created through RuntimeSession which has the Arc<RuntimeContext>.
+        Err(Error::Internal(
+            "create_view on RuntimeContext should be called through RuntimeSession".into(),
+        ))
+    }
+
+    fn drop_view(&self, plan: DropViewPlan) -> Result<()> {
+        RuntimeContext::drop_view(self, &plan.name, plan.if_exists)
+    }
+}
+
+impl<P> RuntimeContext<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    /// Rebuild an index by dropping and recreating it.
+    pub(crate) fn reindex_index(
+        &self,
+        plan: llkv_plan::ReindexPlan,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let canonical_index = plan.canonical_name.to_ascii_lowercase();
+        let snapshot = self.catalog.snapshot();
+
+        // Search for the index across all tables
+        for canonical_table_name in snapshot.table_names() {
+            let Some(table_id) = snapshot.table_id(&canonical_table_name) else {
+                continue;
+            };
+
+            if let Some(entry) = self
+                .metadata
+                .single_column_index(table_id, &canonical_index)?
+            {
+                // Found the index - rebuild it by unregistering and re-registering
+                let table = self.lookup_table(&canonical_table_name)?;
+
+                // Unregister the physical index
+                table.table.unregister_sort_index(entry.column_id)?;
+
+                // Re-register the physical index (this rebuilds it)
+                table.table.register_sort_index(entry.column_id)?;
+
+                drop(table);
+
+                return Ok(RuntimeStatementResult::NoOp);
+            }
+        }
+
+        // Index not found
+        Err(Error::CatalogError(format!(
+            "Index '{}' does not exist",
+            plan.name
+        )))
     }
 }

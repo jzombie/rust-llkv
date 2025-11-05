@@ -389,10 +389,12 @@ impl NumericKernels {
                     llkv_expr::expr::AggregateCall::CountStar => {}
                     llkv_expr::expr::AggregateCall::Count { expr, .. }
                     | llkv_expr::expr::AggregateCall::Sum { expr, .. }
+                    | llkv_expr::expr::AggregateCall::Total { expr, .. }
                     | llkv_expr::expr::AggregateCall::Avg { expr, .. }
                     | llkv_expr::expr::AggregateCall::Min(expr)
                     | llkv_expr::expr::AggregateCall::Max(expr)
-                    | llkv_expr::expr::AggregateCall::CountNulls(expr) => {
+                    | llkv_expr::expr::AggregateCall::CountNulls(expr)
+                    | llkv_expr::expr::AggregateCall::GroupConcat { expr, .. } => {
                         Self::collect_fields(expr, acc);
                     }
                 }
@@ -942,6 +944,7 @@ impl NumericKernels {
                             return left_s;
                         }
                     }
+                    BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {}
                 }
 
                 ScalarExpr::binary(left_s, *op, right_s)
@@ -1053,7 +1056,11 @@ impl NumericKernels {
                     BinaryOp::Subtract => Self::affine_sub(left_state, right_state),
                     BinaryOp::Multiply => Self::affine_mul(left_state, right_state),
                     BinaryOp::Divide => Self::affine_div(left_state, right_state),
-                    BinaryOp::Modulo | BinaryOp::And | BinaryOp::Or => None,
+                    BinaryOp::Modulo
+                    | BinaryOp::And
+                    | BinaryOp::Or
+                    | BinaryOp::BitwiseShiftLeft
+                    | BinaryOp::BitwiseShiftRight => None,
                 }
             }
             ScalarExpr::Compare { .. } => None,
@@ -1138,6 +1145,30 @@ impl NumericKernels {
                 let truthy = Self::truthy_numeric(lhs) || Self::truthy_numeric(rhs);
                 Some(ScalarExpr::literal(if truthy { 1 } else { 0 }))
             }
+            BinaryOp::BitwiseShiftLeft => {
+                let lhs_i64 = match lhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let rhs_i64 = match rhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
+                Some(ScalarExpr::literal(result))
+            }
+            BinaryOp::BitwiseShiftRight => {
+                let lhs_i64 = match lhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let rhs_i64 = match rhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
+                Some(ScalarExpr::literal(result))
+            }
         }
     }
 
@@ -1189,6 +1220,30 @@ impl NumericKernels {
                     0
                 },
             )),
+            BinaryOp::BitwiseShiftLeft => {
+                let lhs_i64 = match lhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let rhs_i64 = match rhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
+                Some(NumericValue::Integer(result))
+            }
+            BinaryOp::BitwiseShiftRight => {
+                let lhs_i64 = match lhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let rhs_i64 = match rhs {
+                    NumericValue::Integer(i) => i,
+                    NumericValue::Float(f) => f as i64,
+                };
+                let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
+                Some(NumericValue::Integer(result))
+            }
         }
     }
 

@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use llkv_plan::{InsertPlan, InsertSource, PlanValue};
+use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue};
 use llkv_runtime::{RuntimeStatementResult, TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace};
 use llkv_sql::SqlEngine;
-use llkv_storage::pager::BoxedPager;
 use llkv_storage::pager::MemPager;
 
 #[test]
@@ -121,7 +120,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .namespace_registry()
         .read()
         .expect("namespace registry lock")
-        .namespace::<TemporaryRuntimeNamespace<BoxedPager>>(TEMPORARY_NAMESPACE_ID)
+        .namespace::<TemporaryRuntimeNamespace>(TEMPORARY_NAMESPACE_ID)
         .expect("temporary namespace present");
 
     let temp_context = temp_namespace.context();
@@ -147,6 +146,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
             vec![PlanValue::Integer(1), PlanValue::String("a".into())],
             vec![PlanValue::Integer(2), PlanValue::String("b".into())],
         ]),
+        on_conflict: InsertConflictAction::None,
     };
 
     let result = engine

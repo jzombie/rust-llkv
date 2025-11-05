@@ -10,9 +10,9 @@ use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapsho
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
-    AlterTablePlan, CreateIndexPlan, CreateTablePlan, DeletePlan, DropIndexPlan, DropTablePlan,
-    InsertPlan, PlanColumnSpec, RenameTablePlan, RuntimeContext, RuntimeStatementResult,
-    SelectExecution, SelectPlan, UpdatePlan,
+    AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateViewPlan, DeletePlan, DropIndexPlan,
+    DropTablePlan, DropViewPlan, InsertPlan, PlanColumnSpec, RenameTablePlan, RuntimeContext,
+    RuntimeStatementResult, SelectExecution, SelectPlan, UpdatePlan,
 };
 use llkv_plan::TruncatePlan;
 
@@ -100,6 +100,14 @@ where
 
     fn drop_index(&self, plan: DropIndexPlan) -> LlkvResult<Self::DropIndexOutput> {
         CatalogDdl::drop_index(self.ctx.as_ref(), plan)
+    }
+
+    fn create_view(&self, plan: CreateViewPlan) -> LlkvResult<()> {
+        CatalogDdl::create_view(self.ctx.as_ref(), plan)
+    }
+
+    fn drop_view(&self, plan: DropViewPlan) -> LlkvResult<()> {
+        CatalogDdl::drop_view(self.ctx.as_ref(), plan)
     }
 }
 

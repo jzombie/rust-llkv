@@ -267,6 +267,15 @@ where
                         )?),
                         distinct: *distinct,
                     },
+                    AggregateCall::Total { expr, distinct } => AggregateCall::Total {
+                        expr: Box::new(translate_scalar_with(
+                            expr,
+                            schema,
+                            unknown_column,
+                            _unknown_aggregate,
+                        )?),
+                        distinct: *distinct,
+                    },
                     AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
                         expr: Box::new(translate_scalar_with(
                             expr,
@@ -285,6 +294,20 @@ where
                     AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(
                         translate_scalar_with(expr, schema, unknown_column, _unknown_aggregate)?,
                     )),
+                    AggregateCall::GroupConcat {
+                        expr,
+                        distinct,
+                        separator,
+                    } => AggregateCall::GroupConcat {
+                        expr: Box::new(translate_scalar_with(
+                            expr,
+                            schema,
+                            unknown_column,
+                            _unknown_aggregate,
+                        )?),
+                        distinct: *distinct,
+                        separator: separator.clone(),
+                    },
                 };
             Ok(ScalarExpr::Aggregate(translated))
         }

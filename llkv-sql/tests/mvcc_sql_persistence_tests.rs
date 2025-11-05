@@ -30,19 +30,20 @@
 use arrow::array::{Array, Int64Array, StringArray};
 use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
-use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
+use llkv_storage::pager::{BoxedPager, simd_r_drive_pager::SimdRDrivePager};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 /// Helper to create a new SqlEngine with a fresh file-backed pager.
-fn create_engine_with_file(path: &std::path::Path) -> SqlEngine<SimdRDrivePager> {
-    let pager = Arc::new(SimdRDrivePager::open(path).expect("Failed to open SimdRDrivePager"));
+fn create_engine_with_file(path: &std::path::Path) -> SqlEngine {
+    let disk_pager = Arc::new(SimdRDrivePager::open(path).expect("Failed to open SimdRDrivePager"));
+    let pager = Arc::new(BoxedPager::from_arc(disk_pager));
     let context = Arc::new(RuntimeContext::new(pager));
     SqlEngine::with_context(context, false)
 }
 
 /// Helper to execute a SELECT and extract Int64 values from first column.
-fn select_int64_values(engine: &SqlEngine<SimdRDrivePager>, sql: &str) -> Vec<Option<i64>> {
+fn select_int64_values(engine: &SqlEngine, sql: &str) -> Vec<Option<i64>> {
     let mut results = engine.execute(sql).expect("SELECT failed");
     assert_eq!(results.len(), 1, "Expected exactly one result");
 
@@ -74,7 +75,7 @@ fn select_int64_values(engine: &SqlEngine<SimdRDrivePager>, sql: &str) -> Vec<Op
 }
 
 /// Helper to execute a SELECT and extract String values from first column.
-fn select_string_values(engine: &SqlEngine<SimdRDrivePager>, sql: &str) -> Vec<Option<String>> {
+fn select_string_values(engine: &SqlEngine, sql: &str) -> Vec<Option<String>> {
     let mut results = engine.execute(sql).expect("SELECT failed");
     assert_eq!(results.len(), 1, "Expected exactly one result");
 
@@ -106,7 +107,7 @@ fn select_string_values(engine: &SqlEngine<SimdRDrivePager>, sql: &str) -> Vec<O
 }
 
 /// Helper to count rows from a SELECT COUNT(*) query.
-fn count_rows(engine: &SqlEngine<SimdRDrivePager>, table: &str) -> i64 {
+fn count_rows(engine: &SqlEngine, table: &str) -> i64 {
     let sql = format!("SELECT COUNT(*) FROM {}", table);
     let values = select_int64_values(engine, &sql);
     assert_eq!(values.len(), 1, "Expected exactly one count result");

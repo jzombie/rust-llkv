@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
@@ -25,31 +25,39 @@ use llkv_result::Error;
 use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
-    CreateTableSource, DeletePlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan,
-    InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec,
-    PlanStatement, PlanValue, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
-    extract_rows_from_range,
+    CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction, ForeignKeySpec,
+    IndexColumnPlan, InsertConflictAction, InsertPlan, InsertSource, MultiColumnUniqueSpec,
+    OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan,
+    RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult,
+    SelectPlan, SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
 };
-use llkv_storage::pager::Pager;
-use llkv_table::CatalogDdl;
+use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
+use llkv_table::{CatalogDdl, TriggerEventMeta, TriggerTimingMeta};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, Assignment, AssignmentTarget, BeginTransactionKind,
-    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics,
-    DataType as SqlDataType, Delete, Distinct, ExceptionWhen, Expr as SqlExpr, FromTable,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    BinaryOperator, ColumnOption, ColumnOptionDef, ConstraintCharacteristics, CreateTrigger,
+    DataType as SqlDataType, Delete, Distinct, DropTrigger, ExceptionWhen, Expr as SqlExpr,
+    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
     JoinOperator, LimitClause, NullsDistinctOption, ObjectName, ObjectNamePart, ObjectType,
     OrderBy, OrderByKind, Query, ReferentialAction, SchemaName, Select, SelectItem,
     SelectItemQualifiedWildcardKind, Set, SetExpr, SetOperator, SetQuantifier, SqlOption,
     Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
-    TransactionModifier, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan,
+    TransactionModifier, TriggerEvent, TriggerObject, TriggerPeriod, UnaryOperator,
+    UpdateTableFromKind, VacuumStatement, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Span;
+
+type SqlPager = BoxedPager;
+type SqlRuntimePager = SqlPager;
+type SqlStatementResult = RuntimeStatementResult<SqlPager>;
+type SqlContext = RuntimeContext<SqlPager>;
+type SqlSession = RuntimeSession;
+type P = SqlRuntimePager;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatementExpectation {
@@ -189,6 +197,8 @@ const MAX_BUFFERED_INSERT_ROWS: usize = 8192;
 struct InsertBuffer {
     table_name: String,
     columns: Vec<String>,
+    /// Conflict resolution action
+    on_conflict: InsertConflictAction,
     /// Total literal rows gathered so far (sums `statement_row_counts`).
     total_rows: usize,
     /// Row counts for each original INSERT statement so we can emit per-statement results.
@@ -198,19 +208,30 @@ struct InsertBuffer {
 }
 
 impl InsertBuffer {
-    fn new(table_name: String, columns: Vec<String>, rows: Vec<Vec<PlanValue>>) -> Self {
+    fn new(
+        table_name: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<PlanValue>>,
+        on_conflict: InsertConflictAction,
+    ) -> Self {
         let row_count = rows.len();
         Self {
             table_name,
             columns,
+            on_conflict,
             total_rows: row_count,
             statement_row_counts: vec![row_count],
             rows,
         }
     }
 
-    fn can_accept(&self, table_name: &str, columns: &[String]) -> bool {
-        self.table_name == table_name && self.columns == columns
+    fn can_accept(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        on_conflict: InsertConflictAction,
+    ) -> bool {
+        self.table_name == table_name && self.columns == columns && self.on_conflict == on_conflict
     }
 
     fn push_statement(&mut self, rows: Vec<Vec<PlanValue>>) {
@@ -236,25 +257,20 @@ enum PreparedInsert {
         table_name: String,
         columns: Vec<String>,
         rows: Vec<Vec<PlanValue>>,
+        on_conflict: InsertConflictAction,
     },
     Immediate(InsertPlan),
 }
 
 /// Return value from [`SqlEngine::buffer_insert`], exposing any buffered flush results along with
 /// the row-count placeholder for the currently processed statement.
-struct BufferedInsertResult<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    flushed: Vec<RuntimeStatementResult<P>>,
-    current: Option<RuntimeStatementResult<P>>,
+struct BufferedInsertResult {
+    flushed: Vec<SqlStatementResult>,
+    current: Option<SqlStatementResult>,
 }
 
-pub struct SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    engine: RuntimeEngine<P>,
+pub struct SqlEngine {
+    engine: RuntimeEngine,
     default_nulls_first: AtomicBool,
     /// Buffer for batching INSERTs across execute() calls for massive performance gains.
     insert_buffer: RefCell<Option<InsertBuffer>>,
@@ -269,10 +285,7 @@ where
 
 const DROPPED_TABLE_TRANSACTION_ERR: &str = "another transaction has dropped this table";
 
-impl<P> Drop for SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
+impl Drop for SqlEngine {
     fn drop(&mut self) {
         // Flush remaining INSERTs when engine is dropped
         if let Err(e) = self.flush_buffer_results() {
@@ -281,10 +294,7 @@ where
     }
 }
 
-impl<P> Clone for SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+impl Clone for SqlEngine {
     fn clone(&self) -> Self {
         tracing::warn!(
             "[SQL_ENGINE] SqlEngine::clone() called - will create new Engine with new session!"
@@ -304,12 +314,9 @@ where
 }
 
 #[allow(dead_code)]
-impl<P> SqlEngine<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
+impl SqlEngine {
     fn from_runtime_engine(
-        engine: RuntimeEngine<P>,
+        engine: RuntimeEngine,
         default_nulls_first: bool,
         insert_buffering_enabled: bool,
     ) -> Self {
@@ -350,11 +357,21 @@ where
         }
     }
 
-    fn execute_plan_statement(
-        &self,
-        statement: PlanStatement,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
-        let table = llkv_runtime::statement_table_name(&statement).map(str::to_string);
+    fn execute_plan_statement(&self, statement: PlanStatement) -> SqlResult<SqlStatementResult> {
+        // Don't apply table error mapping to CREATE VIEW or DROP VIEW statements
+        // because the "table" name is the view being created/dropped, not a referenced table.
+        // Any "unknown table" errors from CREATE VIEW are about tables referenced in the SELECT.
+        let should_map_error = !matches!(
+            &statement,
+            PlanStatement::CreateView(_) | PlanStatement::DropView(_)
+        );
+
+        let table = if should_map_error {
+            llkv_runtime::statement_table_name(&statement).map(str::to_string)
+        } else {
+            None
+        };
+
         self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
@@ -368,7 +385,10 @@ where
     ///
     /// Callers that intend to stream large amounts of literal `INSERT ... VALUES` input can
     /// enable batching later using [`SqlEngine::set_insert_buffering`].
-    pub fn new(pager: Arc<P>) -> Self {
+    pub fn new<Pg>(pager: Arc<Pg>) -> Self
+    where
+        Pg: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    {
         let engine = RuntimeEngine::new(pager);
         Self::from_runtime_engine(engine, false, false)
     }
@@ -432,12 +452,195 @@ where
         re.replace_all(sql, "$1)").to_string()
     }
 
-    pub(crate) fn context_arc(&self) -> Arc<RuntimeContext<P>> {
+    /// Preprocess SQL to handle empty IN lists.
+    ///
+    /// SQLite permits `expr IN ()` and `expr NOT IN ()` as degenerate forms of IN expressions.
+    /// The sqlparser library rejects these, so we convert them to constant boolean expressions:
+    /// `expr IN ()` becomes `expr = NULL AND 0 = 1` (always false), and `expr NOT IN ()`
+    /// becomes `expr = NULL OR 1 = 1` (always true). The `expr = NULL` component ensures the
+    /// original expression is still evaluated (in case it has side effects), while the constant
+    /// comparison determines the final result.
+    fn preprocess_empty_in_lists(sql: &str) -> String {
+        static EMPTY_IN_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: expression NOT IN () or expression IN ()
+        // Matches: parenthesized expressions, quoted strings, hex literals, identifiers, or numbers
+        let re = EMPTY_IN_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)(\([^)]*\)|x'[0-9a-fA-F]*'|'(?:[^']|'')*'|[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*|\d+(?:\.\d+)?)\s+(NOT\s+)?IN\s*\(\s*\)")
+                .expect("valid empty IN regex")
+        });
+
+        re.replace_all(sql, |caps: &regex::Captures| {
+            let expr = &caps[1];
+            if caps.get(2).is_some() {
+                // expr NOT IN () → always true (but still evaluate expr)
+                format!("({} = NULL OR 1 = 1)", expr)
+            } else {
+                // expr IN () → always false (but still evaluate expr)
+                format!("({} = NULL AND 0 = 1)", expr)
+            }
+        })
+        .to_string()
+    }
+
+    /// Strip SQLite index hints (INDEXED BY, NOT INDEXED) from table references.
+    ///
+    /// SQLite supports index hints like `FROM table INDEXED BY index_name` or `FROM table NOT INDEXED`.
+    /// These are query optimization hints that guide the query planner's index selection.
+    /// Since sqlparser doesn't support this syntax and our planner makes its own index decisions,
+    /// we strip these hints during preprocessing for compatibility with SQLite SQL Logic Tests.
+    fn preprocess_index_hints(sql: &str) -> String {
+        static INDEX_HINT_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: INDEXED BY index_name or NOT INDEXED
+        // Pattern captures the table reference and removes the index hint
+        let re = INDEX_HINT_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\s+(INDEXED\s+BY\s+[a-zA-Z_][a-zA-Z0-9_]*|NOT\s+INDEXED)\b")
+                .expect("valid index hint regex")
+        });
+
+        re.replace_all(sql, "").to_string()
+    }
+
+    /// Convert SQLite standalone REINDEX to VACUUM REINDEX for sqlparser.
+    ///
+    /// SQLite supports `REINDEX index_name` as a standalone statement, but sqlparser
+    /// only recognizes REINDEX as part of the VACUUM statement syntax. This preprocessor
+    /// converts the SQLite form to the VACUUM REINDEX form that sqlparser can parse.
+    fn preprocess_reindex_syntax(sql: &str) -> String {
+        static REINDEX_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: REINDEX followed by an identifier (index name)
+        // Captures the full statement to replace it with VACUUM REINDEX
+        let re = REINDEX_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\bREINDEX\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\b")
+                .expect("valid reindex regex")
+        });
+
+        re.replace_all(sql, "VACUUM REINDEX $1").to_string()
+    }
+
+    /// Normalize SQLite trigger shorthand so sqlparser accepts the syntax.
+    ///
+    /// SQLite allows omitting the trigger timing (defaulting to AFTER) and the
+    /// `FOR EACH ROW` clause (defaulting to row-level triggers). sqlparser
+    /// requires both pieces to be explicit, so we inject them before parsing.
+    ///
+    /// # TODO
+    ///
+    /// This is a temporary workaround. The proper fix is to extend sqlparser's
+    /// `SQLiteDialect::parse_statement` to handle CREATE TRIGGER with optional
+    /// timing/FOR EACH ROW clauses, matching SQLite's actual grammar. That would
+    /// eliminate this fragile regex preprocessing entirely.
+    fn preprocess_sqlite_trigger_shorthand(sql: &str) -> String {
+        static IDENT_PATTERN: OnceLock<String> = OnceLock::new();
+        static COLUMN_IDENT_PATTERN: OnceLock<String> = OnceLock::new();
+        static TIMING_REGEX: OnceLock<Regex> = OnceLock::new();
+        static FOR_EACH_BEGIN_REGEX: OnceLock<Regex> = OnceLock::new();
+        static FOR_EACH_WHEN_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        IDENT_PATTERN.get_or_init(|| {
+            // Matches optional dotted identifiers with standard or quoted segments.
+            r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"#
+                .to_string()
+        });
+        COLUMN_IDENT_PATTERN
+            .get_or_init(|| r#"(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*)"#.to_string());
+
+        let timing_re = TIMING_REGEX.get_or_init(|| {
+            let event = format!(
+                "UPDATE(?:\\s+OF\\s+{col}(?:\\s*,\\s*{col})*)?|DELETE|INSERT",
+                col = COLUMN_IDENT_PATTERN
+                    .get()
+                    .expect("column ident pattern initialized")
+            );
+            let pattern = format!(
+                r"(?ix)(?P<head>CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?{ident})\s+(?P<event>{event})\s+ON",
+                ident = IDENT_PATTERN
+                    .get()
+                    .expect("ident pattern initialized"),
+                event = event
+            );
+            Regex::new(&pattern).expect("valid trigger timing regex")
+        });
+
+        let with_timing = timing_re
+            .replace_all(sql, |caps: &regex::Captures| {
+                let head = caps.name("head").unwrap().as_str();
+                let event = caps.name("event").unwrap().as_str().trim();
+                format!("{head} AFTER {event} ON")
+            })
+            .to_string();
+
+        let for_each_begin_re = FOR_EACH_BEGIN_REGEX.get_or_init(|| {
+            let pattern = format!(
+                r"(?ix)(?P<prefix>ON\s+{ident})\s+(?P<keyword>BEGIN\b)",
+                ident = IDENT_PATTERN.get().expect("ident pattern initialized"),
+            );
+            Regex::new(&pattern).expect("valid trigger FOR EACH BEGIN regex")
+        });
+
+        let with_for_each_begin = for_each_begin_re
+            .replace_all(&with_timing, |caps: &regex::Captures| {
+                let prefix = caps.name("prefix").unwrap().as_str();
+                let keyword = caps.name("keyword").unwrap().as_str();
+                format!("{prefix} FOR EACH ROW {keyword}")
+            })
+            .to_string();
+
+        let for_each_when_re = FOR_EACH_WHEN_REGEX.get_or_init(|| {
+            let pattern = format!(
+                r"(?ix)(?P<prefix>ON\s+{ident})\s+(?P<keyword>WHEN\b)",
+                ident = IDENT_PATTERN.get().expect("ident pattern initialized"),
+            );
+            Regex::new(&pattern).expect("valid trigger FOR EACH WHEN regex")
+        });
+
+        for_each_when_re
+            .replace_all(&with_for_each_begin, |caps: &regex::Captures| {
+                let prefix = caps.name("prefix").unwrap().as_str();
+                let keyword = caps.name("keyword").unwrap().as_str();
+                format!("{prefix} FOR EACH ROW {keyword}")
+            })
+            .to_string()
+    }
+
+    /// Preprocess SQL to convert bare table names in IN clauses to subqueries.
+    ///
+    /// SQLite allows `expr IN tablename` as shorthand for `expr IN (SELECT * FROM tablename)`.
+    /// The sqlparser library requires parentheses, so we convert the shorthand form.
+    fn preprocess_bare_table_in_clauses(sql: &str) -> String {
+        static BARE_TABLE_IN_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: [NOT] IN identifier followed by whitespace/newline/end or specific punctuation
+        // Avoid matching "IN (" which is already a valid subquery
+        let re = BARE_TABLE_IN_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\b(NOT\s+)?IN\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)(\s|$|;|,|\))")
+                .expect("valid bare table IN regex")
+        });
+
+        re.replace_all(sql, |caps: &regex::Captures| {
+            let table_name = &caps[2];
+            let trailing = &caps[3];
+            if let Some(not_keyword) = caps.get(1) {
+                format!(
+                    "{}IN (SELECT * FROM {}){}",
+                    not_keyword.as_str(),
+                    table_name,
+                    trailing
+                )
+            } else {
+                format!("IN (SELECT * FROM {}){}", table_name, trailing)
+            }
+        })
+        .to_string()
+    }
+
+    pub(crate) fn context_arc(&self) -> Arc<SqlContext> {
         self.engine.context()
     }
 
-    /// Construct an engine from an existing runtime context with insert buffering disabled.
-    pub fn with_context(context: Arc<RuntimeContext<P>>, default_nulls_first: bool) -> Self {
+    pub fn with_context(context: Arc<SqlContext>, default_nulls_first: bool) -> Self {
         Self::from_runtime_engine(
             RuntimeEngine::from_context(context),
             default_nulls_first,
@@ -475,7 +678,7 @@ where
     }
 
     /// Get a reference to the underlying session (for advanced use like error handling in test harnesses).
-    pub fn session(&self) -> &RuntimeSession<P> {
+    pub fn session(&self) -> &SqlSession {
         self.engine.session()
     }
 
@@ -491,18 +694,38 @@ where
     /// output for you. `execute` remains the right tool for schema migrations, transactional
     /// scripts, or workflows that need to inspect the specific runtime response for each
     /// statement.
-    pub fn execute(&self, sql: &str) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
+    pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
         // Preprocess SQL
         let processed_sql = Self::preprocess_create_type_syntax(sql);
         let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
         let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
+        let processed_sql = Self::preprocess_bare_table_in_clauses(&processed_sql);
+        let processed_sql = Self::preprocess_empty_in_lists(&processed_sql);
+        let processed_sql = Self::preprocess_index_hints(&processed_sql);
+        let processed_sql = Self::preprocess_reindex_syntax(&processed_sql);
 
         let dialect = GenericDialect {};
-        let statements = parse_sql_with_recursion_limit(&dialect, &processed_sql)
-            .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
-
+        let statements = match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
+            Ok(stmts) => stmts,
+            Err(parse_err) => {
+                // SQLite allows omitting BEFORE/AFTER and FOR EACH ROW in CREATE TRIGGER.
+                // If parsing fails and the SQL contains CREATE TRIGGER, attempt to expand
+                // the shorthand form and retry. This is a workaround until sqlparser's
+                // SQLite dialect properly supports the abbreviated syntax.
+                if processed_sql.to_uppercase().contains("CREATE TRIGGER") {
+                    let expanded = Self::preprocess_sqlite_trigger_shorthand(&processed_sql);
+                    parse_sql_with_recursion_limit(&dialect, &expanded).map_err(|_| {
+                        Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}"))
+                    })?
+                } else {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "failed to parse SQL: {parse_err}"
+                    )));
+                }
+            }
+        };
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements.iter() {
             let statement_expectation = next_statement_expectation();
@@ -541,7 +764,7 @@ where
     /// Workloads that stream many INSERT statements without interleaving reads can invoke this
     /// to force persistence without waiting for the next non-INSERT statement or the engine
     /// drop hook.
-    pub fn flush_pending_inserts(&self) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
+    pub fn flush_pending_inserts(&self) -> SqlResult<Vec<SqlStatementResult>> {
         self.flush_buffer_results()
     }
 
@@ -555,7 +778,7 @@ where
         &self,
         insert: sqlparser::ast::Insert,
         expectation: StatementExpectation,
-    ) -> SqlResult<BufferedInsertResult<P>> {
+    ) -> SqlResult<BufferedInsertResult> {
         // Expectations serve two purposes: (a) ensure we surface synchronous errors when the
         // SLT harness anticipates them, and (b) force a flush when the harness is validating the
         // rows-affected count. In both situations we bypass the buffer entirely so the runtime
@@ -591,12 +814,13 @@ where
                 table_name,
                 columns,
                 rows,
+                on_conflict,
             } => {
                 let mut flushed = Vec::new();
                 let statement_rows = rows.len();
                 let mut buf = self.insert_buffer.borrow_mut();
                 match buf.as_mut() {
-                    Some(buffer) if buffer.can_accept(&table_name, &columns) => {
+                    Some(buffer) if buffer.can_accept(&table_name, &columns, on_conflict) => {
                         buffer.push_statement(rows);
                         if buffer.should_flush() {
                             drop(buf);
@@ -618,7 +842,12 @@ where
                         drop(buf);
                         flushed = self.flush_buffer_results()?;
                         let mut buf = self.insert_buffer.borrow_mut();
-                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows));
+                        *buf = Some(InsertBuffer::new(
+                            table_name.clone(),
+                            columns,
+                            rows,
+                            on_conflict,
+                        ));
                         Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
@@ -628,7 +857,12 @@ where
                         })
                     }
                     None => {
-                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows));
+                        *buf = Some(InsertBuffer::new(
+                            table_name.clone(),
+                            columns,
+                            rows,
+                            on_conflict,
+                        ));
                         Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
@@ -651,7 +885,7 @@ where
     }
 
     /// Flush buffered INSERTs, returning one result per original statement.
-    fn flush_buffer_results(&self) -> SqlResult<Vec<RuntimeStatementResult<P>>> {
+    fn flush_buffer_results(&self) -> SqlResult<Vec<SqlStatementResult>> {
         let mut buf = self.insert_buffer.borrow_mut();
         let buffer = match buf.take() {
             Some(b) => b,
@@ -662,6 +896,7 @@ where
         let InsertBuffer {
             table_name,
             columns,
+            on_conflict,
             total_rows,
             statement_row_counts,
             rows,
@@ -675,6 +910,7 @@ where
             table: table_name.clone(),
             columns,
             source: InsertSource::Rows(rows),
+            on_conflict,
         };
 
         let executed = self.execute_plan_statement(PlanStatement::Insert(plan))?;
@@ -745,11 +981,25 @@ where
                 DROPPED_TABLE_TRANSACTION_ERR.into(),
             ));
         }
-        if stmt.replace_into || stmt.ignore || stmt.or.is_some() {
-            return Err(Error::InvalidArgumentError(
-                "non-standard INSERT forms are not supported".into(),
-            ));
-        }
+
+        // Extract conflict resolution action
+        use sqlparser::ast::SqliteOnConflict;
+        let on_conflict = if stmt.replace_into {
+            InsertConflictAction::Replace
+        } else if stmt.ignore {
+            InsertConflictAction::Ignore
+        } else if let Some(or_clause) = stmt.or {
+            match or_clause {
+                SqliteOnConflict::Replace => InsertConflictAction::Replace,
+                SqliteOnConflict::Ignore => InsertConflictAction::Ignore,
+                SqliteOnConflict::Abort => InsertConflictAction::Abort,
+                SqliteOnConflict::Fail => InsertConflictAction::Fail,
+                SqliteOnConflict::Rollback => InsertConflictAction::Rollback,
+            }
+        } else {
+            InsertConflictAction::None
+        };
+
         if stmt.overwrite {
             return Err(Error::InvalidArgumentError(
                 "INSERT OVERWRITE is not supported".into(),
@@ -816,6 +1066,7 @@ where
                     table_name: display_name,
                     columns,
                     rows,
+                    on_conflict,
                 })
             }
             SetExpr::Select(select) => {
@@ -824,6 +1075,7 @@ where
                         table_name: display_name,
                         columns,
                         rows,
+                        on_conflict,
                     });
                 }
                 if let Some(range_rows) = extract_rows_from_range(select.as_ref())? {
@@ -831,6 +1083,7 @@ where
                         table_name: display_name,
                         columns,
                         rows: range_rows.into_rows(),
+                        on_conflict,
                     });
                 }
 
@@ -841,6 +1094,7 @@ where
                     source: InsertSource::Select {
                         plan: Box::new(select_plan),
                     },
+                    on_conflict,
                 }))
             }
             _ => Err(Error::InvalidArgumentError(
@@ -903,7 +1157,7 @@ where
         }
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<RuntimeStatementResult<P>> {
+    fn execute_statement(&self, statement: Statement) -> SqlResult<SqlStatementResult> {
         let statement_sql = statement.to_string();
         let _query_label_guard = push_query_label(statement_sql.clone());
         tracing::debug!("SQL execute_statement: {}", statement_sql.trim());
@@ -953,7 +1207,7 @@ where
     fn execute_statement_non_transactional(
         &self,
         statement: Statement,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
+    ) -> SqlResult<SqlStatementResult> {
         tracing::trace!("DEBUG SQL execute_statement_non_transactional called");
         match statement {
             Statement::CreateTable(stmt) => {
@@ -1023,6 +1277,10 @@ where
             Statement::CreateDomain(create_domain) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateDomain");
                 self.handle_create_domain(create_domain)
+            }
+            Statement::CreateTrigger(create_trigger) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: CreateTrigger");
+                self.handle_create_trigger(create_trigger)
             }
             Statement::DropDomain(drop_domain) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: DropDomain");
@@ -1095,6 +1353,10 @@ where
                     temporary,
                 )
             }
+            Statement::DropTrigger(drop_trigger) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: DropTrigger");
+                self.handle_drop_trigger(drop_trigger)
+            }
             Statement::AlterTable {
                 name,
                 if_exists,
@@ -1112,6 +1374,10 @@ where
             Statement::Pragma { name, value, is_eq } => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Pragma");
                 self.handle_pragma(name, value, is_eq)
+            }
+            Statement::Vacuum(vacuum) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Vacuum");
+                self.handle_vacuum(vacuum)
             }
             other => {
                 tracing::trace!(
@@ -1199,7 +1465,7 @@ where
         &self,
         display_name: &str,
         canonical_name: &str,
-    ) -> SqlResult<HashSet<String>> {
+    ) -> SqlResult<FxHashSet<String>> {
         let context = self.engine.context();
 
         if context.is_table_marked_dropped(canonical_name) {
@@ -1231,7 +1497,7 @@ where
                 if let Some(table_id) = context.catalog().table_id(&canonical_name)
                     && let Some(resolver) = context.catalog().field_resolver(table_id)
                 {
-                    let fallback: HashSet<String> = resolver
+                    let fallback: FxHashSet<String> = resolver
                         .field_names()
                         .into_iter()
                         .map(|name| name.to_ascii_lowercase())
@@ -1243,11 +1509,11 @@ where
                     );
                     return Ok(fallback);
                 }
-                Ok(HashSet::default())
+                Ok(FxHashSet::default())
             }
             Err(err) => {
                 if Self::is_table_missing_error(&err) {
-                    Ok(HashSet::default())
+                    Ok(FxHashSet::default())
                 } else {
                     Err(Self::map_table_error(display_name, err))
                 }
@@ -1285,7 +1551,7 @@ where
     fn handle_create_table(
         &self,
         mut stmt: sqlparser::ast::CreateTable,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
+    ) -> SqlResult<SqlStatementResult> {
         validate_create_table_common(&stmt)?;
 
         let (mut schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
@@ -1373,13 +1639,13 @@ where
                 dup, display_name
             )
         })?;
-        let column_names_lower: HashSet<String> = column_names
+        let column_names_lower: FxHashSet<String> = column_names
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
 
         let mut columns: Vec<PlanColumnSpec> = Vec::with_capacity(column_defs_ast.len());
-        let mut primary_key_columns: HashSet<String> = HashSet::default();
+        let mut primary_key_columns: FxHashSet<String> = FxHashSet::default();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
         let mut multi_column_uniques: Vec<MultiColumnUniqueSpec> = Vec::new();
 
@@ -1493,8 +1759,8 @@ where
 
         // Apply supported table-level constraints (e.g., PRIMARY KEY)
         if !constraints.is_empty() {
-            let mut column_lookup: HashMap<String, usize> = HashMap::default();
-            column_lookup.reserve(columns.len());
+            let mut column_lookup: FxHashMap<String, usize> =
+                FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
             for (idx, column) in columns.iter().enumerate() {
                 column_lookup.insert(column.name.to_ascii_lowercase(), idx);
             }
@@ -1797,7 +2063,7 @@ where
         };
 
         let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
-        let mut seen_column_names: HashSet<String> = HashSet::default();
+        let mut seen_column_names: FxHashSet<String> = FxHashSet::default();
         for item in columns {
             // Check WITH FILL before calling helper (not part of standard validation)
             if item.column.with_fill.is_some() {
@@ -1871,7 +2137,7 @@ where
         on_delete: Option<ReferentialAction>,
         on_update: Option<ReferentialAction>,
         characteristics: &Option<ConstraintCharacteristics>,
-        known_columns_lower: &HashSet<String>,
+        known_columns_lower: &FxHashSet<String>,
         name: Option<String>,
     ) -> SqlResult<ForeignKeySpec> {
         if characteristics.is_some() {
@@ -2069,11 +2335,6 @@ where
                 "CREATE OR ALTER VIEW is not supported".into(),
             ));
         }
-        if temporary {
-            return Err(Error::InvalidArgumentError(
-                "TEMPORARY VIEWS are not supported".into(),
-            ));
-        }
 
         // Parse view name (same as table parsing)
         let (schema_name, view_name) = parse_schema_qualified_name(&name)?;
@@ -2178,9 +2439,22 @@ where
         // Convert query to SQL string for storage (after applying column aliases when present)
         let view_definition = query_ast.to_string();
 
-        // Create the view through the runtime context so catalog and metadata stay authoritative.
-        let context = self.engine.context();
-        context.create_view(&display_name, view_definition, select_plan, if_not_exists)?;
+        // Build CreateViewPlan with namespace routing (same pattern as CREATE TABLE)
+        let namespace = if temporary {
+            Some(TEMPORARY_NAMESPACE_ID.to_string())
+        } else {
+            None
+        };
+
+        let plan = CreateViewPlan {
+            name: display_name.clone(),
+            if_not_exists,
+            view_definition,
+            select_plan: Box::new(select_plan),
+            namespace,
+        };
+
+        self.execute_plan_statement(PlanStatement::CreateView(plan))?;
 
         tracing::debug!("Created view: {}", display_name);
         Ok(RuntimeStatementResult::NoOp)
@@ -2225,6 +2499,138 @@ where
         Ok(RuntimeStatementResult::NoOp)
     }
 
+    fn handle_create_trigger(
+        &self,
+        create_trigger: CreateTrigger,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let CreateTrigger {
+            or_alter,
+            or_replace,
+            is_constraint,
+            name,
+            period,
+            period_before_table: _,
+            events,
+            table_name,
+            referenced_table_name,
+            referencing,
+            trigger_object,
+            include_each: _,
+            condition,
+            exec_body,
+            statements_as,
+            statements,
+            characteristics,
+        } = create_trigger;
+
+        if or_alter {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR ALTER TRIGGER is not supported".into(),
+            ));
+        }
+
+        if or_replace {
+            return Err(Error::InvalidArgumentError(
+                "CREATE OR REPLACE TRIGGER is not supported".into(),
+            ));
+        }
+
+        if is_constraint {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER ... CONSTRAINT is not supported".into(),
+            ));
+        }
+
+        if referenced_table_name.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER referencing another table is not supported".into(),
+            ));
+        }
+
+        if !referencing.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER REFERENCING clauses are not supported".into(),
+            ));
+        }
+
+        if characteristics.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER constraint characteristics are not supported".into(),
+            ));
+        }
+
+        if events.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER requires at least one event".into(),
+            ));
+        }
+
+        if events.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER currently supports exactly one trigger event".into(),
+            ));
+        }
+
+        let timing = match period {
+            TriggerPeriod::Before => TriggerTimingMeta::Before,
+            TriggerPeriod::After | TriggerPeriod::For => TriggerTimingMeta::After,
+            TriggerPeriod::InsteadOf => TriggerTimingMeta::InsteadOf,
+        };
+
+        let event_meta = match events.into_iter().next().expect("checked length") {
+            TriggerEvent::Insert => TriggerEventMeta::Insert,
+            TriggerEvent::Delete => TriggerEventMeta::Delete,
+            TriggerEvent::Update(columns) => TriggerEventMeta::Update {
+                columns: columns
+                    .into_iter()
+                    .map(|ident| ident.value.to_ascii_lowercase())
+                    .collect(),
+            },
+            TriggerEvent::Truncate => {
+                return Err(Error::InvalidArgumentError(
+                    "CREATE TRIGGER for TRUNCATE events is not supported".into(),
+                ));
+            }
+        };
+
+        let (trigger_display_name, canonical_trigger_name) = canonical_object_name(&name)?;
+        let (table_display_name, canonical_table_name) = canonical_object_name(&table_name)?;
+
+        let condition_sql = condition.map(|expr| expr.to_string());
+
+        let body_sql = if let Some(exec_body) = exec_body {
+            format!("EXECUTE {exec_body}")
+        } else if let Some(statements) = statements {
+            let rendered = statements.to_string();
+            if statements_as {
+                format!("AS {rendered}")
+            } else {
+                rendered
+            }
+        } else {
+            return Err(Error::InvalidArgumentError(
+                "CREATE TRIGGER requires a trigger body".into(),
+            ));
+        };
+
+        let for_each_row = matches!(trigger_object, TriggerObject::Row);
+
+        self.engine.context().create_trigger(
+            &trigger_display_name,
+            &canonical_trigger_name,
+            &table_display_name,
+            &canonical_table_name,
+            timing,
+            event_meta,
+            for_each_row,
+            condition_sql,
+            body_sql,
+            false,
+        )?;
+
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
     fn handle_drop_domain(
         &self,
         drop_domain: sqlparser::ast::DropDomain,
@@ -2248,6 +2654,46 @@ where
 
             tracing::debug!("Dropped and removed from catalog type alias: {}", type_name);
         }
+
+        Ok(RuntimeStatementResult::NoOp)
+    }
+
+    fn handle_drop_trigger(
+        &self,
+        drop_trigger: DropTrigger,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let DropTrigger {
+            if_exists,
+            trigger_name,
+            table_name,
+            option,
+        } = drop_trigger;
+
+        if option.is_some() {
+            return Err(Error::InvalidArgumentError(
+                "DROP TRIGGER CASCADE/RESTRICT options are not supported".into(),
+            ));
+        }
+
+        let (trigger_display_name, canonical_trigger_name) = canonical_object_name(&trigger_name)?;
+
+        let (table_display, table_canonical) = if let Some(table_name) = table_name {
+            let (display, canonical) = canonical_object_name(&table_name)?;
+            (Some(display), Some(canonical))
+        } else {
+            (None, None)
+        };
+
+        let table_display_hint = table_display.as_deref();
+        let table_canonical_hint = table_canonical.as_deref();
+
+        self.engine.context().drop_trigger(
+            &trigger_display_name,
+            &canonical_trigger_name,
+            table_display_hint,
+            table_canonical_hint,
+            if_exists,
+        )?;
 
         Ok(RuntimeStatementResult::NoOp)
     }
@@ -2419,6 +2865,7 @@ where
                 table: display_name.to_string(),
                 columns: column_names,
                 source: InsertSource::Rows(rows),
+                on_conflict: InsertConflictAction::None,
             };
             self.execute_plan_statement(PlanStatement::Insert(insert_plan))?;
         }
@@ -2836,6 +3283,7 @@ where
                 table_name,
                 columns,
                 rows,
+                on_conflict,
             } => {
                 tracing::trace!(
                     "DEBUG SQL handle_insert executing buffered-values insert for table={}",
@@ -2845,6 +3293,7 @@ where
                     table: table_name,
                     columns,
                     source: InsertSource::Rows(rows),
+                    on_conflict,
                 };
                 self.execute_plan_statement(PlanStatement::Insert(plan))
             }
@@ -2900,23 +3349,25 @@ where
         let resolver = catalog.identifier_resolver();
         let table_id = catalog.table_id(&canonical_name);
 
-        let mut column_assignments = Vec::with_capacity(assignments.len());
-        let mut seen: HashMap<String, ()> = HashMap::default();
+        // Use a HashMap to track column assignments. If a column appears multiple times,
+        // the last assignment wins (SQLite-compatible behavior).
+        let mut assignments_map: FxHashMap<String, (String, sqlparser::ast::Expr)> =
+            FxHashMap::with_capacity_and_hasher(assignments.len(), FxBuildHasher);
         for assignment in assignments {
             let column_name = resolve_assignment_column_name(&assignment.target)?;
             let normalized = column_name.to_ascii_lowercase();
-            if seen.insert(normalized, ()).is_some() {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column '{}' in UPDATE assignments",
-                    column_name
-                )));
-            }
-            let value = match SqlValue::try_from_expr(&assignment.value) {
+            // Store in map - last assignment wins
+            assignments_map.insert(normalized, (column_name, assignment.value.clone()));
+        }
+
+        let mut column_assignments = Vec::with_capacity(assignments_map.len());
+        for (_normalized, (column_name, expr)) in assignments_map {
+            let value = match SqlValue::try_from_expr(&expr) {
                 Ok(literal) => AssignmentValue::Literal(PlanValue::from(literal)),
                 Err(Error::InvalidArgumentError(msg))
                     if msg.contains("unsupported literal expression") =>
                 {
-                    let normalized_expr = self.materialize_in_subquery(assignment.value.clone())?;
+                    let normalized_expr = self.materialize_in_subquery(expr.clone())?;
                     let translated = translate_scalar_with_context(
                         &resolver,
                         IdentifierContext::new(table_id),
@@ -3167,7 +3618,8 @@ where
 
                 for name in names {
                     let view_name = Self::object_name_to_string(&name)?;
-                    self.engine.context().drop_view(&view_name, if_exists)?;
+                    let plan = llkv_plan::DropViewPlan::new(view_name).if_exists(if_exists);
+                    self.execute_plan_statement(llkv_plan::PlanStatement::DropView(plan))?;
                 }
 
                 Ok(RuntimeStatementResult::NoOp)
@@ -3779,6 +4231,12 @@ where
                                         if batch.num_columns() == 0 {
                                             continue;
                                         }
+                                        if batch.num_columns() > 1 {
+                                            return Err(Error::InvalidArgumentError(format!(
+                                                "IN subquery must return exactly one column, got {}",
+                                                batch.num_columns()
+                                            )));
+                                        }
                                         let column = batch.column(0);
 
                                         for row_idx in 0..column.len() {
@@ -4001,14 +4459,14 @@ where
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
-        let mut visited_views = HashSet::default();
+        let mut visited_views = FxHashSet::default();
         self.execute_query_with_view_support(query, &mut visited_views)
     }
 
     fn execute_query_with_view_support(
         &self,
         query: Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         if let Some(result) = self.try_execute_simple_view_select(&query, visited_views)? {
             return Ok(result);
@@ -4034,7 +4492,7 @@ where
     fn try_execute_simple_view_select(
         &self,
         query: &Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         use sqlparser::ast::SetExpr;
 
@@ -4200,8 +4658,8 @@ where
                 let exec = *view_execution;
                 let batches = exec.collect()?;
                 let view_fields = view_schema.fields();
-                let mut name_to_index = HashMap::default();
-                name_to_index.reserve(view_fields.len());
+                let mut name_to_index =
+                    FxHashMap::with_capacity_and_hasher(view_fields.len(), Default::default());
                 for (idx, field) in view_fields.iter().enumerate() {
                     name_to_index.insert(field.name().to_ascii_lowercase(), idx);
                 }
@@ -4266,7 +4724,7 @@ where
     fn try_execute_simple_derived_select(
         &self,
         query: &Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         use sqlparser::ast::{Expr as SqlExpr, SelectItem, SetExpr};
 
@@ -4485,7 +4943,7 @@ where
         let mut batches = inner_exec.collect()?;
         let output_table_name = alias_name.clone().unwrap_or(inner_table_name.clone());
 
-        let mut name_to_index = HashMap::default();
+        let mut name_to_index = FxHashMap::default();
         for (idx, field) in inner_schema.fields().iter().enumerate() {
             name_to_index.insert(field.name().to_ascii_lowercase(), idx);
         }
@@ -4592,7 +5050,7 @@ where
     fn try_execute_view_set_operation(
         &self,
         query: &Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         if !matches!(query.body.as_ref(), SetExpr::SetOperation { .. }) {
             return Ok(None);
@@ -4617,7 +5075,7 @@ where
     fn evaluate_set_expr(
         &self,
         expr: &SetExpr,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         match expr {
             SetExpr::SetOperation {
@@ -4640,7 +5098,7 @@ where
     fn execute_setexpr_query(
         &self,
         expr: &SetExpr,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         let sql = expr.to_string();
         let dialect = GenericDialect {};
@@ -4784,7 +5242,7 @@ where
             .convert_columns(batch.columns())
             .map_err(|err| Error::Internal(format!("failed to row-encode union result: {err}")))?;
 
-        let mut seen = HashSet::default();
+        let mut seen = FxHashSet::default();
         let mut indices = Vec::new();
         let mut has_duplicates = false;
         for (idx, row) in rows.iter().enumerate() {
@@ -5555,21 +6013,17 @@ where
                         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
                             if is_distinct {
                                 return Err(Error::InvalidArgumentError(
-                                    "COUNT(DISTINCT *) is not supported".into(),
+                                    "DISTINCT aggregates must be applied to columns not *, e.g. table columns like: 1,0,2,2".into(),
                                 ));
                             }
-                            AggregateExpr::count_star(alias)
+                            AggregateExpr::count_star(alias, false)
                         }
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) => {
                             if !is_simple_aggregate_column(arg_expr) {
                                 return Ok(None);
                             }
                             let column = resolve_column_name(arg_expr)?;
-                            if is_distinct {
-                                AggregateExpr::count_distinct_column(column, alias)
-                            } else {
-                                AggregateExpr::count_column(column, alias)
-                            }
+                            AggregateExpr::count_column(column, alias, is_distinct)
                         }
                         FunctionArg::Named { .. } | FunctionArg::ExprNamed { .. } => {
                             return Err(Error::InvalidArgumentError(
@@ -6011,6 +6465,30 @@ where
             ))),
         }
     }
+
+    fn handle_vacuum(&self, vacuum: VacuumStatement) -> SqlResult<RuntimeStatementResult<P>> {
+        // Only support REINDEX with a table name (which is treated as index name in LLKV)
+        if vacuum.reindex {
+            let index_name = vacuum.table_name.ok_or_else(|| {
+                Error::InvalidArgumentError("REINDEX requires an index name".to_string())
+            })?;
+
+            let (display_name, canonical_name) = canonical_object_name(&index_name)?;
+
+            let plan = ReindexPlan::new(display_name.clone()).with_canonical(canonical_name);
+
+            let statement = PlanStatement::Reindex(plan);
+            self.engine.execute_statement(statement).map_err(|err| {
+                tracing::error!("REINDEX failed for '{}': {}", display_name, err);
+                err
+            })
+        } else {
+            // Other VACUUM variants are not supported
+            Err(Error::InvalidArgumentError(
+                "Only REINDEX is supported; general VACUUM is not implemented".to_string(),
+            ))
+        }
+    }
 }
 
 fn canonical_object_name(name: &ObjectName) -> SqlResult<(String, String)> {
@@ -6208,7 +6686,7 @@ fn validate_check_constraint(
 ) -> SqlResult<()> {
     use sqlparser::ast::Expr as SqlExpr;
 
-    let column_names_lower: HashSet<String> = column_names
+    let column_names_lower: FxHashSet<String> = column_names
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
@@ -6609,6 +7087,34 @@ fn try_parse_aggregate_function(
                 }
             }
         }
+        "total" => {
+            if args_slice.len() != 1 {
+                return Err(Error::InvalidArgumentError(
+                    "TOTAL accepts exactly one argument".into(),
+                ));
+            }
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "TOTAL requires a column argument".into(),
+                    ));
+                }
+            };
+
+            let expr = translate_scalar_internal(
+                arg_expr,
+                resolver,
+                context,
+                outer_scopes,
+                tracker,
+                None,
+            )?;
+            llkv_expr::expr::AggregateCall::Total {
+                expr: Box::new(expr),
+                distinct,
+            }
+        }
         "min" => {
             if args_slice.len() != 1 {
                 return Err(Error::InvalidArgumentError(
@@ -6682,6 +7188,64 @@ fn try_parse_aggregate_function(
             llkv_expr::expr::AggregateCall::Avg {
                 expr: Box::new(expr),
                 distinct,
+            }
+        }
+        "group_concat" => {
+            if args_slice.is_empty() || args_slice.len() > 2 {
+                return Err(Error::InvalidArgumentError(
+                    "GROUP_CONCAT accepts one or two arguments".into(),
+                ));
+            }
+
+            // First argument is the column/expression
+            let arg_expr = match &args_slice[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                _ => {
+                    return Err(Error::InvalidArgumentError(
+                        "GROUP_CONCAT requires a column argument".into(),
+                    ));
+                }
+            };
+
+            let expr = translate_scalar_internal(
+                arg_expr,
+                resolver,
+                context,
+                outer_scopes,
+                tracker,
+                None,
+            )?;
+
+            // Second argument (optional) is the separator
+            let separator = if args_slice.len() == 2 {
+                match &args_slice[1] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(
+                        ValueWithSpan {
+                            value: sqlparser::ast::Value::SingleQuotedString(s),
+                            ..
+                        },
+                    ))) => Some(s.clone()),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "GROUP_CONCAT separator must be a string literal".into(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+
+            // SQLite doesn't support DISTINCT with a custom separator
+            if distinct && separator.is_some() {
+                return Err(Error::InvalidArgumentError(
+                    "GROUP_CONCAT does not support DISTINCT with a custom separator".into(),
+                ));
+            }
+
+            llkv_expr::expr::AggregateCall::GroupConcat {
+                expr: Box::new(expr),
+                distinct,
+                separator,
             }
         }
         _ => return Ok(None),
@@ -6851,18 +7415,15 @@ fn resolve_identifier_expr(
     }
 }
 
-fn translate_condition_with_context<P>(
-    engine: &SqlEngine<P>,
+fn translate_condition_with_context(
+    engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     expr: &SqlExpr,
     outer_scopes: &[IdentifierContext],
     subqueries: &mut Vec<llkv_plan::FilterSubquery>,
     mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
-) -> SqlResult<llkv_expr::expr::Expr<'static, String>>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::TransformFrame documentation for pattern details.
     //
@@ -7529,7 +8090,9 @@ fn translate_scalar_internal(
                     | BinaryOperator::Divide
                     | BinaryOperator::Modulo
                     | BinaryOperator::And
-                    | BinaryOperator::Or => {
+                    | BinaryOperator::Or
+                    | BinaryOperator::PGBitwiseShiftLeft
+                    | BinaryOperator::PGBitwiseShiftRight => {
                         work_stack.push(ScalarFrame::Exit(ScalarExitContext::BinaryOp {
                             op: op.clone(),
                         }));
@@ -7992,6 +8555,22 @@ fn translate_scalar_internal(
                             );
                             result_stack.push(expr);
                         }
+                        BinaryOperator::PGBitwiseShiftLeft => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::BitwiseShiftLeft,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
+                        BinaryOperator::PGBitwiseShiftRight => {
+                            let expr = llkv_expr::expr::ScalarExpr::binary(
+                                left_expr,
+                                llkv_expr::expr::BinaryOp::BitwiseShiftRight,
+                                right_expr,
+                            );
+                            result_stack.push(expr);
+                        }
                         other => {
                             return Err(Error::InvalidArgumentError(format!(
                                 "unsupported scalar binary operator: {other:?}"
@@ -8308,18 +8887,12 @@ fn translate_scalar_internal(
         .ok_or_else(|| Error::Internal("translate_scalar: empty result stack".into()))
 }
 
-struct ScalarSubqueryPlanner<'engine, 'vec, P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    engine: &'engine SqlEngine<P>,
+struct ScalarSubqueryPlanner<'engine, 'vec> {
+    engine: &'engine SqlEngine,
     scalar_subqueries: &'vec mut Vec<llkv_plan::ScalarSubquery>,
 }
 
-impl<'engine, 'vec, P> ScalarSubqueryResolver for ScalarSubqueryPlanner<'engine, 'vec, P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
+impl<'engine, 'vec> ScalarSubqueryResolver for ScalarSubqueryPlanner<'engine, 'vec> {
     fn handle_scalar_subquery(
         &mut self,
         subquery: &Query,
@@ -8863,6 +9436,8 @@ fn push_table_factor(
 ) -> SqlResult<()> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
+            // Note: Index hints (INDEXED BY, NOT INDEXED) are SQLite-specific query hints
+            // that are ignored by the `..` pattern. We accept them for compatibility.
             let (schema_opt, table) = parse_schema_qualified_name(name)?;
             let schema = schema_opt.unwrap_or_default();
             let alias_name = alias.as_ref().map(|a| a.name.value.clone());
@@ -9208,6 +9783,109 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 0, "expected IN list filter to remove all rows");
+    }
+
+    #[test]
+    fn empty_in_list_filters_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE test_table(col INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO test_table VALUES (1), (2), (3)")
+            .expect("insert rows");
+
+        let batches = engine
+            .sql("SELECT * FROM test_table WHERE col IN ()")
+            .expect("run empty IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0, "expected empty IN list to filter all rows");
+    }
+
+    #[test]
+    fn empty_not_in_list_preserves_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE test_table(col INTEGER)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO test_table VALUES (1), (2), (3)")
+            .expect("insert rows");
+
+        let batches = engine
+            .sql("SELECT * FROM test_table WHERE col NOT IN () ORDER BY col")
+            .expect("run empty NOT IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 3,
+            "expected empty NOT IN list to preserve all rows"
+        );
+
+        let mut values: Vec<i64> = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int column");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    values.push(column.value(idx));
+                }
+            }
+        }
+
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn empty_in_list_with_constant_expression() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        let batches = engine
+            .sql("SELECT 1 IN ()")
+            .expect("run constant empty IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 1, "expected one result row");
+
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int column")
+            .value(0);
+
+        assert_eq!(value, 0, "expected 1 IN () to evaluate to 0 (false)");
+    }
+
+    #[test]
+    fn empty_not_in_list_with_constant_expression() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        let batches = engine
+            .sql("SELECT 1 NOT IN ()")
+            .expect("run constant empty NOT IN list");
+
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 1, "expected one result row");
+
+        let value = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int column")
+            .value(0);
+
+        assert_eq!(value, 1, "expected 1 NOT IN () to evaluate to 1 (true)");
     }
 
     #[test]

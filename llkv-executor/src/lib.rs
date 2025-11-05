@@ -106,6 +106,7 @@ enum AggregateValue {
     Null,
     Int64(i64),
     Float64(f64),
+    String(String),
 }
 
 impl AggregateValue {
@@ -115,6 +116,7 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v),
             AggregateValue::Float64(v) => Some(*v as i64),
+            AggregateValue::String(s) => s.parse().ok(),
         }
     }
 
@@ -125,6 +127,7 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v as f64),
             AggregateValue::Float64(v) => Some(*v),
+            AggregateValue::String(s) => s.parse().ok(),
         }
     }
 }
@@ -1962,12 +1965,12 @@ where
 
         for aggregate in &plan.aggregates {
             match aggregate {
-                AggregateExpr::CountStar { alias } => {
+                AggregateExpr::CountStar { alias, distinct } => {
                     specs.push(AggregateSpec {
                         alias: alias.clone(),
                         kind: AggregateKind::Count {
                             field_id: None,
-                            distinct: false,
+                            distinct: *distinct,
                         },
                     });
                     spec_to_projection.push(None);
@@ -2002,6 +2005,18 @@ where
                                 distinct: *distinct,
                             }
                         }
+                        AggregateFunction::TotalInt64 => {
+                            let input_type = Self::validate_aggregate_type(
+                                Some(field.data_type().clone()),
+                                "TOTAL",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
+                            AggregateKind::Total {
+                                field_id: column_index as u32,
+                                data_type: input_type,
+                                distinct: *distinct,
+                            }
+                        }
                         AggregateFunction::MinInt64 => {
                             let input_type = Self::validate_aggregate_type(
                                 Some(field.data_type().clone()),
@@ -2026,6 +2041,11 @@ where
                         }
                         AggregateFunction::CountNulls => AggregateKind::CountNulls {
                             field_id: column_index as u32,
+                        },
+                        AggregateFunction::GroupConcat => AggregateKind::GroupConcat {
+                            field_id: column_index as u32,
+                            distinct: *distinct,
+                            separator: ",".to_string(),
                         },
                     };
 
@@ -2135,6 +2155,36 @@ where
 
         for projection in &plan.projections {
             if let SelectProjection::Computed { expr, alias } = projection {
+                // Check if this is a simple aggregate expression
+                if let ScalarExpr::Aggregate(agg) = expr {
+                    let key = format!("{:?}", agg);
+                    if let Some(agg_value) = aggregate_values.get(&key) {
+                        match agg_value {
+                            AggregateValue::Null => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
+                                arrays.push(Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef);
+                            }
+                            AggregateValue::Int64(v) => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
+                                arrays.push(Arc::new(Int64Array::from(vec![Some(*v)])) as ArrayRef);
+                            }
+                            AggregateValue::Float64(v) => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Float64, true)));
+                                arrays
+                                    .push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
+                            }
+                            AggregateValue::String(s) => {
+                                fields.push(Arc::new(Field::new(alias, DataType::Utf8, true)));
+                                arrays
+                                    .push(Arc::new(StringArray::from(vec![Some(s.as_str())]))
+                                        as ArrayRef);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // Complex expression - try to evaluate as integer
                 let value = Self::evaluate_expr_with_aggregates(expr, &aggregate_values)?;
                 fields.push(Arc::new(Field::new(alias, DataType::Int64, true)));
                 arrays.push(Arc::new(Int64Array::from(vec![value])) as ArrayRef);
@@ -2256,10 +2306,12 @@ where
                 }
                 AggregateCall::Count { expr, .. }
                 | AggregateCall::Sum { expr, .. }
+                | AggregateCall::Total { expr, .. }
                 | AggregateCall::Avg { expr, .. }
                 | AggregateCall::Min(expr)
                 | AggregateCall::Max(expr)
-                | AggregateCall::CountNulls(expr) => {
+                | AggregateCall::CountNulls(expr)
+                | AggregateCall::GroupConcat { expr, .. } => {
                     let (column_index, data_type_opt) = if let Some(column) =
                         try_extract_simple_column(expr)
                     {
@@ -2300,6 +2352,23 @@ where
                                 )
                             })?;
                             AggregateKind::Sum {
+                                field_id,
+                                data_type: input_type,
+                                distinct: *distinct,
+                            }
+                        }
+                        AggregateCall::Total { distinct, .. } => {
+                            let input_type = Self::validate_aggregate_type(
+                                data_type_opt.clone(),
+                                "TOTAL",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            AggregateKind::Total {
                                 field_id,
                                 data_type: input_type,
                                 distinct: *distinct,
@@ -2361,6 +2430,22 @@ where
                                 )
                             })?;
                             AggregateKind::CountNulls { field_id }
+                        }
+                        AggregateCall::GroupConcat {
+                            distinct,
+                            separator,
+                            ..
+                        } => {
+                            let field_id = u32::try_from(column_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            AggregateKind::GroupConcat {
+                                field_id,
+                                distinct: *distinct,
+                                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+                            }
                         }
                         _ => unreachable!(),
                     };
@@ -2452,6 +2537,21 @@ where
                     AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float_array.value(0))
+                };
+                results.insert(field.name().to_string(), value);
+            }
+            // Try StringArray for GROUP_CONCAT
+            else if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                if string_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        string_array.len()
+                    )));
+                }
+                let value = if string_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::String(string_array.value(0).to_string())
                 };
                 results.insert(field.name().to_string(), value);
             } else {
@@ -3763,10 +3863,12 @@ where
                     AggregateCall::CountStar => (None, None),
                     AggregateCall::Count { expr, .. }
                     | AggregateCall::Sum { expr, .. }
+                    | AggregateCall::Total { expr, .. }
                     | AggregateCall::Avg { expr, .. }
                     | AggregateCall::Min(expr)
                     | AggregateCall::Max(expr)
-                    | AggregateCall::CountNulls(expr) => {
+                    | AggregateCall::CountNulls(expr)
+                    | AggregateCall::GroupConcat { expr, .. } => {
                         if let Some(col_name) = try_extract_simple_column(expr) {
                             let idx = resolve_column_name_to_index(col_name, &column_lookup_map)
                                 .ok_or_else(|| {
@@ -3961,12 +4063,12 @@ where
         let mut specs: Vec<AggregateSpec> = Vec::with_capacity(plan.aggregates.len());
         for aggregate in plan.aggregates {
             match aggregate {
-                AggregateExpr::CountStar { alias } => {
+                AggregateExpr::CountStar { alias, distinct } => {
                     specs.push(AggregateSpec {
                         alias,
                         kind: AggregateKind::Count {
                             field_id: None,
-                            distinct: false,
+                            distinct,
                         },
                     });
                 }
@@ -3995,6 +4097,18 @@ where
                                 &[DataType::Int64, DataType::Float64],
                             )?;
                             AggregateKind::Sum {
+                                field_id: col.field_id,
+                                data_type: input_type,
+                                distinct,
+                            }
+                        }
+                        AggregateFunction::TotalInt64 => {
+                            let input_type = Self::validate_aggregate_type(
+                                Some(col.data_type.clone()),
+                                "TOTAL",
+                                &[DataType::Int64, DataType::Float64],
+                            )?;
+                            AggregateKind::Total {
                                 field_id: col.field_id,
                                 data_type: input_type,
                                 distinct,
@@ -4032,6 +4146,11 @@ where
                                 field_id: col.field_id,
                             }
                         }
+                        AggregateFunction::GroupConcat => AggregateKind::GroupConcat {
+                            field_id: col.field_id,
+                            distinct,
+                            separator: ",".to_string(),
+                        },
                     };
                     specs.push(AggregateSpec { alias, kind });
                 }
@@ -4290,7 +4409,57 @@ where
                     ));
                 }
                 SelectProjection::Computed { expr, alias } => {
-                    // Evaluate the expression with aggregates substituted
+                    // Check if this is a simple aggregate expression
+                    if let ScalarExpr::Aggregate(agg) = expr {
+                        let key = format!("{:?}", agg);
+                        if let Some(agg_value) = computed_aggregates.get(&key) {
+                            match agg_value {
+                                AggregateValue::Null => {
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Int64,
+                                        true,
+                                    ));
+                                    arrays
+                                        .push(Arc::new(Int64Array::from(vec![None::<i64>]))
+                                            as ArrayRef);
+                                }
+                                AggregateValue::Int64(v) => {
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Int64,
+                                        true,
+                                    ));
+                                    arrays.push(
+                                        Arc::new(Int64Array::from(vec![Some(*v)])) as ArrayRef
+                                    );
+                                }
+                                AggregateValue::Float64(v) => {
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Float64,
+                                        true,
+                                    ));
+                                    arrays
+                                        .push(Arc::new(Float64Array::from(vec![Some(*v)]))
+                                            as ArrayRef);
+                                }
+                                AggregateValue::String(s) => {
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Utf8,
+                                        true,
+                                    ));
+                                    arrays
+                                        .push(Arc::new(StringArray::from(vec![Some(s.as_str())]))
+                                            as ArrayRef);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Complex expression - try to evaluate as integer
                     let value = Self::evaluate_expr_with_aggregates(expr, &computed_aggregates)?;
 
                     fields.push(arrow::datatypes::Field::new(alias, DataType::Int64, true));
@@ -4348,6 +4517,15 @@ where
                 )?,
                 distinct: *distinct,
             },
+            AggregateCall::Total { distinct, .. } => llkv_aggregate::AggregateKind::Total {
+                field_id: 0,
+                data_type: Self::validate_aggregate_type(
+                    data_type.clone(),
+                    "TOTAL",
+                    &[DataType::Int64, DataType::Float64],
+                )?,
+                distinct: *distinct,
+            },
             AggregateCall::Avg { distinct, .. } => llkv_aggregate::AggregateKind::Avg {
                 field_id: 0,
                 data_type: Self::validate_aggregate_type(
@@ -4376,11 +4554,34 @@ where
             AggregateCall::CountNulls(_) => {
                 llkv_aggregate::AggregateKind::CountNulls { field_id: 0 }
             }
+            AggregateCall::GroupConcat {
+                distinct,
+                separator,
+                ..
+            } => llkv_aggregate::AggregateKind::GroupConcat {
+                field_id: 0,
+                distinct: *distinct,
+                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+            },
         };
 
         Ok(llkv_aggregate::AggregateSpec { alias, kind })
     }
 
+    /// Validate or coerce input data type for aggregates with centralized, scalable type handling.
+    ///
+    /// For numeric aggregates (e.g. SUM, AVG, TOTAL):
+    /// - Implements SQLite-compatible type coercion automatically
+    /// - Int64 and Float64 are used directly
+    /// - Utf8 (strings), Boolean, and Date types are coerced to Float64
+    /// - String values will be parsed at runtime (non-numeric strings -> 0)
+    /// - **Ignores** the `allowed` parameter for these functions
+    ///
+    /// For other aggregates (e.g. MIN, MAX, COUNT, etc.):
+    /// - Only allows types in the `allowed` list
+    ///
+    /// This is the SINGLE centralized function for all aggregate type handling.
+    /// No need to update multiple call sites when adding type support.
     fn validate_aggregate_type(
         data_type: Option<DataType>,
         func_name: &str,
@@ -4391,13 +4592,33 @@ where
                 "missing input type metadata for {func_name} aggregate"
             ))
         })?;
-        if allowed.iter().any(|candidate| candidate == &dt) {
-            Ok(dt)
+
+        // Numeric aggregates (SUM, AVG, TOTAL) and comparison aggregates (MIN, MAX)
+        // all support SQLite-style type coercion
+        if matches!(func_name, "SUM" | "AVG" | "TOTAL" | "MIN" | "MAX") {
+            match dt {
+                // Numeric types used directly
+                DataType::Int64 | DataType::Float64 => Ok(dt),
+
+                // SQLite-compatible coercion: strings, booleans, dates -> Float64
+                // Actual conversion happens in llkv-aggregate::array_value_to_numeric
+                DataType::Utf8 | DataType::Boolean | DataType::Date32 => Ok(DataType::Float64),
+
+                _ => Err(Error::InvalidArgumentError(format!(
+                    "{func_name} aggregate not supported for column type {:?}",
+                    dt
+                ))),
+            }
         } else {
-            Err(Error::InvalidArgumentError(format!(
-                "{func_name} aggregate not supported for column type {:?}",
-                dt
-            )))
+            // Other aggregates use explicit allowed list
+            if allowed.iter().any(|candidate| candidate == &dt) {
+                Ok(dt)
+            } else {
+                Err(Error::InvalidArgumentError(format!(
+                    "{func_name} aggregate not supported for column type {:?}",
+                    dt
+                )))
+            }
         }
     }
 
@@ -4623,6 +4844,53 @@ where
                     });
                     spec_to_projection.push(Some(projection_index));
                 }
+                AggregateCall::Total { expr, distinct } => {
+                    let (projection_index, data_type, field_id) =
+                        if let Some(col_name) = try_extract_simple_column(expr) {
+                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                                Error::InvalidArgumentError(format!(
+                                    "unknown column '{}' in aggregate",
+                                    col_name
+                                ))
+                            })?;
+                            let projection_index = get_or_insert_column_projection(
+                                &mut projections,
+                                &mut column_projection_cache,
+                                table_ref,
+                                col,
+                            );
+                            let data_type = col.data_type.clone();
+                            (projection_index, data_type, col.field_id)
+                        } else {
+                            let (projection_index, inferred_type) = ensure_computed_projection(
+                                expr,
+                                table_ref,
+                                &mut projections,
+                                &mut computed_projection_cache,
+                                &mut computed_alias_counter,
+                            )?;
+                            let field_id = u32::try_from(projection_index).map_err(|_| {
+                                Error::InvalidArgumentError(
+                                    "aggregate projection index exceeds supported range".into(),
+                                )
+                            })?;
+                            (projection_index, inferred_type, field_id)
+                        };
+                    let normalized_type = Self::validate_aggregate_type(
+                        Some(data_type.clone()),
+                        "TOTAL",
+                        &[DataType::Int64, DataType::Float64],
+                    )?;
+                    specs.push(AggregateSpec {
+                        alias: key.clone(),
+                        kind: AggregateKind::Total {
+                            field_id,
+                            data_type: normalized_type,
+                            distinct: *distinct,
+                        },
+                    });
+                    spec_to_projection.push(Some(projection_index));
+                }
                 AggregateCall::Avg { expr, distinct } => {
                     let (projection_index, data_type, field_id) =
                         if let Some(col_name) = try_extract_simple_column(expr) {
@@ -4808,6 +5076,57 @@ where
                         spec_to_projection.push(Some(projection_index));
                     }
                 }
+                AggregateCall::GroupConcat {
+                    expr,
+                    distinct,
+                    separator,
+                } => {
+                    if let Some(col_name) = try_extract_simple_column(expr) {
+                        let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::GroupConcat {
+                                field_id: col.field_id,
+                                distinct: *distinct,
+                                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+                            },
+                        });
+                        spec_to_projection.push(Some(projection_index));
+                    } else {
+                        let (projection_index, _dtype) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        specs.push(AggregateSpec {
+                            alias: key.clone(),
+                            kind: AggregateKind::GroupConcat {
+                                field_id,
+                                distinct: *distinct,
+                                separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+                            },
+                        });
+                        spec_to_projection.push(Some(projection_index));
+                    }
+                }
             }
         }
 
@@ -4925,6 +5244,21 @@ where
                     AggregateValue::Null
                 } else {
                     AggregateValue::Float64(float64_array.value(0))
+                };
+                results.insert(alias, value);
+            } else if let Some(string_array) =
+                array.as_any().downcast_ref::<arrow::array::StringArray>()
+            {
+                if string_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        string_array.len()
+                    )));
+                }
+                let value = if string_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::String(string_array.value(0).to_string())
                 };
                 results.insert(alias, value);
             } else {
@@ -5478,7 +5812,10 @@ where
                                 }
                                 left_num % right_num
                             }
-                            BinaryOp::And | BinaryOp::Or => unreachable!(),
+                            BinaryOp::And
+                            | BinaryOp::Or
+                            | BinaryOp::BitwiseShiftLeft
+                            | BinaryOp::BitwiseShiftRight => unreachable!(),
                         };
 
                         if matches!(op, BinaryOp::Divide) {
@@ -5493,6 +5830,44 @@ where
                     }
                     BinaryOp::And => Ok(evaluate_plan_value_logical_and(left_val, right_val)),
                     BinaryOp::Or => Ok(evaluate_plan_value_logical_or(left_val, right_val)),
+                    BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
+                        if matches!(&left_val, PlanValue::Null)
+                            || matches!(&right_val, PlanValue::Null)
+                        {
+                            return Ok(PlanValue::Null);
+                        }
+
+                        // Convert to integers
+                        let lhs = match left_val {
+                            PlanValue::Integer(i) => i,
+                            PlanValue::Float(f) => f as i64,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Non-numeric value {:?} in bitwise shift operation",
+                                    other
+                                )));
+                            }
+                        };
+                        let rhs = match right_val {
+                            PlanValue::Integer(i) => i,
+                            PlanValue::Float(f) => f as i64,
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "Non-numeric value {:?} in bitwise shift operation",
+                                    other
+                                )));
+                            }
+                        };
+
+                        // Use wrapping arithmetic like SQLite
+                        let result = match op {
+                            BinaryOp::BitwiseShiftLeft => lhs.wrapping_shl(rhs as u32),
+                            BinaryOp::BitwiseShiftRight => lhs.wrapping_shr(rhs as u32),
+                            _ => unreachable!(),
+                        };
+
+                        Ok(PlanValue::Integer(result))
+                    }
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
@@ -5738,7 +6113,10 @@ where
                                     }
                                     lhs.checked_rem(rhs)
                                 }
-                                BinaryOp::And | BinaryOp::Or => unreachable!(),
+                                BinaryOp::And
+                                | BinaryOp::Or
+                                | BinaryOp::BitwiseShiftLeft
+                                | BinaryOp::BitwiseShiftRight => unreachable!(),
                             };
 
                             result.map(Some).ok_or_else(|| {
@@ -5751,6 +6129,23 @@ where
                     },
                     BinaryOp::And => Ok(evaluate_option_logical_and(left_val, right_val)),
                     BinaryOp::Or => Ok(evaluate_option_logical_or(left_val, right_val)),
+                    BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
+                        match (left_val, right_val) {
+                            (Some(lhs), Some(rhs)) => {
+                                let result = match op {
+                                    BinaryOp::BitwiseShiftLeft => {
+                                        Some(lhs.wrapping_shl(rhs as u32))
+                                    }
+                                    BinaryOp::BitwiseShiftRight => {
+                                        Some(lhs.wrapping_shr(rhs as u32))
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                Ok(result)
+                            }
+                            _ => Ok(None),
+                        }
+                    }
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
@@ -6675,10 +7070,12 @@ fn collect_field_ids(expr: &ScalarExpr<FieldId>, out: &mut FxHashSet<FieldId>) {
             AggregateCall::CountStar => {}
             AggregateCall::Count { expr, .. }
             | AggregateCall::Sum { expr, .. }
+            | AggregateCall::Total { expr, .. }
             | AggregateCall::Avg { expr, .. }
             | AggregateCall::Min(expr)
             | AggregateCall::Max(expr)
-            | AggregateCall::CountNulls(expr) => {
+            | AggregateCall::CountNulls(expr)
+            | AggregateCall::GroupConcat { expr, .. } => {
                 collect_field_ids(expr, out);
             }
         },
@@ -7360,6 +7757,16 @@ fn evaluate_constant_aggregate(
                 _ => None,
             }
         }
+        AggregateCall::Total { expr, .. } => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Integer(0)),
+                Literal::Integer(value) => Some(Literal::Integer(value)),
+                Literal::Float(value) => Some(Literal::Float(value)),
+                Literal::Boolean(flag) => Some(Literal::Integer(if flag { 1 } else { 0 })),
+                _ => None,
+            }
+        }
         AggregateCall::Avg { expr, .. } => {
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             match value {
@@ -7389,6 +7796,19 @@ fn evaluate_constant_aggregate(
             let count = if matches!(value, Literal::Null) { 1 } else { 0 };
             Some(Literal::Integer(count))
         }
+        AggregateCall::GroupConcat {
+            expr, separator: _, ..
+        } => {
+            let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
+            match value {
+                Literal::Null => Some(Literal::Null),
+                Literal::String(s) => Some(Literal::String(s)),
+                Literal::Integer(i) => Some(Literal::String(i.to_string())),
+                Literal::Float(f) => Some(Literal::String(f.to_string())),
+                Literal::Boolean(b) => Some(Literal::String(if b { "1" } else { "0" }.to_string())),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -7411,8 +7831,29 @@ fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Opt
                 BinaryOp::Multiply => multiply_literals(left, right),
                 BinaryOp::Divide => divide_literals(left, right),
                 BinaryOp::Modulo => modulo_literals(left, right),
-                BinaryOp::And | BinaryOp::Or => unreachable!(),
+                BinaryOp::And
+                | BinaryOp::Or
+                | BinaryOp::BitwiseShiftLeft
+                | BinaryOp::BitwiseShiftRight => unreachable!(),
             }
+        }
+        BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
+            if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
+                return Some(Literal::Null);
+            }
+
+            // Convert both operands to integers
+            let lhs = literal_to_i128(left)?;
+            let rhs = literal_to_i128(right)?;
+
+            // SQLite uses wrapping arithmetic for shifts (operate on i64 then extend to i128)
+            let result = match op {
+                BinaryOp::BitwiseShiftLeft => (lhs as i64).wrapping_shl(rhs as u32) as i128,
+                BinaryOp::BitwiseShiftRight => (lhs as i64).wrapping_shr(rhs as u32) as i128,
+                _ => unreachable!(),
+            };
+
+            Some(Literal::Integer(result))
         }
     }
 }

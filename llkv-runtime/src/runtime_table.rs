@@ -4,7 +4,9 @@ use rustc_hash::FxHashSet;
 
 use arrow::record_batch::RecordBatch;
 use llkv_executor::ExecutorRowBatch;
-use llkv_plan::{CreateTablePlan, InsertPlan, InsertSource, PlanColumnSpec, PlanValue};
+use llkv_plan::{
+    CreateTablePlan, InsertConflictAction, InsertPlan, InsertSource, PlanColumnSpec, PlanValue,
+};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -401,6 +403,7 @@ where
             table: self.display_name.clone(),
             columns: batch.columns,
             source: InsertSource::Rows(batch.rows),
+            on_conflict: InsertConflictAction::None,
         };
         let snapshot = self.context.default_snapshot();
         self.context.insert(plan, snapshot)
@@ -411,6 +414,7 @@ where
             table: self.display_name.clone(),
             columns: Vec::new(),
             source: InsertSource::Batches(batches),
+            on_conflict: InsertConflictAction::None,
         };
         let snapshot = self.context.default_snapshot();
         self.context.insert(plan, snapshot)

@@ -3873,6 +3873,8 @@ fn format_binary_op(op: BinaryOp) -> &'static str {
         BinaryOp::Modulo => "%",
         BinaryOp::And => "AND",
         BinaryOp::Or => "OR",
+        BinaryOp::BitwiseShiftLeft => "<<",
+        BinaryOp::BitwiseShiftRight => ">>",
     }
 }
 

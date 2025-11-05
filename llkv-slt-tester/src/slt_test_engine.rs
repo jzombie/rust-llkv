@@ -12,7 +12,7 @@ use arrow::array::{
 use llkv_result::Error;
 use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
 /// Thread-local storage for expected column types from sqllogictest directives.
@@ -218,11 +218,11 @@ fn record_statement(sql: &str, duration: Duration, result_type: &str) {
 
 /// Tokio-agnostic harness that adapts `SqlEngine` to the `sqllogictest` runner.
 pub struct EngineHarness {
-    engine: SqlEngine<MemPager>,
+    engine: SqlEngine,
 }
 
 impl EngineHarness {
-    pub fn new(engine: SqlEngine<MemPager>) -> Self {
+    pub fn new(engine: SqlEngine) -> Self {
         tracing::debug!("[HARNESS] new() created harness at {:p}", &engine);
         // The SLT workload streams thousands of literal INSERTs. Enable cross-statement
         // batching so we exercise the optimized ingestion path while keeping single-engine
@@ -236,7 +236,7 @@ impl EngineHarness {
 
 #[derive(Clone)]
 pub struct SharedContext {
-    context: Arc<RuntimeContext<MemPager>>,
+    context: Arc<RuntimeContext<BoxedPager>>,
 }
 
 impl Default for SharedContext {
@@ -247,12 +247,12 @@ impl Default for SharedContext {
 
 impl SharedContext {
     pub fn new() -> Self {
-        let pager = Arc::new(MemPager::default());
+        let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
         let context = Arc::new(RuntimeContext::new(pager));
         Self { context }
     }
 
-    pub fn make_engine(&self) -> SqlEngine<MemPager> {
+    pub fn make_engine(&self) -> SqlEngine {
         SqlEngine::with_context(Arc::clone(&self.context), false)
     }
 }
@@ -292,7 +292,9 @@ fn format_struct_value(struct_array: &StructArray, row_idx: usize) -> String {
                 if a.is_null(row_idx) {
                     "NULL".to_string()
                 } else {
-                    a.value(row_idx).to_string()
+                    // SQLite-compatible float formatting - try to match expected format
+                    let val = a.value(row_idx);
+                    val.to_string()
                 }
             }
             arrow::datatypes::DataType::Boolean => {

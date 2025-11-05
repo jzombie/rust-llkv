@@ -205,12 +205,59 @@ where
         );
 
         // Check catalog first for table existence
-        let catalog_table_id = self.catalog.table_id(canonical_name).ok_or_else(|| {
-            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
-        })?;
+        tracing::debug!(
+            "[CATALOG_LOOKUP] Looking up table '{}' in catalog @ {:p}",
+            canonical_name,
+            &*self.catalog
+        );
+        let catalog_table_id = match self.catalog.table_id(canonical_name) {
+            Some(id) => {
+                tracing::debug!(
+                    "[CATALOG_LOOKUP] Found table '{}' with id={} in catalog",
+                    canonical_name,
+                    id
+                );
+                id
+            }
+            None => {
+                tracing::debug!(
+                    "[CATALOG_LOOKUP] Table '{}' NOT FOUND in catalog @ {:p}",
+                    canonical_name,
+                    &*self.catalog
+                );
+                // Table not found in catalog - try fallback if available
+                if let Some(fallback) = &self.fallback_lookup {
+                    tracing::debug!(
+                        "[LAZY_LOAD] Table '{}' not found in catalog, trying fallback context",
+                        canonical_name
+                    );
+                    return fallback.lookup_table(canonical_name);
+                }
+                return Err(Error::InvalidArgumentError(format!(
+                    "unknown table '{}'",
+                    canonical_name
+                )));
+            }
+        };
 
         let table_id = catalog_table_id;
-        let table = Table::from_id_and_store(table_id, Arc::clone(&self.store))?;
+
+        // Try to load the table from our store. If it fails, try fallback context.
+        let table = match Table::from_id_and_store(table_id, Arc::clone(&self.store)) {
+            Ok(t) => t,
+            Err(e) => {
+                // Table exists in catalog but not in our store - try fallback
+                if let Some(fallback) = &self.fallback_lookup {
+                    tracing::debug!(
+                        "[LAZY_LOAD] Table '{}' found in catalog but not in store ({}), trying fallback context",
+                        canonical_name,
+                        e
+                    );
+                    return fallback.lookup_table(canonical_name);
+                }
+                return Err(e);
+            }
+        };
         let store = table.store();
         let mut logical_fields = store.user_field_ids_for_table(table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
@@ -224,9 +271,25 @@ where
             constraint_records,
             multi_column_uniques,
         } = summary;
-        let _table_meta = table_meta.ok_or_else(|| {
-            Error::InvalidArgumentError(format!("unknown table '{}'", canonical_name))
-        })?;
+
+        // If table_meta is None, the table metadata isn't in our context's store.
+        // Try fallback context before erroring.
+        let _table_meta = match table_meta {
+            Some(meta) => meta,
+            None => {
+                if let Some(fallback) = &self.fallback_lookup {
+                    tracing::debug!(
+                        "[LAZY_LOAD] Table '{}' metadata not found, trying fallback context",
+                        canonical_name
+                    );
+                    return fallback.lookup_table(canonical_name);
+                }
+                return Err(Error::InvalidArgumentError(format!(
+                    "unknown table '{}'",
+                    canonical_name
+                )));
+            }
+        };
         let catalog_field_resolver = self.catalog.field_resolver(catalog_table_id);
         let mut metadata_primary_keys: FxHashSet<FieldId> = FxHashSet::default();
         let mut metadata_unique_fields: FxHashSet<FieldId> = FxHashSet::default();

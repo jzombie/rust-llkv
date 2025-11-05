@@ -1,12 +1,16 @@
 use arrow::array::{Array, Int64Array};
 use llkv_runtime::RuntimeContext;
 use llkv_sql::SqlEngine;
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use std::sync::Arc;
+
+fn make_boxed_pager() -> Arc<BoxedPager> {
+    Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())))
+}
 
 #[test]
 fn insert_rollback_smoke() {
-    let context = Arc::new(RuntimeContext::new(Arc::new(MemPager::default())));
+    let context = Arc::new(RuntimeContext::new(make_boxed_pager()));
     let engine = SqlEngine::with_context(Arc::clone(&context), false);
     engine.execute("CREATE TABLE integers(i INTEGER)").unwrap();
     engine.execute("BEGIN TRANSACTION").unwrap();
@@ -76,8 +80,7 @@ fn nested_begin_does_not_clear_transaction() {
 
 #[test]
 fn transaction_functionality_script() {
-    let pager = Arc::new(MemPager::default());
-    let engine = SqlEngine::with_context(Arc::new(RuntimeContext::new(pager)), false);
+    let engine = SqlEngine::with_context(Arc::new(RuntimeContext::new(make_boxed_pager())), false);
 
     engine
         .execute("PRAGMA enable_verification;")
@@ -96,8 +99,7 @@ fn transaction_functionality_script() {
 
 #[test]
 fn basic_transaction_visibility() {
-    let pager = Arc::new(MemPager::default());
-    let context = Arc::new(RuntimeContext::new(pager));
+    let context = Arc::new(RuntimeContext::new(make_boxed_pager()));
     let conn1 = SqlEngine::with_context(Arc::clone(&context), false);
     let conn2 = SqlEngine::with_context(Arc::clone(&context), false);
 
@@ -152,8 +154,7 @@ fn basic_transaction_visibility() {
 
 #[test]
 fn commit_visibility_across_connections() {
-    let pager = Arc::new(MemPager::default());
-    let shared = Arc::new(RuntimeContext::new(pager));
+    let shared = Arc::new(RuntimeContext::new(make_boxed_pager()));
     let con1 = SqlEngine::with_context(Arc::clone(&shared), false);
     let con2 = SqlEngine::with_context(Arc::clone(&shared), false);
 
@@ -174,8 +175,7 @@ fn commit_visibility_across_connections() {
 
 #[test]
 fn duckdb_basic_transactions_script() {
-    let pager = Arc::new(MemPager::default());
-    let context = Arc::new(RuntimeContext::new(pager));
+    let context = Arc::new(RuntimeContext::new(make_boxed_pager()));
     let con1 = SqlEngine::with_context(Arc::clone(&context), false);
     let con2 = SqlEngine::with_context(Arc::clone(&context), false);
 
@@ -223,8 +223,7 @@ fn duckdb_basic_transactions_script() {
 
 #[test]
 fn duckdb_transaction_functionality_script() {
-    let pager = Arc::new(MemPager::default());
-    let context = Arc::new(RuntimeContext::new(pager));
+    let context = Arc::new(RuntimeContext::new(make_boxed_pager()));
     let engine = SqlEngine::with_context(Arc::clone(&context), false);
 
     engine

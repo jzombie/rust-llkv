@@ -15,7 +15,7 @@ use crate::constraints::{ForeignKeyTableInfo, ValidatedForeignKey, validate_fore
 use crate::reserved;
 use crate::resolvers::resolve_table_name;
 use crate::sys_catalog::{ConstraintNameRecord, SysCatalog};
-use crate::sys_catalog::{MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta};
+use crate::sys_catalog::{MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, TriggerEntryMeta};
 use crate::table::Table;
 use crate::types::{FieldId, TableColumn, TableId};
 use crate::view::{ForeignKeyView, TableView};
@@ -51,28 +51,7 @@ struct TableSnapshot {
     single_indexes: FxHashMap<String, SingleColumnIndexEntry>,
     multi_column_indexes: FxHashMap<String, MultiColumnIndexEntryMeta>,
     sort_indexes: FxHashSet<FieldId>,
-}
-
-impl TableSnapshot {
-    fn new(
-        table_meta: Option<TableMeta>,
-        column_metas: FxHashMap<FieldId, ColMeta>,
-        constraints: FxHashMap<ConstraintId, ConstraintRecord>,
-        constraint_names: FxHashMap<ConstraintId, String>,
-        single_indexes: FxHashMap<String, SingleColumnIndexEntry>,
-        multi_column_indexes: FxHashMap<String, MultiColumnIndexEntryMeta>,
-        sort_indexes: FxHashSet<FieldId>,
-    ) -> Self {
-        Self {
-            table_meta,
-            column_metas,
-            constraints,
-            constraint_names,
-            single_indexes,
-            multi_column_indexes,
-            sort_indexes,
-        }
-    }
+    triggers: FxHashMap<String, TriggerEntryMeta>,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +171,7 @@ where
         let multi_uniques = catalog.get_multi_column_indexes(table_id)?;
         let single_index_metas = catalog.get_single_column_indexes(table_id)?;
         let multi_column_index_metas = catalog.get_multi_column_indexes(table_id)?;
+        let trigger_metas = catalog.get_triggers(table_id)?;
         let mut constraints = FxHashMap::default();
         let mut constraint_names = FxHashMap::default();
         let mut single_indexes = FxHashMap::default();
@@ -218,6 +198,10 @@ where
         for meta in multi_column_index_metas {
             multi_column_indexes.insert(meta.canonical_name.clone(), meta);
         }
+        let mut triggers = FxHashMap::default();
+        for meta in trigger_metas {
+            triggers.insert(meta.canonical_name.clone(), meta);
+        }
         for (record, name) in constraint_records
             .into_iter()
             .zip(constraint_name_entries.into_iter())
@@ -227,15 +211,16 @@ where
             }
             constraints.insert(record.constraint_id, record);
         }
-        let snapshot = TableSnapshot::new(
+        let snapshot = TableSnapshot {
             table_meta,
-            FxHashMap::default(),
+            column_metas: FxHashMap::default(),
             constraints,
             constraint_names,
             single_indexes,
             multi_column_indexes,
             sort_indexes,
-        );
+            triggers,
+        };
         Ok(TableState::from_snapshot(snapshot))
     }
 
@@ -617,6 +602,54 @@ where
         Ok(result)
     }
 
+    /// Return the trigger definitions cached for the table.
+    pub fn triggers(&self, table_id: TableId) -> LlkvResult<Vec<TriggerEntryMeta>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        let state = tables.get(&table_id).unwrap();
+        Ok(state.current.triggers.values().cloned().collect())
+    }
+
+    /// Fetch a trigger definition by its canonical name.
+    pub fn trigger(
+        &self,
+        table_id: TableId,
+        canonical_name: &str,
+    ) -> LlkvResult<Option<TriggerEntryMeta>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        let state = tables.get(&table_id).unwrap();
+        Ok(state
+            .current
+            .triggers
+            .get(&canonical_name.to_ascii_lowercase())
+            .cloned())
+    }
+
+    /// Insert or replace a trigger definition in the cached snapshot.
+    pub fn insert_trigger(&self, table_id: TableId, trigger: TriggerEntryMeta) -> LlkvResult<()> {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        state
+            .current
+            .triggers
+            .insert(trigger.canonical_name.clone(), trigger);
+        Ok(())
+    }
+
+    /// Remove a trigger definition by canonical name. Returns true when the trigger existed.
+    pub fn remove_trigger(&self, table_id: TableId, canonical_name: &str) -> LlkvResult<bool> {
+        self.ensure_table_state(table_id)?;
+        let mut tables = self.tables.write().unwrap();
+        let state = tables.get_mut(&table_id).unwrap();
+        Ok(state
+            .current
+            .triggers
+            .remove(&canonical_name.to_ascii_lowercase())
+            .is_some())
+    }
+
     /// Prepare the metadata state for dropping a table by clearing cached entries.
     ///
     /// Column metadata is loaded eagerly for the provided field identifiers so deletions
@@ -637,6 +670,7 @@ where
             state.current.single_indexes.clear();
             state.current.multi_column_indexes.clear();
             state.current.sort_indexes.clear();
+            state.current.triggers.clear();
         }
         drop(tables);
         self.refresh_referencing_index_for_table(table_id);
@@ -891,6 +925,21 @@ where
                 entries.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
                 catalog.put_single_column_indexes(table_id, &entries)?;
                 state.persisted.single_indexes = state.current.single_indexes.clone();
+            }
+        }
+
+        if state.current.triggers != state.persisted.triggers {
+            if state.current.triggers.is_empty() {
+                if !state.persisted.triggers.is_empty() {
+                    catalog.delete_triggers(table_id)?;
+                }
+                state.persisted.triggers.clear();
+            } else {
+                let mut entries: Vec<TriggerEntryMeta> =
+                    state.current.triggers.values().cloned().collect();
+                entries.sort_by(|a, b| a.canonical_name.cmp(&b.canonical_name));
+                catalog.put_triggers(table_id, &entries)?;
+                state.persisted.triggers = state.current.triggers.clone();
             }
         }
 
@@ -1314,6 +1363,26 @@ where
 
         catalog.put_next_table_id(following)?;
         Ok(next)
+    }
+
+    /// Ensure the catalog's next_table_id counter is at least `minimum`.
+    ///
+    /// This is primarily used by in-memory namespaces (e.g., temporary tables)
+    /// that share a catalog handle with persistent storage. By seeding their
+    /// own metadata store with a higher starting point we avoid collisions on
+    /// table IDs already allocated by the persistent catalog.
+    pub fn ensure_next_table_id_at_least(&self, minimum: TableId) -> LlkvResult<()> {
+        if reserved::is_reserved_table_id(minimum) {
+            return Err(Error::InvalidArgumentError(
+                reserved::reserved_table_id_message(minimum),
+            ));
+        }
+
+        let catalog = SysCatalog::new(&self.store);
+        match catalog.get_next_table_id()? {
+            Some(current) if current >= minimum => Ok(()),
+            _ => catalog.put_next_table_id(minimum),
+        }
     }
 
     /// Check if a field has a sort index in the underlying store.

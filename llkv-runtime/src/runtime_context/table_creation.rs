@@ -256,6 +256,11 @@ where
             }
         }
 
+        // Flush table metadata to SysCatalog immediately so fallback contexts (e.g., temporary
+        // contexts needing to access persistent tables) can see the table. This is critical for
+        // temporary views that reference persistent tables.
+        self.metadata.flush_table(table_id)?;
+
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,
         })
@@ -372,6 +377,11 @@ where
         }
         tables.insert(canonical_name.clone(), Arc::clone(&table_entry));
         drop(tables); // Release write lock before catalog operations
+
+        // Flush table metadata to SysCatalog immediately so fallback contexts (e.g., temporary
+        // contexts needing to access persistent tables) can see the table. This is critical for
+        // temporary views that reference persistent tables.
+        self.metadata.flush_table(table_id)?;
 
         Ok(RuntimeStatementResult::CreateTable {
             table_name: display_name,

@@ -5,12 +5,12 @@ use llkv_result::Error;
 use llkv_runtime::{
     CreateIndexPlan, IndexColumnPlan, PlanValue, RuntimeContext, RuntimeStatementResult, row,
 };
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::CatalogDdl;
 
 #[test]
 fn multi_column_unique_survives_restart() {
-    let pager = Arc::new(MemPager::default());
+    let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
     let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
 
     context

@@ -5,7 +5,7 @@ use llkv_column_map::store::ColumnStore;
 use llkv_plan::DropTablePlan;
 use llkv_result::Error;
 use llkv_runtime::{PlanColumnSpec, RuntimeContext};
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::constraints::{
     ConstraintKind, ConstraintRecord, ConstraintState, ForeignKeyAction, ForeignKeyConstraint,
 };
@@ -13,7 +13,8 @@ use llkv_table::{CatalogDdl, MetadataManager};
 
 #[test]
 fn drop_table_removes_persisted_metadata() {
-    let pager = Arc::new(MemPager::default());
+    let mem_pager = Arc::new(MemPager::default());
+    let pager = Arc::new(BoxedPager::from_arc(Arc::clone(&mem_pager)));
     let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
 
     context
@@ -28,7 +29,7 @@ fn drop_table_removes_persisted_metadata() {
         .table_id("drop_test")
         .expect("table id registered");
 
-    let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("open column store"));
+    let store = Arc::new(ColumnStore::open(Arc::clone(&mem_pager)).expect("open column store"));
     let metadata_view = MetadataManager::new(Arc::clone(&store));
     assert!(
         metadata_view
@@ -67,7 +68,8 @@ fn drop_table_removes_persisted_metadata() {
 
 #[test]
 fn drop_table_respects_foreign_keys_after_restart() {
-    let pager = Arc::new(MemPager::default());
+    let mem_pager = Arc::new(MemPager::default());
+    let pager = Arc::new(BoxedPager::from_arc(Arc::clone(&mem_pager)));
 
     {
         let context = Arc::new(RuntimeContext::new(Arc::clone(&pager)));
@@ -97,7 +99,7 @@ fn drop_table_respects_foreign_keys_after_restart() {
             .table_id("children")
             .expect("child table id registered");
 
-        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("open column store"));
+        let store = Arc::new(ColumnStore::open(Arc::clone(&mem_pager)).expect("open column store"));
         let metadata = MetadataManager::new(Arc::clone(&store));
         let record = ConstraintRecord {
             constraint_id: 1,

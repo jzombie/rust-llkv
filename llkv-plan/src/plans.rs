@@ -218,6 +218,58 @@ impl DropTablePlan {
 }
 
 // ============================================================================
+// CREATE VIEW Plan
+// ============================================================================
+
+/// Plan for creating a view.
+#[derive(Clone, Debug)]
+pub struct CreateViewPlan {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub view_definition: String,
+    pub select_plan: Box<SelectPlan>,
+    /// Optional storage namespace for the view (e.g., "temp" for temporary views).
+    pub namespace: Option<String>,
+}
+
+impl CreateViewPlan {
+    pub fn new(name: impl Into<String>, view_definition: String, select_plan: SelectPlan) -> Self {
+        Self {
+            name: name.into(),
+            if_not_exists: false,
+            view_definition,
+            select_plan: Box::new(select_plan),
+            namespace: None,
+        }
+    }
+}
+
+// ============================================================================
+// DROP VIEW Plan
+// ============================================================================
+
+/// Plan for dropping a view.
+#[derive(Clone, Debug)]
+pub struct DropViewPlan {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+impl DropViewPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            if_exists: false,
+        }
+    }
+
+    pub fn if_exists(mut self, if_exists: bool) -> Self {
+        self.if_exists = if_exists;
+        self
+    }
+}
+
+// ============================================================================
 // RENAME TABLE Plan
 // ============================================================================
 
@@ -269,6 +321,28 @@ impl DropIndexPlan {
 
     pub fn if_exists(mut self, if_exists: bool) -> Self {
         self.if_exists = if_exists;
+        self
+    }
+}
+
+/// Plan for rebuilding an index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReindexPlan {
+    pub name: String,
+    pub canonical_name: String,
+}
+
+impl ReindexPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        let display = name.into();
+        Self {
+            canonical_name: display.to_ascii_lowercase(),
+            name: display,
+        }
+    }
+
+    pub fn with_canonical(mut self, canonical: impl Into<String>) -> Self {
+        self.canonical_name = canonical.into();
         self
     }
 }
@@ -536,12 +610,30 @@ pub enum CreateTableSource {
 // INSERT Plan
 // ============================================================================
 
+/// SQLite conflict resolution action for INSERT statements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertConflictAction {
+    /// Standard INSERT behavior - fail on constraint violation
+    None,
+    /// INSERT OR REPLACE - update existing row on conflict
+    Replace,
+    /// INSERT OR IGNORE - skip row on conflict
+    Ignore,
+    /// INSERT OR ABORT - abort transaction on conflict
+    Abort,
+    /// INSERT OR FAIL - fail statement on conflict (but don't rollback)
+    Fail,
+    /// INSERT OR ROLLBACK - rollback transaction on conflict
+    Rollback,
+}
+
 /// Plan for inserting data into a table.
 #[derive(Clone, Debug)]
 pub struct InsertPlan {
     pub table: String,
     pub columns: Vec<String>,
     pub source: InsertSource,
+    pub on_conflict: InsertConflictAction,
 }
 
 /// Source data for INSERT operations.
@@ -928,6 +1020,7 @@ pub enum ValueTableMode {
 pub enum AggregateExpr {
     CountStar {
         alias: String,
+        distinct: bool,
     },
     Column {
         column: String,
@@ -942,33 +1035,31 @@ pub enum AggregateExpr {
 pub enum AggregateFunction {
     Count,
     SumInt64,
+    TotalInt64,
     MinInt64,
     MaxInt64,
     CountNulls,
+    GroupConcat,
 }
 
 impl AggregateExpr {
-    pub fn count_star(alias: impl Into<String>) -> Self {
+    pub fn count_star(alias: impl Into<String>, distinct: bool) -> Self {
         Self::CountStar {
             alias: alias.into(),
+            distinct,
         }
     }
 
-    pub fn count_column(column: impl Into<String>, alias: impl Into<String>) -> Self {
+    pub fn count_column(
+        column: impl Into<String>,
+        alias: impl Into<String>,
+        distinct: bool,
+    ) -> Self {
         Self::Column {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::Count,
-            distinct: false,
-        }
-    }
-
-    pub fn count_distinct_column(column: impl Into<String>, alias: impl Into<String>) -> Self {
-        Self::Column {
-            column: column.into(),
-            alias: alias.into(),
-            function: AggregateFunction::Count,
-            distinct: true,
+            distinct,
         }
     }
 
@@ -977,6 +1068,15 @@ impl AggregateExpr {
             column: column.into(),
             alias: alias.into(),
             function: AggregateFunction::SumInt64,
+            distinct: false,
+        }
+    }
+
+    pub fn total_int64(column: impl Into<String>, alias: impl Into<String>) -> Self {
+        Self::Column {
+            column: column.into(),
+            alias: alias.into(),
+            function: AggregateFunction::TotalInt64,
             distinct: false,
         }
     }
@@ -1115,9 +1215,12 @@ pub enum PlanStatement {
     RollbackTransaction,
     CreateTable(CreateTablePlan),
     DropTable(DropTablePlan),
+    CreateView(CreateViewPlan),
+    DropView(DropViewPlan),
     DropIndex(DropIndexPlan),
     AlterTable(AlterTablePlan),
     CreateIndex(CreateIndexPlan),
+    Reindex(ReindexPlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),

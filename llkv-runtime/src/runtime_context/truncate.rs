@@ -33,6 +33,14 @@ where
             }
         };
 
+        // Views are read-only - reject TRUNCATE operations
+        if self.is_view(table.table.table_id())? {
+            return Err(Error::InvalidArgumentError(format!(
+                "cannot modify view '{}'",
+                display_name
+            )));
+        }
+
         self.truncate_all_rows(table.as_ref(), display_name, canonical_name, snapshot)
     }
 

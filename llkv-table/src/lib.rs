@@ -75,7 +75,8 @@ pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
 pub use sys_catalog::{
     ColMeta, CustomTypeMeta, MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
-    TableMeta, TableMultiColumnIndexMeta, TableSingleColumnIndexMeta,
+    TableMeta, TableMultiColumnIndexMeta, TableSingleColumnIndexMeta, TableTriggerMeta,
+    TriggerEntryMeta, TriggerEventMeta, TriggerTimingMeta,
 };
 pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
