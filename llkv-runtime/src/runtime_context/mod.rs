@@ -1117,15 +1117,15 @@ where
             {
                 // Found the index - rebuild it by unregistering and re-registering
                 let table = self.lookup_table(&canonical_table_name)?;
-                
+
                 // Unregister the physical index
                 table.table.unregister_sort_index(entry.column_id)?;
-                
+
                 // Re-register the physical index (this rebuilds it)
                 table.table.register_sort_index(entry.column_id)?;
-                
+
                 drop(table);
-                
+
                 return Ok(RuntimeStatementResult::NoOp);
             }
         }

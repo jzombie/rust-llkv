@@ -1,7 +1,7 @@
 use llkv_plan::PlanValue;
 use llkv_runtime::{
-    AggregateExpr, CreateTablePlan, InsertConflictAction, InsertPlan, InsertSource,
-    PlanColumnSpec, RuntimeContext, RuntimeStatementResult, SelectPlan,
+    AggregateExpr, CreateTablePlan, InsertConflictAction, InsertPlan, InsertSource, PlanColumnSpec,
+    RuntimeContext, RuntimeStatementResult, SelectPlan,
 };
 use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::CatalogDdl;

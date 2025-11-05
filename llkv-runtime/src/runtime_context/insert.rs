@@ -18,7 +18,7 @@ use llkv_executor::{
 use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_transaction::{TransactionSnapshot, mvcc, filter_row_ids_for_snapshot};
+use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -113,6 +113,7 @@ where
     }
 
     /// Insert rows with conflict resolution handling.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_rows_with_conflict(
         &self,
         table: &ExecutorTable<P>,
@@ -124,17 +125,29 @@ where
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
         match on_conflict {
-            InsertConflictAction::None | InsertConflictAction::Abort | 
-            InsertConflictAction::Fail | InsertConflictAction::Rollback => {
+            InsertConflictAction::None
+            | InsertConflictAction::Abort
+            | InsertConflictAction::Fail
+            | InsertConflictAction::Rollback => {
                 // Standard INSERT behavior - fail on constraint violation
                 self.insert_rows(table, display_name, canonical_name, rows, columns, snapshot)
             }
-            InsertConflictAction::Replace => {
-                self.insert_rows_or_replace(table, display_name, canonical_name, rows, columns, snapshot)
-            }
-            InsertConflictAction::Ignore => {
-                self.insert_rows_or_ignore(table, display_name, canonical_name, rows, columns, snapshot)
-            }
+            InsertConflictAction::Replace => self.insert_rows_or_replace(
+                table,
+                display_name,
+                canonical_name,
+                rows,
+                columns,
+                snapshot,
+            ),
+            InsertConflictAction::Ignore => self.insert_rows_or_ignore(
+                table,
+                display_name,
+                canonical_name,
+                rows,
+                columns,
+                snapshot,
+            ),
         }
     }
 
@@ -283,14 +296,19 @@ where
     ) -> Result<RuntimeStatementResult<P>> {
         // Get the constraint context to know which columns have uniqueness constraints
         let constraint_ctx = self.build_table_constraint_context(table)?;
-        
+
         // If columns is empty, it means "all columns in order"
         let columns_for_search = if columns.is_empty() {
-            table.schema.columns.iter().map(|c| c.name.clone()).collect()
+            table
+                .schema
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect()
         } else {
             columns.clone()
         };
-        
+
         // Proactively find conflicting rows by scanning for matches on unique/primary key columns
         let row_ids = self.find_conflicting_rows(
             table,
@@ -299,7 +317,7 @@ where
             &constraint_ctx,
             snapshot,
         )?;
-        
+
         // Delete conflicting rows BEFORE inserting (without foreign key enforcement since we're replacing)
         if !row_ids.is_empty() {
             self.apply_delete(
@@ -311,7 +329,7 @@ where
                 false, // Don't enforce foreign keys for REPLACE
             )?;
         }
-        
+
         // Now insert the new rows
         self.insert_rows(table, display_name, canonical_name, rows, columns, snapshot)
     }
@@ -328,7 +346,7 @@ where
     ) -> Result<RuntimeStatementResult<P>> {
         // Try inserting rows one at a time, counting successes
         let mut rows_inserted = 0;
-        
+
         for row in rows {
             match self.insert_rows(
                 table,
@@ -351,7 +369,7 @@ where
                 }
             }
         }
-        
+
         Ok(RuntimeStatementResult::Insert {
             table_name: display_name,
             rows_inserted,
@@ -439,20 +457,21 @@ where
     ) -> Result<Vec<RowId>> {
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
-        
+
         // Build a mapping from column name to position in the new_rows vectors
         let mut column_positions = std::collections::HashMap::new();
         for (idx, col_name) in columns.iter().enumerate() {
             column_positions.insert(col_name.as_str(), idx);
         }
-        
+
         let mut conflicting_row_ids = Vec::new();
         let table_id = table.table.table_id();
-        
+
         // Helper: get all visible row IDs
-        let anchor_field = table.schema.first_field_id().ok_or_else(|| {
-            Error::Internal("table must have at least one column".into())
-        })?;
+        let anchor_field = table
+            .schema
+            .first_field_id()
+            .ok_or_else(|| Error::Internal("table must have at least one column".into()))?;
         let match_all_filter = Filter {
             field_id: anchor_field,
             op: Operator::Range {
@@ -461,24 +480,24 @@ where
             },
         };
         let filter_expr = Expr::Pred(match_all_filter);
-        
+
         let row_ids = match table.table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        
+
         let row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
             row_ids,
             &self.txn_manager,
             snapshot,
         )?;
-        
+
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         // Check single-column unique constraints
         for unique_col in &constraint_ctx.unique_columns {
             let col_name = &unique_col.name;
@@ -486,17 +505,18 @@ where
                 // Collect non-NULL values being inserted for this unique column
                 let mut new_values = Vec::new();
                 for row in new_rows {
-                    if let Some(value) = row.get(col_pos) {
-                        if !matches!(value, PlanValue::Null) && !new_values.contains(value) {
-                            new_values.push(value.clone());
-                        }
+                    if let Some(value) = row.get(col_pos)
+                        && !matches!(value, PlanValue::Null)
+                        && !new_values.contains(value)
+                    {
+                        new_values.push(value.clone());
                     }
                 }
-                
+
                 if new_values.is_empty() {
                     continue;
                 }
-                
+
                 // Scan existing rows for this column
                 let logical_field_id = LogicalFieldId::for_user(table_id, unique_col.field_id);
                 let mut stream = table.table.stream_columns(
@@ -504,7 +524,7 @@ where
                     row_ids.clone(),
                     GatherNullPolicy::IncludeNulls,
                 )?;
-                
+
                 while let Some(chunk) = stream.next_batch()? {
                     let batch = chunk.batch();
                     if batch.num_columns() == 0 {
@@ -512,21 +532,22 @@ where
                     }
                     let array = batch.column(0);
                     let base_idx = chunk.row_offset();
-                    
+
                     for local_idx in 0..batch.num_rows() {
-                        if let Ok(existing_value) = llkv_plan::plan_value_from_array(array, local_idx) {
-                            if new_values.contains(&existing_value) {
-                                let rid = row_ids[base_idx + local_idx];
-                                if !conflicting_row_ids.contains(&rid) {
-                                    conflicting_row_ids.push(rid);
-                                }
+                        if let Ok(existing_value) =
+                            llkv_plan::plan_value_from_array(array, local_idx)
+                            && new_values.contains(&existing_value)
+                        {
+                            let rid = row_ids[base_idx + local_idx];
+                            if !conflicting_row_ids.contains(&rid) {
+                                conflicting_row_ids.push(rid);
                             }
                         }
                     }
                 }
             }
         }
-        
+
         // Check primary key (single-column or multi-column)
         if let Some(pk) = &constraint_ctx.primary_key {
             self.find_multi_column_conflicts(
@@ -539,7 +560,7 @@ where
                 snapshot,
             )?;
         }
-        
+
         // Check multi-column unique constraints
         for unique_constraint in &constraint_ctx.multi_column_uniques {
             self.find_multi_column_conflicts(
@@ -552,11 +573,12 @@ where
                 snapshot,
             )?;
         }
-        
+
         Ok(conflicting_row_ids)
     }
 
     /// Helper to find conflicts for multi-column constraints (PRIMARY KEY or UNIQUE).
+    #[allow(clippy::too_many_arguments)]
     fn find_multi_column_conflicts(
         &self,
         table: &ExecutorTable<P>,
@@ -570,13 +592,13 @@ where
         if constraint.field_ids.is_empty() {
             return Ok(());
         }
-        
+
         // Build a mapping from column name to position in new_rows
         let mut column_positions = std::collections::HashMap::new();
         for (idx, col_name) in columns.iter().enumerate() {
             column_positions.insert(col_name.as_str(), idx);
         }
-        
+
         // Map constraint columns to positions in new_rows
         let mut constraint_col_positions = Vec::new();
         for &schema_idx in &constraint.schema_indices {
@@ -591,7 +613,7 @@ where
                 constraint_col_positions.push(None);
             }
         }
-        
+
         // Collect multi-column values from new rows
         let mut new_values = Vec::new();
         for row in new_rows {
@@ -614,37 +636,38 @@ where
                 new_values.push(constraint_value);
             }
         }
-        
+
         if new_values.is_empty() {
             return Ok(());
         }
-        
+
         // Scan existing rows for these columns
         let table_id = table.table.table_id();
-        let logical_field_ids: Vec<_> = constraint.field_ids
+        let logical_field_ids: Vec<_> = constraint
+            .field_ids
             .iter()
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
-        
+
         let mut stream = table.table.stream_columns(
             logical_field_ids,
             row_ids.to_vec(),
             GatherNullPolicy::IncludeNulls,
         )?;
-        
+
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             if batch.num_columns() == 0 {
                 continue;
             }
-            
+
             let base_idx = chunk.row_offset();
             let num_rows = batch.num_rows();
-            
+
             for local_idx in 0..num_rows {
                 let mut existing_value = Vec::new();
                 let mut has_all_values = true;
-                
+
                 for col_idx in 0..batch.num_columns() {
                     let array = batch.column(col_idx);
                     match llkv_plan::plan_value_from_array(array, local_idx) {
@@ -655,7 +678,7 @@ where
                         }
                     }
                 }
-                
+
                 if has_all_values && new_values.contains(&existing_value) {
                     let rid = row_ids[base_idx + local_idx];
                     if !conflicting_row_ids.contains(&rid) {
@@ -664,7 +687,7 @@ where
                 }
             }
         }
-        
+
         Ok(())
     }
 }

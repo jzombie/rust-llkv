@@ -1,6 +1,6 @@
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::collections::{VecDeque};
+use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::sync::{
     Arc, OnceLock,
@@ -27,10 +27,9 @@ use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction, ForeignKeySpec,
     IndexColumnPlan, InsertConflictAction, InsertPlan, InsertSource, MultiColumnUniqueSpec,
-    OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue,
-    ReindexPlan, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
-    extract_rows_from_range,
+    OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan,
+    RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult,
+    SelectPlan, SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
@@ -209,7 +208,12 @@ struct InsertBuffer {
 }
 
 impl InsertBuffer {
-    fn new(table_name: String, columns: Vec<String>, rows: Vec<Vec<PlanValue>>, on_conflict: InsertConflictAction) -> Self {
+    fn new(
+        table_name: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<PlanValue>>,
+        on_conflict: InsertConflictAction,
+    ) -> Self {
         let row_count = rows.len();
         Self {
             table_name,
@@ -221,7 +225,12 @@ impl InsertBuffer {
         }
     }
 
-    fn can_accept(&self, table_name: &str, columns: &[String], on_conflict: InsertConflictAction) -> bool {
+    fn can_accept(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        on_conflict: InsertConflictAction,
+    ) -> bool {
         self.table_name == table_name && self.columns == columns && self.on_conflict == on_conflict
     }
 
@@ -833,7 +842,12 @@ impl SqlEngine {
                         drop(buf);
                         flushed = self.flush_buffer_results()?;
                         let mut buf = self.insert_buffer.borrow_mut();
-                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows, on_conflict));
+                        *buf = Some(InsertBuffer::new(
+                            table_name.clone(),
+                            columns,
+                            rows,
+                            on_conflict,
+                        ));
                         Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
@@ -843,7 +857,12 @@ impl SqlEngine {
                         })
                     }
                     None => {
-                        *buf = Some(InsertBuffer::new(table_name.clone(), columns, rows, on_conflict));
+                        *buf = Some(InsertBuffer::new(
+                            table_name.clone(),
+                            columns,
+                            rows,
+                            on_conflict,
+                        ));
                         Ok(BufferedInsertResult {
                             flushed,
                             current: Some(RuntimeStatementResult::Insert {
@@ -962,7 +981,7 @@ impl SqlEngine {
                 DROPPED_TABLE_TRANSACTION_ERR.into(),
             ));
         }
-        
+
         // Extract conflict resolution action
         use sqlparser::ast::SqliteOnConflict;
         let on_conflict = if stmt.replace_into {
@@ -980,7 +999,7 @@ impl SqlEngine {
         } else {
             InsertConflictAction::None
         };
-        
+
         if stmt.overwrite {
             return Err(Error::InvalidArgumentError(
                 "INSERT OVERWRITE is not supported".into(),
@@ -1740,7 +1759,8 @@ impl SqlEngine {
 
         // Apply supported table-level constraints (e.g., PRIMARY KEY)
         if !constraints.is_empty() {
-            let mut column_lookup: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
+            let mut column_lookup: FxHashMap<String, usize> =
+                FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
             for (idx, column) in columns.iter().enumerate() {
                 column_lookup.insert(column.name.to_ascii_lowercase(), idx);
             }
@@ -3331,14 +3351,15 @@ impl SqlEngine {
 
         // Use a HashMap to track column assignments. If a column appears multiple times,
         // the last assignment wins (SQLite-compatible behavior).
-        let mut assignments_map: FxHashMap<String, (String, sqlparser::ast::Expr)> = FxHashMap::with_capacity_and_hasher(assignments.len(), FxBuildHasher::default());
+        let mut assignments_map: FxHashMap<String, (String, sqlparser::ast::Expr)> =
+            FxHashMap::with_capacity_and_hasher(assignments.len(), FxBuildHasher);
         for assignment in assignments {
             let column_name = resolve_assignment_column_name(&assignment.target)?;
             let normalized = column_name.to_ascii_lowercase();
             // Store in map - last assignment wins
             assignments_map.insert(normalized, (column_name, assignment.value.clone()));
         }
-        
+
         let mut column_assignments = Vec::with_capacity(assignments_map.len());
         for (_normalized, (column_name, expr)) in assignments_map {
             let value = match SqlValue::try_from_expr(&expr) {
@@ -4637,7 +4658,8 @@ impl SqlEngine {
                 let exec = *view_execution;
                 let batches = exec.collect()?;
                 let view_fields = view_schema.fields();
-                let mut name_to_index = FxHashMap::with_capacity_and_hasher(view_fields.len(), Default::default());
+                let mut name_to_index =
+                    FxHashMap::with_capacity_and_hasher(view_fields.len(), Default::default());
                 for (idx, field) in view_fields.iter().enumerate() {
                     name_to_index.insert(field.name().to_ascii_lowercase(), idx);
                 }
@@ -6444,30 +6466,26 @@ impl SqlEngine {
         }
     }
 
-    fn handle_vacuum(
-        &self,
-        vacuum: VacuumStatement,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
+    fn handle_vacuum(&self, vacuum: VacuumStatement) -> SqlResult<RuntimeStatementResult<P>> {
         // Only support REINDEX with a table name (which is treated as index name in LLKV)
         if vacuum.reindex {
             let index_name = vacuum.table_name.ok_or_else(|| {
                 Error::InvalidArgumentError("REINDEX requires an index name".to_string())
             })?;
-            
+
             let (display_name, canonical_name) = canonical_object_name(&index_name)?;
-            
-            let plan = ReindexPlan::new(display_name.clone())
-                .with_canonical(canonical_name);
-            
+
+            let plan = ReindexPlan::new(display_name.clone()).with_canonical(canonical_name);
+
             let statement = PlanStatement::Reindex(plan);
             self.engine.execute_statement(statement).map_err(|err| {
                 tracing::error!("REINDEX failed for '{}': {}", display_name, err);
-                err.into()
+                err
             })
         } else {
             // Other VACUUM variants are not supported
             Err(Error::InvalidArgumentError(
-                "Only REINDEX is supported; general VACUUM is not implemented".to_string()
+                "Only REINDEX is supported; general VACUUM is not implemented".to_string(),
             ))
         }
     }

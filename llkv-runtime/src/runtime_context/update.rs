@@ -135,13 +135,13 @@ where
                     PreparedAssignmentValue::Expression { expr_index }
                 }
             };
-            
+
             // Store in map - if column appears multiple times, last one wins (SQLite behavior)
             column_assignments.insert(normalized, (column.clone(), prepared_value));
         }
-        
+
         // Convert map to vector for processing
-        let prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> = 
+        let prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> =
             column_assignments.into_values().collect();
 
         let (row_ids, mut expr_values) =
@@ -465,13 +465,13 @@ where
                     PreparedAssignmentValue::Expression { expr_index }
                 }
             };
-            
+
             // Store in map - if column appears multiple times, last one wins (SQLite behavior)
             column_assignments.insert(normalized, (column.clone(), prepared_value));
         }
-        
+
         // Convert map to vector for processing
-        let prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> = 
+        let prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> =
             column_assignments.into_values().collect();
 
         // Use ROW_ID as the anchor for scanning. This ensures we find ALL rows
@@ -479,7 +479,7 @@ where
         // NULL values or be indexed, and indexes typically don't include NULLs.
         use llkv_table::ROW_ID_FIELD_ID;
         let filter_expr = translation::expression::full_table_scan_filter(ROW_ID_FIELD_ID);
-        
+
         let (row_ids, mut expr_values) =
             self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
 
