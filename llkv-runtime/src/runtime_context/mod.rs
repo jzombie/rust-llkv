@@ -1092,3 +1092,48 @@ where
         RuntimeContext::drop_view(self, &plan.name, plan.if_exists)
     }
 }
+
+impl<P> RuntimeContext<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    /// Rebuild an index by dropping and recreating it.
+    pub(crate) fn reindex_index(
+        &self,
+        plan: llkv_plan::ReindexPlan,
+    ) -> Result<RuntimeStatementResult<P>> {
+        let canonical_index = plan.canonical_name.to_ascii_lowercase();
+        let snapshot = self.catalog.snapshot();
+
+        // Search for the index across all tables
+        for canonical_table_name in snapshot.table_names() {
+            let Some(table_id) = snapshot.table_id(&canonical_table_name) else {
+                continue;
+            };
+
+            if let Some(entry) = self
+                .metadata
+                .single_column_index(table_id, &canonical_index)?
+            {
+                // Found the index - rebuild it by unregistering and re-registering
+                let table = self.lookup_table(&canonical_table_name)?;
+                
+                // Unregister the physical index
+                table.table.unregister_sort_index(entry.column_id)?;
+                
+                // Re-register the physical index (this rebuilds it)
+                table.table.register_sort_index(entry.column_id)?;
+                
+                drop(table);
+                
+                return Ok(RuntimeStatementResult::NoOp);
+            }
+        }
+
+        // Index not found
+        Err(Error::CatalogError(format!(
+            "Index '{}' does not exist",
+            plan.name
+        )))
+    }
+}

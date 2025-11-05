@@ -27,9 +27,9 @@ use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
     CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction, ForeignKeySpec,
     IndexColumnPlan, InsertPlan, InsertSource, MultiColumnUniqueSpec, OrderByPlan, OrderSortType,
-    OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, RenameTablePlan, RuntimeContext,
-    RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan, SelectProjection,
-    TruncatePlan, UpdatePlan, extract_rows_from_range,
+    OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan, RenameTablePlan,
+    RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult, SelectPlan,
+    SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
@@ -46,7 +46,7 @@ use sqlparser::ast::{
     SelectItemQualifiedWildcardKind, Set, SetExpr, SetOperator, SetQuantifier, SqlOption,
     Statement, TableConstraint, TableFactor, TableObject, TableWithJoins, TransactionMode,
     TransactionModifier, TriggerEvent, TriggerObject, TriggerPeriod, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan,
+    UpdateTableFromKind, VacuumStatement, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -488,6 +488,24 @@ impl SqlEngine {
         re.replace_all(sql, "").to_string()
     }
 
+    /// Convert SQLite standalone REINDEX to VACUUM REINDEX for sqlparser.
+    ///
+    /// SQLite supports `REINDEX index_name` as a standalone statement, but sqlparser
+    /// only recognizes REINDEX as part of the VACUUM statement syntax. This preprocessor
+    /// converts the SQLite form to the VACUUM REINDEX form that sqlparser can parse.
+    fn preprocess_reindex_syntax(sql: &str) -> String {
+        static REINDEX_REGEX: OnceLock<Regex> = OnceLock::new();
+
+        // Match: REINDEX followed by an identifier (index name)
+        // Captures the full statement to replace it with VACUUM REINDEX
+        let re = REINDEX_REGEX.get_or_init(|| {
+            Regex::new(r"(?i)\bREINDEX\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\b")
+                .expect("valid reindex regex")
+        });
+
+        re.replace_all(sql, "VACUUM REINDEX $1").to_string()
+    }
+
     /// Normalize SQLite trigger shorthand so sqlparser accepts the syntax.
     ///
     /// SQLite allows omitting the trigger timing (defaulting to AFTER) and the
@@ -672,6 +690,7 @@ impl SqlEngine {
         let processed_sql = Self::preprocess_bare_table_in_clauses(&processed_sql);
         let processed_sql = Self::preprocess_empty_in_lists(&processed_sql);
         let processed_sql = Self::preprocess_index_hints(&processed_sql);
+        let processed_sql = Self::preprocess_reindex_syntax(&processed_sql);
 
         let dialect = GenericDialect {};
         let statements = match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
@@ -1310,6 +1329,10 @@ impl SqlEngine {
             Statement::Pragma { name, value, is_eq } => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Pragma");
                 self.handle_pragma(name, value, is_eq)
+            }
+            Statement::Vacuum(vacuum) => {
+                tracing::trace!("DEBUG SQL execute_statement_non_transactional: Vacuum");
+                self.handle_vacuum(vacuum)
             }
             other => {
                 tracing::trace!(
@@ -6390,6 +6413,34 @@ impl SqlEngine {
                 "unsupported PRAGMA '{}'",
                 display
             ))),
+        }
+    }
+
+    fn handle_vacuum(
+        &self,
+        vacuum: VacuumStatement,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        // Only support REINDEX with a table name (which is treated as index name in LLKV)
+        if vacuum.reindex {
+            let index_name = vacuum.table_name.ok_or_else(|| {
+                Error::InvalidArgumentError("REINDEX requires an index name".to_string())
+            })?;
+            
+            let (display_name, canonical_name) = canonical_object_name(&index_name)?;
+            
+            let plan = ReindexPlan::new(display_name.clone())
+                .with_canonical(canonical_name);
+            
+            let statement = PlanStatement::Reindex(plan);
+            self.engine.execute_statement(statement).map_err(|err| {
+                tracing::error!("REINDEX failed for '{}': {}", display_name, err);
+                err.into()
+            })
+        } else {
+            // Other VACUUM variants are not supported
+            Err(Error::InvalidArgumentError(
+                "Only REINDEX is supported; general VACUUM is not implemented".to_string()
+            ))
         }
     }
 }

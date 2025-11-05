@@ -71,6 +71,7 @@ impl RuntimeEngine {
                 Ok(RuntimeStatementResult::NoOp)
             }
             PlanStatement::DropIndex(plan) => CatalogDdl::drop_index(&self.session, plan),
+            PlanStatement::Reindex(plan) => self.context().reindex_index(plan),
             PlanStatement::AlterTable(plan) => CatalogDdl::alter_table(&self.session, plan),
             PlanStatement::CreateIndex(plan) => CatalogDdl::create_index(&self.session, plan),
             PlanStatement::Insert(plan) => self.session.execute_insert_plan(plan),

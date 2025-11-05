@@ -63,8 +63,8 @@ pub use llkv_plan::{
     CreateTablePlan, CreateTableSource, CreateViewPlan, DeletePlan, DropIndexPlan, DropTablePlan,
     DropViewPlan, ForeignKeyAction, ForeignKeySpec, IndexColumnPlan, InsertPlan, InsertSource,
     IntoPlanColumnSpec, MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget,
-    PlanColumnSpec, PlanOperation, PlanStatement, PlanValue, RenameTablePlan, SelectPlan,
-    SelectProjection, TruncatePlan, UpdatePlan,
+    PlanColumnSpec, PlanOperation, PlanStatement, PlanValue, ReindexPlan, RenameTablePlan,
+    SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
 };
 use llkv_result::{Error, Result};
 use llkv_table::{CatalogDdl, canonical_table_name};
@@ -99,6 +99,7 @@ pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
             .first()
             .map(|table_ref| table_ref.table.as_str()),
         PlanStatement::DropIndex(_) => None,
+        PlanStatement::Reindex(_) => None,
         PlanStatement::BeginTransaction
         | PlanStatement::CommitTransaction
         | PlanStatement::RollbackTransaction => None,

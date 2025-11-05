@@ -325,6 +325,28 @@ impl DropIndexPlan {
     }
 }
 
+/// Plan for rebuilding an index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReindexPlan {
+    pub name: String,
+    pub canonical_name: String,
+}
+
+impl ReindexPlan {
+    pub fn new(name: impl Into<String>) -> Self {
+        let display = name.into();
+        Self {
+            canonical_name: display.to_ascii_lowercase(),
+            name: display,
+        }
+    }
+
+    pub fn with_canonical(mut self, canonical: impl Into<String>) -> Self {
+        self.canonical_name = canonical.into();
+        self
+    }
+}
+
 // ============================================================================
 // ALTER TABLE Plan Structures
 // ============================================================================
@@ -1180,6 +1202,7 @@ pub enum PlanStatement {
     DropIndex(DropIndexPlan),
     AlterTable(AlterTablePlan),
     CreateIndex(CreateIndexPlan),
+    Reindex(ReindexPlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
