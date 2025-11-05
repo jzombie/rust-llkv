@@ -1023,7 +1023,14 @@ impl CatalogDdl for RuntimeSession {
                         .inner
                         .execute_operation(PlanOperation::DropTable(plan.clone()))
                     {
-                        Ok(TransactionResult::NoOp) => Ok(RuntimeStatementResult::NoOp),
+                        Ok(TransactionResult::NoOp) => {
+                            let registry = self.namespace_registry();
+                            registry
+                                .write()
+                                .expect("namespace registry poisoned")
+                                .unregister_table(&canonical_table);
+                            Ok(RuntimeStatementResult::NoOp)
+                        }
                         Ok(_) => Err(Error::Internal(
                             "expected NoOp result for DROP TABLE during transactional execution"
                                 .into(),
@@ -1040,7 +1047,13 @@ impl CatalogDdl for RuntimeSession {
                             plan.name
                         )));
                     }
-                    self.run_autocommit_drop_table(plan)
+                    let result = self.run_autocommit_drop_table(plan)?;
+                    let registry = self.namespace_registry();
+                    registry
+                        .write()
+                        .expect("namespace registry poisoned")
+                        .unregister_table(&canonical_table);
+                    Ok(result)
                 }
             }
             other => Err(Error::InvalidArgumentError(format!(

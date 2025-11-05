@@ -681,6 +681,22 @@ where
 
         tracing::debug!("drop_table: attempting to drop table '{}'", canonical_name);
 
+        if self.is_table_marked_dropped(&canonical_name) {
+            tracing::debug!(
+                "drop_table: table '{}' already marked dropped; if_exists={}",
+                canonical_name,
+                if_exists
+            );
+            return if if_exists {
+                Ok(())
+            } else {
+                Err(Error::CatalogError(format!(
+                    "Catalog Error: Table '{}' does not exist",
+                    display_name
+                )))
+            };
+        }
+
         let cached_entry = {
             let tables = self.tables.read().unwrap();
             tracing::debug!("drop_table: cache contains {} tables", tables.len());
@@ -760,6 +776,7 @@ where
             table_id
         );
 
+        self.remove_table_entry(&canonical_name);
         self.dropped_tables
             .write()
             .unwrap()
