@@ -3330,23 +3330,24 @@ impl SqlEngine {
         let resolver = catalog.identifier_resolver();
         let table_id = catalog.table_id(&canonical_name);
 
-        let mut column_assignments = Vec::with_capacity(assignments.len());
-        let mut seen: HashMap<String, ()> = HashMap::default();
+        // Use a HashMap to track column assignments. If a column appears multiple times,
+        // the last assignment wins (SQLite-compatible behavior).
+        let mut assignments_map: HashMap<String, (String, sqlparser::ast::Expr)> = HashMap::default();
         for assignment in assignments {
             let column_name = resolve_assignment_column_name(&assignment.target)?;
             let normalized = column_name.to_ascii_lowercase();
-            if seen.insert(normalized, ()).is_some() {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column '{}' in UPDATE assignments",
-                    column_name
-                )));
-            }
-            let value = match SqlValue::try_from_expr(&assignment.value) {
+            // Store in map - last assignment wins
+            assignments_map.insert(normalized, (column_name, assignment.value.clone()));
+        }
+        
+        let mut column_assignments = Vec::with_capacity(assignments_map.len());
+        for (_normalized, (column_name, expr)) in assignments_map {
+            let value = match SqlValue::try_from_expr(&expr) {
                 Ok(literal) => AssignmentValue::Literal(PlanValue::from(literal)),
                 Err(Error::InvalidArgumentError(msg))
                     if msg.contains("unsupported literal expression") =>
                 {
-                    let normalized_expr = self.materialize_in_subquery(assignment.value.clone())?;
+                    let normalized_expr = self.materialize_in_subquery(expr.clone())?;
                     let translated = translate_scalar_with_context(
                         &resolver,
                         IdentifierContext::new(table_id),

@@ -96,20 +96,14 @@ where
             ))
         })?;
 
-        let mut seen_columns: FxHashSet<String> =
-            FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
-        let mut prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> =
-            Vec::with_capacity(assignments.len());
+        // Use a map to track column assignments. If a column appears multiple times,
+        // the last assignment wins (SQLite-compatible behavior).
+        let mut column_assignments: FxHashMap<String, (ExecutorColumn, PreparedAssignmentValue)> =
+            FxHashMap::with_capacity_and_hasher(assignments.len(), Default::default());
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
-            if !seen_columns.insert(normalized.clone()) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column '{}' in UPDATE assignments",
-                    assignment.column
-                )));
-            }
             let column = table.schema.resolve(&assignment.column).ok_or_else(|| {
                 Error::InvalidArgumentError(format!(
                     "unknown column '{}' in UPDATE",
@@ -117,10 +111,8 @@ where
                 ))
             })?;
 
-            match assignment.value {
-                AssignmentValue::Literal(value) => {
-                    prepared.push((column.clone(), PreparedAssignmentValue::Literal(value)));
-                }
+            let prepared_value = match assignment.value {
+                AssignmentValue::Literal(value) => PreparedAssignmentValue::Literal(value),
                 AssignmentValue::Expression(expr) => {
                     let translated = translation::expression::translate_scalar_with(
                         &expr,
@@ -140,13 +132,17 @@ where
                     )?;
                     let expr_index = scalar_exprs.len();
                     scalar_exprs.push(translated);
-                    prepared.push((
-                        column.clone(),
-                        PreparedAssignmentValue::Expression { expr_index },
-                    ));
+                    PreparedAssignmentValue::Expression { expr_index }
                 }
-            }
+            };
+            
+            // Store in map - if column appears multiple times, last one wins (SQLite behavior)
+            column_assignments.insert(normalized, (column.clone(), prepared_value));
         }
+        
+        // Convert map to vector for processing
+        let prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> = 
+            column_assignments.into_values().collect();
 
         let (row_ids, mut expr_values) =
             self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
@@ -430,35 +426,23 @@ where
 
         let schema = table.schema.as_ref();
 
-        let mut seen_columns: FxHashSet<String> =
-            FxHashSet::with_capacity_and_hasher(assignments.len(), Default::default());
-        let mut prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> =
-            Vec::with_capacity(assignments.len());
+        // SQLite allows duplicate column assignments (e.g., SET x=3, x=4, x=5)
+        // and uses the rightmost value. We'll use a map to track the last assignment.
+        let mut column_assignments: FxHashMap<String, (ExecutorColumn, PreparedAssignmentValue)> =
+            FxHashMap::default();
         let mut scalar_exprs: Vec<ScalarExpr<FieldId>> = Vec::new();
-        let mut first_field_id: Option<FieldId> = None;
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
-            if !seen_columns.insert(normalized.clone()) {
-                return Err(Error::InvalidArgumentError(format!(
-                    "duplicate column '{}' in UPDATE assignments",
-                    assignment.column
-                )));
-            }
             let column = table.schema.resolve(&assignment.column).ok_or_else(|| {
                 Error::InvalidArgumentError(format!(
                     "unknown column '{}' in UPDATE",
                     assignment.column
                 ))
             })?;
-            if first_field_id.is_none() {
-                first_field_id = Some(column.field_id);
-            }
 
-            match assignment.value {
-                AssignmentValue::Literal(value) => {
-                    prepared.push((column.clone(), PreparedAssignmentValue::Literal(value)));
-                }
+            let prepared_value = match assignment.value {
+                AssignmentValue::Literal(value) => PreparedAssignmentValue::Literal(value),
                 AssignmentValue::Expression(expr) => {
                     let translated = translation::expression::translate_scalar_with(
                         &expr,
@@ -478,19 +462,24 @@ where
                     )?;
                     let expr_index = scalar_exprs.len();
                     scalar_exprs.push(translated);
-                    prepared.push((
-                        column.clone(),
-                        PreparedAssignmentValue::Expression { expr_index },
-                    ));
+                    PreparedAssignmentValue::Expression { expr_index }
                 }
-            }
+            };
+            
+            // Store in map - if column appears multiple times, last one wins (SQLite behavior)
+            column_assignments.insert(normalized, (column.clone(), prepared_value));
         }
+        
+        // Convert map to vector for processing
+        let prepared: Vec<(ExecutorColumn, PreparedAssignmentValue)> = 
+            column_assignments.into_values().collect();
 
-        let anchor_field = first_field_id.ok_or_else(|| {
-            Error::InvalidArgumentError("UPDATE requires at least one target column".into())
-        })?;
-
-        let filter_expr = translation::expression::full_table_scan_filter(anchor_field);
+        // Use ROW_ID as the anchor for scanning. This ensures we find ALL rows
+        // since every row has a row_id and it's never NULL. User columns might have
+        // NULL values or be indexed, and indexes typically don't include NULLs.
+        use llkv_table::ROW_ID_FIELD_ID;
+        let filter_expr = translation::expression::full_table_scan_filter(ROW_ID_FIELD_ID);
+        
         let (row_ids, mut expr_values) =
             self.collect_update_rows(table, &filter_expr, &scalar_exprs, snapshot)?;
 
