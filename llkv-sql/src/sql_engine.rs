@@ -7326,8 +7326,7 @@ fn translate_condition_with_context(
     outer_scopes: &[IdentifierContext],
     subqueries: &mut Vec<llkv_plan::FilterSubquery>,
     mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
-) -> SqlResult<llkv_expr::expr::Expr<'static, String>>
-{
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     // Iterative postorder traversal using the TransformFrame pattern.
     // See llkv-plan::TransformFrame documentation for pattern details.
     //

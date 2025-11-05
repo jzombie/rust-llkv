@@ -276,6 +276,12 @@ where
         Ok(())
     }
 
+    /// Ensure the catalog's next_table_id counter is at least `minimum`.
+    pub fn ensure_next_table_id_at_least(&self, minimum: TableId) -> Result<()> {
+        self.metadata.ensure_next_table_id_at_least(minimum)?;
+        Ok(())
+    }
+
     /// Internal helper for creating a view that can be called from CatalogDdl trait implementation.
     fn create_view_internal(
         self: &Arc<Self>,

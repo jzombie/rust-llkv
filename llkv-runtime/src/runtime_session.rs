@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager};
+use llkv_table::types::TableId;
 use llkv_table::{
     SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation,
 };
@@ -69,6 +70,11 @@ impl SessionNamespaces {
                 RuntimeContext::new_with_catalog(temp_boxed_pager, Arc::clone(&shared_catalog))
                     .with_fallback_lookup(Arc::clone(&base_context)),
             );
+
+            const TEMPORARY_TABLE_ID_START: TableId = 0x8000;
+            temp_context
+                .ensure_next_table_id_at_least(TEMPORARY_TABLE_ID_START)
+                .expect("failed to seed temporary namespace table id counter");
 
             let namespace = Arc::new(TemporaryRuntimeNamespace::new(
                 TEMPORARY_NAMESPACE_ID.to_string(),

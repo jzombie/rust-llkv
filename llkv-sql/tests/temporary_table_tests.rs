@@ -120,7 +120,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .namespace_registry()
         .read()
         .expect("namespace registry lock")
-    .namespace::<TemporaryRuntimeNamespace>(TEMPORARY_NAMESPACE_ID)
+        .namespace::<TemporaryRuntimeNamespace>(TEMPORARY_NAMESPACE_ID)
         .expect("temporary namespace present");
 
     let temp_context = temp_namespace.context();

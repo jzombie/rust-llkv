@@ -1389,6 +1389,26 @@ where
         Ok(next)
     }
 
+    /// Ensure the catalog's next_table_id counter is at least `minimum`.
+    ///
+    /// This is primarily used by in-memory namespaces (e.g., temporary tables)
+    /// that share a catalog handle with persistent storage. By seeding their
+    /// own metadata store with a higher starting point we avoid collisions on
+    /// table IDs already allocated by the persistent catalog.
+    pub fn ensure_next_table_id_at_least(&self, minimum: TableId) -> LlkvResult<()> {
+        if reserved::is_reserved_table_id(minimum) {
+            return Err(Error::InvalidArgumentError(
+                reserved::reserved_table_id_message(minimum),
+            ));
+        }
+
+        let catalog = SysCatalog::new(&self.store);
+        match catalog.get_next_table_id()? {
+            Some(current) if current >= minimum => Ok(()),
+            _ => catalog.put_next_table_id(minimum),
+        }
+    }
+
     /// Check if a field has a sort index in the underlying store.
     ///
     /// Note: Creates a temporary Table instance to access index metadata.
