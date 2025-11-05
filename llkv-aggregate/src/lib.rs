@@ -779,11 +779,11 @@ impl AggregateAccumulator {
                     if array.is_valid(i) {
                         let col_array = batch.column(*column_index);
                         let key = DistinctKey::from_array(col_array, i)?;
-                        if seen.insert(key.clone()) {
-                            if let DistinctKey::Int(v) = key {
-                                // TOTAL never overflows - accumulate as float
-                                *sum += v as f64;
-                            }
+                        if seen.insert(key.clone())
+                            && let DistinctKey::Int(v) = key
+                        {
+                            // TOTAL never overflows - accumulate as float
+                            *sum += v as f64;
                         }
                     }
                 }

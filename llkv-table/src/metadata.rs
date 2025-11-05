@@ -54,30 +54,6 @@ struct TableSnapshot {
     triggers: FxHashMap<String, TriggerEntryMeta>,
 }
 
-impl TableSnapshot {
-    fn new(
-        table_meta: Option<TableMeta>,
-        column_metas: FxHashMap<FieldId, ColMeta>,
-        constraints: FxHashMap<ConstraintId, ConstraintRecord>,
-        constraint_names: FxHashMap<ConstraintId, String>,
-        single_indexes: FxHashMap<String, SingleColumnIndexEntry>,
-        multi_column_indexes: FxHashMap<String, MultiColumnIndexEntryMeta>,
-        sort_indexes: FxHashSet<FieldId>,
-        triggers: FxHashMap<String, TriggerEntryMeta>,
-    ) -> Self {
-        Self {
-            table_meta,
-            column_metas,
-            constraints,
-            constraint_names,
-            single_indexes,
-            multi_column_indexes,
-            sort_indexes,
-            triggers,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct TableState {
     current: TableSnapshot,
@@ -235,16 +211,16 @@ where
             }
             constraints.insert(record.constraint_id, record);
         }
-        let snapshot = TableSnapshot::new(
+        let snapshot = TableSnapshot {
             table_meta,
-            FxHashMap::default(),
+            column_metas: FxHashMap::default(),
             constraints,
             constraint_names,
             single_indexes,
             multi_column_indexes,
             sort_indexes,
             triggers,
-        );
+        };
         Ok(TableState::from_snapshot(snapshot))
     }
 

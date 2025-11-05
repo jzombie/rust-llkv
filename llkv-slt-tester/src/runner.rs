@@ -380,10 +380,13 @@ impl LlkvSltRunner {
                     let error_msg = format!("{}", e);
 
                     // Check if this is an integer overflow error in a query that expects empty result
-                    let is_overflow_error = matches!(&record, sqllogictest::Record::Query { 
-                        expected: sqllogictest::QueryExpect::Results { results, .. }, 
-                        .. 
-                    } if results.is_empty())
+                    let is_overflow_error = matches!(
+                        &record,
+                        sqllogictest::Record::Query {
+                            expected: sqllogictest::QueryExpect::Results { results, .. },
+                            ..
+                        } if results.is_empty()
+                    )
                         && error_msg.contains("integer overflow");
 
                     if is_overflow_error {

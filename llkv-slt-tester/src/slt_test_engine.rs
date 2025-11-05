@@ -339,18 +339,15 @@ impl AsyncDB for EngineHarness {
                 }
                 let mut result = results.remove(0);
                 let in_query_context = expectations::is_set();
-                if in_query_context {
-                    if let RuntimeStatementResult::Insert { rows_inserted, .. } = &result {
-                        if *rows_inserted == 0 {
-                            if let Ok(mut flushed) = self.engine.flush_pending_inserts() {
-                                if let Some(first) = flushed.into_iter().next() {
-                                    // When the current INSERT buffered zero rows we need to surface the first
-                                    // newly flushed result so sqllogictest observes the expected row count.
-                                    result = first;
-                                }
-                            }
-                        }
-                    }
+                if in_query_context
+                    && let RuntimeStatementResult::Insert { rows_inserted, .. } = &result
+                    && *rows_inserted == 0
+                    && let Ok(flushed) = self.engine.flush_pending_inserts()
+                    && let Some(first) = flushed.into_iter().next()
+                {
+                    // When the current INSERT buffered zero rows we need to surface the first
+                    // newly flushed result so sqllogictest observes the expected row count.
+                    result = first;
                 }
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
