@@ -1,6 +1,6 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{VecDeque};
 use std::convert::TryFrom;
 use std::sync::{
     Arc, OnceLock,
@@ -1446,7 +1446,7 @@ impl SqlEngine {
         &self,
         display_name: &str,
         canonical_name: &str,
-    ) -> SqlResult<HashSet<String>> {
+    ) -> SqlResult<FxHashSet<String>> {
         let context = self.engine.context();
 
         if context.is_table_marked_dropped(canonical_name) {
@@ -1478,7 +1478,7 @@ impl SqlEngine {
                 if let Some(table_id) = context.catalog().table_id(&canonical_name)
                     && let Some(resolver) = context.catalog().field_resolver(table_id)
                 {
-                    let fallback: HashSet<String> = resolver
+                    let fallback: FxHashSet<String> = resolver
                         .field_names()
                         .into_iter()
                         .map(|name| name.to_ascii_lowercase())
@@ -1490,11 +1490,11 @@ impl SqlEngine {
                     );
                     return Ok(fallback);
                 }
-                Ok(HashSet::default())
+                Ok(FxHashSet::default())
             }
             Err(err) => {
                 if Self::is_table_missing_error(&err) {
-                    Ok(HashSet::default())
+                    Ok(FxHashSet::default())
                 } else {
                     Err(Self::map_table_error(display_name, err))
                 }
@@ -1620,13 +1620,13 @@ impl SqlEngine {
                 dup, display_name
             )
         })?;
-        let column_names_lower: HashSet<String> = column_names
+        let column_names_lower: FxHashSet<String> = column_names
             .iter()
             .map(|name| name.to_ascii_lowercase())
             .collect();
 
         let mut columns: Vec<PlanColumnSpec> = Vec::with_capacity(column_defs_ast.len());
-        let mut primary_key_columns: HashSet<String> = HashSet::default();
+        let mut primary_key_columns: FxHashSet<String> = FxHashSet::default();
         let mut foreign_keys: Vec<ForeignKeySpec> = Vec::new();
         let mut multi_column_uniques: Vec<MultiColumnUniqueSpec> = Vec::new();
 
@@ -1740,8 +1740,7 @@ impl SqlEngine {
 
         // Apply supported table-level constraints (e.g., PRIMARY KEY)
         if !constraints.is_empty() {
-            let mut column_lookup: HashMap<String, usize> = HashMap::default();
-            column_lookup.reserve(columns.len());
+            let mut column_lookup: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
             for (idx, column) in columns.iter().enumerate() {
                 column_lookup.insert(column.name.to_ascii_lowercase(), idx);
             }
@@ -2044,7 +2043,7 @@ impl SqlEngine {
         };
 
         let mut index_columns: Vec<IndexColumnPlan> = Vec::with_capacity(columns.len());
-        let mut seen_column_names: HashSet<String> = HashSet::default();
+        let mut seen_column_names: FxHashSet<String> = FxHashSet::default();
         for item in columns {
             // Check WITH FILL before calling helper (not part of standard validation)
             if item.column.with_fill.is_some() {
@@ -2118,7 +2117,7 @@ impl SqlEngine {
         on_delete: Option<ReferentialAction>,
         on_update: Option<ReferentialAction>,
         characteristics: &Option<ConstraintCharacteristics>,
-        known_columns_lower: &HashSet<String>,
+        known_columns_lower: &FxHashSet<String>,
         name: Option<String>,
     ) -> SqlResult<ForeignKeySpec> {
         if characteristics.is_some() {
@@ -3332,7 +3331,7 @@ impl SqlEngine {
 
         // Use a HashMap to track column assignments. If a column appears multiple times,
         // the last assignment wins (SQLite-compatible behavior).
-        let mut assignments_map: HashMap<String, (String, sqlparser::ast::Expr)> = HashMap::default();
+        let mut assignments_map: FxHashMap<String, (String, sqlparser::ast::Expr)> = FxHashMap::with_capacity_and_hasher(assignments.len(), FxBuildHasher::default());
         for assignment in assignments {
             let column_name = resolve_assignment_column_name(&assignment.target)?;
             let normalized = column_name.to_ascii_lowercase();
@@ -4439,14 +4438,14 @@ impl SqlEngine {
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
-        let mut visited_views = HashSet::default();
+        let mut visited_views = FxHashSet::default();
         self.execute_query_with_view_support(query, &mut visited_views)
     }
 
     fn execute_query_with_view_support(
         &self,
         query: Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         if let Some(result) = self.try_execute_simple_view_select(&query, visited_views)? {
             return Ok(result);
@@ -4472,7 +4471,7 @@ impl SqlEngine {
     fn try_execute_simple_view_select(
         &self,
         query: &Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         use sqlparser::ast::SetExpr;
 
@@ -4638,8 +4637,7 @@ impl SqlEngine {
                 let exec = *view_execution;
                 let batches = exec.collect()?;
                 let view_fields = view_schema.fields();
-                let mut name_to_index = HashMap::default();
-                name_to_index.reserve(view_fields.len());
+                let mut name_to_index = FxHashMap::with_capacity_and_hasher(view_fields.len(), Default::default());
                 for (idx, field) in view_fields.iter().enumerate() {
                     name_to_index.insert(field.name().to_ascii_lowercase(), idx);
                 }
@@ -4704,7 +4702,7 @@ impl SqlEngine {
     fn try_execute_simple_derived_select(
         &self,
         query: &Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         use sqlparser::ast::{Expr as SqlExpr, SelectItem, SetExpr};
 
@@ -4923,7 +4921,7 @@ impl SqlEngine {
         let mut batches = inner_exec.collect()?;
         let output_table_name = alias_name.clone().unwrap_or(inner_table_name.clone());
 
-        let mut name_to_index = HashMap::default();
+        let mut name_to_index = FxHashMap::default();
         for (idx, field) in inner_schema.fields().iter().enumerate() {
             name_to_index.insert(field.name().to_ascii_lowercase(), idx);
         }
@@ -5030,7 +5028,7 @@ impl SqlEngine {
     fn try_execute_view_set_operation(
         &self,
         query: &Query,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         if !matches!(query.body.as_ref(), SetExpr::SetOperation { .. }) {
             return Ok(None);
@@ -5055,7 +5053,7 @@ impl SqlEngine {
     fn evaluate_set_expr(
         &self,
         expr: &SetExpr,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         match expr {
             SetExpr::SetOperation {
@@ -5078,7 +5076,7 @@ impl SqlEngine {
     fn execute_setexpr_query(
         &self,
         expr: &SetExpr,
-        visited_views: &mut HashSet<String>,
+        visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         let sql = expr.to_string();
         let dialect = GenericDialect {};
@@ -5222,7 +5220,7 @@ impl SqlEngine {
             .convert_columns(batch.columns())
             .map_err(|err| Error::Internal(format!("failed to row-encode union result: {err}")))?;
 
-        let mut seen = HashSet::default();
+        let mut seen = FxHashSet::default();
         let mut indices = Vec::new();
         let mut has_duplicates = false;
         for (idx, row) in rows.iter().enumerate() {
@@ -6670,7 +6668,7 @@ fn validate_check_constraint(
 ) -> SqlResult<()> {
     use sqlparser::ast::Expr as SqlExpr;
 
-    let column_names_lower: HashSet<String> = column_names
+    let column_names_lower: FxHashSet<String> = column_names
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
