@@ -5,7 +5,7 @@
 
 A terminal UI (TUI) app that plays a game of Pong against itself.
 
-Most of the game logic is implemented in SQL so this demo can be used to evaluate and benchmark the LLKV SQL engine.
+Most of the game logic is implemented in SQL so this demo can be used to evaluate and benchmark the SQL engine in the [LLKV](../../) toolkit.
 
 ## Attribution
 
