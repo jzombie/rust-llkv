@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+simd-r-drive-support = ["llkv-storage/simd-r-drive-support"]
+
 [dependencies]
 llkv-sql = { workspace = true }
 llkv-storage = { workspace = true }
