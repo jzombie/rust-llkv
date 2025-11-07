@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+keywords = ["database", "transaction", "mvcc", "concurrency", "isolation"]
+categories = ["database-implementations", "concurrency"]
+readme = "README.md"
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
