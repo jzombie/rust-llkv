@@ -6,67 +6,146 @@
 
 **Work in Progress**
 
-`llkv-slt-tester` provides a test harness to provide [sqllogictest](https://sqlite.org/sqllogictest/doc/trunk/about.wiki) testing for the [LLKV](../) toolkit.
+`llkv-slt-tester` provides a harness and library for running sqllogictest (`.slt`) suites against the LLKV SQL engine. It treats SLT files like idiomatic Rust tests and also supports pointer files (`.slturl`) that reference remote test content.
 
-It treats .slt files like idiomatic Rust tests and can also execute remote tests.
+This README consolidates the previous `SLTURL-SUPPORT.md` and test-runner guidance into one place.
 
-## Overview
+## Quick start
 
-This crate provides a small harness and API for running sqllogictest (`.slt`) suites against the LLKV engine. It is intended to make SLT files feel like ordinary Rust test cases: they can be discovered and executed from a test binary, or fetched from remote locations and executed on demand using idiomatic Rust testing commands.
+Run the included test harness from the workspace root:
 
-**Key points:**
-
-- The harness source file (`tests/slt_harness.rs`) implements a standalone test runner using `libtest-mimic` so the harness controls discovery and reporting.
-- Programmatic API is exposed via `LlkvSltRunner` for embedding SLT execution in other tooling.
-- sqllogictest files have an `.slt` extension.
-- `.slturl` pointer files are supported: a `.slturl` file contains a URL which will be fetched (via `reqwest`) and executed.
-
-## Usage
-
-Run the included test harness:
-
-From the workspace root:
-
-```
+```bash
 cargo test -p llkv-slt-tester --test slt_harness
 ```
 
 Or from inside the `llkv-slt-tester` crate directory:
 
-```
+```bash
 cargo test --test slt_harness
 ```
 
-The harness looks for SLT files under the crate `tests/slt` directory by default.
+The harness discovers SLT files under `tests/slt` by default.
 
-Programmatically you can use the `LlkvSltRunner` API. Examples:
+### Run a specific SLT (harness filter)
 
-```rust
-// Run all .slt files under a directory using the in-memory factory
-let runner = llkv_slt_tester::LlkvSltRunner::in_memory();
-runner.run_directory("tests/slt")?;
+To run a single file, use the test-filter argument (quote the path to avoid shell globbing):
 
-// Run a single .slt or .slturl file
-runner.run_file("tests/slt/example.slt")?;
-runner.run_file("tests/slt/remote.slturl")?; // reads URL and fetches script
+```bash
+cargo test --package llkv-slt-tester --test slt_harness -- "slt/sqlite/index/in/10/slt_good_0.slturl"
 ```
 
-The library also exposes helpers to run SLT content from a string or reader, and to choose single-threaded vs multi-threaded runtimes.
+This is useful when iterating on failing SLT cases.
 
-## Remote (pointer) tests
+## File types: `.slt` vs `.slturl`
 
-Files with the `.slturl` extension are treated as pointers: the harness reads the file contents as a URL, fetches the script over the network, and executes it. Network fetches use `reqwest` (blocking) and therefore require network access at runtime.
+- `.slt` — local sqllogictest file containing SLT content in the repo.
+- `.slturl` — pointer file containing a single HTTP(S) URL (one line) that references remote SLT content. The harness will fetch this content at test time and execute it as if it were a local `.slt`.
 
-## Internals / Implementation notes
+Example `.slturl` file content:
 
-- The test harness source file (`tests/slt_harness.rs`) provides a custom `main` that parses `libtest-mimic::Arguments` and calls into `run_slt_harness_with_args` so the crate can control discovery and reporting.
-- The public API lives in `src/lib.rs` and delegates parsing and execution to `src/runner.rs`.
+```
+https://raw.githubusercontent.com/jzombie/sqlite-sqllogictest-corpus/refs/heads/main/test/index/in/10/slt_good_0.test
+```
+
+### Benefits of `.slturl`
+
+- Keeps repository size small by avoiding checked-in large corpora.
+- Lets tests be maintained in an authoritative external corpus.
+- Tests run identically whether local or fetched remotely.
+
+### Network requirements and CI guidance
+
+- `.slturl` tests require network access during test execution. If your CI environment lacks internet access, mark network-dependent tests `#[ignore]` or run them on a runner with network access.
+- Recommended pattern: provide a small smoke test in-tree and run large remote suites only on a designated benchmarking/validation runner with internet.
+
+## Programmatic API (`LlkvSltRunner`)
+
+`LlkvSltRunner` is the public API for programmatic test execution. Common usage patterns:
+
+```rust
+// Create an in-memory runner that uses the in-memory pager factory
+let runner = llkv_slt_tester::LlkvSltRunner::in_memory();
+
+// Run all .slt/.slturl files under a directory
+runner.run_directory("tests/slt")?;
+
+// Run a single file (works for both .slt and .slturl)
+runner.run_file("tests/slt/example.slt")?;
+runner.run_file("tests/slt/remote.slturl")?; // will fetch the URL
+
+// Run SLT content from a string (useful for unit tests)
+runner.run_reader("--slt-from-string--", std::io::Cursor::new(slt_text))?;
+```
+
+The runner supports single-threaded or multi-threaded execution and integrates with `libtest-mimic` for discovery when running the harness binary.
+
+## Remote pointer implementation details
+
+When the harness encounters a `.slturl` file it:
+
+1. Reads the single-line URL from the pointer file (whitespace trimmed).
+2. Fetches the remote content via HTTP(S) using `reqwest`.
+3. Executes the fetched content exactly like a local `.slt` file.
+
+Errors reported include context (source pointer file and URL) and fall into three classes: file read errors, network errors, and content/parse errors.
+
+### Required format for `.slturl`
+
+- A single line containing a valid HTTP(S) URL.
+- Whitespace will be trimmed automatically.
+
+## Migration guide (converting local `.slt` to `.slturl`)
+
+To move large SLT files out of the repository:
+
+1. Upload your `.slt` file to a remote host (e.g., GitHub raw URL).
+2. Replace the local `.slt` with a `.slturl` file that contains the raw URL.
+3. Commit the small `.slturl` pointer file instead of the large `.slt`.
+
+Example:
+
+```bash
+# Before: tests/slt/sqlite/index/in/10/slt_good_0.slt (1.2MB)
+# After:  tests/slt/sqlite/index/in/10/slt_good_0.slturl (1 line)
+```
+
+## Testing and CI
+
+- A dedicated test (`slt_harness`) discovers both `.slt` and `.slturl` files.
+- For network-dependent tests provide a separate `--ignored` suite or a CI job with internet access. Example command for ignored network tests:
+
+```bash
+cargo test --test slturl_test -- --ignored
+```
+
+- The harness supports collection of query statistics via `LLKV_SLT_STATS=1` if you want timings and per-query metrics.
+
+## Internals / Implementation notes (for maintainers)
+
+- Entry point: `tests/slt_harness.rs` builds the harness binary and delegates to `run_slt_harness_with_args` for discovery and execution.
+- Public API: `src/lib.rs` exposes `LlkvSltRunner`.
+- Runner internals: `src/runner.rs` contains the logic to detect `.slturl` files, fetch remote content, and feed it into the SLT parser/executor.
+- Network fetches currently use blocking `reqwest` for simplicity. Consider async fetch or caching if network latency becomes a bottleneck.
+
+## Troubleshooting
+
+- If a remote `.slturl` fails, curl the URL locally to inspect raw content:
+
+```bash
+curl -sSf "$(cat tests/slt/path/to/file.slturl)" | less
+```
+
+- Normalized or last-failed SLT output is written to `target/last_failed_slt.tmp` when enabled by the harness to aid debugging.
 
 ## Contributing
 
-If you add new SLT suites, place them under `tests/slt` (or adjust the harness invocation). When adding remote pointer tests, add a `.slturl` file whose content is the URL to fetch.
+When adding SLT suites, prefer pointer files for large corpora. For local iteration, keep a small subset of representative tests in-tree.
 
-Please run `cargo test -p llkv-slt-tester --test slt_harness` after changes to verify behavior.
+Please run the harness after changes:
+
+```bash
+cargo test -p llkv-slt-tester --test slt_harness
+```
 
 ## License
 
