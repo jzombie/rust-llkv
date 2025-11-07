@@ -6979,7 +6979,9 @@ fn bind_filter_operator(
         }
         Operator::In(list) => {
             for lit in *list {
-                if let Literal::String(text) = lit && parse_placeholder_marker(text).is_some() {
+                if let Literal::String(text) = lit
+                    && parse_placeholder_marker(text).is_some()
+                {
                     return Err(Error::InvalidArgumentError(
                         "IN predicates do not yet support bound parameters".into(),
                     ));
@@ -9029,9 +9031,8 @@ fn translate_scalar_internal(
                                     ));
                                 }
 
-                                work_stack.push(ScalarFrame::Leaf(
-                                    llkv_expr::expr::ScalarExpr::random(),
-                                ));
+                                work_stack
+                                    .push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::random()));
                                 continue;
                             }
                             _ => {
@@ -9103,12 +9104,15 @@ fn translate_scalar_internal(
                     // sqlparser treats FLOOR as datetime extraction when field is specified
                     // We only support simple FLOOR (NoDateTime field)
                     use sqlparser::ast::{CeilFloorKind, DateTimeField};
-                    if !matches!(field, CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)) {
+                    if !matches!(
+                        field,
+                        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+                    ) {
                         return Err(Error::InvalidArgumentError(format!(
                             "FLOOR with datetime field or scale not supported: {field:?}"
                         )));
                     }
-                    
+
                     // Treat FLOOR as a unary function: CAST(expr AS INT64)
                     // Note: CAST truncates towards zero, not true floor (towards -infinity)
                     work_stack.push(ScalarFrame::Exit(ScalarExitContext::Cast(DataType::Int64)));

@@ -11,7 +11,9 @@ use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_executor::{ExecutorColumn, ExecutorTable, build_array_for_column, resolve_insert_columns, translation};
+use llkv_executor::{
+    ExecutorColumn, ExecutorTable, build_array_for_column, resolve_insert_columns, translation,
+};
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{AssignmentValue, ColumnAssignment, PlanValue, UpdatePlan};
 use llkv_result::{Error, Result};
@@ -19,7 +21,7 @@ use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::{FieldId, RowId, UniqueKey, build_composite_unique_key};
-use llkv_transaction::{mvcc, MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot};
+use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
@@ -375,12 +377,10 @@ where
             snapshot,
         )?;
 
-        let touches_constraints = self.update_touches_constraint_columns(
-            &updated_field_ids,
-            &constraint_ctx,
-        );
-        let use_in_place = snapshot.txn_id == llkv_transaction::TXN_ID_AUTO_COMMIT
-            && !touches_constraints;
+        let touches_constraints =
+            self.update_touches_constraint_columns(&updated_field_ids, &constraint_ctx);
+        let use_in_place =
+            snapshot.txn_id == llkv_transaction::TXN_ID_AUTO_COMMIT && !touches_constraints;
 
         if use_in_place {
             self.update_rows_in_place(
@@ -717,12 +717,10 @@ where
             snapshot,
         )?;
 
-        let touches_constraints = self.update_touches_constraint_columns(
-            &updated_field_ids,
-            &constraint_ctx,
-        );
-        let use_in_place = snapshot.txn_id == llkv_transaction::TXN_ID_AUTO_COMMIT
-            && !touches_constraints;
+        let touches_constraints =
+            self.update_touches_constraint_columns(&updated_field_ids, &constraint_ctx);
+        let use_in_place =
+            snapshot.txn_id == llkv_transaction::TXN_ID_AUTO_COMMIT && !touches_constraints;
 
         if use_in_place {
             self.update_rows_in_place(
@@ -836,10 +834,7 @@ where
                 "in-place update row width mismatch",
             );
             for (dest_idx, (schema_index, _)) in update_columns.iter().enumerate() {
-                let value = row
-                    .get(*schema_index)
-                    .cloned()
-                    .unwrap_or(PlanValue::Null);
+                let value = row.get(*schema_index).cloned().unwrap_or(PlanValue::Null);
                 column_values[dest_idx].push(value);
             }
         }
@@ -900,21 +895,20 @@ where
             return true;
         }
 
-        if constraint_ctx
-            .multi_column_uniques
-            .iter()
-            .any(|unique| unique
+        if constraint_ctx.multi_column_uniques.iter().any(|unique| {
+            unique
                 .field_ids
                 .iter()
-                .any(|field_id| updated_field_ids.contains(field_id)))
-        {
+                .any(|field_id| updated_field_ids.contains(field_id))
+        }) {
             return true;
         }
 
-        if let Some(pk) = &constraint_ctx.primary_key && pk
-            .field_ids
-            .iter()
-            .any(|field_id| updated_field_ids.contains(field_id))
+        if let Some(pk) = &constraint_ctx.primary_key
+            && pk
+                .field_ids
+                .iter()
+                .any(|field_id| updated_field_ids.contains(field_id))
         {
             return true;
         }

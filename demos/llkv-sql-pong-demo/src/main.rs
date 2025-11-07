@@ -1,20 +1,20 @@
 use std::cell::RefCell;
-use std::io::{stdout, Write};
+use std::io::{Write, stdout};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use std::{cmp, thread};
 
 use arrow::array::{Array, Int64Array};
 use arrow::record_batch::RecordBatch;
+use crossterm::QueueableCommand;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, poll, read};
 use crossterm::execute;
 use crossterm::queue;
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::QueueableCommand;
 use indoc::indoc;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
@@ -459,7 +459,15 @@ fn main() -> Result<()> {
         state = updated_state;
 
         let render_start = Instant::now();
-        render_frame(&engine, &params, &state, fps, sound_enabled, max_mode, &perf)?;
+        render_frame(
+            &engine,
+            &params,
+            &state,
+            fps,
+            sound_enabled,
+            max_mode,
+            &perf,
+        )?;
         let render_time = render_start.elapsed();
 
         if sound_enabled && !max_mode {
@@ -521,7 +529,7 @@ fn insert_initial_state(engine: &SqlEngine, _params: &Params) -> Result<()> {
         FROM params
         LIMIT 1;
     "})?;
-    
+
     Ok(())
 }
 
@@ -602,14 +610,14 @@ fn fetch_digit_patterns(engine: &SqlEngine, digit: usize) -> Result<Vec<String>>
         ORDER BY row;
     "})?;
     let batch = first_batch(&batches)?;
-    
+
     let mut patterns = Vec::new();
     let column = batch.column(0);
     let array = column
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .expect("expected StringArray");
-    
+
     for i in 0..batch.num_rows() {
         if !array.is_null(i) {
             patterns.push(array.value(i).to_string());
@@ -618,7 +626,14 @@ fn fetch_digit_patterns(engine: &SqlEngine, digit: usize) -> Result<Vec<String>>
     Ok(patterns)
 }
 
-fn draw_digit(engine: &SqlEngine, buf: &mut Vec<HudCell>, digit: usize, y: u16, x: u16, color: Color) -> Result<()> {
+fn draw_digit(
+    engine: &SqlEngine,
+    buf: &mut Vec<HudCell>,
+    digit: usize,
+    y: u16,
+    x: u16,
+    color: Color,
+) -> Result<()> {
     let patterns = fetch_digit_patterns(engine, digit)?;
     for (i, pattern) in patterns.iter().enumerate() {
         let text = pattern.replace('F', &FULL_BLOCK.to_string());
@@ -667,7 +682,14 @@ fn render_frame(
 
     for (idx, ch) in score_b_str.chars().enumerate() {
         let digit = ch.to_digit(10).unwrap() as usize;
-        draw_digit(engine, &mut hud, digit, 1, 43 + (idx as u16 * 4), Color::DarkGrey)?;
+        draw_digit(
+            engine,
+            &mut hud,
+            digit,
+            1,
+            43 + (idx as u16 * 4),
+            Color::DarkGrey,
+        )?;
     }
 
     hud.push(HudCell {

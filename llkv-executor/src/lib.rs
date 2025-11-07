@@ -8681,7 +8681,10 @@ fn collect_scalar_subquery_ids(expr: &ScalarExpr<FieldId>, ids: &mut FxHashSet<S
                 collect_scalar_subquery_ids(item, ids);
             }
         }
-        ScalarExpr::Aggregate(_) | ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Random => {}
+        ScalarExpr::Aggregate(_)
+        | ScalarExpr::Column(_)
+        | ScalarExpr::Literal(_)
+        | ScalarExpr::Random => {}
     }
 }
 
@@ -8746,7 +8749,10 @@ fn rewrite_scalar_expr_for_subqueries(
                 .map(|item| rewrite_scalar_expr_for_subqueries(item, mapping))
                 .collect(),
         ),
-        ScalarExpr::Aggregate(_) | ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Random => expr.clone(),
+        ScalarExpr::Aggregate(_)
+        | ScalarExpr::Column(_)
+        | ScalarExpr::Literal(_)
+        | ScalarExpr::Random => expr.clone(),
     }
 }
 
