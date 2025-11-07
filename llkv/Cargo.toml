@@ -1,6 +1,6 @@
 [package]
 name = "llkv"
-description = "Columnar Storage Layer for Key-Value Stores"
+description = "An Apache Arrow columnar storage layer with SQL for key-value storage systems."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
