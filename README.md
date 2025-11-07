@@ -16,6 +16,13 @@ LLKV is an experimental SQL database built as a Rust workspace. It layers Apache
 - Maintain a portable test harness with SQL Logic Tests and multi-OS CI coverage.
 - Status: active WIP; core data layout, planner, runtime, and SLT harness are under construction.
 
+## Design Tradeoffs
+
+- Synchronous execution is the default. Hot paths lean on Rayon work-stealing and Crossbeam coordination instead of a pervasive async runtime so individual queries can keep scheduler overhead low, yet the engine still embeds cleanly inside Tokio—our SQL Logic Test runner spins up a Tokio runtime to simulate concurrent connections.
+- Persistent storage backs onto the [SIMD R Drive](https://crates.io/crates/simd-r-drive) project rather than Parquet files. That keeps point updates fast without background compaction, but it does trade off the broader ecosystem tooling that Parquet enjoys.
+- The project reuses the same SQL parser and Arrow memory model as Apache DataFusion while deliberately skipping Tokio. It grew out of an experiment to see how a DataFusion-style stack behaves without a task scheduler in the middle.
+- Full SQL Logic Test coverage and MVCC transactions are core requirements, yet the crate remains alpha-quality. DataFusion is still the safer pick for production deployments with mature connectors and ecosystem support.
+
 ## Layered Architecture
 
 The workspace is organized into six layers; higher layers depend on the ones below and communicate through Arrow data structures.
