@@ -1,6 +1,7 @@
-# LLKV: A Columnar Storage Layer for Key-Value Stores
+# LLKV: A Columnar Storage Layer + SQL interface for Key-Value Stores
 
 [![CodSpeed Badge](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/jzombie/rust-llkv)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jzombie/rust-llkv)
 
 **Work in Progress**
 

@@ -7,10 +7,11 @@
 //! - Foreign key validation for updates
 
 use crate::{RuntimeStatementResult, canonical_table_name};
+use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_executor::{ExecutorColumn, ExecutorTable, resolve_insert_columns, translation};
+use llkv_executor::{ExecutorColumn, ExecutorTable, build_array_for_column, resolve_insert_columns, translation};
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
 use llkv_plan::{AssignmentValue, ColumnAssignment, PlanValue, UpdatePlan};
 use llkv_result::{Error, Result};
@@ -18,14 +19,14 @@ use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::{FieldId, RowId, UniqueKey, build_composite_unique_key};
-use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot};
+use llkv_transaction::{mvcc, MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::{PreparedAssignmentValue, RuntimeContext};
+use super::{PreparedAssignmentValue, RuntimeContext, TableConstraintContext};
 
 impl<P> RuntimeContext<P>
 where
@@ -374,23 +375,41 @@ where
             snapshot,
         )?;
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            canonical_name.clone(),
-            row_ids.clone(),
-            snapshot,
-            false,
-        )?;
+        let touches_constraints = self.update_touches_constraint_columns(
+            &updated_field_ids,
+            &constraint_ctx,
+        );
+        let use_in_place = snapshot.txn_id == llkv_transaction::TXN_ID_AUTO_COMMIT
+            && !touches_constraints;
 
-        let _ = self.insert_rows(
-            table,
-            display_name.clone(),
-            canonical_name,
-            new_rows,
-            column_names,
-            snapshot,
-        )?;
+        if use_in_place {
+            self.update_rows_in_place(
+                table,
+                &display_name,
+                row_ids,
+                new_rows,
+                updated_field_ids,
+                snapshot,
+            )?;
+        } else {
+            let _ = self.apply_delete(
+                table,
+                display_name.clone(),
+                canonical_name.clone(),
+                row_ids.clone(),
+                snapshot,
+                false,
+            )?;
+
+            let _ = self.insert_rows(
+                table,
+                display_name.clone(),
+                canonical_name,
+                new_rows,
+                column_names,
+                snapshot,
+            )?;
+        }
 
         Ok(RuntimeStatementResult::Update {
             table_name: display_name,
@@ -698,28 +717,209 @@ where
             snapshot,
         )?;
 
-        let _ = self.apply_delete(
-            table,
-            display_name.clone(),
-            canonical_name.clone(),
-            row_ids.clone(),
-            snapshot,
-            false,
-        )?;
+        let touches_constraints = self.update_touches_constraint_columns(
+            &updated_field_ids,
+            &constraint_ctx,
+        );
+        let use_in_place = snapshot.txn_id == llkv_transaction::TXN_ID_AUTO_COMMIT
+            && !touches_constraints;
 
-        let _ = self.insert_rows(
-            table,
-            display_name.clone(),
-            canonical_name,
-            new_rows,
-            column_names,
-            snapshot,
-        )?;
+        if use_in_place {
+            self.update_rows_in_place(
+                table,
+                &display_name,
+                row_ids,
+                new_rows,
+                updated_field_ids,
+                snapshot,
+            )?;
+        } else {
+            let _ = self.apply_delete(
+                table,
+                display_name.clone(),
+                canonical_name.clone(),
+                row_ids.clone(),
+                snapshot,
+                false,
+            )?;
+
+            let _ = self.insert_rows(
+                table,
+                display_name.clone(),
+                canonical_name,
+                new_rows,
+                column_names,
+                snapshot,
+            )?;
+        }
 
         Ok(RuntimeStatementResult::Update {
             table_name: display_name,
             rows_updated: row_count,
         })
+    }
+
+    /// Rewrite updated rows in-place for auto-commit transactions.
+    ///
+    /// This keeps MVCC churn bounded by reusing existing `row_id` values and
+    /// preserving the prior `created_by`/`deleted_by` metadata. Snapshot reads
+    /// continue to see the correct version, while OLTP-style auto-commit
+    /// workloads avoid unbounded version growth. Conflict checks mirror the
+    /// delete+insert path so transactional behavior stays identical.
+    ///
+    /// TODO: once `ColumnStore::vacuum_table` exists, trigger chunk compaction
+    /// here for multi-statement transactions after they commit.
+    fn update_rows_in_place(
+        &self,
+        table: &ExecutorTable<P>,
+        display_name: &str,
+        row_ids: Vec<RowId>,
+        new_rows: Vec<Vec<PlanValue>>,
+        updated_field_ids: Vec<FieldId>,
+        snapshot: TransactionSnapshot,
+    ) -> Result<()> {
+        use arrow::array::UInt64Builder;
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        debug_assert_eq!(
+            snapshot.txn_id,
+            llkv_transaction::TXN_ID_AUTO_COMMIT,
+            "update_rows_in_place should only be called for auto-commit transactions",
+        );
+        debug_assert_eq!(
+            row_ids.len(),
+            new_rows.len(),
+            "row_ids and new_rows must have the same length",
+        );
+
+        if row_ids.is_empty() || updated_field_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Preserve conflict detection semantics from delete+insert path.
+        self.detect_delete_conflicts(table, display_name, &row_ids, snapshot)?;
+
+        let row_count = row_ids.len();
+        tracing::debug!(
+            table_id = table.table.table_id(),
+            row_count,
+            ?row_ids,
+            "update_rows_in_place: rewriting rows",
+        );
+
+        let mut update_columns: Vec<(usize, ExecutorColumn)> =
+            Vec::with_capacity(updated_field_ids.len());
+        for field_id in updated_field_ids {
+            let (schema_index, column) = table
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.field_id == field_id)
+                .ok_or_else(|| {
+                    Error::Internal(format!(
+                        "target column with field_id {} missing during in-place update",
+                        field_id
+                    ))
+                })?;
+            update_columns.push((schema_index, column.clone()));
+        }
+
+        let mut column_values: Vec<Vec<PlanValue>> =
+            vec![Vec::with_capacity(row_count); update_columns.len()];
+        for row in &new_rows {
+            debug_assert_eq!(
+                row.len(),
+                table.schema.columns.len(),
+                "in-place update row width mismatch",
+            );
+            for (dest_idx, (schema_index, _)) in update_columns.iter().enumerate() {
+                let value = row
+                    .get(*schema_index)
+                    .cloned()
+                    .unwrap_or(PlanValue::Null);
+                column_values[dest_idx].push(value);
+            }
+        }
+
+        let mut row_id_builder = UInt64Builder::with_capacity(row_count);
+        for &rid in &row_ids {
+            row_id_builder.append_value(rid);
+        }
+        let row_id_array = Arc::new(row_id_builder.finish()) as ArrayRef;
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(update_columns.len() + 1);
+        arrays.push(row_id_array);
+
+        let mut fields = mvcc::build_mvcc_fields();
+        let mut result_fields = Vec::with_capacity(update_columns.len() + 1);
+        result_fields.push(fields.remove(0));
+
+        for ((_, column), values) in update_columns.iter().zip(column_values.into_iter()) {
+            tracing::debug!(
+                column = %column.name,
+                values = ?values,
+                "update_rows_in_place: column rewrite",
+            );
+            let array = build_array_for_column(&column.data_type, &values)?;
+            let field = mvcc::build_field_with_metadata(
+                &column.name,
+                column.data_type.clone(),
+                column.nullable,
+                column.field_id,
+            );
+            arrays.push(array);
+            result_fields.push(field);
+        }
+
+        let schema = Arc::new(Schema::new(result_fields));
+        let batch = RecordBatch::try_new(schema, arrays)
+            .map_err(|e| Error::Internal(format!("failed to build update batch: {}", e)))?;
+
+        table.table.append(&batch)?;
+
+        Ok(())
+    }
+
+    fn update_touches_constraint_columns(
+        &self,
+        updated_field_ids: &[FieldId],
+        constraint_ctx: &TableConstraintContext,
+    ) -> bool {
+        if updated_field_ids.is_empty() {
+            return false;
+        }
+
+        if constraint_ctx
+            .unique_columns
+            .iter()
+            .any(|column| updated_field_ids.contains(&column.field_id))
+        {
+            return true;
+        }
+
+        if constraint_ctx
+            .multi_column_uniques
+            .iter()
+            .any(|unique| unique
+                .field_ids
+                .iter()
+                .any(|field_id| updated_field_ids.contains(field_id)))
+        {
+            return true;
+        }
+
+        if let Some(pk) = &constraint_ctx.primary_key && pk
+            .field_ids
+            .iter()
+            .any(|field_id| updated_field_ids.contains(field_id))
+        {
+            return true;
+        }
+
+        false
     }
 
     /// Collect row IDs and expression values for UPDATE operations.

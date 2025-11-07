@@ -1207,6 +1207,10 @@ where
                                 self.table.table_id(),
                                 &lfid_dtypes,
                             )?,
+                            ScalarExpr::Random => {
+                                // RANDOM() returns a float64 value
+                                DataType::Float64
+                            }
                             ScalarExpr::ScalarSubquery(_) => {
                                 // Scalar subqueries will be resolved at execution time
                                 // For now, assume they can be null and return a generic type
@@ -3237,6 +3241,7 @@ fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::IsNull { expr, .. } => computed_expr_requires_numeric(expr),
         ScalarExpr::Case { .. } => true,
         ScalarExpr::Coalesce(items) => items.iter().any(computed_expr_requires_numeric),
+        ScalarExpr::Random => true,
         ScalarExpr::ScalarSubquery(_) => false,
     }
 }
@@ -3317,6 +3322,7 @@ fn computed_expr_prefers_float(
             }
             Ok(false)
         }
+        ScalarExpr::Random => Ok(true),
         ScalarExpr::ScalarSubquery(_) => Ok(false),
     }
 }
@@ -3352,6 +3358,7 @@ fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
         ScalarExpr::Aggregate(_)
         | ScalarExpr::Column(_)
         | ScalarExpr::Literal(_)
+        | ScalarExpr::Random
         | ScalarExpr::ScalarSubquery(_) => false,
     }
 }
@@ -3536,7 +3543,8 @@ fn synthesize_computed_literal_array(
         | ScalarExpr::Not(_)
         | ScalarExpr::IsNull { .. }
         | ScalarExpr::Case { .. }
-        | ScalarExpr::Coalesce(_) => Ok(new_null_array(data_type, row_count)),
+        | ScalarExpr::Coalesce(_)
+        | ScalarExpr::Random => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
     }
 }
@@ -3768,7 +3776,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                     traverse_stack.push(item);
                 }
             }
-            Column(_) | Literal(_) | Aggregate(_) => {}
+            Column(_) | Literal(_) | Aggregate(_) | ScalarExpr::Random => {}
             ScalarExpr::ScalarSubquery(_) => {}
         }
     }
@@ -3854,6 +3862,9 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
                 }
                 args.reverse();
                 result_stack.push(format!("COALESCE({})", args.join(", ")));
+            }
+            ScalarExpr::Random => {
+                result_stack.push("RANDOM()".to_string());
             }
             ScalarExpr::ScalarSubquery(sub) => {
                 result_stack.push(format!("(SCALAR_SUBQUERY#{})", sub.id.0));

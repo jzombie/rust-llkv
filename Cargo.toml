@@ -1,32 +1,34 @@
 [workspace.package]
 authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
-version = "0.7.0-alpha"
+version = "0.8.0-alpha"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
-llkv = { path = "./llkv", version = "0.7.0-alpha" }
-llkv-aggregate = { path = "./llkv-aggregate", version = "0.7.0-alpha" }
-llkv-column-map = { path = "./llkv-column-map", version = "0.7.0-alpha" }
-llkv-csv = { path = "./llkv-csv", version = "0.7.0-alpha" }
-llkv-executor = { path = "./llkv-executor", version = "0.7.0-alpha" }
-llkv-expr = { path = "./llkv-expr", version = "0.7.0-alpha" }
-llkv-join = { path = "./llkv-join", version = "0.7.0-alpha" }
-llkv-plan = { path = "./llkv-plan", version = "0.7.0-alpha" }
-llkv-result = { path = "./llkv-result", version = "0.7.0-alpha" }
-llkv-runtime = { path = "./llkv-runtime", version = "0.7.0-alpha" }
-llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.7.0-alpha" }
-llkv-sql = { path = "./llkv-sql", version = "0.7.0-alpha" }
-llkv-storage = { path = "./llkv-storage", version = "0.7.0-alpha" }
-llkv-table = { path = "./llkv-table", version = "0.7.0-alpha" }
-llkv-test-utils = { path = "./llkv-test-utils", version = "0.7.0-alpha" }
-llkv-transaction = { path = "./llkv-transaction", version = "0.7.0-alpha" }
+llkv = { path = "./llkv", version = "0.8.0-alpha" }
+llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.0-alpha" }
+llkv-column-map = { path = "./llkv-column-map", version = "0.8.0-alpha" }
+llkv-csv = { path = "./llkv-csv", version = "0.8.0-alpha" }
+llkv-executor = { path = "./llkv-executor", version = "0.8.0-alpha" }
+llkv-expr = { path = "./llkv-expr", version = "0.8.0-alpha" }
+llkv-join = { path = "./llkv-join", version = "0.8.0-alpha" }
+llkv-plan = { path = "./llkv-plan", version = "0.8.0-alpha" }
+llkv-result = { path = "./llkv-result", version = "0.8.0-alpha" }
+llkv-runtime = { path = "./llkv-runtime", version = "0.8.0-alpha" }
+llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.0-alpha" }
+llkv-sql = { path = "./llkv-sql", version = "0.8.0-alpha" }
+llkv-storage = { path = "./llkv-storage", version = "0.8.0-alpha" }
+llkv-table = { path = "./llkv-table", version = "0.8.0-alpha" }
+llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.0-alpha" }
+llkv-transaction = { path = "./llkv-transaction", version = "0.8.0-alpha" }
 simd-r-drive = "0.15.5-alpha"
 simd-r-drive-entry-handle = "0.15.5-alpha"
 
 # Vendor crates
+# Note: A subset of these crates are used only for debug builds or examples;
+# they're listed here to keep workspace versions consistent.
 arrow = { version = "57.0.0", default-features = false, features = ["prettyprint", "ipc"] }
 arrow-array = { version = "57.0.0", default-features = false }
 arrow-ord = { version = "57.0.0", default-features = false }
@@ -35,6 +37,7 @@ async-trait = "0.1.89"
 bitcode = "0.6.7"
 criterion = "0.7.0"
 crossbeam-channel = "0.5.15"
+crossterm = "0.29.0"
 indoc = "2.0.7"
 libtest-mimic = "0.8"
 line-ending = "1.5.1"
@@ -75,6 +78,7 @@ members = [
     "llkv-storage",
     "llkv-table",
     "llkv-test-utils",
-    "llkv-transaction"
+    "llkv-transaction",
+    "demos/llkv-sql-pong-demo"
 ]
 resolver = "2"

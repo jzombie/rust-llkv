@@ -1,4 +1,4 @@
-use crate::SqlResult;
+use crate::{SqlResult, sql_engine::placeholder_marker, sql_engine::register_placeholder};
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
@@ -114,6 +114,10 @@ impl SqlValue {
             Value::Null => Ok(SqlValue::Null),
             Value::Number(text, _) => parse_number_literal(text),
             Value::Boolean(value) => Ok(SqlValue::Boolean(*value)),
+            Value::Placeholder(raw) => {
+                let index = register_placeholder(raw)?;
+                Ok(SqlValue::String(placeholder_marker(index)))
+            }
             other => {
                 if let Some(text) = other.clone().into_string() {
                     Ok(SqlValue::String(text))
