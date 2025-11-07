@@ -1,0 +1,301 @@
+{
+  "repo_notes": [
+    {
+      "content": "Arrow-Native SQL over Key-Value Storage for Rust"
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "Introduce the LLKV database system, explaining its purpose as a low-latency key-value store with SQL capabilities, and providing a high-level summary of its architecture and features",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Architecture",
+      "purpose": "Describe the overall system architecture, explaining the layered design and how components interact",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Workspace and Crates",
+      "purpose": "Detail the 15 crates in the workspace, their responsibilities, and dependencies between them",
+      "parent": "Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "SQL Query Processing Pipeline",
+      "purpose": "Explain the end-to-end flow from SQL text to results, covering parsing, planning, execution, and result formatting",
+      "parent": "Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Data Formats and Arrow Integration",
+      "purpose": "Explain how Apache Arrow is used throughout the system for columnar data representation",
+      "parent": "Architecture",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "SQL Interface",
+      "purpose": "Document the primary user-facing SQL interface, including the SqlEngine and how SQL statements are processed",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "SqlEngine API",
+      "purpose": "Detail the SqlEngine struct, its methods, and how to use it to execute SQL statements",
+      "parent": "SQL Interface",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "SQL Preprocessing and Dialect Handling",
+      "purpose": "Explain how SQL syntax is normalized and preprocessed before parsing, handling dialect-specific quirks",
+      "parent": "SQL Interface",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "INSERT Buffering System",
+      "purpose": "Describe the optimization that batches multiple INSERT statements for improved bulk insert performance",
+      "parent": "SQL Interface",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Query Planning",
+      "purpose": "Explain the query planning layer that converts SQL AST into executable plans",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Plan Structures",
+      "purpose": "Document the various plan types (SelectPlan, InsertPlan, etc.) and their structure",
+      "parent": "Query Planning",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Subquery and Correlation Handling",
+      "purpose": "Explain how correlated subqueries and scalar subqueries are planned and tracked",
+      "parent": "Query Planning",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Expression System",
+      "purpose": "Document the expression AST, translation, compilation, and evaluation systems",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Expression AST",
+      "purpose": "Detail the Expr and ScalarExpr types, including all variants and their semantics",
+      "parent": "Expression System",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Expression Translation",
+      "purpose": "Explain how expressions are translated from String column names to FieldId identifiers",
+      "parent": "Expression System",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Program Compilation",
+      "purpose": "Describe the compilation of expressions into EvalProgram and DomainProgram bytecode",
+      "parent": "Expression System",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Scalar Evaluation and NumericKernels",
+      "purpose": "Document the scalar expression evaluation engine, including vectorization and optimization",
+      "parent": "Expression System",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Aggregation System",
+      "purpose": "Explain aggregate function evaluation, accumulators, and distinct value tracking",
+      "parent": "Expression System",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Query Execution",
+      "purpose": "Document how query plans are executed to produce results",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "TablePlanner and TableExecutor",
+      "purpose": "Explain the table-level query planner and executor, including optimization paths",
+      "parent": "Query Execution",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Scan Execution and Optimization",
+      "purpose": "Detail the table scan execution flow, including fast paths and streaming strategies",
+      "parent": "Query Execution",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Filter Evaluation",
+      "purpose": "Explain how filter expressions are evaluated against rows, including MVCC filtering",
+      "parent": "Query Execution",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Storage Layer",
+      "purpose": "Document the columnar storage system and its interfaces",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Table Abstraction",
+      "purpose": "Detail the Table struct and its API for data operations",
+      "parent": "Storage Layer",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Column Storage and ColumnStore",
+      "purpose": "Explain the column-oriented storage layer and how data is physically stored",
+      "parent": "Storage Layer",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Pager Interface and SIMD Optimization",
+      "purpose": "Document the storage pager abstraction and SIMD-accelerated operations",
+      "parent": "Storage Layer",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Catalog and Metadata Management",
+      "purpose": "Explain the system catalog and metadata management infrastructure",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "CatalogManager API",
+      "purpose": "Document the CatalogManager's role in table lifecycle management",
+      "parent": "Catalog and Metadata Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "System Catalog and SysCatalog",
+      "purpose": "Explain how table and column metadata is stored in the system catalog",
+      "parent": "Catalog and Metadata Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    },
+    {
+      "title": "Custom Types and Type Registry",
+      "purpose": "Document the custom type system and how type aliases are managed",
+      "parent": "Catalog and Metadata Management",
+      "page_notes": [
+        {
+          "content": ""
+        }
+      ]
+    }
+  ]
+}
