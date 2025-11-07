@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "deepwiki": {
+      "url": "https://mcp.deepwiki.com/sse",
+      "type": "http"
+    }
+  },
+  "inputs": []
+}
