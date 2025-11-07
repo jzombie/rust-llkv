@@ -6,7 +6,9 @@
 
 **Work in Progress**
 
-LLKV is an experimental SQL database built as a Rust workspace. It layers Apache Arrow columnar storage, a streaming execution engine, and MVCC transaction management on top of generic key-value pagers. Development focuses on correctness, layered modularity, and end-to-end Arrow interoperability.
+LLKV is an experimental SQL database built as a Rust workspace. It layers Apache Arrow columnar storage, a streaming execution engine, and MVCC transaction management on top of generic key-value pagers.
+
+Arrow arrays are persisted as column chunks addressed by pager-managed physical keys, so backends that already expose zero-copy reads—such as [`simd-r-drive`](https://crates.io/crates/simd-r-drive)—can hand out contiguous buffers for SIMD-friendly scans. Development focuses on correctness, layered modularity, and end-to-end Arrow interoperability.
 
 ## Goals and Status
 

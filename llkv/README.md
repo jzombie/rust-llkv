@@ -8,11 +8,13 @@
 
 `llkv` is the primary entrypoint crate for the LLKV database toolkit. It provides both a command-line interface and a library that re-exports high-level APIs from the underlying workspace crates.
 
+Arrow column chunks are stored under pager-managed physical keys, so pagers that already offer zero-copy reads—like the SIMD-backed [`simd-r-drive`](https://crates.io/crates/simd-r-drive)—can return contiguous buffers that stay SIMD-friendly.
+
 ## Design Notes
 
 - Execution stays synchronous by default. Query workloads rely on hot-path parallelism from Rayon and Crossbeam instead of a global async runtime so scheduler costs stay predictable, while still embedding cleanly inside Tokio—the SLT harness uses Tokio to stage concurrent connection simulations.
-- Storage is built atop the [SIMD R Drive](https://crates.io/crates/simd-r-drive) project rather than Parquet, prioritizing fast point updates over integration with existing data lake tooling.
-- The crate shares Apache DataFusion's SQL parser and Arrow memory model but intentionally avoids Tokio. The goal is to explore how far a DataFusion-like stack can go without a task scheduler while still shipping MVCC transactions and sqllogictest coverage.
+- Storage is built atop the [simd-r-drive](https://crates.io/crates/simd-r-drive) project rather than Parquet, prioritizing fast point updates over integration with existing data lake tooling.
+- The crate shares Apache DataFusion's SQL parser and Arrow memory model but intentionally avoids Tokio. The goal is to explore how far a DataFusion-like stack can go without a task scheduler while still shipping MVCC transactions and [sqllogictest](https://sqlite.org/sqllogictest/doc/trunk/about.wiki) coverage.
 - LLKV remains alpha software. DataFusion offers a broader production footprint today, while this project trails new ideas for specialized workloads.
 
 ## Command-Line Interface
