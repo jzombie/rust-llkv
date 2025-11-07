@@ -2,23 +2,48 @@
 
 **Work in Progress**
 
-`llkv-sql` is the SQL interface for the [LLKV](../) toolkit.
+`llkv-sql` exposes `SqlEngine`, the primary entry point for executing SQL against the [LLKV](../) stack. It converts SQL text into typed plans, handles dialect quirks, batches insert workloads, and delegates execution to the runtime layer.
 
-## Purpose
+## Responsibilities
 
-- Parse SQL statements and convert them to execution plans.
-- Provide the primary user-facing interface for database operations.
-- Execute SQL with full transaction support via [`llkv-runtime`](../llkv-runtime/).
+- Parse SQL statements, translating source text to `sqlparser` ASTs and then to `llkv-plan` structures.
+- Provide user-facing APIs for ad-hoc queries (`sql`) and multi-statement execution (`execute`).
+- Manage SQL preprocessing so SQLite/DuckDB conveniences map cleanly onto `sqlparser` and the planner.
+- Coordinate with [`llkv-runtime`](../llkv-runtime/) for transaction control, MVCC visibility, and plan execution.
 
-## Design Notes
+## SqlEngine Highlights
 
-- Uses [sqlparser](https://crates.io/crates/sqlparser) for SQL parsing and AST generation.
-- Uses [sqllogictest](https://crates.io/crates/sqllogictest) for SQL testing.
-- Converts AST to execution plans and delegates to [`llkv-runtime`](../llkv-runtime/) for execution.
-- Returns results as Arrow `RecordBatch` instances for SELECT queries.
-- The runtime handles all operation types and coordinates with [`llkv-transaction`](../llkv-transaction/) for MVCC support.
-- Correlated subqueries reuse the shared [`llkv_plan::correlation`] utilities so that placeholder generation and column mapping logic remain centralized in the planning layer.
-- Scalar subqueries materialize into `SelectPlan::scalar_subqueries`, allowing the executor to bind correlated inputs without re-parsing SQL.
+- `SqlEngine::new` wires a pager-backed runtime; `SqlEngine::with_context` reuses an existing runtime session when embedding the engine.
+- `execute(&self, sql: &str)` accepts batches of statements, runs the preprocessing pipeline, parses each statement, manages the `InsertBuffer`, and returns `Vec<SqlStatementResult>`.
+- `sql(&self, sql: &str)` enforces single `SELECT` semantics and yields `Vec<RecordBatch>` produced by the executor.
+- `session(&self)` surfaces the underlying [`llkv-runtime::RuntimeSession`] for advanced transaction control.
+
+## SQL Preprocessing Pipeline
+
+The engine normalizes dialect-specific syntax before parsing:
+
+- Converts `CREATE TYPE` to `CREATE DOMAIN`, rewrites SQLite trigger shorthands, and patches `REINDEX` statements.
+- Expands SQLite `expr IN tablename` shorthands into `SELECT` subqueries so the planner sees a consistent AST.
+- Strips SQLite `INDEXED BY`/`NOT INDEXED` hints and removes trailing commas in `VALUES` clauses for DuckDB compatibility.
+- Handles `EXCLUDE` qualified names and other minor dialect mismatches to keep the rest of the stack parser-agnostic.
+
+## INSERT Buffering
+
+- Disabled by default; enable with `set_insert_buffering(true)` when bulk-loading data.
+- Buffers consecutive `INSERT ... VALUES` statements targeting the same table, columns, and conflict action to reduce planning churn.
+- Flush triggers include buffer size limits (8,192 rows), cross-table inserts, non-`INSERT` statements, explicit transaction boundaries, expectation hints, or manual `flush_pending_inserts()` calls.
+- The buffered rows coalesce into one `InsertPlan`, improving batch ingestion throughput without bypassing MVCC.
+
+## Transaction Support
+
+- Standard `BEGIN`, `COMMIT`, and `ROLLBACK` statements wire through the runtime to allocate or finalize MVCC snapshots.
+- Auto-commit mode executes each statement in its own transaction when no explicit transaction is active.
+- Result variants map to [`llkv-runtime`] statement outcomes, including `Select`, `Insert`, `Update`, `Delete`, and catalog DDL responses.
+
+## Testing Hooks
+
+- The SLT harness (`llkv-slt-tester`) uses `SqlEngine` via an `EngineHarness` that enables insert buffering and translates results to sqllogictest expectations.
+- Query-duration metrics (`LLKV_SLT_STATS=1`) surface per-statement timing when running sqllogictest workloads.
 
 ## License
 

@@ -2,22 +2,45 @@
 
 **Work in Progress**
 
-`llkv-transaction` provides transaction management and MVCC (Multi-Version Concurrency Control) for the [LLKV](../) toolkit.
+`llkv-transaction` implements the MVCC substrate used across the [LLKV](../) stack. It allocates transaction IDs, enforces snapshot isolation, and persists commit metadata so row visibility stays deterministic.
 
-## Purpose
+## Responsibilities
 
-- Implement snapshot isolation using MVCC semantics.
-- Allocate and track transaction IDs with commit/abort status.
-- Provide transaction context for coordinating operations across [`llkv-runtime`](../llkv-runtime/).
-- Enforce row visibility rules based on transaction snapshots.
+- Allocate monotonic `TxnId`s and expose the current `last_committed` watermark.
+- Capture `TransactionSnapshot`s for sessions so every statement runs against a consistent view.
+- Track commit, abort, and rollback status for active transactions.
+- Surface MVCC visibility rules to higher layers through helpers that evaluate `created_by` and `deleted_by` metadata.
 
-## Design Notes
+## MVCC Metadata Columns
 
-- Each transaction operates with a consistent snapshot determined by its transaction ID and snapshot timestamp.
-- Row versioning tracks when each row was created and deleted via `created_by` and `deleted_by` columns stored in [`llkv-table`](../llkv-table/).
-- The transaction manager (`TxnIdManager`) allocates monotonic transaction IDs and tracks their commit status.
-- Transactions see a consistent view of data as of their start time, preventing read anomalies.
-- Used by [`llkv-runtime`](../llkv-runtime/) to coordinate session-level transactions and by [`llkv-executor`](../llkv-executor/) for visibility filtering during SELECT queries.
+- Each table automatically manages three hidden columns stored by [`llkv-table`](../llkv-table/) and [`llkv-column-map`](../llkv-column-map/):
+	- `row_id`: monotonically increasing identifier assigned during inserts.
+	- `created_by`: `TxnId` that wrote the row.
+	- `deleted_by`: `TxnId` that removed the row, or `TXN_ID_NONE` if the row is visible.
+- Visibility is determined by comparing these columns against the transaction snapshot (`snapshot_id`) and the current transaction identifier.
+
+## Snapshot Isolation Rules
+
+A row is visible to transaction `T` with snapshot `S` when:
+
+- `created_by <= S.last_committed`
+- `deleted_by == TXN_ID_NONE` or `deleted_by > S.last_committed`
+- `deleted_by != T.txn_id`
+
+These rules implement snapshot isolation with optimistic conflict detection at commit.
+
+## Transaction Lifecycle
+
+- `begin_transaction` captures the current watermark, allocates a new `TxnId`, and freezes a catalog snapshot for schema stability.
+- `commit_transaction` performs conflict detection (write/write conflicts, dropped tables, DDL races), replays staged operations, and persists the updated watermark.
+- `rollback_transaction` discards staged operations and leaves persistent data untouched so uncommitted changes never leak.
+- Auto-commit mode uses `TXN_ID_AUTO_COMMIT` to run single statements without replay.
+
+## Integration
+
+- Embedded by [`llkv-runtime`](../llkv-runtime/) for session control and MVCC metadata injection.
+- Works with [`llkv-table`](../llkv-table/) scans to filter rows according to snapshot visibility.
+- Supports the SQLogic Test harness and benchmarking flows by exposing stats hooks consumed through runtime APIs.
 
 ## License
 

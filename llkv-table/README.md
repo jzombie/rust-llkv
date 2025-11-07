@@ -2,22 +2,37 @@
 
 **Work in Progress**
 
-Columnar table using the [LLKV](../) toolkit.
+`llkv-table` provides the schema-aware table abstraction that sits between SQL plans and the column store. It accepts Arrow `RecordBatch`es, coordinates catalog metadata, and exposes streaming scan APIs used by the runtime and executor layers.
 
-This crate is designed to work directly with Arrow `RecordBatch` and does not provide any additional abstraction over the batch data model beyond how batches are queried and streamed. Data is fed into tables and retrieved from tables as batches of `RecordBatch`.
+## Responsibilities
 
-## Purpose
+- Persist table definitions and column metadata through the system catalog (table `0`).
+- Validate Arrow schemas during `CREATE TABLE` and append operations.
+- Inject and maintain MVCC columns (`row_id`, `created_by`, `deleted_by`) alongside user data.
+- Translate logical field requests into `ColumnStore` lookups and stream Arrow batches back to callers.
 
-- Provide schema-aware table abstraction built on [`llkv-column-map`](../llkv-column-map/) columnar storage.
-- Manage table metadata via the system catalog (table 0).
-- Handle MVCC columns (`created_by`, `deleted_by`) for transaction support.
-- Support table scans with projection, filtering, and ordering.
+## ColumnStore Integration
 
-## Design Notes
+- Tables wrap an `Arc<ColumnStore>` from [`llkv-column-map`](../llkv-column-map/); `ColumnStore::append` handles sorting by `row_id`, last-writer-wins rewrites, and pager commits.
+- Logical fields are namespaced to segregate user data, MVCC bookkeeping, and row-id shadows.
+- `Table::append` performs schema validation, prepares MVCC metadata, and forwards the batch to the column store for persistence.
+- `Table::scan_stream` projects requested columns, applies predicate pushdown via `ColumnStream`, and yields fixed-size batches to avoid buffering entire results.
 
-- Tables use [`llkv-column-map`](../llkv-column-map/) for physical storage but add schema validation and field ID tracking.
-- Integrates with [`llkv-transaction`](../llkv-transaction/) for row-level visibility filtering.
-- Used by [`llkv-runtime`](../llkv-runtime/) for executing SQL operations and by [`llkv-executor`](../llkv-executor/) for SELECT queries.
+## Catalog and Metadata
+
+- `SysCatalog` (table `0`) stores `TableMeta` and `ColMeta` entries that describe user tables.
+- Metadata changes (create, alter, drop) flow through the runtime and land in the catalog via the same Arrow append path, preserving crash consistency.
+
+## MVCC Visibility
+
+- Scan operations cooperate with [`llkv-transaction`](../llkv-transaction/) to filter rows based on transaction snapshots.
+- Hidden MVCC columns remain present in storage; higher layers decide whether to expose them to callers.
+
+## Usage in the Stack
+
+- [`llkv-runtime`](../llkv-runtime/) uses tables for all DML and DDL operations.
+- [`llkv-executor`](../llkv-executor/) relies on `Table::scan_stream` during `SELECT` evaluation, including joins and aggregations.
+- Bulk ingestion paths (e.g., INSERT buffering) ultimately append Arrow batches through this crate, ensuring durability and MVCC tagging remain centralized.
 
 ## License
 
