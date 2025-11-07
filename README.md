@@ -18,6 +18,14 @@ Arrow arrays are persisted as column chunks addressed by pager-managed physical 
 - Maintain a portable test harness with SQL Logic Tests and multi-OS CI coverage.
 - Status: active WIP; core data layout, planner, runtime, and SLT harness are under construction.
 
+## Using the Toolkit
+
+- Navigate to [llkv/](./llkv/) for the workspace entrypoint. That crate houses the CLI binary and the high-level library surface.
+- From the workspace root run `cargo run -p llkv` for the REPL, or `cargo run -p llkv -- --help` to see additional modes.
+- See [llkv/README.md](./llkv/README.md) for installation flags, persistent pager setup, and API examples.
+
+There's also a [`demos/`](./demos/) directory. Those projects are closer to publishable showcases than quick-start snippets, so they live alongside (and in addition to) crate-specific `examples/` trees.
+
 ## Design Tradeoffs
 
 - Synchronous execution is the default. Hot paths lean on Rayon work-stealing and Crossbeam coordination instead of a pervasive async runtime so individual queries can keep scheduler overhead low, yet the engine still embeds cleanly inside Tokio—our SQL Logic Test runner spins up a Tokio runtime to simulate concurrent connections.
