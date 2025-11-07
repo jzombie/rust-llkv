@@ -1,7 +1,8 @@
 # LLKV: Arrow-Native SQL over Key-Value Storage
 
-[![CodSpeed Badge](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/jzombie/rust-llkv)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jzombie/rust-llkv)
+[![made-with-rust][rust-logo]][rust-src-page]
+[![CodSpeed Badge][codspeed-badge]][codspeed-page]
+[![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
 
 **Work in Progress**
 
@@ -26,7 +27,7 @@ The workspace is organized into six layers; higher layers depend on the ones bel
 - **Table and Metadata** (`llkv-table`, `llkv-column-map`): Adds schema-aware table APIs, system catalog management, and logical field tracking atop the column store.
 - **Storage and I/O** (`llkv-storage`, `simd-r-drive`): Provides the `Pager` trait and concrete backends for zero-copy reads with SIMD-friendly alignment.
 
-See [dev-docs/high-level-crate-linkage.md](./dev-docs/high-level-crate-linkage.md) and the [DeepWiki Architecture](https://deepwiki.com/jzombie/rust-llkv) page for dependency details.
+See [dev-docs/high-level-crate-linkage.md](./dev-docs/high-level-crate-linkage.md) and the [DeepWiki Architecture][deepwiki-page] page for dependency details.
 
 ## End-to-End Query Flow
 
@@ -67,3 +68,12 @@ See [dev-docs/high-level-crate-linkage.md](./dev-docs/high-level-crate-linkage.m
 ## License
 
 Licensed under the [Apache-2.0 License](./LICENSE).
+
+[rust-src-page]: https://www.rust-lang.org/
+[rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[codspeed-page]: https://codspeed.io/jzombie/rust-llkv
+[codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json
+
+[deepwiki-page]: https://deepwiki.com/jzombie/rust-llkv
+[deepwiki-badge]: https://deepwiki.com/badge.svg
