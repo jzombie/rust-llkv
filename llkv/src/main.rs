@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
-use llkv::{storage::MemPager, Error as LlkvError, RuntimeStatementResult, SqlEngine};
+use llkv::{Error as LlkvError, RuntimeStatementResult, SqlEngine, storage::MemPager};
 use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
 
 fn print_banner() {
