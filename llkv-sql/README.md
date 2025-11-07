@@ -1,5 +1,9 @@
 # LLKV SQL
 
+[![made-with-rust][rust-logo]][rust-src-page]
+[![CodSpeed Badge][codspeed-badge]][codspeed-page]
+[![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
+
 **Work in Progress**
 
 `llkv-sql` exposes `SqlEngine`, the primary entry point for executing SQL against the [LLKV](../) stack. It converts SQL text into typed plans, handles dialect quirks, batches insert workloads, and delegates execution to the runtime layer.
@@ -48,3 +52,12 @@ The engine normalizes dialect-specific syntax before parsing:
 ## License
 
 Licensed under the [Apache-2.0 License](../LICENSE).
+
+[rust-src-page]: https://www.rust-lang.org/
+[rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[codspeed-page]: https://codspeed.io/jzombie/rust-llkv
+[codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json
+
+[deepwiki-page]: https://deepwiki.com/jzombie/rust-llkv
+[deepwiki-badge]: https://deepwiki.com/badge.svg

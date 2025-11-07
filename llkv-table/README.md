@@ -1,5 +1,9 @@
 # LLKV Table
 
+[![made-with-rust][rust-logo]][rust-src-page]
+[![CodSpeed Badge][codspeed-badge]][codspeed-page]
+[![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
+
 **Work in Progress**
 
 `llkv-table` provides the schema-aware table abstraction that sits between SQL plans and the column store. It accepts Arrow `RecordBatch`es, coordinates catalog metadata, and exposes streaming scan APIs used by the runtime and executor layers.
@@ -37,3 +41,12 @@
 ## License
 
 Licensed under the [Apache-2.0 License](../LICENSE).
+
+[rust-src-page]: https://www.rust-lang.org/
+[rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[codspeed-page]: https://codspeed.io/jzombie/rust-llkv
+[codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json
+
+[deepwiki-page]: https://deepwiki.com/jzombie/rust-llkv
+[deepwiki-badge]: https://deepwiki.com/badge.svg
