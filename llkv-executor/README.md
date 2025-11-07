@@ -1,32 +1,43 @@
 # LLKV Executor
 
+[![made-with-rust][rust-logo]][rust-src-page]
+[![CodSpeed Badge][codspeed-badge]][codspeed-page]
+[![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
+
 **Work in Progress**
 
-`llkv-executor` is the query execution engine for the [LLKV](../) toolkit.
+`llkv-executor` evaluates `SELECT` plans for the [LLKV](../) stack. It produces streaming Arrow `RecordBatch`es, coordinating with table scans, joins, and aggregation primitives while remaining oblivious to transaction orchestration.
 
-## Purpose
+## Responsibilities
 
-- Execute **SELECT queries only** over table data with projection, filtering, and ordering.
-- Provide streaming query results via RecordBatch iterators.
-- Integrate with [`llkv-runtime`](../llkv-runtime/) for transaction-aware query execution.
+- Execute logical `SelectPlan`s emitted by [`llkv-plan`](../llkv-plan/) and dispatched by [`llkv-runtime`](../llkv-runtime/).
+- Stream `RecordBatch` results through callbacks so callers can consume output incrementally.
+- Evaluate projection, filtering, scalar expressions, aggregation, and join operations over Arrow arrays.
+- Integrate with the table layer for predicate pushdown and efficient column gathering.
 
-## Executor vs Runtime
+## Execution Pipeline
 
-The **executor** ([llkv-executor](../llkv-executor/)) and **runtime** ([llkv-runtime](../llkv-runtime/)) serve different purposes:
+- `TableExecutor` builds a `RowStreamBuilder`, fetching projected columns via [`llkv-table`](../llkv-table/) and combining them with computed expressions.
+- Filter evaluation uses vectorized expression kernels to avoid per-row branching; scalar subqueries bind correlated values supplied by the planner.
+- Aggregations delegate to [`llkv-aggregate`](../llkv-aggregate/) for grouped and streaming operations.
+- Joins rely on [`llkv-join`](../llkv-join/) implementations such as hash joins optimized for primitive key pairs.
+- Results are emitted as soon as a batch is available, preventing full result materialization.
 
-- **Executor**: Low-level query evaluation engine that **only handles SELECT queries**. It takes a SELECT plan and produces streaming Arrow RecordBatch results. The executor knows nothing about transactions, MVCC metadata, or other SQL operations (INSERT, UPDATE, DELETE, CREATE TABLE).
+## Interaction with the Runtime
 
-- **Runtime**: High-level orchestration layer that handles **all SQL operations**, manages transactions, injects MVCC metadata, and coordinates between storage and execution layers. The runtime invokes the executor for SELECT operations.
-
-In short: **Executor = SELECT-only query engine** | **Runtime = Full SQL coordinator**
-
-## Design Notes
-
-- The executor works with Arrow `RecordBatch` data and integrates with [`llkv-table`](../llkv-table/) scanning primitives.
-- Query execution is designed for streaming results to avoid materializing entire result sets in memory.
-- Invoked by [`llkv-runtime`](../llkv-runtime/) which provides the transaction context for row visibility filtering.
-- Scalar subqueries run through the same evaluation pipeline as other scalar expressions, using planner-supplied correlated column placeholders to pull outer values during execution.
+- Invoked exclusively by [`llkv-runtime`](../llkv-runtime/), which provides transaction context and MVCC-filtered row streams.
+- Receives already-validated plans; error handling focuses on execution-time failures (e.g., overflow, unsupported expression forms).
+- Remains agnostic to DDL/DML responsibilities so it can focus on efficient batch processing.
 
 ## License
 
 Licensed under the [Apache-2.0 License](../LICENSE).
+
+[rust-src-page]: https://www.rust-lang.org/
+[rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[codspeed-page]: https://codspeed.io/jzombie/rust-llkv
+[codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json
+
+[deepwiki-page]: https://deepwiki.com/jzombie/rust-llkv
+[deepwiki-badge]: https://deepwiki.com/badge.svg

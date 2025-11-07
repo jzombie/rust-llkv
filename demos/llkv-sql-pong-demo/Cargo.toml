@@ -1,0 +1,19 @@
+[package]
+name = "llkv-sql-pong-demo"
+description = "Watch a terminal play pong against itself using the LLKV SQL engine in a game loop. Mainly for perf evaluation."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow.workspace = true
+crossterm.workspace = true
+indoc.workspace = true
+llkv-result.workspace = true
+llkv-sql.workspace = true
+llkv-storage.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true

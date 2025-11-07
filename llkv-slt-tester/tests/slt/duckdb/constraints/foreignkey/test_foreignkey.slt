@@ -74,12 +74,16 @@ SELECT * FROM album;
 2	B	B_cover	
 3	C	C_cover
 
+# Note: Added ORDER BY songid for deterministic results. The original test expected a specific
+# row order without ORDER BY, which is not guaranteed by SQL standard. Updated expected results
+# to match sorted order by primary identifier (songid).
 query IITT
-SELECT * FROM song;
+SELECT * FROM song ORDER BY songid;
 ----
 11	1	A	A_song	
-13	3	C	C_song	
 12	1	A	B_song	
+13	3	C	C_song	
+
 
 # Any row that is updated from the table with primary key must not exist in the table has foreign key (constraint)
 statement error
@@ -93,8 +97,11 @@ UPDATE song SET songalbum='E' WHERE albumcover='C_song';
 statement ok
 UPDATE album SET artistid=5, albumname='D' WHERE albumcover='B_cover';
 
+# Note: Added ORDER BY artistid for deterministic results. The original test expected a specific
+# row order without ORDER BY, which is not guaranteed by SQL standard. Updated expected results
+# to match sorted order by primary identifier (artistid).
 query ITT
-SELECT * FROM album;
+SELECT * FROM album ORDER BY artistid;
 ----
 1	A	A_cover
 3	C	C_cover

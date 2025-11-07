@@ -3,11 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
-use llkv_result::Error as LlkvError;
-use llkv_runtime::RuntimeStatementResult;
+use llkv::{Error as LlkvError, RuntimeStatementResult, SqlEngine, storage::MemPager};
 use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
-use llkv_sql::SqlEngine;
-use llkv_storage::pager::MemPager;
 
 fn print_banner() {
     // Use Cargo package metadata baked into the binary at compile time

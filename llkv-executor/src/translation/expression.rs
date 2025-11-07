@@ -381,6 +381,7 @@ where
             }
             Ok(ScalarExpr::Coalesce(translated_items))
         }
+        ScalarExpr::Random => Ok(ScalarExpr::Random),
         ScalarExpr::ScalarSubquery(subquery) => Ok(ScalarExpr::ScalarSubquery(subquery.clone())),
     }
 }

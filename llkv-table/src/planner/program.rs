@@ -695,6 +695,9 @@ fn collect_fields<'expr>(
                     stack.push(item);
                 }
             }
+            ScalarExpr::Random => {
+                // Random does not reference any fields
+            }
             ScalarExpr::ScalarSubquery(_) => {
                 // Scalar subqueries are resolved separately at planning time
             }

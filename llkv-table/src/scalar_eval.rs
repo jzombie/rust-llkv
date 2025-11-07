@@ -427,6 +427,9 @@ impl NumericKernels {
                     Self::collect_fields(item, acc);
                 }
             }
+            ScalarExpr::Random => {
+                // Random does not reference any fields
+            }
             ScalarExpr::ScalarSubquery(_) => {
                 // Scalar subqueries don't directly reference fields from the outer query
             }
@@ -564,6 +567,7 @@ impl NumericKernels {
                 }
                 Ok(None)
             }
+            ScalarExpr::Random => Ok(Some(NumericValue::Float(rand::random::<f64>()))),
             ScalarExpr::ScalarSubquery(_) => Err(Error::Internal(
                 "Scalar subquery evaluation requires a separate execution context".into(),
             )),
@@ -678,6 +682,14 @@ impl NumericKernels {
             }
             ScalarExpr::Case { .. } => Ok(None),
             ScalarExpr::Coalesce(_) => Ok(None),
+            ScalarExpr::Random => {
+                // Generate array of random float values
+                let values: Vec<f64> = (0..len).map(|_| rand::random::<f64>()).collect();
+                let array = Float64Array::from(values);
+                Ok(Some(VectorizedExpr::Array(NumericArray::from_float(
+                    Arc::new(array),
+                ))))
+            }
             ScalarExpr::ScalarSubquery(_) => Ok(None),
         }
     }
@@ -874,7 +886,8 @@ impl NumericKernels {
             ScalarExpr::Column(_)
             | ScalarExpr::Literal(_)
             | ScalarExpr::Aggregate(_)
-            | ScalarExpr::GetField { .. } => expr.clone(),
+            | ScalarExpr::GetField { .. }
+            | ScalarExpr::Random => expr.clone(),
             ScalarExpr::Binary { left, op, right } => {
                 let left_s = Self::simplify(left);
                 let right_s = Self::simplify(right);
@@ -1069,6 +1082,7 @@ impl NumericKernels {
             ScalarExpr::Cast { expr, .. } => Self::affine_state(expr),
             ScalarExpr::Case { .. } => None,
             ScalarExpr::Coalesce(_) => None,
+            ScalarExpr::Random => None,
             ScalarExpr::ScalarSubquery(_) => None,
         }
     }
@@ -1426,6 +1440,7 @@ impl NumericKernels {
                 }
                 result_kind
             }
+            ScalarExpr::Random => NumericKind::Float,
             ScalarExpr::ScalarSubquery(_) => NumericKind::Float,
         }
     }
@@ -1488,6 +1503,7 @@ impl NumericKernels {
                 }
                 Some(result_kind)
             }
+            ScalarExpr::Random => Some(NumericKind::Float),
             ScalarExpr::ScalarSubquery(_) => Some(NumericKind::Float),
         }
     }

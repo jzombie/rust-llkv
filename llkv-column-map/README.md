@@ -1,47 +1,57 @@
 # LLKV Column Map
 
+[![made-with-rust][rust-logo]][rust-src-page]
+[![CodSpeed Badge][codspeed-badge]][codspeed-page]
+[![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
+
 **Work in Progress**
 
-This crate provides low-level columnar mapping for the [LLKV](../) toolkit.
+`llkv-column-map` implements the `ColumnStore`, the Arrow-native columnar storage engine for the [LLKV](../) stack. It maps logical fields to pager-managed physical chunks, enabling efficient scans, appends, and MVCC bookkeeping.
 
-It's used by [`llkv-table`](../llkv-table/) as an interface into the lower-level [`llkv-storage`](../llkv-storage/) pagers.
+## Responsibilities
 
-## Key features
+- Persist Arrow `RecordBatch`es by chunking columns into pager-backed blobs.
+- Maintain the column catalog that maps `LogicalFieldId` to the physical keys storing metadata and data pages.
+- Provide gather, scan, and append APIs used by [`llkv-table`](../llkv-table/) and the executor layer.
 
-- Low-level columnar mapping used by `llkv-table` and backed by `llkv-storage` pagers.
-- Efficient physical/logical key separation for batched writes and compact storage layout.
-- Scanning and gather APIs with pagination and configurable null-handling for column-oriented consumers.
-- Parallel scan/filter paths with Rayon where parallelism is capped by `LLKV_MAX_THREADS`.
+## Logical vs Physical Keys
 
-## Technical details
+- `LogicalFieldId` encodes namespace (user data, row-id shadow, MVCC metadata), table ID, and field ID to avoid collisions across tables.
+- Physical keys are `u64` identifiers allocated by the pager; catalog entries track which physical keys hold descriptors, data, and row-id segments.
+- Namespaces keep MVCC columns (`TxnCreatedBy`, `TxnDeletedBy`) and user columns isolated while still sharing the same physical store.
 
-- Physical/logical key separation: batched writes of many logical keys can consume far fewer physical keys than writing directly to storage keys.
-- Logical keys are namespaced per field.
-- Physical keys used by the pager are 64-bit integers (`u64`) — keys are numeric rather than arbitrary variable-width bytes.
-- Values may be variable- or fixed-width depending on the chosen encoding.
-- Logical key and value segment pruning.
-- Scanning iterator can iterate over keys or values without maintaining a separate reverse index.
-- Supports scanning iterator pagination.
-- Parallel scan/filter paths honor the `LLKV_MAX_THREADS` environment variable to cap Rayon worker utilization when needed.
-- Configurable gather null-handling policies (preserve, error, or drop missing/null rows) for column-oriented consumers.
-- `Graphviz` (`.dot`) visualization generation (see [examples/visualize.rs](examples/visualize.rs)) for illustrative purposes and debugging.
+## Append Pipeline
 
-## Testing
+- `ColumnStore::append` validates `RecordBatch` schemas, ensures `row_id` ordering, and applies last-writer-wins rewrites when incoming data updates existing rows.
+- New data and row-id chunks are staged and committed atomically through the pager, guaranteeing crash consistency.
+- MVCC metadata columns are appended alongside user columns so visibility checks remain centralized in storage.
 
-Some large (expensive) tests are marked `#[ignore]` by default.
+## Scan and Gather APIs
 
-### Quick Start
+- `ColumnStream` supports projection, filtering, and pagination for streaming reads.
+- Gather operations offer configurable null-handling policies (preserve, error, drop) to accommodate different executor strategies.
+- Parallel scan paths use Rayon; concurrency is bounded by the `LLKV_MAX_THREADS` environment variable when present.
 
-```sh
-cargo test
-```
+## Pager Integration
 
-### Run everything (including ignored)
+- Relies on the `Pager` trait from [`llkv-storage`](../llkv-storage/) for batch get/put operations.
+- Works with both `MemPager` (in-memory) and persistent pagers such as `SimdRDrivePager`, which deliver zero-copy, SIMD-aligned reads.
+- On open, the store loads its catalog from the pager root key or initializes an empty catalog if none exists.
 
-```sh
-cargo test -- --include-ignored
-```
+## Tooling and Testing
+
+- Provides a Graphviz export (`examples/visualize.rs`) for introspecting catalog state.
+- Some large or integration-heavy tests are marked `#[ignore]`; run them with `cargo test -- --include-ignored` when needed.
 
 ## License
 
 Licensed under the [Apache-2.0 License](../LICENSE).
+
+[rust-src-page]: https://www.rust-lang.org/
+[rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[codspeed-page]: https://codspeed.io/jzombie/rust-llkv
+[codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json
+
+[deepwiki-page]: https://deepwiki.com/jzombie/rust-llkv
+[deepwiki-badge]: https://deepwiki.com/badge.svg

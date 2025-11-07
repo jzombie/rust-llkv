@@ -1,33 +1,58 @@
 # LLKV Runtime
 
+[![made-with-rust][rust-logo]][rust-src-page]
+[![CodSpeed Badge][codspeed-badge]][codspeed-page]
+[![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
+
 **Work in Progress**
 
-`llkv-runtime` is an orchestrator for [llkv-table](../llkv-table/) and provides the execution runtime for the [LLKV](../) toolkit.
+`llkv-runtime` coordinates the end-to-end execution of SQL statements for the [LLKV](../) stack. It bridges plans, storage, and MVCC so the higher-level SQL engine can remain stateless.
 
-## Purpose
+## Responsibilities
 
-- Coordinate between the [transaction layer](../llkv-transaction/), [storage layer](../llkv-table/), and [query executor](../llkv-executor/).
-- Execute SQL operations (CREATE TABLE, INSERT, UPDATE, DELETE, SELECT) with full transaction support.
-- Manage MVCC metadata injection for all data modifications.
-- Provide session-level transaction management (auto-commit and multi-statement transactions).
+- Execute all statement types (DDL, DML, transaction control, and queries) using the lower-layer crates.
+- Inject and maintain MVCC columns (`row_id`, `created_by`, `deleted_by`) across every mutation.
+- Manage session lifecycle, namespaces, and transaction snapshots for both auto-commit and explicit transactions.
+- Orchestrate plan evaluation by invoking [`llkv-executor`](../llkv-executor/) for streaming `SELECT` workloads while handling side effects elsewhere.
 
-## Runtime vs Executor
+## Transaction Model
 
-The **runtime** ([llkv-runtime](../llkv-runtime/)) and **executor** ([llkv-executor](../llkv-executor/)) serve different purposes:
+- Built on [`llkv-transaction`](../llkv-transaction/) to allocate monotonic transaction IDs and track commit watermarks.
+- Sessions capture a `TransactionSnapshot` at `BEGIN`; visibility rules follow MVCC snapshot isolation.
+- Auto-commit statements run with `TXN_ID_AUTO_COMMIT = 1`, observing the latest committed snapshot without staging.
+- Explicit transactions maintain a durable catalog snapshot and replay staging operations on commit after conflict checks.
 
-- **Runtime**: High-level orchestration layer that handles **all SQL operations**, manages transactions, injects MVCC metadata, and coordinates between storage and execution layers. Used by [`llkv-sql`](../llkv-sql/) to execute complete SQL statements.
+## Dual-Context Execution
 
-- **Executor**: Low-level query evaluation engine that **only handles SELECT queries**. It takes a SELECT plan and produces streaming Arrow `RecordBatch` results. The executor is invoked by the runtime for SELECT operations but knows nothing about transactions, MVCC metadata, or other SQL operations.
+- Each active transaction holds two runtime contexts:
+	- **Persistent context (`RuntimeContext<BoxedPager>`)**: Operates on existing tables directly, tagging all writes with MVCC metadata.
+	- **Staging context (`RuntimeContext<MemPager>`)**: Buffers tables created inside the transaction so they remain isolated until commit.
+- On commit the runtime replays staged operations into the persistent context after [`TxnIdManager`] confirms the commit and advances the global watermark.
+- Rollback drops the staging context and clears tracked operations, so uncommitted objects never leak.
 
-In short: **Runtime = Full SQL coordinator** | **Executor = SELECT-only query engine**
+## Statement Dispatch
 
-## Design Notes
+- The runtime routes statements produced by [`llkv-plan`](../llkv-plan/) into subsystem-specific executors:
+	- `SELECT` plans stream through [`llkv-executor`](../llkv-executor/), returning Arrow `RecordBatch`es.
+	- Mutations append Arrow batches via [`llkv-table`](../llkv-table/) which delegates to [`llkv-column-map`](../llkv-column-map/).
+	- Catalog updates leverage the system catalog (`SysCatalog`, table 0) to persist schema metadata alongside user data.
+- Result reporting uses enums in [`llkv-result`](../llkv-result/) so callers receive structured responses (`Select`, `Insert`, `CreateTable`, etc.).
 
-- The runtime automatically injects MVCC columns (`row_id`, `created_by`, `deleted_by`) for all data operations.
-- Supports both auto-commit (single-statement) and explicit BEGIN/COMMIT/ROLLBACK transactions.
-- Integrates with [`llkv-transaction`](../llkv-transaction/) for snapshot isolation and visibility filtering.
-- Delegates SELECT query evaluation to [`llkv-executor`](../llkv-executor/) while handling transaction context.
+## Integration Points
+
+- Consumed by [`llkv-sql`](../llkv-sql/) to power `SqlEngine` APIs.
+- Supplies the session handle returned by `SqlEngine::session()` for advanced transaction control.
+- Provides helper hooks used by the SLT harness to expose detailed query statistics when `LLKV_SLT_STATS=1` is set.
 
 ## License
 
 Licensed under the [Apache-2.0 License](../LICENSE).
+
+[rust-src-page]: https://www.rust-lang.org/
+[rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[codspeed-page]: https://codspeed.io/jzombie/rust-llkv
+[codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json
+
+[deepwiki-page]: https://deepwiki.com/jzombie/rust-llkv
+[deepwiki-badge]: https://deepwiki.com/badge.svg

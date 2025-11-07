@@ -135,6 +135,11 @@ pub enum ScalarExpr<F> {
         /// Optional ELSE result.
         else_expr: Option<Box<ScalarExpr<F>>>,
     },
+    /// Random number generator returning a float in [0.0, 1.0).
+    ///
+    /// Follows the PostgreSQL/DuckDB standard: each evaluation produces a new
+    /// pseudo-random value. No seed control is exposed at the SQL level.
+    Random,
 }
 
 /// Aggregate function call within a scalar expression.
@@ -254,6 +259,11 @@ impl<F> ScalarExpr<F> {
             branches,
             else_expr: else_expr.map(Box::new),
         }
+    }
+
+    #[inline]
+    pub fn random() -> Self {
+        Self::Random
     }
 }
 

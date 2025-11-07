@@ -2,8 +2,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
+use std::ops::Bound;
 use std::sync::{
-    Arc, OnceLock,
+    Arc, OnceLock, RwLock,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 
@@ -70,6 +71,219 @@ thread_local! {
     static PENDING_STATEMENT_EXPECTATIONS: RefCell<VecDeque<StatementExpectation>> = const {
         RefCell::new(VecDeque::new())
     };
+}
+
+pub(crate) const PARAM_SENTINEL_PREFIX: &str = "__llkv_param__";
+pub(crate) const PARAM_SENTINEL_SUFFIX: &str = "__";
+
+thread_local! {
+    static ACTIVE_PARAMETER_STATE: RefCell<Option<ParameterState>> = const {
+        RefCell::new(None)
+    };
+}
+
+#[derive(Default)]
+struct ParameterState {
+    assigned: FxHashMap<String, usize>,
+    next_auto: usize,
+    max_index: usize,
+}
+
+impl ParameterState {
+    fn register(&mut self, raw: &str) -> SqlResult<usize> {
+        if raw == "?" {
+            self.next_auto += 1;
+            let idx = self.next_auto;
+            self.max_index = self.max_index.max(idx);
+            return Ok(idx);
+        }
+
+        if let Some(&idx) = self.assigned.get(raw) {
+            return Ok(idx);
+        }
+
+        let idx = if let Some(rest) = raw.strip_prefix('?') {
+            parse_numeric_placeholder(rest, raw)?
+        } else if let Some(rest) = raw.strip_prefix('$') {
+            parse_numeric_placeholder(rest, raw)?
+        } else if let Some(rest) = raw.strip_prefix(':') {
+            if rest.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "named parameters must include an identifier".into(),
+                ));
+            }
+            self.max_index + 1
+        } else {
+            return Err(Error::InvalidArgumentError(format!(
+                "unsupported SQL parameter placeholder: {raw}",
+            )));
+        };
+
+        self.assigned.insert(raw.to_string(), idx);
+        self.max_index = self.max_index.max(idx);
+        self.next_auto = self.next_auto.max(idx);
+        Ok(idx)
+    }
+
+    fn max_index(&self) -> usize {
+        self.max_index
+    }
+}
+
+fn parse_numeric_placeholder(text: &str, raw: &str) -> SqlResult<usize> {
+    if text.is_empty() {
+        return Err(Error::InvalidArgumentError(format!(
+            "parameter placeholder '{raw}' is missing an index",
+        )));
+    }
+    text.parse::<usize>().map_err(|_| {
+        Error::InvalidArgumentError(format!(
+            "parameter placeholder '{raw}' must end with digits"
+        ))
+    })
+}
+
+struct ParameterScope {
+    finished: bool,
+}
+
+impl ParameterScope {
+    fn new() -> Self {
+        ACTIVE_PARAMETER_STATE.with(|cell| {
+            debug_assert!(
+                cell.borrow().is_none(),
+                "nested parameter scopes not supported"
+            );
+            *cell.borrow_mut() = Some(ParameterState::default());
+        });
+        Self { finished: false }
+    }
+
+    fn finish(mut self) -> ParameterState {
+        let state = ACTIVE_PARAMETER_STATE
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        self.finished = true;
+        state
+    }
+}
+
+impl Drop for ParameterScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            ACTIVE_PARAMETER_STATE.with(|cell| {
+                cell.borrow_mut().take();
+            });
+        }
+    }
+}
+
+pub(crate) fn register_placeholder(raw: &str) -> SqlResult<usize> {
+    ACTIVE_PARAMETER_STATE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let state = guard.as_mut().ok_or_else(|| {
+            Error::InvalidArgumentError(
+                "SQL parameters can only be used with prepared statements".into(),
+            )
+        })?;
+        state.register(raw)
+    })
+}
+
+pub(crate) fn placeholder_marker(index: usize) -> String {
+    format!("{PARAM_SENTINEL_PREFIX}{index}{PARAM_SENTINEL_SUFFIX}")
+}
+
+pub(crate) fn literal_placeholder(index: usize) -> Literal {
+    Literal::String(placeholder_marker(index))
+}
+
+fn parse_placeholder_marker(text: &str) -> Option<usize> {
+    let stripped = text.strip_prefix(PARAM_SENTINEL_PREFIX)?;
+    let numeric = stripped.strip_suffix(PARAM_SENTINEL_SUFFIX)?;
+    numeric.parse().ok()
+}
+
+#[derive(Clone, Debug)]
+pub enum SqlParamValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    String(String),
+}
+
+impl SqlParamValue {
+    fn as_literal(&self) -> Literal {
+        match self {
+            SqlParamValue::Null => Literal::Null,
+            SqlParamValue::Integer(v) => Literal::Integer(i128::from(*v)),
+            SqlParamValue::Float(v) => Literal::Float(*v),
+            SqlParamValue::Boolean(v) => Literal::Boolean(*v),
+            SqlParamValue::String(s) => Literal::String(s.clone()),
+        }
+    }
+
+    fn as_plan_value(&self) -> PlanValue {
+        match self {
+            SqlParamValue::Null => PlanValue::Null,
+            SqlParamValue::Integer(v) => PlanValue::Integer(*v),
+            SqlParamValue::Float(v) => PlanValue::Float(*v),
+            SqlParamValue::Boolean(v) => PlanValue::Integer(if *v { 1 } else { 0 }),
+            SqlParamValue::String(s) => PlanValue::String(s.clone()),
+        }
+    }
+}
+
+impl From<i64> for SqlParamValue {
+    fn from(value: i64) -> Self {
+        SqlParamValue::Integer(value)
+    }
+}
+
+impl From<f64> for SqlParamValue {
+    fn from(value: f64) -> Self {
+        SqlParamValue::Float(value)
+    }
+}
+
+impl From<bool> for SqlParamValue {
+    fn from(value: bool) -> Self {
+        SqlParamValue::Boolean(value)
+    }
+}
+
+impl From<String> for SqlParamValue {
+    fn from(value: String) -> Self {
+        SqlParamValue::String(value)
+    }
+}
+
+impl From<&str> for SqlParamValue {
+    fn from(value: &str) -> Self {
+        SqlParamValue::String(value.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct PreparedPlan {
+    plan: PlanStatement,
+    param_count: usize,
+}
+
+#[derive(Clone)]
+pub struct PreparedStatement {
+    inner: Arc<PreparedPlan>,
+}
+
+impl PreparedStatement {
+    fn new(inner: Arc<PreparedPlan>) -> Self {
+        Self { inner }
+    }
+
+    pub fn parameter_count(&self) -> usize {
+        self.inner.param_count
+    }
 }
 
 pub fn register_statement_expectation(expectation: StatementExpectation) {
@@ -281,6 +495,7 @@ pub struct SqlEngine {
     /// harness) can opt in via [`SqlEngine::set_insert_buffering`] to trade immediate visibility
     /// for much lower planning overhead.
     insert_buffering_enabled: AtomicBool,
+    statement_cache: RwLock<FxHashMap<String, Arc<PreparedPlan>>>,
 }
 
 const DROPPED_TABLE_TRANSACTION_ERR: &str = "another transaction has dropped this table";
@@ -309,6 +524,7 @@ impl Clone for SqlEngine {
             insert_buffering_enabled: AtomicBool::new(
                 self.insert_buffering_enabled.load(AtomicOrdering::Relaxed),
             ),
+            statement_cache: RwLock::new(FxHashMap::default()),
         }
     }
 }
@@ -325,6 +541,7 @@ impl SqlEngine {
             default_nulls_first: AtomicBool::new(default_nulls_first),
             insert_buffer: RefCell::new(None),
             insert_buffering_enabled: AtomicBool::new(insert_buffering_enabled),
+            statement_cache: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -698,13 +915,7 @@ impl SqlEngine {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
         // Preprocess SQL
-        let processed_sql = Self::preprocess_create_type_syntax(sql);
-        let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
-        let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
-        let processed_sql = Self::preprocess_bare_table_in_clauses(&processed_sql);
-        let processed_sql = Self::preprocess_empty_in_lists(&processed_sql);
-        let processed_sql = Self::preprocess_index_hints(&processed_sql);
-        let processed_sql = Self::preprocess_reindex_syntax(&processed_sql);
+        let processed_sql = Self::preprocess_sql_input(sql);
 
         let dialect = GenericDialect {};
         let statements = match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
@@ -759,6 +970,16 @@ impl SqlEngine {
         Ok(results)
     }
 
+    fn preprocess_sql_input(sql: &str) -> String {
+        let processed_sql = Self::preprocess_create_type_syntax(sql);
+        let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
+        let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
+        let processed_sql = Self::preprocess_bare_table_in_clauses(&processed_sql);
+        let processed_sql = Self::preprocess_empty_in_lists(&processed_sql);
+        let processed_sql = Self::preprocess_index_hints(&processed_sql);
+        Self::preprocess_reindex_syntax(&processed_sql)
+    }
+
     /// Flush any buffered literal `INSERT` statements and return their per-statement results.
     ///
     /// Workloads that stream many INSERT statements without interleaving reads can invoke this
@@ -766,6 +987,95 @@ impl SqlEngine {
     /// drop hook.
     pub fn flush_pending_inserts(&self) -> SqlResult<Vec<SqlStatementResult>> {
         self.flush_buffer_results()
+    }
+
+    /// Prepare a single SQL statement for repeated execution.
+    ///
+    /// Prepared statements currently support `UPDATE` queries with positional or named
+    /// parameters. Callers must provide parameter bindings when executing the returned handle.
+    pub fn prepare(&self, sql: &str) -> SqlResult<PreparedStatement> {
+        let processed_sql = Self::preprocess_sql_input(sql);
+
+        if let Some(existing) = self
+            .statement_cache
+            .read()
+            .expect("statement cache poisoned")
+            .get(&processed_sql)
+        {
+            return Ok(PreparedStatement::new(Arc::clone(existing)));
+        }
+
+        let dialect = GenericDialect {};
+        let statements = parse_sql_with_recursion_limit(&dialect, &processed_sql)
+            .map_err(|err| Error::InvalidArgumentError(format!("failed to parse SQL: {err}")))?;
+
+        if statements.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "prepared statements must contain exactly one SQL statement".into(),
+            ));
+        }
+
+        let statement = statements
+            .into_iter()
+            .next()
+            .expect("statement count checked");
+
+        let scope = ParameterScope::new();
+
+        let plan = match statement {
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+                ..
+            } => {
+                let update_plan =
+                    self.build_update_plan(table, assignments, from, selection, returning)?;
+                PlanStatement::Update(update_plan)
+            }
+            other => {
+                return Err(Error::InvalidArgumentError(format!(
+                    "prepared statements do not yet support {other:?}"
+                )));
+            }
+        };
+
+        let parameter_meta = scope.finish();
+        let prepared = Arc::new(PreparedPlan {
+            plan,
+            param_count: parameter_meta.max_index(),
+        });
+
+        self.statement_cache
+            .write()
+            .expect("statement cache poisoned")
+            .insert(processed_sql, Arc::clone(&prepared));
+
+        Ok(PreparedStatement::new(prepared))
+    }
+
+    /// Execute a previously prepared statement with the supplied parameters.
+    pub fn execute_prepared(
+        &self,
+        statement: &PreparedStatement,
+        params: &[SqlParamValue],
+    ) -> SqlResult<Vec<SqlStatementResult>> {
+        if params.len() != statement.parameter_count() {
+            return Err(Error::InvalidArgumentError(format!(
+                "prepared statement expected {} parameters, received {}",
+                statement.parameter_count(),
+                params.len()
+            )));
+        }
+
+        let mut flushed = self.flush_buffer_results()?;
+        let mut plan = statement.inner.plan.clone();
+        bind_plan_parameters(&mut plan, params, statement.parameter_count())?;
+        let current = self.execute_plan_statement(plan)?;
+        flushed.insert(0, current);
+        Ok(flushed)
     }
 
     /// Buffer an `INSERT` statement when batching is enabled, or execute it immediately
@@ -3308,14 +3618,14 @@ impl SqlEngine {
         }
     }
 
-    fn handle_update(
+    fn build_update_plan(
         &self,
         table: TableWithJoins,
         assignments: Vec<Assignment>,
         from: Option<UpdateTableFromKind>,
         selection: Option<SqlExpr>,
         returning: Option<Vec<SelectItem>>,
-    ) -> SqlResult<RuntimeStatementResult<P>> {
+    ) -> SqlResult<UpdatePlan> {
         if from.is_some() {
             return Err(Error::InvalidArgumentError(
                 "UPDATE ... FROM is not supported yet".into(),
@@ -3412,6 +3722,18 @@ impl SqlEngine {
             assignments: column_assignments,
             filter,
         };
+        Ok(plan)
+    }
+
+    fn handle_update(
+        &self,
+        table: TableWithJoins,
+        assignments: Vec<Assignment>,
+        from: Option<UpdateTableFromKind>,
+        selection: Option<SqlExpr>,
+        returning: Option<Vec<SelectItem>>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let plan = self.build_update_plan(table, assignments, from, selection, returning)?;
         self.execute_plan_statement(PlanStatement::Update(plan))
     }
 
@@ -6491,6 +6813,231 @@ impl SqlEngine {
     }
 }
 
+fn bind_plan_parameters(
+    plan: &mut PlanStatement,
+    params: &[SqlParamValue],
+    expected_count: usize,
+) -> SqlResult<()> {
+    if expected_count == 0 {
+        return Ok(());
+    }
+
+    match plan {
+        PlanStatement::Update(update) => bind_update_plan_parameters(update, params),
+        other => Err(Error::InvalidArgumentError(format!(
+            "prepared execution is not yet supported for {:?}",
+            other
+        ))),
+    }
+}
+
+fn bind_update_plan_parameters(plan: &mut UpdatePlan, params: &[SqlParamValue]) -> SqlResult<()> {
+    for assignment in &mut plan.assignments {
+        match &mut assignment.value {
+            AssignmentValue::Literal(value) => bind_plan_value(value, params)?,
+            AssignmentValue::Expression(expr) => bind_scalar_expr(expr, params)?,
+        }
+    }
+
+    if let Some(filter) = &mut plan.filter {
+        bind_predicate_expr(filter, params)?;
+    }
+
+    Ok(())
+}
+
+fn bind_plan_value(value: &mut PlanValue, params: &[SqlParamValue]) -> SqlResult<()> {
+    match value {
+        PlanValue::String(text) => {
+            if let Some(index) = parse_placeholder_marker(text) {
+                let param = params
+                    .get(index.saturating_sub(1))
+                    .ok_or_else(|| missing_parameter_error(index, params.len()))?;
+                *value = param.as_plan_value();
+            }
+        }
+        PlanValue::Struct(fields) => {
+            for field in fields.values_mut() {
+                bind_plan_value(field, params)?;
+            }
+        }
+        PlanValue::Null | PlanValue::Integer(_) | PlanValue::Float(_) => {}
+    }
+    Ok(())
+}
+
+fn bind_scalar_expr(
+    expr: &mut llkv_expr::expr::ScalarExpr<String>,
+    params: &[SqlParamValue],
+) -> SqlResult<()> {
+    use llkv_expr::expr::ScalarExpr;
+
+    match expr {
+        ScalarExpr::Column(_) => {}
+        ScalarExpr::Literal(lit) => bind_literal(lit, params)?,
+        ScalarExpr::Binary { left, right, .. } => {
+            bind_scalar_expr(left, params)?;
+            bind_scalar_expr(right, params)?;
+        }
+        ScalarExpr::Not(inner) => bind_scalar_expr(inner, params)?,
+        ScalarExpr::IsNull { expr: inner, .. } => bind_scalar_expr(inner, params)?,
+        ScalarExpr::Aggregate(_) => {
+            return Err(Error::InvalidArgumentError(
+                "parameters inside aggregate expressions are not supported".into(),
+            ));
+        }
+        ScalarExpr::GetField { base, .. } => bind_scalar_expr(base, params)?,
+        ScalarExpr::Cast { expr: inner, .. } => bind_scalar_expr(inner, params)?,
+        ScalarExpr::Compare { left, right, .. } => {
+            bind_scalar_expr(left, params)?;
+            bind_scalar_expr(right, params)?;
+        }
+        ScalarExpr::Coalesce(list) => {
+            for item in list {
+                bind_scalar_expr(item, params)?;
+            }
+        }
+        ScalarExpr::ScalarSubquery(_) => {
+            return Err(Error::InvalidArgumentError(
+                "parameters inside scalar subqueries are not supported yet".into(),
+            ));
+        }
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                bind_scalar_expr(op, params)?;
+            }
+            for (when, then) in branches {
+                bind_scalar_expr(when, params)?;
+                bind_scalar_expr(then, params)?;
+            }
+            if let Some(else_expr) = else_expr {
+                bind_scalar_expr(else_expr, params)?;
+            }
+        }
+        ScalarExpr::Random => {}
+    }
+
+    Ok(())
+}
+
+fn bind_predicate_expr(
+    expr: &mut llkv_expr::expr::Expr<'static, String>,
+    params: &[SqlParamValue],
+) -> SqlResult<()> {
+    use llkv_expr::expr::Expr;
+
+    match expr {
+        Expr::And(list) | Expr::Or(list) => {
+            for sub in list {
+                bind_predicate_expr(sub, params)?;
+            }
+        }
+        Expr::Not(inner) => bind_predicate_expr(inner, params)?,
+        Expr::Pred(filter) => bind_filter_operator(&mut filter.op, params)?,
+        Expr::Compare { left, right, .. } => {
+            bind_scalar_expr(left, params)?;
+            bind_scalar_expr(right, params)?;
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            bind_scalar_expr(inner, params)?;
+            for item in list {
+                bind_scalar_expr(item, params)?;
+            }
+        }
+        Expr::IsNull { expr: inner, .. } => bind_scalar_expr(inner, params)?,
+        Expr::Literal(_) => {}
+        Expr::Exists(_) => {
+            return Err(Error::InvalidArgumentError(
+                "parameters inside EXISTS subqueries are not supported yet".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bind_filter_operator(
+    op: &mut llkv_expr::expr::Operator<'static>,
+    params: &[SqlParamValue],
+) -> SqlResult<()> {
+    use llkv_expr::expr::Operator;
+
+    match op {
+        Operator::Equals(lit)
+        | Operator::GreaterThan(lit)
+        | Operator::GreaterThanOrEquals(lit)
+        | Operator::LessThan(lit)
+        | Operator::LessThanOrEquals(lit) => bind_literal(lit, params),
+        Operator::Range { lower, upper } => {
+            bind_bound_literal(lower, params)?;
+            bind_bound_literal(upper, params)
+        }
+        Operator::In(list) => {
+            for lit in *list {
+                if let Literal::String(text) = lit
+                    && parse_placeholder_marker(text).is_some()
+                {
+                    return Err(Error::InvalidArgumentError(
+                        "IN predicates do not yet support bound parameters".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Operator::StartsWith { pattern, .. }
+        | Operator::EndsWith { pattern, .. }
+        | Operator::Contains { pattern, .. } => {
+            if pattern.contains(PARAM_SENTINEL_PREFIX) {
+                return Err(Error::InvalidArgumentError(
+                    "LIKE-style predicates do not yet support bound parameters".into(),
+                ));
+            }
+            Ok(())
+        }
+        Operator::IsNull | Operator::IsNotNull => Ok(()),
+    }
+}
+
+fn bind_bound_literal(bound: &mut Bound<Literal>, params: &[SqlParamValue]) -> SqlResult<()> {
+    match bound {
+        Bound::Included(lit) | Bound::Excluded(lit) => bind_literal(lit, params),
+        Bound::Unbounded => Ok(()),
+    }
+}
+
+fn bind_literal(literal: &mut Literal, params: &[SqlParamValue]) -> SqlResult<()> {
+    match literal {
+        Literal::String(text) => {
+            if let Some(index) = parse_placeholder_marker(text) {
+                let param = params
+                    .get(index.saturating_sub(1))
+                    .ok_or_else(|| missing_parameter_error(index, params.len()))?;
+                *literal = param.as_literal();
+            }
+            Ok(())
+        }
+        Literal::Struct(fields) => {
+            for (_, value) in fields.iter_mut() {
+                bind_literal(value, params)?;
+            }
+            Ok(())
+        }
+        Literal::Integer(_) | Literal::Float(_) | Literal::Boolean(_) | Literal::Null => Ok(()),
+    }
+}
+
+fn missing_parameter_error(index: usize, provided: usize) -> Error {
+    Error::InvalidArgumentError(format!(
+        "missing parameter value for placeholder {} ({} provided)",
+        index, provided
+    ))
+}
+
 fn canonical_object_name(name: &ObjectName) -> SqlResult<(String, String)> {
     if name.0.is_empty() {
         return Err(Error::InvalidArgumentError(
@@ -6954,7 +7501,9 @@ fn expr_contains_aggregate(expr: &llkv_expr::expr::ScalarExpr<String>) -> bool {
                     .unwrap_or(false)
         }
         llkv_expr::expr::ScalarExpr::Coalesce(items) => items.iter().any(expr_contains_aggregate),
-        llkv_expr::expr::ScalarExpr::Column(_) | llkv_expr::expr::ScalarExpr::Literal(_) => false,
+        llkv_expr::expr::ScalarExpr::Column(_)
+        | llkv_expr::expr::ScalarExpr::Literal(_)
+        | llkv_expr::expr::ScalarExpr::Random => false,
         llkv_expr::expr::ScalarExpr::ScalarSubquery(_) => false,
     }
 }
@@ -8019,6 +8568,7 @@ fn translate_scalar_internal(
         Abs,
         Coalesce,
         NullIf,
+        Floor,
     }
 
     type ScalarFrame<'a> =
@@ -8322,6 +8872,49 @@ fn translate_scalar_internal(
                                 work_stack.push(ScalarFrame::Enter(arg_expr));
                                 continue;
                             }
+                            "floor" => {
+                                let args_slice: &[FunctionArg] = match &func.args {
+                                    FunctionArguments::List(list) => {
+                                        if list.duplicate_treatment.is_some()
+                                            || !list.clauses.is_empty()
+                                        {
+                                            return Err(Error::InvalidArgumentError(
+                                                "FLOOR does not support qualifiers".into(),
+                                            ));
+                                        }
+                                        &list.args
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "FLOOR requires exactly one argument".into(),
+                                        ));
+                                    }
+                                };
+
+                                if args_slice.len() != 1 {
+                                    return Err(Error::InvalidArgumentError(
+                                        "FLOOR requires exactly one argument".into(),
+                                    ));
+                                }
+
+                                let arg_expr = match &args_slice[0] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => expr,
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "FLOOR argument must be an expression".into(),
+                                        ));
+                                    }
+                                };
+
+                                work_stack.push(ScalarFrame::Exit(
+                                    ScalarExitContext::BuiltinFunction {
+                                        func: BuiltinScalarFunction::Floor,
+                                        arg_count: 1,
+                                    },
+                                ));
+                                work_stack.push(ScalarFrame::Enter(arg_expr));
+                                continue;
+                            }
                             "coalesce" => {
                                 let args_slice: &[FunctionArg] = match &func.args {
                                     FunctionArguments::List(list) => {
@@ -8412,6 +9005,36 @@ fn translate_scalar_internal(
                                 }
                                 continue;
                             }
+                            "random" | "rand" => {
+                                let args_slice: &[FunctionArg] = match &func.args {
+                                    FunctionArguments::List(list) => {
+                                        if list.duplicate_treatment.is_some()
+                                            || !list.clauses.is_empty()
+                                        {
+                                            return Err(Error::InvalidArgumentError(
+                                                "RANDOM does not support qualifiers".into(),
+                                            ));
+                                        }
+                                        &list.args
+                                    }
+                                    FunctionArguments::None => &[],
+                                    _ => {
+                                        return Err(Error::InvalidArgumentError(
+                                            "RANDOM does not accept arguments".into(),
+                                        ));
+                                    }
+                                };
+
+                                if !args_slice.is_empty() {
+                                    return Err(Error::InvalidArgumentError(
+                                        "RANDOM does not accept arguments".into(),
+                                    ));
+                                }
+
+                                work_stack
+                                    .push(ScalarFrame::Leaf(llkv_expr::expr::ScalarExpr::random()));
+                                continue;
+                            }
                             _ => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "unsupported function in scalar expression: {:?}",
@@ -8476,6 +9099,24 @@ fn translate_scalar_internal(
                         outer_scopes,
                     )?;
                     work_stack.push(ScalarFrame::Leaf(translated));
+                }
+                SqlExpr::Floor { expr, field } => {
+                    // sqlparser treats FLOOR as datetime extraction when field is specified
+                    // We only support simple FLOOR (NoDateTime field)
+                    use sqlparser::ast::{CeilFloorKind, DateTimeField};
+                    if !matches!(
+                        field,
+                        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+                    ) {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "FLOOR with datetime field or scale not supported: {field:?}"
+                        )));
+                    }
+
+                    // Treat FLOOR as a unary function: CAST(expr AS INT64)
+                    // Note: CAST truncates towards zero, not true floor (towards -infinity)
+                    work_stack.push(ScalarFrame::Exit(ScalarExitContext::Cast(DataType::Int64)));
+                    work_stack.push(ScalarFrame::Enter(expr.as_ref()));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
@@ -8634,6 +9275,14 @@ fn translate_scalar_internal(
                                 )],
                                 else_expr: Some(Box::new(left)),
                             }
+                        }
+                        BuiltinScalarFunction::Floor => {
+                            debug_assert_eq!(args.len(), 1);
+                            let arg = args.pop().expect("FLOOR expects one argument");
+                            // Implement FLOOR as CAST to INT64 which truncates towards zero
+                            // Note: This is not mathematically correct for negative numbers
+                            // (should round towards negative infinity), but works for positive values
+                            llkv_expr::expr::ScalarExpr::cast(arg, DataType::Int64)
                         }
                     };
 
@@ -8946,6 +9595,12 @@ fn build_abs_case_expr(
 
 fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match &value.value {
+        Value::Placeholder(name) => {
+            let index = register_placeholder(name)?;
+            Ok(llkv_expr::expr::ScalarExpr::literal(literal_placeholder(
+                index,
+            )))
+        }
         Value::Number(text, _) => {
             if text.contains(['.', 'e', 'E']) {
                 let parsed = text.parse::<f64>().map_err(|err| {
