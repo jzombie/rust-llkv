@@ -47,6 +47,15 @@ use std::sync::{Arc, RwLock};
 ///
 /// `ColumnStore` is `Send + Sync` and can be safely shared across threads via `Arc`.
 /// Internal state (catalog, caches) uses `RwLock` for concurrent access.
+///
+/// # Test Harness Integration
+///
+/// - **SQLite `sqllogictest`**: Every upstream case exercises the column store, providing
+///   a compatibility baseline but not full parity with SQLite yet.
+/// - **DuckDB suites**: Early dialect-specific tests stress MVCC and typed casts, informing
+///   future work rather than proving comprehensive DuckDB coverage.
+/// - **Hardening mandate**: Failures uncovered by the suites result in storage fixes, not
+///   filtered tests, to preserve confidence in OLAP scenarios built atop this crate.
 pub struct ColumnStore<P: Pager> {
     pub(crate) pager: Arc<P>,
     pub(crate) catalog: Arc<RwLock<ColumnCatalog>>,

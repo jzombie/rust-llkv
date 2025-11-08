@@ -9,6 +9,9 @@ use super::*;
 // TODO: Rename to ScalarRanges?
 // NOTE: Struct name reflects historical usage across integer scans; retain
 // until floating-point range pruning is fully generalized.
+/// Type-indexed bounds for range pruning across primitive Arrow scalars.
+///
+/// Each field captures the caller-provided lower/upper bound pair for a given primitive domain.
 #[derive(Default, Clone, Copy)]
 pub struct IntRanges {
     pub u64_r: Option<(Bound<u64>, Bound<u64>)>,

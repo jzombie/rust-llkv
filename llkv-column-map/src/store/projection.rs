@@ -44,6 +44,10 @@ pub enum GatherNullPolicy {
     DropNulls,
 }
 
+/// Logical projection request describing a field and optional alias.
+///
+/// Used by planners to pull a column by [`LogicalFieldId`] and to rename the output slot when
+/// needed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Projection {
     pub logical_field_id: LogicalFieldId,
@@ -85,6 +89,10 @@ impl GatherNullPolicy {
     }
 }
 
+/// Scratch structures shared across field plans during multi-column gathers.
+///
+/// Keeps cached chunk blobs and row indexes so repeated projection passes avoid redundant pager
+/// reads.
 pub struct MultiGatherContext {
     field_infos: Vec<(LogicalFieldId, DataType)>,
     fields: Vec<Field>,

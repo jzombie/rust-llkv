@@ -3,7 +3,14 @@
 //! This module groups the high-level storage concepts exposed by the column map
 //! crate: configuration, catalog management, scans, projections, and indexing.
 //! Each submodule provides a focused capability while re-exporting the primary
-//! entry points (`ColumnStore`, `ScanBuilder`, projection helpers, etc.).
+//! entry points (`ColumnStore`, `ScanBuilder`, projection helpers, etc.). The
+//! combined surface is what keeps the SQLite and DuckDB `sqllogictest` suites
+//! happy—descriptor iterators stream chunk metadata under tight memory budgets
+//! while projection and filtering visitors preserve dialect semantics.
+//!
+//! Updates here should keep the rustdoc narrative aligned with the
+//! [workspace README](../../README.md) and accompanying DeepWiki article so the
+//! story remains coherent for newcomers evaluating the project.
 //!
 //! # Layout
 //! - [`core`]: ColumnStore implementation, ingestion, and metadata handling

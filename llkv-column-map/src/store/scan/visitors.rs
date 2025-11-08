@@ -147,9 +147,10 @@ impl<T> PrimitiveFullVisitor for T where
 {
 }
 
-// Pagination adapter: enforces offset/limit across chunks (unsorted)
-// and across coalesced runs (sorted). It wraps an inner visitor that
-// implements the same traits and forwards appropriately.
+/// Pagination adapter that enforces offset/limit semantics while streaming scan results.
+///
+/// Wraps an inner visitor and trims batches or runs before forwarding, supporting both sorted
+/// and unsorted flows.
 pub struct PaginateVisitor<'a, V: ?Sized> {
     pub inner: &'a mut V,
     // items to skip before emitting

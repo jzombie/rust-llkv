@@ -3,6 +3,10 @@ use crate::types::Namespace;
 use arrow::datatypes::DataType;
 use rustc_hash::FxHashMap;
 
+/// Owned handles to sorted value chunks and their permutation arrays.
+///
+/// Maintains lookup maps so scans can resolve a [`llkv_storage::types::PhysicalKey`] into the
+/// matching cached [`simd_r_drive_entry_handle::EntryHandle`] without allocating.
 #[derive(Debug)]
 pub struct SortedChunkBuffers {
     values: Vec<EntryHandle>,
@@ -75,6 +79,10 @@ impl SortedChunkBuffers {
     }
 }
 
+/// Sorted buffers extended with row-id handles for null-aware scans.
+///
+/// Wraps a base [`SortedChunkBuffers`] and mirrors the lookup table for row-id chunks so range
+/// filtering and pagination can reference all three blob classes consistently.
 #[derive(Debug)]
 pub struct SortedChunkBuffersWithRids {
     base: SortedChunkBuffers,

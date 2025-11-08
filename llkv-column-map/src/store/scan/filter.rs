@@ -108,6 +108,9 @@ impl BitMask {
     }
 }
 
+/// Contiguous span of row identifiers produced by predicate evaluation.
+///
+/// Runs coalesce dense matches so iterators can advance without per-row bookkeeping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilterRun {
     pub start_row_id: u64,
@@ -129,6 +132,10 @@ impl FilterRun {
     }
 }
 
+/// Dense encoding of predicate matches, supporting both run-length and sparse row sets.
+///
+/// Filter kernels return this structure so scan adapters can choose the cheapest representation
+/// for downstream consumers.
 #[derive(Debug)]
 pub struct FilterResult {
     runs: Vec<FilterRun>,
@@ -286,6 +293,9 @@ where
     }
 }
 
+/// Phantom-typed dispatcher for UTF-8 filter kernels.
+///
+/// Parameterized by the output adapter so monomorphized call sites stay inlined.
 pub struct Utf8Filter<O>(PhantomData<O>)
 where
     O: OffsetSizeTrait + StringContainsKernel;
