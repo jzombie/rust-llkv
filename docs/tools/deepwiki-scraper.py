@@ -522,6 +522,214 @@ def extract_page_content(url, session):
     
     return markdown
 
+def extract_and_enhance_diagrams(repo, output_dir, session):
+    """Extract diagrams from JavaScript and enhance all markdown files."""
+    print("\n" + "="*80)
+    print("PHASE 2: Extracting diagrams and enhancing markdown files")
+    print("="*80)
+    
+    # Extract all diagrams first (fetch from any page - they're all in the JS)
+    print("\nExtracting diagrams from JavaScript payload...")
+    url = f'https://deepwiki.com/{repo}/1-overview'
+    
+    try:
+        response = session.get(url)
+        response.raise_for_status()
+        html_text = response.text
+    except Exception as e:
+        print(f"  Warning: Could not fetch diagrams: {e}")
+        return
+    
+    # Extract diagrams with context
+    diagram_pattern = r'```mermaid\\n(.*?)```'
+    all_diagrams = re.findall(diagram_pattern, html_text, re.DOTALL)
+    print(f"  Found {len(all_diagrams)} total diagrams")
+    
+    # Extract with more context (500+ chars before each diagram)
+    diagram_contexts = []
+    markdown_pattern = r'([^`]{500,}?)```mermaid\\n(.*?)```'
+    markdown_matches = re.finditer(markdown_pattern, html_text, re.DOTALL)
+    
+    for match in markdown_matches:
+        context_before = match.group(1)
+        diagram = match.group(2)
+        
+        # Unescape context - keep last 500 chars
+        context = context_before.replace('\\n', '\n')
+        context = context.replace('\\t', ' ')
+        context = context.replace('\\"', '"')
+        context = context.replace('\\\\', '\\')
+        context = context.replace('\\u003c', '<')
+        context = context.replace('\\u003e', '>')
+        context = context.replace('\\u0026', '&')
+        context = context[-500:].strip()
+        
+        # Unescape diagram
+        diagram = diagram.replace('\\n', '\n')
+        diagram = diagram.replace('\\t', '\t')
+        diagram = diagram.replace('\\"', '"')
+        diagram = diagram.replace('\\\\', '\\')
+        diagram = diagram.replace('\\u003c', '<')
+        diagram = diagram.replace('\\u003e', '>')
+        diagram = diagram.replace('\\u0026', '&')
+        diagram = diagram.strip()
+        
+        if len(diagram) > 10:
+            context_lines = [l.strip() for l in context.split('\n') if l.strip()]
+            
+            # Find last heading
+            last_heading = None
+            for line in reversed(context_lines):
+                if line.startswith('#'):
+                    last_heading = line
+                    break
+            
+            # Get last 2-3 non-heading lines as anchor text
+            anchor_lines = []
+            for line in reversed(context_lines):
+                if not line.startswith('#') and len(line) > 20:
+                    anchor_lines.insert(0, line)
+                    if len(anchor_lines) >= 3:
+                        break
+            
+            anchor_text = ' '.join(anchor_lines)[-300:] if anchor_lines else ''
+            
+            diagram_contexts.append({
+                'last_heading': last_heading or '',
+                'anchor_text': anchor_text,
+                'diagram': diagram
+            })
+    
+    print(f"  Found {len(diagram_contexts)} diagrams with context")
+    
+    # Save diagrams for reference
+    diagram_file = output_dir / '_diagrams_with_context.txt'
+    with open(diagram_file, 'w', encoding='utf-8') as f:
+        for i, item in enumerate(diagram_contexts, 1):
+            f.write(f"\n{'='*80}\n")
+            f.write(f"DIAGRAM {i}\n")
+            f.write(f"Heading: {item['last_heading']}\n")
+            f.write(f"Anchor: {item['anchor_text'][:200]}...\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"```mermaid\n{item['diagram']}\n```\n")
+    
+    print(f"  Saved diagram reference to {diagram_file.name}")
+    
+    # Now enhance all markdown files
+    print("\nEnhancing markdown files with diagrams...")
+    md_files = list(output_dir.glob('**/*.md'))
+    md_files = [f for f in md_files if not f.name.startswith('_')]
+    
+    enhanced_count = 0
+    for md_file in md_files:
+        with open(md_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Skip if already has diagrams
+        if '```mermaid' in content:
+            continue
+        
+        # Match and insert diagrams
+        lines = content.split('\n')
+        diagrams_used = set()
+        pending_insertions = []
+        
+        # Normalize content for matching
+        content_normalized = content.lower()
+        content_normalized = ' '.join(content_normalized.split())
+        
+        for idx, item in enumerate(diagram_contexts):
+            if idx in diagrams_used:
+                continue
+            
+            anchor = item['anchor_text']
+            heading = item['last_heading']
+            
+            if not anchor and not heading:
+                continue
+            
+            best_match_line = -1
+            best_match_score = 0
+            
+            # Try anchor text matching
+            if len(anchor) > 50:
+                anchor_normalized = anchor.lower()
+                anchor_normalized = ' '.join(anchor_normalized.split())
+                
+                for chunk_size in [300, 200, 150, 100, 80]:
+                    if len(anchor_normalized) >= chunk_size:
+                        test_chunk = anchor_normalized[-chunk_size:]
+                        pos = content_normalized.find(test_chunk)
+                        if pos != -1:
+                            # Convert char position to line number
+                            char_count = 0
+                            for line_num, line in enumerate(lines):
+                                char_count += len(' '.join(line.split())) + 1
+                                if char_count >= pos:
+                                    best_match_line = line_num
+                                    best_match_score = chunk_size
+                                    break
+                            if best_match_line != -1:
+                                break
+            
+            # Fallback: heading match
+            if best_match_line == -1 and heading:
+                heading_normalized = heading.lower().replace('#', '').strip()
+                heading_normalized = ' '.join(heading_normalized.split())
+                
+                for line_num, line in enumerate(lines):
+                    if line.strip().startswith('#'):
+                        line_normalized = line.lower().replace('#', '').strip()
+                        line_normalized = ' '.join(line_normalized.split())
+                        
+                        if heading_normalized in line_normalized:
+                            best_match_line = line_num
+                            best_match_score = 50
+                            break
+            
+            if best_match_line != -1:
+                # Find insertion point: after paragraph
+                insert_line = best_match_line + 1
+                
+                if lines[best_match_line].strip().startswith('#'):
+                    # Skip blank lines after heading
+                    while insert_line < len(lines) and not lines[insert_line].strip():
+                        insert_line += 1
+                    # Skip through paragraph
+                    while insert_line < len(lines):
+                        if not lines[insert_line].strip() or lines[insert_line].strip().startswith('#'):
+                            break
+                        insert_line += 1
+                else:
+                    # Find end of current paragraph
+                    while insert_line < len(lines):
+                        if not lines[insert_line].strip() or lines[insert_line].strip().startswith('#'):
+                            break
+                        insert_line += 1
+                
+                pending_insertions.append((insert_line, item['diagram'], best_match_score, idx))
+                diagrams_used.add(idx)
+        
+        # Insert diagrams (from bottom up)
+        if pending_insertions:
+            pending_insertions.sort(key=lambda x: x[0], reverse=True)
+            
+            for insert_line, diagram, score, idx in pending_insertions:
+                lines.insert(insert_line, '')
+                lines.insert(insert_line, '```')
+                lines.insert(insert_line, diagram)
+                lines.insert(insert_line, '```mermaid')
+                lines.insert(insert_line, '')
+            
+            # Save enhanced file
+            with open(md_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            
+            enhanced_count += 1
+            print(f"  ✓ {md_file.name} ({len(pending_insertions)} diagrams)")
+    
+    print(f"\n✓ Enhanced {enhanced_count} files with diagrams")
+
 def main():
     if len(sys.argv) < 3:
         print("Usage: python deepwiki-scraper.py <owner/repo> <output-dir>")
@@ -538,6 +746,10 @@ def main():
     
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("="*80)
+    print("PHASE 1: Extracting clean markdown content")
+    print("="*80)
     print(f"Output directory: {output_dir}")
     
     # Create session with headers
@@ -602,6 +814,13 @@ def main():
                 print(f"  ✗ Failed to extract {page['title']}: {e}")
         
         print(f"\n✓ Successfully extracted {success_count}/{len(pages)} pages to {output_dir}")
+        
+        # Extract and enhance with diagrams
+        extract_and_enhance_diagrams(repo, output_dir, session)
+        
+        print("\n" + "="*80)
+        print("✓ COMPLETE: All pages extracted and enhanced with diagrams")
+        print("="*80)
         
     except Exception as e:
         print(f"\n✗ Error: {e}")
