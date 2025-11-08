@@ -10,7 +10,7 @@
 
 ## Responsibilities
 
-- Parse SQL statements, translating source text to `sqlparser` ASTs and then to `llkv-plan` structures.
+- Parse SQL statements, translating source text to `sqlparser` ASTs and then to [`llkv-plan`](../llkv-plan/) structures.
 - Provide user-facing APIs for ad-hoc queries (`sql`) and multi-statement execution (`execute`).
 - Manage SQL preprocessing so SQLite/DuckDB conveniences map cleanly onto `sqlparser` and the planner.
 - Coordinate with [`llkv-runtime`](../llkv-runtime/) for transaction control, MVCC visibility, and plan execution.
@@ -42,11 +42,11 @@ The engine normalizes dialect-specific syntax before parsing:
 
 - Standard `BEGIN`, `COMMIT`, and `ROLLBACK` statements wire through the runtime to allocate or finalize MVCC snapshots.
 - Auto-commit mode executes each statement in its own transaction when no explicit transaction is active.
-- Result variants map to [`llkv-runtime`] statement outcomes, including `Select`, `Insert`, `Update`, `Delete`, and catalog DDL responses.
+- Result variants map to [`llkv-runtime`](../llkv-runtime/) statement outcomes, including `Select`, `Insert`, `Update`, `Delete`, and catalog DDL responses.
 
 ## Testing Hooks
 
-- The SLT harness (`llkv-slt-tester`) uses `SqlEngine` via an `EngineHarness` that enables insert buffering and translates results to sqllogictest expectations.
+- The SLT harness ([`llkv-slt-tester`](../llkv-slt-tester/)) uses `SqlEngine` via an `EngineHarness` that enables insert buffering and translates results to sqllogictest expectations.
 - Query-duration metrics (`LLKV_SLT_STATS=1`) surface per-statement timing when running sqllogictest workloads.
 
 ## License

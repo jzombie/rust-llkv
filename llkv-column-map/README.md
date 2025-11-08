@@ -30,7 +30,7 @@
 
 - `ColumnStream` supports projection, filtering, and pagination for streaming reads.
 - Gather operations offer configurable null-handling policies (preserve, error, drop) to accommodate different executor strategies.
-- Parallel scan paths use Rayon; concurrency is bounded by the `LLKV_MAX_THREADS` environment variable when present.
+- Parallel scan paths use [Rayon](https://crates.io/crates/rayon); concurrency is bounded by the `LLKV_MAX_THREADS` environment variable when present.
 
 ## Pager Integration
 

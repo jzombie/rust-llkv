@@ -46,18 +46,18 @@ Scalar expressions represent arithmetic and data manipulation:
 
 ## Integration with Other Crates
 
-### Planner (`llkv-plan`)
+### Planner ([`llkv-plan`](../llkv-plan/))
 
 - [`llkv-plan`](../llkv-plan/) uses `llkv-expr` to construct logical query plans.
 - `SelectFilter` and other plan structures embed `Expr<String>` for predicates, ensuring the planner remains decoupled from execution details.
 - Correlation helpers in the planner manage placeholder assignment for correlated subqueries, which are represented as `ScalarExpr::ScalarSubquery`.
 
-### Executor (`llkv-executor`)
+### Executor ([`llkv-executor`](../llkv-executor/))
 
 - [`llkv-executor`](../llkv-executor/) evaluates expressions by collecting aggregates, compiling filter programs, and streaming results.
 - The executor applies MVCC visibility filters and evaluates `HAVING` clauses using the `Expr` and `ScalarExpr` structures.
 
-### Table Layer (`llkv-table`)
+### Table Layer ([`llkv-table`](../llkv-table/))
 
 - [`llkv-table`](../llkv-table/) compiles `Expr<FieldId>` into stack-based `EvalProgram` structures for efficient vectorized evaluation.
 - Provides domain analysis and affine transformation extraction to optimize range scans and index selection.
