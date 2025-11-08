@@ -91,7 +91,7 @@ The following is a non-exhaustive list of some of the APIs this crate re-exports
 
 ### Using Persistent Storage
 
-For persistent databases, enable the `simd-r-drive-support` feature and use a file-backed pager:
+For persistent databases, enable the `simd-r-drive-support` feature and use a file-backed pager. Replace the version tag with the [latest release published on crates.io](https://crates.io/crates/llkv) when you upgrade:
 
 ```toml
 [dependencies]
