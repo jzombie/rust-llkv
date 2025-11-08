@@ -18,7 +18,6 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
-from markitdown import MarkItDown
 import html2text
 
 def sanitize_filename(text):
