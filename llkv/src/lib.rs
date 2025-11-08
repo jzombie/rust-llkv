@@ -46,6 +46,29 @@
 //! documentation here stays synchronized with the rest of the repository so the rustdoc narrative
 //! matches the public design record.
 //!
+//! # Crate Topology
+//!
+//! LLKV ships as a layered Cargo workspace where higher crates depend on the ones below while sharing
+//! Arrow as their interchange format. The main strata are:
+//!
+//! - **SQL Interface**: [`llkv-sql`](../llkv_sql/index.html) exposes the SQL entry point and delegates
+//!   planning and execution.
+//! - **Query Planning**: [`llkv-plan`](../llkv_plan/index.html) and [`llkv-expr`](../llkv_expr/index.html)
+//!   define logical plans and expression ASTs.
+//! - **Runtime & Transactions**: [`llkv-runtime`](../llkv_runtime/index.html) orchestrates sessions and
+//!   MVCC, while [`llkv-transaction`](../llkv_transaction/index.html) manages transaction IDs and
+//!   snapshot isolation.
+//! - **Query Execution**: [`llkv-executor`](../llkv_executor/index.html) streams Arrow `RecordBatch`
+//!   results with help from [`llkv-aggregate`](../llkv_aggregate/index.html) and
+//!   [`llkv-join`](../llkv_join/index.html).
+//! - **Table & Metadata**: [`llkv-table`](../llkv_table/index.html) enforces schemas and catalogs atop
+//!   [`llkv-column-map`](../llkv_column_map/index.html), the columnar storage engine.
+//! - **Storage & I/O**: [`llkv-storage`](../llkv_storage/index.html) provides the pager abstraction and
+//!   integrates with [`simd-r-drive`](https://crates.io/crates/simd-r-drive) backends.
+//! - **Supporting crates**: [`llkv-result`](../llkv_result/index.html) unifies error handling,
+//!   [`llkv-csv`](../llkv_csv/index.html) handles CSV ingestion, [`llkv-test-utils`](../llkv_test_utils/index.html)
+//!   supplies testing helpers, and [`llkv-slt-tester`](../llkv_slt_tester/index.html) drives SQL logic tests.
+//!
 //! # MVCC Snapshot Isolation
 //!
 //! LLKV tracks visibility with MVCC metadata injected into every table: hidden `row_id`,
