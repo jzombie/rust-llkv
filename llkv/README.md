@@ -81,11 +81,12 @@ let batches = engine.sql("SELECT * FROM users WHERE id > 0").unwrap();
 
 ### Re-exported APIs
 
-The following is a non-exhaustive list of some of the APIs this crate re-exports.
+The following is a non-exhaustive list of some of the APIs this crate re-exports. Enable the `simd-r-drive-support` feature flag when you need durable storage via the SIMD R-Drive pager.
 
 - **`SqlEngine`** — Main SQL execution engine from [`llkv-sql`](../llkv-sql/)
 - **`storage::MemPager`** — In-memory pager for transient databases
 - **`storage::Pager`** — Trait for custom storage backends
+- **`storage::SimdRDrivePager`** — Durable pager backed by [`simd-r-drive`](https://crates.io/crates/simd-r-drive) (requires the `simd-r-drive-support` feature)
 - **`Error` / `Result`** — Error handling types
 
 ### Using Persistent Storage
