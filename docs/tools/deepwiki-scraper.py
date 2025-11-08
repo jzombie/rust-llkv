@@ -13,6 +13,7 @@ import sys
 import os
 import re
 import time
+import json
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import requests
@@ -27,10 +28,14 @@ def sanitize_filename(text):
     return text.strip('-').lower()
 
 def fetch_page(url, session):
-    """Fetch a page with retries"""
+    """Fetch a page with retries and browser-like headers"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
     for attempt in range(3):
         try:
-            response = session.get(url, timeout=30)
+            response = session.get(url, headers=headers, timeout=30)
             response.raise_for_status()
             return response
         except Exception as e:
@@ -123,36 +128,290 @@ def extract_wiki_structure(repo, session):
     return pages
 
 def convert_html_to_markdown(html_content):
-    """Convert HTML content to markdown, trying markitdown first, then html2text"""
-    # Try markitdown first
+    """Convert HTML to markdown using html2text - diagrams will be added later"""
+    # Use html2text for conversion
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.body_width = 0  # No line wrapping
+    markdown = h.handle(html_content)
+    
+    # NOTE: Mermaid diagram processing is DISABLED
+    # Diagrams will be matched and inserted in a separate pass
+    # This is because the HTML contains diagrams from ALL pages mixed together
+    
+    return markdown.strip()
+    
+    # Original markitdown code (temporarily disabled)
+    # try:
+    #     # Try markitdown first - create a temporary file since it expects file-like input
+    #     import tempfile
+    #     with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
+    #         f.write(html_content)
+    #         temp_path = f.name
+    #     
+    #     try:
+    #         md = MarkItDown()
+    #         result = md.convert(temp_path)
+    #         markdown = result.text_content
+    #     finally:
+    #         # Clean up temp file
+    #         os.unlink(temp_path)
+    #     
+    #     return markdown.strip()
+    # except Exception as e:
+    #     print(f"  Warning: markitdown failed ({e}), falling back to html2text")
+    #     # Fallback to html2text
+    #     h = html2text.HTML2Text()
+    #     h.ignore_links = False
+    #     h.body_width = 0  # No line wrapping
+    #     markdown = h.handle(html_content)
+    #     return markdown.strip()
+
+def extract_mermaid_from_nextjs_data(html_text):
+    """Extract mermaid diagram code from Next.js streaming response"""
+    mermaid_blocks = []
+    
     try:
-        md = MarkItDown()
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as f:
-            f.write(html_content)
-            temp_path = f.name
+        # Strategy 1: Look for ```mermaid blocks with escaped newlines (\\n)
+        # The HTML contains literal \n escape sequences, not actual newlines
+        pattern = r'```mermaid\\n(.*?)```'
+        matches = re.finditer(pattern, html_text, re.DOTALL)
         
-        try:
-            result = md.convert(temp_path)
-            return result.text_content.strip()
-        finally:
-            os.unlink(temp_path)
-    except Exception:
-        # Fallback to html2text
-        h = html2text.HTML2Text()
-        h.ignore_links = False
-        h.ignore_images = False
-        h.ignore_emphasis = False
-        h.body_width = 0  # Don't wrap lines
-        h.skip_internal_links = False
+        for match in matches:
+            block = match.group(1)
+            
+            # Unescape newlines and other escapes
+            block = block.replace('\\n', '\n')
+            block = block.replace('\\t', '\t')
+            block = block.replace('\\"', '"')
+            block = block.replace('\\\\', '\\')
+            block = block.replace('\\u003c', '<')
+            block = block.replace('\\u003e', '>')
+            block = block.replace('\\u0026', '&')
+            
+            block = block.strip()
+            if len(block) > 10:
+                mermaid_blocks.append(block)
+                lines = block.split('\n')
+                print(f"  Found mermaid diagram: {lines[0][:50]}... ({len(lines)} lines)")
         
-        markdown = h.handle(html_content)
-        return markdown.strip()
+        # Strategy 2: JavaScript string extraction (fallback)
+        if not mermaid_blocks:
+            print(f"  No fenced mermaid blocks found, trying JavaScript extraction...")
+            
+            mermaid_starts = ['graph TD', 'graph TB', 'graph LR', 'graph RL', 'graph BT',
+                            'flowchart TD', 'flowchart TB', 'flowchart LR',
+                            'sequenceDiagram', 'classDiagram']
+            
+            for start_keyword in mermaid_starts:
+                pos = 0
+                while True:
+                    pos = html_text.find(start_keyword, pos)
+                    if pos == -1:
+                        break
+                    
+                    # Look backwards for opening quote
+                    search_start = max(0, pos - 20)
+                    prefix = html_text[search_start:pos]
+                    quote_pos = prefix.rfind('"')
+                    
+                    if quote_pos == -1:
+                        pos += 1
+                        continue
+                    
+                    string_start = search_start + quote_pos + 1
+                    
+                    # Scan forward for closing quote
+                    i = pos
+                    while i < len(html_text) and i < pos + 10000:
+                        if i > 0 and html_text[i-1] == '\\':
+                            i += 1
+                            continue
+                        
+                        if html_text[i] == '"':
+                            string_end = i
+                            break
+                        i += 1
+                    else:
+                        pos += 1
+                        continue
+                    
+                    # Extract and unescape
+                    block = html_text[string_start:string_end]
+                    block = block.replace('\\n', '\n')
+                    block = block.replace('\\t', '\t')
+                    block = block.replace('\\"', '"')
+                    block = block.replace('\\\\', '\\')
+                    block = block.replace('\\u003c', '<')
+                    block = block.replace('\\u003e', '>')
+                    block = block.replace('\\u0026', '&')
+                    
+                    lines = [l for l in block.split('\n') if l.strip()]
+                    if len(lines) >= 3:
+                        mermaid_blocks.append(block.strip())
+                        print(f"  Found JS mermaid diagram: {lines[0][:50]}... ({len(lines)} lines)")
+                    
+                    pos += 1
+        
+        # Deduplicate
+        unique_blocks = []
+        seen = set()
+        for block in mermaid_blocks:
+            fingerprint = block[:100]
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                unique_blocks.append(block)
+        
+        if unique_blocks:
+            print(f"  Extracted {len(unique_blocks)} unique mermaid diagram(s)")
+        else:
+            print(f"  Warning: No valid mermaid diagrams extracted")
+        
+        return unique_blocks
+        
+        if unique_blocks:
+            print(f"  Extracted {len(unique_blocks)} unique mermaid diagram(s)")
+        else:
+            print(f"  Warning: No valid mermaid diagrams extracted")
+        
+        return unique_blocks
+        
+    except Exception as e:
+        print(f"  Warning: Failed to extract mermaid from page data: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def inject_mermaid_into_html(soup, mermaid_blocks):
+    """Inject mermaid blocks into the HTML before markdown conversion"""
+    if not mermaid_blocks:
+        return soup
+    
+    # Since we extract ALL diagrams from the Next.js payload (which includes all pages),
+    # but we only want the diagrams for THIS specific page, we have a mismatch.
+    # Best approach: Place diagrams after EVERY paragraph, not just headings,
+    # to create enough insertion points.
+    
+    content = soup.find('article') or soup.find('main') or soup.find('body')
+    if not content:
+        return soup
+    
+    # Find all insertion points: headings and paragraphs
+    insertion_points = []
+    
+    # Add headings
+    for heading in content.find_all(['h2', 'h3', 'h4', 'h5', 'h6']):  # Skip h1 (page title)
+        insertion_points.append(heading)
+    
+    # Add some paragraphs as well (every 2nd paragraph)
+    paragraphs = content.find_all('p')
+    for i, p in enumerate(paragraphs):
+        if i % 2 == 0 and len(p.get_text().strip()) > 50:  # Only substantial paragraphs
+            insertion_points.append(p)
+    
+    # If still not enough points, just bail and place what we can
+    if len(insertion_points) == 0:
+        print(f"  Warning: No insertion points found for {len(mermaid_blocks)} diagrams")
+        return soup
+    
+    # Limit to reasonable number of diagrams (probably only ~10-20 are actually relevant to this page)
+    diagrams_to_place = min(len(mermaid_blocks), len(insertion_points), 50)
+    
+    # Inject placeholders
+    for i in range(diagrams_to_place):
+        marker_id = f"MERMAID_PLACEHOLDER_{i}"
+        marker_html = f'<p>[[{marker_id}]]</p>'
+        marker_tag = BeautifulSoup(marker_html, 'html.parser')
+        
+        # Insert after this insertion point
+        insertion_points[i].insert_after(marker_tag)
+        if i < 10:  # Only print first 10 to avoid spam
+            print(f"  Placed diagram {i+1} after: {insertion_points[i].get_text()[:40]}")
+    
+    if diagrams_to_place < len(mermaid_blocks):
+        print(f"  Note: Placed {diagrams_to_place}/{len(mermaid_blocks)} diagrams (limiting to page-relevant content)")
+    
+    return soup
+
+def inject_mermaid_into_markdown(markdown, mermaid_blocks):
+    """
+    Inject mermaid blocks into markdown using intelligent heuristics.
+    Place diagrams after headings that suggest a diagram should follow.
+    """
+    if not mermaid_blocks:
+        return markdown
+    
+    # Keywords that suggest a diagram should follow this heading
+    diagram_keywords = [
+        'diagram', 'architecture', 'flow', 'structure', 'pipeline', 
+        'workflow', 'overview', 'layers', 'graph', 'visualization',
+        'sequence', 'process', 'hierarchy', 'dependency', 'lifecycle'
+    ]
+    
+    lines = markdown.split('\n')
+    result = []
+    diagram_idx = 0
+    
+    i = 0
+    while i < len(lines) and diagram_idx < len(mermaid_blocks):
+        line = lines[i]
+        result.append(line)
+        
+        # Check if this is a heading that should have a diagram
+        stripped = line.strip().lower()
+        if stripped.startswith('###') or stripped.startswith('##'):
+            # Extract heading text
+            heading_text = stripped.lstrip('#').strip()
+            
+            # Check if heading contains diagram keywords
+            if any(keyword in heading_text for keyword in diagram_keywords):
+                # Look ahead to see if next non-empty line is already a diagram
+                next_line_idx = i + 1
+                while next_line_idx < len(lines) and not lines[next_line_idx].strip():
+                    next_line_idx += 1
+                
+                # Only inject if next content is not already a diagram
+                if next_line_idx < len(lines) and not lines[next_line_idx].strip().startswith('```'):
+                    # Insert diagram after this heading
+                    result.append('')
+                    result.append('```mermaid')
+                    result.append(mermaid_blocks[diagram_idx])
+                    result.append('```')
+                    result.append('')
+                    diagram_idx += 1
+                    print(f"  [DEBUG] Inserted diagram {diagram_idx} after heading: {heading_text[:50]}")
+        
+        i += 1
+    
+    # Append remaining lines
+    while i < len(lines):
+        result.append(lines[i])
+        i += 1
+    
+    # If we still have unused diagrams, append them at the end
+    if diagram_idx < len(mermaid_blocks):
+        print(f"  [DEBUG] {len(mermaid_blocks) - diagram_idx} diagrams not placed, appending at end")
+        result.append('')
+        result.append('## Additional Diagrams')
+        result.append('')
+        for idx in range(diagram_idx, len(mermaid_blocks)):
+            result.append('```mermaid')
+            result.append(mermaid_blocks[idx])
+            result.append('```')
+            result.append('')
+    
+    return '\n'.join(result)
 
 def extract_page_content(url, session):
     """Extract the main content from a wiki page"""
     print(f"  Fetching {url}...")
     response = fetch_page(url, session)
+    
+    # NOTE: Mermaid diagrams are client-side rendered and cannot be extracted
+    # without running JavaScript. They exist in the Next.js data payload but
+    # are mixed with all other pages, making per-page extraction impossible.
+    
+    # Parse HTML with BeautifulSoup to get THIS page's structure
     soup = BeautifulSoup(response.text, 'html.parser')
     
     # Remove unwanted elements first
@@ -205,7 +464,15 @@ def extract_page_content(url, session):
     
     # Convert to markdown
     html_content = str(content)
+    
+    # DEBUG: Check if mermaid blocks exist in HTML
+    mermaid_count = html_content.count('language-mermaid')
+    print(f"  [DEBUG] Found {mermaid_count} mermaid blocks in HTML content")
+    
     markdown = convert_html_to_markdown(html_content)
+    
+    # NOTE: Mermaid diagram injection disabled - diagrams are mixed across all pages
+    # in the JavaScript payload and cannot be reliably extracted per-page
     
     # Clean up markdown: remove duplicate titles and stray "Menu" lines
     lines = markdown.split('\n')
