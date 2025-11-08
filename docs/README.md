@@ -1,137 +1,208 @@
-# DeepWiki Markdown Extractor
+# DeepWiki Documentation Builder
 
-A generic utility for extracting wiki documentation from [DeepWiki.com](https://deepwiki.com) as individual markdown files via web scraping.
+A generic utility for extracting wiki documentation from [DeepWiki.com](https://deepwiki.com) and building it into beautiful HTML documentation with mdBook.
 
 ## Features
 
 - Scrapes wiki pages directly from DeepWiki website
 - Converts HTML to clean markdown using html2text
-- Extracts all main wiki pages as separate markdown files
+- Extracts mermaid diagrams from JavaScript payload using intelligent fuzzy matching
 - Preserves page hierarchy and numbering
+- Builds beautiful HTML documentation with mdBook
 - Supports any GitHub repository indexed by DeepWiki
-- Self-contained Docker image (Python-based)
+- Fully configurable via environment variables
+- Self-contained Docker image
 - No authentication required
 
 ## Prerequisites
 
 - Docker installed on your system
-- Internet connection (to access DeepWiki MCP server)
+- Internet connection (to access DeepWiki)
 
 ## Usage
 
-### With Docker (Recommended)
+### Quick Start
 
-1. **Build the Docker image:**
-   ```bash
-   docker build -t deepwiki-scraper docs
-   ```
+Build the complete documentation (markdown + HTML book):
 
-2. **Run the scraper:**
-   ```bash
-   docker run --rm \
-     -v "$PWD/output:/workspace/output" \
-     deepwiki-scraper \
-     python /usr/local/bin/deepwiki-scraper.py <owner/repo> /workspace/output
-   ```
+```bash
+# Build the Docker image
+cd docs
+docker build -t deepwiki-scraper .
 
-   **Example:**
-   ```bash
-   docker run --rm \
-     -v "$PWD/docs/wiki:/workspace/output" \
-     deepwiki-scraper \
-     python /usr/local/bin/deepwiki-scraper.py jzombie/rust-llkv /workspace/output
-   ```
+# Run the complete build
+docker run --rm \
+  -e REPO="owner/repo" \
+  -e BOOK_TITLE="My Documentation" \
+  -v "$(pwd)/output:/output" \
+  deepwiki-scraper
+```
 
-### With Python (Local)
+### Configuration Options
 
-If you have Python 3.11+ installed:
+All configuration is done via environment variables:
 
-1. **Install dependencies:**
-   ```bash
-   pip install -r docs/tools/requirements.txt
-   ```
+| Variable            | Description                                  | Default                       |
+| ------------------- | -------------------------------------------- | ----------------------------- |
+| `REPO`              | GitHub repository (owner/repo)               | `jzombie/rust-llkv`           |
+| `BOOK_TITLE`        | Title for the documentation book             | `Documentation`               |
+| `BOOK_AUTHORS`      | Author name(s)                               | Auto-detected from repo owner |
+| `GIT_REPO_URL`      | Git repository URL                           | Auto-constructed from REPO    |
+| `EDIT_URL_TEMPLATE` | Edit URL template for "Edit this page" links | Auto-constructed              |
+| `MARKDOWN_ONLY`     | Skip mdBook build, only extract markdown     | `false`                       |
 
-2. **Run the scraper:**
-   ```bash
-   python docs/tools/deepwiki-scraper.py <owner/repo> <output-directory>
-   ```
+### Markdown-Only Mode (Debugging)
 
-   **Example:**
-   ```bash
-   python docs/tools/deepwiki-scraper.py jzombie/rust-llkv ./wiki-output
-   ```
+For faster iteration when debugging or just extracting markdown:
+
+```bash
+docker run --rm \
+  -e REPO="owner/repo" \
+  -e MARKDOWN_ONLY="true" \
+  -v "$(pwd)/output:/output" \
+  deepwiki-scraper
+```
+
+This will:
+- Scrape wiki pages from DeepWiki
+- Extract and intelligently place mermaid diagrams
+- Output only the markdown files (skip mdBook build)
+- Much faster for debugging diagram placement or content extraction
+
+### Complete Example
+
+```bash
+# Build documentation for LLKV project
+docker run --rm \
+  -e REPO="jzombie/rust-llkv" \
+  -e BOOK_TITLE="LLKV Documentation" \
+  -v "$(pwd)/output:/output" \
+  deepwiki-scraper
+
+# Serve the documentation locally
+cd output
+python3 -m http.server --directory book 8000
+# Open http://localhost:8000 in your browser
+```
 
 ## Output Format
 
-The extractor creates individual markdown files with the naming convention:
+### Full Build Mode
 
-```
-<page-number>-<page-title>.md
-```
+When built without `MARKDOWN_ONLY=true`, you get:
 
-**Examples:**
+- `output/book/` - Complete HTML documentation
+  - Searchable, responsive mdBook site
+  - Working mermaid diagram rendering
+  - Navigation sidebar with hierarchy
+  - "Edit this page" links to GitHub
+- `output/markdown/` - Source markdown files
+  - Individual markdown files with naming: `<number>-<title>.md`
+  - Subsections in `section-N/` directories
+  - Enhanced with intelligently-placed mermaid diagrams
+- `output/book.toml` - mdBook configuration file
+
+### Markdown-Only Mode
+
+When built with `MARKDOWN_ONLY=true`:
+
+- `output/markdown/` - Source markdown files only
+  - Same structure as above
+  - Faster for debugging diagram placement
+  - Use when you only need the markdown content
+
+**Example filenames:**
 - `1-overview.md`
 - `2-1-workspace-and-crates.md`
 - `3-2-sql-parser.md`
-
-Each file contains:
-- The page title as an H1 header
-- Full markdown content from DeepWiki
-- Proper formatting and structure
+- `section-4/4-1-logical-planning.md`
 
 ## How It Works
 
-1. **Fetch Main Page:** Connects to DeepWiki website and fetches the repository's wiki home page
-2. **Extract Navigation:** Parses HTML to find all wiki page links in the navigation
-3. **Scrape Each Page:** Fetches each wiki page's HTML content
-4. **Convert to Markdown:** Uses html2text to convert HTML to clean markdown
-5. **Save Files:** Writes individual markdown files with clean filenames
+### Phase 1: Clean Markdown Extraction
+1. Fetches wiki structure from DeepWiki
+2. Scrapes each page's HTML content
+3. Removes navigation and UI elements
+4. Converts to clean markdown using html2text
+5. Saves to temporary directory
+
+### Phase 2: Diagram Enhancement
+1. Extracts JavaScript payload from any DeepWiki page
+2. Finds ~461 total mermaid diagrams embedded in JavaScript
+3. Extracts ~48 diagrams with sufficient context (500-char snippets)
+4. Uses fuzzy matching with progressive chunk sizes (300→200→150→100→80 chars)
+5. Intelligently inserts diagrams after relevant paragraphs
+6. Moves completed files atomically to output directory
+
+### Phase 3: mdBook Build (unless MARKDOWN_ONLY=true)
+1. Initializes mdBook structure with configuration
+2. Auto-generates SUMMARY.md table of contents from file structure
+3. Copies markdown files to book source
+4. Installs mdbook-mermaid assets (CSS/JS for diagram rendering)
+5. Builds complete HTML documentation
+6. Copies outputs to /output directory
 
 ## Technical Details
 
-- **Scraping:** Direct HTTP requests to `https://deepwiki.com/<owner>/<repo>`
-- **HTML Parsing:** BeautifulSoup4 for robust HTML parsing
-- **Markdown Conversion:** html2text for HTML to Markdown conversion
-- **Dependencies:** requests, beautifulsoup4, html2text (see `tools/requirements.txt`)
-- **Rate Limiting:** 1 second delay between requests to be respectful
+- **Scraping:** Direct HTTP requests to DeepWiki
+- **HTML Parsing:** BeautifulSoup4 for robust parsing
+- **Markdown Conversion:** html2text with body_width=0
+- **Diagram Extraction:** Regex pattern matching on JavaScript `self.__next_f.push` calls
+- **Fuzzy Matching:** Normalized whitespace, progressive chunk comparison, scoring system
+- **Documentation Build:** mdBook with rust theme + mdbook-mermaid plugin
+- **Package Management:** uv (modern Python package manager)
+- **Dependencies:** Python 3.11, Rust (latest), mdbook, mdbook-mermaid
+- **Architecture:** Multi-stage Docker build (Rust builder + Python runtime)
 
 ## Troubleshooting
 
 ### "No wiki pages found"
-The repository may not be indexed by DeepWiki, or the HTML structure has changed. Try visiting `https://deepwiki.com/<owner>/<repo>` in a browser to verify the wiki exists.
+The repository may not be indexed by DeepWiki. Try visiting `https://deepwiki.com/<owner>/<repo>` in a browser to verify the wiki exists.
 
 ### "Could not find content on page"
-The HTML structure of DeepWiki may have changed. The scraper looks for common content selectors (`article`, `main`, `.wiki-content`, etc.) and may need updating.
+The HTML structure of DeepWiki may have changed. The scraper looks for common content selectors and may need updating.
+
+### Diagrams not appearing
+- Check that the wiki has mermaid diagrams on DeepWiki's website
+- Use `MARKDOWN_ONLY=true` to debug the markdown output
+- Diagrams are matched using fuzzy matching - some may not have enough context to match accurately
 
 ### Connection timeouts
-The scraper includes automatic retries (3 attempts per page). If issues persist, check your internet connection or try again later.
+The scraper includes automatic retries (3 attempts per page). If issues persist, check your internet connection.
 
-## Example: Extracting LLKV Documentation
+### mdBook build fails
+- Ensure Docker has enough memory (2GB+ recommended)
+- Check that the Rust toolchain installed correctly in the image
+- Try `MARKDOWN_ONLY=true` to verify markdown extraction works independently
 
-To extract the LLKV project documentation:
+## Examples
 
+### Extract markdown only (fast debugging)
 ```bash
-# Build the Docker image
-docker build -t deepwiki-scraper docs
-
-# Extract to docs/wiki directory
 docker run --rm \
-  -v "$PWD/docs/wiki:/workspace/output" \
-  deepwiki-scraper \
-  python /usr/local/bin/deepwiki-scraper.py jzombie/rust-llkv /workspace/output
-
-# Verify extraction
-ls -lh docs/wiki/
+  -e REPO="facebook/react" \
+  -e MARKDOWN_ONLY="true" \
+  -v "$(pwd)/output:/output" \
+  deepwiki-scraper
 ```
 
-You should see files like:
+### Build complete documentation
+```bash
+docker run --rm \
+  -e REPO="facebook/react" \
+  -e BOOK_TITLE="React Documentation" \
+  -e BOOK_AUTHORS="Meta Open Source" \
+  -v "$(pwd)/output:/output" \
+  deepwiki-scraper
 ```
-1-overview.md
-2-architecture.md
-3-sql-interface.md
-4-query-planning.md
-...
-12-development-guide.md
+
+### Use with any DeepWiki repository
+```bash
+docker run --rm \
+  -e REPO="microsoft/vscode" \
+  -e BOOK_TITLE="VS Code Internals" \
+  -v "$(pwd)/vscode-docs:/output" \
+  deepwiki-scraper
 ```
 
 ## License
@@ -141,5 +212,24 @@ This tool is part of the LLKV project and is provided under the same license ter
 ## Credits
 
 - **DeepWiki:** AI-powered documentation service at [deepwiki.com](https://deepwiki.com)
+- **mdBook:** Rust-based documentation builder
+- **mdbook-mermaid:** Mermaid diagram support for mdBook
 - **BeautifulSoup4:** HTML parsing library
 - **html2text:** HTML to Markdown converter
+- **uv:** Fast Python package installer
+
+## Architecture Notes
+
+This tool is designed to be fully generic and can be extracted as a standalone package:
+
+- **No hardcoded repository specifics** - all configuration via environment variables
+- **Dynamic structure discovery** - auto-generates table of contents from actual files
+- **Fuzzy diagram matching** - works with DeepWiki's client-side rendering
+- **Temp directory workflow** - atomic operations, no partial states
+- **Multi-stage Docker build** - optimized image size with both Python and Rust tools
+
+Perfect for:
+- Extracting any DeepWiki wiki as markdown
+- Building searchable HTML documentation
+- Creating offline documentation archives
+- Integrating into CI/CD pipelines

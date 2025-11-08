@@ -126,6 +126,54 @@ def extract_wiki_structure(repo, session):
     
     return pages
 
+def clean_deepwiki_footer(markdown):
+    """Remove DeepWiki UI elements from the end of markdown content"""
+    lines = markdown.split('\n')
+    
+    # Find where the DeepWiki footer starts
+    # Use regex patterns to handle variations in the UI text
+    footer_patterns = [
+        r'^\s*Dismiss\s*$',
+        r'Refresh this wiki',
+        r'This wiki was recently refreshed',
+        r'###\s*On this page',
+        r'Please wait \d+ days? to refresh',  # Handles "1 day" or "N days"
+        r'You can refresh again in',           # Alternative phrasing
+        r'^\s*View this search on DeepWiki',
+        r'^\s*Edit Wiki\s*$'
+    ]
+    
+    # Compile patterns for efficiency
+    compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in footer_patterns]
+    
+    # Scan from end backwards to find footer start
+    footer_start = None
+    for i in range(len(lines) - 1, max(0, len(lines) - 50), -1):
+        line = lines[i].strip()
+        if any(pattern.search(line) for pattern in compiled_patterns):
+            footer_start = i
+            break
+    
+    # If we found a footer, scan backwards to find the first indicator
+    # (in case there are multiple, we want the earliest one)
+    if footer_start is not None:
+        for i in range(footer_start - 1, max(0, footer_start - 20), -1):
+            line = lines[i].strip()
+            if any(pattern.search(line) for pattern in compiled_patterns):
+                footer_start = i
+            elif line and not line.startswith('*') and not line.startswith('-'):
+                # Hit content that's not part of the footer
+                break
+        
+        # Remove everything from footer_start onwards
+        lines = lines[:footer_start]
+    
+    # Also remove trailing empty lines
+    while lines and not lines[-1].strip():
+        lines.pop()
+    
+    return '\n'.join(lines)
+
 def convert_html_to_markdown(html_content):
     """Convert HTML to markdown using html2text - diagrams will be added later"""
     # Use html2text for conversion
@@ -137,6 +185,9 @@ def convert_html_to_markdown(html_content):
     # NOTE: Mermaid diagram processing is DISABLED
     # Diagrams will be matched and inserted in a separate pass
     # This is because the HTML contains diagrams from ALL pages mixed together
+    
+    # Clean up DeepWiki footer UI elements
+    markdown = clean_deepwiki_footer(markdown)
     
     return markdown.strip()
     
@@ -401,7 +452,7 @@ def inject_mermaid_into_markdown(markdown, mermaid_blocks):
     
     return '\n'.join(result)
 
-def extract_page_content(url, session):
+def extract_page_content(url, session, current_page_info=None):
     """Extract the main content from a wiki page"""
     print(f"  Fetching {url}...")
     response = fetch_page(url, session)
@@ -496,7 +547,7 @@ def extract_page_content(url, session):
     markdown = '\n'.join(clean_lines).strip()
     
     # Fix internal wiki links to match our filename structure
-    # Convert /jzombie/rust-llkv/2.1-page to section-2/2-1-page.md
+    # Convert /jzombie/rust-llkv/2.1-page to appropriate relative path
     def fix_wiki_link(match):
         full_path = match.group(1)
         # Extract page number and slug (full_path is just "4-query-planning" part)
@@ -508,12 +559,35 @@ def extract_page_content(url, session):
             # Convert page number format: 2.1 -> 2-1
             file_num = page_num.replace('.', '-')
             
-            # Determine if it's a subsection
-            if '.' in page_num:
-                main_section = page_num.split('.')[0]
-                return f'](section-{main_section}/{file_num}-{slug}.md)'
+            # Determine target location
+            is_target_subsection = '.' in page_num
+            target_main_section = page_num.split('.')[0] if is_target_subsection else None
+            
+            # Determine source location (current page)
+            if current_page_info:
+                is_source_subsection = current_page_info.get('level', 0) > 0
+                source_main_section = current_page_info.get('number', '').split('.')[0] if is_source_subsection else None
             else:
-                return f']({file_num}-{slug}.md)'
+                is_source_subsection = False
+                source_main_section = None
+            
+            # Generate relative path based on source and target locations
+            if is_target_subsection:
+                # Target is in a subsection directory
+                if is_source_subsection and source_main_section == target_main_section:
+                    # Both in same section directory - use just filename
+                    return f']({file_num}-{slug}.md)'
+                else:
+                    # Different sections or source is main page - use full path
+                    return f'](section-{target_main_section}/{file_num}-{slug}.md)'
+            else:
+                # Target is a main page
+                if is_source_subsection:
+                    # Source is in subsection, target is main page - go up one level
+                    return f'](../{file_num}-{slug}.md)'
+                else:
+                    # Both main pages - use just filename
+                    return f']({file_num}-{slug}.md)'
         return match.group(0)
     
     # Replace wiki links: [text](/owner/repo/page) -> [text](file.md)
@@ -768,7 +842,7 @@ def main():
             success_count = 0
             for page in pages:
                 try:
-                    markdown = extract_page_content(page['url'], session)
+                    markdown = extract_page_content(page['url'], session, current_page_info=page)
                     
                     # Generate filename based on hierarchy
                     num_prefix = page['number'].replace('.', '-')

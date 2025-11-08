@@ -11,6 +11,7 @@ BOOK_TITLE="${BOOK_TITLE:-Documentation}"
 BOOK_AUTHORS="${BOOK_AUTHORS:-}"
 GIT_REPO_URL="${GIT_REPO_URL:-}"
 EDIT_URL_TEMPLATE="${EDIT_URL_TEMPLATE:-}"
+MARKDOWN_ONLY="${MARKDOWN_ONLY:-false}"  # Set to "true" to skip mdBook build (debugging)
 WORK_DIR="/workspace"
 WIKI_DIR="$WORK_DIR/wiki"
 OUTPUT_DIR="/output"
@@ -31,11 +32,30 @@ echo "  Repository:    $REPO"
 echo "  Book Title:    $BOOK_TITLE"
 echo "  Authors:       $BOOK_AUTHORS"
 echo "  Git Repo URL:  $GIT_REPO_URL"
+echo "  Markdown Only: $MARKDOWN_ONLY"
 
 # Step 1: Scrape wiki
 echo ""
 echo "Step 1: Scraping wiki from DeepWiki..."
 python3 /usr/local/bin/deepwiki-scraper.py "$REPO" "$WIKI_DIR"
+
+# If markdown-only mode, skip mdBook build
+if [ "$MARKDOWN_ONLY" = "true" ]; then
+    echo ""
+    echo "Step 2: Copying markdown files to output (markdown-only mode)..."
+    mkdir -p "$OUTPUT_DIR/markdown"
+    cp -r "$WIKI_DIR"/* "$OUTPUT_DIR/markdown/"
+    
+    echo ""
+    echo "================================================================================"
+    echo "✓ Markdown extraction complete!"
+    echo "================================================================================"
+    echo ""
+    echo "Outputs:"
+    echo "  - Markdown files:  /output/markdown/"
+    echo ""
+    exit 0
+fi
 
 # Step 2: Initialize mdbook structure
 echo ""
