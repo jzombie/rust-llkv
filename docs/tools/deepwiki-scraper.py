@@ -522,8 +522,8 @@ def extract_page_content(url, session):
     
     return markdown
 
-def extract_and_enhance_diagrams(repo, output_dir, session):
-    """Extract diagrams from JavaScript and enhance all markdown files."""
+def extract_and_enhance_diagrams(repo, temp_dir, session):
+    """Extract diagrams from JavaScript and enhance all markdown files in temp directory."""
     print("\n" + "="*80)
     print("PHASE 2: Extracting diagrams and enhancing markdown files")
     print("="*80)
@@ -602,23 +602,9 @@ def extract_and_enhance_diagrams(repo, output_dir, session):
     
     print(f"  Found {len(diagram_contexts)} diagrams with context")
     
-    # Save diagrams for reference
-    diagram_file = output_dir / '_diagrams_with_context.txt'
-    with open(diagram_file, 'w', encoding='utf-8') as f:
-        for i, item in enumerate(diagram_contexts, 1):
-            f.write(f"\n{'='*80}\n")
-            f.write(f"DIAGRAM {i}\n")
-            f.write(f"Heading: {item['last_heading']}\n")
-            f.write(f"Anchor: {item['anchor_text'][:200]}...\n")
-            f.write(f"{'='*80}\n")
-            f.write(f"```mermaid\n{item['diagram']}\n```\n")
-    
-    print(f"  Saved diagram reference to {diagram_file.name}")
-    
-    # Now enhance all markdown files
+    # Now enhance all markdown files IN TEMP DIRECTORY
     print("\nEnhancing markdown files with diagrams...")
-    md_files = list(output_dir.glob('**/*.md'))
-    md_files = [f for f in md_files if not f.name.startswith('_')]
+    md_files = list(temp_dir.glob('**/*.md'))
     
     enhanced_count = 0
     for md_file in md_files:
@@ -744,87 +730,119 @@ def main():
         print("Error: Repository must be in format 'owner/repo'")
         sys.exit(1)
     
-    # Create output directory
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Create temp directory for work-in-progress
+    import tempfile
+    import shutil
     
-    print("="*80)
-    print("PHASE 1: Extracting clean markdown content")
-    print("="*80)
-    print(f"Output directory: {output_dir}")
-    
-    # Create session with headers
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-    })
-    
-    try:
-        # Extract wiki structure
-        pages = extract_wiki_structure(repo, session)
+    with tempfile.TemporaryDirectory(prefix='deepwiki_') as temp_path:
+        temp_dir = Path(temp_path)
         
-        if not pages:
-            print("\nError: No wiki pages found")
-            print("The repository may not have a DeepWiki wiki, or the HTML structure has changed.")
-            sys.exit(1)
-        
-        print(f"\nFound {len(pages)} pages\n")
-        
-        # Create directory structure for subsections
-        # Main pages go in root, subsections in subdirectories
-        main_pages = [p for p in pages if p['level'] == 0]
-        print(f"Main pages: {len(main_pages)}")
-        print(f"Subsections: {len(pages) - len(main_pages)}\n")
-        
-        # Extract each page
-        success_count = 0
-        for page in pages:
-            try:
-                markdown = extract_page_content(page['url'], session)
-                
-                # Generate filename based on hierarchy
-                num_prefix = page['number'].replace('.', '-')
-                title_slug = sanitize_filename(page['title'])
-                
-                # Determine output path based on level
-                if page['level'] == 0:
-                    # Main page: goes in root directory
-                    filename = f"{num_prefix}-{title_slug}.md"
-                    filepath = output_dir / filename
-                else:
-                    # Subsection: create subdirectory named after main section
-                    main_section = page['number'].split('.')[0]
-                    section_dir = output_dir / f"section-{main_section}"
-                    section_dir.mkdir(exist_ok=True)
-                    filename = f"{num_prefix}-{title_slug}.md"
-                    filepath = section_dir / filename
-                
-                # Ensure content starts with title
-                if not markdown.startswith('#'):
-                    markdown = f"# {page['title']}\n\n{markdown}"
-                
-                # Write file
-                filepath.write_text(markdown, encoding='utf-8')
-                print(f"  ✓ {filepath.relative_to(output_dir)} ({len(markdown)} bytes)")
-                success_count += 1
-                
-                # Be nice to the server
-                time.sleep(1)
-                
-            except Exception as e:
-                print(f"  ✗ Failed to extract {page['title']}: {e}")
-        
-        print(f"\n✓ Successfully extracted {success_count}/{len(pages)} pages to {output_dir}")
-        
-        # Extract and enhance with diagrams
-        extract_and_enhance_diagrams(repo, output_dir, session)
-        
-        print("\n" + "="*80)
-        print("✓ COMPLETE: All pages extracted and enhanced with diagrams")
         print("="*80)
+        print("PHASE 1: Extracting clean markdown content")
+        print("="*80)
+        print(f"Working directory: {temp_dir}")
+        print(f"Output directory: {output_dir}")
         
-    except Exception as e:
-        print(f"\n✗ Error: {e}")
-        sys.exit(1)
+        # Create session with headers
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        })
+        
+        try:
+            # Extract wiki structure
+            pages = extract_wiki_structure(repo, session)
+            
+            if not pages:
+                print("\nError: No wiki pages found")
+                print("The repository may not have a DeepWiki wiki, or the HTML structure has changed.")
+                sys.exit(1)
+            
+            print(f"\nFound {len(pages)} pages\n")
+            
+            # Create directory structure for subsections
+            main_pages = [p for p in pages if p['level'] == 0]
+            print(f"Main pages: {len(main_pages)}")
+            print(f"Subsections: {len(pages) - len(main_pages)}\n")
+            
+            # Extract each page TO TEMP DIRECTORY
+            success_count = 0
+            for page in pages:
+                try:
+                    markdown = extract_page_content(page['url'], session)
+                    
+                    # Generate filename based on hierarchy
+                    num_prefix = page['number'].replace('.', '-')
+                    title_slug = sanitize_filename(page['title'])
+                    
+                    # Determine output path based on level
+                    if page['level'] == 0:
+                        # Main page: goes in root directory
+                        filename = f"{num_prefix}-{title_slug}.md"
+                        filepath = temp_dir / filename
+                    else:
+                        # Subsection: create subdirectory named after main section
+                        main_section = page['number'].split('.')[0]
+                        section_dir = temp_dir / f"section-{main_section}"
+                        section_dir.mkdir(exist_ok=True)
+                        filename = f"{num_prefix}-{title_slug}.md"
+                        filepath = section_dir / filename
+                    
+                    # Ensure content starts with title
+                    if not markdown.startswith('#'):
+                        markdown = f"# {page['title']}\n\n{markdown}"
+                    
+                    # Write file to temp
+                    filepath.write_text(markdown, encoding='utf-8')
+                    print(f"  ✓ {filepath.relative_to(temp_dir)} ({len(markdown)} bytes)")
+                    success_count += 1
+                    
+                    # Be nice to the server
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    print(f"  ✗ Failed to extract {page['title']}: {e}")
+            
+            print(f"\n✓ Successfully extracted {success_count}/{len(pages)} pages to temp directory")
+            
+            # Extract and enhance with diagrams IN TEMP DIRECTORY
+            extract_and_enhance_diagrams(repo, temp_dir, session)
+            
+            # Move completed files from temp to final output directory
+            print("\n" + "="*80)
+            print("PHASE 3: Moving completed files to output directory")
+            print("="*80)
+            
+            # Create output directory
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Remove old files in output (including temp/helper files)
+            for old_file in output_dir.glob('**/*'):
+                if old_file.is_file():
+                    old_file.unlink()
+            for old_dir in [d for d in output_dir.iterdir() if d.is_dir()]:
+                shutil.rmtree(old_dir)
+            
+            # Move all files from temp to output
+            moved_count = 0
+            for item in temp_dir.iterdir():
+                dest = output_dir / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest)
+                    moved_count += len(list(dest.glob('*.md')))
+                elif item.suffix == '.md':
+                    shutil.copy2(item, dest)
+                    moved_count += 1
+            
+            print(f"  ✓ Moved {moved_count} markdown files to {output_dir}")
+            
+            print("\n" + "="*80)
+            print("✓ COMPLETE: All pages extracted and enhanced with diagrams")
+            print("="*80)
+            
+        except Exception as e:
+            print(f"\n✗ Error: {e}")
+            sys.exit(1)
 
 if __name__ == '__main__':
     main()
