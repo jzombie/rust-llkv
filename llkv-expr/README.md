@@ -1,6 +1,7 @@
 # LLKV Query Expression AST
 
 [![made-with-rust][rust-logo]][rust-src-page]
+[![rust-docs][rust-docs-badge]][rust-docs-page]
 [![CodSpeed Badge][codspeed-badge]][codspeed-page]
 [![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
 
@@ -46,18 +47,18 @@ Scalar expressions represent arithmetic and data manipulation:
 
 ## Integration with Other Crates
 
-### Planner (`llkv-plan`)
+### Planner ([`llkv-plan`](../llkv-plan/))
 
 - [`llkv-plan`](../llkv-plan/) uses `llkv-expr` to construct logical query plans.
 - `SelectFilter` and other plan structures embed `Expr<String>` for predicates, ensuring the planner remains decoupled from execution details.
 - Correlation helpers in the planner manage placeholder assignment for correlated subqueries, which are represented as `ScalarExpr::ScalarSubquery`.
 
-### Executor (`llkv-executor`)
+### Executor ([`llkv-executor`](../llkv-executor/))
 
 - [`llkv-executor`](../llkv-executor/) evaluates expressions by collecting aggregates, compiling filter programs, and streaming results.
 - The executor applies MVCC visibility filters and evaluates `HAVING` clauses using the `Expr` and `ScalarExpr` structures.
 
-### Table Layer (`llkv-table`)
+### Table Layer ([`llkv-table`](../llkv-table/))
 
 - [`llkv-table`](../llkv-table/) compiles `Expr<FieldId>` into stack-based `EvalProgram` structures for efficient vectorized evaluation.
 - Provides domain analysis and affine transformation extraction to optimize range scans and index selection.
@@ -75,6 +76,9 @@ Licensed under the [Apache-2.0 License](../LICENSE).
 
 [rust-src-page]: https://www.rust-lang.org/
 [rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[rust-docs-page]: https://docs.rs/llkv-expr
+[rust-docs-badge]: https://img.shields.io/docsrs/llkv-expr
 
 [codspeed-page]: https://codspeed.io/jzombie/rust-llkv
 [codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json

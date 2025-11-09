@@ -1,6 +1,7 @@
 # LLKV Column Map
 
 [![made-with-rust][rust-logo]][rust-src-page]
+[![rust-docs][rust-docs-badge]][rust-docs-page]
 [![CodSpeed Badge][codspeed-badge]][codspeed-page]
 [![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
 
@@ -30,7 +31,7 @@
 
 - `ColumnStream` supports projection, filtering, and pagination for streaming reads.
 - Gather operations offer configurable null-handling policies (preserve, error, drop) to accommodate different executor strategies.
-- Parallel scan paths use Rayon; concurrency is bounded by the `LLKV_MAX_THREADS` environment variable when present.
+- Parallel scan paths use [Rayon](https://crates.io/crates/rayon); concurrency is bounded by the `LLKV_MAX_THREADS` environment variable when present.
 
 ## Pager Integration
 
@@ -49,6 +50,9 @@ Licensed under the [Apache-2.0 License](../LICENSE).
 
 [rust-src-page]: https://www.rust-lang.org/
 [rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[rust-docs-page]: https://docs.rs/llkv-column-map
+[rust-docs-badge]: https://img.shields.io/docsrs/llkv-column-map
 
 [codspeed-page]: https://codspeed.io/jzombie/rust-llkv
 [codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json

@@ -8,6 +8,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 autobenches = false
+keywords = ["database", "columnar", "arrow", "storage", "mapping"]
+categories = ["database-implementations", "data-structures"]
+readme = "README.md"
 
 [dependencies]
 arrow = { workspace = true }

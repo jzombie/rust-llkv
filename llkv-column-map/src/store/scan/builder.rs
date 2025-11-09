@@ -365,6 +365,10 @@ macro_rules! declare_sorted_with_rids_range_filter_for_type {
     };
 }
 
+/// Configurable scanner for a single logical column.
+///
+/// Collects [`crate::store::scan::ScanOptions`] and typed range bounds before dispatching work into the visitor
+/// pipeline.
 pub struct ScanBuilder<'a, P: Pager<Blob = EntryHandle>> {
     store: &'a ColumnStore<P>,
     field_id: LogicalFieldId,

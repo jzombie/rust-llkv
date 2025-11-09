@@ -12,7 +12,7 @@ Arrow column chunks are stored under pager-managed physical keys, so pagers that
 
 ## Design Notes
 
-- Execution stays synchronous by default. Query workloads rely on hot-path parallelism from Rayon and Crossbeam instead of a global async runtime so scheduler costs stay predictable, while still embedding cleanly inside Tokio—the SLT harness uses Tokio to stage concurrent connection simulations.
+- Execution stays synchronous by default. Query workloads rely on hot-path parallelism from [Rayon](https://crates.io/crates/rayon) and [Crossbeam](https://crates.io/crates/crossbeam) instead of a global async runtime so scheduler costs stay predictable, while still embedding cleanly inside Tokio—the SLT harness uses Tokio to stage concurrent connection simulations.
 - Storage is built atop the [simd-r-drive](https://crates.io/crates/simd-r-drive) project rather than Parquet, prioritizing fast point updates over integration with existing data lake tooling.
 - The crate shares Apache DataFusion's SQL parser and Arrow memory model but intentionally avoids Tokio. The goal is to explore how far a DataFusion-like stack can go without a task scheduler while still shipping MVCC transactions and [sqllogictest](https://sqlite.org/sqllogictest/doc/trunk/about.wiki) coverage.
 - LLKV remains alpha software. DataFusion offers a broader production footprint today, while this project trails new ideas for specialized workloads.
@@ -81,19 +81,21 @@ let batches = engine.sql("SELECT * FROM users WHERE id > 0").unwrap();
 
 ### Re-exported APIs
 
-- **`SqlEngine`** — Main SQL execution engine from `llkv-sql`
+The following is a non-exhaustive list of some of the APIs this crate re-exports. Enable the `simd-r-drive-support` feature flag when you need durable storage via the SIMD R-Drive pager.
+
+- **`SqlEngine`** — Main SQL execution engine from [`llkv-sql`](../llkv-sql/)
 - **`storage::MemPager`** — In-memory pager for transient databases
 - **`storage::Pager`** — Trait for custom storage backends
-- **`RuntimeStatementResult`** — Statement execution result types
+- **`storage::SimdRDrivePager`** — Durable pager backed by [`simd-r-drive`](https://crates.io/crates/simd-r-drive) (requires the `simd-r-drive-support` feature)
 - **`Error` / `Result`** — Error handling types
 
 ### Using Persistent Storage
 
-For persistent databases, enable the `simd-r-drive-support` feature and use a file-backed pager:
+For persistent databases, enable the `simd-r-drive-support` feature and use a file-backed pager. Replace the version tag with the [latest release published on crates.io](https://crates.io/crates/llkv) when you upgrade:
 
 ```toml
 [dependencies]
-llkv = { version = "0.8.0-alpha", features = ["simd-r-drive-support"] }
+llkv = { version = "0.8.1-alpha", features = ["simd-r-drive-support"] }
 ```
 
 ```rust
@@ -108,11 +110,11 @@ let engine = SqlEngine::new(Arc::new(pager));
 
 LLKV is organized as a layered workspace with each crate focused on a specific responsibility:
 
-- **SQL Interface** (`llkv-sql`) — Parses SQL and manages the `SqlEngine` API
-- **Planning** (`llkv-plan`, `llkv-expr`) — Logical plans and expression ASTs
-- **Runtime** (`llkv-runtime`, `llkv-transaction`) — Transaction orchestration and MVCC
-- **Execution** (`llkv-executor`, `llkv-aggregate`, `llkv-join`) — Query evaluation and streaming results
-- **Storage** (`llkv-table`, `llkv-column-map`, `llkv-storage`) — Columnar storage and pager abstractions
+- **SQL Interface** ([`llkv-sql`](../llkv-sql/)) — Parses SQL and manages the `SqlEngine` API
+- **Planning** ([`llkv-plan`](../llkv-plan/), [`llkv-expr`](../llkv-expr/)) — Logical plans and expression ASTs
+- **Runtime** ([`llkv-runtime`](../llkv-runtime/), [`llkv-transaction`](../llkv-transaction/)) — Transaction orchestration and MVCC
+- **Execution** ([`llkv-executor`](../llkv-executor/), [`llkv-aggregate`](../llkv-aggregate/), [`llkv-join`](../llkv-join/)) — Query evaluation and streaming results
+- **Storage** ([`llkv-table`](../llkv-table/), [`llkv-column-map`](../llkv-column-map/), [`llkv-storage`](../llkv-storage/)) — Columnar storage and pager abstractions
 
 See the [workspace root README](../) and [DeepWiki documentation][deepwiki-page] for detailed architecture information.
 

@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+keywords = ["database", "expression", "ast", "sql", "query"]
+categories = ["database-implementations", "parser-implementations"]
+readme = "README.md"
 
 [dependencies]
 arrow.workspace = true

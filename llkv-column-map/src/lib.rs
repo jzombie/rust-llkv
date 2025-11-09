@@ -1,8 +1,22 @@
 //! Columnar storage engine for LLKV.
 //!
-//! This crate provides a low-level columnar storage layer that persists Apache Arrow
+//! This crate provides the low-level columnar layer that persists Apache Arrow
 //! [`RecordBatch`]es to disk and supports efficient scans, filters, and updates.
-//! It serves as the foundation for [`llkv-table`] and higher-level query execution.
+//! It serves as the foundation for [`llkv-table`] and higher-level query
+//! execution.
+//!
+//! # Role in the Story
+//!
+//! The column map is where LLKV’s Arrow-first design meets pager-backed
+//! persistence. Every [`sqllogictest`](https://sqlite.org/sqllogictest/doc/trunk/about.wiki) shipped with SQLite—and an expanding set of
+//! DuckDB suites—ultimately routes through these descriptors and chunk walkers.
+//! The storage layer therefore carries the burden of matching SQLite semantics
+//! while staying efficient enough for OLAP workloads. Gaps uncovered by the
+//! logic tests are treated as defects in this crate, not harness exceptions.
+//!
+//! The engine is maintained in the open by a single developer. These docs aim
+//! to give newcomers the same context captured in the README and DeepWiki pages
+//! so the story remains accessible as the project grows.
 //!
 //! # Architecture
 //!
@@ -38,6 +52,17 @@
 //! - `RowIdShadow`: Internal row ID tracking for each column
 //! - `TxnCreatedBy`: MVCC transaction that created each row
 //! - `TxnDeletedBy`: MVCC transaction that deleted each row
+//!
+//! # Test Coverage
+//!
+//! - **SQLite suites**: The storage layer powers every SQLite [`sqllogictest`](https://sqlite.org/sqllogictest/doc/trunk/about.wiki)
+//!   case that upstream publishes. Passing those suites provides a baseline for
+//!   SQLite compatibility, but LLKV still diverges from SQLite behavior in
+//!   places and should not be treated as a drop-in replacement yet.
+//! - **DuckDB extensions**: DuckDB-focused suites exercise MVCC edge cases and
+//!   typed transaction flows. Coverage is early and informs the roadmap rather
+//!   than proving full DuckDB parity today. All suites run through the
+//!   [`sqllogictest` crate](https://crates.io/crates/sqllogictest).
 //!
 //! # Thread Safety
 //!

@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+keywords = ["database", "csv", "arrow", "parser", "import"]
+categories = ["database-implementations", "encoding"]
+readme = "README.md"
 
 [dependencies]
 arrow = { workspace = true, default-features = false, features = ["csv", "prettyprint"] }

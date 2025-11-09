@@ -2,7 +2,115 @@
 //!
 //! This crate serves as the primary entrypoint for the LLKV database toolkit.
 //! It re-exports the high-level SQL engine and storage abstractions from the
-//! underlying `llkv-*` crates, providing a unified API surface for users.
+//! underlying `llkv-*` crates so downstream applications see a single surface
+//! for planning, execution, and storage.
+//!
+//! # Why LLKV Exists
+//!
+//! LLKV explores what an [Apache Arrow](https://arrow.apache.org/)-first SQL stack can look like when layered
+//! on top of key-value pagers instead of a purpose-built storage format. The
+//! project targets columnar OLAP workloads while insisting on compatibility with
+//! the reference SQLite [`sqllogictest`](https://sqlite.org/sqllogictest/doc/trunk/about.wiki) suite. Today every published SQLite test
+//! runs unmodified against LLKV, giving the engine a broad SQL regression net as
+//! new features land.
+//!
+//! LLKV also ingests a growing set of DuckDB `sqllogictest` cases. Those tests help
+//! keep transaction semantics honest as dual-dialect support takes shape, but the
+//! DuckDB integration is early and still expanding.
+//!
+//! # Story So Far
+//!
+//! LLKV is an experimental SQL database that layers Arrow columnar storage, a streaming execution
+//! engine, and MVCC transaction management on top of key-value pagers. Every crate in this workspace
+//! serves that goal, keeping [`arrow::record_batch::RecordBatch`] as the interchange format from
+//! storage through execution.
+//!
+//! The surface begins with [llkv-sql](../llkv_sql/index.html), which parses statements via
+//! [`sqlparser`](https://docs.rs/sqlparser) and lowers them into execution plans. Those plans feed
+//! into [llkv-runtime](../llkv_runtime/index.html), the orchestration layer that injects MVCC
+//! metadata, coordinates transactions, and dispatches work across the execution and storage stacks.
+//! Query evaluation lives in [llkv-executor](../llkv_executor/index.html), which streams Arrow
+//! `RecordBatch` results without owning MVCC state, while [llkv-table](../llkv_table/index.html)
+//! enforces schema rules and logical field tracking on top of the column store.
+//!
+//! At the storage layer, [llkv-column-map](../llkv_column_map/index.html) persists column chunks as
+//! Arrow-serialized blobs keyed by pager-managed physical IDs. That layout lets backends such as
+//! [`simd-r-drive`] provide zero-copy buffers, and it keeps higher layers working against Arrow data
+//! structures end-to-end. Concurrency remains synchronous by default, leaning on [Rayon] and
+//! [Crossbeam] while still embedding inside [Tokio] when async orchestration is required.
+//!
+//! Compatibility is measured continuously. [`llkv_slt_tester`](../llkv_slt_tester/index.html)
+//! executes SQLite and DuckDB `sqllogictest` suites via the
+//! [`sqllogictest` crate](https://crates.io/crates/sqllogictest), CI spans Linux, macOS, and Windows,
+//! and the
+//! documentation here stays synchronized with the rest of the repository so the rustdoc narrative
+//! matches the public design record.
+//!
+//! # Crate Topology
+//!
+//! LLKV ships as a layered Cargo workspace where higher crates depend on the ones below while sharing
+//! Arrow as their interchange format. The main strata are:
+//!
+//! - **SQL Interface**: [`llkv-sql`](../llkv_sql/index.html) exposes the SQL entry point and delegates
+//!   planning and execution.
+//! - **Query Planning**: [`llkv-plan`](../llkv_plan/index.html) and [`llkv-expr`](../llkv_expr/index.html)
+//!   define logical plans and expression ASTs.
+//! - **Runtime & Transactions**: [`llkv-runtime`](../llkv_runtime/index.html) orchestrates sessions and
+//!   MVCC, while [`llkv-transaction`](../llkv_transaction/index.html) manages transaction IDs and
+//!   snapshot isolation.
+//! - **Query Execution**: [`llkv-executor`](../llkv_executor/index.html) streams Arrow `RecordBatch`
+//!   results with help from [`llkv-aggregate`](../llkv_aggregate/index.html) and
+//!   [`llkv-join`](../llkv_join/index.html).
+//! - **Table & Metadata**: [`llkv-table`](../llkv_table/index.html) enforces schemas and catalogs atop
+//!   [`llkv-column-map`](../llkv_column_map/index.html), the columnar storage engine.
+//! - **Storage & I/O**: [`llkv-storage`](../llkv_storage/index.html) provides the pager abstraction and
+//!   integrates with [`simd-r-drive`](https://crates.io/crates/simd-r-drive) backends.
+//! - **Supporting crates**: [`llkv-result`](../llkv_result/index.html) unifies error handling,
+//!   [`llkv-csv`](../llkv_csv/index.html) handles CSV ingestion, [`llkv-test-utils`](../llkv_test_utils/index.html)
+//!   supplies testing helpers, and [`llkv-slt-tester`](../llkv_slt_tester/index.html) drives SQL logic tests.
+//!
+//! # MVCC Snapshot Isolation
+//!
+//! LLKV tracks visibility with MVCC metadata injected into every table: hidden `row_id`,
+//! `created_by`, and `deleted_by` columns are managed by the runtime and storage layers. Transactions
+//! obtain 64-bit IDs from the [`llkv_transaction`](../llkv_transaction/index.html) stack, capture a
+//! snapshot of the last committed transaction, and tag new or modified rows accordingly. Rows are
+//! visible when `created_by` is at or below the snapshot watermark and `deleted_by` is absent or
+//! greater than that watermark. `UPDATE` and `DELETE` use soft deletes (`deleted_by = txn_id`), so
+//! old versions remain until future compaction work lands, and auto-commit statements reuse a fast
+//! path that tags rows with the reserved auto-commit ID.
+//!
+//! Each transaction operates with both a base context (existing tables) and a staging context (new
+//! tables created during the transaction). On commit, staged operations replay into the base pager
+//! once the transaction watermark advances, preserving snapshot isolation without copying entire
+//! tables during the unit of work.
+//!
+//! # Roadmap Signals
+//!
+//! Active work centers on extending the transaction lifecycle (the
+//! [`TxnIdManager`](../llkv_transaction/struct.TxnIdManager.html) still carries TODOs for next-ID
+//! management), expanding the constraint system across primary, unique, foreign-key, and check
+//! metadata, and tightening performance around Arrow batch sizing and columnar access patterns. The
+//! crates in this workspace continue to evolve together, keeping documentation and implementation in
+//! lockstep.
+//!
+//! # Dialect and Tooling Outlook
+//!
+//! - **SQLite compatibility**: LLKV parses SQLite-flavored SQL, batches `INSERT`
+//!   statements for throughput, and surfaces results in Arrow form. Passing the
+//!   upstream `sqllogictest` suites establishes a baseline but does not yet make
+//!   LLKV a drop-in SQLite replacement.
+//! - **DuckDB coverage**: Early DuckDB suites exercise MVCC and typed
+//!   transaction flows. They chart the roadmap rather than guarantee full DuckDB
+//!   parity today.
+//! - **Tokio-friendly, synchronous core**: Queries execute synchronously by
+//!   default, delegating concurrency to [Rayon] and [Crossbeam]. Embedders can still
+//!   tuck the engine inside [Tokio], which is how the SQL Logic Test runner drives
+//!   concurrent sessions.
+//!
+//! See [dev-docs/high-level-crate-linkage.md](../dev-docs/high-level-crate-linkage.md)
+//! and the [DeepWiki architecture overview](https://deepwiki.com/jzombie/rust-llkv)
+//! for diagrams and extended commentary.
 //!
 //! # Quick Start
 //!
@@ -20,11 +128,11 @@
 //!
 //! LLKV is organized as a layered workspace:
 //!
-//! - **SQL Interface** (`llkv-sql`): Parses and executes SQL statements.
-//! - **Query Planning** (`llkv-plan`, `llkv-expr`): Defines logical plans and expression ASTs.
-//! - **Runtime** (`llkv-runtime`, `llkv-transaction`): Coordinates MVCC transactions and statement execution.
-//! - **Execution** (`llkv-executor`, `llkv-aggregate`, `llkv-join`): Evaluates queries and streams Arrow batches.
-//! - **Storage** (`llkv-table`, `llkv-column-map`, `llkv-storage`): Manages columnar storage and pager abstractions.
+//! - **SQL Interface** ([llkv-sql](../llkv_sql/index.html)): Parses and executes SQL statements.
+//! - **Query Planning** ([llkv-plan](../llkv_plan/index.html), [llkv-expr](../llkv_expr/index.html)): Defines logical plans and expression ASTs.
+//! - **Runtime** ([llkv-runtime](../llkv_runtime/index.html), [llkv-transaction](../llkv_transaction/index.html)): Coordinates MVCC transactions and statement execution.
+//! - **Execution** ([llkv-executor](../llkv_executor/index.html), [llkv-aggregate](../llkv_aggregate/index.html), [llkv-join](../llkv_join/index.html)): Streams Arrow batches through operators.
+//! - **Storage** ([llkv-table](../llkv_table/index.html), [llkv-column-map](../llkv_column_map/index.html), [llkv-storage](../llkv_storage/index.html)): Manages columnar storage and pager abstractions.
 //!
 //! # Re-exports
 //!
@@ -32,6 +140,11 @@
 //!
 //! - [`SqlEngine`]: The main SQL execution engine.
 //! - [`storage`]: Pager abstractions and implementations.
+//!
+//! [Rayon]: https://docs.rs/rayon
+//! [Crossbeam]: https://docs.rs/crossbeam
+//! [Tokio]: https://docs.rs/tokio
+//! [`simd-r-drive`]: https://crates.io/crates/simd-r-drive
 
 // Re-export the SQL engine as the primary user-facing API
 pub use llkv_sql::SqlEngine;

@@ -1,6 +1,7 @@
 # LLKV Runtime
 
 [![made-with-rust][rust-logo]][rust-src-page]
+[![rust-docs][rust-docs-badge]][rust-docs-page]
 [![CodSpeed Badge][codspeed-badge]][codspeed-page]
 [![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
 
@@ -50,6 +51,9 @@ Licensed under the [Apache-2.0 License](../LICENSE).
 
 [rust-src-page]: https://www.rust-lang.org/
 [rust-logo]: https://img.shields.io/badge/Made%20with-Rust-black?&logo=Rust
+
+[rust-docs-page]: https://docs.rs/llkv-runtime
+[rust-docs-badge]: https://img.shields.io/docsrs/llkv-runtime
 
 [codspeed-page]: https://codspeed.io/jzombie/rust-llkv
 [codspeed-badge]: https://img.shields.io/endpoint?url=https://codspeed.io/badge.json

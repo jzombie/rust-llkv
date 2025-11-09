@@ -109,6 +109,9 @@ pub(crate) trait IndexOps<P: Pager>: Send + Sync {
 }
 
 /// A container for the store's index implementations.
+///
+/// Coordinates index registration, refresh, and teardown by delegating to concrete index ops while
+/// batching pager mutations.
 pub struct IndexManager<P: Pager> {
     pub(crate) pager: Arc<P>,
     pub(crate) presence_ops: presence::PresenceIndexOps,

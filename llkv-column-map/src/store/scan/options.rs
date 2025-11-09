@@ -5,6 +5,10 @@
 
 use super::*;
 
+/// Hint flags that shape [`crate::store::scan::ScanBuilder`] iteration semantics.
+///
+/// Options control ordering, pagination, row-id emission, and null handling while remaining
+/// lightweight enough to build inline around hot scan paths.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanOptions {
     pub sorted: bool,
