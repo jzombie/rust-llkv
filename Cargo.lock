@@ -1609,6 +1609,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "thiserror",
+ "time",
 ]
 
 [[package]]
@@ -1737,6 +1738,7 @@ dependencies = [
  "simd-r-drive-entry-handle",
  "sqlparser",
  "tempfile",
+ "time",
  "tracing",
 ]
 

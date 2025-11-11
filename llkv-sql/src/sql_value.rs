@@ -1,8 +1,9 @@
 use crate::{SqlResult, sql_engine::placeholder_marker, sql_engine::register_placeholder};
+use llkv_executor::utils::parse_date32_literal;
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
-use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, UnaryOperator, Value, ValueWithSpan};
+use sqlparser::ast::{BinaryOperator, DataType, Expr as SqlExpr, TypedString, UnaryOperator, Value, ValueWithSpan};
 
 #[derive(Clone, Debug)]
 pub(crate) enum SqlValue {
@@ -11,6 +12,7 @@ pub(crate) enum SqlValue {
     Float(f64),
     Boolean(bool),
     String(String),
+    Date32(i32),
     Struct(FxHashMap<String, SqlValue>),
 }
 
@@ -18,6 +20,7 @@ impl SqlValue {
     pub(crate) fn try_from_expr(expr: &SqlExpr) -> SqlResult<Self> {
         match expr {
             SqlExpr::Value(value) => SqlValue::from_value(value),
+            SqlExpr::TypedString(typed) => SqlValue::from_typed_string(typed),
             SqlExpr::UnaryOp {
                 op: UnaryOperator::Minus,
                 expr,
@@ -27,6 +30,7 @@ impl SqlValue {
                 SqlValue::Null
                 | SqlValue::Boolean(_)
                 | SqlValue::String(_)
+                | SqlValue::Date32(_)
                 | SqlValue::Struct(_) => Err(Error::InvalidArgumentError(
                     "cannot negate non-numeric literal".into(),
                 )),
@@ -39,6 +43,9 @@ impl SqlValue {
                 SqlValue::Null => Ok(SqlValue::Null),
                 SqlValue::Struct(_) => Err(Error::InvalidArgumentError(
                     "cannot CAST struct literals".into(),
+                )),
+                SqlValue::Date32(_) => Err(Error::InvalidArgumentError(
+                    "cannot CAST DATE literals".into(),
                 )),
                 other => Err(Error::InvalidArgumentError(format!(
                     "unsupported literal CAST expression: {other:?}"
@@ -56,6 +63,7 @@ impl SqlValue {
                         let lhs_i64 = match lhs {
                             SqlValue::Integer(i) => i,
                             SqlValue::Float(f) => f as i64,
+                            SqlValue::Date32(days) => days as i64,
                             _ => {
                                 return Err(Error::InvalidArgumentError(
                                     "bitwise shift requires numeric operands".into(),
@@ -66,6 +74,7 @@ impl SqlValue {
                         let rhs_i64 = match rhs {
                             SqlValue::Integer(i) => i,
                             SqlValue::Float(f) => f as i64,
+                            SqlValue::Date32(days) => days as i64,
                             _ => {
                                 return Err(Error::InvalidArgumentError(
                                     "bitwise shift requires numeric operands".into(),
@@ -129,6 +138,25 @@ impl SqlValue {
             }
         }
     }
+
+    fn from_typed_string(typed: &TypedString) -> SqlResult<Self> {
+        let text = match typed.value.value.clone().into_string() {
+            Some(text) => text,
+            None => {
+                return Err(Error::InvalidArgumentError(
+                    "typed string literal must be a quoted string".into(),
+                ));
+            }
+        };
+
+        match typed.data_type {
+            DataType::Date => {
+                let days = parse_date32_literal(&text)?;
+                Ok(SqlValue::Date32(days))
+            }
+            _ => Ok(SqlValue::String(text)),
+        }
+    }
 }
 
 fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
@@ -153,6 +181,7 @@ impl From<SqlValue> for PlanValue {
             SqlValue::Float(v) => PlanValue::Float(v),
             SqlValue::Boolean(v) => PlanValue::Integer(if v { 1 } else { 0 }),
             SqlValue::String(s) => PlanValue::String(s),
+            SqlValue::Date32(days) => PlanValue::Date32(days),
             SqlValue::Struct(fields) => {
                 let converted: FxHashMap<String, PlanValue> = fields
                     .into_iter()

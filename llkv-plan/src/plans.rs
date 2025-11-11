@@ -72,6 +72,7 @@ pub enum PlanValue {
     Integer(i64),
     Float(f64),
     String(String),
+    Date32(i32),
     Struct(FxHashMap<String, PlanValue>),
 }
 
@@ -139,6 +140,7 @@ pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanV
         Literal::Float(f) => Ok(PlanValue::Float(*f)),
         Literal::String(s) => Ok(PlanValue::String(s.clone())),
         Literal::Boolean(b) => Ok(PlanValue::from(*b)),
+        Literal::Date32(days) => Ok(PlanValue::Date32(*days)),
         Literal::Struct(fields) => {
             let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
             for (name, value) in fields {
@@ -1155,7 +1157,7 @@ pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanV
                 .ok_or_else(|| {
                     Error::InvalidArgumentError("expected Date32 array in INSERT SELECT".into())
                 })?;
-            Ok(PlanValue::Integer(values.value(index) as i64))
+            Ok(PlanValue::Date32(values.value(index)))
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported data type in INSERT SELECT: {other:?}"

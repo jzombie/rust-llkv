@@ -785,6 +785,7 @@ impl NumericKernels {
                     Some(NumericValue::Integer(if *b { 1 } else { 0 }))
                 }
                 llkv_expr::literal::Literal::String(_) => None,
+                llkv_expr::literal::Literal::Date32(_) => None,
                 llkv_expr::literal::Literal::Struct(_) => None,
                 llkv_expr::literal::Literal::Null => None,
             }
@@ -1387,6 +1388,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Boolean(_) => NumericKind::Integer,
                 llkv_expr::literal::Literal::Null => NumericKind::Integer,
                 llkv_expr::literal::Literal::String(_) => NumericKind::Float,
+                llkv_expr::literal::Literal::Date32(_) => NumericKind::Float,
                 llkv_expr::literal::Literal::Struct(_) => NumericKind::Float,
             },
             ScalarExpr::Column(fid) => arrays

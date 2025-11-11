@@ -9,11 +9,12 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch,
-    StringArray, UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, OffsetSizeTrait,
+    RecordBatch, StringArray, UInt64Array, new_null_array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
+use time::{Date, Month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
@@ -1140,6 +1141,7 @@ where
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                            ScalarExpr::Literal(Literal::Date32(_)) => DataType::Date32,
                             ScalarExpr::Literal(Literal::Null) => DataType::Null,
                             ScalarExpr::Literal(Literal::Struct(fields)) => {
                                 // Infer struct type from the literal fields
@@ -3374,6 +3376,7 @@ fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
             Ok(false)
         }
         Literal::Integer(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
+        Literal::Date32(_) => Ok(false),
     }
 }
 
@@ -3423,6 +3426,7 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
         Literal::Float(_) => Ok(DataType::Float64),
         Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
+        Literal::Date32(_) => Ok(DataType::Date32),
         Literal::Null => Ok(DataType::Null),
         Literal::Struct(fields) => {
             let inferred_fields = fields
@@ -3464,6 +3468,9 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
         }
+        ScalarExpr::Literal(Literal::Date32(value)) => {
+            Ok(Arc::new(Date32Array::from(vec![*value; row_count])) as ArrayRef)
+        }
         ScalarExpr::Literal(Literal::Null) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::Literal(Literal::Struct(fields)) => {
             // Build a struct array from the literal fields
@@ -3492,6 +3499,9 @@ fn synthesize_computed_literal_array(
                     }
                     Literal::String(v) => {
                         Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
+                    }
+                    Literal::Date32(v) => {
+                        Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
                     }
                     Literal::Null => new_null_array(&field_dtype, row_count),
                     Literal::Struct(nested_fields) => {
@@ -3906,6 +3916,7 @@ fn format_literal(lit: &Literal) -> String {
         Literal::Float(f) => f.to_string(),
         Literal::Boolean(b) => b.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
+        Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
         Literal::Null => "NULL".to_string(),
         Literal::Struct(fields) => {
             let field_strs: Vec<_> = fields
@@ -3915,6 +3926,28 @@ fn format_literal(lit: &Literal) -> String {
             format!("{{{}}}", field_strs.join(", "))
         }
     }
+}
+
+fn format_date32(days: i32) -> String {
+    let julian = match epoch_julian_day().checked_add(days) {
+        Some(value) => value,
+        None => return days.to_string(),
+    };
+
+    match Date::from_julian_day(julian) {
+        Ok(date) => {
+            let (year, month, day) = date.to_calendar_date();
+            let month_number = month as u8;
+            format!("{:04}-{:02}-{:02}", year, month_number, day)
+        }
+        Err(_) => days.to_string(),
+    }
+}
+
+fn epoch_julian_day() -> i32 {
+    Date::from_calendar_date(1970, Month::January, 1)
+        .expect("1970-01-01 is a valid date")
+        .to_julian_day()
 }
 
 fn escape_string(value: &str) -> String {

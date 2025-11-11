@@ -7,10 +7,11 @@
 use llkv_result::{Error, Result};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator, Value,
-    ValueWithSpan,
+    DataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName,
+    ObjectNamePart, Select, SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor,
+    TypedString, UnaryOperator, Value, ValueWithSpan,
 };
+use time::{Date, Month};
 
 use crate::PlanValue;
 
@@ -41,13 +42,14 @@ use crate::PlanValue;
 pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
     match expr {
         SqlExpr::Value(value) => plan_value_from_sql_value(value),
+        SqlExpr::TypedString(typed) => plan_value_from_typed_string(typed),
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
         } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
-            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) => Err(
+            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Date32(_) => Err(
                 Error::InvalidArgumentError("cannot negate non-numeric literal".into()),
             ),
         },
@@ -69,6 +71,69 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
             "unsupported literal expression: {other:?}"
         ))),
     }
+}
+
+fn plan_value_from_typed_string(typed: &TypedString) -> Result<PlanValue> {
+    let text = typed
+        .value
+        .value
+        .clone()
+        .into_string()
+        .ok_or_else(|| {
+            Error::InvalidArgumentError("typed string literal must be a quoted string".into())
+        })?;
+
+    match typed.data_type {
+        DataType::Date => {
+            let days = parse_date32_literal(&text)?;
+            Ok(PlanValue::Date32(days))
+        }
+        _ => Ok(PlanValue::String(text)),
+    }
+}
+
+fn parse_date32_literal(text: &str) -> Result<i32> {
+    let mut parts = text.split('-');
+    let year_str = parts
+        .next()
+        .ok_or_else(|| Error::InvalidArgumentError(format!("invalid DATE literal '{text}'")))?;
+    let month_str = parts
+        .next()
+        .ok_or_else(|| Error::InvalidArgumentError(format!("invalid DATE literal '{text}'")))?;
+    let day_str = parts
+        .next()
+        .ok_or_else(|| Error::InvalidArgumentError(format!("invalid DATE literal '{text}'")))?;
+    if parts.next().is_some() {
+        return Err(Error::InvalidArgumentError(format!(
+            "invalid DATE literal '{text}'"
+        )));
+    }
+
+    let year = year_str.parse::<i32>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid year in DATE literal '{text}'"))
+    })?;
+    let month_num = month_str.parse::<u8>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
+    })?;
+    let day = day_str.parse::<u8>().map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid day in DATE literal '{text}'"))
+    })?;
+
+    let month = Month::try_from(month_num).map_err(|_| {
+        Error::InvalidArgumentError(format!("invalid month in DATE literal '{text}'"))
+    })?;
+
+    let date = Date::from_calendar_date(year, month, day).map_err(|err| {
+        Error::InvalidArgumentError(format!("invalid DATE literal '{text}': {err}"))
+    })?;
+    let days = date.to_julian_day() - epoch_julian_day();
+    Ok(days)
+}
+
+fn epoch_julian_day() -> i32 {
+    Date::from_calendar_date(1970, Month::January, 1)
+        .expect("1970-01-01 is a valid date")
+        .to_julian_day()
 }
 
 /// Convert a SQL value literal to a PlanValue.

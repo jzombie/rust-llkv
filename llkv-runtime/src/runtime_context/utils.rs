@@ -54,7 +54,7 @@ where
                             column.name
                         ))
                     })?;
-                    Ok(PlanValue::Integer(casted as i64))
+                    Ok(PlanValue::Date32(casted))
                 }
                 DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
                     "cannot assign integer to STRUCT column '{}'",
@@ -92,7 +92,7 @@ where
                 DataType::Utf8 => Ok(PlanValue::String(s)),
                 DataType::Date32 => {
                     let days = parse_date32_literal(&s)?;
-                    Ok(PlanValue::Integer(days as i64))
+                    Ok(PlanValue::Date32(days))
                 }
                 DataType::Int64 | DataType::Float64 => Err(Error::InvalidArgumentError(format!(
                     "cannot assign string '{}' to numeric column '{}'",
@@ -109,6 +109,27 @@ where
                 _ => Err(Error::InvalidArgumentError(format!(
                     "cannot assign struct value to column '{}'",
                     column.name
+                ))),
+            },
+            PlanValue::Date32(days) => match &column.data_type {
+                DataType::Date32 => Ok(PlanValue::Date32(days)),
+                DataType::Int64 => Ok(PlanValue::Integer(i64::from(days))),
+                DataType::Float64 => Ok(PlanValue::Float(days as f64)),
+                DataType::Utf8 => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign DATE literal to TEXT column '{}'",
+                    column.name
+                ))),
+                DataType::Boolean => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign DATE literal to BOOLEAN column '{}'",
+                    column.name
+                ))),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign DATE literal to STRUCT column '{}'",
+                    column.name
+                ))),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported target type {:?} for DATE literal in column '{}'",
+                    other, column.name
                 ))),
             },
         }

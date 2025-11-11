@@ -34,6 +34,7 @@ impl CanonicalScalar {
             PlanValue::Integer(v) => Ok(CanonicalScalar::Int64(*v)),
             PlanValue::Float(v) => Ok(Self::from_f64(*v)),
             PlanValue::String(v) => Ok(CanonicalScalar::Utf8(Arc::<str>::from(v.as_str()))),
+            PlanValue::Date32(days) => Ok(CanonicalScalar::Date32(*days)),
             PlanValue::Struct(_) => Err(Error::InvalidArgumentError(
                 "struct values are not supported in canonical scalar conversion".into(),
             )),

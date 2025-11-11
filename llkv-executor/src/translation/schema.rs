@@ -58,6 +58,7 @@ pub fn infer_computed_data_type(
         ScalarExpr::Literal(Literal::Float(_)) => Ok(DataType::Float64),
         ScalarExpr::Literal(Literal::Boolean(_)) => Ok(DataType::Boolean),
         ScalarExpr::Literal(Literal::String(_)) => Ok(DataType::Utf8),
+        ScalarExpr::Literal(Literal::Date32(_)) => Ok(DataType::Date32),
         ScalarExpr::Literal(Literal::Null) => Ok(DataType::Null),
         ScalarExpr::Literal(Literal::Struct(_)) => Ok(DataType::Utf8),
         ScalarExpr::Column(field_id) => {
@@ -141,6 +142,7 @@ fn expression_uses_float(
         | ScalarExpr::Literal(Literal::Boolean(_))
         | ScalarExpr::Literal(Literal::Null)
         | ScalarExpr::Literal(Literal::String(_))
+    | ScalarExpr::Literal(Literal::Date32(_))
         | ScalarExpr::Literal(Literal::Struct(_)) => Ok(false),
         ScalarExpr::Column(field_id) => {
             let column = schema.column_by_field_id(*field_id).ok_or_else(|| {

@@ -16,6 +16,8 @@ pub enum Literal {
     Float(f64),
     String(String),
     Boolean(bool),
+    /// Date literal stored as days since the Unix epoch (1970-01-01).
+    Date32(i32),
     /// Struct literal with field names and nested literals
     Struct(Vec<(String, Box<Literal>)>),
     // Other types like Bytes, etc. can be added here.
@@ -109,6 +111,10 @@ macro_rules! impl_from_literal_int {
                             expected: "integer",
                             got: "string",
                         }),
+                        Literal::Date32(_) => Err(LiteralCastError::TypeMismatch {
+                            expected: "integer",
+                            got: "date",
+                        }),
                         Literal::Struct(_) => Err(LiteralCastError::TypeMismatch {
                             expected: "integer",
                             got: "struct",
@@ -155,6 +161,12 @@ impl FromLiteral for f32 {
                     got: "null",
                 });
             }
+            Literal::Date32(_) => {
+                return Err(LiteralCastError::TypeMismatch {
+                    expected: "float",
+                    got: "date",
+                });
+            }
         };
         let cast = value as f32;
         if value.is_finite() && !cast.is_finite() {
@@ -194,6 +206,10 @@ impl FromLiteral for bool {
                     }),
                 }
             }
+            Literal::Date32(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "bool",
+                got: "date",
+            }),
             Literal::Struct(_) => Err(LiteralCastError::TypeMismatch {
                 expected: "bool",
                 got: "struct",
@@ -219,6 +235,10 @@ impl FromLiteral for f64 {
                 expected: "float",
                 got: "string",
             }),
+            Literal::Date32(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "float",
+                got: "date",
+            }),
             Literal::Struct(_) => Err(LiteralCastError::TypeMismatch {
                 expected: "float",
                 got: "struct",
@@ -237,6 +257,7 @@ fn literal_type_name(lit: &Literal) -> &'static str {
         Literal::Float(_) => "float",
         Literal::String(_) => "string",
         Literal::Boolean(_) => "boolean",
+        Literal::Date32(_) => "date",
         Literal::Null => "null",
         Literal::Struct(_) => "struct",
     }
@@ -249,6 +270,10 @@ pub fn literal_to_string(lit: &Literal) -> Result<String, LiteralCastError> {
         Literal::Null => Err(LiteralCastError::TypeMismatch {
             expected: "string",
             got: "null",
+        }),
+        Literal::Date32(_) => Err(LiteralCastError::TypeMismatch {
+            expected: "string",
+            got: "date",
         }),
         _ => Err(LiteralCastError::TypeMismatch {
             expected: "string",

@@ -17,6 +17,8 @@ use std::sync::OnceLock;
 
 const PLACEHOLDER_STREAM: &str = ":s";
 static NUMERIC_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+static TYPED_STRING_RE: OnceLock<Regex> = OnceLock::new();
+static INTERVAL_DAY_PRECISION_RE: OnceLock<Regex> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
@@ -91,6 +93,7 @@ pub fn render_tpch_query(
                 StatementKind::Command
             };
             let mut sql = statement.to_string();
+            sql = normalize_typed_string_literals(sql);
             if !sql.ends_with(';') {
                 sql.push(';');
             }
@@ -248,6 +251,28 @@ fn substitute_stream_placeholder(sql: String, present: bool, options: &QueryOpti
         return sql;
     }
     sql.replace(PLACEHOLDER_STREAM, &options.stream_number.to_string())
+}
+
+fn normalize_typed_string_literals(mut sql: String) -> String {
+    let typed_regex = TYPED_STRING_RE
+        .get_or_init(|| Regex::new(r"(?i)\b(DATE|TIME|TIMESTAMP)\s+'([^']*)'").expect("valid regex"));
+    sql = typed_regex
+        .replace_all(&sql, |caps: &regex::Captures<'_>| {
+            let type_name = caps[1].to_ascii_uppercase();
+            let literal = caps[2].replace('\'', "''");
+            format!("CAST('{literal}' AS {type_name})")
+        })
+        .into_owned();
+
+    let interval_regex = INTERVAL_DAY_PRECISION_RE.get_or_init(|| {
+        Regex::new(r"(?i)INTERVAL\s+'([^']*)'\s+DAY\s*\(\s*\d+\s*\)").expect("valid regex")
+    });
+    interval_regex
+        .replace_all(&sql, |caps: &regex::Captures<'_>| {
+            let literal = caps[1].replace('\'', "''");
+            format!("INTERVAL '{literal}' DAY")
+        })
+        .into_owned()
 }
 
 fn apply_limit_to_last_query(

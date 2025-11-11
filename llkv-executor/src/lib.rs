@@ -15,9 +15,9 @@
 //! in a future refactoring.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, Int64Builder, LargeStringArray, RecordBatch, StringArray,
-    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder, LargeStringArray, RecordBatch,
+    StringArray, StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
@@ -77,6 +77,7 @@ pub mod utils;
 pub type ExecutorResult<T> = Result<T, Error>;
 
 use crate::translation::schema::infer_computed_data_type;
+use crate::utils::format_date32_literal;
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -778,7 +779,7 @@ where
                     let numeric = if flag { 1.0 } else { 0.0 };
                     values.push(Some(numeric));
                 }
-                Literal::String(_) | Literal::Struct(_) => {
+                Literal::String(_) | Literal::Struct(_) | Literal::Date32(_) => {
                     return Err(Error::InvalidArgumentError(
                         "scalar subquery produced non-numeric result in numeric context".into(),
                     ));
@@ -883,8 +884,8 @@ where
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
         use arrow::array::{
-            ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, StructArray,
-            new_null_array,
+            ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
+            StructArray, new_null_array,
         };
         use arrow::datatypes::{DataType, Field};
         use llkv_expr::literal::Literal;
@@ -908,6 +909,10 @@ where
             Literal::String(v) => Ok((
                 DataType::Utf8,
                 Arc::new(StringArray::from(vec![v.clone()])) as ArrayRef,
+            )),
+            Literal::Date32(v) => Ok((
+                DataType::Date32,
+                Arc::new(Date32Array::from(vec![*v])) as ArrayRef,
             )),
             Literal::Null => Ok((DataType::Null, new_null_array(&DataType::Null, 1))),
             Literal::Struct(struct_fields) => {
@@ -5602,6 +5607,7 @@ where
                 Ok(PlanValue::Integer(if *v { 1 } else { 0 }))
             }
             ScalarExpr::Literal(Literal::String(s)) => Ok(PlanValue::String(s.clone())),
+            ScalarExpr::Literal(Literal::Date32(days)) => Ok(PlanValue::Date32(*days)),
             ScalarExpr::Literal(Literal::Null) => Ok(PlanValue::Null),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
@@ -6061,6 +6067,7 @@ where
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
+            ScalarExpr::Literal(Literal::Date32(days)) => Ok(Some(*days as i64)),
             ScalarExpr::Literal(Literal::Null) => Ok(None),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
@@ -6453,6 +6460,10 @@ fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<Ar
         Literal::String(v) => {
             let values: Vec<Option<String>> = (0..len).map(|_| Some(v.clone())).collect();
             Ok(Arc::new(StringArray::from(values)) as ArrayRef)
+        }
+        Literal::Date32(days) => {
+            let values = vec![*days; len];
+            Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
         }
         Literal::Null => Ok(new_null_array(&DataType::Null, len)),
         Literal::Struct(_) => Err(Error::InvalidArgumentError(
@@ -7287,6 +7298,10 @@ fn encode_plan_value(buf: &mut Vec<u8>, value: &PlanValue) {
             buf.extend_from_slice(&len.to_be_bytes());
             buf.extend_from_slice(bytes);
         }
+        PlanValue::Date32(days) => {
+            buf.push(5);
+            buf.extend_from_slice(&days.to_be_bytes());
+        }
         PlanValue::Struct(map) => {
             buf.push(4);
             let mut entries: Vec<_> = map.iter().collect();
@@ -7942,6 +7957,7 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
         match literal {
             Literal::Integer(value) => Some(*value),
             Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
+            Literal::Date32(value) => Some(*value as i128),
             _ => None,
         }
     }
@@ -7983,6 +7999,7 @@ fn literal_to_f64(literal: &Literal) -> Option<f64> {
         Literal::Integer(value) => Some(*value as f64),
         Literal::Float(value) => Some(*value),
         Literal::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
+        Literal::Date32(value) => Some(*value as f64),
         _ => None,
     }
 }
@@ -7992,6 +8009,7 @@ fn literal_to_i128(literal: &Literal) -> Option<i128> {
         Literal::Integer(value) => Some(*value),
         Literal::Float(value) => Some(*value as i128),
         Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
+        Literal::Date32(value) => Some(*value as i128),
         _ => None,
     }
 }
@@ -8001,6 +8019,7 @@ fn literal_truthiness(literal: &Literal) -> Option<bool> {
         Literal::Boolean(value) => Some(*value),
         Literal::Integer(value) => Some(*value != 0),
         Literal::Float(value) => Some(*value != 0.0),
+        Literal::Date32(value) => Some(*value != 0),
         Literal::Null => None,
         _ => None,
     }
@@ -8010,6 +8029,7 @@ fn plan_value_truthiness(value: &PlanValue) -> Option<bool> {
     match value {
         PlanValue::Integer(v) => Some(*v != 0),
         PlanValue::Float(v) => Some(*v != 0.0),
+        PlanValue::Date32(v) => Some(*v != 0),
         PlanValue::Null => None,
         _ => None,
     }
@@ -8124,6 +8144,7 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
                     "0".to_string()
                 }
             }
+            Literal::Date32(days) => format_date32_literal(*days).ok()?,
             Literal::Struct(_) | Literal::Null => return None,
         })),
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
@@ -8476,6 +8497,11 @@ fn literal_compare(lhs: &Literal, rhs: &Literal) -> Option<std::cmp::Ordering> {
         (Literal::Float(a), Literal::Float(b)) => a.partial_cmp(b),
         (Literal::Integer(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
         (Literal::Float(a), Literal::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (Literal::Date32(a), Literal::Date32(b)) => Some(a.cmp(b)),
+        (Literal::Date32(a), Literal::Integer(b)) => Some((*a as i128).cmp(b)),
+        (Literal::Integer(a), Literal::Date32(b)) => Some(a.cmp(&(*b as i128))),
+        (Literal::Date32(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
+        (Literal::Float(a), Literal::Date32(b)) => a.partial_cmp(&(*b as f64)),
         (Literal::String(a), Literal::String(b)) => Some(a.cmp(b)),
         _ => None,
     }
@@ -8488,7 +8514,12 @@ fn literal_equals(lhs: &Literal, rhs: &Literal) -> Option<bool> {
         (Literal::Integer(_), Literal::Integer(_))
         | (Literal::Integer(_), Literal::Float(_))
         | (Literal::Float(_), Literal::Integer(_))
-        | (Literal::Float(_), Literal::Float(_)) => {
+        | (Literal::Float(_), Literal::Float(_))
+        | (Literal::Date32(_), Literal::Date32(_))
+        | (Literal::Date32(_), Literal::Integer(_))
+        | (Literal::Integer(_), Literal::Date32(_))
+        | (Literal::Date32(_), Literal::Float(_))
+        | (Literal::Float(_), Literal::Date32(_)) => {
             literal_compare(lhs, rhs).map(|cmp| cmp == std::cmp::Ordering::Equal)
         }
         _ => None,
@@ -8502,6 +8533,14 @@ fn literal_string(literal: &Literal, case_sensitive: bool) -> Option<String> {
                 Some(value.clone())
             } else {
                 Some(value.to_ascii_lowercase())
+            }
+        }
+        Literal::Date32(value) => {
+            let formatted = format_date32_literal(*value).ok()?;
+            if case_sensitive {
+                Some(formatted)
+            } else {
+                Some(formatted.to_ascii_lowercase())
             }
         }
         _ => None,
@@ -8601,6 +8640,13 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| Error::Internal("failed to downcast float64 array".into()))?;
             Ok(Literal::Float(array.value(idx)))
+        }
+        DataType::Date32 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast date32 array".into()))?;
+            Ok(Literal::Date32(array.value(idx)))
         }
         DataType::Utf8 => {
             let array = array
@@ -9616,6 +9662,29 @@ fn build_comparison_mask(column: &dyn Array, value: &PlanValue) -> ExecutorResul
             }
             Ok(builder.finish())
         }
+        PlanValue::Date32(days) => {
+            let mut builder = BooleanBuilder::with_capacity(column.len());
+            match column.data_type() {
+                DataType::Date32 => {
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Date32Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to Date32Array".into())
+                        })?;
+                    for i in 0..arr.len() {
+                        builder.append_value(!arr.is_null(i) && arr.value(i) == *days);
+                    }
+                }
+                _ => {
+                    return Err(Error::Internal(format!(
+                        "unsupported DATE type for IN list: {:?}",
+                        column.data_type()
+                    )));
+                }
+            }
+            Ok(builder.finish())
+        }
         PlanValue::Struct(_) => Err(Error::Internal(
             "struct comparison in IN list not supported".into(),
         )),
@@ -9749,6 +9818,19 @@ fn array_value_equals_plan_value(
                     == expected),
             _ => Err(Error::InvalidArgumentError(format!(
                 "literal string comparison not supported for {:?}",
+                array.data_type()
+            ))),
+        },
+        PlanValue::Date32(expected) => match array.data_type() {
+            DataType::Date32 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .expect("date32 array")
+                    .value(row_idx)
+                    == *expected),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "literal date comparison not supported for {:?}",
                 array.data_type()
             ))),
         },

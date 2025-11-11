@@ -82,6 +82,7 @@ pub fn normalize_insert_value_for_column(
             "cannot insert struct into STRING column '{}'",
             column.name
         ))),
+        (DataType::Date32, PlanValue::Date32(days)) => Ok(PlanValue::Date32(days)),
         (DataType::Date32, PlanValue::Integer(days)) => {
             let casted = i32::try_from(days).map_err(|_| {
                 Error::InvalidArgumentError(format!(
@@ -89,11 +90,11 @@ pub fn normalize_insert_value_for_column(
                     column.name
                 ))
             })?;
-            Ok(PlanValue::Integer(casted as i64))
+            Ok(PlanValue::Date32(casted))
         }
         (DataType::Date32, PlanValue::String(text)) => {
             let days = parse_date32_literal(&text)?;
-            Ok(PlanValue::Integer(days as i64))
+            Ok(PlanValue::Date32(days))
         }
         (DataType::Date32, other) => Err(Error::InvalidArgumentError(format!(
             "cannot insert {other:?} into DATE column '{}'",
@@ -121,6 +122,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v),
                     PlanValue::Float(v) => builder.append_value(*v as i64),
+                    PlanValue::Date32(days) => builder.append_value(i64::from(*days)),
                     PlanValue::String(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-integer into INT column".into(),
@@ -137,6 +139,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v != 0),
                     PlanValue::Float(v) => builder.append_value(*v != 0.0),
+                    PlanValue::Date32(days) => builder.append_value(*days != 0),
                     PlanValue::String(s) => {
                         let normalized = s.trim().to_ascii_lowercase();
                         match normalized.as_str() {
@@ -166,6 +169,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v as f64),
                     PlanValue::Float(v) => builder.append_value(*v),
+                    PlanValue::Date32(days) => builder.append_value(f64::from(*days)),
                     PlanValue::String(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-numeric into DOUBLE column".into(),
@@ -182,6 +186,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(v.to_string()),
                     PlanValue::Float(v) => builder.append_value(v.to_string()),
+                    PlanValue::Date32(days) => builder.append_value(days.to_string()),
                     PlanValue::String(s) => builder.append_value(s),
                     PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
@@ -205,6 +210,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                         })?;
                         builder.append_value(casted);
                     }
+                    PlanValue::Date32(days) => builder.append_value(*days),
                     PlanValue::Float(_) | PlanValue::Struct(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-date value into DATE column".into(),

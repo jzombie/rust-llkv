@@ -45,3 +45,17 @@ pub fn epoch_julian_day() -> i32 {
         .expect("1970-01-01 is a valid date")
         .to_julian_day()
 }
+
+/// Format an Arrow `Date32` day count into `YYYY-MM-DD` text.
+pub fn format_date32_literal(days: i32) -> LlkvResult<String> {
+    let julian = epoch_julian_day()
+        .checked_add(days)
+        .ok_or_else(|| Error::InvalidArgumentError("date literal out of range".into()))?;
+
+    let date = Date::from_julian_day(julian).map_err(|err| {
+        Error::InvalidArgumentError(format!("invalid DATE value: {err}"))
+    })?;
+    let (year, month, day) = date.to_calendar_date();
+    let month_number = month as u8;
+    Ok(format!("{:04}-{:02}-{:02}", year, month_number, day))
+}

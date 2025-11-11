@@ -212,6 +212,7 @@ pub enum SqlParamValue {
     Float(f64),
     Boolean(bool),
     String(String),
+    Date32(i32),
 }
 
 impl SqlParamValue {
@@ -222,6 +223,7 @@ impl SqlParamValue {
             SqlParamValue::Float(v) => Literal::Float(*v),
             SqlParamValue::Boolean(v) => Literal::Boolean(*v),
             SqlParamValue::String(s) => Literal::String(s.clone()),
+            SqlParamValue::Date32(days) => Literal::Date32(*days),
         }
     }
 
@@ -232,6 +234,7 @@ impl SqlParamValue {
             SqlParamValue::Float(v) => PlanValue::Float(*v),
             SqlParamValue::Boolean(v) => PlanValue::Integer(if *v { 1 } else { 0 }),
             SqlParamValue::String(s) => PlanValue::String(s.clone()),
+            SqlParamValue::Date32(days) => PlanValue::Date32(*days),
         }
     }
 }
@@ -257,6 +260,12 @@ impl From<bool> for SqlParamValue {
 impl From<String> for SqlParamValue {
     fn from(value: String) -> Self {
         SqlParamValue::String(value)
+    }
+}
+
+impl From<i32> for SqlParamValue {
+    fn from(value: i32) -> Self {
+        SqlParamValue::Date32(value)
     }
 }
 
@@ -3630,7 +3639,7 @@ impl SqlEngine {
         or_replace: bool,
         namespace: Option<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-        use arrow::array::{ArrayRef, Float64Builder, Int64Builder, StringBuilder};
+    use arrow::array::{ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
@@ -3659,6 +3668,7 @@ impl SqlEngine {
                 PlanValue::Integer(_) => (DataType::Int64, false),
                 PlanValue::Float(_) => (DataType::Float64, false),
                 PlanValue::String(_) => (DataType::Utf8, false),
+                PlanValue::Date32(_) => (DataType::Date32, false),
                 PlanValue::Null => (DataType::Utf8, true), // Default NULL to string type
                 _ => {
                     return Err(Error::InvalidArgumentError(format!(
@@ -3722,6 +3732,22 @@ impl SqlEngine {
                             other => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "type mismatch in VALUES: expected String, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(builder.finish()) as ArrayRef);
+                }
+                DataType::Date32 => {
+                    let mut builder = Date32Builder::with_capacity(rows.len());
+                    for row in &rows {
+                        match &row[col_idx] {
+                            PlanValue::Date32(v) => builder.append_value(*v),
+                            PlanValue::Null => builder.append_null(),
+                            other => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "type mismatch in VALUES: expected DATE, got {:?}",
                                     other
                                 )));
                             }
@@ -7037,7 +7063,7 @@ fn bind_plan_value(value: &mut PlanValue, params: &[SqlParamValue]) -> SqlResult
                 bind_plan_value(field, params)?;
             }
         }
-        PlanValue::Null | PlanValue::Integer(_) | PlanValue::Float(_) => {}
+        PlanValue::Null | PlanValue::Integer(_) | PlanValue::Float(_) | PlanValue::Date32(_) => {}
     }
     Ok(())
 }
@@ -7203,7 +7229,7 @@ fn bind_literal(literal: &mut Literal, params: &[SqlParamValue]) -> SqlResult<()
             }
             Ok(())
         }
-        Literal::Integer(_) | Literal::Float(_) | Literal::Boolean(_) | Literal::Null => Ok(()),
+        Literal::Integer(_) | Literal::Float(_) | Literal::Boolean(_) | Literal::Null | Literal::Date32(_) => Ok(()),
     }
 }
 
@@ -10000,6 +10026,11 @@ fn translate_scalar_internal(
                             Literal::Struct(_) => {
                                 return Err(Error::InvalidArgumentError(
                                     "cannot negate struct literal".into(),
+                                ));
+                            }
+                            Literal::Date32(_) => {
+                                return Err(Error::InvalidArgumentError(
+                                    "cannot negate date literal".into(),
                                 ));
                             }
                             Literal::Null => {
