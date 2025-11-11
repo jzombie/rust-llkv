@@ -1759,6 +1759,7 @@ dependencies = [
  "regex",
  "sqlparser",
  "thiserror",
+ "tpchgen",
 ]
 
 [[package]]
@@ -2969,6 +2970,12 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tpchgen"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5315a6fb66b84b9dc4ade3ce3d85fc246305c87a8106193e9565b8a45394cbe"
 
 [[package]]
 name = "tracing"

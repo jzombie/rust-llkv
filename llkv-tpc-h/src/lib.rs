@@ -20,6 +20,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tpchgen::generators::{
+    CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
+    PartSuppGenerator, RegionGenerator, SupplierGenerator,
+};
 
 const DEFAULT_SCHEMA_NAME: &str = "TPCD";
 const DBGEN_RELATIVE_PATH: &str = "tpc_tools/dbgen";
@@ -347,6 +351,486 @@ fn apply_constraints_to_tables(
                 .constraints
                 .extend(entries.iter().cloned().map(normalize_table_constraint));
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TPC-H data loading helpers
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct LoadTableSummary {
+    pub table: &'static str,
+    pub rows: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadSummary {
+    pub tables: Vec<LoadTableSummary>,
+}
+
+impl LoadSummary {
+    pub fn total_rows(&self) -> usize {
+        self.tables.iter().map(|entry| entry.rows).sum()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColumnKind {
+    Number,
+    String,
+    Date,
+}
+
+impl ColumnKind {
+    fn requires_quotes(self) -> bool {
+        matches!(self, ColumnKind::String | ColumnKind::Date)
+    }
+}
+
+const REGION_COLUMNS: &[&str] = &["r_regionkey", "r_name", "r_comment"];
+const REGION_KINDS: &[ColumnKind] = &[ColumnKind::Number, ColumnKind::String, ColumnKind::String];
+
+const NATION_COLUMNS: &[&str] = &["n_nationkey", "n_name", "n_regionkey", "n_comment"];
+const NATION_KINDS: &[ColumnKind] = &[
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+];
+
+const SUPPLIER_COLUMNS: &[&str] = &[
+    "s_suppkey",
+    "s_name",
+    "s_address",
+    "s_nationkey",
+    "s_phone",
+    "s_acctbal",
+    "s_comment",
+];
+const SUPPLIER_KINDS: &[ColumnKind] = &[
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+];
+
+const CUSTOMER_COLUMNS: &[&str] = &[
+    "c_custkey",
+    "c_name",
+    "c_address",
+    "c_nationkey",
+    "c_phone",
+    "c_acctbal",
+    "c_mktsegment",
+    "c_comment",
+];
+const CUSTOMER_KINDS: &[ColumnKind] = &[
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::String,
+];
+
+const PART_COLUMNS: &[&str] = &[
+    "p_partkey",
+    "p_name",
+    "p_mfgr",
+    "p_brand",
+    "p_type",
+    "p_size",
+    "p_container",
+    "p_retailprice",
+    "p_comment",
+];
+const PART_KINDS: &[ColumnKind] = &[
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+];
+
+const PARTSUPP_COLUMNS: &[&str] = &[
+    "ps_partkey",
+    "ps_suppkey",
+    "ps_availqty",
+    "ps_supplycost",
+    "ps_comment",
+];
+const PARTSUPP_KINDS: &[ColumnKind] = &[
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::String,
+];
+
+const ORDERS_COLUMNS: &[&str] = &[
+    "o_orderkey",
+    "o_custkey",
+    "o_orderstatus",
+    "o_totalprice",
+    "o_orderdate",
+    "o_orderpriority",
+    "o_clerk",
+    "o_shippriority",
+    "o_comment",
+];
+const ORDERS_KINDS: &[ColumnKind] = &[
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::Date,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::Number,
+    ColumnKind::String,
+];
+
+const LINEITEM_COLUMNS: &[&str] = &[
+    "l_orderkey",
+    "l_partkey",
+    "l_suppkey",
+    "l_linenumber",
+    "l_quantity",
+    "l_extendedprice",
+    "l_discount",
+    "l_tax",
+    "l_returnflag",
+    "l_linestatus",
+    "l_shipdate",
+    "l_commitdate",
+    "l_receiptdate",
+    "l_shipinstruct",
+    "l_shipmode",
+    "l_comment",
+];
+const LINEITEM_KINDS: &[ColumnKind] = &[
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::Number,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::Date,
+    ColumnKind::Date,
+    ColumnKind::Date,
+    ColumnKind::String,
+    ColumnKind::String,
+    ColumnKind::String,
+];
+
+pub fn load_tpch_data(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<LoadSummary> {
+    if batch_size == 0 {
+        return Err(TpchError::Parse(
+            "batch size must be greater than zero".into(),
+        ));
+    }
+
+    let mut tables = Vec::new();
+
+    tables.push(LoadTableSummary {
+        table: "REGION",
+        rows: load_region(engine, schema_name, scale_factor, batch_size)?,
+    });
+    tables.push(LoadTableSummary {
+        table: "NATION",
+        rows: load_nation(engine, schema_name, scale_factor, batch_size)?,
+    });
+    tables.push(LoadTableSummary {
+        table: "SUPPLIER",
+        rows: load_supplier(engine, schema_name, scale_factor, batch_size)?,
+    });
+    tables.push(LoadTableSummary {
+        table: "CUSTOMER",
+        rows: load_customer(engine, schema_name, scale_factor, batch_size)?,
+    });
+    tables.push(LoadTableSummary {
+        table: "PART",
+        rows: load_part(engine, schema_name, scale_factor, batch_size)?,
+    });
+    tables.push(LoadTableSummary {
+        table: "PARTSUPP",
+        rows: load_partsupp(engine, schema_name, scale_factor, batch_size)?,
+    });
+    tables.push(LoadTableSummary {
+        table: "ORDERS",
+        rows: load_orders(engine, schema_name, scale_factor, batch_size)?,
+    });
+    tables.push(LoadTableSummary {
+        table: "LINEITEM",
+        rows: load_lineitem(engine, schema_name, scale_factor, batch_size)?,
+    });
+
+    Ok(LoadSummary { tables })
+}
+
+fn load_region(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = RegionGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "REGION",
+        REGION_COLUMNS,
+        REGION_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_nation(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = NationGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "NATION",
+        NATION_COLUMNS,
+        NATION_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_supplier(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = SupplierGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "SUPPLIER",
+        SUPPLIER_COLUMNS,
+        SUPPLIER_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_customer(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = CustomerGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "CUSTOMER",
+        CUSTOMER_COLUMNS,
+        CUSTOMER_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_part(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = PartGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "PART",
+        PART_COLUMNS,
+        PART_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_partsupp(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = PartSuppGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "PARTSUPP",
+        PARTSUPP_COLUMNS,
+        PARTSUPP_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_orders(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = OrderGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "ORDERS",
+        ORDERS_COLUMNS,
+        ORDERS_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_lineitem(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<usize> {
+    let generator = LineItemGenerator::new(scale_factor, 1, 1);
+    let rows = generator.iter().map(|row| row.to_string());
+    load_table_from_lines(
+        engine,
+        schema_name,
+        "LINEITEM",
+        LINEITEM_COLUMNS,
+        LINEITEM_KINDS,
+        rows,
+        batch_size,
+    )
+}
+
+fn load_table_from_lines<I>(
+    engine: &SqlEngine,
+    schema_name: &str,
+    table_name: &'static str,
+    columns: &[&str],
+    kinds: &[ColumnKind],
+    rows: I,
+    batch_size: usize,
+) -> Result<usize>
+where
+    I: Iterator<Item = String>,
+{
+    if columns.len() != kinds.len() {
+        return Err(TpchError::Parse(format!(
+            "column definition mismatch for {}",
+            table_name
+        )));
+    }
+
+    let mut batch = Vec::with_capacity(batch_size);
+    let mut row_count = 0usize;
+
+    for line in rows {
+        if line.is_empty() {
+            continue;
+        }
+        let row_sql = format_row_values(&line, kinds)?;
+        batch.push(row_sql);
+        row_count += 1;
+        if batch.len() == batch_size {
+            flush_insert(engine, schema_name, table_name, columns, &batch)?;
+            batch.clear();
+        }
+    }
+
+    if !batch.is_empty() {
+        flush_insert(engine, schema_name, table_name, columns, &batch)?;
+    }
+
+    Ok(row_count)
+}
+
+fn flush_insert(
+    engine: &SqlEngine,
+    schema_name: &str,
+    table_name: &'static str,
+    columns: &[&str],
+    rows: &[String],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut sql = format!(
+        "INSERT INTO {}.{} ({}) VALUES ",
+        schema_name,
+        table_name,
+        columns.join(", ")
+    );
+    sql.push_str(&rows.join(", "));
+    sql.push(';');
+    engine.execute(&sql)?;
+    Ok(())
+}
+
+fn format_row_values(line: &str, kinds: &[ColumnKind]) -> Result<String> {
+    let raw_fields: Vec<&str> = line.trim_end_matches('|').split('|').collect();
+    if raw_fields.len() != kinds.len() {
+        return Err(TpchError::Parse(format!(
+            "row '{}' does not match column definition (expected {}, found {})",
+            line,
+            kinds.len(),
+            raw_fields.len()
+        )));
+    }
+
+    let formatted_values: Vec<String> = raw_fields
+        .iter()
+        .zip(kinds.iter())
+        .map(|(raw, kind)| format_value(kind, raw))
+        .collect();
+
+    Ok(format!("({})", formatted_values.join(", ")))
+}
+
+fn format_value(kind: &ColumnKind, raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".into();
+    }
+    if kind.requires_quotes() {
+        format!("'{}'", raw.replace('\'', "''"))
+    } else {
+        raw.to_string()
     }
 }
 

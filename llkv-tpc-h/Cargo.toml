@@ -14,3 +14,4 @@ llkv-sql.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 sqlparser.workspace = true
+tpchgen = "2.0.1"
