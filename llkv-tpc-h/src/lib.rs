@@ -27,7 +27,7 @@ use tpchgen::generators::{
 
 pub mod queries;
 
-const DEFAULT_SCHEMA_NAME: &str = "TPCD";
+pub const DEFAULT_SCHEMA_NAME: &str = "TPCD";
 const DBGEN_RELATIVE_PATH: &str = "tpc_tools/dbgen";
 const DSS_HEADER_FILE: &str = "dss.h";
 const DSS_DDL_FILE: &str = "dss.ddl";

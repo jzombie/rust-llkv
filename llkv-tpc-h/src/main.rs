@@ -1,34 +1,93 @@
-use std::env;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::util::pretty::print_batches;
+use clap::{Args, Parser, Subcommand};
 use llkv::{SqlEngine, storage::MemPager};
-use llkv_tpc_h::{LoadSummary, TpchError, install_default_schema, load_tpch_data};
+use llkv_tpc_h::queries::{QueryOptions, StatementKind, render_tpch_query};
+use llkv_tpc_h::{LoadSummary, SchemaPaths, TpchError, install_default_schema, load_tpch_data};
 
 const DEFAULT_SCALE_FACTOR: f64 = 0.01;
 const DEFAULT_BATCH_SIZE: usize = 500;
 
 fn main() {
-    if let Err(err) = run_from_args() {
+    if let Err(err) = run() {
         eprintln!("tpch bootstrap failed: {err}");
         process::exit(1);
     }
 }
 
-fn run_from_args() -> Result<(), TpchError> {
-    let mut args = env::args().skip(1);
-    match args.next().as_deref() {
-        Some("load") => {
-            let scale_arg = args
-                .next()
-                .unwrap_or_else(|| DEFAULT_SCALE_FACTOR.to_string());
-            let scale_factor = scale_arg
-                .parse::<f64>()
-                .map_err(|_| TpchError::Parse(format!("invalid scale factor '{scale_arg}'")))?;
-            run_load(scale_factor)
-        }
-        _ => run_install(),
+#[derive(Parser)]
+#[command(
+    name = "llkv-tpc-h",
+    about = "TPC-H bootstrap and query runner for LLKV"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Install the canonical TPC-H schema and print catalog metadata.
+    Install,
+    /// Install the schema, load data, and optionally execute benchmark queries.
+    Load(LoadArgs),
+    /// Install the schema, load data, and run specific TPC-H queries.
+    Query(QueryArgs),
+}
+
+#[derive(Args, Clone)]
+struct LoadArgs {
+    /// Scale factor to load (defaults to 0.01, i.e. 10MB).
+    #[arg(value_name = "SCALE", default_value_t = DEFAULT_SCALE_FACTOR)]
+    scale: f64,
+    /// One or more TPC-H query numbers (1-22) to execute after loading.
+    #[arg(
+        long = "query",
+        short = 'q',
+        value_delimiter = ',',
+        value_parser = parse_query_number,
+        value_name = "Q"
+    )]
+    queries: Vec<u8>,
+    /// TPC-H stream number used when rendering parameterized templates.
+    #[arg(long, default_value_t = 1)]
+    stream: u32,
+    /// Override a positional parameter, e.g. --param 3=VALUE.
+    #[arg(long = "param", value_name = "INDEX=VALUE", value_parser = parse_param)]
+    params: Vec<(usize, String)>,
+}
+
+#[derive(Args, Clone)]
+struct QueryArgs {
+    /// One or more TPC-H query numbers (1-22) to execute.
+    #[arg(
+        value_name = "Q",
+        value_delimiter = ',',
+        value_parser = parse_query_number,
+        num_args = 1..
+    )]
+    queries: Vec<u8>,
+    /// Scale factor to load before running the queries.
+    #[arg(long, default_value_t = DEFAULT_SCALE_FACTOR)]
+    scale: f64,
+    /// TPC-H stream number used when rendering parameterized templates.
+    #[arg(long, default_value_t = 1)]
+    stream: u32,
+    /// Override a positional parameter, e.g. --param 3=VALUE.
+    #[arg(long = "param", value_name = "INDEX=VALUE", value_parser = parse_param)]
+    params: Vec<(usize, String)>,
+}
+
+fn run() -> Result<(), TpchError> {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Install) | None => run_install(),
+        Some(Command::Load(args)) => run_load_command(args),
+        Some(Command::Query(args)) => run_query_command(args),
     }
 }
 
@@ -63,11 +122,24 @@ fn run_install() -> Result<(), TpchError> {
          ORDER BY table_name, ordinal_position;",
         schema.schema_name
     );
-    print_query(&engine, "information_schema.columns", &columns_sql)?;
-    Ok(())
+    print_query(&engine, "information_schema.columns", &columns_sql)
 }
 
-fn run_load(scale_factor: f64) -> Result<(), TpchError> {
+fn run_load_command(args: LoadArgs) -> Result<(), TpchError> {
+    let execution = build_query_execution(&args.queries, args.stream, &args.params);
+    run_load_internal(args.scale, execution)
+}
+
+fn run_query_command(args: QueryArgs) -> Result<(), TpchError> {
+    let execution = build_query_execution(&args.queries, args.stream, &args.params)
+        .ok_or_else(|| TpchError::Parse("no TPC-H queries provided".to_string()))?;
+    run_load_internal(args.scale, Some(execution))
+}
+
+fn run_load_internal(
+    scale_factor: f64,
+    execution: Option<QueryExecution>,
+) -> Result<(), TpchError> {
     let engine = SqlEngine::new(Arc::new(MemPager::default()));
     let schema = install_default_schema(&engine)?;
 
@@ -118,6 +190,10 @@ fn run_load(scale_factor: f64) -> Result<(), TpchError> {
         print_query(&engine, label, &sql)?;
     }
 
+    if let Some(execution) = execution {
+        run_tpch_queries(&engine, &schema.schema_name, execution)?;
+    }
+
     Ok(())
 }
 
@@ -140,4 +216,114 @@ fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchErr
         return Ok(());
     }
     print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))
+}
+
+struct QueryExecution {
+    numbers: Vec<u8>,
+    options: QueryOptions,
+}
+
+fn build_query_execution(
+    queries: &[u8],
+    stream: u32,
+    params: &[(usize, String)],
+) -> Option<QueryExecution> {
+    if queries.is_empty() {
+        return None;
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut numbers = Vec::new();
+    for query in queries {
+        if seen.insert(*query) {
+            numbers.push(*query);
+        }
+    }
+
+    let mut overrides = BTreeMap::new();
+    for (idx, value) in params {
+        overrides.insert(*idx, value.clone());
+    }
+
+    Some(QueryExecution {
+        numbers,
+        options: QueryOptions {
+            stream_number: stream,
+            parameter_overrides: overrides,
+        },
+    })
+}
+
+fn run_tpch_queries(
+    engine: &SqlEngine,
+    schema: &str,
+    execution: QueryExecution,
+) -> Result<(), TpchError> {
+    let QueryExecution { numbers, options } = execution;
+    let paths = SchemaPaths::discover();
+
+    println!(
+        "\nRunning {} TPC-H quer{} against schema '{}' (stream {}):",
+        numbers.len(),
+        if numbers.len() == 1 { "y" } else { "ies" },
+        schema,
+        options.stream_number
+    );
+
+    for number in numbers {
+        let rendered = render_tpch_query(&paths, number, schema, &options)?;
+        let heading = rendered
+            .title
+            .as_deref()
+            .map(|title| format!(" - {title}"))
+            .unwrap_or_default();
+        println!("\nTPC-H Q{:02}{}", rendered.number, heading);
+        println!("Template: {}", rendered.path.display());
+
+        let start = Instant::now();
+        for statement in rendered.statements {
+            match statement.kind {
+                StatementKind::Command => {
+                    engine.execute(&statement.sql).map_err(TpchError::Sql)?;
+                }
+                StatementKind::Query => {
+                    let batches = engine.sql(&statement.sql).map_err(TpchError::Sql)?;
+                    if batches.is_empty() {
+                        println!("  (no rows)");
+                    } else {
+                        print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))?;
+                    }
+                }
+            }
+        }
+        println!("Completed Q{:02} in {:?}", rendered.number, start.elapsed());
+    }
+
+    Ok(())
+}
+
+fn parse_query_number(raw: &str) -> Result<u8, String> {
+    let value = raw
+        .parse::<u8>()
+        .map_err(|err| format!("invalid query number '{raw}': {err}"))?;
+    if (1..=22).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "query number must be between 1 and 22, got {value}"
+        ))
+    }
+}
+
+fn parse_param(raw: &str) -> Result<(usize, String), String> {
+    let (index, value) = raw
+        .split_once('=')
+        .ok_or_else(|| "expected INDEX=VALUE".to_string())?;
+    let index = index
+        .parse::<usize>()
+        .map_err(|err| format!("invalid parameter index '{index}': {err}"))?;
+    if index == 0 {
+        return Err("parameter indices start at 1".to_string());
+    }
+    Ok((index, value.to_string()))
 }
