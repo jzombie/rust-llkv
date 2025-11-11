@@ -1750,6 +1750,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-tpc-h"
+version = "0.8.1-alpha"
+dependencies = [
+ "llkv",
+ "regex",
+ "sqlparser",
+ "thiserror",
+]
+
+[[package]]
 name = "llkv-transaction"
 version = "0.8.1-alpha"
 dependencies = [

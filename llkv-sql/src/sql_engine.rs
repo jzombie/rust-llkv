@@ -610,6 +610,20 @@ impl SqlEngine {
         Self::from_runtime_engine(engine, false, false)
     }
 
+    /// Strip TPC-H style `CONNECT TO database;` statements.
+    ///
+    /// The TPCH tooling emits `CONNECT TO <name>;` directives inside the referential
+    /// integrity script even though LLKV always operates within a single database.
+    /// Treat these commands as no-ops so the scripts can run unmodified.
+    fn preprocess_tpch_connect_syntax(sql: &str) -> String {
+        static CONNECT_REGEX: OnceLock<Regex> = OnceLock::new();
+        let re = CONNECT_REGEX.get_or_init(|| {
+            Regex::new(r#"(?im)^\s*CONNECT\s+TO\s+(?:[A-Za-z0-9_]+|'[^']+'|"[^"]+")\s*;\s*"#)
+                .expect("valid CONNECT TO regex")
+        });
+        re.replace_all(sql, "").to_string()
+    }
+
     /// Preprocess SQL to handle qualified names in EXCLUDE clauses
     /// Converts EXCLUDE (schema.table.col) to EXCLUDE ("schema.table.col")
     /// Preprocess CREATE TYPE to CREATE DOMAIN for sqlparser compatibility.
@@ -971,7 +985,8 @@ impl SqlEngine {
     }
 
     fn preprocess_sql_input(sql: &str) -> String {
-        let processed_sql = Self::preprocess_create_type_syntax(sql);
+        let processed_sql = Self::preprocess_tpch_connect_syntax(sql);
+        let processed_sql = Self::preprocess_create_type_syntax(&processed_sql);
         let processed_sql = Self::preprocess_exclude_syntax(&processed_sql);
         let processed_sql = Self::preprocess_trailing_commas_in_values(&processed_sql);
         let processed_sql = Self::preprocess_bare_table_in_clauses(&processed_sql);

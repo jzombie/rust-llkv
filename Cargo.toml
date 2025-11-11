@@ -78,6 +78,7 @@ members = [
     "llkv-storage",
     "llkv-table",
     "llkv-test-utils",
+    "llkv-tpc-h",
     "llkv-transaction",
     "demos/llkv-sql-pong-demo"
 ]
