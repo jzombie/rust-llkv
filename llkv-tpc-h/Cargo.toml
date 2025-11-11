@@ -13,5 +13,6 @@ llkv.workspace = true
 llkv-sql.workspace = true
 regex.workspace = true
 thiserror.workspace = true
-sqlparser.workspace = true
+sqlparser = { workspace = true, features = ["visitor"] }
 tpchgen = "2.0.1"
+clap.workspace = true

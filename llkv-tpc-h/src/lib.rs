@@ -25,6 +25,8 @@ use tpchgen::generators::{
     PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 
+pub mod queries;
+
 const DEFAULT_SCHEMA_NAME: &str = "TPCD";
 const DBGEN_RELATIVE_PATH: &str = "tpc_tools/dbgen";
 const DSS_HEADER_FILE: &str = "dss.h";
@@ -50,13 +52,14 @@ pub enum TpchError {
 /// Convenient alias for results returned by schema helpers.
 pub type Result<T> = std::result::Result<T, TpchError>;
 
-/// File system locations for the bundled TPC-H metadata.
+/// File system locations for the bundled TPC-H metadata and templates.
 #[derive(Debug, Clone)]
 pub struct SchemaPaths {
     pub dss_header: PathBuf,
     pub ddl: PathBuf,
     pub referential_integrity: PathBuf,
     pub tdefs_source: PathBuf,
+    pub queries_dir: PathBuf,
 }
 
 impl SchemaPaths {
@@ -74,7 +77,13 @@ impl SchemaPaths {
             ddl: dbgen_root.join(DSS_DDL_FILE),
             referential_integrity: dbgen_root.join(DSS_RI_FILE),
             tdefs_source: dbgen_root.join(DRIVER_SOURCE_FILE),
+            queries_dir: dbgen_root.join("queries"),
         }
+    }
+
+    /// Return the canonical path to the requested TPC-H SQL query template.
+    pub fn query_path(&self, query_number: u8) -> PathBuf {
+        self.queries_dir.join(format!("{query_number}.sql"))
     }
 }
 
@@ -145,7 +154,7 @@ pub fn install_schema(engine: &SqlEngine, paths: &SchemaPaths) -> Result<TpchSch
     })
 }
 
-fn read_file(path: &Path) -> Result<String> {
+pub(crate) fn read_file(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|source| TpchError::Io {
         path: path.to_path_buf(),
         source,

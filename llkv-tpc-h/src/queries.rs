@@ -1,0 +1,397 @@
+//! Utilities for reading and rendering canonical TPC-H query templates.
+
+use crate::{Result, SchemaPaths, TpchError, read_file};
+use core::ops::ControlFlow;
+use regex::Regex;
+use sqlparser::ast::{
+    Expr as SqlExpr, Ident, LimitClause, ObjectName, ObjectNamePart, Statement, Value,
+    ValueWithSpan, visit_relations_mut, visit_statements_mut,
+};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+use sqlparser::tokenizer::Span;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+const PLACEHOLDER_STREAM: &str = ":s";
+static NUMERIC_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryOptions {
+    pub stream_number: u32,
+    pub parameter_overrides: BTreeMap<usize, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    Query,
+    Command,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderedStatement {
+    pub sql: String,
+    pub kind: StatementKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderedQuery {
+    pub number: u8,
+    pub title: Option<String>,
+    pub path: PathBuf,
+    pub statements: Vec<RenderedStatement>,
+}
+
+pub fn render_tpch_query(
+    paths: &SchemaPaths,
+    number: u8,
+    schema: &str,
+    options: &QueryOptions,
+) -> Result<RenderedQuery> {
+    if !(1..=22).contains(&number) {
+        return Err(TpchError::Parse(format!(
+            "TPC-H query {number} is not part of the canonical workload",
+        )));
+    }
+
+    let template_path = paths.query_path(number);
+    let raw = read_file(&template_path)?;
+    let template = parse_template(&raw, number)?;
+
+    let placeholders = collect_numeric_placeholders(&template.body);
+    let values = build_parameter_values(number, &placeholders, options)?;
+    let rendered_sql = substitute_numeric_placeholders(&template.body, &values, number)?;
+    let rendered_sql =
+        substitute_stream_placeholder(rendered_sql, template.stream_placeholder, options);
+
+    let dialect = GenericDialect {};
+    let mut statements = Parser::parse_sql(&dialect, &rendered_sql).map_err(|err| {
+        TpchError::Parse(format!(
+            "failed to parse rendered SQL for query {number}: {err}"
+        ))
+    })?;
+
+    qualify_statements(&mut statements, schema);
+
+    if let Some(limit) = template.row_limit {
+        if limit > 0 {
+            apply_limit_to_last_query(&mut statements, limit)
+                .map_err(|reason| TpchError::Parse(format!("query {number}: {reason}")))?;
+        }
+    }
+
+    let statements = statements
+        .into_iter()
+        .map(|statement| {
+            let kind = if matches!(statement, Statement::Query(_)) {
+                StatementKind::Query
+            } else {
+                StatementKind::Command
+            };
+            let mut sql = statement.to_string();
+            if !sql.ends_with(';') {
+                sql.push(';');
+            }
+            RenderedStatement { sql, kind }
+        })
+        .collect();
+
+    Ok(RenderedQuery {
+        number,
+        title: template.title,
+        path: template_path,
+        statements,
+    })
+}
+
+struct TemplateParse {
+    title: Option<String>,
+    body: String,
+    stream_placeholder: bool,
+    row_limit: Option<usize>,
+}
+
+fn parse_template(contents: &str, number: u8) -> Result<TemplateParse> {
+    let mut title = None;
+    let mut body_lines = Vec::new();
+    let mut row_limit = None;
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            body_lines.push(String::new());
+            continue;
+        }
+
+        if let Some(comment) = trimmed.strip_prefix("--") {
+            let comment = comment.trim();
+            if title.is_none() && !comment.is_empty() && comment != "$ID$" {
+                title = Some(comment.to_string());
+            }
+            continue;
+        }
+
+        if let Some(directive) = trimmed.strip_prefix(':') {
+            if let Some(limit_str) = directive.strip_prefix('n') {
+                let limit_str = limit_str.trim();
+                if !limit_str.is_empty() {
+                    let parsed = limit_str.parse::<isize>().map_err(|err| {
+                        TpchError::Parse(format!(
+                            "query {number}: invalid :n directive {limit_str}: {err}"
+                        ))
+                    })?;
+                    if parsed > 0 {
+                        row_limit = Some(parsed as usize);
+                    }
+                }
+            }
+            // Other directives (:x, :o, etc.) are metadata for dbgen and can be ignored.
+            continue;
+        }
+
+        body_lines.push(line.to_string());
+    }
+
+    let body = body_lines.join("\n").trim().to_string();
+    let stream_placeholder = body.contains(PLACEHOLDER_STREAM);
+
+    Ok(TemplateParse {
+        title,
+        body,
+        stream_placeholder,
+        row_limit,
+    })
+}
+
+fn collect_numeric_placeholders(sql: &str) -> BTreeSet<usize> {
+    let regex = NUMERIC_PLACEHOLDER_RE.get_or_init(|| Regex::new(r":(\d+)").expect("valid regex"));
+    let mut placeholders = BTreeSet::new();
+    for captures in regex.captures_iter(sql) {
+        if let Some(matched) = captures.get(1) {
+            if let Ok(index) = matched.as_str().parse::<usize>() {
+                placeholders.insert(index);
+            }
+        }
+    }
+    placeholders
+}
+
+fn build_parameter_values(
+    number: u8,
+    required: &BTreeSet<usize>,
+    options: &QueryOptions,
+) -> Result<BTreeMap<usize, String>> {
+    let mut values = BTreeMap::new();
+    if let Some(defaults) = default_parameter_values(number) {
+        for (offset, value) in defaults.iter().enumerate() {
+            values.insert(offset + 1, (*value).to_string());
+        }
+    }
+
+    for (idx, value) in &options.parameter_overrides {
+        values.insert(*idx, value.clone());
+    }
+
+    let missing: Vec<_> = required
+        .iter()
+        .copied()
+        .filter(|idx| !values.contains_key(idx))
+        .collect();
+    if !missing.is_empty() {
+        return Err(TpchError::Parse(format!(
+            "query {number}: missing values for placeholders {missing:?}"
+        )));
+    }
+
+    Ok(values)
+}
+
+fn substitute_numeric_placeholders(
+    body: &str,
+    values: &BTreeMap<usize, String>,
+    number: u8,
+) -> Result<String> {
+    if values.is_empty() {
+        return Ok(body.to_string());
+    }
+
+    let mut ordered: Vec<(usize, &String)> =
+        values.iter().map(|(idx, value)| (*idx, value)).collect();
+    ordered.sort_by_key(|(idx, _)| Reverse(*idx));
+
+    let mut rendered = body.to_string();
+    for (idx, value) in ordered {
+        let placeholder = format!(":{idx}");
+        if rendered.contains(&placeholder) {
+            rendered = rendered.replace(&placeholder, value);
+        }
+    }
+
+    if let Some(unresolved) = NUMERIC_PLACEHOLDER_RE
+        .get_or_init(|| Regex::new(r":(\d+)").expect("valid regex"))
+        .find(&rendered)
+    {
+        return Err(TpchError::Parse(format!(
+            "query {number}: unresolved placeholder {}",
+            &rendered[unresolved.start()..unresolved.end()]
+        )));
+    }
+
+    Ok(rendered)
+}
+
+fn substitute_stream_placeholder(sql: String, present: bool, options: &QueryOptions) -> String {
+    if !present {
+        return sql;
+    }
+    sql.replace(PLACEHOLDER_STREAM, &options.stream_number.to_string())
+}
+
+fn apply_limit_to_last_query(
+    statements: &mut Vec<Statement>,
+    limit: usize,
+) -> std::result::Result<(), String> {
+    let Some(Statement::Query(query)) = statements
+        .iter_mut()
+        .rev()
+        .find(|stmt| matches!(stmt, Statement::Query(_)))
+    else {
+        return Err("no SELECT statement found".to_string());
+    };
+
+    match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit: Some(_), .. }) => {
+            return Err("query already defines a LIMIT clause".to_string());
+        }
+        Some(LimitClause::OffsetCommaLimit { .. }) => {
+            return Err("query uses OFFSET syntax for LIMIT".to_string());
+        }
+        _ => {}
+    }
+
+    query.limit_clause = Some(LimitClause::LimitOffset {
+        limit: Some(SqlExpr::Value(ValueWithSpan {
+            value: Value::Number(limit.to_string(), false),
+            span: Span::empty(),
+        })),
+        offset: None,
+        limit_by: Vec::new(),
+    });
+    Ok(())
+}
+
+fn qualify_statements(statements: &mut Vec<Statement>, schema: &str) {
+    if schema.is_empty() {
+        return;
+    }
+
+    let schema = schema.to_string();
+
+    let _ = visit_statements_mut(statements, |statement| {
+        match statement {
+            Statement::CreateView { name, .. } => {
+                qualify_object_name(name, &schema);
+            }
+            Statement::Drop { names, .. } => {
+                for name in names {
+                    qualify_object_name(name, &schema);
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::<()>::Continue(())
+    });
+
+    let _ = visit_relations_mut(statements, |relation| {
+        qualify_object_name(relation, &schema);
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+fn qualify_object_name(name: &mut ObjectName, schema: &str) {
+    if name.0.is_empty() {
+        name.0.push(ObjectNamePart::Identifier(Ident::new(schema)));
+        return;
+    }
+    if name.0.len() > 1 {
+        return;
+    }
+    if let Some(ObjectNamePart::Identifier(existing)) = name.0.first() {
+        if existing.value.eq_ignore_ascii_case(schema) {
+            return;
+        }
+    }
+    name.0
+        .insert(0, ObjectNamePart::Identifier(Ident::new(schema)));
+}
+
+fn default_parameter_values(query: u8) -> Option<&'static [&'static str]> {
+    match query {
+        1 => Some(&["90"]),
+        2 => Some(&["15", "BRASS", "EUROPE"]),
+        3 => Some(&["BUILDING", "1995-03-15"]),
+        4 => Some(&["1993-07-01"]),
+        5 => Some(&["ASIA", "1994-01-01"]),
+        6 => Some(&["1994-01-01", ".06", "24"]),
+        7 => Some(&["FRANCE", "GERMANY"]),
+        8 => Some(&["BRAZIL", "AMERICA", "ECONOMY ANODIZED STEEL"]),
+        9 => Some(&["green"]),
+        10 => Some(&["1993-10-01"]),
+        11 => Some(&["GERMANY", "0.0001"]),
+        12 => Some(&["MAIL", "SHIP", "1994-01-01"]),
+        13 => Some(&["special", "requests"]),
+        14 => Some(&["1995-09-01"]),
+        15 => Some(&["1996-01-01"]),
+        16 => Some(&[
+            "Brand#45",
+            "MEDIUM POLISHED",
+            "49",
+            "14",
+            "23",
+            "45",
+            "19",
+            "3",
+            "36",
+            "9",
+        ]),
+        17 => Some(&["Brand#23", "MED BOX"]),
+        18 => Some(&["300"]),
+        19 => Some(&["Brand#12", "Brand#23", "Brand#34", "1", "10", "20"]),
+        20 => Some(&["forest", "1994-01-01", "CANADA"]),
+        21 => Some(&["SAUDI ARABIA"]),
+        22 => Some(&["13", "31", "23", "29", "30", "18", "17"]),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q1_rendering_includes_schema_prefix() {
+        let paths = SchemaPaths::discover();
+        let options = QueryOptions::default();
+        let query = render_tpch_query(&paths, 1, "TPCD", &options).expect("render Q1");
+        assert_eq!(query.statements.len(), 1);
+        let sql = &query.statements[0].sql;
+        assert!(sql.to_ascii_uppercase().contains("FROM TPCD.LINEITEM"));
+        assert!(!sql.contains(':'));
+    }
+
+    #[test]
+    fn q3_applies_limit_clause() {
+        let paths = SchemaPaths::discover();
+        let options = QueryOptions::default();
+        let query = render_tpch_query(&paths, 3, "TPCD", &options).expect("render Q3");
+        assert!(
+            query.statements[0]
+                .sql
+                .to_ascii_uppercase()
+                .contains("LIMIT 10")
+        );
+    }
+}
