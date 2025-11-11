@@ -1754,6 +1754,7 @@ name = "llkv-tpc-h"
 version = "0.8.1-alpha"
 dependencies = [
  "llkv",
+ "llkv-sql",
  "regex",
  "sqlparser",
  "thiserror",

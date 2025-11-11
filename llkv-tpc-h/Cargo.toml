@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 llkv.workspace = true
+llkv-sql.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 sqlparser.workspace = true

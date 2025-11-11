@@ -5,14 +5,18 @@
 //! installs the schema into a `SqlEngine`. The goal is to let the TPC-H DDL run
 //! unmodified while still producing a structured manifest the caller can inspect.
 
-use llkv::{Error as LlkvError, SqlEngine};
+use llkv::Error as LlkvError;
+use llkv_sql::{
+    SqlEngine, canonical_table_ident, normalize_table_constraint,
+    order_create_tables_by_foreign_keys,
+};
 use regex::Regex;
 use sqlparser::ast::{
-    AlterTableOperation, CreateTable, Ident, ObjectName, ObjectNamePart, Statement, TableConstraint,
+    AlterTableOperation, CreateTable, Ident, ObjectNamePart, Statement, TableConstraint,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -120,7 +124,7 @@ pub fn install_schema(engine: &SqlEngine, paths: &SchemaPaths) -> Result<TpchSch
     let ri_sql = read_file(&paths.referential_integrity)?;
     let constraint_map = parse_referential_integrity(&ri_sql)?;
     apply_constraints_to_tables(&mut create_tables, &constraint_map);
-    let ordered_tables = order_tables_by_foreign_keys(create_tables);
+    let ordered_tables = order_create_tables_by_foreign_keys(create_tables);
 
     run_sql(
         engine,
@@ -319,7 +323,7 @@ fn parse_referential_integrity(ri_sql: &str) -> Result<HashMap<String, Vec<Table
             name, operations, ..
         } = statement
         {
-            let table_name = canonical_table_name(&name);
+            let table_name = canonical_table_ident(&name).unwrap_or_default();
             let bucket = constraints.entry(table_name).or_default();
             for op in operations {
                 if let AlterTableOperation::AddConstraint { constraint, .. } = op {
@@ -337,83 +341,13 @@ fn apply_constraints_to_tables(
     constraints: &HashMap<String, Vec<TableConstraint>>,
 ) {
     for table in tables {
-        let table_name = canonical_table_name(&table.name);
+        let table_name = canonical_table_ident(&table.name).unwrap_or_default();
         if let Some(entries) = constraints.get(&table_name) {
             table
                 .constraints
                 .extend(entries.iter().cloned().map(normalize_table_constraint));
         }
     }
-}
-
-fn canonical_table_name(name: &ObjectName) -> String {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.to_ascii_uppercase())
-        .unwrap_or_default()
-}
-
-fn order_tables_by_foreign_keys(tables: Vec<CreateTable>) -> Vec<CreateTable> {
-    let mut remaining = tables;
-    let mut ordered = Vec::with_capacity(remaining.len());
-    if remaining.is_empty() {
-        return ordered;
-    }
-
-    let table_names: HashSet<String> = remaining
-        .iter()
-        .map(|table| canonical_table_name(&table.name))
-        .collect();
-
-    let mut resolved: HashSet<String> = HashSet::new();
-
-    while !remaining.is_empty() {
-        let mut progress = false;
-        let current = std::mem::take(&mut remaining);
-        let mut next_round = Vec::new();
-
-        for table in current.into_iter() {
-            let table_name = canonical_table_name(&table.name);
-            let deps = collect_foreign_key_dependencies(&table);
-            let deps_satisfied = deps.into_iter().all(|dep| {
-                dep.is_empty()
-                    || dep == table_name
-                    || !table_names.contains(&dep)
-                    || resolved.contains(&dep)
-            });
-
-            if deps_satisfied {
-                resolved.insert(table_name);
-                ordered.push(table);
-                progress = true;
-            } else {
-                next_round.push(table);
-            }
-        }
-
-        if !progress {
-            ordered.extend(next_round.into_iter());
-            break;
-        }
-
-        remaining = next_round;
-    }
-
-    ordered
-}
-
-fn collect_foreign_key_dependencies(table: &CreateTable) -> Vec<String> {
-    table
-        .constraints
-        .iter()
-        .filter_map(|constraint| match constraint {
-            TableConstraint::ForeignKey { foreign_table, .. } => {
-                Some(canonical_table_name(foreign_table))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 fn render_create_tables(tables: &[CreateTable]) -> String {
@@ -461,69 +395,4 @@ fn strip_connect_statements(sql: &str) -> String {
         .expect("valid CONNECT removal regex")
         .replace_all(sql, "")
         .into_owned()
-}
-
-fn normalize_table_constraint(constraint: TableConstraint) -> TableConstraint {
-    match constraint {
-        TableConstraint::ForeignKey {
-            mut name,
-            mut index_name,
-            columns,
-            foreign_table,
-            referred_columns,
-            on_delete,
-            on_update,
-            characteristics,
-        } => {
-            if name.is_none() {
-                name = index_name.clone();
-            }
-            index_name = None;
-            TableConstraint::ForeignKey {
-                name,
-                index_name,
-                columns,
-                foreign_table,
-                referred_columns,
-                on_delete,
-                on_update,
-                characteristics,
-            }
-        }
-        TableConstraint::PrimaryKey {
-            name,
-            index_name: _,
-            index_type,
-            columns,
-            index_options,
-            characteristics,
-        } => TableConstraint::PrimaryKey {
-            name,
-            index_name: None,
-            index_type,
-            columns,
-            index_options,
-            characteristics,
-        },
-        TableConstraint::Unique {
-            name,
-            index_name: _,
-            index_type,
-            columns,
-            index_options,
-            nulls_distinct,
-            characteristics,
-            index_type_display,
-        } => TableConstraint::Unique {
-            name,
-            index_name: None,
-            index_type,
-            columns,
-            index_options,
-            nulls_distinct,
-            characteristics,
-            index_type_display,
-        },
-        other => other,
-    }
 }

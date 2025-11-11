@@ -37,5 +37,10 @@ pub use sql_engine::{
 mod sql_value;
 use sql_value::SqlValue;
 
+mod ddl_utils;
+pub use ddl_utils::{
+    canonical_table_ident, normalize_table_constraint, order_create_tables_by_foreign_keys,
+};
+
 pub use llkv_runtime::{RuntimeStatementResult, SelectExecution};
 pub use llkv_transaction::TransactionKind;
