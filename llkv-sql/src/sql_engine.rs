@@ -10,7 +10,7 @@ use std::sync::{
 
 use crate::SqlResult;
 use crate::SqlValue;
-use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray, UInt32Array};
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -34,6 +34,7 @@ use llkv_runtime::{
 };
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
+use llkv_table::resolvers::QualifiedTableName;
 use llkv_table::{CatalogDdl, TriggerEventMeta, TriggerTimingMeta};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -3265,96 +3266,170 @@ impl SqlEngine {
         let (_, canonical_name) = llkv_table::canonical_table_name(&table_name)?;
         let columns = context.catalog().table_column_specs(&canonical_name)?;
 
-        // Build RecordBatch with table column information
-        use arrow::array::{BooleanArray, Int32Array, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
+        let alias = match &table_with_joins.relation {
+            TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+            _ => None,
+        };
 
-        let mut cid_values = Vec::new();
-        let mut name_values = Vec::new();
-        let mut type_values = Vec::new();
-        let mut notnull_values = Vec::new();
-        let mut dflt_value_values: Vec<Option<String>> = Vec::new();
-        let mut pk_values = Vec::new();
+        let mut view = InlineView::new(vec![
+            InlineColumn::int32("cid", false),
+            InlineColumn::utf8("name", false),
+            InlineColumn::utf8("type", false),
+            InlineColumn::bool("notnull", false),
+            InlineColumn::utf8("dflt_value", true),
+            InlineColumn::bool("pk", false),
+        ]);
 
         for (idx, col) in columns.iter().enumerate() {
-            cid_values.push(idx as i32);
-            name_values.push(col.name.clone());
-            type_values.push(format!("{:?}", col.data_type)); // Simple type representation
-            notnull_values.push(!col.nullable);
-            dflt_value_values.push(None); // We don't track default values yet
-            pk_values.push(col.primary_key);
+            view.add_row(vec![
+                InlineValue::Int32(Some(idx as i32)),
+                InlineValue::String(Some(col.name.clone())),
+                InlineValue::String(Some(format!("{:?}", col.data_type))),
+                InlineValue::Bool(Some(!col.nullable)),
+                InlineValue::String(None),
+                InlineValue::Bool(Some(col.primary_key)),
+            ])?;
         }
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("cid", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("type", DataType::Utf8, false),
-            Field::new("notnull", DataType::Boolean, false),
-            Field::new("dflt_value", DataType::Utf8, true),
-            Field::new("pk", DataType::Boolean, false),
-        ]));
+        self.execute_inline_view(select, query, table_name, alias.as_deref(), view)
+    }
 
+    fn try_handle_information_schema(
+        &self,
+        query: &Query,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        use sqlparser::ast::SetExpr;
+
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            _ => return Ok(None),
+        };
+
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+
+        let table_with_joins = &select.from[0];
+        let (schema_name, object_name, alias) = match &table_with_joins.relation {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
+                if args.is_some() {
+                    return Ok(None);
+                }
+                let (schema, table) = parse_schema_qualified_name(name)?;
+                (schema, table, alias.as_ref().map(|a| a.name.value.clone()))
+            }
+            _ => return Ok(None),
+        };
+
+        let Some(schema) = schema_name else {
+            return Ok(None);
+        };
+
+        if !schema.eq_ignore_ascii_case("information_schema") {
+            return Ok(None);
+        }
+
+        if table_with_joins_has_join(table_with_joins) {
+            return Err(Error::InvalidArgumentError(
+                "information_schema tables do not support JOIN clauses".into(),
+            ));
+        }
+
+        let table_key = object_name.to_ascii_lowercase();
+        match table_key.as_str() {
+            "tables" => {
+                let view = self.build_information_schema_tables_view()?;
+                self.execute_inline_view(
+                    select,
+                    query,
+                    "information_schema.tables".to_string(),
+                    alias.as_deref(),
+                    view,
+                )
+            }
+            "columns" => {
+                let view = self.build_information_schema_columns_view()?;
+                self.execute_inline_view(
+                    select,
+                    query,
+                    "information_schema.columns".to_string(),
+                    alias.as_deref(),
+                    view,
+                )
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn execute_inline_view(
+        &self,
+        select: &Select,
+        query: &Query,
+        table_label: String,
+        table_alias: Option<&str>,
+        mut view: InlineView,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
+        ensure_inline_select_supported(select, query)?;
+
+        if let Some(selection) = &select.selection {
+            view.apply_selection(selection, table_alias)?;
+        }
+
+        let (schema, batch) = view.into_record_batch()?;
+        self.finalize_inline_select(select, query, table_label, schema, batch)
+    }
+
+    fn finalize_inline_select(
+        &self,
+        select: &Select,
+        query: &Query,
+        table_name: String,
+        schema: Arc<Schema>,
+        batch: RecordBatch,
+    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
         use arrow::array::ArrayRef;
-        let mut batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from(cid_values)) as ArrayRef,
-                Arc::new(StringArray::from(name_values)) as ArrayRef,
-                Arc::new(StringArray::from(type_values)) as ArrayRef,
-                Arc::new(BooleanArray::from(notnull_values)) as ArrayRef,
-                Arc::new(StringArray::from(dflt_value_values)) as ArrayRef,
-                Arc::new(BooleanArray::from(pk_values)) as ArrayRef,
-            ],
-        )
-        .map_err(|e| Error::Internal(format!("failed to create pragma_table_info batch: {}", e)))?;
 
-        // Apply SELECT projections: extract only requested columns
+        let mut working_schema = schema;
+        let mut working_batch = batch;
+
         let projection_indices: Vec<usize> = select
             .projection
             .iter()
-            .filter_map(|item| {
-                match item {
-                    SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => {
-                        schema.index_of(&ident.value).ok()
-                    }
-                    SelectItem::ExprWithAlias { expr, .. } => {
-                        if let SqlExpr::Identifier(ident) = expr {
-                            schema.index_of(&ident.value).ok()
-                        } else {
-                            None
-                        }
-                    }
-                    SelectItem::Wildcard(_) => None, // Handle * separately
-                    _ => None,
+            .filter_map(|item| match item {
+                SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => {
+                    working_schema.index_of(&ident.value).ok()
                 }
+                SelectItem::ExprWithAlias { expr, .. } => {
+                    if let SqlExpr::Identifier(ident) = expr {
+                        working_schema.index_of(&ident.value).ok()
+                    } else {
+                        None
+                    }
+                }
+                SelectItem::Wildcard(_) => None,
+                _ => None,
             })
             .collect();
 
-        // Apply projections if not SELECT *
-        let projected_schema;
         if !projection_indices.is_empty() {
             let projected_fields: Vec<Field> = projection_indices
                 .iter()
-                .map(|&idx| schema.field(idx).clone())
+                .map(|&idx| working_schema.field(idx).clone())
                 .collect();
-            projected_schema = Arc::new(Schema::new(projected_fields));
-
+            let projected_schema = Arc::new(Schema::new(projected_fields));
             let projected_columns: Vec<ArrayRef> = projection_indices
                 .iter()
-                .map(|&idx| Arc::clone(batch.column(idx)))
+                .map(|&idx| Arc::clone(working_batch.column(idx)))
                 .collect();
-
-            batch = RecordBatch::try_new(Arc::clone(&projected_schema), projected_columns)
+            working_batch = RecordBatch::try_new(Arc::clone(&projected_schema), projected_columns)
                 .map_err(|e| Error::Internal(format!("failed to project columns: {}", e)))?;
-        } else {
-            // SELECT * or complex projections - use original schema
-            projected_schema = schema;
+            working_schema = projected_schema;
         }
 
-        // Apply ORDER BY using Arrow compute kernels
         if let Some(order_by) = &query.order_by {
-            use arrow::compute::SortColumn;
-            use arrow::compute::lexsort_to_indices;
+            use arrow::compute::{SortColumn, lexsort_to_indices};
             use sqlparser::ast::OrderByKind;
 
             let exprs = match &order_by.kind {
@@ -3369,14 +3444,14 @@ impl SqlEngine {
             let mut sort_columns = Vec::new();
             for order_expr in exprs {
                 if let SqlExpr::Identifier(ident) = &order_expr.expr
-                    && let Ok(col_idx) = projected_schema.index_of(&ident.value)
+                    && let Ok(col_idx) = working_schema.index_of(&ident.value)
                 {
                     let options = arrow::compute::SortOptions {
                         descending: !order_expr.options.asc.unwrap_or(true),
                         nulls_first: order_expr.options.nulls_first.unwrap_or(false),
                     };
                     sort_columns.push(SortColumn {
-                        values: Arc::clone(batch.column(col_idx)),
+                        values: Arc::clone(working_batch.column(col_idx)),
                         options: Some(options),
                     });
                 }
@@ -3385,16 +3460,13 @@ impl SqlEngine {
             if !sort_columns.is_empty() {
                 let indices = lexsort_to_indices(&sort_columns, None)
                     .map_err(|e| Error::Internal(format!("failed to sort: {}", e)))?;
-
-                use arrow::compute::take;
-                let sorted_columns: Result<Vec<ArrayRef>, _> = batch
+                let sorted_columns: Result<Vec<ArrayRef>, _> = working_batch
                     .columns()
                     .iter()
                     .map(|col| take(col.as_ref(), &indices, None))
                     .collect();
-
-                batch = RecordBatch::try_new(
-                    Arc::clone(&projected_schema),
+                working_batch = RecordBatch::try_new(
+                    Arc::clone(&working_schema),
                     sorted_columns
                         .map_err(|e| Error::Internal(format!("failed to apply sort: {}", e)))?,
                 )
@@ -3402,17 +3474,102 @@ impl SqlEngine {
             }
         }
 
+        if let Some(limit) = extract_limit_count(query)? {
+            if limit < working_batch.num_rows() {
+                let indices: Vec<u32> = (0..limit as u32).collect();
+                let take_indices = UInt32Array::from(indices);
+                let limited_columns: Result<Vec<ArrayRef>, _> = working_batch
+                    .columns()
+                    .iter()
+                    .map(|col| take(col.as_ref(), &take_indices, None))
+                    .collect();
+                working_batch = RecordBatch::try_new(
+                    Arc::clone(&working_schema),
+                    limited_columns
+                        .map_err(|e| Error::Internal(format!("failed to apply limit: {}", e)))?,
+                )
+                .map_err(|e| Error::Internal(format!("failed to create limited batch: {}", e)))?;
+            }
+        }
+
         let execution = SelectExecution::new_single_batch(
             table_name.clone(),
-            Arc::clone(&projected_schema),
-            batch,
+            Arc::clone(&working_schema),
+            working_batch,
         );
 
         Ok(Some(RuntimeStatementResult::Select {
             table_name,
-            schema: projected_schema,
+            schema: working_schema,
             execution: Box::new(execution),
         }))
+    }
+
+    fn build_information_schema_tables_view(&self) -> SqlResult<InlineView> {
+        let context = self.engine.context();
+        let mut table_names = context.catalog().table_names();
+        table_names.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+
+        let mut view = InlineView::new(vec![
+            InlineColumn::utf8("table_schema", true),
+            InlineColumn::utf8("table_name", false),
+            InlineColumn::utf8("table_type", false),
+        ]);
+
+        for name in table_names {
+            let qualified = QualifiedTableName::from(name.as_str());
+            let schema = qualified.schema().map(|s| s.to_string());
+            let table = qualified.table().to_string();
+            view.add_row(vec![
+                InlineValue::String(schema),
+                InlineValue::String(Some(table)),
+                InlineValue::String(Some("BASE TABLE".into())),
+            ])?;
+        }
+
+        Ok(view)
+    }
+
+    fn build_information_schema_columns_view(&self) -> SqlResult<InlineView> {
+        let context = self.engine.context();
+        let catalog = context.catalog();
+        let mut table_names = catalog.table_names();
+        table_names.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+
+        let mut view = InlineView::new(vec![
+            InlineColumn::utf8("table_schema", true),
+            InlineColumn::utf8("table_name", false),
+            InlineColumn::utf8("column_name", false),
+            InlineColumn::int32("ordinal_position", false),
+            InlineColumn::utf8("data_type", false),
+            InlineColumn::bool("is_nullable", false),
+            InlineColumn::bool("is_primary_key", false),
+            InlineColumn::bool("is_unique", false),
+            InlineColumn::utf8("check_expression", true),
+        ]);
+
+        for name in table_names {
+            let qualified = QualifiedTableName::from(name.as_str());
+            let schema = qualified.schema().map(|s| s.to_string());
+            let table = qualified.table().to_string();
+            let (_, canonical) = llkv_table::canonical_table_name(name.as_str())?;
+            let columns = catalog.table_column_specs(&canonical)?;
+            for (idx, col) in columns.iter().enumerate() {
+                view.add_row(vec![
+                    InlineValue::String(schema.clone()),
+                    InlineValue::String(Some(table.clone())),
+                    InlineValue::String(Some(col.name.clone())),
+                    InlineValue::Int32(Some((idx + 1) as i32)),
+                    InlineValue::String(Some(col.data_type.to_string())),
+                    InlineValue::Bool(Some(col.nullable)),
+                    InlineValue::Bool(Some(col.primary_key)),
+                    InlineValue::Bool(Some(col.unique)),
+                    InlineValue::String(col.check_expr.clone()),
+                ])?;
+            }
+        }
+
+        Ok(view)
     }
 
     fn handle_create_table_as(
@@ -4819,6 +4976,10 @@ impl SqlEngine {
 
         // Check for pragma_table_info() table function first
         if let Some(result) = self.try_handle_pragma_table_info(&query)? {
+            return Ok(result);
+        }
+
+        if let Some(result) = self.try_handle_information_schema(&query)? {
             return Ok(result);
         }
 
@@ -7387,6 +7548,512 @@ fn validate_create_table_as(stmt: &sqlparser::ast::CreateTable) -> SqlResult<()>
         ));
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct InlineColumn {
+    name: &'static str,
+    data_type: DataType,
+    nullable: bool,
+}
+
+impl InlineColumn {
+    fn utf8(name: &'static str, nullable: bool) -> Self {
+        Self {
+            name,
+            data_type: DataType::Utf8,
+            nullable,
+        }
+    }
+
+    fn bool(name: &'static str, nullable: bool) -> Self {
+        Self {
+            name,
+            data_type: DataType::Boolean,
+            nullable,
+        }
+    }
+
+    fn int32(name: &'static str, nullable: bool) -> Self {
+        Self {
+            name,
+            data_type: DataType::Int32,
+            nullable,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct InlineRow {
+    values: Vec<InlineValue>,
+}
+
+#[derive(Clone, Debug)]
+enum InlineValue {
+    String(Option<String>),
+    Int32(Option<i32>),
+    Bool(Option<bool>),
+    Null,
+}
+
+struct InlineView {
+    columns: Vec<InlineColumn>,
+    rows: Vec<InlineRow>,
+}
+
+impl InlineView {
+    fn new(columns: Vec<InlineColumn>) -> Self {
+        Self {
+            columns,
+            rows: Vec::new(),
+        }
+    }
+
+    fn add_row(&mut self, values: Vec<InlineValue>) -> SqlResult<()> {
+        if values.len() != self.columns.len() {
+            return Err(Error::Internal(
+                "inline row does not match column layout".into(),
+            ));
+        }
+        for (value, column) in values.iter().zip(self.columns.iter()) {
+            if !value.matches_type(&column.data_type) {
+                return Err(Error::Internal(format!(
+                    "inline value type mismatch for column {}",
+                    column.name
+                )));
+            }
+        }
+        self.rows.push(InlineRow { values });
+        Ok(())
+    }
+
+    fn apply_selection(&mut self, expr: &SqlExpr, alias: Option<&str>) -> SqlResult<()> {
+        let mut filtered = Vec::with_capacity(self.rows.len());
+        for row in self.rows.drain(..) {
+            if evaluate_predicate(expr, &row, &self.columns, alias)? {
+                filtered.push(row);
+            }
+        }
+        self.rows = filtered;
+        Ok(())
+    }
+
+    fn into_record_batch(self) -> SqlResult<(Arc<Schema>, RecordBatch)> {
+        let mut fields = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            fields.push(Field::new(
+                column.name,
+                column.data_type.clone(),
+                column.nullable,
+            ));
+        }
+        let schema = Arc::new(Schema::new(fields));
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.columns.len());
+        for (idx, column) in self.columns.iter().enumerate() {
+            match &column.data_type {
+                DataType::Utf8 => {
+                    let mut values = Vec::with_capacity(self.rows.len());
+                    for row in &self.rows {
+                        match &row.values[idx] {
+                            InlineValue::String(val) => values.push(val.clone()),
+                            InlineValue::Null => values.push(None),
+                            other => {
+                                return Err(Error::Internal(format!(
+                                    "unexpected string value for column {}: {:?}",
+                                    column.name, other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(StringArray::from(values)) as ArrayRef);
+                }
+                DataType::Boolean => {
+                    let mut values = Vec::with_capacity(self.rows.len());
+                    for row in &self.rows {
+                        match &row.values[idx] {
+                            InlineValue::Bool(val) => values.push(*val),
+                            InlineValue::Null => values.push(None),
+                            other => {
+                                return Err(Error::Internal(format!(
+                                    "unexpected boolean value for column {}: {:?}",
+                                    column.name, other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(BooleanArray::from(values)) as ArrayRef);
+                }
+                DataType::Int32 => {
+                    let mut values = Vec::with_capacity(self.rows.len());
+                    for row in &self.rows {
+                        match &row.values[idx] {
+                            InlineValue::Int32(val) => values.push(*val),
+                            InlineValue::Null => values.push(None),
+                            other => {
+                                return Err(Error::Internal(format!(
+                                    "unexpected integer value for column {}: {:?}",
+                                    column.name, other
+                                )));
+                            }
+                        }
+                    }
+                    arrays.push(Arc::new(Int32Array::from(values)) as ArrayRef);
+                }
+                other => {
+                    return Err(Error::Internal(format!(
+                        "unsupported inline column type: {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .map_err(|e| Error::Internal(format!("failed to build inline batch: {}", e)))?;
+        Ok((schema, batch))
+    }
+}
+
+impl InlineValue {
+    fn is_null(&self) -> bool {
+        matches!(
+            self,
+            InlineValue::Null
+                | InlineValue::String(None)
+                | InlineValue::Int32(None)
+                | InlineValue::Bool(None)
+        )
+    }
+
+    fn matches_type(&self, data_type: &DataType) -> bool {
+        if matches!(self, InlineValue::Null) {
+            return true;
+        }
+        match data_type {
+            DataType::Utf8 => matches!(self, InlineValue::String(_) | InlineValue::Null),
+            DataType::Boolean => matches!(self, InlineValue::Bool(_) | InlineValue::Null),
+            DataType::Int32 => matches!(self, InlineValue::Int32(_) | InlineValue::Null),
+            _ => false,
+        }
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            InlineValue::Bool(value) => *value,
+            _ => None,
+        }
+    }
+}
+
+fn ensure_inline_select_supported(select: &Select, query: &Query) -> SqlResult<()> {
+    if select.distinct.is_some() {
+        return Err(Error::InvalidArgumentError(
+            "DISTINCT is not supported for information_schema or pragma queries".into(),
+        ));
+    }
+    if select.top.is_some() {
+        return Err(Error::InvalidArgumentError(
+            "TOP clauses are not supported for information_schema or pragma queries".into(),
+        ));
+    }
+    if select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+    {
+        return Err(Error::InvalidArgumentError(
+            "the requested SELECT features are not supported for information_schema or pragma queries"
+                .into(),
+        ));
+    }
+    if !group_by_is_empty(&select.group_by) {
+        return Err(Error::InvalidArgumentError(
+            "GROUP BY is not supported for information_schema or pragma queries".into(),
+        ));
+    }
+    if select.having.is_some() {
+        return Err(Error::InvalidArgumentError(
+            "HAVING clauses are not supported for information_schema or pragma queries".into(),
+        ));
+    }
+    if !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+    {
+        return Err(Error::InvalidArgumentError(
+            "the requested SELECT modifiers are not supported for information_schema or pragma queries"
+                .into(),
+        ));
+    }
+    if query.with.is_some() {
+        return Err(Error::InvalidArgumentError(
+            "WITH clauses are not supported for information_schema or pragma queries".into(),
+        ));
+    }
+    if query.fetch.is_some() {
+        return Err(Error::InvalidArgumentError(
+            "FETCH clauses are not supported for information_schema or pragma queries".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn extract_limit_count(query: &Query) -> SqlResult<Option<usize>> {
+    use sqlparser::ast::{Expr, LimitClause};
+
+    let Some(limit_clause) = &query.limit_clause else {
+        return Ok(None);
+    };
+
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if offset.is_some() || !limit_by.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "OFFSET/LIMIT BY are not supported for information_schema or pragma queries"
+                        .into(),
+                ));
+            }
+            match limit {
+                None => Ok(None),
+                Some(Expr::Value(value)) => match &value.value {
+                    sqlparser::ast::Value::Number(text, _) => {
+                        let parsed = text.parse::<i64>().map_err(|_| {
+                            Error::InvalidArgumentError("LIMIT must be a positive integer".into())
+                        })?;
+                        if parsed < 0 {
+                            return Err(Error::InvalidArgumentError(
+                                "LIMIT must be non-negative".into(),
+                            ));
+                        }
+                        Ok(Some(parsed as usize))
+                    }
+                    sqlparser::ast::Value::SingleQuotedString(text) => {
+                        let parsed = text.parse::<i64>().map_err(|_| {
+                            Error::InvalidArgumentError("LIMIT must be a positive integer".into())
+                        })?;
+                        if parsed < 0 {
+                            return Err(Error::InvalidArgumentError(
+                                "LIMIT must be non-negative".into(),
+                            ));
+                        }
+                        Ok(Some(parsed as usize))
+                    }
+                    _ => Err(Error::InvalidArgumentError(
+                        "LIMIT must be a numeric literal for information_schema or pragma queries"
+                            .into(),
+                    )),
+                },
+                Some(_) => Err(Error::InvalidArgumentError(
+                    "LIMIT must be a literal for information_schema or pragma queries".into(),
+                )),
+            }
+        }
+        LimitClause::OffsetCommaLimit { .. } => Err(Error::InvalidArgumentError(
+            "LIMIT with comma offset is not supported for information_schema or pragma queries"
+                .into(),
+        )),
+    }
+}
+
+fn evaluate_predicate(
+    expr: &SqlExpr,
+    row: &InlineRow,
+    columns: &[InlineColumn],
+    alias: Option<&str>,
+) -> SqlResult<bool> {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => Ok(evaluate_predicate(left, row, columns, alias)?
+                && evaluate_predicate(right, row, columns, alias)?),
+            BinaryOperator::Or => Ok(evaluate_predicate(left, row, columns, alias)?
+                || evaluate_predicate(right, row, columns, alias)?),
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::GtEq
+            | BinaryOperator::LtEq => {
+                let left_value = evaluate_scalar(left, row, columns, alias)?;
+                let right_value = evaluate_scalar(right, row, columns, alias)?;
+                compare_values(&left_value, &right_value, op)
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "unsupported operator '{}' in inline predicate",
+                op
+            ))),
+        },
+        SqlExpr::IsNull(inner) => Ok(evaluate_scalar(inner, row, columns, alias)?.is_null()),
+        SqlExpr::IsNotNull(inner) => Ok(!evaluate_scalar(inner, row, columns, alias)?.is_null()),
+        SqlExpr::Nested(inner) => evaluate_predicate(inner, row, columns, alias),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(!evaluate_predicate(expr, row, columns, alias)?),
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) | SqlExpr::Value(_) => {
+            let scalar = evaluate_scalar(expr, row, columns, alias)?;
+            scalar
+                .as_bool()
+                .ok_or_else(|| Error::InvalidArgumentError("expression is not boolean".into()))
+        }
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported predicate in inline query".into(),
+        )),
+    }
+}
+
+fn evaluate_scalar(
+    expr: &SqlExpr,
+    row: &InlineRow,
+    columns: &[InlineColumn],
+    alias: Option<&str>,
+) -> SqlResult<InlineValue> {
+    match expr {
+        SqlExpr::Identifier(ident) => {
+            let idx =
+                column_index(columns, &ident.value).ok_or_else(|| invalid_column(&ident.value))?;
+            Ok(row.values[idx].clone())
+        }
+        SqlExpr::CompoundIdentifier(parts) => {
+            let column = resolve_identifier_from_parts(parts, alias).ok_or_else(|| {
+                invalid_column(
+                    &parts
+                        .last()
+                        .map(|ident| ident.value.clone())
+                        .unwrap_or_else(|| "<unknown>".into()),
+                )
+            })?;
+            let idx = column_index(columns, &column).ok_or_else(|| invalid_column(&column))?;
+            Ok(row.values[idx].clone())
+        }
+        SqlExpr::Value(value) => literal_to_inline_value(value),
+        SqlExpr::Nested(inner) => evaluate_scalar(inner, row, columns, alias),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => evaluate_scalar(expr, row, columns, alias),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => {
+            let value = evaluate_scalar(expr, row, columns, alias)?;
+            match value {
+                InlineValue::Int32(Some(v)) => Ok(InlineValue::Int32(Some(-v))),
+                InlineValue::Int32(None) => Ok(InlineValue::Int32(None)),
+                InlineValue::Null => Ok(InlineValue::Null),
+                _ => Err(Error::InvalidArgumentError(
+                    "UNARY - is only supported for numeric expressions in inline queries".into(),
+                )),
+            }
+        }
+        _ => Err(Error::InvalidArgumentError(format!(
+            "unsupported expression '{}' in inline query",
+            expr
+        ))),
+    }
+}
+
+fn resolve_identifier_from_parts<'a>(parts: &'a [Ident], alias: Option<&str>) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() == 1 {
+        return Some(parts[0].value.clone());
+    }
+    if parts.len() == 2 {
+        if let Some(alias_name) = alias {
+            if alias_name.eq_ignore_ascii_case(&parts[0].value) {
+                return Some(parts[1].value.clone());
+            }
+        }
+    }
+    parts.last().map(|ident| ident.value.clone())
+}
+
+fn column_index(columns: &[InlineColumn], name: &str) -> Option<usize> {
+    columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(name))
+}
+
+fn compare_values(left: &InlineValue, right: &InlineValue, op: &BinaryOperator) -> SqlResult<bool> {
+    if left.is_null() || right.is_null() {
+        return Ok(false);
+    }
+    match op {
+        BinaryOperator::Eq => match (left, right) {
+            (InlineValue::String(Some(a)), InlineValue::String(Some(b))) => Ok(a == b),
+            (InlineValue::Int32(Some(a)), InlineValue::Int32(Some(b))) => Ok(a == b),
+            (InlineValue::Bool(Some(a)), InlineValue::Bool(Some(b))) => Ok(a == b),
+            _ => Err(Error::InvalidArgumentError(
+                "type mismatch in comparison".into(),
+            )),
+        },
+        BinaryOperator::NotEq => {
+            compare_values(left, right, &BinaryOperator::Eq).map(|result| !result)
+        }
+        BinaryOperator::Gt | BinaryOperator::Lt | BinaryOperator::GtEq | BinaryOperator::LtEq => {
+            match (left, right) {
+                (InlineValue::String(Some(a)), InlineValue::String(Some(b))) => match op {
+                    BinaryOperator::Gt => Ok(a > b),
+                    BinaryOperator::Lt => Ok(a < b),
+                    BinaryOperator::GtEq => Ok(a >= b),
+                    BinaryOperator::LtEq => Ok(a <= b),
+                    _ => unreachable!(),
+                },
+                (InlineValue::Int32(Some(a)), InlineValue::Int32(Some(b))) => match op {
+                    BinaryOperator::Gt => Ok(a > b),
+                    BinaryOperator::Lt => Ok(a < b),
+                    BinaryOperator::GtEq => Ok(a >= b),
+                    BinaryOperator::LtEq => Ok(a <= b),
+                    _ => unreachable!(),
+                },
+                _ => Err(Error::InvalidArgumentError(
+                    "type mismatch in comparison".into(),
+                )),
+            }
+        }
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported comparison operator".into(),
+        )),
+    }
+}
+
+fn literal_to_inline_value(value: &ValueWithSpan) -> SqlResult<InlineValue> {
+    if let Some(text) = value.clone().value.into_string() {
+        return Ok(InlineValue::String(Some(text)));
+    }
+
+    match &value.value {
+        sqlparser::ast::Value::Number(text, _) => {
+            let parsed = text
+                .parse::<i64>()
+                .map_err(|_| Error::InvalidArgumentError("numeric literal is too large".into()))?;
+            if parsed < i64::from(i32::MIN) || parsed > i64::from(i32::MAX) {
+                return Err(Error::InvalidArgumentError(
+                    "numeric literal is out of range".into(),
+                ));
+            }
+            Ok(InlineValue::Int32(Some(parsed as i32)))
+        }
+        sqlparser::ast::Value::Boolean(flag) => Ok(InlineValue::Bool(Some(*flag))),
+        sqlparser::ast::Value::Null => Ok(InlineValue::Null),
+        other => Err(Error::InvalidArgumentError(format!(
+            "unsupported literal '{other}' in inline query"
+        ))),
+    }
+}
+
+fn invalid_column(name: &str) -> Error {
+    Error::InvalidArgumentError(format!("column '{name}' does not exist"))
 }
 
 fn validate_simple_query(query: &Query) -> SqlResult<()> {

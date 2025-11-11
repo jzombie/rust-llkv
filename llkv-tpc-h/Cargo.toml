@@ -8,6 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+arrow.workspace = true
 llkv.workspace = true
 llkv-sql.workspace = true
 regex.workspace = true

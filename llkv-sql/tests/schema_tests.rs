@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrow::array::Array;
 use llkv_plan::plans::PlanValue;
 use llkv_runtime::RuntimeStatementResult;
 use llkv_sql::SqlEngine;
@@ -197,4 +198,111 @@ fn drop_view_errors_when_target_is_table() {
         err_text_if_exists.contains("use DROP TABLE to delete table"),
         "unexpected error: {err_text_if_exists}"
     );
+}
+
+#[test]
+fn information_schema_tables_lists_user_tables() {
+    use arrow::array::StringArray;
+
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    engine
+        .execute("CREATE TABLE first_table(id INTEGER);")
+        .expect("create first table");
+    engine
+        .execute("CREATE TABLE second_table(id INTEGER);")
+        .expect("create second table");
+
+    let batches = engine
+        .sql("SELECT table_name FROM information_schema.tables ORDER BY table_name;")
+        .expect("information_schema query");
+    let mut names = Vec::new();
+    for batch in batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        for idx in 0..column.len() {
+            if !column.is_null(idx) {
+                names.push(column.value(idx).to_string());
+            }
+        }
+    }
+
+    assert!(
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("first_table")),
+        "first_table not found in information_schema.tables: {:?}",
+        names
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("second_table")),
+        "second_table not found in information_schema.tables: {:?}",
+        names
+    );
+}
+
+#[test]
+fn information_schema_columns_reports_column_metadata() {
+    use arrow::array::{BooleanArray, Int32Array, StringArray};
+
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    engine
+        .execute(
+            "
+        CREATE TABLE audit_log (
+            entry_id INTEGER PRIMARY KEY,
+            payload TEXT NOT NULL
+        );",
+        )
+        .expect("create table");
+
+    let batches = engine
+        .sql(
+            "SELECT table_name, column_name, ordinal_position, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'audit_log'
+             ORDER BY ordinal_position;",
+        )
+        .expect("information_schema.columns query");
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 2);
+
+    let table_names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("table_name column");
+    let column_names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("column_name column");
+    let ordinal_positions = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("ordinal_position column");
+    let nullable_flags = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("is_nullable column");
+
+    for idx in 0..table_names.len() {
+        assert!(
+            table_names.value(idx).eq_ignore_ascii_case("audit_log"),
+            "unexpected table name {}",
+            table_names.value(idx)
+        );
+    }
+    assert_eq!(column_names.value(0), "entry_id");
+    assert_eq!(column_names.value(1), "payload");
+    assert_eq!(ordinal_positions.value(0), 1);
+    assert_eq!(ordinal_positions.value(1), 2);
+    assert_eq!(nullable_flags.len(), 2);
 }
