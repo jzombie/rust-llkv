@@ -142,7 +142,7 @@ fn expression_uses_float(
         | ScalarExpr::Literal(Literal::Boolean(_))
         | ScalarExpr::Literal(Literal::Null)
         | ScalarExpr::Literal(Literal::String(_))
-    | ScalarExpr::Literal(Literal::Date32(_))
+        | ScalarExpr::Literal(Literal::Date32(_))
         | ScalarExpr::Literal(Literal::Struct(_)) => Ok(false),
         ScalarExpr::Column(field_id) => {
             let column = schema.column_by_field_id(*field_id).ok_or_else(|| {

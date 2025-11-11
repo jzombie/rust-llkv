@@ -3639,7 +3639,7 @@ impl SqlEngine {
         or_replace: bool,
         namespace: Option<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-    use arrow::array::{ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder};
+        use arrow::array::{ArrayRef, Date32Builder, Float64Builder, Int64Builder, StringBuilder};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
@@ -7229,7 +7229,11 @@ fn bind_literal(literal: &mut Literal, params: &[SqlParamValue]) -> SqlResult<()
             }
             Ok(())
         }
-        Literal::Integer(_) | Literal::Float(_) | Literal::Boolean(_) | Literal::Null | Literal::Date32(_) => Ok(()),
+        Literal::Integer(_)
+        | Literal::Float(_)
+        | Literal::Boolean(_)
+        | Literal::Null
+        | Literal::Date32(_) => Ok(()),
     }
 }
 

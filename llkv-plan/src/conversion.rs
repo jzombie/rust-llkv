@@ -49,9 +49,12 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
-            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Date32(_) => Err(
-                Error::InvalidArgumentError("cannot negate non-numeric literal".into()),
-            ),
+            PlanValue::Null
+            | PlanValue::String(_)
+            | PlanValue::Struct(_)
+            | PlanValue::Date32(_) => Err(Error::InvalidArgumentError(
+                "cannot negate non-numeric literal".into(),
+            )),
         },
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
@@ -74,14 +77,9 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
 }
 
 fn plan_value_from_typed_string(typed: &TypedString) -> Result<PlanValue> {
-    let text = typed
-        .value
-        .value
-        .clone()
-        .into_string()
-        .ok_or_else(|| {
-            Error::InvalidArgumentError("typed string literal must be a quoted string".into())
-        })?;
+    let text = typed.value.value.clone().into_string().ok_or_else(|| {
+        Error::InvalidArgumentError("typed string literal must be a quoted string".into())
+    })?;
 
     match typed.data_type {
         DataType::Date => {

@@ -254,8 +254,9 @@ fn substitute_stream_placeholder(sql: String, present: bool, options: &QueryOpti
 }
 
 fn normalize_typed_string_literals(mut sql: String) -> String {
-    let typed_regex = TYPED_STRING_RE
-        .get_or_init(|| Regex::new(r"(?i)\b(DATE|TIME|TIMESTAMP)\s+'([^']*)'").expect("valid regex"));
+    let typed_regex = TYPED_STRING_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(DATE|TIME|TIMESTAMP)\s+'([^']*)'").expect("valid regex")
+    });
     sql = typed_regex
         .replace_all(&sql, |caps: &regex::Captures<'_>| {
             let type_name = caps[1].to_ascii_uppercase();

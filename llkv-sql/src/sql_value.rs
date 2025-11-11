@@ -3,7 +3,9 @@ use llkv_executor::utils::parse_date32_literal;
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
-use sqlparser::ast::{BinaryOperator, DataType, Expr as SqlExpr, TypedString, UnaryOperator, Value, ValueWithSpan};
+use sqlparser::ast::{
+    BinaryOperator, DataType, Expr as SqlExpr, TypedString, UnaryOperator, Value, ValueWithSpan,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) enum SqlValue {

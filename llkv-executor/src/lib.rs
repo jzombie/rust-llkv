@@ -22,7 +22,7 @@ use arrow::array::{
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
+use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
@@ -6234,6 +6234,7 @@ enum ColumnAccessor {
     Float64(Arc<Float64Array>),
     Boolean(Arc<BooleanArray>),
     Utf8(Arc<StringArray>),
+    Date32(Arc<Date32Array>),
     Null(usize),
 }
 
@@ -6272,6 +6273,14 @@ impl ColumnAccessor {
                     .clone();
                 Ok(Self::Utf8(Arc::new(typed)))
             }
+            DataType::Date32 => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| Error::Internal("expected Date32 array".into()))?
+                    .clone();
+                Ok(Self::Date32(Arc::new(typed)))
+            }
             DataType::Null => Ok(Self::Null(array.len())),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported column type {:?} in cross product filter",
@@ -6286,6 +6295,7 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => array.len(),
             ColumnAccessor::Boolean(array) => array.len(),
             ColumnAccessor::Utf8(array) => array.len(),
+            ColumnAccessor::Date32(array) => array.len(),
             ColumnAccessor::Null(len) => *len,
         }
     }
@@ -6296,6 +6306,7 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => array.is_null(idx),
             ColumnAccessor::Boolean(array) => array.is_null(idx),
             ColumnAccessor::Utf8(array) => array.is_null(idx),
+            ColumnAccessor::Date32(array) => array.is_null(idx),
             ColumnAccessor::Null(_) => true,
         }
     }
@@ -6309,6 +6320,7 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => Ok(Literal::Float(array.value(idx))),
             ColumnAccessor::Boolean(array) => Ok(Literal::Boolean(array.value(idx))),
             ColumnAccessor::Utf8(array) => Ok(Literal::String(array.value(idx).to_string())),
+            ColumnAccessor::Date32(array) => Ok(Literal::Date32(array.value(idx))),
             ColumnAccessor::Null(_) => Ok(Literal::Null),
         }
     }
@@ -6319,6 +6331,7 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Boolean(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Utf8(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Date32(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Null(len) => new_null_array(&DataType::Null, *len),
         }
     }
@@ -6360,6 +6373,7 @@ impl ValueArray {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
+            | DataType::Date32
             | DataType::Float32
             | DataType::Float64 => {
                 let numeric = NumericArray::try_from_arrow(&array)?;
@@ -6716,6 +6730,20 @@ impl CrossProductExpressionContext {
                         } else {
                             let value = array.value(idx);
                             out.push(Some(predicate.matches(value)));
+                        }
+                    }
+                    Ok(out)
+                }
+                ColumnAccessor::Date32(array) => {
+                    let predicate = build_fixed_width_predicate::<Int32Type>(&filter.op)
+                        .map_err(Error::predicate_build)?;
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                        } else {
+                            let value = array.value(idx);
+                            out.push(Some(predicate.matches(&value)));
                         }
                     }
                     Ok(out)
@@ -11451,9 +11479,9 @@ fn sort_record_batch_with_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::array::{Array, ArrayRef, Date32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use llkv_expr::expr::BinaryOp;
+    use llkv_expr::expr::{BinaryOp, CompareOp};
     use llkv_expr::literal::Literal;
     use llkv_storage::pager::MemPager;
     use std::sync::Arc;
@@ -11502,6 +11530,44 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 addition result");
         assert_eq!(added_array.values(), &[6, 7, 8]);
+    }
+
+    #[test]
+    fn cross_product_filter_handles_date32_columns() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "orders.o_orderdate",
+            DataType::Date32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Date32Array::from(vec![0, 1, 3])) as ArrayRef],
+        )
+        .expect("valid batch");
+
+        let lookup = build_cross_product_column_lookup(schema.as_ref(), &[], &[], &[]);
+        let mut ctx = CrossProductExpressionContext::new(schema.as_ref(), lookup)
+            .expect("context builds from schema");
+
+        let field_id = ctx
+            .schema()
+            .columns
+            .first()
+            .expect("schema exposes date column")
+            .field_id;
+
+        let predicate = LlkvExpr::Compare {
+            left: ScalarExpr::Column(field_id),
+            op: CompareOp::GtEq,
+            right: ScalarExpr::Literal(Literal::Date32(1)),
+        };
+
+        let truths = ctx
+            .evaluate_predicate_truths(&predicate, &batch, &mut |_, _, _, _| Ok(None))
+            .expect("date comparison evaluates");
+
+        assert_eq!(truths, vec![Some(false), Some(true), Some(true)]);
     }
 
     #[test]

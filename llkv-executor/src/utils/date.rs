@@ -52,9 +52,8 @@ pub fn format_date32_literal(days: i32) -> LlkvResult<String> {
         .checked_add(days)
         .ok_or_else(|| Error::InvalidArgumentError("date literal out of range".into()))?;
 
-    let date = Date::from_julian_day(julian).map_err(|err| {
-        Error::InvalidArgumentError(format!("invalid DATE value: {err}"))
-    })?;
+    let date = Date::from_julian_day(julian)
+        .map_err(|err| Error::InvalidArgumentError(format!("invalid DATE value: {err}")))?;
     let (year, month, day) = date.to_calendar_date();
     let month_number = month as u8;
     Ok(format!("{:04}-{:02}-{:02}", year, month_number, day))

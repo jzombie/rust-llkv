@@ -121,7 +121,7 @@ impl NumericArray {
                     .clone();
                 Ok(NumericArray::from_float(Arc::new(float_array)))
             }
-            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Date32 => {
                 let casted = cast(array.as_ref(), &DataType::Int64)
                     .map_err(|e| Error::Internal(format!("cast to Int64 failed: {e}")))?;
                 let int_array = casted
