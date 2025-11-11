@@ -7463,6 +7463,13 @@ fn group_key_value(array: &ArrayRef, row_idx: usize) -> ExecutorResult<GroupKeyV
             }
             Ok(GroupKeyValue::Int(value as i64))
         }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to Date32Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
+        }
         DataType::Boolean => {
             let values = array
                 .as_any()
@@ -11568,6 +11575,20 @@ mod tests {
             .expect("date comparison evaluates");
 
         assert_eq!(truths, vec![Some(false), Some(true), Some(true)]);
+    }
+
+    #[test]
+    fn group_by_handles_date32_columns() {
+        let array: ArrayRef = Arc::new(Date32Array::from(vec![Some(3), None, Some(-7)]));
+
+        let first = group_key_value(&array, 0).expect("extract first group key");
+        assert_eq!(first, GroupKeyValue::Int(3));
+
+        let second = group_key_value(&array, 1).expect("extract second group key");
+        assert_eq!(second, GroupKeyValue::Null);
+
+        let third = group_key_value(&array, 2).expect("extract third group key");
+        assert_eq!(third, GroupKeyValue::Int(-7));
     }
 
     #[test]
