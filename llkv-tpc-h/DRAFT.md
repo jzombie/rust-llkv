@@ -16,3 +16,5 @@ Two available modes:
 
 1. Accuracy (nothing else matters if the results are not accurate)
 2. Performance
+
+Section 2.3 of the spec, "Query Validation," may be of interest for point 1.
