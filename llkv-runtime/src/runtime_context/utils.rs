@@ -10,7 +10,7 @@
 //! - Table cache management
 
 use arrow::array::{Array, UInt64Array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, IntervalUnit};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::utils::parse_date32_literal;
@@ -109,6 +109,17 @@ where
                 _ => Err(Error::InvalidArgumentError(format!(
                     "cannot assign struct value to column '{}'",
                     column.name
+                ))),
+            },
+            PlanValue::Interval(interval) => match &column.data_type {
+                DataType::Interval(IntervalUnit::MonthDayNano) => Ok(PlanValue::Interval(interval)),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign INTERVAL literal to STRUCT column '{}'",
+                    column.name
+                ))),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported target type {:?} for INTERVAL literal in column '{}'",
+                    other, column.name
                 ))),
             },
             PlanValue::Date32(days) => match &column.data_type {

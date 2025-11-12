@@ -16,13 +16,15 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder, LargeStringArray, RecordBatch,
-    StringArray, StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder, IntervalMonthDayNanoArray,
+    LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array, new_null_array,
 };
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema};
+use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, IntervalUnit, Schema};
+use arrow_buffer::IntervalMonthDayNano;
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
@@ -78,6 +80,9 @@ pub type ExecutorResult<T> = Result<T, Error>;
 
 use crate::translation::schema::infer_computed_data_type;
 use crate::utils::format_date32_literal;
+use crate::utils::interval::{
+    compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
+};
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -273,7 +278,9 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
 /// This currently supports Integer, Float, Null, and String values.
 /// The array type is inferred from the first non-null value.
 fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> {
-    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::array::{
+        Date32Array, Float64Array, Int64Array, IntervalMonthDayNanoArray, StringArray,
+    };
 
     // Infer type from first non-null value
     let mut value_type = None;
@@ -289,41 +296,69 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
             let int_values: Vec<Option<i64>> = values
                 .iter()
                 .map(|v| match v {
-                    PlanValue::Integer(i) => Some(*i),
-                    PlanValue::Null => None,
-                    _ => Some(0), // Type mismatch, use default
+                    PlanValue::Integer(i) => Ok(Some(*i)),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected INTEGER plan value, found {other:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             Ok(Arc::new(Int64Array::from(int_values)) as ArrayRef)
         }
         Some(PlanValue::Float(_)) => {
             let float_values: Vec<Option<f64>> = values
                 .iter()
                 .map(|v| match v {
-                    PlanValue::Float(f) => Some(*f),
-                    PlanValue::Integer(i) => Some(*i as f64),
-                    PlanValue::Null => None,
-                    _ => Some(0.0), // Type mismatch, use default
+                    PlanValue::Float(f) => Ok(Some(*f)),
+                    PlanValue::Null => Ok(None),
+                    PlanValue::Integer(i) => Ok(Some(*i as f64)),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected FLOAT plan value, found {other:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             Ok(Arc::new(Float64Array::from(float_values)) as ArrayRef)
         }
         Some(PlanValue::String(_)) => {
             let string_values: Vec<Option<&str>> = values
                 .iter()
                 .map(|v| match v {
-                    PlanValue::String(s) => Some(s.as_str()),
-                    PlanValue::Null => None,
-                    _ => Some(""), // Type mismatch, use default
+                    PlanValue::String(s) => Ok(Some(s.as_str())),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected STRING plan value, found {other:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             Ok(Arc::new(StringArray::from(string_values)) as ArrayRef)
         }
-        _ => {
-            // All nulls, create an Int64 array of nulls
-            let null_values: Vec<Option<i64>> = vec![None; values.len()];
-            Ok(Arc::new(Int64Array::from(null_values)) as ArrayRef)
+        Some(PlanValue::Date32(_)) => {
+            let date_values: Vec<Option<i32>> = values
+                .iter()
+                .map(|v| match v {
+                    PlanValue::Date32(d) => Ok(Some(*d)),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected DATE plan value, found {other:?}"
+                    ))),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Arc::new(Date32Array::from(date_values)) as ArrayRef)
         }
+        Some(PlanValue::Interval(_)) => {
+            let interval_values: Vec<Option<IntervalMonthDayNano>> = values
+                .iter()
+                .map(|v| match v {
+                    PlanValue::Interval(interval) => Ok(Some(interval_value_to_arrow(*interval))),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected INTERVAL plan value, found {other:?}"
+                    ))),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Arc::new(IntervalMonthDayNanoArray::from(interval_values)) as ArrayRef)
+        }
+        _ => Ok(new_null_array(&DataType::Null, values.len())),
     }
 }
 
@@ -779,7 +814,10 @@ where
                     let numeric = if flag { 1.0 } else { 0.0 };
                     values.push(Some(numeric));
                 }
-                Literal::String(_) | Literal::Struct(_) | Literal::Date32(_) => {
+                Literal::String(_)
+                | Literal::Struct(_)
+                | Literal::Date32(_)
+                | Literal::Interval(_) => {
                     return Err(Error::InvalidArgumentError(
                         "scalar subquery produced non-numeric result in numeric context".into(),
                     ));
@@ -883,11 +921,12 @@ where
 
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
+        use crate::utils::interval::interval_value_to_arrow;
         use arrow::array::{
-            ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
-            StructArray, new_null_array,
+            ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array,
+            IntervalMonthDayNanoArray, StringArray, StructArray, new_null_array,
         };
-        use arrow::datatypes::{DataType, Field};
+        use arrow::datatypes::{DataType, Field, IntervalUnit};
         use llkv_expr::literal::Literal;
 
         match lit {
@@ -915,6 +954,12 @@ where
                 Arc::new(Date32Array::from(vec![*v])) as ArrayRef,
             )),
             Literal::Null => Ok((DataType::Null, new_null_array(&DataType::Null, 1))),
+            Literal::Interval(interval) => Ok((
+                DataType::Interval(IntervalUnit::MonthDayNano),
+                Arc::new(IntervalMonthDayNanoArray::from(vec![
+                    interval_value_to_arrow(*interval),
+                ])) as ArrayRef,
+            )),
             Literal::Struct(struct_fields) => {
                 // Build a struct array recursively
                 let mut inner_fields = Vec::new();
@@ -5294,6 +5339,9 @@ where
                 (PlanValue::Integer(l), PlanValue::Float(r)) => (*l as f64).partial_cmp(r),
                 (PlanValue::Float(l), PlanValue::Integer(r)) => l.partial_cmp(&(*r as f64)),
                 (PlanValue::String(l), PlanValue::String(r)) => Some(l.cmp(r)),
+                (PlanValue::Interval(l), PlanValue::Interval(r)) => {
+                    Some(compare_interval_values(*l, *r))
+                }
                 _ => None,
             }
         }
@@ -5375,6 +5423,28 @@ where
                             CompareOp::GtEq => l >= r,
                         }))
                     }
+                    (PlanValue::Interval(l), PlanValue::Interval(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        let ordering = compare_interval_values(l, r);
+                        Ok(Some(match op {
+                            CompareOp::Eq => ordering == std::cmp::Ordering::Equal,
+                            CompareOp::NotEq => ordering != std::cmp::Ordering::Equal,
+                            CompareOp::Lt => ordering == std::cmp::Ordering::Less,
+                            CompareOp::LtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                                )
+                            }
+                            CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
+                            CompareOp::GtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                                )
+                            }
+                        }))
+                    }
                     _ => Ok(Some(false)),
                 }
             }
@@ -5435,6 +5505,9 @@ where
                         (PlanValue::Integer(a), PlanValue::Float(b)) => (*a as f64) == *b,
                         (PlanValue::Float(a), PlanValue::Integer(b)) => *a == (*b as f64),
                         (PlanValue::String(a), PlanValue::String(b)) => a == b,
+                        (PlanValue::Interval(a), PlanValue::Interval(b)) => {
+                            compare_interval_values(*a, *b) == std::cmp::Ordering::Equal
+                        }
                         _ => false,
                     };
 
@@ -5608,6 +5681,7 @@ where
             }
             ScalarExpr::Literal(Literal::String(s)) => Ok(PlanValue::String(s.clone())),
             ScalarExpr::Literal(Literal::Date32(days)) => Ok(PlanValue::Date32(*days)),
+            ScalarExpr::Literal(Literal::Interval(interval)) => Ok(PlanValue::Interval(*interval)),
             ScalarExpr::Literal(Literal::Null) => Ok(PlanValue::Null),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
@@ -5693,6 +5767,28 @@ where
                             CompareOp::GtEq => l >= r,
                         }
                     }
+                    (PlanValue::Interval(l), PlanValue::Interval(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        let ordering = compare_interval_values(*l, *r);
+                        match op {
+                            CompareOp::Eq => ordering == std::cmp::Ordering::Equal,
+                            CompareOp::NotEq => ordering != std::cmp::Ordering::Equal,
+                            CompareOp::Lt => ordering == std::cmp::Ordering::Less,
+                            CompareOp::LtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                                )
+                            }
+                            CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
+                            CompareOp::GtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                                )
+                            }
+                        }
+                    }
                     _ => false,
                 };
 
@@ -5761,6 +5857,14 @@ where
                             || matches!(&right_val, PlanValue::Null)
                         {
                             return Ok(PlanValue::Null);
+                        }
+
+                        if matches!(left_val, PlanValue::Interval(_))
+                            || matches!(right_val, PlanValue::Interval(_))
+                        {
+                            return Err(Error::InvalidArgumentError(
+                                "interval arithmetic not supported in aggregate expressions".into(),
+                            ));
                         }
 
                         if matches!(op, BinaryOp::Divide)
@@ -5928,8 +6032,18 @@ where
                         PlanValue::String(s) => Ok(PlanValue::String(s)),
                         PlanValue::Integer(i) => Ok(PlanValue::String(i.to_string())),
                         PlanValue::Float(f) => Ok(PlanValue::String(f.to_string())),
+                        PlanValue::Interval(_) => Err(Error::InvalidArgumentError(
+                            "Cannot cast interval to string in aggregate expressions".into(),
+                        )),
                         _ => Err(Error::InvalidArgumentError(format!(
                             "Cannot cast {:?} to string",
+                            value
+                        ))),
+                    },
+                    DataType::Interval(IntervalUnit::MonthDayNano) => match value {
+                        PlanValue::Interval(interval) => Ok(PlanValue::Interval(interval)),
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Cannot cast {:?} to interval",
                             value
                         ))),
                     },
@@ -6049,6 +6163,9 @@ where
             (PlanValue::Float(left), PlanValue::Float(right)) => left == right,
             (PlanValue::String(left), PlanValue::String(right)) => left == right,
             (PlanValue::Struct(left), PlanValue::Struct(right)) => left == right,
+            (PlanValue::Interval(left), PlanValue::Interval(right)) => {
+                compare_interval_values(*left, *right) == std::cmp::Ordering::Equal
+            }
             _ => operand == candidate,
         }
     }
@@ -6071,6 +6188,9 @@ where
             ScalarExpr::Literal(Literal::Null) => Ok(None),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
+            )),
+            ScalarExpr::Literal(Literal::Interval(_)) => Err(Error::InvalidArgumentError(
+                "Interval literals not supported in aggregate-only expressions".into(),
             )),
             ScalarExpr::Column(_) => Err(Error::InvalidArgumentError(
                 "Column references not supported in aggregate-only expressions".into(),
@@ -6235,6 +6355,7 @@ enum ColumnAccessor {
     Boolean(Arc<BooleanArray>),
     Utf8(Arc<StringArray>),
     Date32(Arc<Date32Array>),
+    Interval(Arc<IntervalMonthDayNanoArray>),
     Null(usize),
 }
 
@@ -6281,6 +6402,14 @@ impl ColumnAccessor {
                     .clone();
                 Ok(Self::Date32(Arc::new(typed)))
             }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| Error::Internal("expected IntervalMonthDayNano array".into()))?
+                    .clone();
+                Ok(Self::Interval(Arc::new(typed)))
+            }
             DataType::Null => Ok(Self::Null(array.len())),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported column type {:?} in cross product filter",
@@ -6296,6 +6425,7 @@ impl ColumnAccessor {
             ColumnAccessor::Boolean(array) => array.len(),
             ColumnAccessor::Utf8(array) => array.len(),
             ColumnAccessor::Date32(array) => array.len(),
+            ColumnAccessor::Interval(array) => array.len(),
             ColumnAccessor::Null(len) => *len,
         }
     }
@@ -6307,6 +6437,7 @@ impl ColumnAccessor {
             ColumnAccessor::Boolean(array) => array.is_null(idx),
             ColumnAccessor::Utf8(array) => array.is_null(idx),
             ColumnAccessor::Date32(array) => array.is_null(idx),
+            ColumnAccessor::Interval(array) => array.is_null(idx),
             ColumnAccessor::Null(_) => true,
         }
     }
@@ -6321,6 +6452,9 @@ impl ColumnAccessor {
             ColumnAccessor::Boolean(array) => Ok(Literal::Boolean(array.value(idx))),
             ColumnAccessor::Utf8(array) => Ok(Literal::String(array.value(idx).to_string())),
             ColumnAccessor::Date32(array) => Ok(Literal::Date32(array.value(idx))),
+            ColumnAccessor::Interval(array) => Ok(Literal::Interval(interval_value_from_arrow(
+                array.value(idx),
+            ))),
             ColumnAccessor::Null(_) => Ok(Literal::Null),
         }
     }
@@ -6332,6 +6466,7 @@ impl ColumnAccessor {
             ColumnAccessor::Boolean(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Utf8(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Date32(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Interval(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Null(len) => new_null_array(&DataType::Null, *len),
         }
     }
@@ -6342,6 +6477,7 @@ enum ValueArray {
     Numeric(NumericArray),
     Boolean(Arc<BooleanArray>),
     Utf8(Arc<StringArray>),
+    Interval(Arc<IntervalMonthDayNanoArray>),
     Null(usize),
 }
 
@@ -6363,6 +6499,14 @@ impl ValueArray {
                     .ok_or_else(|| Error::Internal("expected Utf8 array".into()))?
                     .clone();
                 Ok(Self::Utf8(Arc::new(typed)))
+            }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| Error::Internal("expected IntervalMonthDayNano array".into()))?
+                    .clone();
+                Ok(Self::Interval(Arc::new(typed)))
             }
             DataType::Null => Ok(Self::Null(array.len())),
             DataType::Int8
@@ -6391,6 +6535,7 @@ impl ValueArray {
             ValueArray::Numeric(array) => array.len(),
             ValueArray::Boolean(array) => array.len(),
             ValueArray::Utf8(array) => array.len(),
+            ValueArray::Interval(array) => array.len(),
             ValueArray::Null(len) => *len,
         }
     }
@@ -6478,6 +6623,11 @@ fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<Ar
         Literal::Date32(days) => {
             let values = vec![*days; len];
             Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
+        }
+        Literal::Interval(interval) => {
+            let value = interval_value_to_arrow(*interval);
+            let values = vec![value; len];
+            Ok(Arc::new(IntervalMonthDayNanoArray::from(values)) as ArrayRef)
         }
         Literal::Null => Ok(new_null_array(&DataType::Null, len)),
         Literal::Struct(_) => Err(Error::InvalidArgumentError(
@@ -6748,6 +6898,21 @@ impl CrossProductExpressionContext {
                     }
                     Ok(out)
                 }
+                ColumnAccessor::Interval(array) => {
+                    let array = array.as_ref();
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                            continue;
+                        }
+                        let literal =
+                            Literal::Interval(interval_value_from_arrow(array.value(idx)));
+                        let matches = evaluate_filter_against_literal(&literal, &filter.op)?;
+                        out.push(Some(matches));
+                    }
+                    Ok(out)
+                }
                 ColumnAccessor::Null(len) => Ok(vec![None; len]),
             },
         }
@@ -6808,6 +6973,40 @@ impl CrossProductExpressionContext {
                 }
                 Ok(out)
             }
+            (ValueArray::Interval(lhs), ValueArray::Interval(rhs)) => {
+                let lhs = lhs.as_ref();
+                let rhs = rhs.as_ref();
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if lhs.is_null(idx) || rhs.is_null(idx) {
+                        out.push(None);
+                    } else {
+                        let lhs_val = interval_value_from_arrow(lhs.value(idx));
+                        let rhs_val = interval_value_from_arrow(rhs.value(idx));
+                        let ordering = compare_interval_values(lhs_val, rhs_val);
+                        let result = match op {
+                            CompareOp::Eq => ordering == std::cmp::Ordering::Equal,
+                            CompareOp::NotEq => ordering != std::cmp::Ordering::Equal,
+                            CompareOp::Lt => ordering == std::cmp::Ordering::Less,
+                            CompareOp::LtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                                )
+                            }
+                            CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
+                            CompareOp::GtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                                )
+                            }
+                        };
+                        out.push(Some(result));
+                    }
+                }
+                Ok(out)
+            }
             _ => Err(Error::InvalidArgumentError(
                 "unsupported comparison between mismatched types in cross product filter".into(),
             )),
@@ -6856,6 +7055,16 @@ impl CrossProductExpressionContext {
                 Ok(out)
             }
             ValueArray::Utf8(arr) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    let is_null = arr.is_null(idx);
+                    let result = if negated { !is_null } else { is_null };
+                    out.push(Some(result));
+                }
+                Ok(out)
+            }
+            ValueArray::Interval(arr) => {
+                let arr = arr.as_ref();
                 let mut out = Vec::with_capacity(len);
                 for idx in 0..len {
                     let is_null = arr.is_null(idx);
@@ -6975,6 +7184,46 @@ impl CrossProductExpressionContext {
                                 } else if array.value(idx) == target_value {
                                     has_match = true;
                                     break;
+                                }
+                            }
+                            ValueArray::Null(_) => saw_null = true,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "type mismatch in IN list evaluation".into(),
+                                ));
+                            }
+                        }
+                    }
+                    out.push(finalize_in_list_result(has_match, saw_null, negated));
+                }
+                Ok(out)
+            }
+            ValueArray::Interval(target_interval) => {
+                let target_interval = target_interval.as_ref();
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if target_interval.is_null(idx) {
+                        out.push(None);
+                        continue;
+                    }
+                    let target_value = interval_value_from_arrow(target_interval.value(idx));
+                    let mut has_match = false;
+                    let mut saw_null = false;
+                    for candidate in &list_values {
+                        match candidate {
+                            ValueArray::Interval(array) => {
+                                let array = array.as_ref();
+                                if array.is_null(idx) {
+                                    saw_null = true;
+                                } else {
+                                    let candidate_value =
+                                        interval_value_from_arrow(array.value(idx));
+                                    if compare_interval_values(target_value, candidate_value)
+                                        == std::cmp::Ordering::Equal
+                                    {
+                                        has_match = true;
+                                        break;
+                                    }
                                 }
                             }
                             ValueArray::Null(_) => saw_null = true,
@@ -7343,6 +7592,12 @@ fn encode_plan_value(buf: &mut Vec<u8>, value: &PlanValue) {
                 buf.extend_from_slice(key_bytes);
                 encode_plan_value(buf, val);
             }
+        }
+        PlanValue::Interval(interval) => {
+            buf.push(6);
+            buf.extend_from_slice(&interval.months.to_be_bytes());
+            buf.extend_from_slice(&interval.days.to_be_bytes());
+            buf.extend_from_slice(&interval.nanos.to_be_bytes());
         }
     }
 }
@@ -8180,11 +8435,16 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
                 }
             }
             Literal::Date32(days) => format_date32_literal(*days).ok()?,
-            Literal::Struct(_) | Literal::Null => return None,
+            Literal::Struct(_) | Literal::Null | Literal::Interval(_) => return None,
         })),
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
             literal_to_i128(literal).map(Literal::Integer)
         }
+        DataType::Interval(IntervalUnit::MonthDayNano) => match literal {
+            Literal::Interval(interval) => Some(Literal::Interval(*interval)),
+            Literal::Null => Some(Literal::Null),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -8538,6 +8798,7 @@ fn literal_compare(lhs: &Literal, rhs: &Literal) -> Option<std::cmp::Ordering> {
         (Literal::Date32(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
         (Literal::Float(a), Literal::Date32(b)) => a.partial_cmp(&(*b as f64)),
         (Literal::String(a), Literal::String(b)) => Some(a.cmp(b)),
+        (Literal::Interval(a), Literal::Interval(b)) => Some(compare_interval_values(*a, *b)),
         _ => None,
     }
 }
@@ -8554,7 +8815,8 @@ fn literal_equals(lhs: &Literal, rhs: &Literal) -> Option<bool> {
         | (Literal::Date32(_), Literal::Integer(_))
         | (Literal::Integer(_), Literal::Date32(_))
         | (Literal::Date32(_), Literal::Float(_))
-        | (Literal::Float(_), Literal::Date32(_)) => {
+        | (Literal::Float(_), Literal::Date32(_))
+        | (Literal::Interval(_), Literal::Interval(_)) => {
             literal_compare(lhs, rhs).map(|cmp| cmp == std::cmp::Ordering::Equal)
         }
         _ => None,
@@ -8696,6 +8958,15 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
                 .downcast_ref::<LargeStringArray>()
                 .ok_or_else(|| Error::Internal("failed to downcast large utf8 array".into()))?;
             Ok(Literal::String(array.value(idx).to_string()))
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .ok_or_else(|| Error::Internal("failed to downcast interval array".into()))?;
+            Ok(Literal::Interval(interval_value_from_arrow(
+                array.value(idx),
+            )))
         }
         DataType::Struct(fields) => {
             let struct_array = array
@@ -9720,6 +9991,39 @@ fn build_comparison_mask(column: &dyn Array, value: &PlanValue) -> ExecutorResul
             }
             Ok(builder.finish())
         }
+        PlanValue::Interval(interval) => {
+            let mut builder = BooleanBuilder::with_capacity(column.len());
+            match column.data_type() {
+                DataType::Interval(IntervalUnit::MonthDayNano) => {
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<IntervalMonthDayNanoArray>()
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "failed to downcast to IntervalMonthDayNanoArray".into(),
+                            )
+                        })?;
+                    let expected = *interval;
+                    for i in 0..arr.len() {
+                        if arr.is_null(i) {
+                            builder.append_value(false);
+                        } else {
+                            let candidate = interval_value_from_arrow(arr.value(i));
+                            let matches = compare_interval_values(expected, candidate)
+                                == std::cmp::Ordering::Equal;
+                            builder.append_value(matches);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Error::Internal(format!(
+                        "unsupported INTERVAL type for IN list: {:?}",
+                        column.data_type()
+                    )));
+                }
+            }
+            Ok(builder.finish())
+        }
         PlanValue::Struct(_) => Err(Error::Internal(
             "struct comparison in IN list not supported".into(),
         )),
@@ -9869,6 +10173,28 @@ fn array_value_equals_plan_value(
                 array.data_type()
             ))),
         },
+        PlanValue::Interval(expected) => {
+            match array.data_type() {
+                DataType::Interval(IntervalUnit::MonthDayNano) => {
+                    if array.is_null(row_idx) {
+                        Ok(false)
+                    } else {
+                        let value = array
+                            .as_any()
+                            .downcast_ref::<IntervalMonthDayNanoArray>()
+                            .expect("interval array")
+                            .value(row_idx);
+                        let arrow_value = interval_value_from_arrow(value);
+                        Ok(compare_interval_values(*expected, arrow_value)
+                            == std::cmp::Ordering::Equal)
+                    }
+                }
+                _ => Err(Error::InvalidArgumentError(format!(
+                    "literal interval comparison not supported for {:?}",
+                    array.data_type()
+                ))),
+            }
+        }
         PlanValue::Struct(_) => Err(Error::InvalidArgumentError(
             "struct literals are not supported in join filters".into(),
         )),

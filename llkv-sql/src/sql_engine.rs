@@ -8,8 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 
-use crate::SqlResult;
-use crate::SqlValue;
+use crate::{SqlResult, SqlValue, interval::parse_interval_literal};
 use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray, UInt32Array};
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -7063,7 +7062,11 @@ fn bind_plan_value(value: &mut PlanValue, params: &[SqlParamValue]) -> SqlResult
                 bind_plan_value(field, params)?;
             }
         }
-        PlanValue::Null | PlanValue::Integer(_) | PlanValue::Float(_) | PlanValue::Date32(_) => {}
+        PlanValue::Null
+        | PlanValue::Integer(_)
+        | PlanValue::Float(_)
+        | PlanValue::Date32(_)
+        | PlanValue::Interval(_) => {}
     }
     Ok(())
 }
@@ -7233,7 +7236,8 @@ fn bind_literal(literal: &mut Literal, params: &[SqlParamValue]) -> SqlResult<()
         | Literal::Float(_)
         | Literal::Boolean(_)
         | Literal::Null
-        | Literal::Date32(_) => Ok(()),
+        | Literal::Date32(_)
+        | Literal::Interval(_) => Ok(()),
     }
 }
 
@@ -9345,6 +9349,11 @@ fn translate_scalar_internal(
                     let result = literal_from_value(value)?;
                     work_stack.push(ScalarFrame::Leaf(result));
                 }
+                SqlExpr::Interval(interval) => {
+                    let parsed = parse_interval_literal(interval)?;
+                    let literal = llkv_expr::expr::ScalarExpr::literal(Literal::Interval(parsed));
+                    work_stack.push(ScalarFrame::Leaf(literal));
+                }
                 SqlExpr::BinaryOp { left, op, right } => match op {
                     BinaryOperator::Plus
                     | BinaryOperator::Minus
@@ -10035,6 +10044,14 @@ fn translate_scalar_internal(
                             Literal::Date32(_) => {
                                 return Err(Error::InvalidArgumentError(
                                     "cannot negate date literal".into(),
+                                ));
+                            }
+                            Literal::Interval(interval) => {
+                                let negated = interval.checked_neg().ok_or_else(|| {
+                                    Error::InvalidArgumentError("interval overflow".into())
+                                })?;
+                                result_stack.push(llkv_expr::expr::ScalarExpr::literal(
+                                    Literal::Interval(negated),
                                 ));
                             }
                             Literal::Null => {
@@ -10980,6 +10997,15 @@ mod tests {
             }
         }
         values
+    }
+
+    #[test]
+    fn debug_interval_expr_structure() {
+        use sqlparser::dialect::GenericDialect;
+        let dialect = GenericDialect {};
+        let sql = "SELECT CAST('1998-12-01' AS DATE) - INTERVAL '90' DAY";
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        panic!("{statements:?}");
     }
 
     #[test]

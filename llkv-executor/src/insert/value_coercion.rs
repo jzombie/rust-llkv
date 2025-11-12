@@ -1,10 +1,12 @@
 //! Helper functions for value coercion and data preparation used during inserts.
 
 use crate::utils::date::parse_date32_literal;
+use crate::utils::interval::interval_value_to_arrow;
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
+    ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder,
+    IntervalMonthDayNanoArray, StringBuilder,
 };
-use arrow::datatypes::{DataType, FieldRef};
+use arrow::datatypes::{DataType, FieldRef, IntervalUnit};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use std::sync::Arc;
@@ -105,6 +107,15 @@ pub fn normalize_insert_value_for_column(
             "expected struct value for struct column '{}', got {other:?}",
             column.name
         ))),
+        (DataType::Interval(IntervalUnit::MonthDayNano), PlanValue::Interval(interval)) => {
+            Ok(PlanValue::Interval(interval))
+        }
+        (DataType::Interval(IntervalUnit::MonthDayNano), other) => {
+            Err(Error::InvalidArgumentError(format!(
+                "cannot insert {other:?} into INTERVAL column '{}'",
+                column.name
+            )))
+        }
         (other_type, other_value) => Err(Error::InvalidArgumentError(format!(
             "unsupported Arrow data type {:?} for INSERT value {:?} in column '{}'",
             other_type, other_value, column.name
@@ -123,7 +134,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Integer(v) => builder.append_value(*v),
                     PlanValue::Float(v) => builder.append_value(*v as i64),
                     PlanValue::Date32(days) => builder.append_value(i64::from(*days)),
-                    PlanValue::String(_) | PlanValue::Struct(_) => {
+                    PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-integer into INT column".into(),
                         ));
@@ -153,7 +164,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                             }
                         }
                     }
-                    PlanValue::Struct(_) => {
+                    PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert struct into BOOLEAN column".into(),
                         ));
@@ -170,7 +181,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Integer(v) => builder.append_value(*v as f64),
                     PlanValue::Float(v) => builder.append_value(*v),
                     PlanValue::Date32(days) => builder.append_value(f64::from(*days)),
-                    PlanValue::String(_) | PlanValue::Struct(_) => {
+                    PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-numeric into DOUBLE column".into(),
                         ));
@@ -188,7 +199,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Float(v) => builder.append_value(v.to_string()),
                     PlanValue::Date32(days) => builder.append_value(days.to_string()),
                     PlanValue::String(s) => builder.append_value(s),
-                    PlanValue::Struct(_) => {
+                    PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert struct into STRING column".into(),
                         ));
@@ -211,7 +222,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                         builder.append_value(casted);
                     }
                     PlanValue::Date32(days) => builder.append_value(*days),
-                    PlanValue::Float(_) | PlanValue::Struct(_) => {
+                    PlanValue::Float(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-date value into DATE column".into(),
                         ));
@@ -255,6 +266,23 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
             }
 
             Ok(Arc::new(StructArray::from(field_arrays)))
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let mut converted: Vec<Option<_>> = Vec::with_capacity(values.len());
+            for value in values {
+                match value {
+                    PlanValue::Null => converted.push(None),
+                    PlanValue::Interval(interval) => {
+                        converted.push(Some(interval_value_to_arrow(*interval)))
+                    }
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "cannot insert {other:?} into INTERVAL column"
+                        )));
+                    }
+                }
+            }
+            Ok(Arc::new(IntervalMonthDayNanoArray::from(converted)) as ArrayRef)
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported Arrow data type for INSERT: {other:?}"

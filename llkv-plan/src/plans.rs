@@ -10,6 +10,7 @@ use arrow::array::{ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_expr::expr::SubqueryId;
+use llkv_expr::literal::IntervalValue;
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
 
@@ -74,6 +75,7 @@ pub enum PlanValue {
     String(String),
     Date32(i32),
     Struct(FxHashMap<String, PlanValue>),
+    Interval(IntervalValue),
 }
 
 impl From<&str> for PlanValue {
@@ -149,6 +151,7 @@ pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanV
             }
             Ok(PlanValue::Struct(map))
         }
+        Literal::Interval(interval) => Ok(PlanValue::Interval(*interval)),
     }
 }
 

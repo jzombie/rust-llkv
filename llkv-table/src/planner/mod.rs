@@ -9,11 +9,13 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, OffsetSizeTrait,
-    RecordBatch, StringArray, UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array,
+    IntervalMonthDayNanoArray, OffsetSizeTrait, RecordBatch, StringArray, UInt64Array,
+    new_null_array,
 };
 use arrow::compute;
-use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
+use arrow_array::types::IntervalMonthDayNanoType;
 use time::{Date, Month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +39,7 @@ use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
-use llkv_expr::literal::{FromLiteral, Literal};
+use llkv_expr::literal::{FromLiteral, IntervalValue, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
@@ -1142,6 +1144,9 @@ where
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
                             ScalarExpr::Literal(Literal::Date32(_)) => DataType::Date32,
+                            ScalarExpr::Literal(Literal::Interval(_)) => {
+                                DataType::Interval(IntervalUnit::MonthDayNano)
+                            }
                             ScalarExpr::Literal(Literal::Null) => DataType::Null,
                             ScalarExpr::Literal(Literal::Struct(fields)) => {
                                 // Infer struct type from the literal fields
@@ -1644,6 +1649,9 @@ where
                 (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
                 (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
+                (Literal::Interval(l), Literal::Interval(r)) => {
+                    Some(compare_interval_values(*l, *r))
+                }
                 (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r),
                 (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64)),
                 _ => None,
@@ -3377,6 +3385,7 @@ fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
         }
         Literal::Integer(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
         Literal::Date32(_) => Ok(false),
+        Literal::Interval(_) => Ok(false),
     }
 }
 
@@ -3427,6 +3436,7 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
         Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
         Literal::Date32(_) => Ok(DataType::Date32),
+        Literal::Interval(_) => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
         Literal::Null => Ok(DataType::Null),
         Literal::Struct(fields) => {
             let inferred_fields = fields
@@ -3439,6 +3449,22 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
             Ok(DataType::Struct(inferred_fields.into()))
         }
     }
+}
+
+#[inline]
+fn interval_value_to_arrow(
+    value: IntervalValue,
+) -> <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native {
+    <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native::new(
+        value.months,
+        value.days,
+        value.nanos,
+    )
+}
+
+#[inline]
+fn compare_interval_values(lhs: IntervalValue, rhs: IntervalValue) -> Ordering {
+    (lhs.months, lhs.days, lhs.nanos).cmp(&(rhs.months, rhs.days, rhs.nanos))
 }
 
 fn synthesize_computed_literal_array(
@@ -3470,6 +3496,10 @@ fn synthesize_computed_literal_array(
         }
         ScalarExpr::Literal(Literal::Date32(value)) => {
             Ok(Arc::new(Date32Array::from(vec![*value; row_count])) as ArrayRef)
+        }
+        ScalarExpr::Literal(Literal::Interval(value)) => {
+            let native = interval_value_to_arrow(*value);
+            Ok(Arc::new(IntervalMonthDayNanoArray::from(vec![native; row_count])) as ArrayRef)
         }
         ScalarExpr::Literal(Literal::Null) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::Literal(Literal::Struct(fields)) => {
@@ -3503,6 +3533,10 @@ fn synthesize_computed_literal_array(
                     Literal::Date32(v) => {
                         Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
                     }
+                    Literal::Interval(v) => Arc::new(IntervalMonthDayNanoArray::from(vec![
+                        interval_value_to_arrow(*v);
+                        row_count
+                    ])) as ArrayRef,
                     Literal::Null => new_null_array(&field_dtype, row_count),
                     Literal::Struct(nested_fields) => {
                         // Recursively build nested struct
@@ -3917,6 +3951,10 @@ fn format_literal(lit: &Literal) -> String {
         Literal::Boolean(b) => b.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
         Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
+        Literal::Interval(interval) => format!(
+            "INTERVAL {{ months: {}, days: {}, nanos: {} }}",
+            interval.months, interval.days, interval.nanos
+        ),
         Literal::Null => "NULL".to_string(),
         Literal::Struct(fields) => {
             let field_strs: Vec<_> = fields

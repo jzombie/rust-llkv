@@ -34,6 +34,8 @@ pub use sql_engine::{
     clear_pending_statement_expectations, register_statement_expectation,
 };
 
+mod interval;
+
 mod sql_value;
 use sql_value::SqlValue;
 

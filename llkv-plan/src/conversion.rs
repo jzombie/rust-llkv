@@ -13,7 +13,7 @@ use sqlparser::ast::{
 };
 use time::{Date, Month};
 
-use crate::PlanValue;
+use crate::{PlanValue, interval::parse_interval_literal};
 
 /// Convert a SQL expression to a PlanValue literal.
 ///
@@ -43,6 +43,10 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
     match expr {
         SqlExpr::Value(value) => plan_value_from_sql_value(value),
         SqlExpr::TypedString(typed) => plan_value_from_typed_string(typed),
+        SqlExpr::Interval(interval) => {
+            let parsed = parse_interval_literal(interval)?;
+            Ok(PlanValue::Interval(parsed))
+        }
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -52,7 +56,8 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
             PlanValue::Null
             | PlanValue::String(_)
             | PlanValue::Struct(_)
-            | PlanValue::Date32(_) => Err(Error::InvalidArgumentError(
+            | PlanValue::Date32(_)
+            | PlanValue::Interval(_) => Err(Error::InvalidArgumentError(
                 "cannot negate non-numeric literal".into(),
             )),
         },
@@ -513,7 +518,10 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::ast::{Expr as SqlExpr, Value, ValueWithSpan};
+    use llkv_expr::literal::IntervalValue;
+    use sqlparser::ast::{Expr as SqlExpr, SelectItem, SetExpr, Statement, Value, ValueWithSpan};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
 
     fn value_with_span(v: Value) -> ValueWithSpan {
         ValueWithSpan {
@@ -589,6 +597,28 @@ mod tests {
         assert_eq!(
             plan_value_from_sql_expr(&expr).unwrap(),
             PlanValue::Integer(50)
+        );
+    }
+
+    #[test]
+    fn test_interval_literal_expression() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT INTERVAL '7' DAY").unwrap();
+        let statement = statements.first().expect("statement");
+        let expr = match statement {
+            Statement::Query(query) => match query.body.as_ref() {
+                SetExpr::Select(select) => match select.projection.first().expect("projection") {
+                    SelectItem::UnnamedExpr(expr) => expr,
+                    other => panic!("unexpected projection {other:?}"),
+                },
+                other => panic!("unexpected set expr {other:?}"),
+            },
+            other => panic!("unexpected statement {other:?}"),
+        };
+
+        assert_eq!(
+            plan_value_from_sql_expr(expr).unwrap(),
+            PlanValue::Interval(IntervalValue::new(0, 7, 0))
         );
     }
 

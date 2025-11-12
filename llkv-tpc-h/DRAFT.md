@@ -18,3 +18,15 @@ Two available modes:
 2. Performance
 
 Section 2.3 of the spec, "Query Validation," may be of interest for point 1.
+
+---
+
+https://www.youtube.com/watch?v=xotGodf7gZY - "If you're going to compare two databases [or solutions] against each other, what should be the [benchmarking] criteria used for testing?
+
+TPC goals:
+
+- Verify existing benchmarks (requires an auditor)
+- Creating good benchmarks (everyone can use them, even without an auditor)
+- Creating a good process for reviewing and monitoring those benchmarks
+- Resolution of disputes and challenges
+- Good benchmarks are like good laws. They lay the foundation for civilized (fair) competition.

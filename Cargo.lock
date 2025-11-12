@@ -1552,6 +1552,7 @@ name = "llkv-executor"
 version = "0.8.1-alpha"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "llkv-aggregate",
  "llkv-column-map",
  "llkv-expr",
@@ -1604,6 +1605,7 @@ dependencies = [
  "llkv-expr",
  "llkv-result",
  "llkv-test-utils",
+ "regex",
  "rustc-hash",
  "serde",
  "serde_json",

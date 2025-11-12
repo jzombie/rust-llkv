@@ -787,6 +787,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::String(_) => None,
                 llkv_expr::literal::Literal::Date32(_) => None,
                 llkv_expr::literal::Literal::Struct(_) => None,
+                llkv_expr::literal::Literal::Interval(_) => None,
                 llkv_expr::literal::Literal::Null => None,
             }
         } else if let ScalarExpr::IsNull { expr, negated } = expr {
@@ -1390,6 +1391,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::String(_) => NumericKind::Float,
                 llkv_expr::literal::Literal::Date32(_) => NumericKind::Float,
                 llkv_expr::literal::Literal::Struct(_) => NumericKind::Float,
+                llkv_expr::literal::Literal::Interval(_) => NumericKind::Float,
             },
             ScalarExpr::Column(fid) => arrays
                 .get(fid)

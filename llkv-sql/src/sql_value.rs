@@ -1,5 +1,9 @@
-use crate::{SqlResult, sql_engine::placeholder_marker, sql_engine::register_placeholder};
+use crate::{
+    SqlResult, interval::parse_interval_literal, sql_engine::placeholder_marker,
+    sql_engine::register_placeholder,
+};
 use llkv_executor::utils::parse_date32_literal;
+use llkv_expr::literal::IntervalValue;
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
@@ -15,6 +19,7 @@ pub(crate) enum SqlValue {
     Boolean(bool),
     String(String),
     Date32(i32),
+    Interval(IntervalValue),
     Struct(FxHashMap<String, SqlValue>),
 }
 
@@ -23,12 +28,20 @@ impl SqlValue {
         match expr {
             SqlExpr::Value(value) => SqlValue::from_value(value),
             SqlExpr::TypedString(typed) => SqlValue::from_typed_string(typed),
+            SqlExpr::Interval(interval) => {
+                let parsed = parse_interval_literal(interval)?;
+                Ok(SqlValue::Interval(parsed))
+            }
             SqlExpr::UnaryOp {
                 op: UnaryOperator::Minus,
                 expr,
             } => match SqlValue::try_from_expr(expr)? {
                 SqlValue::Integer(v) => Ok(SqlValue::Integer(-v)),
                 SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
+                SqlValue::Interval(interval) => interval
+                    .checked_neg()
+                    .map(SqlValue::Interval)
+                    .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into())),
                 SqlValue::Null
                 | SqlValue::Boolean(_)
                 | SqlValue::String(_)
@@ -184,6 +197,7 @@ impl From<SqlValue> for PlanValue {
             SqlValue::Boolean(v) => PlanValue::Integer(if v { 1 } else { 0 }),
             SqlValue::String(s) => PlanValue::String(s),
             SqlValue::Date32(days) => PlanValue::Date32(days),
+            SqlValue::Interval(interval) => PlanValue::Interval(interval),
             SqlValue::Struct(fields) => {
                 let converted: FxHashMap<String, PlanValue> = fields
                     .into_iter()
