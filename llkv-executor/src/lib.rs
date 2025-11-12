@@ -294,7 +294,8 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
 /// The array type is inferred from the first non-null value.
 fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> {
     use arrow::array::{
-        Date32Array, Float64Array, Int64Array, IntervalMonthDayNanoArray, StringArray,
+        Date32Array, Decimal128Array, Float64Array, Int64Array, IntervalMonthDayNanoArray,
+        StringArray,
     };
 
     // Infer type from first non-null value
@@ -307,6 +308,27 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
     }
 
     match value_type {
+        Some(PlanValue::Decimal(d)) => {
+            let precision = d.precision();
+            let scale = d.scale();
+            let mut builder = Decimal128Array::builder(values.len())
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| {
+                    Error::InvalidArgumentError(format!("invalid Decimal128 precision/scale: {}", e))
+                })?;
+            for v in values {
+                match v {
+                    PlanValue::Decimal(d) => builder.append_value(d.raw_value()),
+                    PlanValue::Null => builder.append_null(),
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "expected DECIMAL plan value, found {other:?}"
+                        )))
+                    }
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
         Some(PlanValue::Integer(_)) => {
             let int_values: Vec<Option<i64>> = values
                 .iter()
@@ -4688,6 +4710,10 @@ where
                 // Actual conversion happens in llkv-aggregate::array_value_to_numeric
                 DataType::Utf8 | DataType::Boolean | DataType::Date32 => Ok(DataType::Float64),
 
+                // Null type can occur when expression is all NULLs - aggregate result will be NULL
+                // Use Float64 as a safe default type for the aggregate accumulator
+                DataType::Null => Ok(DataType::Float64),
+
                 _ => Err(Error::InvalidArgumentError(format!(
                     "{func_name} aggregate not supported for column type {:?}",
                     dt
@@ -5902,6 +5928,7 @@ where
                             ));
                         }
 
+                        // Special case: integer division
                         if matches!(op, BinaryOp::Divide)
                             && let (PlanValue::Integer(lhs), PlanValue::Integer(rhs)) =
                                 (&left_val, &right_val)
@@ -5917,13 +5944,106 @@ where
                             return Ok(PlanValue::Integer(lhs / rhs));
                         }
 
-                        let left_is_float = matches!(&left_val, PlanValue::Float(_) | PlanValue::Decimal(_));
-                        let right_is_float = matches!(&right_val, PlanValue::Float(_) | PlanValue::Decimal(_));
+                        // Check if either operand is Decimal - if so, use exact Decimal arithmetic
+                        let has_decimal = matches!(&left_val, PlanValue::Decimal(_))
+                            || matches!(&right_val, PlanValue::Decimal(_));
+
+                        if has_decimal {
+                            use llkv_expr::decimal::DecimalValue;
+
+                            // Convert both operands to Decimal
+                            let left_dec = match &left_val {
+                                PlanValue::Integer(i) => DecimalValue::from_i64(*i),
+                                PlanValue::Float(_f) => {
+                                    // For Float, we lose some precision but maintain the value
+                                    return Err(Error::InvalidArgumentError(
+                                        "Cannot perform exact decimal arithmetic with Float operands"
+                                            .into(),
+                                    ));
+                                }
+                                PlanValue::Decimal(d) => *d,
+                                other => {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "Non-numeric value {:?} in binary operation",
+                                        other
+                                    )));
+                                }
+                            };
+
+                            let right_dec = match &right_val {
+                                PlanValue::Integer(i) => DecimalValue::from_i64(*i),
+                                PlanValue::Float(_f) => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "Cannot perform exact decimal arithmetic with Float operands"
+                                            .into(),
+                                    ));
+                                }
+                                PlanValue::Decimal(d) => *d,
+                                other => {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "Non-numeric value {:?} in binary operation",
+                                        other
+                                    )));
+                                }
+                            };
+
+                            // Perform exact decimal arithmetic
+                            let result_dec = match op {
+                                BinaryOp::Add => left_dec.checked_add(right_dec).map_err(|e| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Decimal addition overflow: {}",
+                                        e
+                                    ))
+                                })?,
+                                BinaryOp::Subtract => left_dec.checked_sub(right_dec).map_err(|e| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Decimal subtraction overflow: {}",
+                                        e
+                                    ))
+                                })?,
+                                BinaryOp::Multiply => left_dec.checked_mul(right_dec).map_err(|e| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Decimal multiplication overflow: {}",
+                                        e
+                                    ))
+                                })?,
+                                BinaryOp::Divide => {
+                                    // Check for division by zero first
+                                    if right_dec.raw_value() == 0 {
+                                        return Ok(PlanValue::Null);
+                                    }
+                                    // For division, preserve scale of left operand
+                                    let target_scale = left_dec.scale();
+                                    left_dec
+                                        .checked_div(right_dec, target_scale)
+                                        .map_err(|e| {
+                                            Error::InvalidArgumentError(format!(
+                                                "Decimal division error: {}",
+                                                e
+                                            ))
+                                        })?
+                                }
+                                BinaryOp::Modulo => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "Modulo not supported for Decimal types".into(),
+                                    ));
+                                }
+                                BinaryOp::And
+                                | BinaryOp::Or
+                                | BinaryOp::BitwiseShiftLeft
+                                | BinaryOp::BitwiseShiftRight => unreachable!(),
+                            };
+
+                            return Ok(PlanValue::Decimal(result_dec));
+                        }
+
+                        // No decimals - use Float or Integer arithmetic as before
+                        let left_is_float = matches!(&left_val, PlanValue::Float(_));
+                        let right_is_float = matches!(&right_val, PlanValue::Float(_));
 
                         let left_num = match left_val {
                             PlanValue::Integer(i) => i as f64,
                             PlanValue::Float(f) => f,
-                            PlanValue::Decimal(d) => d.to_f64(),
                             other => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "Non-numeric value {:?} in binary operation",
@@ -5934,7 +6054,6 @@ where
                         let right_num = match right_val {
                             PlanValue::Integer(i) => i as f64,
                             PlanValue::Float(f) => f,
-                            PlanValue::Decimal(d) => d.to_f64(),
                             other => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "Non-numeric value {:?} in binary operation",

@@ -315,6 +315,48 @@ fn format_struct_value(struct_array: &StructArray, row_idx: usize) -> String {
                     format_struct_value(a, row_idx)
                 }
             }
+            arrow::datatypes::DataType::Decimal128(_precision, scale) => {
+                let a = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .unwrap();
+                if a.is_null(row_idx) {
+                    "NULL".to_string()
+                } else {
+                    // Convert i128 to decimal string with proper formatting
+                    let raw_value = a.value(row_idx);
+                    let scale = *scale as usize;
+                    let negative = raw_value < 0;
+                    let abs_value = raw_value.abs();
+
+                    // Convert to string and add decimal point
+                    let value_str = abs_value.to_string();
+                    let formatted = if scale == 0 {
+                        value_str
+                    } else if value_str.len() <= scale {
+                        // Need to pad with leading zeros
+                        format!("0.{:0>width$}", value_str, width = scale)
+                    } else {
+                        // Insert decimal point
+                        let int_part = &value_str[..value_str.len() - scale];
+                        let frac_part = &value_str[value_str.len() - scale..];
+                        format!("{}.{}", int_part, frac_part)
+                    };
+
+                    // Remove trailing zeros after decimal point
+                    let trimmed = if formatted.contains('.') {
+                        formatted.trim_end_matches('0').trim_end_matches('.')
+                    } else {
+                        &formatted
+                    };
+
+                    if negative {
+                        format!("-{}", trimmed)
+                    } else {
+                        trimmed.to_string()
+                    }
+                }
+            }
             _ => "NULL".to_string(),
         };
         parts.push(format!("'{}': {}", field_name, value_str));
@@ -459,6 +501,48 @@ impl AsyncDB for EngineHarness {
                                             }
                                         }
                                         arrow::datatypes::DataType::Null => "NULL".to_string(),
+                                        arrow::datatypes::DataType::Decimal128(_precision, scale) => {
+                                            let a = array
+                                                .as_any()
+                                                .downcast_ref::<arrow::array::Decimal128Array>()
+                                                .unwrap();
+                                            if a.is_null(row_idx) {
+                                                "NULL".to_string()
+                                            } else {
+                                                // Convert i128 to decimal string with proper formatting
+                                                let raw_value = a.value(row_idx);
+                                                let scale = *scale as usize;
+                                                let negative = raw_value < 0;
+                                                let abs_value = raw_value.abs();
+                                                
+                                                // Convert to string and add decimal point
+                                                let value_str = abs_value.to_string();
+                                                let formatted = if scale == 0 {
+                                                    value_str
+                                                } else if value_str.len() <= scale {
+                                                    // Need to pad with leading zeros
+                                                    format!("0.{:0>width$}", value_str, width = scale)
+                                                } else {
+                                                    // Insert decimal point
+                                                    let int_part = &value_str[..value_str.len() - scale];
+                                                    let frac_part = &value_str[value_str.len() - scale..];
+                                                    format!("{}.{}", int_part, frac_part)
+                                                };
+                                                
+                                                // Remove trailing zeros after decimal point
+                                                let trimmed = if formatted.contains('.') {
+                                                    formatted.trim_end_matches('0').trim_end_matches('.')
+                                                } else {
+                                                    &formatted
+                                                };
+                                                
+                                                if negative {
+                                                    format!("-{}", trimmed)
+                                                } else {
+                                                    trimmed.to_string()
+                                                }
+                                            }
+                                        }
                                         _ => "".to_string(),
                                     };
                                     row.push(val);
@@ -476,7 +560,8 @@ impl AsyncDB for EngineHarness {
                                     | arrow::datatypes::DataType::UInt64 => {
                                         DefaultColumnType::Integer
                                     }
-                                    arrow::datatypes::DataType::Float64 => {
+                                    arrow::datatypes::DataType::Float64
+                                    | arrow::datatypes::DataType::Decimal128(_, _) => {
                                         DefaultColumnType::FloatingPoint
                                     }
                                     arrow::datatypes::DataType::Utf8 => DefaultColumnType::Text,

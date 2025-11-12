@@ -322,6 +322,9 @@ impl DistinctKey {
                     })?;
                 Ok(DistinctKey::Decimal(values.value(index)))
             }
+            // Null type can occur when all values are NULL - treat as Int for accumulator purposes
+            // The actual value will always be NULL and won't be counted as distinct
+            DataType::Null => Ok(DistinctKey::Int(0)),
             other => Err(Error::InvalidArgumentError(format!(
                 "COUNT(DISTINCT) is not supported for column type {other:?}"
             ))),
@@ -434,6 +437,9 @@ fn array_value_to_numeric(array: &ArrayRef, index: usize) -> AggregateResult<f64
                 .ok_or_else(|| Error::InvalidArgumentError("Expected Boolean array".into()))?;
             Ok(if arr.value(index) { 1.0 } else { 0.0 })
         }
+        // Null type can occur when all values are NULL - return 0.0 as default
+        // (though these values won't actually be accumulated since they're NULL)
+        DataType::Null => Ok(0.0),
         other => Err(Error::InvalidArgumentError(format!(
             "Numeric coercion not supported for column type {other:?}"
         ))),
@@ -763,6 +769,11 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                // COUNT(NULL column) should be 0, not the row count
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
                 let non_null = i64::try_from(non_null).map_err(|_| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
@@ -773,6 +784,10 @@ impl AggregateAccumulator {
             }
             AggregateAccumulator::CountDistinctColumn { column_index, seen } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 for i in 0..array.len() {
                     if !array.is_valid(i) {
                         continue;
@@ -848,6 +863,10 @@ impl AggregateAccumulator {
                 saw_value,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 // Use generic numeric coercion to support Utf8 and other types
                 for i in 0..column.len() {
                     if column.is_valid(i) {
@@ -863,6 +882,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 for i in 0..column.len() {
                     if !column.is_valid(i) {
                         continue;
@@ -981,6 +1004,10 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 // Use generic numeric coercion to support Utf8 and other types
                 for i in 0..column.len() {
                     if column.is_valid(i) {
@@ -995,6 +1022,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 for i in 0..column.len() {
                     if !column.is_valid(i) {
                         continue;
@@ -1127,6 +1158,10 @@ impl AggregateAccumulator {
                 count,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 // Use generic numeric coercion to support Utf8 and other types
                 for i in 0..column.len() {
                     if column.is_valid(i) {
@@ -1146,6 +1181,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 for i in 0..column.len() {
                     if !column.is_valid(i) {
                         continue;
@@ -1246,6 +1285,10 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 // Use generic numeric coercion to support Utf8 and other types
                 for i in 0..column.len() {
                     if column.is_valid(i) {
@@ -1307,6 +1350,10 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let column = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(column.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 // Use generic numeric coercion to support Utf8 and other types
                 for i in 0..column.len() {
                     if column.is_valid(i) {
