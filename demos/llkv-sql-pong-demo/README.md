@@ -1,7 +1,6 @@
 # LLKV SQL Pong Demo App
 
 [![made-with-rust][rust-logo]][rust-src-page]
-[![rust-docs][rust-docs-badge]][rust-docs-page]
 [![Ask DeepWiki][deepwiki-badge]][deepwiki-page]
 
 A terminal UI (TUI) app that plays a game of Pong against itself.
