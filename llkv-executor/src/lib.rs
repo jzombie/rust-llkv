@@ -120,6 +120,7 @@ enum AggregateValue {
     Null,
     Int64(i64),
     Float64(f64),
+    Decimal128 { value: i128, scale: i8 },
     String(String),
 }
 
@@ -130,6 +131,11 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v),
             AggregateValue::Float64(v) => Some(*v as i64),
+            AggregateValue::Decimal128 { value, scale } => {
+                // Convert Decimal128 to i64 by scaling down
+                let divisor = 10_i128.pow(*scale as u32);
+                Some((value / divisor) as i64)
+            }
             AggregateValue::String(s) => s.parse().ok(),
         }
     }
@@ -141,6 +147,11 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v as f64),
             AggregateValue::Float64(v) => Some(*v),
+            AggregateValue::Decimal128 { value, scale } => {
+                // Convert Decimal128 to f64
+                let divisor = 10_f64.powi(*scale as i32);
+                Some(*value as f64 / divisor)
+            }
             AggregateValue::String(s) => s.parse().ok(),
         }
     }
@@ -2282,6 +2293,23 @@ where
                                 arrays
                                     .push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
                             }
+                            AggregateValue::Decimal128 { value, scale } => {
+                                // Determine precision from the value
+                                let precision = if *value == 0 {
+                                    1
+                                } else {
+                                    (*value).abs().to_string().len() as u8
+                                };
+                                fields.push(Arc::new(Field::new(
+                                    alias,
+                                    DataType::Decimal128(precision, *scale),
+                                    true,
+                                )));
+                                let array = Decimal128Array::from(vec![Some(*value)])
+                                    .with_precision_and_scale(precision, *scale)
+                                    .map_err(|e| Error::Internal(format!("invalid Decimal128: {}", e)))?;
+                                arrays.push(Arc::new(array) as ArrayRef);
+                            }
                             AggregateValue::String(s) => {
                                 fields.push(Arc::new(Field::new(alias, DataType::Utf8, true)));
                                 arrays
@@ -2661,6 +2689,24 @@ where
                     AggregateValue::Null
                 } else {
                     AggregateValue::String(string_array.value(0).to_string())
+                };
+                results.insert(field.name().to_string(), value);
+            }
+            // Try Decimal128Array for SUM/AVG on Decimal columns
+            else if let Some(decimal_array) = array.as_any().downcast_ref::<Decimal128Array>() {
+                if decimal_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        decimal_array.len()
+                    )));
+                }
+                let value = if decimal_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::Decimal128 {
+                        value: decimal_array.value(0),
+                        scale: decimal_array.scale() as i8,
+                    }
                 };
                 results.insert(field.name().to_string(), value);
             } else {
@@ -3662,6 +3708,73 @@ where
         ))
     }
 
+    /// Infer the Arrow data type for a computed expression in GROUP BY context
+    fn infer_computed_expression_type(
+        expr: &ScalarExpr<String>,
+        base_schema: &Schema,
+        column_lookup_map: &FxHashMap<String, usize>,
+        sample_batch: &RecordBatch,
+    ) -> Option<DataType> {
+        use llkv_expr::expr::AggregateCall;
+
+        // If it's a simple aggregate, return its result type
+        if let ScalarExpr::Aggregate(agg_call) = expr {
+            return match agg_call {
+                AggregateCall::CountStar | AggregateCall::Count { .. } | AggregateCall::CountNulls(_) => {
+                    Some(DataType::Int64)
+                }
+                AggregateCall::Sum { expr: agg_expr, .. }
+                | AggregateCall::Total { expr: agg_expr, .. }
+                | AggregateCall::Avg { expr: agg_expr, .. }
+                | AggregateCall::Min(agg_expr)
+                | AggregateCall::Max(agg_expr) => {
+                    // For aggregate functions, infer the type from the expression
+                    if let Some(col_name) = try_extract_simple_column(agg_expr) {
+                        let idx = resolve_column_name_to_index(col_name, column_lookup_map)?;
+                        Some(base_schema.field(idx).data_type().clone())
+                    } else {
+                        // Complex expression - evaluate to determine scale, but use conservative precision
+                        // For SUM/TOTAL/AVG of decimal expressions, the result can grow beyond the sample value
+                        if sample_batch.num_rows() > 0 {
+                            let mut computed_values = Vec::new();
+                            if let Ok(value) = Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                                agg_expr,
+                                &FxHashMap::default(),
+                                Some(sample_batch),
+                                Some(column_lookup_map),
+                                0,
+                            ) {
+                                computed_values.push(value);
+                                if let Ok(array) = plan_values_to_arrow_array(&computed_values) {
+                                    match array.data_type() {
+                                        // If it's Decimal128, use maximum precision to avoid overflow in aggregates
+                                        DataType::Decimal128(_, scale) => {
+                                            return Some(DataType::Decimal128(38, *scale));
+                                        }
+                                        // If evaluation returned NULL, fall back to Float64
+                                        DataType::Null => {
+                                            return Some(DataType::Float64);
+                                        }
+                                        other => {
+                                            return Some(other.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Unable to determine type, fall back to Float64
+                        Some(DataType::Float64)
+                    }
+                }
+                AggregateCall::GroupConcat { .. } => Some(DataType::Utf8),
+            };
+        }
+
+        // For other expressions, could try evaluating with sample data
+        // but for now return None to fall back to Float64
+        None
+    }
+
     fn build_group_by_output_columns(
         &self,
         plan: &SelectPlan,
@@ -3720,11 +3833,17 @@ where
                         source: OutputSource::TableColumn { index: *index },
                     });
                 }
-                SelectProjection::Computed { expr: _, alias } => {
-                    // For GROUP BY with aggregates, we don't evaluate the expression here
-                    // because it may contain aggregate functions. We'll evaluate it later
-                    // per group. For now, assume Float64 as a conservative type.
-                    let field = Field::new(alias.clone(), DataType::Float64, true);
+                SelectProjection::Computed { expr, alias } => {
+                    // For GROUP BY with aggregates, we need to infer the type from the expression
+                    // If it's a simple aggregate, use the aggregate's result type
+                    // Otherwise, we'll need to evaluate a sample to determine the type
+                    let inferred_type = Self::infer_computed_expression_type(
+                        expr,
+                        base_schema,
+                        column_lookup_map,
+                        _sample_batch,
+                    ).unwrap_or(DataType::Float64);
+                    let field = Field::new(alias.clone(), inferred_type, true);
                     columns.push(OutputColumn {
                         field,
                         source: OutputSource::Computed {
@@ -4553,6 +4672,23 @@ where
                                         .push(Arc::new(Float64Array::from(vec![Some(*v)]))
                                             as ArrayRef);
                                 }
+                                AggregateValue::Decimal128 { value, scale } => {
+                                    // Determine precision from the value
+                                    let precision = if *value == 0 {
+                                        1
+                                    } else {
+                                        (*value).abs().to_string().len() as u8
+                                    };
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Decimal128(precision, *scale),
+                                        true,
+                                    ));
+                                    let array = Decimal128Array::from(vec![Some(*value)])
+                                        .with_precision_and_scale(precision, *scale)
+                                        .map_err(|e| Error::Internal(format!("invalid Decimal128: {}", e)))?;
+                                    arrays.push(Arc::new(array) as ArrayRef);
+                                }
                                 AggregateValue::String(s) => {
                                     fields.push(arrow::datatypes::Field::new(
                                         alias,
@@ -5369,6 +5505,24 @@ where
                     AggregateValue::Null
                 } else {
                     AggregateValue::String(string_array.value(0).to_string())
+                };
+                results.insert(alias, value);
+            } else if let Some(decimal_array) =
+                array.as_any().downcast_ref::<arrow::array::Decimal128Array>()
+            {
+                if decimal_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        decimal_array.len()
+                    )));
+                }
+                let value = if decimal_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::Decimal128 {
+                        value: decimal_array.value(0),
+                        scale: decimal_array.scale() as i8,
+                    }
                 };
                 results.insert(alias, value);
             } else {

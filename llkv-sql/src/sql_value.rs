@@ -3,6 +3,7 @@ use crate::{
     sql_engine::register_placeholder,
 };
 use llkv_executor::utils::parse_date32_literal;
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::IntervalValue;
 use llkv_plan::plans::PlanValue;
 use llkv_plan::{add_interval_to_date32, subtract_interval_from_date32};
@@ -17,6 +18,7 @@ pub(crate) enum SqlValue {
     Null,
     Integer(i64),
     Float(f64),
+    Decimal(DecimalValue),
     Boolean(bool),
     String(String),
     Date32(i32),
@@ -39,6 +41,12 @@ impl SqlValue {
             } => match SqlValue::try_from_expr(expr)? {
                 SqlValue::Integer(v) => Ok(SqlValue::Integer(-v)),
                 SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
+                SqlValue::Decimal(dec) => {
+                    // Negate the raw i128 value while preserving scale
+                    DecimalValue::new(-dec.raw_value(), dec.scale())
+                        .map(SqlValue::Decimal)
+                        .map_err(|err| Error::InvalidArgumentError(format!("decimal negation overflow: {}", err)))
+                }
                 SqlValue::Interval(interval) => interval
                     .checked_neg()
                     .map(SqlValue::Interval)
@@ -163,17 +171,41 @@ impl SqlValue {
 }
 
 fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
-    if text.contains(['.', 'e', 'E']) {
+    // Scientific notation (e/E) requires float
+    if text.contains(['e', 'E']) {
         let value = text
             .parse::<f64>()
             .map_err(|err| Error::InvalidArgumentError(format!("invalid float literal: {err}")))?;
-        Ok(SqlValue::Float(value))
-    } else {
-        let value = text.parse::<i64>().map_err(|err| {
-            Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
-        })?;
-        Ok(SqlValue::Integer(value))
+        return Ok(SqlValue::Float(value));
     }
+
+    // Decimal point → parse as Decimal with exact precision
+    if let Some(dot_pos) = text.find('.') {
+        let integer_part = &text[..dot_pos];
+        let fractional_part = &text[dot_pos + 1..];
+        
+        // Parse the number as i128 by removing the decimal point
+        let combined = format!("{}{}", integer_part, fractional_part);
+        let raw_value = combined.parse::<i128>().map_err(|err| {
+            Error::InvalidArgumentError(format!("invalid decimal literal: {err}"))
+        })?;
+        
+        // Scale is the number of digits after the decimal point
+        let scale = fractional_part.len() as i8;
+        
+        // Create DecimalValue
+        let decimal = DecimalValue::new(raw_value, scale).map_err(|err| {
+            Error::InvalidArgumentError(format!("invalid decimal literal: {}", err))
+        })?;
+        
+        return Ok(SqlValue::Decimal(decimal));
+    }
+
+    // No decimal point → integer
+    let value = text.parse::<i64>().map_err(|err| {
+        Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
+    })?;
+    Ok(SqlValue::Integer(value))
 }
 
 impl From<SqlValue> for PlanValue {
@@ -182,6 +214,7 @@ impl From<SqlValue> for PlanValue {
             SqlValue::Null => PlanValue::Null,
             SqlValue::Integer(v) => PlanValue::Integer(v),
             SqlValue::Float(v) => PlanValue::Float(v),
+            SqlValue::Decimal(d) => PlanValue::Decimal(d),
             SqlValue::Boolean(v) => PlanValue::Integer(if v { 1 } else { 0 }),
             SqlValue::String(s) => PlanValue::String(s),
             SqlValue::Date32(days) => PlanValue::Date32(days),

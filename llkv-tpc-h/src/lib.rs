@@ -384,9 +384,11 @@ impl LoadSummary {
     }
 }
 
+// TODO: Why is this defined here?  Is this a duplicate of something else?
 #[derive(Clone, Copy)]
 enum ColumnKind {
     Number,
+    Decimal,
     String,
     Date,
 }
@@ -850,7 +852,20 @@ fn render_create_tables(tables: &[CreateTable]) -> String {
             sql.push('\n');
         }
         let statement = Statement::CreateTable(table.clone());
-        sql.push_str(&statement.to_string());
+        let rendered_sql = statement.to_string();
+        
+        // DEBUG: Print LINEITEM table schema to verify DECIMAL columns
+        if let Some(last_part) = table.name.0.last() {
+            if let Some(ident) = last_part.as_ident() {
+                if ident.value.to_ascii_uppercase() == "LINEITEM" {
+                    eprintln!("\n=== DEBUG: LINEITEM CREATE TABLE SQL ===");
+                    eprintln!("{}", rendered_sql);
+                    eprintln!("=== END DEBUG ===\n");
+                }
+            }
+        }
+        
+        sql.push_str(&rendered_sql);
         sql.push_str(";\n");
     }
     sql

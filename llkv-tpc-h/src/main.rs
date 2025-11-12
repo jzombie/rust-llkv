@@ -14,7 +14,7 @@ const DEFAULT_BATCH_SIZE: usize = 500;
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("tpch bootstrap failed: {err}");
+        tracing::debug!("tpch bootstrap failed: {err}");
         process::exit(1);
     }
 }
@@ -210,10 +210,23 @@ fn print_load_summary(summary: &LoadSummary) {
 
 fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchError> {
     println!("\n{label}");
+    
+    // DEBUG: Print the actual SQL being executed 
+    tracing::debug!("\n=== DEBUG: ACTUAL SQL ===");
+    tracing::debug!("{}", sql);
+    tracing::debug!("=== END DEBUG ===\n");
+    
     let batches = engine.sql(sql)?;
     if batches.is_empty() {
         println!("  (no rows)");
         return Ok(());
+    }
+    // Debug: print schema to see actual data types
+    if !batches.is_empty() {
+        tracing::debug!("DEBUG Schema:");
+        for field in batches[0].schema().fields() {
+            tracing::debug!("  {} -> {:?}", field.name(), field.data_type());
+        }
     }
     print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))
 }
@@ -287,10 +300,22 @@ fn run_tpch_queries(
                     engine.execute(&statement.sql).map_err(TpchError::Sql)?;
                 }
                 StatementKind::Query => {
+                    // DEBUG: Print the SQL for Query 1
+                    if rendered.number == 1 {
+                        tracing::debug!("\n=== DEBUG: QUERY 1 SQL ===");
+                        tracing::debug!("{}", statement.sql);
+                        tracing::debug!("=== END DEBUG ===\n");
+                    }
+                    
                     let batches = engine.sql(&statement.sql).map_err(TpchError::Sql)?;
                     if batches.is_empty() {
                         println!("  (no rows)");
                     } else {
+                        // Debug: print schema to see actual data types
+                        tracing::debug!("DEBUG Schema for Q{:02}:", rendered.number);
+                        for field in batches[0].schema().fields() {
+                            tracing::debug!("  {} -> {:?}", field.name(), field.data_type());
+                        }
                         print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))?;
                     }
                 }

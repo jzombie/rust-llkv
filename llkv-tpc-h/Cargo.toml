@@ -9,10 +9,11 @@ publish.workspace = true
 
 [dependencies]
 arrow.workspace = true
+clap.workspace = true
 llkv.workspace = true
 llkv-sql.workspace = true
 regex.workspace = true
-thiserror.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
+thiserror.workspace = true
+tracing.workspace = true
 tpchgen = "2.0.1"
-clap.workspace = true
