@@ -1,4 +1,6 @@
-Here’s a tight, working summary of TPC-H and how to use it, grounded in the official spec and download pages.
+Note: This is a preemptive summary and does not yet incorporate all of the context from the draft.
+
+---
 
 # What TPC-H is
 

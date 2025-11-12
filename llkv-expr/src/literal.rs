@@ -3,6 +3,7 @@
 //! Literals capture query parameters before a table knows the concrete Arrow
 //! type of each column. Conversion helpers here defer type checking until the
 //! caller can perform schema-aware coercion.
+use crate::decimal::DecimalValue;
 use arrow::datatypes::ArrowPrimitiveType;
 use std::ops::Bound;
 
@@ -79,6 +80,8 @@ pub enum Literal {
     Null,
     Integer(i128),
     Float(f64),
+    /// Decimal literal stored as scaled integer with fixed precision.
+    Decimal(DecimalValue),
     String(String),
     Boolean(bool),
     /// Date literal stored as days since the Unix epoch (1970-01-01).
@@ -190,6 +193,20 @@ macro_rules! impl_from_literal_int {
                             expected: "integer",
                             got: "interval",
                         }),
+                        Literal::Decimal(decimal) => {
+                            if decimal.scale() == 0 {
+                                let raw = decimal.raw_value();
+                                <$ty>::try_from(raw).map_err(|_| LiteralCastError::OutOfRange {
+                                    target: std::any::type_name::<$ty>(),
+                                    value: raw,
+                                })
+                            } else {
+                                Err(LiteralCastError::TypeMismatch {
+                                    expected: "integer",
+                                    got: "decimal",
+                                })
+                            }
+                        }
                         Literal::Null => Err(LiteralCastError::TypeMismatch {
                             expected: "integer",
                             got: "null",
@@ -208,6 +225,7 @@ impl FromLiteral for f32 {
         let value = match lit {
             Literal::Float(f) => *f,
             Literal::Integer(i) => *i as f64,
+            Literal::Decimal(d) => d.to_f64(),
             Literal::Boolean(_) => {
                 return Err(LiteralCastError::TypeMismatch {
                     expected: "float",
@@ -295,6 +313,10 @@ impl FromLiteral for bool {
                 expected: "bool",
                 got: "interval",
             }),
+            Literal::Decimal(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "bool",
+                got: "decimal",
+            }),
             Literal::Null => Err(LiteralCastError::TypeMismatch {
                 expected: "bool",
                 got: "null",
@@ -308,6 +330,7 @@ impl FromLiteral for f64 {
         match lit {
             Literal::Float(f) => Ok(*f),
             Literal::Integer(i) => Ok(*i as f64),
+            Literal::Decimal(d) => Ok(d.to_f64()),
             Literal::Boolean(_) => Err(LiteralCastError::TypeMismatch {
                 expected: "float",
                 got: "boolean",
@@ -340,6 +363,7 @@ fn literal_type_name(lit: &Literal) -> &'static str {
     match lit {
         Literal::Integer(_) => "integer",
         Literal::Float(_) => "float",
+        Literal::Decimal(_) => "decimal",
         Literal::String(_) => "string",
         Literal::Boolean(_) => "boolean",
         Literal::Date32(_) => "date",

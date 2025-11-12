@@ -15,10 +15,10 @@
 //! in a future refactoring.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder, IntervalMonthDayNanoArray,
-    LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
+    IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
@@ -33,6 +33,7 @@ use llkv_expr::SubqueryId;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
 };
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::Literal;
 use llkv_expr::typed_predicate::{
     build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -82,7 +83,14 @@ use crate::translation::schema::infer_computed_data_type;
 use crate::utils::interval::{
     compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
 };
-use crate::utils::{format_date32_literal, parse_date32_literal};
+use crate::utils::{
+    align_decimal_to_scale,
+    decimal_from_f64,
+    decimal_from_i64,
+    decimal_truthy,
+    format_date32_literal,
+    parse_date32_literal,
+};
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -136,6 +144,13 @@ impl AggregateValue {
             AggregateValue::String(s) => s.parse().ok(),
         }
     }
+}
+
+fn decimal_exact_i64(decimal: DecimalValue) -> Option<i64> {
+    decimal
+        .rescale(0)
+        .ok()
+        .and_then(|integral| i64::try_from(integral.raw_value()).ok())
 }
 
 struct GroupState {
@@ -814,6 +829,14 @@ where
                     let numeric = if flag { 1.0 } else { 0.0 };
                     values.push(Some(numeric));
                 }
+                Literal::Decimal(decimal) => {
+                    if let Some(value) = decimal_exact_i64(decimal) {
+                        values.push(Some(value as f64));
+                    } else {
+                        all_integer = false;
+                        values.push(Some(decimal.to_f64()));
+                    }
+                }
                 Literal::String(_)
                 | Literal::Struct(_)
                 | Literal::Date32(_)
@@ -923,7 +946,7 @@ where
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
         use crate::utils::interval::interval_value_to_arrow;
         use arrow::array::{
-            ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array,
+            ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
             IntervalMonthDayNanoArray, StringArray, StructArray, new_null_array,
         };
         use arrow::datatypes::{DataType, Field, IntervalUnit};
@@ -945,6 +968,20 @@ where
                 DataType::Boolean,
                 Arc::new(BooleanArray::from(vec![*v])) as ArrayRef,
             )),
+            Literal::Decimal(value) => {
+                let iter = std::iter::once(value.raw_value());
+                let array = Decimal128Array::from_iter_values(iter)
+                    .with_precision_and_scale(value.precision(), value.scale())
+                    .map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "failed to build Decimal128 literal array: {err}"
+                        ))
+                    })?;
+                Ok((
+                    DataType::Decimal128(value.precision(), value.scale()),
+                    Arc::new(array) as ArrayRef,
+                ))
+            }
             Literal::String(v) => Ok((
                 DataType::Utf8,
                 Arc::new(StringArray::from(vec![v.clone()])) as ArrayRef,
@@ -5676,6 +5713,7 @@ where
         match expr {
             ScalarExpr::Literal(Literal::Integer(v)) => Ok(PlanValue::Integer(*v as i64)),
             ScalarExpr::Literal(Literal::Float(v)) => Ok(PlanValue::Float(*v)),
+            ScalarExpr::Literal(Literal::Decimal(value)) => Ok(PlanValue::Decimal(*value)),
             ScalarExpr::Literal(Literal::Boolean(v)) => {
                 Ok(PlanValue::Integer(if *v { 1 } else { 0 }))
             }
@@ -6191,6 +6229,13 @@ where
         match expr {
             ScalarExpr::Literal(Literal::Integer(v)) => Ok(Some(*v as i64)),
             ScalarExpr::Literal(Literal::Float(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Decimal(value)) => {
+                if let Some(int) = decimal_exact_i64(*value) {
+                    Ok(Some(int))
+                } else {
+                    Ok(Some(value.to_f64() as i64))
+                }
+            }
             ScalarExpr::Literal(Literal::Boolean(v)) => Ok(Some(if *v { 1 } else { 0 })),
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
@@ -6634,6 +6679,17 @@ fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<Ar
         Literal::Date32(days) => {
             let values = vec![*days; len];
             Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
+        }
+        Literal::Decimal(value) => {
+            let iter = std::iter::repeat(value.raw_value()).take(len);
+            let array = Decimal128Array::from_iter_values(iter)
+                .with_precision_and_scale(value.precision(), value.scale())
+                .map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "failed to synthesize decimal literal array: {err}"
+                    ))
+                })?;
+            Ok(Arc::new(array) as ArrayRef)
         }
         Literal::Interval(interval) => {
             let value = interval_value_to_arrow(*interval);
@@ -7579,6 +7635,11 @@ fn encode_plan_value(buf: &mut Vec<u8>, value: &PlanValue) {
             buf.push(2);
             buf.extend_from_slice(&v.to_bits().to_be_bytes());
         }
+        PlanValue::Decimal(decimal) => {
+            buf.push(7);
+            buf.extend_from_slice(&decimal.raw_value().to_be_bytes());
+            buf.push(decimal.scale().to_be_bytes()[0]);
+        }
         PlanValue::String(s) => {
             buf.push(3);
             let bytes = s.as_bytes();
@@ -8257,6 +8318,10 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     fn literal_to_i128_from_integer_like(literal: &Literal) -> Option<i128> {
         match literal {
             Literal::Integer(value) => Some(*value),
+            Literal::Decimal(value) => value
+                .rescale(0)
+                .ok()
+                .map(|integral| integral.raw_value()),
             Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
             Literal::Date32(value) => Some(*value as i128),
             _ => None,
@@ -8299,6 +8364,7 @@ fn literal_to_f64(literal: &Literal) -> Option<f64> {
     match literal {
         Literal::Integer(value) => Some(*value as f64),
         Literal::Float(value) => Some(*value),
+        Literal::Decimal(value) => Some(value.to_f64()),
         Literal::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
         Literal::Date32(value) => Some(*value as f64),
         _ => None,
@@ -8309,6 +8375,10 @@ fn literal_to_i128(literal: &Literal) -> Option<i128> {
     match literal {
         Literal::Integer(value) => Some(*value),
         Literal::Float(value) => Some(*value as i128),
+        Literal::Decimal(value) => value
+            .rescale(0)
+            .ok()
+            .map(|integral| integral.raw_value()),
         Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
         Literal::Date32(value) => Some(*value as i128),
         _ => None,
@@ -8320,6 +8390,7 @@ fn literal_truthiness(literal: &Literal) -> Option<bool> {
         Literal::Boolean(value) => Some(*value),
         Literal::Integer(value) => Some(*value != 0),
         Literal::Float(value) => Some(*value != 0.0),
+        Literal::Decimal(value) => Some(decimal_truthy(*value)),
         Literal::Date32(value) => Some(*value != 0),
         Literal::Null => None,
         _ => None,
@@ -8330,6 +8401,7 @@ fn plan_value_truthiness(value: &PlanValue) -> Option<bool> {
     match value {
         PlanValue::Integer(v) => Some(*v != 0),
         PlanValue::Float(v) => Some(*v != 0.0),
+        PlanValue::Decimal(v) => Some(decimal_truthy(*v)),
         PlanValue::Date32(v) => Some(*v != 0),
         PlanValue::Null => None,
         _ => None,
@@ -8438,6 +8510,7 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
             Literal::String(text) => text.clone(),
             Literal::Integer(value) => value.to_string(),
             Literal::Float(value) => value.to_string(),
+            Literal::Decimal(value) => value.to_string(),
             Literal::Boolean(value) => {
                 if *value {
                     "1".to_string()
@@ -8448,8 +8521,11 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
             Literal::Date32(days) => format_date32_literal(*days).ok()?,
             Literal::Struct(_) | Literal::Null | Literal::Interval(_) => return None,
         })),
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
-            literal_to_i128(literal).map(Literal::Integer)
+        DataType::Decimal128(precision, scale) => {
+            literal_to_decimal_literal(literal, *precision, *scale)
+        }
+        DataType::Decimal256(precision, scale) => {
+            literal_to_decimal_literal(literal, *precision, *scale)
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => match literal {
             Literal::Interval(interval) => Some(Literal::Interval(*interval)),
@@ -8462,6 +8538,35 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
             Literal::String(text) => parse_date32_literal(text).ok().map(Literal::Date32),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn literal_to_decimal_literal(
+    literal: &Literal,
+    precision: u8,
+    scale: i8,
+) -> Option<Literal> {
+    match literal {
+        Literal::Decimal(value) => align_decimal_to_scale(*value, precision, scale)
+            .ok()
+            .map(Literal::Decimal),
+        Literal::Integer(value) => {
+            let int = i64::try_from(*value).ok()?;
+            decimal_from_i64(int, precision, scale)
+                .ok()
+                .map(Literal::Decimal)
+        }
+        Literal::Float(value) => decimal_from_f64(*value, precision, scale)
+            .ok()
+            .map(Literal::Decimal),
+        Literal::Boolean(value) => {
+            let int = if *value { 1 } else { 0 };
+            decimal_from_i64(int, precision, scale)
+                .ok()
+                .map(Literal::Decimal)
+        }
+        Literal::Null => Some(Literal::Null),
         _ => None,
     }
 }
@@ -8940,6 +9045,22 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
                 .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| Error::Internal("failed to downcast uint64 array".into()))?;
             Ok(Literal::Integer(array.value(idx) as i128))
+        }
+        DataType::Decimal128(_, scale) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast decimal128 array".into()))?;
+            let scale_i8 = i8::try_from(*scale).map_err(|_| {
+                Error::InvalidArgumentError(format!(
+                    "decimal scale {scale} exceeds supported range"
+                ))
+            })?;
+            let raw = array.value(idx);
+            let decimal = DecimalValue::new(raw, scale_i8).map_err(|err| {
+                Error::InvalidArgumentError(format!("invalid decimal value: {err}"))
+            })?;
+            Ok(Literal::Decimal(decimal))
         }
         DataType::Float32 => {
             let array = array
@@ -9974,6 +10095,60 @@ fn build_comparison_mask(column: &dyn Array, value: &PlanValue) -> ExecutorResul
             }
             Ok(builder.finish())
         }
+        PlanValue::Decimal(expected) => match column.data_type() {
+            DataType::Decimal128(precision, scale) => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::Internal("failed to downcast to Decimal128Array".into())
+                    })?;
+                let expected_aligned = align_decimal_to_scale(*expected, *precision, *scale)
+                    .map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "decimal literal {expected} incompatible with DECIMAL({}, {}): {err}",
+                            precision, scale
+                        ))
+                    })?;
+                let mut builder = BooleanBuilder::with_capacity(arr.len());
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        let actual = DecimalValue::new(arr.value(i), *scale).map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "invalid decimal value stored in column: {err}"
+                            ))
+                        })?;
+                        builder.append_value(
+                            actual.raw_value() == expected_aligned.raw_value(),
+                        );
+                    }
+                }
+                Ok(builder.finish())
+            }
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Boolean => {
+                if let Some(int_value) = decimal_exact_i64(*expected) {
+                    return build_comparison_mask(column, &PlanValue::Integer(int_value));
+                }
+                Ok(BooleanArray::from(vec![false; column.len()]))
+            }
+            DataType::Float32 | DataType::Float64 => {
+                build_comparison_mask(column, &PlanValue::Float(expected.to_f64()))
+            }
+            _ => Err(Error::Internal(format!(
+                "unsupported decimal type for IN list: {:?}",
+                column.data_type()
+            ))),
+        },
         PlanValue::String(val) => {
             let mut builder = BooleanBuilder::with_capacity(column.len());
             let arr = column
@@ -10057,6 +10232,80 @@ fn array_value_equals_plan_value(
 
     match literal {
         PlanValue::Null => Ok(array.is_null(row_idx)),
+        PlanValue::Decimal(expected) => match array.data_type() {
+            DataType::Decimal128(precision, scale) => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::Internal("failed to downcast to Decimal128Array".into())
+                    })?;
+                let actual = DecimalValue::new(arr.value(row_idx), *scale).map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "invalid decimal value retrieved from column: {err}"
+                    ))
+                })?;
+                let expected_aligned = align_decimal_to_scale(*expected, *precision, *scale)
+                    .map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "failed to align decimal literal for comparison: {err}"
+                        ))
+                    })?;
+                Ok(actual.raw_value() == expected_aligned.raw_value())
+            }
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                if let Some(int_value) = decimal_exact_i64(*expected) {
+                    array_value_equals_plan_value(
+                        array,
+                        row_idx,
+                        &PlanValue::Integer(int_value),
+                    )
+                } else {
+                    Ok(false)
+                }
+            }
+            DataType::Float32 | DataType::Float64 => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                array_value_equals_plan_value(
+                    array,
+                    row_idx,
+                    &PlanValue::Float(expected.to_f64()),
+                )
+            }
+            DataType::Boolean => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                if let Some(int_value) = decimal_exact_i64(*expected) {
+                    array_value_equals_plan_value(
+                        array,
+                        row_idx,
+                        &PlanValue::Integer(int_value),
+                    )
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "decimal literal comparison not supported for {:?}",
+                array.data_type()
+            ))),
+        },
         PlanValue::Integer(expected) => match array.data_type() {
             DataType::Int8 => Ok(!array.is_null(row_idx)
                 && array

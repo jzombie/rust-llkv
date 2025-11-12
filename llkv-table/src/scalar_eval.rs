@@ -6,7 +6,7 @@
 
 use std::{convert::TryFrom, sync::Arc};
 
-use arrow::array::{Array, ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
@@ -21,18 +21,20 @@ use crate::types::FieldId;
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap = FxHashMap<FieldId, NumericArray>;
 
-/// Describes whether a numeric value is represented as an integer or a float.
+/// Describes whether a numeric value is represented as an integer, float, or decimal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericKind {
     Integer,
     Float,
+    Decimal,
 }
 
-/// Holds a numeric value while preserving whether it originated as an integer or float.
+/// Holds a numeric value while preserving whether it originated as an integer, float, or decimal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumericValue {
     Integer(i64),
     Float(f64),
+    Decimal(llkv_expr::decimal::DecimalValue),
 }
 
 impl NumericValue {
@@ -41,6 +43,7 @@ impl NumericValue {
         match self {
             NumericValue::Integer(v) => v as f64,
             NumericValue::Float(v) => v,
+            NumericValue::Decimal(d) => d.to_f64(),
         }
     }
 
@@ -49,6 +52,7 @@ impl NumericValue {
         match self {
             NumericValue::Integer(v) => Some(v),
             NumericValue::Float(_) => None,
+            NumericValue::Decimal(_) => None,
         }
     }
 
@@ -57,6 +61,7 @@ impl NumericValue {
         match self {
             NumericValue::Integer(_) => NumericKind::Integer,
             NumericValue::Float(_) => NumericKind::Float,
+            NumericValue::Decimal(_) => NumericKind::Decimal,
         }
     }
 }
@@ -80,6 +85,7 @@ pub struct NumericArray {
     len: usize,
     int_data: Option<Arc<Int64Array>>,
     float_data: Option<Arc<Float64Array>>,
+    decimal_data: Option<Arc<Decimal128Array>>,
 }
 
 impl NumericArray {
@@ -90,6 +96,7 @@ impl NumericArray {
             len,
             int_data: Some(array),
             float_data: None,
+            decimal_data: None,
         }
     }
 
@@ -100,6 +107,18 @@ impl NumericArray {
             len,
             int_data: None,
             float_data: Some(array),
+            decimal_data: None,
+        }
+    }
+
+    pub(crate) fn from_decimal(array: Arc<Decimal128Array>) -> Self {
+        let len = array.len();
+        Self {
+            kind: NumericKind::Decimal,
+            len,
+            int_data: None,
+            float_data: None,
+            decimal_data: Some(array),
         }
     }
 
@@ -121,6 +140,14 @@ impl NumericArray {
                     .ok_or_else(|| Error::Internal("expected Float64 array".into()))?
                     .clone();
                 Ok(NumericArray::from_float(Arc::new(float_array)))
+            }
+            DataType::Decimal128(_, _) => {
+                let decimal_array = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| Error::Internal("expected Decimal128 array".into()))?
+                    .clone();
+                Ok(NumericArray::from_decimal(Arc::new(decimal_array)))
             }
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Date32 => {
                 let casted = cast(array.as_ref(), &DataType::Int64)
@@ -224,6 +251,22 @@ impl NumericArray {
                     Some(NumericValue::Float(array.value(idx)))
                 }
             }
+            NumericKind::Decimal => {
+                let array = self
+                    .decimal_data
+                    .as_ref()
+                    .expect("decimal array missing backing data");
+                if array.is_null(idx) {
+                    None
+                } else {
+                    let value_i128 = array.value(idx);
+                    let scale = array.scale();
+                    Some(NumericValue::Decimal(
+                        llkv_expr::decimal::DecimalValue::new(value_i128, scale)
+                            .expect("valid decimal from Decimal128Array")
+                    ))
+                }
+            }
         }
     }
 
@@ -238,6 +281,11 @@ impl NumericArray {
                 self.float_data
                     .as_ref()
                     .expect("float array missing backing data"),
+            ) as ArrayRef,
+            NumericKind::Decimal => Arc::clone(
+                self.decimal_data
+                    .as_ref()
+                    .expect("decimal array missing backing data"),
             ) as ArrayRef,
         }
     }
@@ -260,12 +308,32 @@ impl NumericArray {
                 let float_array = Float64Array::from_iter(iter);
                 NumericArray::from_float(Arc::new(float_array))
             }
+            NumericKind::Decimal => {
+                let array = self
+                    .decimal_data
+                    .as_ref()
+                    .expect("decimal array missing backing data");
+                let iter = (0..self.len).map(|idx| {
+                    if array.is_null(idx) {
+                        None
+                    } else {
+                        let value_i128 = array.value(idx);
+                        let scale = array.scale();
+                        let decimal = llkv_expr::decimal::DecimalValue::new(value_i128, scale)
+                            .expect("valid decimal from Decimal128Array");
+                        Some(decimal.to_f64())
+                    }
+                });
+                let float_array = Float64Array::from_iter(iter);
+                NumericArray::from_float(Arc::new(float_array))
+            }
         }
     }
 
     fn to_aligned_array_ref(&self, preferred: NumericKind) -> ArrayRef {
         match (preferred, self.kind) {
             (NumericKind::Float, NumericKind::Integer) => self.promote_to_float().to_array_ref(),
+            (NumericKind::Float, NumericKind::Decimal) => self.promote_to_float().to_array_ref(),
             _ => self.to_array_ref(),
         }
     }
@@ -274,18 +342,32 @@ impl NumericArray {
         let contains_float = values
             .iter()
             .any(|opt| matches!(opt, Some(NumericValue::Float(_))));
-        match (contains_float, preferred) {
-            (true, _) => {
+        let contains_decimal = values
+            .iter()
+            .any(|opt| matches!(opt, Some(NumericValue::Decimal(_))));
+        
+        match (contains_float, contains_decimal, preferred) {
+            // If any float, convert all to float
+            (true, _, _) => {
                 let iter = values.into_iter().map(|opt| opt.map(|v| v.as_f64()));
                 let array = Float64Array::from_iter(iter);
                 NumericArray::from_float(Arc::new(array))
             }
-            (false, NumericKind::Float) => {
+            // If decimals but no floats
+            (false, true, NumericKind::Float) | (false, true, NumericKind::Decimal) | (false, true, NumericKind::Integer) => {
+                // For now, convert decimals to float - proper decimal array handling would require alignment
                 let iter = values.into_iter().map(|opt| opt.map(|v| v.as_f64()));
                 let array = Float64Array::from_iter(iter);
                 NumericArray::from_float(Arc::new(array))
             }
-            (false, NumericKind::Integer) => {
+            // Pure integers with float or decimal preference
+            (false, false, NumericKind::Float) | (false, false, NumericKind::Decimal) => {
+                let iter = values.into_iter().map(|opt| opt.map(|v| v.as_f64()));
+                let array = Float64Array::from_iter(iter);
+                NumericArray::from_float(Arc::new(array))
+            }
+            // Pure integers
+            (false, false, NumericKind::Integer) => {
                 let iter = values
                     .into_iter()
                     .map(|opt| opt.map(|v| v.as_i64().expect("expected integer")));
@@ -309,7 +391,9 @@ impl VectorizedExpr {
             VectorizedExpr::Scalar(Some(value)) => {
                 let target_kind = match (value.kind(), kind) {
                     (NumericKind::Float, _) => NumericKind::Float,
+                    (NumericKind::Decimal, _) => NumericKind::Float, // Convert decimals to float for now
                     (NumericKind::Integer, NumericKind::Float) => NumericKind::Float,
+                    (NumericKind::Integer, NumericKind::Decimal) => NumericKind::Float,
                     (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
                 };
                 let values = vec![Some(value); len];
@@ -808,6 +892,10 @@ impl NumericKernels {
                         Some(NumericValue::Float(*i as f64))
                     }
                 }
+                llkv_expr::literal::Literal::Decimal(decimal) => {
+                    // Preserve decimal values instead of converting to float
+                    Some(NumericValue::Decimal(*decimal))
+                }
                 llkv_expr::literal::Literal::Boolean(b) => {
                     Some(NumericValue::Integer(if *b { 1 } else { 0 }))
                 }
@@ -857,6 +945,7 @@ impl NumericKernels {
         match value {
             NumericValue::Integer(v) => v != 0,
             NumericValue::Float(v) => v != 0.0,
+            NumericValue::Decimal(d) => d.raw_value() != 0,
         }
     }
 
@@ -941,6 +1030,22 @@ impl NumericKernels {
                     ));
                 }
                 let truncated = v.trunc();
+                if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+                    return Err(Error::InvalidArgumentError(
+                        "DATE cast value out of range".into(),
+                    ));
+                }
+                Ok(Some(truncated as i32))
+            }
+            Some(NumericValue::Decimal(d)) => {
+                // Convert decimal to float for DATE cast
+                let f = d.to_f64();
+                if !f.is_finite() {
+                    return Err(Error::InvalidArgumentError(
+                        "cannot cast non-finite decimal to DATE".into(),
+                    ));
+                }
+                let truncated = f.trunc();
                 if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
                     return Err(Error::InvalidArgumentError(
                         "DATE cast value out of range".into(),
@@ -1150,6 +1255,7 @@ impl NumericKernels {
             Literal::Null => "NULL",
             Literal::Integer(_) => "INTEGER",
             Literal::Float(_) => "FLOAT",
+            Literal::Decimal(_) => "DECIMAL",
             Literal::String(_) => "STRING",
             Literal::Boolean(_) => "BOOLEAN",
             Literal::Date32(_) => "DATE",
@@ -1299,6 +1405,14 @@ impl NumericKernels {
                         }
                         Literal::Float(v) => {
                             ScalarExpr::literal(Literal::Integer(if *v == 0.0 { 1 } else { 0 }))
+                        }
+                        Literal::Decimal(d) => {
+                            let is_zero = if d.scale() == 0 {
+                                d.raw_value() == 0
+                            } else {
+                                d.to_f64() == 0.0
+                            };
+                            ScalarExpr::literal(Literal::Integer(if is_zero { 1 } else { 0 }))
                         }
                         Literal::Boolean(v) => {
                             ScalarExpr::literal(Literal::Integer(if *v { 0 } else { 1 }))
@@ -1485,10 +1599,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
                 Some(ScalarExpr::literal(result))
@@ -1497,10 +1613,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
                 Some(ScalarExpr::literal(result))
@@ -1512,6 +1630,7 @@ impl NumericKernels {
         match value {
             NumericValue::Integer(i) => ScalarExpr::literal(i),
             NumericValue::Float(f) => ScalarExpr::literal(f),
+            NumericValue::Decimal(d) => ScalarExpr::Literal(Literal::Decimal(d)),
         }
     }
 
@@ -1560,10 +1679,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
                 Some(NumericValue::Integer(result))
@@ -1572,10 +1693,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
                 Some(NumericValue::Integer(result))
@@ -1654,6 +1777,7 @@ impl NumericKernels {
             Some(NumericValue::Integer(v)) => Ok(Some(match target {
                 NumericKind::Integer => NumericValue::Integer(v),
                 NumericKind::Float => NumericValue::Float(v as f64),
+                NumericKind::Decimal => NumericValue::Float(v as f64), // Convert to float for now
             })),
             Some(NumericValue::Float(v)) => {
                 if !v.is_finite() {
@@ -1663,11 +1787,28 @@ impl NumericKernels {
                 }
                 match target {
                     NumericKind::Float => Ok(Some(NumericValue::Float(v))),
+                    NumericKind::Decimal => Ok(Some(NumericValue::Float(v))), // Keep as float for now
                     NumericKind::Integer => {
                         let truncated = v.trunc();
                         if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
                             return Err(Error::InvalidArgumentError(
                                 "float out of range for INT64 cast".into(),
+                            ));
+                        }
+                        Ok(Some(NumericValue::Integer(truncated as i64)))
+                    }
+                }
+            }
+            Some(NumericValue::Decimal(d)) => {
+                // Convert decimal to float for casting
+                let f = d.to_f64();
+                match target {
+                    NumericKind::Float | NumericKind::Decimal => Ok(Some(NumericValue::Float(f))),
+                    NumericKind::Integer => {
+                        let truncated = f.trunc();
+                        if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+                            return Err(Error::InvalidArgumentError(
+                                "decimal out of range for INT64 cast".into(),
                             ));
                         }
                         Ok(Some(NumericValue::Integer(truncated as i64)))
@@ -1682,7 +1823,7 @@ impl NumericKernels {
         target: NumericKind,
     ) -> LlkvResult<NumericArray> {
         match target {
-            NumericKind::Float => Ok(array.promote_to_float()),
+            NumericKind::Float | NumericKind::Decimal => Ok(array.promote_to_float()),
             NumericKind::Integer => {
                 if array.kind() == NumericKind::Integer {
                     Ok(array.clone())
@@ -1706,6 +1847,16 @@ impl NumericKernels {
             ScalarExpr::Literal(lit) => match lit {
                 llkv_expr::literal::Literal::Float(_) => NumericKind::Float,
                 llkv_expr::literal::Literal::Integer(_) => NumericKind::Integer,
+                llkv_expr::literal::Literal::Decimal(decimal) => {
+                    if decimal.scale() == 0
+                        && (decimal.raw_value() >= i128::from(i64::MIN))
+                        && (decimal.raw_value() <= i128::from(i64::MAX))
+                    {
+                        NumericKind::Integer
+                    } else {
+                        NumericKind::Float
+                    }
+                }
                 llkv_expr::literal::Literal::Boolean(_) => NumericKind::Integer,
                 llkv_expr::literal::Literal::Null => NumericKind::Integer,
                 llkv_expr::literal::Literal::String(_) => NumericKind::Float,
@@ -1848,6 +1999,13 @@ impl NumericKernels {
             | DataType::Float32
             | DataType::Float64
             | DataType::Null => Some(NumericKind::Float),
+            DataType::Decimal128(_, scale) => {
+                if *scale == 0 {
+                    Some(NumericKind::Integer)
+                } else {
+                    Some(NumericKind::Float)
+                }
+            }
             _ => None,
         }
     }
@@ -1860,10 +2018,12 @@ impl NumericKernels {
         let lhs_value = match lhs_kind {
             NumericKind::Integer => NumericValue::Integer(1),
             NumericKind::Float => NumericValue::Float(1.0),
+            NumericKind::Decimal => NumericValue::Float(1.0), // Use float for decimal
         };
         let rhs_value = match rhs_kind {
             NumericKind::Integer => NumericValue::Integer(1),
             NumericKind::Float => NumericValue::Float(1.0),
+            NumericKind::Decimal => NumericValue::Float(1.0), // Use float for decimal
         };
 
         Self::apply_binary_values(op, lhs_value, rhs_value)
@@ -2061,6 +2221,7 @@ mod tests {
             let actual = value.map(|num| match num {
                 NumericValue::Integer(v) => v,
                 NumericValue::Float(v) => v as i64,
+                NumericValue::Decimal(d) => d.to_f64() as i64,
             });
             assert_eq!(actual, *expected, "row {idx} did not match");
         }
@@ -2074,6 +2235,7 @@ mod tests {
             let actual = value.map(|num| match num {
                 NumericValue::Integer(v) => v,
                 NumericValue::Float(v) => v as i64,
+                NumericValue::Decimal(d) => d.to_f64() as i64,
             });
             assert_eq!(actual, *expected, "comparison row {idx} mismatch");
         }

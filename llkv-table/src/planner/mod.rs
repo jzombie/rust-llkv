@@ -9,7 +9,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
     IntervalMonthDayNanoArray, OffsetSizeTrait, RecordBatch, StringArray, UInt64Array,
     new_null_array,
 };
@@ -39,6 +39,7 @@ use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::{FromLiteral, IntervalValue, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -1144,6 +1145,8 @@ where
                         let dtype = match &info.expr {
                             ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
+                            ScalarExpr::Literal(Literal::Decimal(value)) =>
+                                DataType::Decimal128(value.precision(), value.scale()),
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
                             ScalarExpr::Literal(Literal::Date32(_)) => DataType::Date32,
@@ -1196,6 +1199,7 @@ where
                                 match result_kind {
                                     NumericKind::Integer => DataType::Int64,
                                     NumericKind::Float => DataType::Float64,
+                                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
                                 }
                             }
                             ScalarExpr::Column(fid) => {
@@ -1450,6 +1454,7 @@ where
                 let output_dtype = match result_kind {
                     NumericKind::Integer => DataType::Int64,
                     NumericKind::Float => DataType::Float64,
+                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
                 };
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
@@ -1635,6 +1640,15 @@ where
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
                 (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
                 (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
+                (Literal::Decimal(l), Literal::Decimal(r)) => (*l).cmp(*r).ok(),
+                (Literal::Decimal(l), Literal::Integer(r)) => DecimalValue::new(*r, 0)
+                    .ok()
+                    .and_then(|int| (*l).cmp(int).ok()),
+                (Literal::Integer(l), Literal::Decimal(r)) => DecimalValue::new(*l, 0)
+                    .ok()
+                    .and_then(|int| int.cmp(*r).ok()),
+                (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
+                (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
                 (Literal::Date32(l), Literal::Date32(r)) => l.partial_cmp(r),
                 (Literal::Interval(l), Literal::Interval(r)) => {
@@ -3363,6 +3377,7 @@ fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
 fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
     match literal {
         Literal::Float(_) => Ok(true),
+        Literal::Decimal(_) => Ok(true),
         Literal::Struct(fields) => {
             for (_, nested) in fields {
                 if literal_prefers_float(nested.as_ref())? {
@@ -3420,7 +3435,8 @@ fn get_field_dtype(
 fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
     match literal {
         Literal::Integer(_) => Ok(DataType::Int64),
-        Literal::Float(_) => Ok(DataType::Float64),
+    Literal::Float(_) => Ok(DataType::Float64),
+    Literal::Decimal(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
         Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
         Literal::Date32(_) => Ok(DataType::Date32),
@@ -3476,6 +3492,15 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::Float(value)) => {
             Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
         }
+        ScalarExpr::Literal(Literal::Decimal(value)) => {
+            let iter = std::iter::repeat(value.raw_value()).take(row_count);
+            let array = Decimal128Array::from_iter_values(iter)
+                .with_precision_and_scale(value.precision(), value.scale().into())
+                .map_err(|err| Error::InvalidArgumentError(format!(
+                    "failed to build Decimal128 literal array: {err}"
+                )))?;
+            Ok(Arc::new(array) as ArrayRef)
+        }
         ScalarExpr::Literal(Literal::Boolean(value)) => {
             Ok(Arc::new(BooleanArray::from(vec![*value; row_count])) as ArrayRef)
         }
@@ -3511,6 +3536,15 @@ fn synthesize_computed_literal_array(
                     }
                     Literal::Float(v) => {
                         Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
+                    }
+                    Literal::Decimal(v) => {
+                        let iter = std::iter::repeat(v.raw_value()).take(row_count);
+                        let array = Decimal128Array::from_iter_values(iter)
+                            .with_precision_and_scale(v.precision(), v.scale().into())
+                            .map_err(|err| Error::InvalidArgumentError(format!(
+                                "failed to build Decimal128 literal array: {err}"
+                            )))?;
+                        Arc::new(array) as ArrayRef
                     }
                     Literal::Boolean(v) => {
                         Arc::new(BooleanArray::from(vec![*v; row_count])) as ArrayRef
@@ -3936,6 +3970,7 @@ fn format_literal(lit: &Literal) -> String {
     match lit {
         Literal::Integer(i) => i.to_string(),
         Literal::Float(f) => f.to_string(),
+        Literal::Decimal(d) => d.to_string(),
         Literal::Boolean(b) => b.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
         Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
@@ -4990,6 +5025,7 @@ fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Opti
     match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
         Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
         Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
+        Some(NumericValue::Decimal(d)) => Ok(Some(Literal::Decimal(d))),
         None => Ok(None),
     }
 }
@@ -5089,6 +5125,7 @@ fn literal_type_name(literal: &Literal) -> &'static str {
         Literal::Null => "NULL",
         Literal::Integer(_) => "INTEGER",
         Literal::Float(_) => "FLOAT",
+    Literal::Decimal(_) => "DECIMAL",
         Literal::String(_) => "STRING",
         Literal::Boolean(_) => "BOOLEAN",
         Literal::Date32(_) => "DATE",

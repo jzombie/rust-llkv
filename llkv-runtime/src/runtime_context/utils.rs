@@ -13,7 +13,12 @@ use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, IntervalUnit};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_executor::utils::parse_date32_literal;
+use llkv_executor::utils::{
+    align_decimal_to_scale,
+    decimal_truthy,
+    parse_date32_literal,
+    truncate_decimal_to_i64,
+};
 use llkv_executor::{ExecutorColumn, ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
@@ -42,6 +47,47 @@ where
     ) -> Result<PlanValue> {
         match value {
             PlanValue::Null => Ok(PlanValue::Null),
+            PlanValue::Decimal(decimal) => match &column.data_type {
+                DataType::Decimal128(precision, scale) => {
+                    let aligned = align_decimal_to_scale(decimal, *precision, *scale).map_err(
+                        |err| {
+                            Error::InvalidArgumentError(format!(
+                                "decimal literal {} incompatible with DECIMAL({}, {}) column '{}': {err}",
+                                decimal, precision, scale, column.name
+                            ))
+                        },
+                    )?;
+                    Ok(PlanValue::Decimal(aligned))
+                }
+                DataType::Int64 => {
+                    let coerced = truncate_decimal_to_i64(decimal).map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "decimal literal {} incompatible with INT column '{}': {err}",
+                            decimal, column.name
+                        ))
+                    })?;
+                    Ok(PlanValue::Integer(coerced))
+                }
+                DataType::Float64 => Ok(PlanValue::Float(decimal.to_f64())),
+                DataType::Boolean => Ok(PlanValue::Integer(if decimal_truthy(decimal) {
+                    1
+                } else {
+                    0
+                })),
+                DataType::Utf8 => Ok(PlanValue::String(decimal.to_string())),
+                DataType::Date32 => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign decimal literal to DATE column '{}'",
+                    column.name
+                ))),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign decimal literal to STRUCT column '{}'",
+                    column.name
+                ))),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported target type {:?} for DECIMAL literal in column '{}'",
+                    other, column.name
+                ))),
+            },
             PlanValue::Integer(v) => match &column.data_type {
                 DataType::Int64 => Ok(PlanValue::Integer(v)),
                 DataType::Float64 => Ok(PlanValue::Float(v as f64)),

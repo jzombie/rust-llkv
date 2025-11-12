@@ -160,6 +160,46 @@ pub enum AggregateAccumulator {
         sum: f64,
         seen: FxHashSet<DistinctKey>,
     },
+    SumDecimal128 {
+        column_index: usize,
+        sum: i128,
+        precision: u8,
+        scale: i8,
+    },
+    SumDistinctDecimal128 {
+        column_index: usize,
+        sum: i128,
+        seen: FxHashSet<DistinctKey>,
+        precision: u8,
+        scale: i8,
+    },
+    TotalDecimal128 {
+        column_index: usize,
+        sum: i128,
+        precision: u8,
+        scale: i8,
+    },
+    TotalDistinctDecimal128 {
+        column_index: usize,
+        sum: i128,
+        seen: FxHashSet<DistinctKey>,
+        precision: u8,
+        scale: i8,
+    },
+    AvgDecimal128 {
+        column_index: usize,
+        sum: i128,
+        count: i64,
+        precision: u8,
+        scale: i8,
+    },
+    AvgDistinctDecimal128 {
+        column_index: usize,
+        sum: i128,
+        seen: FxHashSet<DistinctKey>,
+        precision: u8,
+        scale: i8,
+    },
     MinInt64 {
         column_index: usize,
         value: Option<i64>,
@@ -168,6 +208,12 @@ pub enum AggregateAccumulator {
         column_index: usize,
         value: Option<f64>,
     },
+    MinDecimal128 {
+        column_index: usize,
+        value: Option<i128>,
+        precision: u8,
+        scale: i8,
+    },
     MaxInt64 {
         column_index: usize,
         value: Option<i64>,
@@ -175,6 +221,12 @@ pub enum AggregateAccumulator {
     MaxFloat64 {
         column_index: usize,
         value: Option<f64>,
+    },
+    MaxDecimal128 {
+        column_index: usize,
+        value: Option<i128>,
+        precision: u8,
+        scale: i8,
     },
     CountNulls {
         column_index: usize,
@@ -201,6 +253,7 @@ pub enum DistinctKey {
     Str(String),
     Bool(bool),
     Date(i32),
+    Decimal(i128), // Store raw decimal value for exact comparison
 }
 
 impl DistinctKey {
@@ -257,6 +310,17 @@ impl DistinctKey {
                         )
                     })?;
                 Ok(DistinctKey::Date(values.value(index)))
+            }
+            DataType::Decimal128(_, _) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "COUNT(DISTINCT) expected a DECIMAL128 column in execution".into(),
+                        )
+                    })?;
+                Ok(DistinctKey::Decimal(values.value(index)))
             }
             other => Err(Error::InvalidArgumentError(format!(
                 "COUNT(DISTINCT) is not supported for column type {other:?}"
@@ -344,6 +408,16 @@ fn array_value_to_numeric(array: &ArrayRef, index: usize) -> AggregateResult<f64
                 .ok_or_else(|| Error::InvalidArgumentError("Expected Float64 array".into()))?;
             Ok(arr.value(index))
         }
+        DataType::Decimal128(_, scale) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .ok_or_else(|| Error::InvalidArgumentError("Expected Decimal128 array".into()))?;
+            let value_i128 = arr.value(index);
+            // Convert decimal to f64: value / 10^scale
+            let scale_factor = 10_f64.powi(*scale as i32);
+            Ok(value_i128 as f64 / scale_factor)
+        }
         DataType::Utf8 => {
             let arr = array
                 .as_any()
@@ -422,6 +496,23 @@ impl AggregateAccumulator {
                         value: Some(0),
                         has_values: false,
                     }),
+                    (DataType::Decimal128(precision, scale), true) => {
+                        Ok(AggregateAccumulator::SumDistinctDecimal128 {
+                            column_index: idx,
+                            sum: 0,
+                            seen: FxHashSet::default(),
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
+                    (DataType::Decimal128(precision, scale), false) => {
+                        Ok(AggregateAccumulator::SumDecimal128 {
+                            column_index: idx,
+                            sum: 0,
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
                     (DataType::Float64, true) | (DataType::Utf8, true) => {
                         Ok(AggregateAccumulator::SumDistinctFloat64 {
@@ -461,6 +552,23 @@ impl AggregateAccumulator {
                         column_index: idx,
                         value: 0.0,
                     }),
+                    (DataType::Decimal128(precision, scale), true) => {
+                        Ok(AggregateAccumulator::TotalDistinctDecimal128 {
+                            column_index: idx,
+                            sum: 0,
+                            seen: FxHashSet::default(),
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
+                    (DataType::Decimal128(precision, scale), false) => {
+                        Ok(AggregateAccumulator::TotalDecimal128 {
+                            column_index: idx,
+                            sum: 0,
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
                     (DataType::Float64, true) | (DataType::Utf8, true) => {
                         Ok(AggregateAccumulator::TotalDistinctFloat64 {
@@ -500,6 +608,24 @@ impl AggregateAccumulator {
                         sum: 0,
                         count: 0,
                     }),
+                    (DataType::Decimal128(precision, scale), true) => {
+                        Ok(AggregateAccumulator::AvgDistinctDecimal128 {
+                            column_index: idx,
+                            sum: 0,
+                            seen: FxHashSet::default(),
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
+                    (DataType::Decimal128(precision, scale), false) => {
+                        Ok(AggregateAccumulator::AvgDecimal128 {
+                            column_index: idx,
+                            sum: 0,
+                            count: 0,
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
                     (DataType::Float64, true) | (DataType::Utf8, true) => {
                         Ok(AggregateAccumulator::AvgDistinctFloat64 {
@@ -530,6 +656,14 @@ impl AggregateAccumulator {
                         column_index: idx,
                         value: None,
                     }),
+                    DataType::Decimal128(precision, scale) => {
+                        Ok(AggregateAccumulator::MinDecimal128 {
+                            column_index: idx,
+                            value: None,
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
                     DataType::Float64 | DataType::Utf8 => Ok(AggregateAccumulator::MinFloat64 {
                         column_index: idx,
@@ -550,6 +684,14 @@ impl AggregateAccumulator {
                         column_index: idx,
                         value: None,
                     }),
+                    DataType::Decimal128(precision, scale) => {
+                        Ok(AggregateAccumulator::MaxDecimal128 {
+                            column_index: idx,
+                            value: None,
+                            precision: *precision,
+                            scale: *scale,
+                        })
+                    }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
                     DataType::Float64 | DataType::Utf8 => Ok(AggregateAccumulator::MaxFloat64 {
                         column_index: idx,
@@ -741,8 +883,54 @@ impl AggregateAccumulator {
                                 }
                             }
                             DistinctKey::Date(d) => d as f64,
+                            DistinctKey::Decimal(_) => array_value_to_numeric(column, i)?,
                         };
                         *sum += v;
+                    }
+                }
+            }
+            AggregateAccumulator::SumDecimal128 {
+                column_index,
+                sum,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
+                            Error::InvalidArgumentError("Decimal128 sum overflow".into())
+                        })?;
+                    }
+                }
+            }
+            AggregateAccumulator::SumDistinctDecimal128 {
+                column_index,
+                sum,
+                seen,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if !arr.is_valid(i) {
+                        continue;
+                    }
+                    let key = DistinctKey::from_array(column, i)?;
+                    if seen.insert(key) {
+                        *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
+                            Error::InvalidArgumentError("Decimal128 sum overflow".into())
+                        })?;
                     }
                 }
             }
@@ -827,8 +1015,54 @@ impl AggregateAccumulator {
                                 }
                             }
                             DistinctKey::Date(d) => d as f64,
+                            DistinctKey::Decimal(_) => array_value_to_numeric(column, i)?,
                         };
                         *sum += v;
+                    }
+                }
+            }
+            AggregateAccumulator::TotalDecimal128 {
+                column_index,
+                sum,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
+                            Error::InvalidArgumentError("Decimal128 total overflow".into())
+                        })?;
+                    }
+                }
+            }
+            AggregateAccumulator::TotalDistinctDecimal128 {
+                column_index,
+                sum,
+                seen,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if !arr.is_valid(i) {
+                        continue;
+                    }
+                    let key = DistinctKey::from_array(column, i)?;
+                    if seen.insert(key) {
+                        *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
+                            Error::InvalidArgumentError("Decimal128 total overflow".into())
+                        })?;
                     }
                 }
             }
@@ -932,8 +1166,58 @@ impl AggregateAccumulator {
                                 }
                             }
                             DistinctKey::Date(d) => d as f64,
+                            DistinctKey::Decimal(_) => array_value_to_numeric(column, i)?,
                         };
                         *sum += v;
+                    }
+                }
+            }
+            AggregateAccumulator::AvgDecimal128 {
+                column_index,
+                sum,
+                count,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
+                            Error::InvalidArgumentError("Decimal128 avg sum overflow".into())
+                        })?;
+                        *count = count.checked_add(1).ok_or_else(|| {
+                            Error::InvalidArgumentError("AVG count exceeds i64 range".into())
+                        })?;
+                    }
+                }
+            }
+            AggregateAccumulator::AvgDistinctDecimal128 {
+                column_index,
+                sum,
+                seen,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if !arr.is_valid(i) {
+                        continue;
+                    }
+                    let key = DistinctKey::from_array(column, i)?;
+                    if seen.insert(key) {
+                        *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
+                            Error::InvalidArgumentError("Decimal128 avg sum overflow".into())
+                        })?;
                     }
                 }
             }
@@ -976,6 +1260,28 @@ impl AggregateAccumulator {
                     }
                 }
             }
+            AggregateAccumulator::MinDecimal128 {
+                column_index,
+                value,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        let v = arr.value(i);
+                        *value = Some(match *value {
+                            Some(current) => current.min(v),
+                            None => v,
+                        });
+                    }
+                }
+            }
             AggregateAccumulator::MaxInt64 {
                 column_index,
                 value,
@@ -1010,6 +1316,28 @@ impl AggregateAccumulator {
                                 Some(Ordering::Greater) => v,
                                 _ => current,
                             },
+                            None => v,
+                        });
+                    }
+                }
+            }
+            AggregateAccumulator::MaxDecimal128 {
+                column_index,
+                value,
+                ..
+            } => {
+                let column = batch.column(*column_index);
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError("Expected Decimal128 array".into())
+                    })?;
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        let v = arr.value(i);
+                        *value = Some(match *value {
+                            Some(current) => current.max(v),
                             None => v,
                         });
                     }
@@ -1156,6 +1484,49 @@ impl AggregateAccumulator {
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("sum_distinct", DataType::Float64, true), array))
             }
+            AggregateAccumulator::SumDecimal128 {
+                sum,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let array = Arc::new(
+                    arrow::array::Decimal128Array::from(vec![sum])
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(|e| {
+                            Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                        })?,
+                ) as ArrayRef;
+                Ok((Field::new("sum", data_type, true), array))
+            }
+            AggregateAccumulator::SumDistinctDecimal128 {
+                sum,
+                seen,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let array = if seen.is_empty() {
+                    Arc::new(
+                        arrow::array::Decimal128Array::from(vec![Option::<i128>::None])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef
+                } else {
+                    Arc::new(
+                        arrow::array::Decimal128Array::from(vec![sum])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef
+                };
+                Ok((Field::new("sum_distinct", data_type, true), array))
+            }
             AggregateAccumulator::TotalInt64 { value, .. } => {
                 let mut builder = Float64Builder::with_capacity(1);
                 builder.append_value(value);
@@ -1185,6 +1556,38 @@ impl AggregateAccumulator {
                     Field::new("total_distinct", DataType::Float64, false),
                     array,
                 ))
+            }
+            AggregateAccumulator::TotalDecimal128 {
+                sum,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let array = Arc::new(
+                    arrow::array::Decimal128Array::from(vec![sum])
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(|e| {
+                            Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                        })?,
+                ) as ArrayRef;
+                Ok((Field::new("total", data_type, false), array))
+            }
+            AggregateAccumulator::TotalDistinctDecimal128 {
+                sum,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let array = Arc::new(
+                    arrow::array::Decimal128Array::from(vec![sum])
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(|e| {
+                            Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                        })?,
+                ) as ArrayRef;
+                Ok((Field::new("total_distinct", data_type, false), array))
             }
             AggregateAccumulator::AvgInt64 { sum, count, .. } => {
                 let mut builder = Float64Builder::with_capacity(1);
@@ -1234,6 +1637,65 @@ impl AggregateAccumulator {
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("avg_distinct", DataType::Float64, true), array))
             }
+            AggregateAccumulator::AvgDecimal128 {
+                sum,
+                count,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let array = if count > 0 {
+                    // Compute average in decimal space: sum / count
+                    let avg = sum / (count as i128);
+                    Arc::new(
+                        arrow::array::Decimal128Array::from(vec![avg])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef
+                } else {
+                    Arc::new(
+                        arrow::array::Decimal128Array::from(vec![Option::<i128>::None])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef
+                };
+                Ok((Field::new("avg", data_type, true), array))
+            }
+            AggregateAccumulator::AvgDistinctDecimal128 {
+                sum,
+                seen,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let count = seen.len();
+                let array = if count > 0 {
+                    // Compute average in decimal space: sum / count
+                    let avg = sum / (count as i128);
+                    Arc::new(
+                        arrow::array::Decimal128Array::from(vec![avg])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef
+                } else {
+                    Arc::new(
+                        arrow::array::Decimal128Array::from(vec![Option::<i128>::None])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef
+                };
+                Ok((Field::new("avg_distinct", data_type, true), array))
+            }
             AggregateAccumulator::MinInt64 { value, .. } => {
                 let mut builder = Int64Builder::with_capacity(1);
                 if let Some(v) = value {
@@ -1254,6 +1716,31 @@ impl AggregateAccumulator {
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("min", DataType::Float64, true), array))
             }
+            AggregateAccumulator::MinDecimal128 {
+                value,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let array = match value {
+                    Some(v) => Arc::new(
+                        arrow::array::Decimal128Array::from(vec![v])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef,
+                    None => Arc::new(
+                        arrow::array::Decimal128Array::from(vec![Option::<i128>::None])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef,
+                };
+                Ok((Field::new("min", data_type, true), array))
+            }
             AggregateAccumulator::MaxInt64 { value, .. } => {
                 let mut builder = Int64Builder::with_capacity(1);
                 if let Some(v) = value {
@@ -1273,6 +1760,31 @@ impl AggregateAccumulator {
                 }
                 let array = Arc::new(builder.finish()) as ArrayRef;
                 Ok((Field::new("max", DataType::Float64, true), array))
+            }
+            AggregateAccumulator::MaxDecimal128 {
+                value,
+                precision,
+                scale,
+                ..
+            } => {
+                let data_type = DataType::Decimal128(precision, scale);
+                let array = match value {
+                    Some(v) => Arc::new(
+                        arrow::array::Decimal128Array::from(vec![v])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef,
+                    None => Arc::new(
+                        arrow::array::Decimal128Array::from(vec![Option::<i128>::None])
+                            .with_precision_and_scale(precision, scale)
+                            .map_err(|e| {
+                                Error::InvalidArgumentError(format!("Invalid decimal: {}", e))
+                            })?,
+                    ) as ArrayRef,
+                };
+                Ok((Field::new("max", data_type, true), array))
             }
             AggregateAccumulator::CountNulls {
                 non_null_rows,

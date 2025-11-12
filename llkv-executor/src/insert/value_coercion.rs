@@ -2,8 +2,15 @@
 
 use crate::utils::date::parse_date32_literal;
 use crate::utils::interval::interval_value_to_arrow;
+use crate::utils::{
+    align_decimal_to_scale,
+    decimal_from_f64,
+    decimal_from_i64,
+    decimal_truthy,
+    truncate_decimal_to_i64,
+};
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder,
+    ArrayRef, BooleanBuilder, Date32Builder, Decimal128Array, Float64Builder, Int64Builder,
     IntervalMonthDayNanoArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, FieldRef, IntervalUnit};
@@ -43,6 +50,15 @@ pub fn normalize_insert_value_for_column(
         (_, PlanValue::Null) => Ok(PlanValue::Null),
         (DataType::Int64, PlanValue::Integer(v)) => Ok(PlanValue::Integer(v)),
         (DataType::Int64, PlanValue::Float(v)) => Ok(PlanValue::Integer(v as i64)),
+        (DataType::Int64, PlanValue::Decimal(decimal)) => {
+            let coerced = truncate_decimal_to_i64(decimal).map_err(|err| {
+                Error::InvalidArgumentError(format!(
+                    "cannot insert decimal literal {} into INT column '{}': {err}",
+                    decimal, column.name
+                ))
+            })?;
+            Ok(PlanValue::Integer(coerced))
+        }
         (DataType::Int64, other) => Err(Error::InvalidArgumentError(format!(
             "cannot insert {other:?} into INT column '{}'",
             column.name
@@ -52,6 +68,9 @@ pub fn normalize_insert_value_for_column(
         }
         (DataType::Boolean, PlanValue::Float(v)) => {
             Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 }))
+        }
+        (DataType::Boolean, PlanValue::Decimal(decimal)) => {
+            Ok(PlanValue::Integer(if decimal_truthy(decimal) { 1 } else { 0 }))
         }
         (DataType::Boolean, PlanValue::String(s)) => {
             let normalized = s.trim().to_ascii_lowercase();
@@ -73,12 +92,18 @@ pub fn normalize_insert_value_for_column(
         ))),
         (DataType::Float64, PlanValue::Integer(v)) => Ok(PlanValue::Float(v as f64)),
         (DataType::Float64, PlanValue::Float(v)) => Ok(PlanValue::Float(v)),
+        (DataType::Float64, PlanValue::Decimal(decimal)) => {
+            Ok(PlanValue::Float(decimal.to_f64()))
+        }
         (DataType::Float64, other) => Err(Error::InvalidArgumentError(format!(
             "cannot insert {other:?} into DOUBLE column '{}'",
             column.name
         ))),
         (DataType::Utf8, PlanValue::Integer(v)) => Ok(PlanValue::String(v.to_string())),
         (DataType::Utf8, PlanValue::Float(v)) => Ok(PlanValue::String(v.to_string())),
+        (DataType::Utf8, PlanValue::Decimal(decimal)) => {
+            Ok(PlanValue::String(decimal.to_string()))
+        }
         (DataType::Utf8, PlanValue::String(s)) => Ok(PlanValue::String(s)),
         (DataType::Utf8, PlanValue::Struct(_)) => Err(Error::InvalidArgumentError(format!(
             "cannot insert struct into STRING column '{}'",
@@ -98,6 +123,10 @@ pub fn normalize_insert_value_for_column(
             let days = parse_date32_literal(&text)?;
             Ok(PlanValue::Date32(days))
         }
+        (DataType::Date32, PlanValue::Decimal(_)) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert decimal literal into DATE column '{}'",
+            column.name
+        ))),
         (DataType::Date32, other) => Err(Error::InvalidArgumentError(format!(
             "cannot insert {other:?} into DATE column '{}'",
             column.name
@@ -116,6 +145,37 @@ pub fn normalize_insert_value_for_column(
                 column.name
             )))
         }
+        (DataType::Decimal128(precision, scale), PlanValue::Decimal(decimal)) => {
+            let aligned = align_decimal_to_scale(decimal, *precision, *scale).map_err(|err| {
+                Error::InvalidArgumentError(format!(
+                    "decimal literal {} incompatible with DECIMAL({}, {}) column '{}': {err}",
+                    decimal, precision, scale, column.name
+                ))
+            })?;
+            Ok(PlanValue::Decimal(aligned))
+        }
+        (DataType::Decimal128(precision, scale), PlanValue::Integer(value)) => {
+            let decimal = decimal_from_i64(value, *precision, *scale).map_err(|err| {
+                Error::InvalidArgumentError(format!(
+                    "integer literal {value} incompatible with DECIMAL({}, {}) column '{}': {err}",
+                    precision, scale, column.name
+                ))
+            })?;
+            Ok(PlanValue::Decimal(decimal))
+        }
+        (DataType::Decimal128(precision, scale), PlanValue::Float(value)) => {
+            let decimal = decimal_from_f64(value, *precision, *scale).map_err(|err| {
+                Error::InvalidArgumentError(format!(
+                    "float literal {value} incompatible with DECIMAL({}, {}) column '{}': {err}",
+                    precision, scale, column.name
+                ))
+            })?;
+            Ok(PlanValue::Decimal(decimal))
+        }
+        (DataType::Decimal128(_, _), other) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert {other:?} into DECIMAL column '{}'",
+            column.name
+        ))),
         (other_type, other_value) => Err(Error::InvalidArgumentError(format!(
             "unsupported Arrow data type {:?} for INSERT value {:?} in column '{}'",
             other_type, other_value, column.name
@@ -133,6 +193,15 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v),
                     PlanValue::Float(v) => builder.append_value(*v as i64),
+                    PlanValue::Decimal(decimal) => {
+                        let coerced = truncate_decimal_to_i64(*decimal).map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "cannot insert decimal literal {} into INT column: {err}",
+                                decimal
+                            ))
+                        })?;
+                        builder.append_value(coerced);
+                    }
                     PlanValue::Date32(days) => builder.append_value(i64::from(*days)),
                     PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
@@ -150,6 +219,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v != 0),
                     PlanValue::Float(v) => builder.append_value(*v != 0.0),
+                    PlanValue::Decimal(decimal) => {
+                        builder.append_value(decimal_truthy(*decimal));
+                    }
                     PlanValue::Date32(days) => builder.append_value(*days != 0),
                     PlanValue::String(s) => {
                         let normalized = s.trim().to_ascii_lowercase();
@@ -180,6 +252,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v as f64),
                     PlanValue::Float(v) => builder.append_value(*v),
+                    PlanValue::Decimal(decimal) => {
+                        builder.append_value(decimal.to_f64());
+                    }
                     PlanValue::Date32(days) => builder.append_value(f64::from(*days)),
                     PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
@@ -197,6 +272,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(v.to_string()),
                     PlanValue::Float(v) => builder.append_value(v.to_string()),
+                    PlanValue::Decimal(decimal) => {
+                        builder.append_value(decimal.to_string());
+                    }
                     PlanValue::Date32(days) => builder.append_value(days.to_string()),
                     PlanValue::String(s) => builder.append_value(s),
                     PlanValue::Struct(_) | PlanValue::Interval(_) => {
@@ -222,6 +300,11 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                         builder.append_value(casted);
                     }
                     PlanValue::Date32(days) => builder.append_value(*days),
+                    PlanValue::Decimal(_) => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert decimal literal into DATE column".into(),
+                        ));
+                    }
                     PlanValue::Float(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-date value into DATE column".into(),
@@ -266,6 +349,55 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
             }
 
             Ok(Arc::new(StructArray::from(field_arrays)))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let mut raw_values: Vec<Option<i128>> = Vec::with_capacity(values.len());
+            for value in values {
+                let entry = match value {
+                    PlanValue::Null => None,
+                    PlanValue::Decimal(decimal) => {
+                        let aligned = align_decimal_to_scale(*decimal, *precision, *scale)
+                            .map_err(|err| {
+                                Error::InvalidArgumentError(format!(
+                                    "decimal literal {} incompatible with DECIMAL({}, {}): {err}",
+                                    decimal, precision, scale
+                                ))
+                            })?;
+                        Some(aligned.raw_value())
+                    }
+                    PlanValue::Integer(value) => {
+                        let decimal = decimal_from_i64(*value, *precision, *scale).map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "integer literal {value} incompatible with DECIMAL({}, {}): {err}",
+                                precision, scale
+                            ))
+                        })?;
+                        Some(decimal.raw_value())
+                    }
+                    PlanValue::Float(value) => {
+                        let decimal = decimal_from_f64(*value, *precision, *scale).map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "float literal {value} incompatible with DECIMAL({}, {}): {err}",
+                                precision, scale
+                            ))
+                        })?;
+                        Some(decimal.raw_value())
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert non-decimal value into DECIMAL column".into(),
+                        ));
+                    }
+                };
+                raw_values.push(entry);
+            }
+
+            let array = Decimal128Array::from_iter(raw_values.into_iter())
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|err| Error::InvalidArgumentError(format!(
+                    "failed to build Decimal128 array: {err}"
+                )))?;
+            Ok(Arc::new(array) as ArrayRef)
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
             let mut converted: Vec<Option<_>> = Vec::with_capacity(values.len());

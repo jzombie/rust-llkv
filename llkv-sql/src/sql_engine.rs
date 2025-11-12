@@ -16,6 +16,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
 
 use llkv_executor::{SelectExecution, push_query_label};
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::Literal;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
@@ -7065,6 +7066,7 @@ fn bind_plan_value(value: &mut PlanValue, params: &[SqlParamValue]) -> SqlResult
         PlanValue::Null
         | PlanValue::Integer(_)
         | PlanValue::Float(_)
+        | PlanValue::Decimal(_)
         | PlanValue::Date32(_)
         | PlanValue::Interval(_) => {}
     }
@@ -7234,6 +7236,7 @@ fn bind_literal(literal: &mut Literal, params: &[SqlParamValue]) -> SqlResult<()
         }
         Literal::Integer(_)
         | Literal::Float(_)
+        | Literal::Decimal(_)
         | Literal::Boolean(_)
         | Literal::Null
         | Literal::Date32(_)
@@ -10057,6 +10060,26 @@ fn translate_scalar_internal(
                             Literal::Null => {
                                 result_stack
                                     .push(llkv_expr::expr::ScalarExpr::literal(Literal::Null));
+                            }
+                            Literal::Decimal(value) => {
+                                let negated_raw = value
+                                    .raw_value()
+                                    .checked_neg()
+                                    .ok_or_else(|| {
+                                        Error::InvalidArgumentError(
+                                            "decimal overflow when applying unary minus"
+                                                .into(),
+                                        )
+                                    })?;
+                                let negated = DecimalValue::new(negated_raw, value.scale())
+                                    .map_err(|err| {
+                                        Error::InvalidArgumentError(format!(
+                                            "failed to negate decimal literal: {err}"
+                                        ))
+                                    })?;
+                                result_stack.push(llkv_expr::expr::ScalarExpr::literal(
+                                    Literal::Decimal(negated),
+                                ));
                             }
                         },
                         other => {

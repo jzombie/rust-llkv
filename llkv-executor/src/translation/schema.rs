@@ -1,6 +1,7 @@
 use crate::ExecutorResult;
 use crate::types::{ExecutorSchema, ExecutorTable};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema};
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::ScalarExpr;
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
@@ -56,6 +57,9 @@ pub fn infer_computed_data_type(
     match expr {
         ScalarExpr::Literal(Literal::Integer(_)) => Ok(DataType::Int64),
         ScalarExpr::Literal(Literal::Float(_)) => Ok(DataType::Float64),
+        ScalarExpr::Literal(Literal::Decimal(value)) => {
+            Ok(DataType::Decimal128(value.precision(), value.scale()))
+        }
         ScalarExpr::Literal(Literal::Boolean(_)) => Ok(DataType::Boolean),
         ScalarExpr::Literal(Literal::String(_)) => Ok(DataType::Utf8),
         ScalarExpr::Literal(Literal::Date32(_)) => Ok(DataType::Date32),
@@ -131,6 +135,13 @@ fn normalized_numeric_type(dtype: &DataType) -> DataType {
         | DataType::UInt64
         | DataType::Float32
         | DataType::Float64 => DataType::Float64,
+        DataType::Decimal128(precision, scale) => {
+            if *scale == 0 && *precision <= 18 {
+                DataType::Int64
+            } else {
+                DataType::Float64
+            }
+        }
         other => other.clone(),
     }
 }
@@ -141,6 +152,9 @@ fn expression_uses_float(
 ) -> ExecutorResult<bool> {
     match expr {
         ScalarExpr::Literal(Literal::Float(_)) => Ok(true),
+        ScalarExpr::Literal(Literal::Decimal(value)) => {
+            Ok(!decimal_literal_behaves_like_integer(value))
+        }
         ScalarExpr::Literal(Literal::Integer(_))
         | ScalarExpr::Literal(Literal::Boolean(_))
         | ScalarExpr::Literal(Literal::Null)
@@ -247,6 +261,12 @@ fn resolve_struct_field_type(
             "GetField can only be applied to struct types".into(),
         ))
     }
+}
+
+fn decimal_literal_behaves_like_integer(value: &DecimalValue) -> bool {
+    value.scale() == 0
+        && value.raw_value() >= i128::from(i64::MIN)
+        && value.raw_value() <= i128::from(i64::MAX)
 }
 
 #[cfg(test)]

@@ -139,6 +139,8 @@ enum Layout {
 ///
 /// Using `num_enum` gives zero-cost Into/TryFrom conversions and avoids
 /// manual matches for u8 <-> enum mapping.
+/// 
+/// NOTE: Decimal128 stores precision and scale inline as the next two bytes after the type tag.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, IntoPrimitive, TryFromPrimitive)]
 enum PrimType {
@@ -159,11 +161,13 @@ enum PrimType {
     Boolean = 15,
     Date32 = 16,
     Date64 = 17,
+    Decimal128 = 18,
 }
 
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 
 /// Map Arrow `DataType` to on-disk `PrimType`.
+/// For Decimal128, precision and scale are stored separately in the serialized format.
 #[inline]
 fn prim_from_datatype(dt: &DataType) -> Result<PrimType> {
     use DataType::*;
@@ -185,14 +189,16 @@ fn prim_from_datatype(dt: &DataType) -> Result<PrimType> {
         Boolean => PrimType::Boolean,
         Date32 => PrimType::Date32,
         Date64 => PrimType::Date64,
+        Decimal128(_, _) => PrimType::Decimal128,
         _ => return Err(Error::Internal("unsupported Arrow type".into())),
     };
     Ok(p)
 }
 
 /// Map on-disk `PrimType` to Arrow `DataType`.
+/// For Decimal128, precision and scale must be provided separately.
 #[inline]
-fn datatype_from_prim(p: PrimType) -> Result<DataType> {
+fn datatype_from_prim(p: PrimType, precision: u8, scale: u8) -> Result<DataType> {
     use DataType::*;
     let dt = match p {
         PrimType::UInt64 => UInt64,
@@ -212,6 +218,7 @@ fn datatype_from_prim(p: PrimType) -> Result<DataType> {
         PrimType::Boolean => Boolean,
         PrimType::Date32 => Date32,
         PrimType::Date64 => Date64,
+        PrimType::Decimal128 => Decimal128(precision, scale as i8),
     };
     Ok(dt)
 }
@@ -266,8 +273,24 @@ fn serialize_primitive(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
     out.extend_from_slice(&MAGIC);
     out.push(Layout::Primitive as u8);
     out.push(u8::from(code));
-    // 2 bytes padding reserved (e.g., future versioning).
-    out.extend_from_slice(&[0u8; 2]);
+    
+    // For Decimal128, store precision and scale in the 2 padding bytes
+    // For other types, use zeros as before
+    match code {
+        PrimType::Decimal128 => {
+            if let DataType::Decimal128(precision, scale) = arr.data_type() {
+                out.push(*precision);
+                out.push(*scale as u8);
+            } else {
+                return Err(Error::Internal("expected Decimal128 data type".into()));
+            }
+        }
+        _ => {
+            // 2 bytes padding reserved (e.g., future versioning).
+            out.extend_from_slice(&[0u8; 2]);
+        }
+    }
+    
     write_u64_le(&mut out, len);
     write_u32_le(&mut out, values_len);
     write_u32_le(&mut out, 0);
@@ -412,6 +435,8 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
 
     let layout = raw[4];
     let type_code = raw[5];
+    let precision = raw[6]; // Used for Decimal128
+    let scale = raw[7];     // Used for Decimal128
 
     let mut o = 8usize;
     let len = read_u64_le(raw, &mut o) as usize;
@@ -430,7 +455,7 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
 
             let p = PrimType::try_from(type_code)
                 .map_err(|_| Error::Internal("unsupported primitive code".into()))?;
-            let data_type = datatype_from_prim(p)?;
+            let data_type = datatype_from_prim(p, precision, scale)?;
 
             let data = ArrayData::builder(data_type)
                 .len(len)
@@ -475,7 +500,8 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
 
             let p = PrimType::try_from(type_code)
                 .map_err(|_| Error::Internal("unsupported varlen code".into()))?;
-            let data_type = datatype_from_prim(p)?;
+            // Varlen types (Binary, Utf8, etc.) don't use precision/scale
+            let data_type = datatype_from_prim(p, 0, 0)?;
 
             let data = ArrayData::builder(data_type)
                 .len(len)

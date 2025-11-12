@@ -4,6 +4,7 @@
 //! llkv-plan data structures, particularly for literal value conversion
 //! and range SELECT parsing.
 
+use llkv_expr::decimal::DecimalValue;
 use llkv_result::{Error, Result};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
@@ -52,6 +53,22 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
+            PlanValue::Decimal(value) => {
+                let negated = value
+                    .raw_value()
+                    .checked_neg()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "decimal literal overflow when applying unary minus".into(),
+                        )
+                    })?;
+                let decimal = DecimalValue::new(negated, value.scale()).map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "failed to negate decimal literal: {err}"
+                    ))
+                })?;
+                Ok(PlanValue::Decimal(decimal))
+            }
             PlanValue::Null
             | PlanValue::String(_)
             | PlanValue::Struct(_)

@@ -43,3 +43,23 @@ TPC goals:
 - Creating a good process for reviewing and monitoring those benchmarks
 - Resolution of disputes and challenges
 - Good benchmarks are like good laws. They lay the foundation for civilized (fair) competition.
+
+---
+
+https://github.com/apache/datafusion-benchmarks?tab=readme-ov-file#tpc-legal-considerations
+
+It is important to know that TPC benchmarks are copyrighted IP of the Transaction Processing Council. Only members of the TPC consortium are allowed to publish TPC benchmark results. Fun fact: only four companies have published official TPC-DS benchmark results so far, and those results can be seen [here](https://www.tpc.org/tpcds/results/tpcds_results5.asp?orderby=dbms&version=3).
+
+However, anyone is welcome to create derivative benchmarks under the TPC's fair use policy, and that is what we are doing here. We do not aim to run a true TPC benchmark (which is a significant endeavor). We are just running the individual queries and recording the timings.
+
+Throughout this document and when talking about these benchmarks, you will see the term "derived from TPC-H" or "derived from TPC-DS". We are required to use this terminology and this is explained in the [fair-use policy (PDF)](https://www.tpc.org/tpc_documents_current_versions/pdf/tpc_fair_use_quick_reference_v1.0.0.pdf).
+
+DataFusion benchmarks are a Non-TPC Benchmark. Any comparison between official TPC Results with non-TPC workloads is prohibited by the TPC.
+
+## TPC Legal Notices
+
+TPC-H is Copyright © 1993-2022 Transaction Processing Performance Council. The full TPC-H specification in PDF format can be found here.
+
+TPC-DS is Copyright © 2021 Transaction Processing Performance Council. The full TPC-DS specification in PDF format can be found here.
+
+TPC, TPC Benchmark, TPC-H, and TPC-DS are trademarks of the Transaction Processing Performance Council.
