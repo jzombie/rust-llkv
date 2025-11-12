@@ -10,9 +10,9 @@ use arrow::array::{Array, ArrayRef, Date32Array, Float64Array, Int64Array, Strin
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::literal::Literal;
-use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
-use llkv_plan::parse_date32_literal;
+use llkv_expr::literal::{IntervalValue, Literal};
+use llkv_expr::{AggregateCall, BinaryOp, CompareOp, ScalarExpr};
+use llkv_plan::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -473,6 +473,11 @@ impl NumericKernels {
             }
             ScalarExpr::Literal(_) => Ok(Self::literal_numeric_value(expr)),
             ScalarExpr::Binary { left, op, right } => {
+                if let Some(result) =
+                    Self::try_evaluate_date_interval_binary(left, *op, right, idx, arrays)?
+                {
+                    return Ok(result);
+                }
                 let l = Self::evaluate_value(left, idx, arrays)?;
                 let r = Self::evaluate_value(right, idx, arrays)?;
                 Ok(Self::apply_binary(*op, l, r))
@@ -625,6 +630,9 @@ impl NumericKernels {
         arrays: &NumericArrayMap,
         preferred: NumericKind,
     ) -> LlkvResult<Option<VectorizedExpr>> {
+        if Self::expr_contains_interval(expr) {
+            return Ok(None);
+        }
         match expr {
             ScalarExpr::Column(fid) => {
                 let array = arrays
@@ -940,6 +948,200 @@ impl NumericKernels {
                 }
                 Ok(Some(truncated as i32))
             }
+        }
+    }
+
+    fn try_evaluate_date_interval_binary(
+        left: &ScalarExpr<FieldId>,
+        op: BinaryOp,
+        right: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<Option<NumericValue>>> {
+        match op {
+            BinaryOp::Add => {
+                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)? {
+                    if let Some(interval_value) =
+                        Self::evaluate_interval_operand(right, idx, arrays)?
+                    {
+                        let adjusted = Self::apply_interval_to_date32_value(
+                            date_value,
+                            interval_value,
+                            false,
+                        )?;
+                        return Ok(Some(
+                            adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                        ));
+                    }
+                }
+                if let Some(date_value) = Self::evaluate_date_operand(right, idx, arrays)? {
+                    if let Some(interval_value) =
+                        Self::evaluate_interval_operand(left, idx, arrays)?
+                    {
+                        let adjusted = Self::apply_interval_to_date32_value(
+                            date_value,
+                            interval_value,
+                            false,
+                        )?;
+                        return Ok(Some(
+                            adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                        ));
+                    }
+                }
+                Ok(None)
+            }
+            BinaryOp::Subtract => {
+                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)? {
+                    if let Some(interval_value) =
+                        Self::evaluate_interval_operand(right, idx, arrays)?
+                    {
+                        let adjusted =
+                            Self::apply_interval_to_date32_value(date_value, interval_value, true)?;
+                        return Ok(Some(
+                            adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                        ));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate_date_operand(
+        expr: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<Option<i32>>> {
+        match expr {
+            ScalarExpr::Literal(Literal::Null) => Ok(Some(None)),
+            ScalarExpr::Literal(Literal::Date32(days)) => Ok(Some(Some(*days))),
+            ScalarExpr::Cast {
+                expr: inner,
+                data_type,
+            } if matches!(data_type, DataType::Date32) => {
+                if let Some(result) = Self::cast_literal_to_date32(inner) {
+                    let days = result?;
+                    return Ok(Some(days));
+                }
+                let value = Self::evaluate_value(inner, idx, arrays)?;
+                let days = Self::numeric_value_to_date32(value)?;
+                Ok(Some(days))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate_interval_operand(
+        expr: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<Option<IntervalValue>>> {
+        match expr {
+            ScalarExpr::Literal(Literal::Null) => Ok(Some(None)),
+            ScalarExpr::Literal(Literal::Interval(value)) => Ok(Some(Some(*value))),
+            ScalarExpr::Binary { left, op, right } => match op {
+                BinaryOp::Add => Self::evaluate_interval_binary(left, right, idx, arrays, true),
+                BinaryOp::Subtract => {
+                    Self::evaluate_interval_binary(left, right, idx, arrays, false)
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate_interval_binary(
+        left: &ScalarExpr<FieldId>,
+        right: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+        is_addition: bool,
+    ) -> LlkvResult<Option<Option<IntervalValue>>> {
+        let lhs = Self::evaluate_interval_operand(left, idx, arrays)?;
+        let rhs = Self::evaluate_interval_operand(right, idx, arrays)?;
+        match (lhs, rhs) {
+            (Some(Some(l)), Some(Some(r))) => {
+                let combined = if is_addition {
+                    l.checked_add(r)
+                } else {
+                    l.checked_sub(r)
+                }
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("interval arithmetic overflow".into())
+                })?;
+                Ok(Some(Some(combined)))
+            }
+            (Some(None), _) | (_, Some(None)) => Ok(Some(None)),
+            (Some(_), None) | (None, Some(_)) => Ok(None),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn apply_interval_to_date32_value(
+        date: Option<i32>,
+        interval: Option<IntervalValue>,
+        subtract: bool,
+    ) -> LlkvResult<Option<i32>> {
+        match (date, interval) {
+            (None, _) | (_, None) => Ok(None),
+            (Some(days), Some(interval)) => {
+                let adjusted = if subtract {
+                    subtract_interval_from_date32(days, interval)?
+                } else {
+                    add_interval_to_date32(days, interval)?
+                };
+                Ok(Some(adjusted))
+            }
+        }
+    }
+
+    fn expr_contains_interval(expr: &ScalarExpr<FieldId>) -> bool {
+        match expr {
+            ScalarExpr::Literal(literal) => matches!(literal, Literal::Interval(_)),
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::expr_contains_interval(left) || Self::expr_contains_interval(right)
+            }
+            ScalarExpr::Cast { expr, .. } => Self::expr_contains_interval(expr),
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::expr_contains_interval(left) || Self::expr_contains_interval(right)
+            }
+            ScalarExpr::Not(inner) => Self::expr_contains_interval(inner),
+            ScalarExpr::IsNull { expr, .. } => Self::expr_contains_interval(expr),
+            ScalarExpr::Aggregate(agg) => Self::aggregate_contains_interval(agg),
+            ScalarExpr::GetField { base, .. } => Self::expr_contains_interval(base),
+            ScalarExpr::Coalesce(items) => items.iter().any(Self::expr_contains_interval),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand
+                    .as_deref()
+                    .map_or(false, Self::expr_contains_interval)
+                    || branches.iter().any(|(when_expr, then_expr)| {
+                        Self::expr_contains_interval(when_expr)
+                            || Self::expr_contains_interval(then_expr)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .map_or(false, Self::expr_contains_interval)
+            }
+            ScalarExpr::Column(_) | ScalarExpr::ScalarSubquery(_) | ScalarExpr::Random => false,
+        }
+    }
+
+    fn aggregate_contains_interval(agg: &AggregateCall<FieldId>) -> bool {
+        match agg {
+            AggregateCall::CountStar => false,
+            AggregateCall::Count { expr, .. }
+            | AggregateCall::Sum { expr, .. }
+            | AggregateCall::Total { expr, .. }
+            | AggregateCall::Avg { expr, .. }
+            | AggregateCall::Min(expr)
+            | AggregateCall::Max(expr)
+            | AggregateCall::CountNulls(expr)
+            | AggregateCall::GroupConcat { expr, .. } => Self::expr_contains_interval(expr),
         }
     }
 
@@ -1507,7 +1709,7 @@ impl NumericKernels {
                 llkv_expr::literal::Literal::Boolean(_) => NumericKind::Integer,
                 llkv_expr::literal::Literal::Null => NumericKind::Integer,
                 llkv_expr::literal::Literal::String(_) => NumericKind::Float,
-                llkv_expr::literal::Literal::Date32(_) => NumericKind::Float,
+                llkv_expr::literal::Literal::Date32(_) => NumericKind::Integer,
                 llkv_expr::literal::Literal::Struct(_) => NumericKind::Float,
                 llkv_expr::literal::Literal::Interval(_) => NumericKind::Float,
             },
@@ -1637,6 +1839,7 @@ impl NumericKernels {
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
+            | DataType::Date32
             | DataType::Boolean => Some(NumericKind::Integer),
             DataType::UInt8
             | DataType::UInt16
