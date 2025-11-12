@@ -5,6 +5,7 @@ use crate::{
 use llkv_executor::utils::parse_date32_literal;
 use llkv_expr::literal::IntervalValue;
 use llkv_plan::plans::PlanValue;
+use llkv_plan::{add_interval_to_date32, subtract_interval_from_date32};
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
@@ -54,60 +55,47 @@ impl SqlValue {
                 op: UnaryOperator::Plus,
                 expr,
             } => SqlValue::try_from_expr(expr),
-            SqlExpr::Cast { expr, .. } => match SqlValue::try_from_expr(expr)? {
-                SqlValue::Null => Ok(SqlValue::Null),
-                SqlValue::Struct(_) => Err(Error::InvalidArgumentError(
-                    "cannot CAST struct literals".into(),
-                )),
-                SqlValue::Date32(_) => Err(Error::InvalidArgumentError(
-                    "cannot CAST DATE literals".into(),
-                )),
-                other => Err(Error::InvalidArgumentError(format!(
-                    "unsupported literal CAST expression: {other:?}"
-                ))),
-            },
+            SqlExpr::Cast {
+                expr, data_type, ..
+            } => {
+                let inner = SqlValue::try_from_expr(expr)?;
+                match data_type {
+                    DataType::Date => match inner {
+                        SqlValue::Null => Ok(SqlValue::Null),
+                        SqlValue::String(text) => {
+                            let days = parse_date32_literal(&text)?;
+                            Ok(SqlValue::Date32(days))
+                        }
+                        SqlValue::Date32(days) => Ok(SqlValue::Date32(days)),
+                        other => Err(Error::InvalidArgumentError(format!(
+                            "cannot CAST literal {:?} to DATE",
+                            other
+                        ))),
+                    },
+                    _ => match inner {
+                        SqlValue::Null => Ok(SqlValue::Null),
+                        SqlValue::Struct(_) => Err(Error::InvalidArgumentError(
+                            "cannot CAST struct literals".into(),
+                        )),
+                        SqlValue::Date32(_) => Err(Error::InvalidArgumentError(
+                            "cannot CAST DATE literals".into(),
+                        )),
+                        other => Err(Error::InvalidArgumentError(format!(
+                            "unsupported literal CAST expression: {other:?}"
+                        ))),
+                    },
+                }
+            }
             SqlExpr::Nested(inner) => SqlValue::try_from_expr(inner),
             SqlExpr::Dictionary(fields) => SqlValue::from_dictionary(fields),
             SqlExpr::BinaryOp { left, op, right } => {
-                // Support bitwise shifts for INSERT VALUES (e.g., 1<<63)
+                let lhs = SqlValue::try_from_expr(left)?;
+                let rhs = SqlValue::try_from_expr(right)?;
                 match op {
+                    BinaryOperator::Plus => add_literals(lhs, rhs),
+                    BinaryOperator::Minus => subtract_literals(lhs, rhs),
                     BinaryOperator::PGBitwiseShiftLeft | BinaryOperator::PGBitwiseShiftRight => {
-                        let lhs = SqlValue::try_from_expr(left)?;
-                        let rhs = SqlValue::try_from_expr(right)?;
-
-                        let lhs_i64 = match lhs {
-                            SqlValue::Integer(i) => i,
-                            SqlValue::Float(f) => f as i64,
-                            SqlValue::Date32(days) => days as i64,
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "bitwise shift requires numeric operands".into(),
-                                ));
-                            }
-                        };
-
-                        let rhs_i64 = match rhs {
-                            SqlValue::Integer(i) => i,
-                            SqlValue::Float(f) => f as i64,
-                            SqlValue::Date32(days) => days as i64,
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "bitwise shift requires numeric operands".into(),
-                                ));
-                            }
-                        };
-
-                        let result = match op {
-                            BinaryOperator::PGBitwiseShiftLeft => {
-                                lhs_i64.wrapping_shl(rhs_i64 as u32)
-                            }
-                            BinaryOperator::PGBitwiseShiftRight => {
-                                lhs_i64.wrapping_shr(rhs_i64 as u32)
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        Ok(SqlValue::Integer(result))
+                        bitshift_literals(op.clone(), lhs, rhs)
                     }
                     _ => Err(Error::InvalidArgumentError(
                         "unsupported literal expression: binary operation".into(),
@@ -207,4 +195,87 @@ impl From<SqlValue> for PlanValue {
             }
         }
     }
+}
+
+fn add_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
+    match (lhs, rhs) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (SqlValue::Date32(days), SqlValue::Interval(interval)) => {
+            let adjusted = add_interval_to_date32(days, interval)?;
+            Ok(SqlValue::Date32(adjusted))
+        }
+        (SqlValue::Interval(interval), SqlValue::Date32(days)) => {
+            let adjusted = add_interval_to_date32(days, interval)?;
+            Ok(SqlValue::Date32(adjusted))
+        }
+        (SqlValue::Interval(left), SqlValue::Interval(right)) => left
+            .checked_add(right)
+            .map(SqlValue::Interval)
+            .ok_or_else(|| Error::InvalidArgumentError("interval addition overflow".into())),
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported literal expression: binary operation".into(),
+        )),
+    }
+}
+
+fn subtract_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
+    match (lhs, rhs) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (SqlValue::Date32(days), SqlValue::Interval(interval)) => {
+            let adjusted = subtract_interval_from_date32(days, interval)?;
+            Ok(SqlValue::Date32(adjusted))
+        }
+        (SqlValue::Date32(lhs_days), SqlValue::Date32(rhs_days)) => {
+            let delta = i64::from(lhs_days) - i64::from(rhs_days);
+            if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
+                return Err(Error::InvalidArgumentError(
+                    "DATE subtraction overflowed day precision".into(),
+                ));
+            }
+            Ok(SqlValue::Interval(IntervalValue::new(0, delta as i32, 0)))
+        }
+        (SqlValue::Interval(left), SqlValue::Interval(right)) => left
+            .checked_sub(right)
+            .map(SqlValue::Interval)
+            .ok_or_else(|| Error::InvalidArgumentError("interval subtraction overflow".into())),
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported literal expression: binary operation".into(),
+        )),
+    }
+}
+
+fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
+    if matches!(lhs, SqlValue::Null) || matches!(rhs, SqlValue::Null) {
+        return Ok(SqlValue::Null);
+    }
+
+    let lhs_i64 = match lhs {
+        SqlValue::Integer(i) => i,
+        SqlValue::Float(f) => f as i64,
+        SqlValue::Date32(days) => days as i64,
+        _ => {
+            return Err(Error::InvalidArgumentError(
+                "bitwise shift requires numeric operands".into(),
+            ));
+        }
+    };
+
+    let rhs_i64 = match rhs {
+        SqlValue::Integer(i) => i,
+        SqlValue::Float(f) => f as i64,
+        SqlValue::Date32(days) => days as i64,
+        _ => {
+            return Err(Error::InvalidArgumentError(
+                "bitwise shift requires numeric operands".into(),
+            ));
+        }
+    };
+
+    let result = match op {
+        BinaryOperator::PGBitwiseShiftLeft => lhs_i64.wrapping_shl(rhs_i64 as u32),
+        BinaryOperator::PGBitwiseShiftRight => lhs_i64.wrapping_shr(rhs_i64 as u32),
+        _ => unreachable!(),
+    };
+
+    Ok(SqlValue::Integer(result))
 }

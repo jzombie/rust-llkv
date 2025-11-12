@@ -6,12 +6,13 @@
 
 use std::{convert::TryFrom, sync::Arc};
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Date32Array, Float64Array, Int64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
+use llkv_plan::parse_date32_literal;
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -515,6 +516,10 @@ impl NumericKernels {
                 "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
             ScalarExpr::Cast { expr, data_type } => {
+                if matches!(data_type, DataType::Date32) {
+                    return Self::evaluate_cast_date32_value(expr, idx, arrays);
+                }
+
                 let value = Self::evaluate_value(expr, idx, arrays)?;
                 let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
                     Error::InvalidArgumentError(format!(
@@ -591,6 +596,16 @@ impl NumericKernels {
         len: usize,
         arrays: &NumericArrayMap,
     ) -> LlkvResult<ArrayRef> {
+        if let ScalarExpr::Cast {
+            expr: inner,
+            data_type,
+        } = expr
+        {
+            if matches!(data_type, DataType::Date32) {
+                return Self::evaluate_cast_date32_batch(inner, len, arrays);
+            }
+        }
+
         let preferred = Self::infer_result_kind(expr, arrays);
         if let Some(vectorized) = Self::try_evaluate_vectorized(expr, len, arrays, preferred)? {
             return Ok(vectorized.materialize(len, preferred));
@@ -661,6 +676,10 @@ impl NumericKernels {
                 "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
             ScalarExpr::Cast { expr, data_type } => {
+                if matches!(data_type, DataType::Date32) {
+                    return Ok(None);
+                }
+
                 let inner_kind = Self::infer_result_kind(expr, arrays);
                 let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays, inner_kind)?;
                 let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
@@ -836,6 +855,105 @@ impl NumericKernels {
     #[inline]
     fn option_numeric_truthiness(value: Option<NumericValue>) -> Option<bool> {
         value.map(Self::truthy_numeric)
+    }
+
+    fn evaluate_cast_date32_value(
+        expr: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<NumericValue>> {
+        if let Some(result) = Self::cast_literal_to_date32(expr) {
+            let days = result?;
+            return Ok(days.map(|d| NumericValue::Integer(i64::from(d))));
+        }
+
+        let value = Self::evaluate_value(expr, idx, arrays)?;
+        let days = Self::numeric_value_to_date32(value)?;
+        Ok(days.map(|d| NumericValue::Integer(i64::from(d))))
+    }
+
+    fn evaluate_cast_date32_batch(
+        expr: &ScalarExpr<FieldId>,
+        len: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<ArrayRef> {
+        if let Some(result) = Self::cast_literal_to_date32(expr) {
+            let days = result?;
+            let values: Vec<Option<i32>> = match days {
+                Some(d) => vec![Some(d); len],
+                None => vec![None; len],
+            };
+            let array = Date32Array::from(values);
+            return Ok(Arc::new(array) as ArrayRef);
+        }
+
+        let mut values: Vec<Option<i32>> = Vec::with_capacity(len);
+        for idx in 0..len {
+            let value = Self::evaluate_value(expr, idx, arrays)?;
+            values.push(Self::numeric_value_to_date32(value)?);
+        }
+
+        let array = Date32Array::from(values);
+        Ok(Arc::new(array) as ArrayRef)
+    }
+
+    fn cast_literal_to_date32(expr: &ScalarExpr<FieldId>) -> Option<LlkvResult<Option<i32>>> {
+        match expr {
+            ScalarExpr::Literal(lit) => {
+                let result = match lit {
+                    Literal::Null => Ok(None),
+                    Literal::Date32(days) => Ok(Some(*days)),
+                    Literal::String(text) => parse_date32_literal(text).map(Some),
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "cannot CAST literal {} to DATE",
+                        Self::literal_type_name(lit)
+                    ))),
+                };
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    fn numeric_value_to_date32(value: Option<NumericValue>) -> LlkvResult<Option<i32>> {
+        match value {
+            None => Ok(None),
+            Some(NumericValue::Integer(v)) => {
+                if v < i64::from(i32::MIN) || v > i64::from(i32::MAX) {
+                    return Err(Error::InvalidArgumentError(
+                        "DATE cast value out of range".into(),
+                    ));
+                }
+                Ok(Some(v as i32))
+            }
+            Some(NumericValue::Float(v)) => {
+                if !v.is_finite() {
+                    return Err(Error::InvalidArgumentError(
+                        "cannot cast non-finite float to DATE".into(),
+                    ));
+                }
+                let truncated = v.trunc();
+                if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+                    return Err(Error::InvalidArgumentError(
+                        "DATE cast value out of range".into(),
+                    ));
+                }
+                Ok(Some(truncated as i32))
+            }
+        }
+    }
+
+    fn literal_type_name(literal: &Literal) -> &'static str {
+        match literal {
+            Literal::Null => "NULL",
+            Literal::Integer(_) => "INTEGER",
+            Literal::Float(_) => "FLOAT",
+            Literal::String(_) => "STRING",
+            Literal::Boolean(_) => "BOOLEAN",
+            Literal::Date32(_) => "DATE",
+            Literal::Struct(_) => "STRUCT",
+            Literal::Interval(_) => "INTERVAL",
+        }
     }
 
     #[inline]

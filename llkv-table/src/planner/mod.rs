@@ -44,6 +44,9 @@ use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_plan::date::{
+    add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
+};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -1614,24 +1617,8 @@ where
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
     ) -> LlkvResult<Option<bool>> {
-        use llkv_expr::literal::Literal;
-
-        fn evaluate_constant_literal(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
-            let simplified = NumericKernels::simplify(expr);
-            if let ScalarExpr::Literal(lit) = &simplified {
-                return Ok(Some(lit.clone()));
-            }
-
-            let arrays = NumericArrayMap::default();
-            match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
-                Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
-                Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
-                None => Ok(None),
-            }
-        }
-
-        let left_lit_opt = evaluate_constant_literal(left)?;
-        let right_lit_opt = evaluate_constant_literal(right)?;
+        let left_lit_opt = evaluate_constant_literal_expr(left)?;
+        let right_lit_opt = evaluate_constant_literal_expr(right)?;
 
         let left_lit = match left_lit_opt {
             Some(Literal::Null) | None => return Ok(None),
@@ -1649,6 +1636,7 @@ where
                 (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
                 (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
+                (Literal::Date32(l), Literal::Date32(r)) => l.partial_cmp(r),
                 (Literal::Interval(l), Literal::Interval(r)) => {
                     Some(compare_interval_values(*l, *r))
                 }
@@ -4985,6 +4973,128 @@ fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
         }
     }
     row_ids
+}
+
+fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
+    let simplified = NumericKernels::simplify(expr);
+
+    if let Some(literal) = evaluate_constant_literal_non_numeric(&simplified)? {
+        return Ok(Some(literal));
+    }
+
+    if let ScalarExpr::Literal(lit) = &simplified {
+        return Ok(Some(lit.clone()));
+    }
+
+    let arrays = NumericArrayMap::default();
+    match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
+        Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
+        Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
+        None => Ok(None),
+    }
+}
+
+fn evaluate_constant_literal_non_numeric(
+    expr: &ScalarExpr<FieldId>,
+) -> LlkvResult<Option<Literal>> {
+    match expr {
+        ScalarExpr::Literal(lit) => Ok(Some(lit.clone())),
+        ScalarExpr::Cast { expr, data_type } => match data_type {
+            DataType::Date32 => {
+                let inner = evaluate_constant_literal_non_numeric(expr)?;
+                match inner {
+                    Some(Literal::Null) => Ok(Some(Literal::Null)),
+                    Some(Literal::String(text)) => {
+                        let days = parse_date32_literal(&text)?;
+                        Ok(Some(Literal::Date32(days)))
+                    }
+                    Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
+                    Some(other) => Err(Error::InvalidArgumentError(format!(
+                        "cannot cast literal of type {} to DATE",
+                        literal_type_name(&other)
+                    ))),
+                    None => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        },
+        ScalarExpr::Binary { left, op, right } => {
+            let left_lit = match evaluate_constant_literal_non_numeric(left)? {
+                Some(lit) => lit,
+                None => return Ok(None),
+            };
+            let right_lit = match evaluate_constant_literal_non_numeric(right)? {
+                Some(lit) => lit,
+                None => return Ok(None),
+            };
+
+            if matches!(left_lit, Literal::Null) || matches!(right_lit, Literal::Null) {
+                return Ok(Some(Literal::Null));
+            }
+
+            match op {
+                BinaryOp::Add => match (&left_lit, &right_lit) {
+                    (Literal::Date32(days), Literal::Interval(interval))
+                    | (Literal::Interval(interval), Literal::Date32(days)) => {
+                        let adjusted = add_interval_to_date32(*days, *interval)?;
+                        Ok(Some(Literal::Date32(adjusted)))
+                    }
+                    (Literal::Interval(left), Literal::Interval(right)) => {
+                        let sum = left.checked_add(*right).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "interval addition overflow during constant folding".into(),
+                            )
+                        })?;
+                        Ok(Some(Literal::Interval(sum)))
+                    }
+                    _ => Ok(None),
+                },
+                BinaryOp::Subtract => match (&left_lit, &right_lit) {
+                    (Literal::Date32(days), Literal::Interval(interval)) => {
+                        let adjusted = subtract_interval_from_date32(*days, *interval)?;
+                        Ok(Some(Literal::Date32(adjusted)))
+                    }
+                    (Literal::Interval(left), Literal::Interval(right)) => {
+                        let diff = left.checked_sub(*right).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "interval subtraction overflow during constant folding".into(),
+                            )
+                        })?;
+                        Ok(Some(Literal::Interval(diff)))
+                    }
+                    (Literal::Date32(lhs), Literal::Date32(rhs)) => {
+                        let delta = i64::from(*lhs) - i64::from(*rhs);
+                        if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
+                            return Err(Error::InvalidArgumentError(
+                                "DATE subtraction overflowed day precision".into(),
+                            ));
+                        }
+                        Ok(Some(Literal::Interval(IntervalValue::new(
+                            0,
+                            delta as i32,
+                            0,
+                        ))))
+                    }
+                    _ => Ok(None),
+                },
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn literal_type_name(literal: &Literal) -> &'static str {
+    match literal {
+        Literal::Null => "NULL",
+        Literal::Integer(_) => "INTEGER",
+        Literal::Float(_) => "FLOAT",
+        Literal::String(_) => "STRING",
+        Literal::Boolean(_) => "BOOLEAN",
+        Literal::Date32(_) => "DATE",
+        Literal::Struct(_) => "STRUCT",
+        Literal::Interval(_) => "INTERVAL",
+    }
 }
 
 fn is_supported_numeric(dtype: &DataType) -> bool {

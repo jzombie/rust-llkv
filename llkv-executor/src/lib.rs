@@ -79,10 +79,10 @@ pub mod utils;
 pub type ExecutorResult<T> = Result<T, Error>;
 
 use crate::translation::schema::infer_computed_data_type;
-use crate::utils::format_date32_literal;
 use crate::utils::interval::{
     compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
 };
+use crate::utils::{format_date32_literal, parse_date32_literal};
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -6047,6 +6047,17 @@ where
                             value
                         ))),
                     },
+                    DataType::Date32 => match value {
+                        PlanValue::Date32(days) => Ok(PlanValue::Date32(days)),
+                        PlanValue::String(text) => {
+                            let days = parse_date32_literal(&text)?;
+                            Ok(PlanValue::Date32(days))
+                        }
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Cannot cast {:?} to date",
+                            value
+                        ))),
+                    },
                     _ => Err(Error::InvalidArgumentError(format!(
                         "CAST to {:?} not supported in aggregate expressions",
                         data_type
@@ -8443,6 +8454,12 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
         DataType::Interval(IntervalUnit::MonthDayNano) => match literal {
             Literal::Interval(interval) => Some(Literal::Interval(*interval)),
             Literal::Null => Some(Literal::Null),
+            _ => None,
+        },
+        DataType::Date32 => match literal {
+            Literal::Null => Some(Literal::Null),
+            Literal::Date32(days) => Some(Literal::Date32(*days)),
+            Literal::String(text) => parse_date32_literal(text).ok().map(Literal::Date32),
             _ => None,
         },
         _ => None,
