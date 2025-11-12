@@ -21,6 +21,19 @@ Section 2.3 of the spec, "Query Validation," may be of interest for point 1.
 
 ---
 
+Typical flow:
+
+1. Run `dbgen/dss.ddl` to create the 8 TPC-H tables.
+2. Run `dbgen/dss.ri` to add PKs and FKs.
+3. Use `dbgen` to generate .tbl data and load it into those tables.
+
+Related files:
+
+- `dbgen/dists.dss` — data distributions.
+- `dbgen/dss.h` — column widths/types used by dbgen.
+
+---
+
 https://www.youtube.com/watch?v=xotGodf7gZY - "If you're going to compare two databases [or solutions] against each other, what should be the [benchmarking] criteria used for testing?
 
 TPC goals:
