@@ -8,9 +8,10 @@ use std::mem;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, GenericBinaryArray, GenericBinaryBuilder, GenericStringArray,
-    GenericStringBuilder, OffsetSizeTrait, PrimitiveArray, PrimitiveBuilder, RecordBatch,
-    StructArray, UInt32Array, UInt64Array, new_empty_array,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Decimal128Builder, GenericBinaryArray,
+    GenericBinaryBuilder, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
+    PrimitiveArray, PrimitiveBuilder, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    new_empty_array,
 };
 use arrow::compute::{self, take};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
@@ -602,6 +603,106 @@ where
     }
 
     let array = PrimitiveArray::<T>::from_iter(values);
+    Ok(Arc::new(array) as ArrayRef)
+}
+
+/// Gather rows for Decimal128, preserving precision and scale from the schema.
+///
+/// This is a specialized version of `gather_rows_single_shot` that handles
+/// Decimal128 types. Unlike the generic primitive gather, we need to preserve
+/// the exact precision and scale metadata from the schema's DataType.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gather_rows_single_shot_decimal128(
+    row_index: &FxHashMap<u64, usize>,
+    len: usize,
+    value_metas: &[ChunkMetadata],
+    row_metas: &[ChunkMetadata],
+    candidate_indices: &[usize],
+    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+    allow_missing: bool,
+    dtype: &DataType,
+) -> Result<ArrayRef> {
+    let (precision, scale) = match dtype {
+        DataType::Decimal128(p, s) => (*p, *s),
+        _ => {
+            return Err(Error::Internal(
+                "gather_rows_single_shot_decimal128: expected Decimal128 dtype".into(),
+            ))
+        }
+    };
+
+    if len == 0 {
+        let empty = Decimal128Builder::new()
+            .with_precision_and_scale(precision, scale)
+            .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?
+            .finish();
+        return Ok(Arc::new(empty) as ArrayRef);
+    }
+
+    let mut values: Vec<Option<i128>> = vec![None; len];
+    let mut found: Vec<bool> = vec![false; len];
+
+    for &idx in candidate_indices {
+        let value_chunk = chunk_blobs
+            .remove(&value_metas[idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let row_chunk = chunk_blobs
+            .remove(&row_metas[idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+
+        let value_any = deserialize_array(value_chunk)?;
+        let value_arr = value_any
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+        let row_any = deserialize_array(row_chunk)?;
+        let row_arr = row_any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+        for i in 0..row_arr.len() {
+            if !row_arr.is_valid(i) {
+                continue;
+            }
+            let row_id = row_arr.value(i);
+            if let Some(&out_idx) = row_index.get(&row_id) {
+                found[out_idx] = true;
+                if value_arr.is_null(i) {
+                    values[out_idx] = None;
+                } else {
+                    values[out_idx] = Some(value_arr.value(i));
+                }
+            }
+        }
+    }
+
+    if !allow_missing {
+        if found.iter().any(|f| !*f) {
+            return Err(Error::Internal(
+                "gather_rows_multi: one or more requested row IDs were not found".into(),
+            ));
+        }
+    } else {
+        for (idx, was_found) in found.iter().enumerate() {
+            if !*was_found {
+                values[idx] = None;
+            }
+        }
+    }
+
+    let mut builder = Decimal128Builder::new()
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?;
+
+    for value in values {
+        match value {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+
+    let array = builder.finish();
     Ok(Arc::new(array) as ArrayRef)
 }
 
@@ -1284,6 +1385,141 @@ where
     }
 
     let mut builder = PrimitiveBuilder::<T>::with_capacity(len);
+    for row_scratch_item in row_scratch.iter().take(len) {
+        if let Some((chunk_idx, value_idx)) = *row_scratch_item {
+            if let Some(&slot) = chunk_lookup.get(&chunk_idx) {
+                let (idx, value_arr, _) = candidates[slot];
+                debug_assert_eq!(idx, chunk_idx);
+                if value_arr.is_null(value_idx) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(value_arr.value(value_idx));
+                }
+            } else {
+                builder.append_null();
+            }
+        } else {
+            builder.append_null();
+        }
+    }
+
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+/// Gather rows from chunks for Decimal128, preserving precision and scale from the schema.
+///
+/// This is a specialized version of `gather_rows_from_chunks` that handles Decimal128 types.
+/// We need to preserve the exact precision and scale metadata from the schema's DataType.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gather_rows_from_chunks_decimal128(
+    row_ids: &[u64],
+    row_locator: RowLocator,
+    len: usize,
+    candidate_indices: &[usize],
+    value_metas: &[ChunkMetadata],
+    row_metas: &[ChunkMetadata],
+    chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
+    row_scratch: &mut [Option<(usize, usize)>],
+    allow_missing: bool,
+    dtype: &DataType,
+) -> Result<ArrayRef> {
+    let (precision, scale) = match dtype {
+        DataType::Decimal128(p, s) => (*p, *s),
+        _ => {
+            return Err(Error::Internal(
+                "gather_rows_from_chunks_decimal128: expected Decimal128 dtype".into(),
+            ))
+        }
+    };
+
+    if len == 0 {
+        let empty = Decimal128Builder::new()
+            .with_precision_and_scale(precision, scale)
+            .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?
+            .finish();
+        return Ok(Arc::new(empty) as ArrayRef);
+    }
+
+    if candidate_indices.len() == 1 {
+        let chunk_idx = candidate_indices[0];
+        let value_any = chunk_arrays
+            .get(&value_metas[chunk_idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let row_any = chunk_arrays
+            .get(&row_metas[chunk_idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let _value_arr = value_any
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+        let row_arr = row_any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+        if row_arr.null_count() == 0 && row_ids.windows(2).all(|w| w[0] <= w[1]) {
+            let values = row_arr.values();
+            if let Ok(start_idx) = values.binary_search(&row_ids[0])
+                && start_idx + len <= values.len()
+                && row_ids == &values[start_idx..start_idx + len]
+            {
+                return Ok(value_any.slice(start_idx, len));
+            }
+        }
+    }
+
+    for slot in row_scratch.iter_mut().take(len) {
+        *slot = None;
+    }
+
+    let mut candidates: Vec<(usize, &Decimal128Array, &UInt64Array)> =
+        Vec::with_capacity(candidate_indices.len());
+    let mut chunk_lookup: FxHashMap<usize, usize> = FxHashMap::default();
+
+    for (slot, &chunk_idx) in candidate_indices.iter().enumerate() {
+        let value_any = chunk_arrays
+            .get(&value_metas[chunk_idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let value_arr = value_any
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
+        let row_any = chunk_arrays
+            .get(&row_metas[chunk_idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let row_arr = row_any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+        candidates.push((chunk_idx, value_arr, row_arr));
+        chunk_lookup.insert(chunk_idx, slot);
+
+        for i in 0..row_arr.len() {
+            if !row_arr.is_valid(i) {
+                continue;
+            }
+            let row_id = row_arr.value(i);
+            if let Some(out_idx) = row_locator.lookup(row_id, len) {
+                row_scratch[out_idx] = Some((chunk_idx, i));
+            }
+        }
+    }
+
+    if !allow_missing {
+        for slot in row_scratch.iter().take(len) {
+            if slot.is_none() {
+                return Err(Error::Internal(
+                    "gather_rows_multi: one or more requested row IDs were not found".into(),
+                ));
+            }
+        }
+    }
+
+    let mut builder = Decimal128Builder::new()
+        .with_precision_and_scale(precision, scale)
+        .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?;
+
     for row_scratch_item in row_scratch.iter().take(len) {
         if let Some((chunk_idx, value_idx)) = *row_scratch_item {
             if let Some(&slot) = chunk_lookup.get(&chunk_idx) {

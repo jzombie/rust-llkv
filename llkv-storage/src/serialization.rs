@@ -457,9 +457,24 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
                 .map_err(|_| Error::Internal("unsupported primitive code".into()))?;
             let data_type = datatype_from_prim(p, precision, scale)?;
 
+            // Decimal128 requires 16-byte alignment. If the buffer isn't aligned, copy it.
+            let buffer = if matches!(data_type, DataType::Decimal128(_, _)) {
+                let ptr = payload.as_ptr();
+                if ptr as usize % 16 != 0 {
+                    // Buffer is not 16-byte aligned, need to copy to aligned buffer
+                    let mut aligned_vec = Vec::with_capacity(payload.len());
+                    aligned_vec.extend_from_slice(&payload);
+                    arrow::buffer::Buffer::from(aligned_vec)
+                } else {
+                    payload
+                }
+            } else {
+                payload
+            };
+
             let data = ArrayData::builder(data_type)
                 .len(len)
-                .add_buffer(payload)
+                .add_buffer(buffer)
                 .build()?;
             Ok(make_array(data))
         }

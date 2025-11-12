@@ -4666,9 +4666,6 @@ where
     ///
     /// For other aggregates (e.g. MIN, MAX, COUNT, etc.):
     /// - Only allows types in the `allowed` list
-    ///
-    /// This is the SINGLE centralized function for all aggregate type handling.
-    /// No need to update multiple call sites when adding type support.
     fn validate_aggregate_type(
         data_type: Option<DataType>,
         func_name: &str,
@@ -4685,7 +4682,7 @@ where
         if matches!(func_name, "SUM" | "AVG" | "TOTAL" | "MIN" | "MAX") {
             match dt {
                 // Numeric types used directly
-                DataType::Int64 | DataType::Float64 => Ok(dt),
+                DataType::Int64 | DataType::Float64 | DataType::Decimal128(_, _) => Ok(dt),
 
                 // SQLite-compatible coercion: strings, booleans, dates -> Float64
                 // Actual conversion happens in llkv-aggregate::array_value_to_numeric
@@ -5920,12 +5917,13 @@ where
                             return Ok(PlanValue::Integer(lhs / rhs));
                         }
 
-                        let left_is_float = matches!(&left_val, PlanValue::Float(_));
-                        let right_is_float = matches!(&right_val, PlanValue::Float(_));
+                        let left_is_float = matches!(&left_val, PlanValue::Float(_) | PlanValue::Decimal(_));
+                        let right_is_float = matches!(&right_val, PlanValue::Float(_) | PlanValue::Decimal(_));
 
                         let left_num = match left_val {
                             PlanValue::Integer(i) => i as f64,
                             PlanValue::Float(f) => f,
+                            PlanValue::Decimal(d) => d.to_f64(),
                             other => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "Non-numeric value {:?} in binary operation",
@@ -5936,6 +5934,7 @@ where
                         let right_num = match right_val {
                             PlanValue::Integer(i) => i as f64,
                             PlanValue::Float(f) => f,
+                            PlanValue::Decimal(d) => d.to_f64(),
                             other => {
                                 return Err(Error::InvalidArgumentError(format!(
                                     "Non-numeric value {:?} in binary operation",

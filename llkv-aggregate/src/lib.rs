@@ -486,42 +486,42 @@ impl AggregateAccumulator {
                     Error::Internal("Sum aggregate requires projection index".into())
                 })?;
                 match (data_type, *distinct) {
-                    (DataType::Int64, true) => Ok(AggregateAccumulator::SumDistinctInt64 {
+                    (&DataType::Int64, true) => Ok(AggregateAccumulator::SumDistinctInt64 {
                         column_index: idx,
                         sum: Some(0),
                         seen: FxHashSet::default(),
                     }),
-                    (DataType::Int64, false) => Ok(AggregateAccumulator::SumInt64 {
+                    (&DataType::Int64, false) => Ok(AggregateAccumulator::SumInt64 {
                         column_index: idx,
                         value: Some(0),
                         has_values: false,
                     }),
-                    (DataType::Decimal128(precision, scale), true) => {
+                    (&DataType::Decimal128(precision, scale), true) => {
                         Ok(AggregateAccumulator::SumDistinctDecimal128 {
                             column_index: idx,
                             sum: 0,
                             seen: FxHashSet::default(),
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
-                    (DataType::Decimal128(precision, scale), false) => {
+                    (&DataType::Decimal128(precision, scale), false) => {
                         Ok(AggregateAccumulator::SumDecimal128 {
                             column_index: idx,
                             sum: 0,
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
-                    (DataType::Float64, true) | (DataType::Utf8, true) => {
+                    (&DataType::Float64, true) | (&DataType::Utf8, true) => {
                         Ok(AggregateAccumulator::SumDistinctFloat64 {
                             column_index: idx,
                             sum: 0.0,
                             seen: FxHashSet::default(),
                         })
                     }
-                    (DataType::Float64, false) | (DataType::Utf8, false) => {
+                    (&DataType::Float64, false) | (&DataType::Utf8, false) => {
                         Ok(AggregateAccumulator::SumFloat64 {
                             column_index: idx,
                             value: 0.0,
@@ -543,41 +543,41 @@ impl AggregateAccumulator {
                     Error::Internal("Total aggregate requires projection index".into())
                 })?;
                 match (data_type, *distinct) {
-                    (DataType::Int64, true) => Ok(AggregateAccumulator::TotalDistinctInt64 {
+                    (&DataType::Int64, true) => Ok(AggregateAccumulator::TotalDistinctInt64 {
                         column_index: idx,
                         sum: 0.0,
                         seen: FxHashSet::default(),
                     }),
-                    (DataType::Int64, false) => Ok(AggregateAccumulator::TotalInt64 {
+                    (&DataType::Int64, false) => Ok(AggregateAccumulator::TotalInt64 {
                         column_index: idx,
                         value: 0.0,
                     }),
-                    (DataType::Decimal128(precision, scale), true) => {
+                    (&DataType::Decimal128(precision, scale), true) => {
                         Ok(AggregateAccumulator::TotalDistinctDecimal128 {
                             column_index: idx,
                             sum: 0,
                             seen: FxHashSet::default(),
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
-                    (DataType::Decimal128(precision, scale), false) => {
+                    (&DataType::Decimal128(precision, scale), false) => {
                         Ok(AggregateAccumulator::TotalDecimal128 {
                             column_index: idx,
                             sum: 0,
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
-                    (DataType::Float64, true) | (DataType::Utf8, true) => {
+                    (&DataType::Float64, true) | (&DataType::Utf8, true) => {
                         Ok(AggregateAccumulator::TotalDistinctFloat64 {
                             column_index: idx,
                             sum: 0.0,
                             seen: FxHashSet::default(),
                         })
                     }
-                    (DataType::Float64, false) | (DataType::Utf8, false) => {
+                    (&DataType::Float64, false) | (&DataType::Utf8, false) => {
                         Ok(AggregateAccumulator::TotalFloat64 {
                             column_index: idx,
                             value: 0.0,
@@ -598,43 +598,43 @@ impl AggregateAccumulator {
                     Error::Internal("Avg aggregate requires projection index".into())
                 })?;
                 match (data_type, *distinct) {
-                    (DataType::Int64, true) => Ok(AggregateAccumulator::AvgDistinctInt64 {
+                    (&DataType::Int64, true) => Ok(AggregateAccumulator::AvgDistinctInt64 {
                         column_index: idx,
                         sum: 0,
                         seen: FxHashSet::default(),
                     }),
-                    (DataType::Int64, false) => Ok(AggregateAccumulator::AvgInt64 {
+                    (&DataType::Int64, false) => Ok(AggregateAccumulator::AvgInt64 {
                         column_index: idx,
                         sum: 0,
                         count: 0,
                     }),
-                    (DataType::Decimal128(precision, scale), true) => {
+                    (&DataType::Decimal128(precision, scale), true) => {
                         Ok(AggregateAccumulator::AvgDistinctDecimal128 {
                             column_index: idx,
                             sum: 0,
                             seen: FxHashSet::default(),
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
-                    (DataType::Decimal128(precision, scale), false) => {
+                    (&DataType::Decimal128(precision, scale), false) => {
                         Ok(AggregateAccumulator::AvgDecimal128 {
                             column_index: idx,
                             sum: 0,
                             count: 0,
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
-                    (DataType::Float64, true) | (DataType::Utf8, true) => {
+                    (&DataType::Float64, true) | (&DataType::Utf8, true) => {
                         Ok(AggregateAccumulator::AvgDistinctFloat64 {
                             column_index: idx,
                             sum: 0.0,
                             seen: FxHashSet::default(),
                         })
                     }
-                    (DataType::Float64, false) | (DataType::Utf8, false) => {
+                    (&DataType::Float64, false) | (&DataType::Utf8, false) => {
                         Ok(AggregateAccumulator::AvgFloat64 {
                             column_index: idx,
                             sum: 0.0,
@@ -652,20 +652,20 @@ impl AggregateAccumulator {
                     Error::Internal("Min aggregate requires projection index".into())
                 })?;
                 match data_type {
-                    DataType::Int64 => Ok(AggregateAccumulator::MinInt64 {
+                    &DataType::Int64 => Ok(AggregateAccumulator::MinInt64 {
                         column_index: idx,
                         value: None,
                     }),
-                    DataType::Decimal128(precision, scale) => {
+                    &DataType::Decimal128(precision, scale) => {
                         Ok(AggregateAccumulator::MinDecimal128 {
                             column_index: idx,
                             value: None,
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
-                    DataType::Float64 | DataType::Utf8 => Ok(AggregateAccumulator::MinFloat64 {
+                    &DataType::Float64 | &DataType::Utf8 => Ok(AggregateAccumulator::MinFloat64 {
                         column_index: idx,
                         value: None,
                     }),
@@ -680,20 +680,20 @@ impl AggregateAccumulator {
                     Error::Internal("Max aggregate requires projection index".into())
                 })?;
                 match data_type {
-                    DataType::Int64 => Ok(AggregateAccumulator::MaxInt64 {
+                    &DataType::Int64 => Ok(AggregateAccumulator::MaxInt64 {
                         column_index: idx,
                         value: None,
                     }),
-                    DataType::Decimal128(precision, scale) => {
+                    &DataType::Decimal128(precision, scale) => {
                         Ok(AggregateAccumulator::MaxDecimal128 {
                             column_index: idx,
                             value: None,
-                            precision: *precision,
-                            scale: *scale,
+                            precision,
+                            scale,
                         })
                     }
                     // For Float64 and Utf8, use Float64 accumulator with numeric coercion
-                    DataType::Float64 | DataType::Utf8 => Ok(AggregateAccumulator::MaxFloat64 {
+                    &DataType::Float64 | &DataType::Utf8 => Ok(AggregateAccumulator::MaxFloat64 {
                         column_index: idx,
                         value: None,
                     }),
