@@ -11038,12 +11038,45 @@ mod tests {
     }
 
     #[test]
-    fn debug_interval_expr_structure() {
+    fn test_interval_expr_structure() {
+        use sqlparser::ast::{BinaryOperator, Expr as SqlExprAst, Query, SetExpr, Statement};
         use sqlparser::dialect::GenericDialect;
+        
         let dialect = GenericDialect {};
         let sql = "SELECT CAST('1998-12-01' AS DATE) - INTERVAL '90' DAY";
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        panic!("{statements:?}");
+        
+        assert_eq!(statements.len(), 1, "expected single statement");
+        
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected Query statement");
+        };
+        
+        let Query { body, .. } = query.as_ref();
+        let SetExpr::Select(select) = body.as_ref() else {
+            panic!("expected Select body");
+        };
+        
+        assert_eq!(select.projection.len(), 1, "expected single projection");
+        
+        // Verify the projection is a BinaryOp with Minus operator and Interval on the right
+        match &select.projection[0] {
+            sqlparser::ast::SelectItem::UnnamedExpr(SqlExprAst::BinaryOp { left, op, right }) => {
+                // Left side should be a CAST expression
+                assert!(matches!(left.as_ref(), SqlExprAst::Cast { .. }), "expected CAST on left");
+                
+                // Operator should be Minus
+                assert_eq!(*op, BinaryOperator::Minus, "expected Minus operator");
+                
+                // Right side should be an Interval
+                assert!(matches!(right.as_ref(), SqlExprAst::Interval(_)), "expected Interval on right");
+                
+                if let SqlExprAst::Interval(interval) = right.as_ref() {
+                    assert_eq!(interval.leading_field, Some(sqlparser::ast::DateTimeField::Day));
+                }
+            }
+            other => panic!("unexpected projection structure: {other:?}"),
+        }
     }
 
     #[test]
