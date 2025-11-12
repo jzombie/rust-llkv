@@ -13,6 +13,11 @@ const DEFAULT_SCALE_FACTOR: f64 = 0.01;
 const DEFAULT_BATCH_SIZE: usize = 500;
 
 fn main() {
+    // Initialize tracing subscriber to respect RUST_LOG environment variable
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     if let Err(err) = run() {
         tracing::debug!("tpch bootstrap failed: {err}");
         process::exit(1);

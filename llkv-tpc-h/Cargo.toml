@@ -16,4 +16,5 @@ regex.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tpchgen = "2.0.1"
