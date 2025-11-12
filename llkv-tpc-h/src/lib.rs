@@ -883,6 +883,7 @@ fn build_table_infos(
         .collect()
 }
 
+// TODO: Dedupe; this should be solely in llkv-sql
 fn strip_connect_statements(sql: &str) -> String {
     Regex::new(r#"(?im)^\s*CONNECT\s+TO\s+(?:[A-Za-z0-9_]+|'[^']+'|"[^"]+")\s*;\s*"#)
         .expect("valid CONNECT removal regex")
