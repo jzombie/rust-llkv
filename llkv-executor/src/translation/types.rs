@@ -42,7 +42,10 @@ pub fn sql_type_to_arrow(type_str: &str) -> Result<DataType> {
     let (base_type, params) = if let Some(paren_pos) = normalized.find('(') {
         let base = &normalized[..paren_pos];
         let end_paren = normalized.find(')').ok_or_else(|| {
-            Error::InvalidArgumentError(format!("missing closing parenthesis in type: '{}'", type_str))
+            Error::InvalidArgumentError(format!(
+                "missing closing parenthesis in type: '{}'",
+                type_str
+            ))
         })?;
         let params = &normalized[paren_pos + 1..end_paren];
         (base, Some(params))
@@ -75,20 +78,21 @@ pub fn sql_type_to_arrow(type_str: &str) -> Result<DataType> {
 /// Parse DECIMAL(precision, scale) parameters.
 fn parse_decimal_params(params: &str) -> Result<DataType> {
     let parts: Vec<&str> = params.split(',').map(|s| s.trim()).collect();
-    
+
     match parts.len() {
         1 => {
             // DECIMAL(p) means scale = 0
             let precision = parts[0].parse::<u8>().map_err(|_| {
                 Error::InvalidArgumentError(format!("invalid DECIMAL precision: '{}'", parts[0]))
             })?;
-            
+
             if precision == 0 || precision > 38 {
                 return Err(Error::InvalidArgumentError(format!(
-                    "DECIMAL precision must be between 1 and 38, got: {}", precision
+                    "DECIMAL precision must be between 1 and 38, got: {}",
+                    precision
                 )));
             }
-            
+
             Ok(DataType::Decimal128(precision, 0))
         }
         2 => {
@@ -99,23 +103,26 @@ fn parse_decimal_params(params: &str) -> Result<DataType> {
             let scale = parts[1].parse::<i8>().map_err(|_| {
                 Error::InvalidArgumentError(format!("invalid DECIMAL scale: '{}'", parts[1]))
             })?;
-            
+
             if precision == 0 || precision > 38 {
                 return Err(Error::InvalidArgumentError(format!(
-                    "DECIMAL precision must be between 1 and 38, got: {}", precision
+                    "DECIMAL precision must be between 1 and 38, got: {}",
+                    precision
                 )));
             }
-            
+
             if scale < 0 || scale as u8 > precision {
                 return Err(Error::InvalidArgumentError(format!(
-                    "DECIMAL scale must be between 0 and precision ({}), got: {}", precision, scale
+                    "DECIMAL scale must be between 0 and precision ({}), got: {}",
+                    precision, scale
                 )));
             }
-            
+
             Ok(DataType::Decimal128(precision, scale))
         }
         _ => Err(Error::InvalidArgumentError(format!(
-            "invalid DECIMAL parameters: expected (precision) or (precision, scale), got: '{}'", params
+            "invalid DECIMAL parameters: expected (precision) or (precision, scale), got: '{}'",
+            params
         ))),
     }
 }
@@ -152,22 +159,49 @@ mod tests {
     #[test]
     fn test_decimal_types() {
         // Default DECIMAL without parameters
-        assert_eq!(sql_type_to_arrow("DECIMAL").unwrap(), DataType::Decimal128(38, 10));
-        assert_eq!(sql_type_to_arrow("NUMERIC").unwrap(), DataType::Decimal128(38, 10));
-        
+        assert_eq!(
+            sql_type_to_arrow("DECIMAL").unwrap(),
+            DataType::Decimal128(38, 10)
+        );
+        assert_eq!(
+            sql_type_to_arrow("NUMERIC").unwrap(),
+            DataType::Decimal128(38, 10)
+        );
+
         // DECIMAL with precision only
-        assert_eq!(sql_type_to_arrow("DECIMAL(10)").unwrap(), DataType::Decimal128(10, 0));
-        assert_eq!(sql_type_to_arrow("NUMERIC(15)").unwrap(), DataType::Decimal128(15, 0));
-        
+        assert_eq!(
+            sql_type_to_arrow("DECIMAL(10)").unwrap(),
+            DataType::Decimal128(10, 0)
+        );
+        assert_eq!(
+            sql_type_to_arrow("NUMERIC(15)").unwrap(),
+            DataType::Decimal128(15, 0)
+        );
+
         // DECIMAL with precision and scale
-        assert_eq!(sql_type_to_arrow("DECIMAL(10,2)").unwrap(), DataType::Decimal128(10, 2));
-        assert_eq!(sql_type_to_arrow("NUMERIC(18,4)").unwrap(), DataType::Decimal128(18, 4));
-        assert_eq!(sql_type_to_arrow("DECIMAL(38,10)").unwrap(), DataType::Decimal128(38, 10));
-        
+        assert_eq!(
+            sql_type_to_arrow("DECIMAL(10,2)").unwrap(),
+            DataType::Decimal128(10, 2)
+        );
+        assert_eq!(
+            sql_type_to_arrow("NUMERIC(18,4)").unwrap(),
+            DataType::Decimal128(18, 4)
+        );
+        assert_eq!(
+            sql_type_to_arrow("DECIMAL(38,10)").unwrap(),
+            DataType::Decimal128(38, 10)
+        );
+
         // With whitespace
-        assert_eq!(sql_type_to_arrow("DECIMAL(10, 2)").unwrap(), DataType::Decimal128(10, 2));
-        assert_eq!(sql_type_to_arrow("DECIMAL( 10 , 2 )").unwrap(), DataType::Decimal128(10, 2));
-        
+        assert_eq!(
+            sql_type_to_arrow("DECIMAL(10, 2)").unwrap(),
+            DataType::Decimal128(10, 2)
+        );
+        assert_eq!(
+            sql_type_to_arrow("DECIMAL( 10 , 2 )").unwrap(),
+            DataType::Decimal128(10, 2)
+        );
+
         // Invalid cases
         assert!(sql_type_to_arrow("DECIMAL(0)").is_err()); // precision must be >= 1
         assert!(sql_type_to_arrow("DECIMAL(39)").is_err()); // precision must be <= 38

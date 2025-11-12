@@ -3483,22 +3483,22 @@ impl SqlEngine {
             }
         }
 
-        if let Some(limit) = extract_limit_count(query)? {
-            if limit < working_batch.num_rows() {
-                let indices: Vec<u32> = (0..limit as u32).collect();
-                let take_indices = UInt32Array::from(indices);
-                let limited_columns: Result<Vec<ArrayRef>, _> = working_batch
-                    .columns()
-                    .iter()
-                    .map(|col| take(col.as_ref(), &take_indices, None))
-                    .collect();
-                working_batch = RecordBatch::try_new(
-                    Arc::clone(&working_schema),
-                    limited_columns
-                        .map_err(|e| Error::Internal(format!("failed to apply limit: {}", e)))?,
-                )
-                .map_err(|e| Error::Internal(format!("failed to create limited batch: {}", e)))?;
-            }
+        if let Some(limit) = extract_limit_count(query)?
+            && limit < working_batch.num_rows()
+        {
+            let indices: Vec<u32> = (0..limit as u32).collect();
+            let take_indices = UInt32Array::from(indices);
+            let limited_columns: Result<Vec<ArrayRef>, _> = working_batch
+                .columns()
+                .iter()
+                .map(|col| take(col.as_ref(), &take_indices, None))
+                .collect();
+            working_batch = RecordBatch::try_new(
+                Arc::clone(&working_schema),
+                limited_columns
+                    .map_err(|e| Error::Internal(format!("failed to apply limit: {}", e)))?,
+            )
+            .map_err(|e| Error::Internal(format!("failed to create limited batch: {}", e)))?;
         }
 
         let execution = SelectExecution::new_single_batch(
@@ -3517,7 +3517,7 @@ impl SqlEngine {
     fn build_information_schema_tables_view(&self) -> SqlResult<InlineView> {
         let context = self.engine.context();
         let mut table_names = context.catalog().table_names();
-        table_names.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        table_names.sort_by_key(|a| a.to_ascii_lowercase());
 
         let mut view = InlineView::new(vec![
             InlineColumn::utf8("table_schema", true),
@@ -3543,7 +3543,7 @@ impl SqlEngine {
         let context = self.engine.context();
         let catalog = context.catalog();
         let mut table_names = catalog.table_names();
-        table_names.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        table_names.sort_by_key(|a| a.to_ascii_lowercase());
 
         let mut view = InlineView::new(vec![
             InlineColumn::utf8("table_schema", true),
@@ -7998,19 +7998,18 @@ fn evaluate_scalar(
     }
 }
 
-fn resolve_identifier_from_parts<'a>(parts: &'a [Ident], alias: Option<&str>) -> Option<String> {
+fn resolve_identifier_from_parts(parts: &[Ident], alias: Option<&str>) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
     if parts.len() == 1 {
         return Some(parts[0].value.clone());
     }
-    if parts.len() == 2 {
-        if let Some(alias_name) = alias {
-            if alias_name.eq_ignore_ascii_case(&parts[0].value) {
-                return Some(parts[1].value.clone());
-            }
-        }
+    if parts.len() == 2
+        && let Some(alias_name) = alias
+        && alias_name.eq_ignore_ascii_case(&parts[0].value)
+    {
+        return Some(parts[1].value.clone());
     }
     parts.last().map(|ident| ident.value.clone())
 }
@@ -10062,13 +10061,10 @@ fn translate_scalar_internal(
                                     .push(llkv_expr::expr::ScalarExpr::literal(Literal::Null));
                             }
                             Literal::Decimal(value) => {
-                                let negated_raw = value
-                                    .raw_value()
-                                    .checked_neg()
-                                    .ok_or_else(|| {
+                                let negated_raw =
+                                    value.raw_value().checked_neg().ok_or_else(|| {
                                         Error::InvalidArgumentError(
-                                            "decimal overflow when applying unary minus"
-                                                .into(),
+                                            "decimal overflow when applying unary minus".into(),
                                         )
                                     })?;
                                 let negated = DecimalValue::new(negated_raw, value.scale())
@@ -11041,38 +11037,47 @@ mod tests {
     fn test_interval_expr_structure() {
         use sqlparser::ast::{BinaryOperator, Expr as SqlExprAst, Query, SetExpr, Statement};
         use sqlparser::dialect::GenericDialect;
-        
+
         let dialect = GenericDialect {};
         let sql = "SELECT CAST('1998-12-01' AS DATE) - INTERVAL '90' DAY";
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
-        
+
         assert_eq!(statements.len(), 1, "expected single statement");
-        
+
         let Statement::Query(query) = &statements[0] else {
             panic!("expected Query statement");
         };
-        
+
         let Query { body, .. } = query.as_ref();
         let SetExpr::Select(select) = body.as_ref() else {
             panic!("expected Select body");
         };
-        
+
         assert_eq!(select.projection.len(), 1, "expected single projection");
-        
+
         // Verify the projection is a BinaryOp with Minus operator and Interval on the right
         match &select.projection[0] {
             sqlparser::ast::SelectItem::UnnamedExpr(SqlExprAst::BinaryOp { left, op, right }) => {
                 // Left side should be a CAST expression
-                assert!(matches!(left.as_ref(), SqlExprAst::Cast { .. }), "expected CAST on left");
-                
+                assert!(
+                    matches!(left.as_ref(), SqlExprAst::Cast { .. }),
+                    "expected CAST on left"
+                );
+
                 // Operator should be Minus
                 assert_eq!(*op, BinaryOperator::Minus, "expected Minus operator");
-                
+
                 // Right side should be an Interval
-                assert!(matches!(right.as_ref(), SqlExprAst::Interval(_)), "expected Interval on right");
-                
+                assert!(
+                    matches!(right.as_ref(), SqlExprAst::Interval(_)),
+                    "expected Interval on right"
+                );
+
                 if let SqlExprAst::Interval(interval) = right.as_ref() {
-                    assert_eq!(interval.leading_field, Some(sqlparser::ast::DateTimeField::Day));
+                    assert_eq!(
+                        interval.leading_field,
+                        Some(sqlparser::ast::DateTimeField::Day)
+                    );
                 }
             }
             other => panic!("unexpected projection structure: {other:?}"),

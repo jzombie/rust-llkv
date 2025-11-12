@@ -54,18 +54,13 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
             PlanValue::Decimal(value) => {
-                let negated = value
-                    .raw_value()
-                    .checked_neg()
-                    .ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "decimal literal overflow when applying unary minus".into(),
-                        )
-                    })?;
+                let negated = value.raw_value().checked_neg().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "decimal literal overflow when applying unary minus".into(),
+                    )
+                })?;
                 let decimal = DecimalValue::new(negated, value.scale()).map_err(|err| {
-                    Error::InvalidArgumentError(format!(
-                        "failed to negate decimal literal: {err}"
-                    ))
+                    Error::InvalidArgumentError(format!("failed to negate decimal literal: {err}"))
                 })?;
                 Ok(PlanValue::Decimal(decimal))
             }

@@ -3,10 +3,7 @@
 use crate::utils::date::parse_date32_literal;
 use crate::utils::interval::interval_value_to_arrow;
 use crate::utils::{
-    align_decimal_to_scale,
-    decimal_from_f64,
-    decimal_from_i64,
-    decimal_truthy,
+    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
     truncate_decimal_to_i64,
 };
 use arrow::array::{
@@ -70,7 +67,11 @@ pub fn normalize_insert_value_for_column(
             Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 }))
         }
         (DataType::Boolean, PlanValue::Decimal(decimal)) => {
-            Ok(PlanValue::Integer(if decimal_truthy(decimal) { 1 } else { 0 }))
+            Ok(PlanValue::Integer(if decimal_truthy(decimal) {
+                1
+            } else {
+                0
+            }))
         }
         (DataType::Boolean, PlanValue::String(s)) => {
             let normalized = s.trim().to_ascii_lowercase();
@@ -92,18 +93,14 @@ pub fn normalize_insert_value_for_column(
         ))),
         (DataType::Float64, PlanValue::Integer(v)) => Ok(PlanValue::Float(v as f64)),
         (DataType::Float64, PlanValue::Float(v)) => Ok(PlanValue::Float(v)),
-        (DataType::Float64, PlanValue::Decimal(decimal)) => {
-            Ok(PlanValue::Float(decimal.to_f64()))
-        }
+        (DataType::Float64, PlanValue::Decimal(decimal)) => Ok(PlanValue::Float(decimal.to_f64())),
         (DataType::Float64, other) => Err(Error::InvalidArgumentError(format!(
             "cannot insert {other:?} into DOUBLE column '{}'",
             column.name
         ))),
         (DataType::Utf8, PlanValue::Integer(v)) => Ok(PlanValue::String(v.to_string())),
         (DataType::Utf8, PlanValue::Float(v)) => Ok(PlanValue::String(v.to_string())),
-        (DataType::Utf8, PlanValue::Decimal(decimal)) => {
-            Ok(PlanValue::String(decimal.to_string()))
-        }
+        (DataType::Utf8, PlanValue::Decimal(decimal)) => Ok(PlanValue::String(decimal.to_string())),
         (DataType::Utf8, PlanValue::String(s)) => Ok(PlanValue::String(s)),
         (DataType::Utf8, PlanValue::Struct(_)) => Err(Error::InvalidArgumentError(format!(
             "cannot insert struct into STRING column '{}'",
@@ -394,9 +391,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
 
             let array = Decimal128Array::from_iter(raw_values.into_iter())
                 .with_precision_and_scale(*precision, *scale)
-                .map_err(|err| Error::InvalidArgumentError(format!(
-                    "failed to build Decimal128 array: {err}"
-                )))?;
+                .map_err(|err| {
+                    Error::InvalidArgumentError(format!("failed to build Decimal128 array: {err}"))
+                })?;
             Ok(Arc::new(array) as ArrayRef)
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {

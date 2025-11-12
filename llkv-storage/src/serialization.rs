@@ -139,7 +139,7 @@ enum Layout {
 ///
 /// Using `num_enum` gives zero-cost Into/TryFrom conversions and avoids
 /// manual matches for u8 <-> enum mapping.
-/// 
+///
 /// NOTE: Decimal128 stores precision and scale inline as the next two bytes after the type tag.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, IntoPrimitive, TryFromPrimitive)]
@@ -273,7 +273,7 @@ fn serialize_primitive(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
     out.extend_from_slice(&MAGIC);
     out.push(Layout::Primitive as u8);
     out.push(u8::from(code));
-    
+
     // For Decimal128, store precision and scale in the 2 padding bytes
     // For other types, use zeros as before
     match code {
@@ -290,7 +290,7 @@ fn serialize_primitive(arr: &dyn Array, code: PrimType) -> Result<Vec<u8>> {
             out.extend_from_slice(&[0u8; 2]);
         }
     }
-    
+
     write_u64_le(&mut out, len);
     write_u32_le(&mut out, values_len);
     write_u32_le(&mut out, 0);
@@ -436,7 +436,7 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
     let layout = raw[4];
     let type_code = raw[5];
     let precision = raw[6]; // Used for Decimal128
-    let scale = raw[7];     // Used for Decimal128
+    let scale = raw[7]; // Used for Decimal128
 
     let mut o = 8usize;
     let len = read_u64_le(raw, &mut o) as usize;
@@ -460,7 +460,7 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
             // Decimal128 requires 16-byte alignment. If the buffer isn't aligned, copy it.
             let buffer = if matches!(data_type, DataType::Decimal128(_, _)) {
                 let ptr = payload.as_ptr();
-                if ptr as usize % 16 != 0 {
+                if !(ptr as usize).is_multiple_of(16) {
                     // Buffer is not 16-byte aligned, need to copy to aligned buffer
                     let mut aligned_vec = Vec::with_capacity(payload.len());
                     aligned_vec.extend_from_slice(&payload);

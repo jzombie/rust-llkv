@@ -627,7 +627,7 @@ pub(crate) fn gather_rows_single_shot_decimal128(
         _ => {
             return Err(Error::Internal(
                 "gather_rows_single_shot_decimal128: expected Decimal128 dtype".into(),
-            ))
+            ));
         }
     };
 
@@ -1428,7 +1428,7 @@ pub(crate) fn gather_rows_from_chunks_decimal128(
         _ => {
             return Err(Error::Internal(
                 "gather_rows_from_chunks_decimal128: expected Decimal128 dtype".into(),
-            ))
+            ));
         }
     };
 

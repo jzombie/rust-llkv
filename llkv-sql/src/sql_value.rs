@@ -45,7 +45,12 @@ impl SqlValue {
                     // Negate the raw i128 value while preserving scale
                     DecimalValue::new(-dec.raw_value(), dec.scale())
                         .map(SqlValue::Decimal)
-                        .map_err(|err| Error::InvalidArgumentError(format!("decimal negation overflow: {}", err)))
+                        .map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "decimal negation overflow: {}",
+                                err
+                            ))
+                        })
                 }
                 SqlValue::Interval(interval) => interval
                     .checked_neg()
@@ -183,28 +188,28 @@ fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
     if let Some(dot_pos) = text.find('.') {
         let integer_part = &text[..dot_pos];
         let fractional_part = &text[dot_pos + 1..];
-        
+
         // Parse the number as i128 by removing the decimal point
         let combined = format!("{}{}", integer_part, fractional_part);
         let raw_value = combined.parse::<i128>().map_err(|err| {
             Error::InvalidArgumentError(format!("invalid decimal literal: {err}"))
         })?;
-        
+
         // Scale is the number of digits after the decimal point
         let scale = fractional_part.len() as i8;
-        
+
         // Create DecimalValue
         let decimal = DecimalValue::new(raw_value, scale).map_err(|err| {
             Error::InvalidArgumentError(format!("invalid decimal literal: {}", err))
         })?;
-        
+
         return Ok(SqlValue::Decimal(decimal));
     }
 
     // No decimal point → integer
-    let value = text.parse::<i64>().map_err(|err| {
-        Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
-    })?;
+    let value = text
+        .parse::<i64>()
+        .map_err(|err| Error::InvalidArgumentError(format!("invalid integer literal: {err}")))?;
     Ok(SqlValue::Integer(value))
 }
 

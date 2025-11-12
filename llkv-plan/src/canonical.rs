@@ -86,12 +86,7 @@ impl CanonicalScalar {
                         )
                     })?;
                 let raw = values.value(row_idx);
-                let scale_i8 = i8::try_from(*scale).map_err(|_| {
-                    Error::InvalidArgumentError(format!(
-                        "decimal scale {scale} exceeds i8 bounds when building canonical scalar"
-                    ))
-                })?;
-                let decimal = DecimalValue::new(raw, scale_i8).map_err(|err| {
+                let decimal = DecimalValue::new(raw, *scale).map_err(|err| {
                     Error::InvalidArgumentError(format!(
                         "failed to build canonical decimal scalar: {err}"
                     ))

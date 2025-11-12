@@ -77,11 +77,11 @@ pub fn render_tpch_query(
 
     qualify_statements(&mut statements, schema);
 
-    if let Some(limit) = template.row_limit {
-        if limit > 0 {
-            apply_limit_to_last_query(&mut statements, limit)
-                .map_err(|reason| TpchError::Parse(format!("query {number}: {reason}")))?;
-        }
+    if let Some(limit) = template.row_limit
+        && limit > 0
+    {
+        apply_limit_to_last_query(&mut statements, limit)
+            .map_err(|reason| TpchError::Parse(format!("query {number}: {reason}")))?;
     }
 
     let statements = statements
@@ -173,10 +173,10 @@ fn collect_numeric_placeholders(sql: &str) -> BTreeSet<usize> {
     let regex = NUMERIC_PLACEHOLDER_RE.get_or_init(|| Regex::new(r":(\d+)").expect("valid regex"));
     let mut placeholders = BTreeSet::new();
     for captures in regex.captures_iter(sql) {
-        if let Some(matched) = captures.get(1) {
-            if let Ok(index) = matched.as_str().parse::<usize>() {
-                placeholders.insert(index);
-            }
+        if let Some(matched) = captures.get(1)
+            && let Ok(index) = matched.as_str().parse::<usize>()
+        {
+            placeholders.insert(index);
         }
     }
     placeholders
@@ -277,7 +277,7 @@ fn normalize_typed_string_literals(mut sql: String) -> String {
 }
 
 fn apply_limit_to_last_query(
-    statements: &mut Vec<Statement>,
+    statements: &mut [Statement],
     limit: usize,
 ) -> std::result::Result<(), String> {
     let Some(Statement::Query(query)) = statements
@@ -345,10 +345,10 @@ fn qualify_object_name(name: &mut ObjectName, schema: &str) {
     if name.0.len() > 1 {
         return;
     }
-    if let Some(ObjectNamePart::Identifier(existing)) = name.0.first() {
-        if existing.value.eq_ignore_ascii_case(schema) {
-            return;
-        }
+    if let Some(ObjectNamePart::Identifier(existing)) = name.0.first()
+        && existing.value.eq_ignore_ascii_case(schema)
+    {
+        return;
     }
     name.0
         .insert(0, ObjectNamePart::Identifier(Ident::new(schema)));

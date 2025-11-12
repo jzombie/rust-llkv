@@ -30,10 +30,10 @@ use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::SubqueryId;
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
 };
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::Literal;
 use llkv_expr::typed_predicate::{
     build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -84,12 +84,8 @@ use crate::utils::interval::{
     compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
 };
 use crate::utils::{
-    align_decimal_to_scale,
-    decimal_from_f64,
-    decimal_from_i64,
-    decimal_truthy,
-    format_date32_literal,
-    parse_date32_literal,
+    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
+    format_date32_literal, parse_date32_literal,
 };
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
@@ -325,7 +321,10 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
             let mut builder = Decimal128Array::builder(values.len())
                 .with_precision_and_scale(precision, scale)
                 .map_err(|e| {
-                    Error::InvalidArgumentError(format!("invalid Decimal128 precision/scale: {}", e))
+                    Error::InvalidArgumentError(format!(
+                        "invalid Decimal128 precision/scale: {}",
+                        e
+                    ))
                 })?;
             for v in values {
                 match v {
@@ -334,7 +333,7 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
                     other => {
                         return Err(Error::InvalidArgumentError(format!(
                             "expected DECIMAL plan value, found {other:?}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -2307,7 +2306,9 @@ where
                                 )));
                                 let array = Decimal128Array::from(vec![Some(*value)])
                                     .with_precision_and_scale(precision, *scale)
-                                    .map_err(|e| Error::Internal(format!("invalid Decimal128: {}", e)))?;
+                                    .map_err(|e| {
+                                        Error::Internal(format!("invalid Decimal128: {}", e))
+                                    })?;
                                 arrays.push(Arc::new(array) as ArrayRef);
                             }
                             AggregateValue::String(s) => {
@@ -2705,7 +2706,7 @@ where
                 } else {
                     AggregateValue::Decimal128 {
                         value: decimal_array.value(0),
-                        scale: decimal_array.scale() as i8,
+                        scale: decimal_array.scale(),
                     }
                 };
                 results.insert(field.name().to_string(), value);
@@ -3720,9 +3721,9 @@ where
         // If it's a simple aggregate, return its result type
         if let ScalarExpr::Aggregate(agg_call) = expr {
             return match agg_call {
-                AggregateCall::CountStar | AggregateCall::Count { .. } | AggregateCall::CountNulls(_) => {
-                    Some(DataType::Int64)
-                }
+                AggregateCall::CountStar
+                | AggregateCall::Count { .. }
+                | AggregateCall::CountNulls(_) => Some(DataType::Int64),
                 AggregateCall::Sum { expr: agg_expr, .. }
                 | AggregateCall::Total { expr: agg_expr, .. }
                 | AggregateCall::Avg { expr: agg_expr, .. }
@@ -3737,13 +3738,15 @@ where
                         // For SUM/TOTAL/AVG of decimal expressions, the result can grow beyond the sample value
                         if sample_batch.num_rows() > 0 {
                             let mut computed_values = Vec::new();
-                            if let Ok(value) = Self::evaluate_expr_with_plan_value_aggregates_and_row(
-                                agg_expr,
-                                &FxHashMap::default(),
-                                Some(sample_batch),
-                                Some(column_lookup_map),
-                                0,
-                            ) {
+                            if let Ok(value) =
+                                Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                                    agg_expr,
+                                    &FxHashMap::default(),
+                                    Some(sample_batch),
+                                    Some(column_lookup_map),
+                                    0,
+                                )
+                            {
                                 computed_values.push(value);
                                 if let Ok(array) = plan_values_to_arrow_array(&computed_values) {
                                     match array.data_type() {
@@ -3842,7 +3845,8 @@ where
                         base_schema,
                         column_lookup_map,
                         _sample_batch,
-                    ).unwrap_or(DataType::Float64);
+                    )
+                    .unwrap_or(DataType::Float64);
                     let field = Field::new(alias.clone(), inferred_type, true);
                     columns.push(OutputColumn {
                         field,
@@ -4686,7 +4690,9 @@ where
                                     ));
                                     let array = Decimal128Array::from(vec![Some(*value)])
                                         .with_precision_and_scale(precision, *scale)
-                                        .map_err(|e| Error::Internal(format!("invalid Decimal128: {}", e)))?;
+                                        .map_err(|e| {
+                                            Error::Internal(format!("invalid Decimal128: {}", e))
+                                        })?;
                                     arrays.push(Arc::new(array) as ArrayRef);
                                 }
                                 AggregateValue::String(s) => {
@@ -5507,8 +5513,9 @@ where
                     AggregateValue::String(string_array.value(0).to_string())
                 };
                 results.insert(alias, value);
-            } else if let Some(decimal_array) =
-                array.as_any().downcast_ref::<arrow::array::Decimal128Array>()
+            } else if let Some(decimal_array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
             {
                 if decimal_array.len() != 1 {
                     return Err(Error::Internal(format!(
@@ -5521,7 +5528,7 @@ where
                 } else {
                     AggregateValue::Decimal128 {
                         value: decimal_array.value(0),
-                        scale: decimal_array.scale() as i8,
+                        scale: decimal_array.scale(),
                     }
                 };
                 results.insert(alias, value);
@@ -6149,18 +6156,22 @@ where
                                         e
                                     ))
                                 })?,
-                                BinaryOp::Subtract => left_dec.checked_sub(right_dec).map_err(|e| {
-                                    Error::InvalidArgumentError(format!(
-                                        "Decimal subtraction overflow: {}",
-                                        e
-                                    ))
-                                })?,
-                                BinaryOp::Multiply => left_dec.checked_mul(right_dec).map_err(|e| {
-                                    Error::InvalidArgumentError(format!(
-                                        "Decimal multiplication overflow: {}",
-                                        e
-                                    ))
-                                })?,
+                                BinaryOp::Subtract => {
+                                    left_dec.checked_sub(right_dec).map_err(|e| {
+                                        Error::InvalidArgumentError(format!(
+                                            "Decimal subtraction overflow: {}",
+                                            e
+                                        ))
+                                    })?
+                                }
+                                BinaryOp::Multiply => {
+                                    left_dec.checked_mul(right_dec).map_err(|e| {
+                                        Error::InvalidArgumentError(format!(
+                                            "Decimal multiplication overflow: {}",
+                                            e
+                                        ))
+                                    })?
+                                }
                                 BinaryOp::Divide => {
                                     // Check for division by zero first
                                     if right_dec.raw_value() == 0 {
@@ -6168,14 +6179,12 @@ where
                                     }
                                     // For division, preserve scale of left operand
                                     let target_scale = left_dec.scale();
-                                    left_dec
-                                        .checked_div(right_dec, target_scale)
-                                        .map_err(|e| {
-                                            Error::InvalidArgumentError(format!(
-                                                "Decimal division error: {}",
-                                                e
-                                            ))
-                                        })?
+                                    left_dec.checked_div(right_dec, target_scale).map_err(|e| {
+                                        Error::InvalidArgumentError(format!(
+                                            "Decimal division error: {}",
+                                            e
+                                        ))
+                                    })?
                                 }
                                 BinaryOp::Modulo => {
                                     return Err(Error::InvalidArgumentError(
@@ -6953,7 +6962,7 @@ fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<Ar
             Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
         }
         Literal::Decimal(value) => {
-            let iter = std::iter::repeat(value.raw_value()).take(len);
+            let iter = std::iter::repeat_n(value.raw_value(), len);
             let array = Decimal128Array::from_iter_values(iter)
                 .with_precision_and_scale(value.precision(), value.scale())
                 .map_err(|err| {
@@ -8590,10 +8599,7 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     fn literal_to_i128_from_integer_like(literal: &Literal) -> Option<i128> {
         match literal {
             Literal::Integer(value) => Some(*value),
-            Literal::Decimal(value) => value
-                .rescale(0)
-                .ok()
-                .map(|integral| integral.raw_value()),
+            Literal::Decimal(value) => value.rescale(0).ok().map(|integral| integral.raw_value()),
             Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
             Literal::Date32(value) => Some(*value as i128),
             _ => None,
@@ -8647,10 +8653,7 @@ fn literal_to_i128(literal: &Literal) -> Option<i128> {
     match literal {
         Literal::Integer(value) => Some(*value),
         Literal::Float(value) => Some(*value as i128),
-        Literal::Decimal(value) => value
-            .rescale(0)
-            .ok()
-            .map(|integral| integral.raw_value()),
+        Literal::Decimal(value) => value.rescale(0).ok().map(|integral| integral.raw_value()),
         Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
         Literal::Date32(value) => Some(*value as i128),
         _ => None,
@@ -8814,11 +8817,7 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
     }
 }
 
-fn literal_to_decimal_literal(
-    literal: &Literal,
-    precision: u8,
-    scale: i8,
-) -> Option<Literal> {
+fn literal_to_decimal_literal(literal: &Literal, precision: u8, scale: i8) -> Option<Literal> {
     match literal {
         Literal::Decimal(value) => align_decimal_to_scale(*value, precision, scale)
             .ok()
@@ -9323,13 +9322,8 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| Error::Internal("failed to downcast decimal128 array".into()))?;
-            let scale_i8 = i8::try_from(*scale).map_err(|_| {
-                Error::InvalidArgumentError(format!(
-                    "decimal scale {scale} exceeds supported range"
-                ))
-            })?;
             let raw = array.value(idx);
-            let decimal = DecimalValue::new(raw, scale_i8).map_err(|err| {
+            let decimal = DecimalValue::new(raw, *scale).map_err(|err| {
                 Error::InvalidArgumentError(format!("invalid decimal value: {err}"))
             })?;
             Ok(Literal::Decimal(decimal))
@@ -10392,9 +10386,7 @@ fn build_comparison_mask(column: &dyn Array, value: &PlanValue) -> ExecutorResul
                                 "invalid decimal value stored in column: {err}"
                             ))
                         })?;
-                        builder.append_value(
-                            actual.raw_value() == expected_aligned.raw_value(),
-                        );
+                        builder.append_value(actual.raw_value() == expected_aligned.raw_value());
                     }
                 }
                 Ok(builder.finish())
@@ -10540,11 +10532,7 @@ fn array_value_equals_plan_value(
                     return Ok(false);
                 }
                 if let Some(int_value) = decimal_exact_i64(*expected) {
-                    array_value_equals_plan_value(
-                        array,
-                        row_idx,
-                        &PlanValue::Integer(int_value),
-                    )
+                    array_value_equals_plan_value(array, row_idx, &PlanValue::Integer(int_value))
                 } else {
                     Ok(false)
                 }
@@ -10553,22 +10541,14 @@ fn array_value_equals_plan_value(
                 if array.is_null(row_idx) {
                     return Ok(false);
                 }
-                array_value_equals_plan_value(
-                    array,
-                    row_idx,
-                    &PlanValue::Float(expected.to_f64()),
-                )
+                array_value_equals_plan_value(array, row_idx, &PlanValue::Float(expected.to_f64()))
             }
             DataType::Boolean => {
                 if array.is_null(row_idx) {
                     return Ok(false);
                 }
                 if let Some(int_value) = decimal_exact_i64(*expected) {
-                    array_value_equals_plan_value(
-                        array,
-                        row_idx,
-                        &PlanValue::Integer(int_value),
-                    )
+                    array_value_equals_plan_value(array, row_idx, &PlanValue::Integer(int_value))
                 } else {
                     Ok(false)
                 }

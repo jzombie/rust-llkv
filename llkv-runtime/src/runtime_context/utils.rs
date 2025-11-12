@@ -14,10 +14,7 @@ use arrow::datatypes::{DataType, IntervalUnit};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::utils::{
-    align_decimal_to_scale,
-    decimal_truthy,
-    parse_date32_literal,
-    truncate_decimal_to_i64,
+    align_decimal_to_scale, decimal_truthy, parse_date32_literal, truncate_decimal_to_i64,
 };
 use llkv_executor::{ExecutorColumn, ExecutorTable, translation};
 use llkv_plan::PlanValue;

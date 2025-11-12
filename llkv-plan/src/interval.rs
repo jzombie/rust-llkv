@@ -44,12 +44,12 @@ pub fn parse_interval_literal(interval: &SqlInterval) -> Result<IntervalValue> {
     let leading = interval.leading_field.as_ref().map(map_field).transpose()?;
     let last = interval.last_field.as_ref().map(map_field).transpose()?;
 
-    if let (Some(leading_unit), Some(last_unit)) = (leading, last) {
-        if leading_unit.rank() > last_unit.rank() {
-            return Err(Error::InvalidArgumentError(format!(
-                "invalid interval field order: {leading_unit:?} TO {last_unit:?}"
-            )));
-        }
+    if let (Some(leading_unit), Some(last_unit)) = (leading, last)
+        && leading_unit.rank() > last_unit.rank()
+    {
+        return Err(Error::InvalidArgumentError(format!(
+            "invalid interval field order: {leading_unit:?} TO {last_unit:?}"
+        )));
     }
 
     if leading.is_none() && interval.leading_precision.is_some() {
@@ -58,12 +58,13 @@ pub fn parse_interval_literal(interval: &SqlInterval) -> Result<IntervalValue> {
         ));
     }
 
-    if let Some(unit) = leading {
-        if unit != IntervalUnit::Second && interval.fractional_seconds_precision.is_some() {
-            return Err(Error::InvalidArgumentError(
-                "fractional seconds precision only applies to SECOND intervals".into(),
-            ));
-        }
+    if let Some(unit) = leading
+        && unit != IntervalUnit::Second
+        && interval.fractional_seconds_precision.is_some()
+    {
+        return Err(Error::InvalidArgumentError(
+            "fractional seconds precision only applies to SECOND intervals".into(),
+        ));
     }
 
     match leading {
@@ -591,12 +592,12 @@ fn parse_unsigned_seconds(value: &str, fractional_precision: Option<u64>) -> Sql
     let seconds = parse_unsigned_digits(whole, "second")?;
     let mut nanos = 0i64;
     if let Some(frac) = fraction {
-        if let Some(precision) = fractional_precision {
-            if frac.len() as u64 > precision {
-                return Err(Error::InvalidArgumentError(format!(
-                    "fractional second precision exceeds declared precision ({precision})"
-                )));
-            }
+        if let Some(precision) = fractional_precision
+            && frac.len() as u64 > precision
+        {
+            return Err(Error::InvalidArgumentError(format!(
+                "fractional second precision exceeds declared precision ({precision})"
+            )));
         }
         if frac.len() > 9 {
             return Err(Error::InvalidArgumentError(
@@ -648,12 +649,12 @@ fn parse_signed_decimal_seconds(
         .map_err(|_| Error::InvalidArgumentError("second component out of range".into()))?;
     let mut nanos = 0i64;
     if let Some(frac) = fraction {
-        if let Some(precision) = fractional_precision {
-            if frac.len() as u64 > precision {
-                return Err(Error::InvalidArgumentError(format!(
-                    "fractional second precision exceeds declared precision ({precision})"
-                )));
-            }
+        if let Some(precision) = fractional_precision
+            && frac.len() as u64 > precision
+        {
+            return Err(Error::InvalidArgumentError(format!(
+                "fractional second precision exceeds declared precision ({precision})"
+            )));
         }
         if frac.len() > 9 {
             return Err(Error::InvalidArgumentError(
@@ -769,12 +770,12 @@ fn parse_signed_integer(value: &str, label: &str) -> SqlResult<SignedInteger> {
 }
 
 fn enforce_precision(length: usize, precision: Option<u64>, label: &str) -> SqlResult<()> {
-    if let Some(max_digits) = precision {
-        if length as u64 > max_digits {
-            return Err(Error::InvalidArgumentError(format!(
-                "{label} exceeds leading precision {max_digits}"
-            )));
-        }
+    if let Some(max_digits) = precision
+        && length as u64 > max_digits
+    {
+        return Err(Error::InvalidArgumentError(format!(
+            "{label} exceeds leading precision {max_digits}"
+        )));
     }
     Ok(())
 }

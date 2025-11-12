@@ -6,7 +6,9 @@
 
 use std::{convert::TryFrom, sync::Arc};
 
-use arrow::array::{Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
@@ -263,7 +265,7 @@ impl NumericArray {
                     let scale = array.scale();
                     Some(NumericValue::Decimal(
                         llkv_expr::decimal::DecimalValue::new(value_i128, scale)
-                            .expect("valid decimal from Decimal128Array")
+                            .expect("valid decimal from Decimal128Array"),
                     ))
                 }
             }
@@ -345,7 +347,7 @@ impl NumericArray {
         let contains_decimal = values
             .iter()
             .any(|opt| matches!(opt, Some(NumericValue::Decimal(_))));
-        
+
         match (contains_float, contains_decimal, preferred) {
             // If any float, convert all to float
             (true, _, _) => {
@@ -354,7 +356,9 @@ impl NumericArray {
                 NumericArray::from_float(Arc::new(array))
             }
             // If decimals but no floats
-            (false, true, NumericKind::Float) | (false, true, NumericKind::Decimal) | (false, true, NumericKind::Integer) => {
+            (false, true, NumericKind::Float)
+            | (false, true, NumericKind::Decimal)
+            | (false, true, NumericKind::Integer) => {
                 // For now, convert decimals to float - proper decimal array handling would require alignment
                 let iter = values.into_iter().map(|opt| opt.map(|v| v.as_f64()));
                 let array = Float64Array::from_iter(iter);
@@ -689,10 +693,9 @@ impl NumericKernels {
             expr: inner,
             data_type,
         } = expr
+            && matches!(data_type, DataType::Date32)
         {
-            if matches!(data_type, DataType::Date32) {
-                return Self::evaluate_cast_date32_batch(inner, len, arrays);
-            }
+            return Self::evaluate_cast_date32_batch(inner, len, arrays);
         }
 
         let preferred = Self::infer_result_kind(expr, arrays);
@@ -1065,47 +1068,38 @@ impl NumericKernels {
     ) -> LlkvResult<Option<Option<NumericValue>>> {
         match op {
             BinaryOp::Add => {
-                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)? {
-                    if let Some(interval_value) =
+                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)?
+                    && let Some(interval_value) =
                         Self::evaluate_interval_operand(right, idx, arrays)?
-                    {
-                        let adjusted = Self::apply_interval_to_date32_value(
-                            date_value,
-                            interval_value,
-                            false,
-                        )?;
-                        return Ok(Some(
-                            adjusted.map(|days| NumericValue::Integer(i64::from(days))),
-                        ));
-                    }
+                {
+                    let adjusted =
+                        Self::apply_interval_to_date32_value(date_value, interval_value, false)?;
+                    return Ok(Some(
+                        adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                    ));
                 }
-                if let Some(date_value) = Self::evaluate_date_operand(right, idx, arrays)? {
-                    if let Some(interval_value) =
+                if let Some(date_value) = Self::evaluate_date_operand(right, idx, arrays)?
+                    && let Some(interval_value) =
                         Self::evaluate_interval_operand(left, idx, arrays)?
-                    {
-                        let adjusted = Self::apply_interval_to_date32_value(
-                            date_value,
-                            interval_value,
-                            false,
-                        )?;
-                        return Ok(Some(
-                            adjusted.map(|days| NumericValue::Integer(i64::from(days))),
-                        ));
-                    }
+                {
+                    let adjusted =
+                        Self::apply_interval_to_date32_value(date_value, interval_value, false)?;
+                    return Ok(Some(
+                        adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                    ));
                 }
                 Ok(None)
             }
             BinaryOp::Subtract => {
-                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)? {
-                    if let Some(interval_value) =
+                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)?
+                    && let Some(interval_value) =
                         Self::evaluate_interval_operand(right, idx, arrays)?
-                    {
-                        let adjusted =
-                            Self::apply_interval_to_date32_value(date_value, interval_value, true)?;
-                        return Ok(Some(
-                            adjusted.map(|days| NumericValue::Integer(i64::from(days))),
-                        ));
-                    }
+                {
+                    let adjusted =
+                        Self::apply_interval_to_date32_value(date_value, interval_value, true)?;
+                    return Ok(Some(
+                        adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                    ));
                 }
                 Ok(None)
             }
@@ -1123,8 +1117,8 @@ impl NumericKernels {
             ScalarExpr::Literal(Literal::Date32(days)) => Ok(Some(Some(*days))),
             ScalarExpr::Cast {
                 expr: inner,
-                data_type,
-            } if matches!(data_type, DataType::Date32) => {
+                data_type: DataType::Date32,
+            } => {
                 if let Some(result) = Self::cast_literal_to_date32(inner) {
                     let days = result?;
                     return Ok(Some(days));
@@ -1221,16 +1215,14 @@ impl NumericKernels {
                 branches,
                 else_expr,
             } => {
-                operand
-                    .as_deref()
-                    .map_or(false, Self::expr_contains_interval)
+                operand.as_deref().is_some_and(Self::expr_contains_interval)
                     || branches.iter().any(|(when_expr, then_expr)| {
                         Self::expr_contains_interval(when_expr)
                             || Self::expr_contains_interval(then_expr)
                     })
                     || else_expr
                         .as_deref()
-                        .map_or(false, Self::expr_contains_interval)
+                        .is_some_and(Self::expr_contains_interval)
             }
             ScalarExpr::Column(_) | ScalarExpr::ScalarSubquery(_) | ScalarExpr::Random => false,
         }

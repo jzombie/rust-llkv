@@ -3,9 +3,7 @@ use llkv_expr::decimal::{DecimalError, DecimalValue};
 fn pow10_i128(exp: u32) -> Result<i128, DecimalError> {
     let mut value: i128 = 1;
     for _ in 0..exp {
-        value = value
-            .checked_mul(10)
-            .ok_or(DecimalError::Overflow)?;
+        value = value.checked_mul(10).ok_or(DecimalError::Overflow)?;
     }
     Ok(value)
 }

@@ -1154,17 +1154,10 @@ pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanV
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "expected Decimal128 array in INSERT SELECT".into(),
-                    )
+                    Error::InvalidArgumentError("expected Decimal128 array in INSERT SELECT".into())
                 })?;
             let raw = values.value(index);
-            let scale_i8 = i8::try_from(*scale).map_err(|_| {
-                Error::InvalidArgumentError(format!(
-                    "decimal scale {scale} exceeds i8 bounds in INSERT SELECT"
-                ))
-            })?;
-            let decimal = DecimalValue::new(raw, scale_i8).map_err(|err| {
+            let decimal = DecimalValue::new(raw, *scale).map_err(|err| {
                 Error::InvalidArgumentError(format!(
                     "failed to convert Decimal128 value at index {index}: {err}"
                 ))

@@ -1145,8 +1145,9 @@ where
                         let dtype = match &info.expr {
                             ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
-                            ScalarExpr::Literal(Literal::Decimal(value)) =>
-                                DataType::Decimal128(value.precision(), value.scale()),
+                            ScalarExpr::Literal(Literal::Decimal(value)) => {
+                                DataType::Decimal128(value.precision(), value.scale())
+                            }
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
                             ScalarExpr::Literal(Literal::Date32(_)) => DataType::Date32,
@@ -1640,13 +1641,13 @@ where
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
                 (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
                 (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
-                (Literal::Decimal(l), Literal::Decimal(r)) => (*l).cmp(*r).ok(),
+                (Literal::Decimal(l), Literal::Decimal(r)) => (*l).compare(*r).ok(),
                 (Literal::Decimal(l), Literal::Integer(r)) => DecimalValue::new(*r, 0)
                     .ok()
-                    .and_then(|int| (*l).cmp(int).ok()),
+                    .and_then(|int| (*l).compare(int).ok()),
                 (Literal::Integer(l), Literal::Decimal(r)) => DecimalValue::new(*l, 0)
                     .ok()
-                    .and_then(|int| int.cmp(*r).ok()),
+                    .and_then(|int| int.compare(*r).ok()),
                 (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
                 (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
@@ -3435,8 +3436,8 @@ fn get_field_dtype(
 fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
     match literal {
         Literal::Integer(_) => Ok(DataType::Int64),
-    Literal::Float(_) => Ok(DataType::Float64),
-    Literal::Decimal(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
+        Literal::Float(_) => Ok(DataType::Float64),
+        Literal::Decimal(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
         Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
         Literal::Date32(_) => Ok(DataType::Date32),
@@ -3493,12 +3494,14 @@ fn synthesize_computed_literal_array(
             Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
         }
         ScalarExpr::Literal(Literal::Decimal(value)) => {
-            let iter = std::iter::repeat(value.raw_value()).take(row_count);
+            let iter = std::iter::repeat_n(value.raw_value(), row_count);
             let array = Decimal128Array::from_iter_values(iter)
-                .with_precision_and_scale(value.precision(), value.scale().into())
-                .map_err(|err| Error::InvalidArgumentError(format!(
-                    "failed to build Decimal128 literal array: {err}"
-                )))?;
+                .with_precision_and_scale(value.precision(), value.scale())
+                .map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "failed to build Decimal128 literal array: {err}"
+                    ))
+                })?;
             Ok(Arc::new(array) as ArrayRef)
         }
         ScalarExpr::Literal(Literal::Boolean(value)) => {
@@ -3538,12 +3541,14 @@ fn synthesize_computed_literal_array(
                         Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
                     }
                     Literal::Decimal(v) => {
-                        let iter = std::iter::repeat(v.raw_value()).take(row_count);
+                        let iter = std::iter::repeat_n(v.raw_value(), row_count);
                         let array = Decimal128Array::from_iter_values(iter)
-                            .with_precision_and_scale(v.precision(), v.scale().into())
-                            .map_err(|err| Error::InvalidArgumentError(format!(
-                                "failed to build Decimal128 literal array: {err}"
-                            )))?;
+                            .with_precision_and_scale(v.precision(), v.scale())
+                            .map_err(|err| {
+                                Error::InvalidArgumentError(format!(
+                                    "failed to build Decimal128 literal array: {err}"
+                                ))
+                            })?;
                         Arc::new(array) as ArrayRef
                     }
                     Literal::Boolean(v) => {
@@ -5035,25 +5040,26 @@ fn evaluate_constant_literal_non_numeric(
 ) -> LlkvResult<Option<Literal>> {
     match expr {
         ScalarExpr::Literal(lit) => Ok(Some(lit.clone())),
-        ScalarExpr::Cast { expr, data_type } => match data_type {
-            DataType::Date32 => {
-                let inner = evaluate_constant_literal_non_numeric(expr)?;
-                match inner {
-                    Some(Literal::Null) => Ok(Some(Literal::Null)),
-                    Some(Literal::String(text)) => {
-                        let days = parse_date32_literal(&text)?;
-                        Ok(Some(Literal::Date32(days)))
-                    }
-                    Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
-                    Some(other) => Err(Error::InvalidArgumentError(format!(
-                        "cannot cast literal of type {} to DATE",
-                        literal_type_name(&other)
-                    ))),
-                    None => Ok(None),
+        ScalarExpr::Cast {
+            expr,
+            data_type: DataType::Date32,
+        } => {
+            let inner = evaluate_constant_literal_non_numeric(expr)?;
+            match inner {
+                Some(Literal::Null) => Ok(Some(Literal::Null)),
+                Some(Literal::String(text)) => {
+                    let days = parse_date32_literal(&text)?;
+                    Ok(Some(Literal::Date32(days)))
                 }
+                Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
+                Some(other) => Err(Error::InvalidArgumentError(format!(
+                    "cannot cast literal of type {} to DATE",
+                    literal_type_name(&other)
+                ))),
+                None => Ok(None),
             }
-            _ => Ok(None),
-        },
+        }
+        ScalarExpr::Cast { .. } => Ok(None),
         ScalarExpr::Binary { left, op, right } => {
             let left_lit = match evaluate_constant_literal_non_numeric(left)? {
                 Some(lit) => lit,
@@ -5125,7 +5131,7 @@ fn literal_type_name(literal: &Literal) -> &'static str {
         Literal::Null => "NULL",
         Literal::Integer(_) => "INTEGER",
         Literal::Float(_) => "FLOAT",
-    Literal::Decimal(_) => "DECIMAL",
+        Literal::Decimal(_) => "DECIMAL",
         Literal::String(_) => "STRING",
         Literal::Boolean(_) => "BOOLEAN",
         Literal::Date32(_) => "DATE",

@@ -10,7 +10,7 @@ use arrow::datatypes::DECIMAL128_MAX_PRECISION;
 use arrow_buffer::i256;
 
 /// Maximum precision supported by `DecimalValue` (aligns with Arrow's Decimal128).
-pub const MAX_DECIMAL_PRECISION: u8 = DECIMAL128_MAX_PRECISION as u8;
+pub const MAX_DECIMAL_PRECISION: u8 = DECIMAL128_MAX_PRECISION;
 const POW10_BASE: i256 = i256::from_i128(10);
 
 /// Errors that can occur while manipulating decimal values.
@@ -122,7 +122,7 @@ impl DecimalValue {
             let factor = pow10(diff)?;
             let scaled = i256::from_i128(self.value)
                 .checked_mul(factor)
-            .ok_or(DecimalError::Overflow)?;
+                .ok_or(DecimalError::Overflow)?;
             let new_value = scaled.to_i128().ok_or(DecimalError::Overflow)?;
             return Self::new(new_value, target_scale);
         }
@@ -131,12 +131,8 @@ impl DecimalValue {
         let diff = (self.scale - target_scale) as u32;
         let factor = pow10(diff)?;
         let value = i256::from_i128(self.value);
-        let quotient = value
-            .checked_div(factor)
-            .ok_or(DecimalError::Overflow)?;
-        let remainder = value
-            .checked_rem(factor)
-            .ok_or(DecimalError::Overflow)?;
+        let quotient = value.checked_div(factor).ok_or(DecimalError::Overflow)?;
+        let remainder = value.checked_rem(factor).ok_or(DecimalError::Overflow)?;
         if remainder != i256::ZERO {
             return Err(DecimalError::InexactRescale {
                 from: self.scale,
@@ -191,10 +187,12 @@ impl DecimalValue {
             return Err(DecimalError::DivisionByZero);
         }
         if !scale_within_bounds(target_scale as i16) {
-            return Err(DecimalError::ScaleOutOfRange { scale: target_scale });
+            return Err(DecimalError::ScaleOutOfRange {
+                scale: target_scale,
+            });
         }
-    let numerator = i256::from_i128(self.value);
-    let denominator = i256::from_i128(other.value);
+        let numerator = i256::from_i128(self.value);
+        let denominator = i256::from_i128(other.value);
 
         // Adjust numerator to reach the requested target scale.
         let scale_adjust = (target_scale as i32 + other.scale as i32) - self.scale as i32;
@@ -251,7 +249,10 @@ impl DecimalValue {
     }
 
     /// Compare two decimals by aligning their scales.
-    pub fn cmp(self, other: Self) -> Result<std::cmp::Ordering, DecimalError> {
+    ///
+    /// Note: This method is fallible (returns Result) unlike std::cmp::Ord::cmp,
+    /// so we use a distinct name to avoid confusion with the trait method.
+    pub fn compare(self, other: Self) -> Result<std::cmp::Ordering, DecimalError> {
         let target_scale = self.scale.max(other.scale);
         let lhs = self.rescale(target_scale)?;
         let rhs = other.rescale(target_scale)?;
@@ -265,7 +266,7 @@ impl fmt::Display for DecimalValue {
             return write!(f, "{}", self.value);
         }
         let negative = self.value < 0;
-    let digits = digit_buffer(i256::from_i128(self.value));
+        let digits = digit_buffer(i256::from_i128(self.value));
         if digits.len() <= self.scale as usize {
             let mut result = String::with_capacity(self.scale as usize + 2);
             if negative {
@@ -304,11 +305,11 @@ fn digit_count_i256(mut value: i256) -> u8 {
         return 1;
     }
     if value < i256::ZERO {
-    value = value.wrapping_neg();
+        value = value.wrapping_neg();
     }
     let mut count: u8 = 0;
     while value != i256::ZERO {
-    value = value.wrapping_div(POW10_BASE);
+        value = value.wrapping_div(POW10_BASE);
         count += 1;
     }
     count
@@ -328,8 +329,7 @@ fn digit_buffer(mut value: i256) -> String {
         let rem = current.wrapping_rem(ten);
         let digit = rem
             .to_i128()
-            .expect("remainder from decimal division fits in i128")
-            as i32;
+            .expect("remainder from decimal division fits in i128") as i32;
         buf.push((b'0' + digit as u8) as char);
         current = current.wrapping_div(ten);
     }

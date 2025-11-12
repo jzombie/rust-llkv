@@ -913,9 +913,7 @@ impl AggregateAccumulator {
                 }
             }
             AggregateAccumulator::SumDecimal128 {
-                column_index,
-                sum,
-                ..
+                column_index, sum, ..
             } => {
                 let column = batch.column(*column_index);
                 let arr = column
@@ -1053,9 +1051,7 @@ impl AggregateAccumulator {
                 }
             }
             AggregateAccumulator::TotalDecimal128 {
-                column_index,
-                sum,
-                ..
+                column_index, sum, ..
             } => {
                 let column = batch.column(*column_index);
                 let arr = column

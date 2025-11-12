@@ -215,12 +215,12 @@ fn print_load_summary(summary: &LoadSummary) {
 
 fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchError> {
     println!("\n{label}");
-    
-    // DEBUG: Print the actual SQL being executed 
+
+    // DEBUG: Print the actual SQL being executed
     tracing::debug!("\n=== DEBUG: ACTUAL SQL ===");
     tracing::debug!("{}", sql);
     tracing::debug!("=== END DEBUG ===\n");
-    
+
     let batches = engine.sql(sql)?;
     if batches.is_empty() {
         println!("  (no rows)");
@@ -311,7 +311,7 @@ fn run_tpch_queries(
                         tracing::debug!("{}", statement.sql);
                         tracing::debug!("=== END DEBUG ===\n");
                     }
-                    
+
                     let batches = engine.sql(&statement.sql).map_err(TpchError::Sql)?;
                     if batches.is_empty() {
                         println!("  (no rows)");

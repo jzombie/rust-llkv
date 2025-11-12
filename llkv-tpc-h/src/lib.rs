@@ -196,10 +196,10 @@ fn parse_numeric_literal(token: &str) -> Option<i64> {
     if let Ok(value) = token.parse::<i64>() {
         return Some(value);
     }
-    if let Some(hex) = token.strip_prefix("0x") {
-        if let Ok(value) = i64::from_str_radix(hex, 16) {
-            return Some(value);
-        }
+    if let Some(hex) = token.strip_prefix("0x")
+        && let Ok(value) = i64::from_str_radix(hex, 16)
+    {
+        return Some(value);
     }
     None
 }
@@ -388,6 +388,7 @@ impl LoadSummary {
 #[derive(Clone, Copy)]
 enum ColumnKind {
     Number,
+    #[allow(dead_code)]
     Decimal,
     String,
     Date,
@@ -560,40 +561,40 @@ pub fn load_tpch_data(
         ));
     }
 
-    let mut tables = Vec::new();
-
-    tables.push(LoadTableSummary {
-        table: "REGION",
-        rows: load_region(engine, schema_name, scale_factor, batch_size)?,
-    });
-    tables.push(LoadTableSummary {
-        table: "NATION",
-        rows: load_nation(engine, schema_name, scale_factor, batch_size)?,
-    });
-    tables.push(LoadTableSummary {
-        table: "SUPPLIER",
-        rows: load_supplier(engine, schema_name, scale_factor, batch_size)?,
-    });
-    tables.push(LoadTableSummary {
-        table: "CUSTOMER",
-        rows: load_customer(engine, schema_name, scale_factor, batch_size)?,
-    });
-    tables.push(LoadTableSummary {
-        table: "PART",
-        rows: load_part(engine, schema_name, scale_factor, batch_size)?,
-    });
-    tables.push(LoadTableSummary {
-        table: "PARTSUPP",
-        rows: load_partsupp(engine, schema_name, scale_factor, batch_size)?,
-    });
-    tables.push(LoadTableSummary {
-        table: "ORDERS",
-        rows: load_orders(engine, schema_name, scale_factor, batch_size)?,
-    });
-    tables.push(LoadTableSummary {
-        table: "LINEITEM",
-        rows: load_lineitem(engine, schema_name, scale_factor, batch_size)?,
-    });
+    let tables = vec![
+        LoadTableSummary {
+            table: "REGION",
+            rows: load_region(engine, schema_name, scale_factor, batch_size)?,
+        },
+        LoadTableSummary {
+            table: "NATION",
+            rows: load_nation(engine, schema_name, scale_factor, batch_size)?,
+        },
+        LoadTableSummary {
+            table: "SUPPLIER",
+            rows: load_supplier(engine, schema_name, scale_factor, batch_size)?,
+        },
+        LoadTableSummary {
+            table: "CUSTOMER",
+            rows: load_customer(engine, schema_name, scale_factor, batch_size)?,
+        },
+        LoadTableSummary {
+            table: "PART",
+            rows: load_part(engine, schema_name, scale_factor, batch_size)?,
+        },
+        LoadTableSummary {
+            table: "PARTSUPP",
+            rows: load_partsupp(engine, schema_name, scale_factor, batch_size)?,
+        },
+        LoadTableSummary {
+            table: "ORDERS",
+            rows: load_orders(engine, schema_name, scale_factor, batch_size)?,
+        },
+        LoadTableSummary {
+            table: "LINEITEM",
+            rows: load_lineitem(engine, schema_name, scale_factor, batch_size)?,
+        },
+    ];
 
     Ok(LoadSummary { tables })
 }
@@ -853,18 +854,17 @@ fn render_create_tables(tables: &[CreateTable]) -> String {
         }
         let statement = Statement::CreateTable(table.clone());
         let rendered_sql = statement.to_string();
-        
+
         // DEBUG: Print LINEITEM table schema to verify DECIMAL columns
-        if let Some(last_part) = table.name.0.last() {
-            if let Some(ident) = last_part.as_ident() {
-                if ident.value.to_ascii_uppercase() == "LINEITEM" {
-                    eprintln!("\n=== DEBUG: LINEITEM CREATE TABLE SQL ===");
-                    eprintln!("{}", rendered_sql);
-                    eprintln!("=== END DEBUG ===\n");
-                }
-            }
+        if let Some(last_part) = table.name.0.last()
+            && let Some(ident) = last_part.as_ident()
+            && ident.value.eq_ignore_ascii_case("LINEITEM")
+        {
+            eprintln!("\n=== DEBUG: LINEITEM CREATE TABLE SQL ===");
+            eprintln!("{}", rendered_sql);
+            eprintln!("=== END DEBUG ===\n");
         }
-        
+
         sql.push_str(&rendered_sql);
         sql.push_str(";\n");
     }
