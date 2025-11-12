@@ -10428,7 +10428,22 @@ fn arrow_type_from_sql(data_type: &SqlDataType) -> SqlResult<arrow::datatypes::D
         | SqlDataType::Char(_)
         | SqlDataType::Uuid => Ok(DataType::Utf8),
         SqlDataType::Date => Ok(DataType::Date32),
-        SqlDataType::Decimal(_) | SqlDataType::Numeric(_) => Ok(DataType::Float64),
+        SqlDataType::Decimal(exact_number_info) | SqlDataType::Numeric(exact_number_info) => {
+            // Parse DECIMAL(precision, scale) or use defaults
+            match exact_number_info {
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    Ok(DataType::Decimal128(*p as u8, *s as i8))
+                }
+                sqlparser::ast::ExactNumberInfo::Precision(p) => {
+                    // DECIMAL(p) means scale = 0
+                    Ok(DataType::Decimal128(*p as u8, 0))
+                }
+                sqlparser::ast::ExactNumberInfo::None => {
+                    // DECIMAL without precision defaults to DECIMAL(38, 0) per SQL standard
+                    Ok(DataType::Decimal128(38, 0))
+                }
+            }
+        }
         SqlDataType::Boolean => Ok(DataType::Boolean),
         SqlDataType::Custom(name, args) => {
             if name.0.len() == 1
