@@ -263,6 +263,9 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
                     println!("  -> Loading {table}...");
                 }
             }
+            TableLoadEvent::Progress { table, rows } => {
+                println!("     {table}: {rows} rows loaded...");
+            }
             TableLoadEvent::Complete {
                 table,
                 rows,

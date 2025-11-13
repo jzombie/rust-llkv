@@ -140,6 +140,7 @@ struct TableColumn {
 }
 
 impl TpchToolkit {
+    const PROGRESS_REPORT_INTERVAL: usize = 100_000;
     /// Build a toolkit by parsing the bundled TPC-H metadata at the provided paths.
     pub fn from_paths(paths: SchemaPaths) -> Result<Self> {
         let dss_header = read_file(&paths.dss_header)?;
@@ -239,7 +240,7 @@ impl TpchToolkit {
     /// Load all base tables while emitting status updates through the provided callback.
     ///
     /// The callback receives a [`TableLoadEvent`] for each table when loading starts and
-    /// again after the batched inserts finish.
+    /// again as batches progress and after the inserts finish.
     pub fn load_data_with_progress<F>(
         &self,
         engine: &SqlEngine,
@@ -259,173 +260,81 @@ impl TpchToolkit {
 
         let mut tables = Vec::with_capacity(8);
 
-        {
-            let generator = RegionGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "REGION",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "REGION", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "REGION",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
+        macro_rules! load_table_with_progress {
+            ($collection:ident, $table_name:literal, $iter:expr) => {{
+                let expected = self.table_schema($table_name)?.info.base_rows;
+                on_progress(TableLoadEvent::Begin {
+                    table: $table_name,
+                    estimated_rows: Some(estimate_rows(expected, scale_factor)),
+                });
+                let started = Instant::now();
+                let summary = {
+                    let iter = $iter;
+                    let rows = iter.map(|row| row.to_string());
+                    let mut forward = |rows_loaded: usize| {
+                        on_progress(TableLoadEvent::Progress {
+                            table: $table_name,
+                            rows: rows_loaded,
+                        });
+                    };
+                    self.load_table_with_rows(
+                        engine,
+                        schema_name,
+                        $table_name,
+                        rows,
+                        batch_size,
+                        Some(&mut forward),
+                    )?
+                };
+                on_progress(TableLoadEvent::Complete {
+                    table: $table_name,
+                    rows: summary.rows,
+                    elapsed: started.elapsed(),
+                });
+                $collection.push(summary);
+            }};
         }
 
-        {
-            let generator = NationGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "NATION",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "NATION", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "NATION",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
-        }
-
-        {
-            let generator = SupplierGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "SUPPLIER",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "SUPPLIER", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "SUPPLIER",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
-        }
-
-        {
-            let generator = CustomerGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "CUSTOMER",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "CUSTOMER", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "CUSTOMER",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
-        }
-
-        {
-            let generator = PartGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "PART",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "PART", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "PART",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
-        }
-
-        {
-            let generator = PartSuppGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "PARTSUPP",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "PARTSUPP", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "PARTSUPP",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
-        }
-
-        {
-            let generator = OrderGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "ORDERS",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "ORDERS", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "ORDERS",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
-        }
-
-        {
-            let generator = LineItemGenerator::new(scale_factor, 1, 1);
-            let iter = generator.iter();
-            let size_hint = iter.size_hint();
-            let estimated = size_hint.1.or(Some(size_hint.0));
-            on_progress(TableLoadEvent::Begin {
-                table: "LINEITEM",
-                estimated_rows: estimated,
-            });
-            let started = Instant::now();
-            let rows = iter.map(|row| row.to_string());
-            let summary =
-                self.load_table_with_rows(engine, schema_name, "LINEITEM", rows, batch_size)?;
-            on_progress(TableLoadEvent::Complete {
-                table: "LINEITEM",
-                rows: summary.rows,
-                elapsed: started.elapsed(),
-            });
-            tables.push(summary);
-        }
+        load_table_with_progress!(
+            tables,
+            "REGION",
+            RegionGenerator::new(scale_factor, 1, 1).iter()
+        );
+        load_table_with_progress!(
+            tables,
+            "NATION",
+            NationGenerator::new(scale_factor, 1, 1).iter()
+        );
+        load_table_with_progress!(
+            tables,
+            "SUPPLIER",
+            SupplierGenerator::new(scale_factor, 1, 1).iter()
+        );
+        load_table_with_progress!(
+            tables,
+            "CUSTOMER",
+            CustomerGenerator::new(scale_factor, 1, 1).iter()
+        );
+        load_table_with_progress!(
+            tables,
+            "PART",
+            PartGenerator::new(scale_factor, 1, 1).iter()
+        );
+        load_table_with_progress!(
+            tables,
+            "PARTSUPP",
+            PartSuppGenerator::new(scale_factor, 1, 1).iter()
+        );
+        load_table_with_progress!(
+            tables,
+            "ORDERS",
+            OrderGenerator::new(scale_factor, 1, 1).iter()
+        );
+        load_table_with_progress!(
+            tables,
+            "LINEITEM",
+            LineItemGenerator::new(scale_factor, 1, 1).iter()
+        );
 
         Ok(LoadSummary { tables })
     }
@@ -482,19 +391,22 @@ impl TpchToolkit {
     }
 
     /// Load a single TPC-H table by streaming generated rows through batched inserts.
-    fn load_table_with_rows<I>(
+    fn load_table_with_rows<I, F>(
         &self,
         engine: &SqlEngine,
         schema_name: &str,
         table_name: &'static str,
         rows: I,
         batch_size: usize,
+        progress: Option<&mut F>,
     ) -> Result<LoadTableSummary>
     where
         I: Iterator<Item = String>,
+        F: FnMut(usize),
     {
         let table = self.table_schema(table_name)?;
-        let row_count = self.load_table_from_lines(engine, schema_name, table, rows, batch_size)?;
+        let row_count =
+            self.load_table_from_lines(engine, schema_name, table, rows, batch_size, progress)?;
         Ok(LoadTableSummary {
             table: table_name,
             rows: row_count,
@@ -502,16 +414,18 @@ impl TpchToolkit {
     }
 
     /// Consume delimited rows, format them into SQL literals, and flush them in batches.
-    fn load_table_from_lines<I>(
+    fn load_table_from_lines<I, F>(
         &self,
         engine: &SqlEngine,
         schema_name: &str,
         table: &TableSchema,
         rows: I,
         batch_size: usize,
+        mut progress: Option<&mut F>,
     ) -> Result<usize>
     where
         I: Iterator<Item = String>,
+        F: FnMut(usize),
     {
         let mut batch = Vec::with_capacity(batch_size);
         let mut row_count = 0usize;
@@ -526,6 +440,11 @@ impl TpchToolkit {
             if batch.len() == batch_size {
                 self.flush_insert(engine, schema_name, table, &batch)?;
                 batch.clear();
+            }
+            if row_count % Self::PROGRESS_REPORT_INTERVAL == 0 {
+                if let Some(callback) = progress.as_mut() {
+                    callback(row_count);
+                }
             }
         }
 
@@ -896,6 +815,10 @@ pub enum TableLoadEvent {
         table: &'static str,
         estimated_rows: Option<usize>,
     },
+    Progress {
+        table: &'static str,
+        rows: usize,
+    },
     Complete {
         table: &'static str,
         rows: usize,
@@ -918,6 +841,24 @@ impl LoadSummary {
     /// Return the total number of rows loaded across all tables.
     pub fn total_rows(&self) -> usize {
         self.tables.iter().map(|entry| entry.rows).sum()
+    }
+}
+
+fn estimate_rows(base_rows: u64, scale_factor: f64) -> usize {
+    if base_rows == 0 {
+        return 0;
+    }
+    let scaled = (base_rows as f64) * scale_factor;
+    if !scaled.is_finite() {
+        return 0;
+    }
+    let rounded = scaled.round();
+    if scale_factor > 0.0 && rounded < 1.0 {
+        1
+    } else if rounded <= 0.0 {
+        0
+    } else {
+        rounded as usize
     }
 }
 
