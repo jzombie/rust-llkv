@@ -1,5 +1,5 @@
 [package]
-name = "llkv-tpc-h"
+name = "llkv-tpch"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true

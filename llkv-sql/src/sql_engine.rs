@@ -626,12 +626,7 @@ impl SqlEngine {
     /// integrity script even though LLKV always operates within a single database.
     /// Treat these commands as no-ops so the scripts can run unmodified.
     fn preprocess_tpch_connect_syntax(sql: &str) -> String {
-        static CONNECT_REGEX: OnceLock<Regex> = OnceLock::new();
-        let re = CONNECT_REGEX.get_or_init(|| {
-            Regex::new(r#"(?im)^\s*CONNECT\s+TO\s+(?:[A-Za-z0-9_]+|'[^']+'|"[^"]+")\s*;\s*"#)
-                .expect("valid CONNECT TO regex")
-        });
-        re.replace_all(sql, "").to_string()
+        crate::tpch::strip_tpch_connect_statements(sql)
     }
 
     /// Preprocess SQL to handle qualified names in EXCLUDE clauses

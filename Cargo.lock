@@ -1755,8 +1755,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "llkv-tpc-h"
-version = "0.8.1-alpha"
+name = "llkv-tpch"
+version = "0.8.2-alpha"
 dependencies = [
  "arrow",
  "clap",

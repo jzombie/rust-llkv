@@ -1,3 +1,5 @@
+// TODO: If running in development mode, include warning about unoptimized performance.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::process;
 use std::sync::Arc;
@@ -6,8 +8,8 @@ use std::time::Instant;
 use arrow::util::pretty::print_batches;
 use clap::{Args, Parser, Subcommand};
 use llkv::{SqlEngine, storage::MemPager};
-use llkv_tpc_h::queries::{QueryOptions, StatementKind, render_tpch_query};
-use llkv_tpc_h::{LoadSummary, SchemaPaths, TpchError, install_default_schema, load_tpch_data};
+use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
+use llkv_tpch::{LoadSummary, SchemaPaths, TpchError, install_default_schema, load_tpch_data};
 
 const DEFAULT_SCALE_FACTOR: f64 = 0.01;
 const DEFAULT_BATCH_SIZE: usize = 500;
@@ -26,7 +28,7 @@ fn main() {
 
 #[derive(Parser)]
 #[command(
-    name = "llkv-tpc-h",
+    name = "llkv-tpch",
     about = "TPC-H bootstrap and query runner for LLKV"
 )]
 struct Cli {

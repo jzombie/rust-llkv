@@ -12,32 +12,38 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Span;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const PLACEHOLDER_STREAM: &str = ":s";
 static NUMERIC_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
 static TYPED_STRING_RE: OnceLock<Regex> = OnceLock::new();
 static INTERVAL_DAY_PRECISION_RE: OnceLock<Regex> = OnceLock::new();
+static C_BLOCK_COMMENT_RE: OnceLock<Regex> = OnceLock::new();
+static DEFAULT_QUERY_PARAMETERS: OnceLock<Vec<Vec<String>>> = OnceLock::new();
 
+/// Controls rendering behavior for TPC-H query templates.
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
     pub stream_number: u32,
     pub parameter_overrides: BTreeMap<usize, String>,
 }
 
+/// Classification of rendered statements for downstream consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
     Query,
     Command,
 }
 
+/// A rendered SQL statement alongside its classification.
 #[derive(Debug, Clone)]
 pub struct RenderedStatement {
     pub sql: String,
     pub kind: StatementKind,
 }
 
+/// Collection of statements produced from a single TPC-H query template.
 #[derive(Debug, Clone)]
 pub struct RenderedQuery {
     pub number: u8,
@@ -46,6 +52,11 @@ pub struct RenderedQuery {
     pub statements: Vec<RenderedStatement>,
 }
 
+/// Render a canonical TPC-H query from the bundled templates.
+///
+/// The renderer fetches a template, resolves stream and numeric placeholders using
+/// defaults from `varsub.c` alongside caller-provided overrides, qualifies table names
+/// with the supplied schema, and returns each resulting statement with its kind.
 pub fn render_tpch_query(
     paths: &SchemaPaths,
     number: u8,
@@ -63,7 +74,7 @@ pub fn render_tpch_query(
     let template = parse_template(&raw, number)?;
 
     let placeholders = collect_numeric_placeholders(&template.body);
-    let values = build_parameter_values(number, &placeholders, options)?;
+    let values = build_parameter_values(paths, number, &placeholders, options)?;
     let rendered_sql = substitute_numeric_placeholders(&template.body, &values, number)?;
     let rendered_sql =
         substitute_stream_placeholder(rendered_sql, template.stream_placeholder, options);
@@ -109,6 +120,7 @@ pub fn render_tpch_query(
     })
 }
 
+/// Parsed representation of a template file prior to placeholder substitution.
 struct TemplateParse {
     title: Option<String>,
     body: String,
@@ -116,6 +128,7 @@ struct TemplateParse {
     row_limit: Option<usize>,
 }
 
+/// Parse a template file into its descriptive metadata and SQL body.
 fn parse_template(contents: &str, number: u8) -> Result<TemplateParse> {
     let mut title = None;
     let mut body_lines = Vec::new();
@@ -169,6 +182,7 @@ fn parse_template(contents: &str, number: u8) -> Result<TemplateParse> {
     })
 }
 
+/// Collect every `:N` placeholder used inside the template body.
 fn collect_numeric_placeholders(sql: &str) -> BTreeSet<usize> {
     let regex = NUMERIC_PLACEHOLDER_RE.get_or_init(|| Regex::new(r":(\d+)").expect("valid regex"));
     let mut placeholders = BTreeSet::new();
@@ -182,15 +196,20 @@ fn collect_numeric_placeholders(sql: &str) -> BTreeSet<usize> {
     placeholders
 }
 
+/// Construct the final parameter binding map for a template.
+///
+/// Defaults from the upstream toolkit are merged with caller overrides, and the result
+/// is validated against the set of placeholders referenced in the template.
 fn build_parameter_values(
+    paths: &SchemaPaths,
     number: u8,
     required: &BTreeSet<usize>,
     options: &QueryOptions,
 ) -> Result<BTreeMap<usize, String>> {
     let mut values = BTreeMap::new();
-    if let Some(defaults) = default_parameter_values(number) {
+    if let Some(defaults) = default_parameter_values(paths, number)? {
         for (offset, value) in defaults.iter().enumerate() {
-            values.insert(offset + 1, (*value).to_string());
+            values.insert(offset + 1, value.clone());
         }
     }
 
@@ -212,6 +231,7 @@ fn build_parameter_values(
     Ok(values)
 }
 
+/// Replace all numbered placeholders in the template with concrete values.
 fn substitute_numeric_placeholders(
     body: &str,
     values: &BTreeMap<usize, String>,
@@ -246,6 +266,7 @@ fn substitute_numeric_placeholders(
     Ok(rendered)
 }
 
+/// Apply the stream-number substitution (`:s`) when present in the SQL.
 fn substitute_stream_placeholder(sql: String, present: bool, options: &QueryOptions) -> String {
     if !present {
         return sql;
@@ -253,6 +274,7 @@ fn substitute_stream_placeholder(sql: String, present: bool, options: &QueryOpti
     sql.replace(PLACEHOLDER_STREAM, &options.stream_number.to_string())
 }
 
+/// Rewrite DuckDB-style typed string literals into standard `CAST` syntax we can parse.
 fn normalize_typed_string_literals(mut sql: String) -> String {
     let typed_regex = TYPED_STRING_RE.get_or_init(|| {
         Regex::new(r"(?i)\b(DATE|TIME|TIMESTAMP)\s+'([^']*)'").expect("valid regex")
@@ -276,6 +298,8 @@ fn normalize_typed_string_literals(mut sql: String) -> String {
         .into_owned()
 }
 
+/// Inject a `LIMIT` clause into the final `SELECT` statement when the template
+/// uses the `:n` directive to cap output rows.
 fn apply_limit_to_last_query(
     statements: &mut [Statement],
     limit: usize,
@@ -309,6 +333,7 @@ fn apply_limit_to_last_query(
     Ok(())
 }
 
+/// Prefix relations in the rendered statements with the requested schema name.
 fn qualify_statements(statements: &mut Vec<Statement>, schema: &str) {
     if schema.is_empty() {
         return;
@@ -337,6 +362,7 @@ fn qualify_statements(statements: &mut Vec<Statement>, schema: &str) {
     });
 }
 
+/// Insert the schema identifier at the front of an object name when needed.
 fn qualify_object_name(name: &mut ObjectName, schema: &str) {
     if name.0.is_empty() {
         name.0.push(ObjectNamePart::Identifier(Ident::new(schema)));
@@ -354,42 +380,137 @@ fn qualify_object_name(name: &mut ObjectName, schema: &str) {
         .insert(0, ObjectNamePart::Identifier(Ident::new(schema)));
 }
 
-fn default_parameter_values(query: u8) -> Option<&'static [&'static str]> {
-    match query {
-        1 => Some(&["90"]),
-        2 => Some(&["15", "BRASS", "EUROPE"]),
-        3 => Some(&["BUILDING", "1995-03-15"]),
-        4 => Some(&["1993-07-01"]),
-        5 => Some(&["ASIA", "1994-01-01"]),
-        6 => Some(&["1994-01-01", ".06", "24"]),
-        7 => Some(&["FRANCE", "GERMANY"]),
-        8 => Some(&["BRAZIL", "AMERICA", "ECONOMY ANODIZED STEEL"]),
-        9 => Some(&["green"]),
-        10 => Some(&["1993-10-01"]),
-        11 => Some(&["GERMANY", "0.0001"]),
-        12 => Some(&["MAIL", "SHIP", "1994-01-01"]),
-        13 => Some(&["special", "requests"]),
-        14 => Some(&["1995-09-01"]),
-        15 => Some(&["1996-01-01"]),
-        16 => Some(&[
-            "Brand#45",
-            "MEDIUM POLISHED",
-            "49",
-            "14",
-            "23",
-            "45",
-            "19",
-            "3",
-            "36",
-            "9",
-        ]),
-        17 => Some(&["Brand#23", "MED BOX"]),
-        18 => Some(&["300"]),
-        19 => Some(&["Brand#12", "Brand#23", "Brand#34", "1", "10", "20"]),
-        20 => Some(&["forest", "1994-01-01", "CANADA"]),
-        21 => Some(&["SAUDI ARABIA"]),
-        22 => Some(&["13", "31", "23", "29", "30", "18", "17"]),
-        _ => None,
+/// Fetch the cached default parameters for the requested query number.
+fn default_parameter_values(paths: &SchemaPaths, query: u8) -> Result<Option<&'static [String]>> {
+    if query == 0 {
+        return Ok(None);
+    }
+
+    let defaults = ensure_query_parameter_defaults(paths)?;
+    let idx = (query - 1) as usize;
+    let entry = defaults.get(idx).filter(|values| !values.is_empty());
+    Ok(entry.map(|values| values.as_slice()))
+}
+
+/// Load and cache the default parameter table from the upstream toolkit.
+fn ensure_query_parameter_defaults(paths: &SchemaPaths) -> Result<&'static Vec<Vec<String>>> {
+    if let Some(existing) = DEFAULT_QUERY_PARAMETERS.get() {
+        return Ok(existing);
+    }
+
+    let parsed = parse_default_query_parameters(&paths.varsub_source)?;
+    DEFAULT_QUERY_PARAMETERS
+        .set(parsed)
+        .map_err(|_| TpchError::Parse("default parameter cache already initialized".into()))?;
+    DEFAULT_QUERY_PARAMETERS
+        .get()
+        .ok_or_else(|| TpchError::Parse("failed to load default parameter cache".into()))
+}
+
+/// Parse the `defaults` array in `varsub.c` into per-query parameter vectors.
+fn parse_default_query_parameters(path: &Path) -> Result<Vec<Vec<String>>> {
+    let source = read_file(path)?;
+    let definition_start = source
+        .find("char *defaults")
+        .ok_or_else(|| TpchError::Parse("unable to locate defaults array in varsub.c".into()))?;
+    let after_definition = &source[definition_start..];
+    let open_brace = after_definition.find('{').ok_or_else(|| {
+        TpchError::Parse("malformed defaults array: missing opening brace".into())
+    })?;
+
+    let mut depth = 0i32;
+    let mut closing_offset = None;
+    for (idx, ch) in after_definition[open_brace..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    closing_offset = Some(idx + open_brace);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let closing_offset = closing_offset.ok_or_else(|| {
+        TpchError::Parse("malformed defaults array: missing closing brace".into())
+    })?;
+    let body = &after_definition[open_brace + 1..closing_offset];
+    let comment_free = strip_c_block_comments(body);
+    let entries = extract_defaults_entries(&comment_free);
+
+    if entries.is_empty() {
+        return Err(TpchError::Parse(
+            "failed to extract any default query parameter entries".into(),
+        ));
+    }
+
+    Ok(entries)
+}
+
+/// Remove C-style block comments from a snippet before parsing it as an initializer.
+fn strip_c_block_comments(contents: &str) -> String {
+    let regex = C_BLOCK_COMMENT_RE
+        .get_or_init(|| Regex::new(r"(?s)/\*.*?\*/").expect("valid C comment regex"));
+    regex.replace_all(contents, "").into_owned()
+}
+
+/// Split the defaults initializer into individual query entries.
+fn extract_defaults_entries(contents: &str) -> Vec<Vec<String>> {
+    let mut entries = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+
+    for ch in contents.chars() {
+        match ch {
+            '{' => {
+                if depth > 0 {
+                    current.push(ch);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    entries.push(parse_default_entry(&current));
+                    current.clear();
+                } else if depth > 0 {
+                    current.push(ch);
+                }
+            }
+            _ => {
+                if depth > 0 {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+
+    entries
+}
+
+/// Convert a single array entry into a list of string parameters, skipping `NULL`s.
+fn parse_default_entry(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|value| value.trim())
+        .filter_map(|value| {
+            if value.is_empty() || value.eq_ignore_ascii_case("NULL") {
+                None
+            } else {
+                Some(unquote(value))
+            }
+        })
+        .collect()
+}
+
+/// Strip surrounding quotes from a C string literal and collapse escaped quotes.
+fn unquote(value: &str) -> String {
+    if let Some(stripped) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        stripped.replace("\\\"", "\"")
+    } else {
+        value.to_string()
     }
 }
 

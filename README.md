@@ -11,6 +11,12 @@ LLKV is an experimental SQL database built as a Rust workspace. It layers [Apach
 
 Arrow arrays are persisted as column chunks addressed by pager-managed physical keys, so backends that already expose zero-copy reads—such as [`simd-r-drive`](https://crates.io/crates/simd-r-drive)—can hand out contiguous buffers for SIMD-friendly scans. Development focuses on correctness, layered modularity, and end-to-end Arrow interoperability.
 
+## Getting Started
+
+[llkv/](./llkv/) provides the main entrypoint for this repository.
+
+This README tries to give a high-level overview of the entire workspace, and the [llkv/](./llkv/) directory re-exports most of it into a single library that can be imported into other applications.
+
 ## Goals and Status
 
 - Provide a modular SQL stack with Arrow [RecordBatch](https://docs.rs/arrow/latest/arrow/record_batch/struct.RecordBatch.html) as the universal interchange format.
