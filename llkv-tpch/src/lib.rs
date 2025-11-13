@@ -268,13 +268,20 @@ impl TpchToolkit {
                     estimated_rows: Some(estimate_rows(expected, scale_factor)),
                 });
                 let started = Instant::now();
+                let mut last_report = started;
                 let summary = {
                     let iter = $iter;
                     let rows = iter.map(|row| row.to_string());
                     let mut forward = |rows_loaded: usize| {
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(started);
+                        let since_last = now.duration_since(last_report);
+                        last_report = now;
                         on_progress(TableLoadEvent::Progress {
                             table: $table_name,
                             rows: rows_loaded,
+                            elapsed,
+                            since_last,
                         });
                     };
                     self.load_table_with_rows(
@@ -818,6 +825,8 @@ pub enum TableLoadEvent {
     Progress {
         table: &'static str,
         rows: usize,
+        elapsed: Duration,
+        since_last: Duration,
     },
     Complete {
         table: &'static str,
