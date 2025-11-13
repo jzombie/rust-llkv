@@ -60,6 +60,7 @@ pub struct SchemaPaths {
     pub referential_integrity: PathBuf,
     pub tdefs_source: PathBuf,
     pub queries_dir: PathBuf,
+    pub varsub_source: PathBuf,
 }
 
 impl SchemaPaths {
@@ -78,6 +79,7 @@ impl SchemaPaths {
             referential_integrity: dbgen_root.join(DSS_RI_FILE),
             tdefs_source: dbgen_root.join(DRIVER_SOURCE_FILE),
             queries_dir: dbgen_root.join("queries"),
+            varsub_source: dbgen_root.join("varsub.c"),
         }
     }
 
@@ -317,12 +319,18 @@ impl TpchToolkit {
         Ok(LoadSummary { tables })
     }
 
+    /// Look up the parsed table schema by canonical TPC-H name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TpchError::Parse`] when the toolkit does not include the requested table.
     fn table_schema(&self, table_name: &str) -> Result<&TableSchema> {
         self.tables_by_name
             .get(table_name)
             .ok_or_else(|| TpchError::Parse(format!("unknown TPC-H table '{table_name}'")))
     }
 
+    /// Serialize the ordered `CREATE TABLE` statements into an executable batch.
     fn render_create_tables(&self) -> String {
         let mut sql = String::new();
         for table_name in &self.creation_order {
@@ -338,6 +346,7 @@ impl TpchToolkit {
         sql
     }
 
+    /// Return table metadata in creation order so callers can display deterministic summaries.
     fn table_infos(&self) -> Vec<TpchTableInfo> {
         self.creation_order
             .iter()
@@ -346,6 +355,7 @@ impl TpchToolkit {
             .collect()
     }
 
+    /// Load a single TPC-H table by streaming generated rows through batched inserts.
     fn load_table_with_rows<I>(
         &self,
         engine: &SqlEngine,
@@ -365,6 +375,7 @@ impl TpchToolkit {
         })
     }
 
+    /// Consume delimited rows, format them into SQL literals, and flush them in batches.
     fn load_table_from_lines<I>(
         &self,
         engine: &SqlEngine,
@@ -399,6 +410,11 @@ impl TpchToolkit {
         Ok(row_count)
     }
 
+    /// Convert a raw delimited line into a parenthesized SQL value tuple.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TpchError::Parse`] when the column count does not match the table schema.
     fn format_row_values(&self, table: &TableSchema, line: &str) -> Result<String> {
         let raw_fields: Vec<&str> = line.trim_end_matches('|').split('|').collect();
         if raw_fields.len() != table.columns.len() {
@@ -419,6 +435,7 @@ impl TpchToolkit {
         Ok(format!("({})", formatted_values.join(", ")))
     }
 
+    /// Execute a batched INSERT for pre-formatted row values.
     fn flush_insert(
         &self,
         engine: &SqlEngine,
@@ -499,6 +516,7 @@ pub fn load_tpch_data_with_toolkit(
     toolkit.load_data(engine, schema_name, scale_factor, batch_size)
 }
 
+/// Read a text file and wrap IO errors with the target path.
 pub(crate) fn read_file(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|source| TpchError::Io {
         path: path.to_path_buf(),
@@ -506,6 +524,7 @@ pub(crate) fn read_file(path: &Path) -> Result<String> {
     })
 }
 
+/// Execute a SQL batch against the provided engine, ignoring whitespace-only fragments.
 fn run_sql(engine: &SqlEngine, sql: &str) -> Result<()> {
     if sql.trim().is_empty() {
         return Ok(());
@@ -513,6 +532,7 @@ fn run_sql(engine: &SqlEngine, sql: &str) -> Result<()> {
     engine.execute(sql).map(|_| ()).map_err(TpchError::Sql)
 }
 
+/// Scan `dss.h` and collect numeric `#define` entries keyed by macro name.
 fn parse_numeric_macros(contents: &str) -> HashMap<String, i64> {
     let mut macros = HashMap::new();
     for line in contents.lines() {
@@ -537,6 +557,7 @@ fn parse_numeric_macros(contents: &str) -> HashMap<String, i64> {
     macros
 }
 
+/// Parse decimal or hexadecimal numeric tokens supplied by the TPC-H headers.
 fn parse_numeric_literal(token: &str) -> Option<i64> {
     if let Ok(value) = token.parse::<i64>() {
         return Some(value);
@@ -549,6 +570,15 @@ fn parse_numeric_literal(token: &str) -> Option<i64> {
     None
 }
 
+/// Parse the `tdef tdefs[]` manifest from `driver.c` into table metadata.
+///
+/// The helper resolves base-row expressions through the provided macro map so scale
+/// factors match the upstream generator.
+///
+/// # Errors
+///
+/// Returns [`TpchError::Parse`] when the manifest layout is malformed or when row count
+/// expressions cannot be evaluated.
 fn parse_tdefs(
     contents: &str,
     macros: &HashMap<String, i64>,
@@ -613,6 +643,9 @@ fn parse_tdefs(
     Ok(tables)
 }
 
+/// Evaluate an expression describing baseline row counts for a table definition.
+///
+/// Returns an error string when the literal or macro cannot be resolved.
 fn evaluate_base_expr(
     expr: &str,
     macros: &HashMap<String, i64>,
@@ -626,6 +659,14 @@ fn evaluate_base_expr(
     Err(format!("unrecognized literal or macro '{expr}'"))
 }
 
+/// Parse the canonical TPC-H DDL and rewrite table names with the provided schema prefix.
+///
+/// The returned tuple contains the normalized `CREATE TABLE` statements alongside their
+/// uppercase table identifiers for downstream indexing.
+///
+/// # Errors
+///
+/// Returns [`TpchError::Parse`] when the DDL fails to parse or omits expected identifiers.
 fn parse_ddl_with_schema(ddl_sql: &str, schema: &str) -> Result<(Vec<CreateTable>, Vec<String>)> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, ddl_sql)
@@ -668,6 +709,15 @@ fn parse_ddl_with_schema(ddl_sql: &str, schema: &str) -> Result<(Vec<CreateTable
     Ok((tables, names))
 }
 
+/// Parse the constraint file `dss.ri` and bucket constraints by canonical table name.
+///
+/// CONNECT-specific directives are stripped so the generic sqlparser dialect can handle the
+/// statements without vendor extensions.
+///
+/// # Errors
+///
+/// Returns [`TpchError::Parse`] when the file cannot be parsed or produces unexpected
+/// statements.
 fn parse_referential_integrity(ri_sql: &str) -> Result<HashMap<String, Vec<TableConstraint>>> {
     let cleaned = strip_tpch_connect_statements(ri_sql);
     let dialect = GenericDialect {};
@@ -694,6 +744,7 @@ fn parse_referential_integrity(ri_sql: &str) -> Result<HashMap<String, Vec<Table
     Ok(constraints)
 }
 
+/// Attach parsed table constraints to the corresponding `CREATE TABLE` statements.
 fn apply_constraints_to_tables(
     tables: &mut [CreateTable],
     constraints: &HashMap<String, Vec<TableConstraint>>,
@@ -724,11 +775,23 @@ pub struct LoadSummary {
 }
 
 impl LoadSummary {
+    /// Return the total number of rows loaded across all tables.
     pub fn total_rows(&self) -> usize {
         self.tables.iter().map(|entry| entry.rows).sum()
     }
 }
 
+/// Derive ordered column metadata from a parsed `CREATE TABLE` statement.
+///
+/// The returned list mirrors the definition order and marks columns that need
+/// quoting when we render load batches by delegating to
+/// [`column_requires_quotes`]. This keeps value formatting aligned with the
+/// upstream schema so bulk inserts can stream rows without additional lookups.
+///
+/// # Errors
+///
+/// Returns [`TpchError::Parse`] when the definition omits a column list, which
+/// signals that the upstream DDL parse drifted from expectations.
 fn build_columns(table_name: &str, table: &CreateTable) -> Result<Vec<TableColumn>> {
     if table.columns.is_empty() {
         return Err(TpchError::Parse(format!(
@@ -749,6 +812,10 @@ fn build_columns(table_name: &str, table: &CreateTable) -> Result<Vec<TableColum
     Ok(columns)
 }
 
+/// Determine whether a column data type must be wrapped in single quotes.
+///
+/// Textual and temporal types require quoting so the generated INSERT batches remain
+/// valid SQL and preserve formatting. Numeric types stay unquoted to avoid implicit casts.
 fn column_requires_quotes(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -775,6 +842,10 @@ fn column_requires_quotes(data_type: &DataType) -> bool {
     )
 }
 
+/// Populate `TpchTableInfo` from parsed `driver.c` metadata, falling back to defaults.
+///
+/// When the upstream manifest omits a table, the helper synthesizes a file name and
+/// description so callers still receive a consistent summary payload.
 fn build_table_info(name: &str, raw_tables: &HashMap<String, RawTableDef>) -> TpchTableInfo {
     let file_key = format!("{}.tbl", name.to_ascii_lowercase());
     if let Some(raw) = raw_tables.get(&file_key) {
@@ -794,6 +865,7 @@ fn build_table_info(name: &str, raw_tables: &HashMap<String, RawTableDef>) -> Tp
     }
 }
 
+/// Convert a raw generator field into a SQL literal, escaping quotes as needed.
 fn format_value(column: &TableColumn, raw: &str) -> String {
     if raw.is_empty() {
         return "''".into();
