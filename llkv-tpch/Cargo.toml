@@ -9,10 +9,12 @@ publish.workspace = true
 
 [dependencies]
 arrow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 llkv.workspace = true
 llkv-sql.workspace = true
 regex.workspace = true
+rust_decimal.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
 thiserror.workspace = true
 tpchgen.workspace = true

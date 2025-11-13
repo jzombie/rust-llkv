@@ -36,6 +36,7 @@ arrow-schema = { version = "57.0.0", default-features = false }
 arrow-buffer = { version = "57.0.0", default-features = false }
 async-trait = "0.1.89"
 bitcode = "0.6.7"
+chrono = "0.4.42"
 clap = { version = "4.5.18", features = ["derive"] }
 criterion = "0.7.0"
 crossbeam-channel = "0.5.15"
@@ -49,6 +50,7 @@ rand = "0.9.1"
 rayon = "1.10.0"
 regex = "1.12.2"
 roaring = "0.11.2"
+rust_decimal = "1.39.0"
 sqlparser = "0.59.0"
 tempfile = "3.23.0"
 thiserror = "2.0.17"

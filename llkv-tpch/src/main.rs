@@ -1,6 +1,7 @@
 // TODO: If running in development mode, include warning about unoptimized performance.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,8 +9,12 @@ use std::time::Instant;
 use arrow::util::pretty::print_batches;
 use clap::{Args, Parser, Subcommand};
 use llkv::{SqlEngine, storage::MemPager};
+use llkv_tpch::qualification::{QualificationOptions, QualificationStatus};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
-use llkv_tpch::{LoadSummary, SchemaPaths, TpchError, install_default_schema, load_tpch_data};
+use llkv_tpch::{
+    LoadSummary, SchemaPaths, TableLoadEvent, TpchError, TpchToolkit, install_default_schema,
+    load_tpch_data,
+};
 
 const DEFAULT_SCALE_FACTOR: f64 = 0.01;
 const DEFAULT_BATCH_SIZE: usize = 500;
@@ -44,6 +49,8 @@ enum Command {
     Load(LoadArgs),
     /// Install the schema, load data, and run specific TPC-H queries.
     Query(QueryArgs),
+    /// Install, load, and validate query answers against the canonical reference output.
+    Qualify(QualifyArgs),
 }
 
 #[derive(Args, Clone)]
@@ -89,12 +96,38 @@ struct QueryArgs {
     params: Vec<(usize, String)>,
 }
 
+#[derive(Args, Clone)]
+struct QualifyArgs {
+    /// Scale factor to load before running qualification.
+    #[arg(long, default_value_t = 1.0)]
+    scale: f64,
+    /// TPC-H stream number used when rendering parameterized templates.
+    #[arg(long, default_value_t = 1)]
+    stream: u32,
+    /// One or more TPC-H query numbers (1-22) to validate.
+    #[arg(
+        long = "query",
+        short = 'q',
+        value_delimiter = ',',
+        value_parser = parse_query_number,
+        value_name = "Q"
+    )]
+    queries: Vec<u8>,
+    /// Override the qualification dataset directory (defaults to the bundled ref_data).
+    #[arg(long = "dataset", value_name = "PATH")]
+    dataset_dir: Option<PathBuf>,
+    /// Select the bundled qualification dataset scale (ref_data/<scale>).
+    #[arg(long = "ref-scale", value_name = "NAME", default_value = "1")]
+    ref_scale: String,
+}
+
 fn run() -> Result<(), TpchError> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Install) | None => run_install(),
         Some(Command::Load(args)) => run_load_command(args),
         Some(Command::Query(args)) => run_query_command(args),
+        Some(Command::Qualify(args)) => run_qualify_command(args),
     }
 }
 
@@ -200,6 +233,97 @@ fn run_load_internal(
     if let Some(execution) = execution {
         run_tpch_queries(&engine, &schema.schema_name, execution)?;
     }
+
+    Ok(())
+}
+
+fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
+    let toolkit = TpchToolkit::with_default_paths()?;
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    let schema = toolkit.install(&engine)?;
+
+    println!(
+        "Installing TPC-H schema '{}' and loading data at scale factor {:.3} for qualification",
+        schema.schema_name, args.scale
+    );
+
+    let summary = toolkit.load_data_with_progress(
+        &engine,
+        &schema.schema_name,
+        args.scale,
+        DEFAULT_BATCH_SIZE,
+        |event| match event {
+            TableLoadEvent::Begin {
+                table,
+                estimated_rows,
+            } => {
+                if let Some(rows) = estimated_rows {
+                    println!("  -> Loading {table} (~{rows} rows)...");
+                } else {
+                    println!("  -> Loading {table}...");
+                }
+            }
+            TableLoadEvent::Complete {
+                table,
+                rows,
+                elapsed,
+            } => {
+                println!(
+                    "     finished {table} ({rows} rows) in {:.2}s",
+                    elapsed.as_secs_f64()
+                );
+            }
+        },
+    )?;
+    print_load_summary(&summary);
+
+    let mut options = if let Some(dir) = &args.dataset_dir {
+        QualificationOptions::new(dir.clone())
+    } else {
+        QualificationOptions::from_scale(toolkit.schema_paths(), &args.ref_scale)
+    };
+    options = options.with_stream_number(args.stream);
+    if !args.queries.is_empty() {
+        options = options.with_queries(args.queries.clone());
+    }
+
+    let reports = toolkit.run_qualification(&engine, &schema.schema_name, &options)?;
+
+    println!(
+        "\nQualification results for stream {} (dataset: {}):",
+        args.stream,
+        options.dataset_dir().display()
+    );
+
+    let mut passed = 0usize;
+    for report in &reports {
+        let status = if report.status == QualificationStatus::Pass {
+            passed += 1;
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        println!(
+            "  Q{:02}: {} (expected {} rows, actual {})",
+            report.query, status, report.expected_row_count, report.actual_row_count
+        );
+        if report.status == QualificationStatus::Fail {
+            if !report.missing_rows.is_empty() {
+                println!("    missing rows:");
+                for row in &report.missing_rows {
+                    println!("      {}", row.join(" | "));
+                }
+            }
+            if !report.extra_rows.is_empty() {
+                println!("    extra rows:");
+                for row in &report.extra_rows {
+                    println!("      {}", row.join(" | "));
+                }
+            }
+        }
+    }
+
+    println!("\nSummary: {passed}/{} queries passed", reports.len());
 
     Ok(())
 }
