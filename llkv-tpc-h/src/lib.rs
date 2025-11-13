@@ -8,11 +8,11 @@
 use llkv::Error as LlkvError;
 use llkv_sql::{
     SqlEngine, canonical_table_ident, normalize_table_constraint,
-    order_create_tables_by_foreign_keys,
+    order_create_tables_by_foreign_keys, tpch::strip_tpch_connect_statements,
 };
 use regex::Regex;
 use sqlparser::ast::{
-    AlterTableOperation, CreateTable, Ident, ObjectNamePart, Statement, TableConstraint,
+    AlterTableOperation, CreateTable, DataType, Ident, ObjectNamePart, Statement, TableConstraint,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -93,6 +93,352 @@ impl Default for SchemaPaths {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TpchToolkit {
+    schema_paths: SchemaPaths,
+    schema_name: String,
+    tables_by_name: HashMap<String, TableSchema>,
+    creation_order: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TableSchema {
+    name: String,
+    create_table: CreateTable,
+    info: TpchTableInfo,
+    columns: Vec<TableColumn>,
+    column_list_sql: String,
+}
+
+#[derive(Debug, Clone)]
+struct TableColumn {
+    name: String,
+    requires_quotes: bool,
+}
+
+impl TpchToolkit {
+    /// Build a toolkit by parsing the bundled TPC-H metadata at the provided paths.
+    pub fn from_paths(paths: SchemaPaths) -> Result<Self> {
+        let dss_header = read_file(&paths.dss_header)?;
+        let macros = parse_numeric_macros(&dss_header);
+        let tdefs_source = read_file(&paths.tdefs_source)?;
+        let raw_tables = parse_tdefs(&tdefs_source, &macros)?;
+
+        let ddl_sql = read_file(&paths.ddl)?;
+        let (mut create_tables, _) = parse_ddl_with_schema(&ddl_sql, DEFAULT_SCHEMA_NAME)?;
+
+        let ri_sql = read_file(&paths.referential_integrity)?;
+        let constraint_map = parse_referential_integrity(&ri_sql)?;
+        apply_constraints_to_tables(&mut create_tables, &constraint_map);
+
+        let ordered_tables = order_create_tables_by_foreign_keys(create_tables);
+
+        let mut tables_by_name = HashMap::with_capacity(ordered_tables.len());
+        let mut creation_order = Vec::with_capacity(ordered_tables.len());
+
+        for table in ordered_tables {
+            let table_name = canonical_table_ident(&table.name).ok_or_else(|| {
+                TpchError::Parse("CREATE TABLE statement missing canonical name".into())
+            })?;
+
+            let columns = build_columns(&table_name, &table)?;
+            let column_list_sql = columns
+                .iter()
+                .map(|col| col.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let info = build_table_info(&table_name, &raw_tables);
+
+            let schema = TableSchema {
+                name: table_name.clone(),
+                create_table: table,
+                info,
+                columns,
+                column_list_sql,
+            };
+
+            if tables_by_name.insert(table_name.clone(), schema).is_some() {
+                return Err(TpchError::Parse(format!(
+                    "duplicate table definition for {table_name}"
+                )));
+            }
+            creation_order.push(table_name);
+        }
+
+        Ok(Self {
+            schema_paths: paths,
+            schema_name: DEFAULT_SCHEMA_NAME.to_string(),
+            tables_by_name,
+            creation_order,
+        })
+    }
+
+    /// Build a toolkit using the default metadata bundled with the crate.
+    pub fn with_default_paths() -> Result<Self> {
+        Self::from_paths(SchemaPaths::default())
+    }
+
+    /// Return the schema name the toolkit targets (defaults to `TPCD`).
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    /// Expose the resolved metadata paths for callers that need to read query templates.
+    pub fn schema_paths(&self) -> &SchemaPaths {
+        &self.schema_paths
+    }
+
+    /// Install the TPC-H schema into the provided engine.
+    pub fn install(&self, engine: &SqlEngine) -> Result<TpchSchema> {
+        let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {};", self.schema_name);
+        run_sql(engine, &create_schema_sql)?;
+        let ddl_batch_sql = self.render_create_tables();
+        run_sql(engine, &ddl_batch_sql)?;
+
+        Ok(TpchSchema {
+            schema_name: self.schema_name.clone(),
+            tables: self.table_infos(),
+        })
+    }
+
+    /// Load all TPC-H base tables using the provided generator scale factor and batch size.
+    pub fn load_data(
+        &self,
+        engine: &SqlEngine,
+        schema_name: &str,
+        scale_factor: f64,
+        batch_size: usize,
+    ) -> Result<LoadSummary> {
+        if batch_size == 0 {
+            return Err(TpchError::Parse(
+                "batch size must be greater than zero".into(),
+            ));
+        }
+
+        let mut tables = Vec::with_capacity(8);
+
+        {
+            let generator = RegionGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "REGION",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        {
+            let generator = NationGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "NATION",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        {
+            let generator = SupplierGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "SUPPLIER",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        {
+            let generator = CustomerGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "CUSTOMER",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        {
+            let generator = PartGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "PART",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        {
+            let generator = PartSuppGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "PARTSUPP",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        {
+            let generator = OrderGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "ORDERS",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        {
+            let generator = LineItemGenerator::new(scale_factor, 1, 1);
+            let rows = generator.iter().map(|row| row.to_string());
+            tables.push(self.load_table_with_rows(
+                engine,
+                schema_name,
+                "LINEITEM",
+                rows,
+                batch_size,
+            )?);
+        }
+
+        Ok(LoadSummary { tables })
+    }
+
+    fn table_schema(&self, table_name: &str) -> Result<&TableSchema> {
+        self.tables_by_name
+            .get(table_name)
+            .ok_or_else(|| TpchError::Parse(format!("unknown TPC-H table '{table_name}'")))
+    }
+
+    fn render_create_tables(&self) -> String {
+        let mut sql = String::new();
+        for table_name in &self.creation_order {
+            if let Some(table) = self.tables_by_name.get(table_name) {
+                if !sql.is_empty() {
+                    sql.push('\n');
+                }
+                let statement = Statement::CreateTable(table.create_table.clone());
+                sql.push_str(&statement.to_string());
+                sql.push_str(";\n");
+            }
+        }
+        sql
+    }
+
+    fn table_infos(&self) -> Vec<TpchTableInfo> {
+        self.creation_order
+            .iter()
+            .filter_map(|name| self.tables_by_name.get(name))
+            .map(|table| table.info.clone())
+            .collect()
+    }
+
+    fn load_table_with_rows<I>(
+        &self,
+        engine: &SqlEngine,
+        schema_name: &str,
+        table_name: &'static str,
+        rows: I,
+        batch_size: usize,
+    ) -> Result<LoadTableSummary>
+    where
+        I: Iterator<Item = String>,
+    {
+        let table = self.table_schema(table_name)?;
+        let row_count = self.load_table_from_lines(engine, schema_name, table, rows, batch_size)?;
+        Ok(LoadTableSummary {
+            table: table_name,
+            rows: row_count,
+        })
+    }
+
+    fn load_table_from_lines<I>(
+        &self,
+        engine: &SqlEngine,
+        schema_name: &str,
+        table: &TableSchema,
+        rows: I,
+        batch_size: usize,
+    ) -> Result<usize>
+    where
+        I: Iterator<Item = String>,
+    {
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut row_count = 0usize;
+
+        for line in rows {
+            if line.is_empty() {
+                continue;
+            }
+            let row_sql = self.format_row_values(table, &line)?;
+            batch.push(row_sql);
+            row_count += 1;
+            if batch.len() == batch_size {
+                self.flush_insert(engine, schema_name, table, &batch)?;
+                batch.clear();
+            }
+        }
+
+        if !batch.is_empty() {
+            self.flush_insert(engine, schema_name, table, &batch)?;
+        }
+
+        Ok(row_count)
+    }
+
+    fn format_row_values(&self, table: &TableSchema, line: &str) -> Result<String> {
+        let raw_fields: Vec<&str> = line.trim_end_matches('|').split('|').collect();
+        if raw_fields.len() != table.columns.len() {
+            return Err(TpchError::Parse(format!(
+                "row '{}' does not match column definition (expected {}, found {})",
+                line,
+                table.columns.len(),
+                raw_fields.len()
+            )));
+        }
+
+        let formatted_values: Vec<String> = raw_fields
+            .iter()
+            .zip(table.columns.iter())
+            .map(|(raw, column)| format_value(column, raw))
+            .collect();
+
+        Ok(format!("({})", formatted_values.join(", ")))
+    }
+
+    fn flush_insert(
+        &self,
+        engine: &SqlEngine,
+        schema_name: &str,
+        table: &TableSchema,
+        rows: &[String],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut sql = format!(
+            "INSERT INTO {}.{} ({}) VALUES ",
+            schema_name, table.name, table.column_list_sql
+        );
+        sql.push_str(&rows.join(", "));
+        sql.push(';');
+        run_sql(engine, &sql)
+    }
+}
+
 /// Summary of the installed TPC-H schema.
 #[derive(Debug, Clone)]
 pub struct TpchSchema {
@@ -121,37 +467,36 @@ struct RawTableDef {
 /// This helper uses the default toolkit paths relative to the `llkv-tpc-h`
 /// crate and is the easiest way to bootstrap a database for experimentation.
 pub fn install_default_schema(engine: &SqlEngine) -> Result<TpchSchema> {
-    install_schema(engine, &SchemaPaths::default())
+    let toolkit = TpchToolkit::with_default_paths()?;
+    toolkit.install(engine)
 }
 
 /// Install the TPC-H schema using explicit metadata locations.
 pub fn install_schema(engine: &SqlEngine, paths: &SchemaPaths) -> Result<TpchSchema> {
-    let dss_header = read_file(&paths.dss_header)?;
-    let macros = parse_numeric_macros(&dss_header);
-    let tdefs_source = read_file(&paths.tdefs_source)?;
-    let raw_tables = parse_tdefs(&tdefs_source, &macros)?;
+    let toolkit = TpchToolkit::from_paths(paths.clone())?;
+    toolkit.install(engine)
+}
 
-    let ddl_sql = read_file(&paths.ddl)?;
-    let (mut create_tables, table_names) = parse_ddl_with_schema(&ddl_sql, DEFAULT_SCHEMA_NAME)?;
+/// Load the TPC-H data set using the default toolkit metadata paths.
+pub fn load_tpch_data(
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<LoadSummary> {
+    let toolkit = TpchToolkit::with_default_paths()?;
+    toolkit.load_data(engine, schema_name, scale_factor, batch_size)
+}
 
-    let ri_sql = read_file(&paths.referential_integrity)?;
-    let constraint_map = parse_referential_integrity(&ri_sql)?;
-    apply_constraints_to_tables(&mut create_tables, &constraint_map);
-    let ordered_tables = order_create_tables_by_foreign_keys(create_tables);
-
-    run_sql(
-        engine,
-        &format!("CREATE SCHEMA IF NOT EXISTS {DEFAULT_SCHEMA_NAME};"),
-    )?;
-    let ddl_batch_sql = render_create_tables(&ordered_tables);
-    run_sql(engine, &ddl_batch_sql)?;
-
-    let tables = build_table_infos(table_names, &raw_tables);
-
-    Ok(TpchSchema {
-        schema_name: DEFAULT_SCHEMA_NAME.to_string(),
-        tables,
-    })
+/// Load the TPC-H data set using a pre-initialized toolkit.
+pub fn load_tpch_data_with_toolkit(
+    toolkit: &TpchToolkit,
+    engine: &SqlEngine,
+    schema_name: &str,
+    scale_factor: f64,
+    batch_size: usize,
+) -> Result<LoadSummary> {
+    toolkit.load_data(engine, schema_name, scale_factor, batch_size)
 }
 
 pub(crate) fn read_file(path: &Path) -> Result<String> {
@@ -324,7 +669,7 @@ fn parse_ddl_with_schema(ddl_sql: &str, schema: &str) -> Result<(Vec<CreateTable
 }
 
 fn parse_referential_integrity(ri_sql: &str) -> Result<HashMap<String, Vec<TableConstraint>>> {
-    let cleaned = strip_connect_statements(ri_sql);
+    let cleaned = strip_tpch_connect_statements(ri_sql);
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, &cleaned)
         .map_err(|err| TpchError::Parse(format!("failed to parse dss.ri: {err}")))?;
@@ -384,524 +729,78 @@ impl LoadSummary {
     }
 }
 
-// TODO: Why is this defined here?  Is this a duplicate of something else?
-#[derive(Clone, Copy)]
-enum ColumnKind {
-    Number,
-    #[allow(dead_code)]
-    Decimal,
-    String,
-    Date,
-}
-
-impl ColumnKind {
-    fn requires_quotes(self) -> bool {
-        matches!(self, ColumnKind::String | ColumnKind::Date)
-    }
-}
-
-const REGION_COLUMNS: &[&str] = &["r_regionkey", "r_name", "r_comment"];
-const REGION_KINDS: &[ColumnKind] = &[ColumnKind::Number, ColumnKind::String, ColumnKind::String];
-
-const NATION_COLUMNS: &[&str] = &["n_nationkey", "n_name", "n_regionkey", "n_comment"];
-const NATION_KINDS: &[ColumnKind] = &[
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-];
-
-const SUPPLIER_COLUMNS: &[&str] = &[
-    "s_suppkey",
-    "s_name",
-    "s_address",
-    "s_nationkey",
-    "s_phone",
-    "s_acctbal",
-    "s_comment",
-];
-const SUPPLIER_KINDS: &[ColumnKind] = &[
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-];
-
-const CUSTOMER_COLUMNS: &[&str] = &[
-    "c_custkey",
-    "c_name",
-    "c_address",
-    "c_nationkey",
-    "c_phone",
-    "c_acctbal",
-    "c_mktsegment",
-    "c_comment",
-];
-const CUSTOMER_KINDS: &[ColumnKind] = &[
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::String,
-];
-
-const PART_COLUMNS: &[&str] = &[
-    "p_partkey",
-    "p_name",
-    "p_mfgr",
-    "p_brand",
-    "p_type",
-    "p_size",
-    "p_container",
-    "p_retailprice",
-    "p_comment",
-];
-const PART_KINDS: &[ColumnKind] = &[
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-];
-
-const PARTSUPP_COLUMNS: &[&str] = &[
-    "ps_partkey",
-    "ps_suppkey",
-    "ps_availqty",
-    "ps_supplycost",
-    "ps_comment",
-];
-const PARTSUPP_KINDS: &[ColumnKind] = &[
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::String,
-];
-
-const ORDERS_COLUMNS: &[&str] = &[
-    "o_orderkey",
-    "o_custkey",
-    "o_orderstatus",
-    "o_totalprice",
-    "o_orderdate",
-    "o_orderpriority",
-    "o_clerk",
-    "o_shippriority",
-    "o_comment",
-];
-const ORDERS_KINDS: &[ColumnKind] = &[
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::Date,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::Number,
-    ColumnKind::String,
-];
-
-const LINEITEM_COLUMNS: &[&str] = &[
-    "l_orderkey",
-    "l_partkey",
-    "l_suppkey",
-    "l_linenumber",
-    "l_quantity",
-    "l_extendedprice",
-    "l_discount",
-    "l_tax",
-    "l_returnflag",
-    "l_linestatus",
-    "l_shipdate",
-    "l_commitdate",
-    "l_receiptdate",
-    "l_shipinstruct",
-    "l_shipmode",
-    "l_comment",
-];
-const LINEITEM_KINDS: &[ColumnKind] = &[
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::Number,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::Date,
-    ColumnKind::Date,
-    ColumnKind::Date,
-    ColumnKind::String,
-    ColumnKind::String,
-    ColumnKind::String,
-];
-
-pub fn load_tpch_data(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<LoadSummary> {
-    if batch_size == 0 {
-        return Err(TpchError::Parse(
-            "batch size must be greater than zero".into(),
-        ));
-    }
-
-    let tables = vec![
-        LoadTableSummary {
-            table: "REGION",
-            rows: load_region(engine, schema_name, scale_factor, batch_size)?,
-        },
-        LoadTableSummary {
-            table: "NATION",
-            rows: load_nation(engine, schema_name, scale_factor, batch_size)?,
-        },
-        LoadTableSummary {
-            table: "SUPPLIER",
-            rows: load_supplier(engine, schema_name, scale_factor, batch_size)?,
-        },
-        LoadTableSummary {
-            table: "CUSTOMER",
-            rows: load_customer(engine, schema_name, scale_factor, batch_size)?,
-        },
-        LoadTableSummary {
-            table: "PART",
-            rows: load_part(engine, schema_name, scale_factor, batch_size)?,
-        },
-        LoadTableSummary {
-            table: "PARTSUPP",
-            rows: load_partsupp(engine, schema_name, scale_factor, batch_size)?,
-        },
-        LoadTableSummary {
-            table: "ORDERS",
-            rows: load_orders(engine, schema_name, scale_factor, batch_size)?,
-        },
-        LoadTableSummary {
-            table: "LINEITEM",
-            rows: load_lineitem(engine, schema_name, scale_factor, batch_size)?,
-        },
-    ];
-
-    Ok(LoadSummary { tables })
-}
-
-fn load_region(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = RegionGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "REGION",
-        REGION_COLUMNS,
-        REGION_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_nation(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = NationGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "NATION",
-        NATION_COLUMNS,
-        NATION_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_supplier(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = SupplierGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "SUPPLIER",
-        SUPPLIER_COLUMNS,
-        SUPPLIER_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_customer(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = CustomerGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "CUSTOMER",
-        CUSTOMER_COLUMNS,
-        CUSTOMER_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_part(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = PartGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "PART",
-        PART_COLUMNS,
-        PART_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_partsupp(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = PartSuppGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "PARTSUPP",
-        PARTSUPP_COLUMNS,
-        PARTSUPP_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_orders(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = OrderGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "ORDERS",
-        ORDERS_COLUMNS,
-        ORDERS_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_lineitem(
-    engine: &SqlEngine,
-    schema_name: &str,
-    scale_factor: f64,
-    batch_size: usize,
-) -> Result<usize> {
-    let generator = LineItemGenerator::new(scale_factor, 1, 1);
-    let rows = generator.iter().map(|row| row.to_string());
-    load_table_from_lines(
-        engine,
-        schema_name,
-        "LINEITEM",
-        LINEITEM_COLUMNS,
-        LINEITEM_KINDS,
-        rows,
-        batch_size,
-    )
-}
-
-fn load_table_from_lines<I>(
-    engine: &SqlEngine,
-    schema_name: &str,
-    table_name: &'static str,
-    columns: &[&str],
-    kinds: &[ColumnKind],
-    rows: I,
-    batch_size: usize,
-) -> Result<usize>
-where
-    I: Iterator<Item = String>,
-{
-    if columns.len() != kinds.len() {
+fn build_columns(table_name: &str, table: &CreateTable) -> Result<Vec<TableColumn>> {
+    if table.columns.is_empty() {
         return Err(TpchError::Parse(format!(
-            "column definition mismatch for {}",
-            table_name
+            "table '{table_name}' does not declare any columns"
         )));
     }
 
-    let mut batch = Vec::with_capacity(batch_size);
-    let mut row_count = 0usize;
+    let mut columns = Vec::with_capacity(table.columns.len());
+    for column_def in &table.columns {
+        let name = column_def.name.value.clone();
+        let requires_quotes = column_requires_quotes(&column_def.data_type);
+        columns.push(TableColumn {
+            name,
+            requires_quotes,
+        });
+    }
 
-    for line in rows {
-        if line.is_empty() {
-            continue;
+    Ok(columns)
+}
+
+fn column_requires_quotes(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Character(_)
+            | DataType::Char(_)
+            | DataType::CharacterVarying(_)
+            | DataType::CharVarying(_)
+            | DataType::Varchar(_)
+            | DataType::Nvarchar(_)
+            | DataType::CharacterLargeObject(_)
+            | DataType::CharLargeObject(_)
+            | DataType::Clob(_)
+            | DataType::Text
+            | DataType::String(_)
+            | DataType::Uuid
+            | DataType::Date
+            | DataType::Datetime(_)
+            | DataType::Datetime64(_, _)
+            | DataType::Timestamp(_, _)
+            | DataType::TimestampNtz
+            | DataType::Time(_, _)
+            | DataType::JSON
+            | DataType::JSONB
+    )
+}
+
+fn build_table_info(name: &str, raw_tables: &HashMap<String, RawTableDef>) -> TpchTableInfo {
+    let file_key = format!("{}.tbl", name.to_ascii_lowercase());
+    if let Some(raw) = raw_tables.get(&file_key) {
+        TpchTableInfo {
+            name: name.to_string(),
+            file_name: raw.file_name.clone(),
+            description: raw.description.clone(),
+            base_rows: raw.base_rows,
         }
-        let row_sql = format_row_values(&line, kinds)?;
-        batch.push(row_sql);
-        row_count += 1;
-        if batch.len() == batch_size {
-            flush_insert(engine, schema_name, table_name, columns, &batch)?;
-            batch.clear();
+    } else {
+        TpchTableInfo {
+            name: name.to_string(),
+            file_name: file_key.clone(),
+            description: format!("{} table", name.to_ascii_lowercase()),
+            base_rows: 0,
         }
     }
-
-    if !batch.is_empty() {
-        flush_insert(engine, schema_name, table_name, columns, &batch)?;
-    }
-
-    Ok(row_count)
 }
 
-fn flush_insert(
-    engine: &SqlEngine,
-    schema_name: &str,
-    table_name: &'static str,
-    columns: &[&str],
-    rows: &[String],
-) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let mut sql = format!(
-        "INSERT INTO {}.{} ({}) VALUES ",
-        schema_name,
-        table_name,
-        columns.join(", ")
-    );
-    sql.push_str(&rows.join(", "));
-    sql.push(';');
-    engine.execute(&sql)?;
-    Ok(())
-}
-
-fn format_row_values(line: &str, kinds: &[ColumnKind]) -> Result<String> {
-    let raw_fields: Vec<&str> = line.trim_end_matches('|').split('|').collect();
-    if raw_fields.len() != kinds.len() {
-        return Err(TpchError::Parse(format!(
-            "row '{}' does not match column definition (expected {}, found {})",
-            line,
-            kinds.len(),
-            raw_fields.len()
-        )));
-    }
-
-    let formatted_values: Vec<String> = raw_fields
-        .iter()
-        .zip(kinds.iter())
-        .map(|(raw, kind)| format_value(kind, raw))
-        .collect();
-
-    Ok(format!("({})", formatted_values.join(", ")))
-}
-
-fn format_value(kind: &ColumnKind, raw: &str) -> String {
+fn format_value(column: &TableColumn, raw: &str) -> String {
     if raw.is_empty() {
         return "''".into();
     }
-    if kind.requires_quotes() {
+    if column.requires_quotes {
         format!("'{}'", raw.replace('\'', "''"))
     } else {
         raw.to_string()
     }
-}
-
-fn render_create_tables(tables: &[CreateTable]) -> String {
-    let mut sql = String::new();
-    for table in tables {
-        if !sql.is_empty() {
-            sql.push('\n');
-        }
-        let statement = Statement::CreateTable(table.clone());
-        let rendered_sql = statement.to_string();
-
-        // DEBUG: Print LINEITEM table schema to verify DECIMAL columns
-        if let Some(last_part) = table.name.0.last()
-            && let Some(ident) = last_part.as_ident()
-            && ident.value.eq_ignore_ascii_case("LINEITEM")
-        {
-            eprintln!("\n=== DEBUG: LINEITEM CREATE TABLE SQL ===");
-            eprintln!("{}", rendered_sql);
-            eprintln!("=== END DEBUG ===\n");
-        }
-
-        sql.push_str(&rendered_sql);
-        sql.push_str(";\n");
-    }
-    sql
-}
-
-fn build_table_infos(
-    names: Vec<String>,
-    raw_tables: &HashMap<String, RawTableDef>,
-) -> Vec<TpchTableInfo> {
-    names
-        .into_iter()
-        .map(|name| {
-            let file_key = format!("{}.tbl", name.to_ascii_lowercase());
-            if let Some(raw) = raw_tables.get(&file_key) {
-                TpchTableInfo {
-                    name: name.clone(),
-                    file_name: raw.file_name.clone(),
-                    description: raw.description.clone(),
-                    base_rows: raw.base_rows,
-                }
-            } else {
-                TpchTableInfo {
-                    name: name.clone(),
-                    file_name: file_key.clone(),
-                    description: format!("{} table", name.to_ascii_lowercase()),
-                    base_rows: 0,
-                }
-            }
-        })
-        .collect()
-}
-
-// TODO: Dedupe; this should be solely in llkv-sql
-fn strip_connect_statements(sql: &str) -> String {
-    Regex::new(r#"(?im)^\s*CONNECT\s+TO\s+(?:[A-Za-z0-9_]+|'[^']+'|"[^"]+")\s*;\s*"#)
-        .expect("valid CONNECT removal regex")
-        .replace_all(sql, "")
-        .into_owned()
 }

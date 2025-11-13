@@ -34,6 +34,8 @@ pub use sql_engine::{
     clear_pending_statement_expectations, register_statement_expectation,
 };
 
+pub mod tpch;
+
 mod interval;
 
 mod sql_value;
