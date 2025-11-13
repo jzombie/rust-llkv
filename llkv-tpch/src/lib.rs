@@ -481,7 +481,7 @@ struct RawTableDef {
 
 /// Install the bundled TPC-H schema into the provided SQL engine.
 ///
-/// This helper uses the default toolkit paths relative to the `llkv-tpc-h`
+/// This helper uses the default toolkit paths relative to the `llkv-tpch`
 /// crate and is the easiest way to bootstrap a database for experimentation.
 pub fn install_default_schema(engine: &SqlEngine) -> Result<TpchSchema> {
     let toolkit = TpchToolkit::with_default_paths()?;
