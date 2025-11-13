@@ -17,7 +17,7 @@ use llkv_tpch::{
 };
 
 const DEFAULT_SCALE_FACTOR: f64 = 0.01;
-const DEFAULT_BATCH_SIZE: usize = 500;
+const DEFAULT_BATCH_SIZE: usize = 65_536;
 
 fn main() {
     // Initialize tracing subscriber to respect RUST_LOG environment variable
