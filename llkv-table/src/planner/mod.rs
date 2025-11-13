@@ -9,11 +9,14 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, OffsetSizeTrait, RecordBatch,
-    StringArray, UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+    IntervalMonthDayNanoArray, OffsetSizeTrait, RecordBatch, StringArray, UInt64Array,
+    new_null_array,
 };
 use arrow::compute;
-use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
+use arrow_array::types::IntervalMonthDayNanoType;
+use time::{Date, Month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
@@ -36,11 +39,15 @@ use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
-use llkv_expr::literal::{FromLiteral, Literal};
+use llkv_expr::decimal::DecimalValue;
+use llkv_expr::literal::{FromLiteral, IntervalValue, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_plan::date::{
+    add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
+};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -1138,8 +1145,15 @@ where
                         let dtype = match &info.expr {
                             ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
                             ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
+                            ScalarExpr::Literal(Literal::Decimal(value)) => {
+                                DataType::Decimal128(value.precision(), value.scale())
+                            }
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
                             ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
+                            ScalarExpr::Literal(Literal::Date32(_)) => DataType::Date32,
+                            ScalarExpr::Literal(Literal::Interval(_)) => {
+                                DataType::Interval(IntervalUnit::MonthDayNano)
+                            }
                             ScalarExpr::Literal(Literal::Null) => DataType::Null,
                             ScalarExpr::Literal(Literal::Struct(fields)) => {
                                 // Infer struct type from the literal fields
@@ -1186,6 +1200,7 @@ where
                                 match result_kind {
                                     NumericKind::Integer => DataType::Int64,
                                     NumericKind::Float => DataType::Float64,
+                                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
                                 }
                             }
                             ScalarExpr::Column(fid) => {
@@ -1440,6 +1455,7 @@ where
                 let output_dtype = match result_kind {
                     NumericKind::Integer => DataType::Int64,
                     NumericKind::Float => DataType::Float64,
+                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
                 };
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
@@ -1607,24 +1623,8 @@ where
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
     ) -> LlkvResult<Option<bool>> {
-        use llkv_expr::literal::Literal;
-
-        fn evaluate_constant_literal(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
-            let simplified = NumericKernels::simplify(expr);
-            if let ScalarExpr::Literal(lit) = &simplified {
-                return Ok(Some(lit.clone()));
-            }
-
-            let arrays = NumericArrayMap::default();
-            match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
-                Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
-                Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
-                None => Ok(None),
-            }
-        }
-
-        let left_lit_opt = evaluate_constant_literal(left)?;
-        let right_lit_opt = evaluate_constant_literal(right)?;
+        let left_lit_opt = evaluate_constant_literal_expr(left)?;
+        let right_lit_opt = evaluate_constant_literal_expr(right)?;
 
         let left_lit = match left_lit_opt {
             Some(Literal::Null) | None => return Ok(None),
@@ -1641,7 +1641,20 @@ where
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
                 (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
                 (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
+                (Literal::Decimal(l), Literal::Decimal(r)) => (*l).compare(*r).ok(),
+                (Literal::Decimal(l), Literal::Integer(r)) => DecimalValue::new(*r, 0)
+                    .ok()
+                    .and_then(|int| (*l).compare(int).ok()),
+                (Literal::Integer(l), Literal::Decimal(r)) => DecimalValue::new(*l, 0)
+                    .ok()
+                    .and_then(|int| int.compare(*r).ok()),
+                (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
+                (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
+                (Literal::Date32(l), Literal::Date32(r)) => l.partial_cmp(r),
+                (Literal::Interval(l), Literal::Interval(r)) => {
+                    Some(compare_interval_values(*l, *r))
+                }
                 (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r),
                 (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64)),
                 _ => None,
@@ -3365,6 +3378,7 @@ fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
 fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
     match literal {
         Literal::Float(_) => Ok(true),
+        Literal::Decimal(_) => Ok(true),
         Literal::Struct(fields) => {
             for (_, nested) in fields {
                 if literal_prefers_float(nested.as_ref())? {
@@ -3374,6 +3388,8 @@ fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
             Ok(false)
         }
         Literal::Integer(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
+        Literal::Date32(_) => Ok(false),
+        Literal::Interval(_) => Ok(false),
     }
 }
 
@@ -3421,8 +3437,11 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
     match literal {
         Literal::Integer(_) => Ok(DataType::Int64),
         Literal::Float(_) => Ok(DataType::Float64),
+        Literal::Decimal(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
         Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
+        Literal::Date32(_) => Ok(DataType::Date32),
+        Literal::Interval(_) => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
         Literal::Null => Ok(DataType::Null),
         Literal::Struct(fields) => {
             let inferred_fields = fields
@@ -3435,6 +3454,22 @@ fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
             Ok(DataType::Struct(inferred_fields.into()))
         }
     }
+}
+
+#[inline]
+fn interval_value_to_arrow(
+    value: IntervalValue,
+) -> <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native {
+    <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native::new(
+        value.months,
+        value.days,
+        value.nanos,
+    )
+}
+
+#[inline]
+fn compare_interval_values(lhs: IntervalValue, rhs: IntervalValue) -> Ordering {
+    (lhs.months, lhs.days, lhs.nanos).cmp(&(rhs.months, rhs.days, rhs.nanos))
 }
 
 fn synthesize_computed_literal_array(
@@ -3458,11 +3493,29 @@ fn synthesize_computed_literal_array(
         ScalarExpr::Literal(Literal::Float(value)) => {
             Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
         }
+        ScalarExpr::Literal(Literal::Decimal(value)) => {
+            let iter = std::iter::repeat_n(value.raw_value(), row_count);
+            let array = Decimal128Array::from_iter_values(iter)
+                .with_precision_and_scale(value.precision(), value.scale())
+                .map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "failed to build Decimal128 literal array: {err}"
+                    ))
+                })?;
+            Ok(Arc::new(array) as ArrayRef)
+        }
         ScalarExpr::Literal(Literal::Boolean(value)) => {
             Ok(Arc::new(BooleanArray::from(vec![*value; row_count])) as ArrayRef)
         }
         ScalarExpr::Literal(Literal::String(value)) => {
             Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
+        }
+        ScalarExpr::Literal(Literal::Date32(value)) => {
+            Ok(Arc::new(Date32Array::from(vec![*value; row_count])) as ArrayRef)
+        }
+        ScalarExpr::Literal(Literal::Interval(value)) => {
+            let native = interval_value_to_arrow(*value);
+            Ok(Arc::new(IntervalMonthDayNanoArray::from(vec![native; row_count])) as ArrayRef)
         }
         ScalarExpr::Literal(Literal::Null) => Ok(new_null_array(data_type, row_count)),
         ScalarExpr::Literal(Literal::Struct(fields)) => {
@@ -3487,12 +3540,30 @@ fn synthesize_computed_literal_array(
                     Literal::Float(v) => {
                         Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
                     }
+                    Literal::Decimal(v) => {
+                        let iter = std::iter::repeat_n(v.raw_value(), row_count);
+                        let array = Decimal128Array::from_iter_values(iter)
+                            .with_precision_and_scale(v.precision(), v.scale())
+                            .map_err(|err| {
+                                Error::InvalidArgumentError(format!(
+                                    "failed to build Decimal128 literal array: {err}"
+                                ))
+                            })?;
+                        Arc::new(array) as ArrayRef
+                    }
                     Literal::Boolean(v) => {
                         Arc::new(BooleanArray::from(vec![*v; row_count])) as ArrayRef
                     }
                     Literal::String(v) => {
                         Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
                     }
+                    Literal::Date32(v) => {
+                        Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
+                    }
+                    Literal::Interval(v) => Arc::new(IntervalMonthDayNanoArray::from(vec![
+                        interval_value_to_arrow(*v);
+                        row_count
+                    ])) as ArrayRef,
                     Literal::Null => new_null_array(&field_dtype, row_count),
                     Literal::Struct(nested_fields) => {
                         // Recursively build nested struct
@@ -3904,8 +3975,14 @@ fn format_literal(lit: &Literal) -> String {
     match lit {
         Literal::Integer(i) => i.to_string(),
         Literal::Float(f) => f.to_string(),
+        Literal::Decimal(d) => d.to_string(),
         Literal::Boolean(b) => b.to_string(),
         Literal::String(s) => format!("\"{}\"", escape_string(s)),
+        Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
+        Literal::Interval(interval) => format!(
+            "INTERVAL {{ months: {}, days: {}, nanos: {} }}",
+            interval.months, interval.days, interval.nanos
+        ),
         Literal::Null => "NULL".to_string(),
         Literal::Struct(fields) => {
             let field_strs: Vec<_> = fields
@@ -3915,6 +3992,28 @@ fn format_literal(lit: &Literal) -> String {
             format!("{{{}}}", field_strs.join(", "))
         }
     }
+}
+
+fn format_date32(days: i32) -> String {
+    let julian = match epoch_julian_day().checked_add(days) {
+        Some(value) => value,
+        None => return days.to_string(),
+    };
+
+    match Date::from_julian_day(julian) {
+        Ok(date) => {
+            let (year, month, day) = date.to_calendar_date();
+            let month_number = month as u8;
+            format!("{:04}-{:02}-{:02}", year, month_number, day)
+        }
+        Err(_) => days.to_string(),
+    }
+}
+
+fn epoch_julian_day() -> i32 {
+    Date::from_calendar_date(1970, Month::January, 1)
+        .expect("1970-01-01 is a valid date")
+        .to_julian_day()
 }
 
 fn escape_string(value: &str) -> String {
@@ -4914,6 +5013,131 @@ fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
         }
     }
     row_ids
+}
+
+fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
+    let simplified = NumericKernels::simplify(expr);
+
+    if let Some(literal) = evaluate_constant_literal_non_numeric(&simplified)? {
+        return Ok(Some(literal));
+    }
+
+    if let ScalarExpr::Literal(lit) = &simplified {
+        return Ok(Some(lit.clone()));
+    }
+
+    let arrays = NumericArrayMap::default();
+    match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
+        Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
+        Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
+        Some(NumericValue::Decimal(d)) => Ok(Some(Literal::Decimal(d))),
+        None => Ok(None),
+    }
+}
+
+fn evaluate_constant_literal_non_numeric(
+    expr: &ScalarExpr<FieldId>,
+) -> LlkvResult<Option<Literal>> {
+    match expr {
+        ScalarExpr::Literal(lit) => Ok(Some(lit.clone())),
+        ScalarExpr::Cast {
+            expr,
+            data_type: DataType::Date32,
+        } => {
+            let inner = evaluate_constant_literal_non_numeric(expr)?;
+            match inner {
+                Some(Literal::Null) => Ok(Some(Literal::Null)),
+                Some(Literal::String(text)) => {
+                    let days = parse_date32_literal(&text)?;
+                    Ok(Some(Literal::Date32(days)))
+                }
+                Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
+                Some(other) => Err(Error::InvalidArgumentError(format!(
+                    "cannot cast literal of type {} to DATE",
+                    literal_type_name(&other)
+                ))),
+                None => Ok(None),
+            }
+        }
+        ScalarExpr::Cast { .. } => Ok(None),
+        ScalarExpr::Binary { left, op, right } => {
+            let left_lit = match evaluate_constant_literal_non_numeric(left)? {
+                Some(lit) => lit,
+                None => return Ok(None),
+            };
+            let right_lit = match evaluate_constant_literal_non_numeric(right)? {
+                Some(lit) => lit,
+                None => return Ok(None),
+            };
+
+            if matches!(left_lit, Literal::Null) || matches!(right_lit, Literal::Null) {
+                return Ok(Some(Literal::Null));
+            }
+
+            match op {
+                BinaryOp::Add => match (&left_lit, &right_lit) {
+                    (Literal::Date32(days), Literal::Interval(interval))
+                    | (Literal::Interval(interval), Literal::Date32(days)) => {
+                        let adjusted = add_interval_to_date32(*days, *interval)?;
+                        Ok(Some(Literal::Date32(adjusted)))
+                    }
+                    (Literal::Interval(left), Literal::Interval(right)) => {
+                        let sum = left.checked_add(*right).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "interval addition overflow during constant folding".into(),
+                            )
+                        })?;
+                        Ok(Some(Literal::Interval(sum)))
+                    }
+                    _ => Ok(None),
+                },
+                BinaryOp::Subtract => match (&left_lit, &right_lit) {
+                    (Literal::Date32(days), Literal::Interval(interval)) => {
+                        let adjusted = subtract_interval_from_date32(*days, *interval)?;
+                        Ok(Some(Literal::Date32(adjusted)))
+                    }
+                    (Literal::Interval(left), Literal::Interval(right)) => {
+                        let diff = left.checked_sub(*right).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "interval subtraction overflow during constant folding".into(),
+                            )
+                        })?;
+                        Ok(Some(Literal::Interval(diff)))
+                    }
+                    (Literal::Date32(lhs), Literal::Date32(rhs)) => {
+                        let delta = i64::from(*lhs) - i64::from(*rhs);
+                        if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
+                            return Err(Error::InvalidArgumentError(
+                                "DATE subtraction overflowed day precision".into(),
+                            ));
+                        }
+                        Ok(Some(Literal::Interval(IntervalValue::new(
+                            0,
+                            delta as i32,
+                            0,
+                        ))))
+                    }
+                    _ => Ok(None),
+                },
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn literal_type_name(literal: &Literal) -> &'static str {
+    match literal {
+        Literal::Null => "NULL",
+        Literal::Integer(_) => "INTEGER",
+        Literal::Float(_) => "FLOAT",
+        Literal::Decimal(_) => "DECIMAL",
+        Literal::String(_) => "STRING",
+        Literal::Boolean(_) => "BOOLEAN",
+        Literal::Date32(_) => "DATE",
+        Literal::Struct(_) => "STRUCT",
+        Literal::Interval(_) => "INTERVAL",
+    }
 }
 
 fn is_supported_numeric(dtype: &DataType) -> bool {

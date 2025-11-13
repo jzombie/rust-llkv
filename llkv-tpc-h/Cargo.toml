@@ -1,0 +1,20 @@
+[package]
+name = "llkv-tpc-h"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow.workspace = true
+clap.workspace = true
+llkv.workspace = true
+llkv-sql.workspace = true
+regex.workspace = true
+sqlparser = { workspace = true, features = ["visitor"] }
+thiserror.workspace = true
+tpchgen.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

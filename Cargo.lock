@@ -1552,6 +1552,7 @@ name = "llkv-executor"
 version = "0.8.2-alpha"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "llkv-aggregate",
  "llkv-column-map",
  "llkv-expr",
@@ -1575,6 +1576,7 @@ version = "0.8.2-alpha"
 dependencies = [
  "arrow",
  "arrow-array",
+ "arrow-buffer",
  "llkv-test-utils",
 ]
 
@@ -1604,11 +1606,13 @@ dependencies = [
  "llkv-expr",
  "llkv-result",
  "llkv-test-utils",
+ "regex",
  "rustc-hash",
  "serde",
  "serde_json",
  "sqlparser",
  "thiserror",
+ "time",
 ]
 
 [[package]]
@@ -1737,6 +1741,7 @@ dependencies = [
  "simd-r-drive-entry-handle",
  "sqlparser",
  "tempfile",
+ "time",
  "tracing",
 ]
 
@@ -1745,6 +1750,22 @@ name = "llkv-test-utils"
 version = "0.8.2-alpha"
 dependencies = [
  "ctor",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "llkv-tpc-h"
+version = "0.8.1-alpha"
+dependencies = [
+ "arrow",
+ "clap",
+ "llkv",
+ "llkv-sql",
+ "regex",
+ "sqlparser",
+ "thiserror",
+ "tpchgen",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2632,6 +2653,18 @@ checksum = "4591acadbcf52f0af60eafbb2c003232b2b4cd8de5f0e9437cb8b1b59046cc0f"
 dependencies = [
  "log",
  "recursive",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5fc6819faabb412da764b99d3b713bb55083c11e7e0c00144d386cd6a1939c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -2957,6 +2990,12 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tpchgen"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5315a6fb66b84b9dc4ade3ce3d85fc246305c87a8106193e9565b8a45394cbe"
 
 [[package]]
 name = "tracing"

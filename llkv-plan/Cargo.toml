@@ -20,6 +20,8 @@ serde_json.workspace = true
 sqlparser.workspace = true
 thiserror.workspace = true
 rustc-hash.workspace = true
+time.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }

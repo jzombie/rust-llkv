@@ -13,6 +13,7 @@ readme = "README.md"
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
+arrow-buffer.workspace = true
 llkv-aggregate.workspace = true
 llkv-column-map.workspace = true
 llkv-expr.workspace = true

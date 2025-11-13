@@ -4,15 +4,16 @@
 //! llkv-plan data structures, particularly for literal value conversion
 //! and range SELECT parsing.
 
+use llkv_expr::decimal::DecimalValue;
 use llkv_result::{Error, Result};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName, ObjectNamePart, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor, UnaryOperator, Value,
-    ValueWithSpan,
+    DataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName,
+    ObjectNamePart, Select, SelectItem, SelectItemQualifiedWildcardKind, TableAlias, TableFactor,
+    TypedString, UnaryOperator, Value, ValueWithSpan,
 };
 
-use crate::PlanValue;
+use crate::{PlanValue, date::parse_date32_literal, interval::parse_interval_literal};
 
 /// Convert a SQL expression to a PlanValue literal.
 ///
@@ -41,15 +42,35 @@ use crate::PlanValue;
 pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
     match expr {
         SqlExpr::Value(value) => plan_value_from_sql_value(value),
+        SqlExpr::TypedString(typed) => plan_value_from_typed_string(typed),
+        SqlExpr::Interval(interval) => {
+            let parsed = parse_interval_literal(interval)?;
+            Ok(PlanValue::Interval(parsed))
+        }
         SqlExpr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
         } => match plan_value_from_sql_expr(expr)? {
             PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
             PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
-            PlanValue::Null | PlanValue::String(_) | PlanValue::Struct(_) => Err(
-                Error::InvalidArgumentError("cannot negate non-numeric literal".into()),
-            ),
+            PlanValue::Decimal(value) => {
+                let negated = value.raw_value().checked_neg().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "decimal literal overflow when applying unary minus".into(),
+                    )
+                })?;
+                let decimal = DecimalValue::new(negated, value.scale()).map_err(|err| {
+                    Error::InvalidArgumentError(format!("failed to negate decimal literal: {err}"))
+                })?;
+                Ok(PlanValue::Decimal(decimal))
+            }
+            PlanValue::Null
+            | PlanValue::String(_)
+            | PlanValue::Struct(_)
+            | PlanValue::Date32(_)
+            | PlanValue::Interval(_) => Err(Error::InvalidArgumentError(
+                "cannot negate non-numeric literal".into(),
+            )),
         },
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
@@ -68,6 +89,20 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported literal expression: {other:?}"
         ))),
+    }
+}
+
+fn plan_value_from_typed_string(typed: &TypedString) -> Result<PlanValue> {
+    let text = typed.value.value.clone().into_string().ok_or_else(|| {
+        Error::InvalidArgumentError("typed string literal must be a quoted string".into())
+    })?;
+
+    match typed.data_type {
+        DataType::Date => {
+            let days = parse_date32_literal(&text)?;
+            Ok(PlanValue::Date32(days))
+        }
+        _ => Ok(PlanValue::String(text)),
     }
 }
 
@@ -450,7 +485,10 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::ast::{Expr as SqlExpr, Value, ValueWithSpan};
+    use llkv_expr::literal::IntervalValue;
+    use sqlparser::ast::{Expr as SqlExpr, SelectItem, SetExpr, Statement, Value, ValueWithSpan};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
 
     fn value_with_span(v: Value) -> ValueWithSpan {
         ValueWithSpan {
@@ -526,6 +564,28 @@ mod tests {
         assert_eq!(
             plan_value_from_sql_expr(&expr).unwrap(),
             PlanValue::Integer(50)
+        );
+    }
+
+    #[test]
+    fn test_interval_literal_expression() {
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT INTERVAL '7' DAY").unwrap();
+        let statement = statements.first().expect("statement");
+        let expr = match statement {
+            Statement::Query(query) => match query.body.as_ref() {
+                SetExpr::Select(select) => match select.projection.first().expect("projection") {
+                    SelectItem::UnnamedExpr(expr) => expr,
+                    other => panic!("unexpected projection {other:?}"),
+                },
+                other => panic!("unexpected set expr {other:?}"),
+            },
+            other => panic!("unexpected statement {other:?}"),
+        };
+
+        assert_eq!(
+            plan_value_from_sql_expr(expr).unwrap(),
+            PlanValue::Interval(IntervalValue::new(0, 7, 0))
         );
     }
 

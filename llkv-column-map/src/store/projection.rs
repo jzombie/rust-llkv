@@ -10,11 +10,13 @@ use crate::gather::{
     gather_rows_from_chunks as shared_gather_rows_from_chunks,
     gather_rows_from_chunks_binary as shared_gather_rows_from_chunks_binary,
     gather_rows_from_chunks_bool as shared_gather_rows_from_chunks_bool,
+    gather_rows_from_chunks_decimal128 as shared_gather_rows_from_chunks_decimal128,
     gather_rows_from_chunks_string as shared_gather_rows_from_chunks_string,
     gather_rows_from_chunks_struct as shared_gather_rows_from_chunks_struct,
     gather_rows_single_shot as shared_gather_rows_single_shot,
     gather_rows_single_shot_binary as shared_gather_rows_single_shot_binary,
     gather_rows_single_shot_bool as shared_gather_rows_single_shot_bool,
+    gather_rows_single_shot_decimal128 as shared_gather_rows_single_shot_decimal128,
     gather_rows_single_shot_string as shared_gather_rows_single_shot_string,
     gather_rows_single_shot_struct as shared_gather_rows_single_shot_struct,
 };
@@ -393,6 +395,14 @@ where
                     allow_missing,
                     &plan.dtype,
                 ),
+                DataType::Decimal128(_, _) => Self::gather_rows_single_shot_decimal128(
+                    &row_index,
+                    row_ids.len(),
+                    plan,
+                    &mut chunk_map,
+                    allow_missing,
+                    &plan.dtype,
+                ),
                 other => with_integer_arrow_type!(
                     other.clone(),
                     |ArrowTy| {
@@ -684,6 +694,17 @@ where
                         allow_missing,
                         &plan.dtype,
                     ),
+                    DataType::Decimal128(_, _) => Self::gather_rows_from_chunks_decimal128(
+                        row_ids,
+                        row_locator,
+                        len,
+                        &plan.candidate_indices,
+                        plan,
+                        ctx.chunk_cache(),
+                        &mut row_scratch,
+                        allow_missing,
+                        &plan.dtype,
+                    ),
                     other => with_integer_arrow_type!(
                         other.clone(),
                         |ArrowTy| {
@@ -832,6 +853,26 @@ where
         )
     }
 
+    fn gather_rows_single_shot_decimal128(
+        row_index: &FxHashMap<u64, usize>,
+        len: usize,
+        plan: &FieldPlan,
+        chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+        allow_missing: bool,
+        dtype: &DataType,
+    ) -> Result<ArrayRef> {
+        shared_gather_rows_single_shot_decimal128(
+            row_index,
+            len,
+            &plan.value_metas,
+            &plan.row_metas,
+            &plan.candidate_indices,
+            chunk_blobs,
+            allow_missing,
+            dtype,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gather_rows_single_shot<T>(
         row_index: &FxHashMap<u64, usize>,
@@ -965,6 +1006,32 @@ where
         dtype: &DataType,
     ) -> Result<ArrayRef> {
         shared_gather_rows_from_chunks_struct(
+            row_locator,
+            len,
+            candidate_indices,
+            &plan.value_metas,
+            &plan.row_metas,
+            chunk_arrays,
+            row_scratch,
+            allow_missing,
+            dtype,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and avoids intermediate structs.
+    fn gather_rows_from_chunks_decimal128(
+        row_ids: &[u64],
+        row_locator: RowLocator,
+        len: usize,
+        candidate_indices: &[usize],
+        plan: &FieldPlan,
+        chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
+        row_scratch: &mut [Option<(usize, usize)>],
+        allow_missing: bool,
+        dtype: &DataType,
+    ) -> Result<ArrayRef> {
+        shared_gather_rows_from_chunks_decimal128(
+            row_ids,
             row_locator,
             len,
             candidate_indices,

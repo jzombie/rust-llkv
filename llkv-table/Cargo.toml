@@ -28,6 +28,7 @@ rayon.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 tracing.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

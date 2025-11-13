@@ -10,10 +10,12 @@
 //! - Table cache management
 
 use arrow::array::{Array, UInt64Array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, IntervalUnit};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_executor::utils::parse_date32_literal;
+use llkv_executor::utils::{
+    align_decimal_to_scale, decimal_truthy, parse_date32_literal, truncate_decimal_to_i64,
+};
 use llkv_executor::{ExecutorColumn, ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
@@ -42,6 +44,47 @@ where
     ) -> Result<PlanValue> {
         match value {
             PlanValue::Null => Ok(PlanValue::Null),
+            PlanValue::Decimal(decimal) => match &column.data_type {
+                DataType::Decimal128(precision, scale) => {
+                    let aligned = align_decimal_to_scale(decimal, *precision, *scale).map_err(
+                        |err| {
+                            Error::InvalidArgumentError(format!(
+                                "decimal literal {} incompatible with DECIMAL({}, {}) column '{}': {err}",
+                                decimal, precision, scale, column.name
+                            ))
+                        },
+                    )?;
+                    Ok(PlanValue::Decimal(aligned))
+                }
+                DataType::Int64 => {
+                    let coerced = truncate_decimal_to_i64(decimal).map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "decimal literal {} incompatible with INT column '{}': {err}",
+                            decimal, column.name
+                        ))
+                    })?;
+                    Ok(PlanValue::Integer(coerced))
+                }
+                DataType::Float64 => Ok(PlanValue::Float(decimal.to_f64())),
+                DataType::Boolean => Ok(PlanValue::Integer(if decimal_truthy(decimal) {
+                    1
+                } else {
+                    0
+                })),
+                DataType::Utf8 => Ok(PlanValue::String(decimal.to_string())),
+                DataType::Date32 => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign decimal literal to DATE column '{}'",
+                    column.name
+                ))),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign decimal literal to STRUCT column '{}'",
+                    column.name
+                ))),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported target type {:?} for DECIMAL literal in column '{}'",
+                    other, column.name
+                ))),
+            },
             PlanValue::Integer(v) => match &column.data_type {
                 DataType::Int64 => Ok(PlanValue::Integer(v)),
                 DataType::Float64 => Ok(PlanValue::Float(v as f64)),
@@ -54,7 +97,7 @@ where
                             column.name
                         ))
                     })?;
-                    Ok(PlanValue::Integer(casted as i64))
+                    Ok(PlanValue::Date32(casted))
                 }
                 DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
                     "cannot assign integer to STRUCT column '{}'",
@@ -92,7 +135,7 @@ where
                 DataType::Utf8 => Ok(PlanValue::String(s)),
                 DataType::Date32 => {
                     let days = parse_date32_literal(&s)?;
-                    Ok(PlanValue::Integer(days as i64))
+                    Ok(PlanValue::Date32(days))
                 }
                 DataType::Int64 | DataType::Float64 => Err(Error::InvalidArgumentError(format!(
                     "cannot assign string '{}' to numeric column '{}'",
@@ -109,6 +152,38 @@ where
                 _ => Err(Error::InvalidArgumentError(format!(
                     "cannot assign struct value to column '{}'",
                     column.name
+                ))),
+            },
+            PlanValue::Interval(interval) => match &column.data_type {
+                DataType::Interval(IntervalUnit::MonthDayNano) => Ok(PlanValue::Interval(interval)),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign INTERVAL literal to STRUCT column '{}'",
+                    column.name
+                ))),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported target type {:?} for INTERVAL literal in column '{}'",
+                    other, column.name
+                ))),
+            },
+            PlanValue::Date32(days) => match &column.data_type {
+                DataType::Date32 => Ok(PlanValue::Date32(days)),
+                DataType::Int64 => Ok(PlanValue::Integer(i64::from(days))),
+                DataType::Float64 => Ok(PlanValue::Float(days as f64)),
+                DataType::Utf8 => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign DATE literal to TEXT column '{}'",
+                    column.name
+                ))),
+                DataType::Boolean => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign DATE literal to BOOLEAN column '{}'",
+                    column.name
+                ))),
+                DataType::Struct(_) => Err(Error::InvalidArgumentError(format!(
+                    "cannot assign DATE literal to STRUCT column '{}'",
+                    column.name
+                ))),
+                other => Err(Error::InvalidArgumentError(format!(
+                    "unsupported target type {:?} for DATE literal in column '{}'",
+                    other, column.name
                 ))),
             },
         }

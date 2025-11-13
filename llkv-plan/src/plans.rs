@@ -6,10 +6,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::SubqueryId;
+use llkv_expr::literal::IntervalValue;
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
 
@@ -71,8 +75,11 @@ pub enum PlanValue {
     Null,
     Integer(i64),
     Float(f64),
+    Decimal(DecimalValue),
     String(String),
+    Date32(i32),
     Struct(FxHashMap<String, PlanValue>),
+    Interval(IntervalValue),
 }
 
 impl From<&str> for PlanValue {
@@ -137,8 +144,10 @@ pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanV
             }
         }
         Literal::Float(f) => Ok(PlanValue::Float(*f)),
+        Literal::Decimal(decimal) => Ok(PlanValue::Decimal(*decimal)),
         Literal::String(s) => Ok(PlanValue::String(s.clone())),
         Literal::Boolean(b) => Ok(PlanValue::from(*b)),
+        Literal::Date32(days) => Ok(PlanValue::Date32(*days)),
         Literal::Struct(fields) => {
             let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
             for (name, value) in fields {
@@ -147,6 +156,7 @@ pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanV
             }
             Ok(PlanValue::Struct(map))
         }
+        Literal::Interval(interval) => Ok(PlanValue::Interval(*interval)),
     }
 }
 
@@ -1139,6 +1149,21 @@ pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanV
                 })?;
             Ok(PlanValue::Float(values.value(index)))
         }
+        DataType::Decimal128(_, scale) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("expected Decimal128 array in INSERT SELECT".into())
+                })?;
+            let raw = values.value(index);
+            let decimal = DecimalValue::new(raw, *scale).map_err(|err| {
+                Error::InvalidArgumentError(format!(
+                    "failed to convert Decimal128 value at index {index}: {err}"
+                ))
+            })?;
+            Ok(PlanValue::Decimal(decimal))
+        }
         DataType::Utf8 => {
             let values = array
                 .as_any()
@@ -1155,7 +1180,7 @@ pub fn plan_value_from_array(array: &ArrayRef, index: usize) -> PlanResult<PlanV
                 .ok_or_else(|| {
                     Error::InvalidArgumentError("expected Date32 array in INSERT SELECT".into())
                 })?;
-            Ok(PlanValue::Integer(values.value(index) as i64))
+            Ok(PlanValue::Date32(values.value(index)))
         }
         other => Err(Error::InvalidArgumentError(format!(
             "unsupported data type in INSERT SELECT: {other:?}"

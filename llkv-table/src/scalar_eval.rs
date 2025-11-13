@@ -6,12 +6,15 @@
 
 use std::{convert::TryFrom, sync::Arc};
 
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
+};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::literal::Literal;
-use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
+use llkv_expr::literal::{IntervalValue, Literal};
+use llkv_expr::{AggregateCall, BinaryOp, CompareOp, ScalarExpr};
+use llkv_plan::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -20,18 +23,20 @@ use crate::types::FieldId;
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap = FxHashMap<FieldId, NumericArray>;
 
-/// Describes whether a numeric value is represented as an integer or a float.
+/// Describes whether a numeric value is represented as an integer, float, or decimal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericKind {
     Integer,
     Float,
+    Decimal,
 }
 
-/// Holds a numeric value while preserving whether it originated as an integer or float.
+/// Holds a numeric value while preserving whether it originated as an integer, float, or decimal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NumericValue {
     Integer(i64),
     Float(f64),
+    Decimal(llkv_expr::decimal::DecimalValue),
 }
 
 impl NumericValue {
@@ -40,6 +45,7 @@ impl NumericValue {
         match self {
             NumericValue::Integer(v) => v as f64,
             NumericValue::Float(v) => v,
+            NumericValue::Decimal(d) => d.to_f64(),
         }
     }
 
@@ -48,6 +54,7 @@ impl NumericValue {
         match self {
             NumericValue::Integer(v) => Some(v),
             NumericValue::Float(_) => None,
+            NumericValue::Decimal(_) => None,
         }
     }
 
@@ -56,6 +63,7 @@ impl NumericValue {
         match self {
             NumericValue::Integer(_) => NumericKind::Integer,
             NumericValue::Float(_) => NumericKind::Float,
+            NumericValue::Decimal(_) => NumericKind::Decimal,
         }
     }
 }
@@ -79,6 +87,7 @@ pub struct NumericArray {
     len: usize,
     int_data: Option<Arc<Int64Array>>,
     float_data: Option<Arc<Float64Array>>,
+    decimal_data: Option<Arc<Decimal128Array>>,
 }
 
 impl NumericArray {
@@ -89,6 +98,7 @@ impl NumericArray {
             len,
             int_data: Some(array),
             float_data: None,
+            decimal_data: None,
         }
     }
 
@@ -99,6 +109,18 @@ impl NumericArray {
             len,
             int_data: None,
             float_data: Some(array),
+            decimal_data: None,
+        }
+    }
+
+    pub(crate) fn from_decimal(array: Arc<Decimal128Array>) -> Self {
+        let len = array.len();
+        Self {
+            kind: NumericKind::Decimal,
+            len,
+            int_data: None,
+            float_data: None,
+            decimal_data: Some(array),
         }
     }
 
@@ -121,7 +143,15 @@ impl NumericArray {
                     .clone();
                 Ok(NumericArray::from_float(Arc::new(float_array)))
             }
-            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+            DataType::Decimal128(_, _) => {
+                let decimal_array = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| Error::Internal("expected Decimal128 array".into()))?
+                    .clone();
+                Ok(NumericArray::from_decimal(Arc::new(decimal_array)))
+            }
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Date32 => {
                 let casted = cast(array.as_ref(), &DataType::Int64)
                     .map_err(|e| Error::Internal(format!("cast to Int64 failed: {e}")))?;
                 let int_array = casted
@@ -223,6 +253,22 @@ impl NumericArray {
                     Some(NumericValue::Float(array.value(idx)))
                 }
             }
+            NumericKind::Decimal => {
+                let array = self
+                    .decimal_data
+                    .as_ref()
+                    .expect("decimal array missing backing data");
+                if array.is_null(idx) {
+                    None
+                } else {
+                    let value_i128 = array.value(idx);
+                    let scale = array.scale();
+                    Some(NumericValue::Decimal(
+                        llkv_expr::decimal::DecimalValue::new(value_i128, scale)
+                            .expect("valid decimal from Decimal128Array"),
+                    ))
+                }
+            }
         }
     }
 
@@ -237,6 +283,11 @@ impl NumericArray {
                 self.float_data
                     .as_ref()
                     .expect("float array missing backing data"),
+            ) as ArrayRef,
+            NumericKind::Decimal => Arc::clone(
+                self.decimal_data
+                    .as_ref()
+                    .expect("decimal array missing backing data"),
             ) as ArrayRef,
         }
     }
@@ -259,12 +310,32 @@ impl NumericArray {
                 let float_array = Float64Array::from_iter(iter);
                 NumericArray::from_float(Arc::new(float_array))
             }
+            NumericKind::Decimal => {
+                let array = self
+                    .decimal_data
+                    .as_ref()
+                    .expect("decimal array missing backing data");
+                let iter = (0..self.len).map(|idx| {
+                    if array.is_null(idx) {
+                        None
+                    } else {
+                        let value_i128 = array.value(idx);
+                        let scale = array.scale();
+                        let decimal = llkv_expr::decimal::DecimalValue::new(value_i128, scale)
+                            .expect("valid decimal from Decimal128Array");
+                        Some(decimal.to_f64())
+                    }
+                });
+                let float_array = Float64Array::from_iter(iter);
+                NumericArray::from_float(Arc::new(float_array))
+            }
         }
     }
 
     fn to_aligned_array_ref(&self, preferred: NumericKind) -> ArrayRef {
         match (preferred, self.kind) {
             (NumericKind::Float, NumericKind::Integer) => self.promote_to_float().to_array_ref(),
+            (NumericKind::Float, NumericKind::Decimal) => self.promote_to_float().to_array_ref(),
             _ => self.to_array_ref(),
         }
     }
@@ -273,18 +344,34 @@ impl NumericArray {
         let contains_float = values
             .iter()
             .any(|opt| matches!(opt, Some(NumericValue::Float(_))));
-        match (contains_float, preferred) {
-            (true, _) => {
+        let contains_decimal = values
+            .iter()
+            .any(|opt| matches!(opt, Some(NumericValue::Decimal(_))));
+
+        match (contains_float, contains_decimal, preferred) {
+            // If any float, convert all to float
+            (true, _, _) => {
                 let iter = values.into_iter().map(|opt| opt.map(|v| v.as_f64()));
                 let array = Float64Array::from_iter(iter);
                 NumericArray::from_float(Arc::new(array))
             }
-            (false, NumericKind::Float) => {
+            // If decimals but no floats
+            (false, true, NumericKind::Float)
+            | (false, true, NumericKind::Decimal)
+            | (false, true, NumericKind::Integer) => {
+                // For now, convert decimals to float - proper decimal array handling would require alignment
                 let iter = values.into_iter().map(|opt| opt.map(|v| v.as_f64()));
                 let array = Float64Array::from_iter(iter);
                 NumericArray::from_float(Arc::new(array))
             }
-            (false, NumericKind::Integer) => {
+            // Pure integers with float or decimal preference
+            (false, false, NumericKind::Float) | (false, false, NumericKind::Decimal) => {
+                let iter = values.into_iter().map(|opt| opt.map(|v| v.as_f64()));
+                let array = Float64Array::from_iter(iter);
+                NumericArray::from_float(Arc::new(array))
+            }
+            // Pure integers
+            (false, false, NumericKind::Integer) => {
                 let iter = values
                     .into_iter()
                     .map(|opt| opt.map(|v| v.as_i64().expect("expected integer")));
@@ -308,7 +395,9 @@ impl VectorizedExpr {
             VectorizedExpr::Scalar(Some(value)) => {
                 let target_kind = match (value.kind(), kind) {
                     (NumericKind::Float, _) => NumericKind::Float,
+                    (NumericKind::Decimal, _) => NumericKind::Float, // Convert decimals to float for now
                     (NumericKind::Integer, NumericKind::Float) => NumericKind::Float,
+                    (NumericKind::Integer, NumericKind::Decimal) => NumericKind::Float,
                     (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
                 };
                 let values = vec![Some(value); len];
@@ -472,6 +561,11 @@ impl NumericKernels {
             }
             ScalarExpr::Literal(_) => Ok(Self::literal_numeric_value(expr)),
             ScalarExpr::Binary { left, op, right } => {
+                if let Some(result) =
+                    Self::try_evaluate_date_interval_binary(left, *op, right, idx, arrays)?
+                {
+                    return Ok(result);
+                }
                 let l = Self::evaluate_value(left, idx, arrays)?;
                 let r = Self::evaluate_value(right, idx, arrays)?;
                 Ok(Self::apply_binary(*op, l, r))
@@ -515,6 +609,10 @@ impl NumericKernels {
                 "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
             ScalarExpr::Cast { expr, data_type } => {
+                if matches!(data_type, DataType::Date32) {
+                    return Self::evaluate_cast_date32_value(expr, idx, arrays);
+                }
+
                 let value = Self::evaluate_value(expr, idx, arrays)?;
                 let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
                     Error::InvalidArgumentError(format!(
@@ -591,6 +689,15 @@ impl NumericKernels {
         len: usize,
         arrays: &NumericArrayMap,
     ) -> LlkvResult<ArrayRef> {
+        if let ScalarExpr::Cast {
+            expr: inner,
+            data_type,
+        } = expr
+            && matches!(data_type, DataType::Date32)
+        {
+            return Self::evaluate_cast_date32_batch(inner, len, arrays);
+        }
+
         let preferred = Self::infer_result_kind(expr, arrays);
         if let Some(vectorized) = Self::try_evaluate_vectorized(expr, len, arrays, preferred)? {
             return Ok(vectorized.materialize(len, preferred));
@@ -610,6 +717,9 @@ impl NumericKernels {
         arrays: &NumericArrayMap,
         preferred: NumericKind,
     ) -> LlkvResult<Option<VectorizedExpr>> {
+        if Self::expr_contains_interval(expr) {
+            return Ok(None);
+        }
         match expr {
             ScalarExpr::Column(fid) => {
                 let array = arrays
@@ -661,6 +771,10 @@ impl NumericKernels {
                 "GetField expressions should not be evaluated in numeric kernels".into(),
             )),
             ScalarExpr::Cast { expr, data_type } => {
+                if matches!(data_type, DataType::Date32) {
+                    return Ok(None);
+                }
+
                 let inner_kind = Self::infer_result_kind(expr, arrays);
                 let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays, inner_kind)?;
                 let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
@@ -781,11 +895,17 @@ impl NumericKernels {
                         Some(NumericValue::Float(*i as f64))
                     }
                 }
+                llkv_expr::literal::Literal::Decimal(decimal) => {
+                    // Preserve decimal values instead of converting to float
+                    Some(NumericValue::Decimal(*decimal))
+                }
                 llkv_expr::literal::Literal::Boolean(b) => {
                     Some(NumericValue::Integer(if *b { 1 } else { 0 }))
                 }
                 llkv_expr::literal::Literal::String(_) => None,
+                llkv_expr::literal::Literal::Date32(_) => None,
                 llkv_expr::literal::Literal::Struct(_) => None,
+                llkv_expr::literal::Literal::Interval(_) => None,
                 llkv_expr::literal::Literal::Null => None,
             }
         } else if let ScalarExpr::IsNull { expr, negated } = expr {
@@ -828,12 +948,312 @@ impl NumericKernels {
         match value {
             NumericValue::Integer(v) => v != 0,
             NumericValue::Float(v) => v != 0.0,
+            NumericValue::Decimal(d) => d.raw_value() != 0,
         }
     }
 
     #[inline]
     fn option_numeric_truthiness(value: Option<NumericValue>) -> Option<bool> {
         value.map(Self::truthy_numeric)
+    }
+
+    fn evaluate_cast_date32_value(
+        expr: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<NumericValue>> {
+        if let Some(result) = Self::cast_literal_to_date32(expr) {
+            let days = result?;
+            return Ok(days.map(|d| NumericValue::Integer(i64::from(d))));
+        }
+
+        let value = Self::evaluate_value(expr, idx, arrays)?;
+        let days = Self::numeric_value_to_date32(value)?;
+        Ok(days.map(|d| NumericValue::Integer(i64::from(d))))
+    }
+
+    fn evaluate_cast_date32_batch(
+        expr: &ScalarExpr<FieldId>,
+        len: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<ArrayRef> {
+        if let Some(result) = Self::cast_literal_to_date32(expr) {
+            let days = result?;
+            let values: Vec<Option<i32>> = match days {
+                Some(d) => vec![Some(d); len],
+                None => vec![None; len],
+            };
+            let array = Date32Array::from(values);
+            return Ok(Arc::new(array) as ArrayRef);
+        }
+
+        let mut values: Vec<Option<i32>> = Vec::with_capacity(len);
+        for idx in 0..len {
+            let value = Self::evaluate_value(expr, idx, arrays)?;
+            values.push(Self::numeric_value_to_date32(value)?);
+        }
+
+        let array = Date32Array::from(values);
+        Ok(Arc::new(array) as ArrayRef)
+    }
+
+    fn cast_literal_to_date32(expr: &ScalarExpr<FieldId>) -> Option<LlkvResult<Option<i32>>> {
+        match expr {
+            ScalarExpr::Literal(lit) => {
+                let result = match lit {
+                    Literal::Null => Ok(None),
+                    Literal::Date32(days) => Ok(Some(*days)),
+                    Literal::String(text) => parse_date32_literal(text).map(Some),
+                    _ => Err(Error::InvalidArgumentError(format!(
+                        "cannot CAST literal {} to DATE",
+                        Self::literal_type_name(lit)
+                    ))),
+                };
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    fn numeric_value_to_date32(value: Option<NumericValue>) -> LlkvResult<Option<i32>> {
+        match value {
+            None => Ok(None),
+            Some(NumericValue::Integer(v)) => {
+                if v < i64::from(i32::MIN) || v > i64::from(i32::MAX) {
+                    return Err(Error::InvalidArgumentError(
+                        "DATE cast value out of range".into(),
+                    ));
+                }
+                Ok(Some(v as i32))
+            }
+            Some(NumericValue::Float(v)) => {
+                if !v.is_finite() {
+                    return Err(Error::InvalidArgumentError(
+                        "cannot cast non-finite float to DATE".into(),
+                    ));
+                }
+                let truncated = v.trunc();
+                if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+                    return Err(Error::InvalidArgumentError(
+                        "DATE cast value out of range".into(),
+                    ));
+                }
+                Ok(Some(truncated as i32))
+            }
+            Some(NumericValue::Decimal(d)) => {
+                // Convert decimal to float for DATE cast
+                let f = d.to_f64();
+                if !f.is_finite() {
+                    return Err(Error::InvalidArgumentError(
+                        "cannot cast non-finite decimal to DATE".into(),
+                    ));
+                }
+                let truncated = f.trunc();
+                if truncated < i32::MIN as f64 || truncated > i32::MAX as f64 {
+                    return Err(Error::InvalidArgumentError(
+                        "DATE cast value out of range".into(),
+                    ));
+                }
+                Ok(Some(truncated as i32))
+            }
+        }
+    }
+
+    fn try_evaluate_date_interval_binary(
+        left: &ScalarExpr<FieldId>,
+        op: BinaryOp,
+        right: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<Option<NumericValue>>> {
+        match op {
+            BinaryOp::Add => {
+                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)?
+                    && let Some(interval_value) =
+                        Self::evaluate_interval_operand(right, idx, arrays)?
+                {
+                    let adjusted =
+                        Self::apply_interval_to_date32_value(date_value, interval_value, false)?;
+                    return Ok(Some(
+                        adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                    ));
+                }
+                if let Some(date_value) = Self::evaluate_date_operand(right, idx, arrays)?
+                    && let Some(interval_value) =
+                        Self::evaluate_interval_operand(left, idx, arrays)?
+                {
+                    let adjusted =
+                        Self::apply_interval_to_date32_value(date_value, interval_value, false)?;
+                    return Ok(Some(
+                        adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                    ));
+                }
+                Ok(None)
+            }
+            BinaryOp::Subtract => {
+                if let Some(date_value) = Self::evaluate_date_operand(left, idx, arrays)?
+                    && let Some(interval_value) =
+                        Self::evaluate_interval_operand(right, idx, arrays)?
+                {
+                    let adjusted =
+                        Self::apply_interval_to_date32_value(date_value, interval_value, true)?;
+                    return Ok(Some(
+                        adjusted.map(|days| NumericValue::Integer(i64::from(days))),
+                    ));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate_date_operand(
+        expr: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<Option<i32>>> {
+        match expr {
+            ScalarExpr::Literal(Literal::Null) => Ok(Some(None)),
+            ScalarExpr::Literal(Literal::Date32(days)) => Ok(Some(Some(*days))),
+            ScalarExpr::Cast {
+                expr: inner,
+                data_type: DataType::Date32,
+            } => {
+                if let Some(result) = Self::cast_literal_to_date32(inner) {
+                    let days = result?;
+                    return Ok(Some(days));
+                }
+                let value = Self::evaluate_value(inner, idx, arrays)?;
+                let days = Self::numeric_value_to_date32(value)?;
+                Ok(Some(days))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate_interval_operand(
+        expr: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+    ) -> LlkvResult<Option<Option<IntervalValue>>> {
+        match expr {
+            ScalarExpr::Literal(Literal::Null) => Ok(Some(None)),
+            ScalarExpr::Literal(Literal::Interval(value)) => Ok(Some(Some(*value))),
+            ScalarExpr::Binary { left, op, right } => match op {
+                BinaryOp::Add => Self::evaluate_interval_binary(left, right, idx, arrays, true),
+                BinaryOp::Subtract => {
+                    Self::evaluate_interval_binary(left, right, idx, arrays, false)
+                }
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn evaluate_interval_binary(
+        left: &ScalarExpr<FieldId>,
+        right: &ScalarExpr<FieldId>,
+        idx: usize,
+        arrays: &NumericArrayMap,
+        is_addition: bool,
+    ) -> LlkvResult<Option<Option<IntervalValue>>> {
+        let lhs = Self::evaluate_interval_operand(left, idx, arrays)?;
+        let rhs = Self::evaluate_interval_operand(right, idx, arrays)?;
+        match (lhs, rhs) {
+            (Some(Some(l)), Some(Some(r))) => {
+                let combined = if is_addition {
+                    l.checked_add(r)
+                } else {
+                    l.checked_sub(r)
+                }
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError("interval arithmetic overflow".into())
+                })?;
+                Ok(Some(Some(combined)))
+            }
+            (Some(None), _) | (_, Some(None)) => Ok(Some(None)),
+            (Some(_), None) | (None, Some(_)) => Ok(None),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn apply_interval_to_date32_value(
+        date: Option<i32>,
+        interval: Option<IntervalValue>,
+        subtract: bool,
+    ) -> LlkvResult<Option<i32>> {
+        match (date, interval) {
+            (None, _) | (_, None) => Ok(None),
+            (Some(days), Some(interval)) => {
+                let adjusted = if subtract {
+                    subtract_interval_from_date32(days, interval)?
+                } else {
+                    add_interval_to_date32(days, interval)?
+                };
+                Ok(Some(adjusted))
+            }
+        }
+    }
+
+    fn expr_contains_interval(expr: &ScalarExpr<FieldId>) -> bool {
+        match expr {
+            ScalarExpr::Literal(literal) => matches!(literal, Literal::Interval(_)),
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::expr_contains_interval(left) || Self::expr_contains_interval(right)
+            }
+            ScalarExpr::Cast { expr, .. } => Self::expr_contains_interval(expr),
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::expr_contains_interval(left) || Self::expr_contains_interval(right)
+            }
+            ScalarExpr::Not(inner) => Self::expr_contains_interval(inner),
+            ScalarExpr::IsNull { expr, .. } => Self::expr_contains_interval(expr),
+            ScalarExpr::Aggregate(agg) => Self::aggregate_contains_interval(agg),
+            ScalarExpr::GetField { base, .. } => Self::expr_contains_interval(base),
+            ScalarExpr::Coalesce(items) => items.iter().any(Self::expr_contains_interval),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand.as_deref().is_some_and(Self::expr_contains_interval)
+                    || branches.iter().any(|(when_expr, then_expr)| {
+                        Self::expr_contains_interval(when_expr)
+                            || Self::expr_contains_interval(then_expr)
+                    })
+                    || else_expr
+                        .as_deref()
+                        .is_some_and(Self::expr_contains_interval)
+            }
+            ScalarExpr::Column(_) | ScalarExpr::ScalarSubquery(_) | ScalarExpr::Random => false,
+        }
+    }
+
+    fn aggregate_contains_interval(agg: &AggregateCall<FieldId>) -> bool {
+        match agg {
+            AggregateCall::CountStar => false,
+            AggregateCall::Count { expr, .. }
+            | AggregateCall::Sum { expr, .. }
+            | AggregateCall::Total { expr, .. }
+            | AggregateCall::Avg { expr, .. }
+            | AggregateCall::Min(expr)
+            | AggregateCall::Max(expr)
+            | AggregateCall::CountNulls(expr)
+            | AggregateCall::GroupConcat { expr, .. } => Self::expr_contains_interval(expr),
+        }
+    }
+
+    fn literal_type_name(literal: &Literal) -> &'static str {
+        match literal {
+            Literal::Null => "NULL",
+            Literal::Integer(_) => "INTEGER",
+            Literal::Float(_) => "FLOAT",
+            Literal::Decimal(_) => "DECIMAL",
+            Literal::String(_) => "STRING",
+            Literal::Boolean(_) => "BOOLEAN",
+            Literal::Date32(_) => "DATE",
+            Literal::Struct(_) => "STRUCT",
+            Literal::Interval(_) => "INTERVAL",
+        }
     }
 
     #[inline]
@@ -977,6 +1397,14 @@ impl NumericKernels {
                         }
                         Literal::Float(v) => {
                             ScalarExpr::literal(Literal::Integer(if *v == 0.0 { 1 } else { 0 }))
+                        }
+                        Literal::Decimal(d) => {
+                            let is_zero = if d.scale() == 0 {
+                                d.raw_value() == 0
+                            } else {
+                                d.to_f64() == 0.0
+                            };
+                            ScalarExpr::literal(Literal::Integer(if is_zero { 1 } else { 0 }))
                         }
                         Literal::Boolean(v) => {
                             ScalarExpr::literal(Literal::Integer(if *v { 0 } else { 1 }))
@@ -1163,10 +1591,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
                 Some(ScalarExpr::literal(result))
@@ -1175,10 +1605,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
                 Some(ScalarExpr::literal(result))
@@ -1190,6 +1622,7 @@ impl NumericKernels {
         match value {
             NumericValue::Integer(i) => ScalarExpr::literal(i),
             NumericValue::Float(f) => ScalarExpr::literal(f),
+            NumericValue::Decimal(d) => ScalarExpr::Literal(Literal::Decimal(d)),
         }
     }
 
@@ -1238,10 +1671,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
                 Some(NumericValue::Integer(result))
@@ -1250,10 +1685,12 @@ impl NumericKernels {
                 let lhs_i64 = match lhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Integer(i) => i,
                     NumericValue::Float(f) => f as i64,
+                    NumericValue::Decimal(d) => d.to_f64() as i64,
                 };
                 let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
                 Some(NumericValue::Integer(result))
@@ -1332,6 +1769,7 @@ impl NumericKernels {
             Some(NumericValue::Integer(v)) => Ok(Some(match target {
                 NumericKind::Integer => NumericValue::Integer(v),
                 NumericKind::Float => NumericValue::Float(v as f64),
+                NumericKind::Decimal => NumericValue::Float(v as f64), // Convert to float for now
             })),
             Some(NumericValue::Float(v)) => {
                 if !v.is_finite() {
@@ -1341,11 +1779,28 @@ impl NumericKernels {
                 }
                 match target {
                     NumericKind::Float => Ok(Some(NumericValue::Float(v))),
+                    NumericKind::Decimal => Ok(Some(NumericValue::Float(v))), // Keep as float for now
                     NumericKind::Integer => {
                         let truncated = v.trunc();
                         if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
                             return Err(Error::InvalidArgumentError(
                                 "float out of range for INT64 cast".into(),
+                            ));
+                        }
+                        Ok(Some(NumericValue::Integer(truncated as i64)))
+                    }
+                }
+            }
+            Some(NumericValue::Decimal(d)) => {
+                // Convert decimal to float for casting
+                let f = d.to_f64();
+                match target {
+                    NumericKind::Float | NumericKind::Decimal => Ok(Some(NumericValue::Float(f))),
+                    NumericKind::Integer => {
+                        let truncated = f.trunc();
+                        if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+                            return Err(Error::InvalidArgumentError(
+                                "decimal out of range for INT64 cast".into(),
                             ));
                         }
                         Ok(Some(NumericValue::Integer(truncated as i64)))
@@ -1360,7 +1815,7 @@ impl NumericKernels {
         target: NumericKind,
     ) -> LlkvResult<NumericArray> {
         match target {
-            NumericKind::Float => Ok(array.promote_to_float()),
+            NumericKind::Float | NumericKind::Decimal => Ok(array.promote_to_float()),
             NumericKind::Integer => {
                 if array.kind() == NumericKind::Integer {
                     Ok(array.clone())
@@ -1384,10 +1839,22 @@ impl NumericKernels {
             ScalarExpr::Literal(lit) => match lit {
                 llkv_expr::literal::Literal::Float(_) => NumericKind::Float,
                 llkv_expr::literal::Literal::Integer(_) => NumericKind::Integer,
+                llkv_expr::literal::Literal::Decimal(decimal) => {
+                    if decimal.scale() == 0
+                        && (decimal.raw_value() >= i128::from(i64::MIN))
+                        && (decimal.raw_value() <= i128::from(i64::MAX))
+                    {
+                        NumericKind::Integer
+                    } else {
+                        NumericKind::Float
+                    }
+                }
                 llkv_expr::literal::Literal::Boolean(_) => NumericKind::Integer,
                 llkv_expr::literal::Literal::Null => NumericKind::Integer,
                 llkv_expr::literal::Literal::String(_) => NumericKind::Float,
+                llkv_expr::literal::Literal::Date32(_) => NumericKind::Integer,
                 llkv_expr::literal::Literal::Struct(_) => NumericKind::Float,
+                llkv_expr::literal::Literal::Interval(_) => NumericKind::Float,
             },
             ScalarExpr::Column(fid) => arrays
                 .get(fid)
@@ -1515,6 +1982,7 @@ impl NumericKernels {
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
+            | DataType::Date32
             | DataType::Boolean => Some(NumericKind::Integer),
             DataType::UInt8
             | DataType::UInt16
@@ -1523,6 +1991,13 @@ impl NumericKernels {
             | DataType::Float32
             | DataType::Float64
             | DataType::Null => Some(NumericKind::Float),
+            DataType::Decimal128(_, scale) => {
+                if *scale == 0 {
+                    Some(NumericKind::Integer)
+                } else {
+                    Some(NumericKind::Float)
+                }
+            }
             _ => None,
         }
     }
@@ -1535,10 +2010,12 @@ impl NumericKernels {
         let lhs_value = match lhs_kind {
             NumericKind::Integer => NumericValue::Integer(1),
             NumericKind::Float => NumericValue::Float(1.0),
+            NumericKind::Decimal => NumericValue::Float(1.0), // Use float for decimal
         };
         let rhs_value = match rhs_kind {
             NumericKind::Integer => NumericValue::Integer(1),
             NumericKind::Float => NumericValue::Float(1.0),
+            NumericKind::Decimal => NumericValue::Float(1.0), // Use float for decimal
         };
 
         Self::apply_binary_values(op, lhs_value, rhs_value)
@@ -1736,6 +2213,7 @@ mod tests {
             let actual = value.map(|num| match num {
                 NumericValue::Integer(v) => v,
                 NumericValue::Float(v) => v as i64,
+                NumericValue::Decimal(d) => d.to_f64() as i64,
             });
             assert_eq!(actual, *expected, "row {idx} did not match");
         }
@@ -1749,6 +2227,7 @@ mod tests {
             let actual = value.map(|num| match num {
                 NumericValue::Integer(v) => v,
                 NumericValue::Float(v) => v as i64,
+                NumericValue::Decimal(d) => d.to_f64() as i64,
             });
             assert_eq!(actual, *expected, "comparison row {idx} mismatch");
         }

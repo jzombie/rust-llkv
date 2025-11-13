@@ -15,19 +15,22 @@
 //! in a future refactoring.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, Int64Builder, LargeStringArray, RecordBatch, StringArray,
-    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
+    IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
-use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
+use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, IntervalUnit, Schema};
+use arrow_buffer::IntervalMonthDayNano;
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::SubqueryId;
+use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
 };
@@ -77,6 +80,13 @@ pub mod utils;
 pub type ExecutorResult<T> = Result<T, Error>;
 
 use crate::translation::schema::infer_computed_data_type;
+use crate::utils::interval::{
+    compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
+};
+use crate::utils::{
+    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
+    format_date32_literal, parse_date32_literal,
+};
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -106,6 +116,7 @@ enum AggregateValue {
     Null,
     Int64(i64),
     Float64(f64),
+    Decimal128 { value: i128, scale: i8 },
     String(String),
 }
 
@@ -116,6 +127,11 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v),
             AggregateValue::Float64(v) => Some(*v as i64),
+            AggregateValue::Decimal128 { value, scale } => {
+                // Convert Decimal128 to i64 by scaling down
+                let divisor = 10_i128.pow(*scale as u32);
+                Some((value / divisor) as i64)
+            }
             AggregateValue::String(s) => s.parse().ok(),
         }
     }
@@ -127,9 +143,21 @@ impl AggregateValue {
             AggregateValue::Null => None,
             AggregateValue::Int64(v) => Some(*v as f64),
             AggregateValue::Float64(v) => Some(*v),
+            AggregateValue::Decimal128 { value, scale } => {
+                // Convert Decimal128 to f64
+                let divisor = 10_f64.powi(*scale as i32);
+                Some(*value as f64 / divisor)
+            }
             AggregateValue::String(s) => s.parse().ok(),
         }
     }
+}
+
+fn decimal_exact_i64(decimal: DecimalValue) -> Option<i64> {
+    decimal
+        .rescale(0)
+        .ok()
+        .and_then(|integral| i64::try_from(integral.raw_value()).ok())
 }
 
 struct GroupState {
@@ -272,7 +300,10 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
 /// This currently supports Integer, Float, Null, and String values.
 /// The array type is inferred from the first non-null value.
 fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> {
-    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::array::{
+        Date32Array, Decimal128Array, Float64Array, Int64Array, IntervalMonthDayNanoArray,
+        StringArray,
+    };
 
     // Infer type from first non-null value
     let mut value_type = None;
@@ -284,45 +315,97 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
     }
 
     match value_type {
+        Some(PlanValue::Decimal(d)) => {
+            let precision = d.precision();
+            let scale = d.scale();
+            let mut builder = Decimal128Array::builder(values.len())
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| {
+                    Error::InvalidArgumentError(format!(
+                        "invalid Decimal128 precision/scale: {}",
+                        e
+                    ))
+                })?;
+            for v in values {
+                match v {
+                    PlanValue::Decimal(d) => builder.append_value(d.raw_value()),
+                    PlanValue::Null => builder.append_null(),
+                    other => {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "expected DECIMAL plan value, found {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
         Some(PlanValue::Integer(_)) => {
             let int_values: Vec<Option<i64>> = values
                 .iter()
                 .map(|v| match v {
-                    PlanValue::Integer(i) => Some(*i),
-                    PlanValue::Null => None,
-                    _ => Some(0), // Type mismatch, use default
+                    PlanValue::Integer(i) => Ok(Some(*i)),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected INTEGER plan value, found {other:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             Ok(Arc::new(Int64Array::from(int_values)) as ArrayRef)
         }
         Some(PlanValue::Float(_)) => {
             let float_values: Vec<Option<f64>> = values
                 .iter()
                 .map(|v| match v {
-                    PlanValue::Float(f) => Some(*f),
-                    PlanValue::Integer(i) => Some(*i as f64),
-                    PlanValue::Null => None,
-                    _ => Some(0.0), // Type mismatch, use default
+                    PlanValue::Float(f) => Ok(Some(*f)),
+                    PlanValue::Null => Ok(None),
+                    PlanValue::Integer(i) => Ok(Some(*i as f64)),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected FLOAT plan value, found {other:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             Ok(Arc::new(Float64Array::from(float_values)) as ArrayRef)
         }
         Some(PlanValue::String(_)) => {
             let string_values: Vec<Option<&str>> = values
                 .iter()
                 .map(|v| match v {
-                    PlanValue::String(s) => Some(s.as_str()),
-                    PlanValue::Null => None,
-                    _ => Some(""), // Type mismatch, use default
+                    PlanValue::String(s) => Ok(Some(s.as_str())),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected STRING plan value, found {other:?}"
+                    ))),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             Ok(Arc::new(StringArray::from(string_values)) as ArrayRef)
         }
-        _ => {
-            // All nulls, create an Int64 array of nulls
-            let null_values: Vec<Option<i64>> = vec![None; values.len()];
-            Ok(Arc::new(Int64Array::from(null_values)) as ArrayRef)
+        Some(PlanValue::Date32(_)) => {
+            let date_values: Vec<Option<i32>> = values
+                .iter()
+                .map(|v| match v {
+                    PlanValue::Date32(d) => Ok(Some(*d)),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected DATE plan value, found {other:?}"
+                    ))),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Arc::new(Date32Array::from(date_values)) as ArrayRef)
         }
+        Some(PlanValue::Interval(_)) => {
+            let interval_values: Vec<Option<IntervalMonthDayNano>> = values
+                .iter()
+                .map(|v| match v {
+                    PlanValue::Interval(interval) => Ok(Some(interval_value_to_arrow(*interval))),
+                    PlanValue::Null => Ok(None),
+                    other => Err(Error::InvalidArgumentError(format!(
+                        "expected INTERVAL plan value, found {other:?}"
+                    ))),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Arc::new(IntervalMonthDayNanoArray::from(interval_values)) as ArrayRef)
+        }
+        _ => Ok(new_null_array(&DataType::Null, values.len())),
     }
 }
 
@@ -778,7 +861,18 @@ where
                     let numeric = if flag { 1.0 } else { 0.0 };
                     values.push(Some(numeric));
                 }
-                Literal::String(_) | Literal::Struct(_) => {
+                Literal::Decimal(decimal) => {
+                    if let Some(value) = decimal_exact_i64(decimal) {
+                        values.push(Some(value as f64));
+                    } else {
+                        all_integer = false;
+                        values.push(Some(decimal.to_f64()));
+                    }
+                }
+                Literal::String(_)
+                | Literal::Struct(_)
+                | Literal::Date32(_)
+                | Literal::Interval(_) => {
                     return Err(Error::InvalidArgumentError(
                         "scalar subquery produced non-numeric result in numeric context".into(),
                     ));
@@ -882,11 +976,12 @@ where
 
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
+        use crate::utils::interval::interval_value_to_arrow;
         use arrow::array::{
-            ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, StructArray,
-            new_null_array,
+            ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+            IntervalMonthDayNanoArray, StringArray, StructArray, new_null_array,
         };
-        use arrow::datatypes::{DataType, Field};
+        use arrow::datatypes::{DataType, Field, IntervalUnit};
         use llkv_expr::literal::Literal;
 
         match lit {
@@ -905,11 +1000,35 @@ where
                 DataType::Boolean,
                 Arc::new(BooleanArray::from(vec![*v])) as ArrayRef,
             )),
+            Literal::Decimal(value) => {
+                let iter = std::iter::once(value.raw_value());
+                let array = Decimal128Array::from_iter_values(iter)
+                    .with_precision_and_scale(value.precision(), value.scale())
+                    .map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "failed to build Decimal128 literal array: {err}"
+                        ))
+                    })?;
+                Ok((
+                    DataType::Decimal128(value.precision(), value.scale()),
+                    Arc::new(array) as ArrayRef,
+                ))
+            }
             Literal::String(v) => Ok((
                 DataType::Utf8,
                 Arc::new(StringArray::from(vec![v.clone()])) as ArrayRef,
             )),
+            Literal::Date32(v) => Ok((
+                DataType::Date32,
+                Arc::new(Date32Array::from(vec![*v])) as ArrayRef,
+            )),
             Literal::Null => Ok((DataType::Null, new_null_array(&DataType::Null, 1))),
+            Literal::Interval(interval) => Ok((
+                DataType::Interval(IntervalUnit::MonthDayNano),
+                Arc::new(IntervalMonthDayNanoArray::from(vec![
+                    interval_value_to_arrow(*interval),
+                ])) as ArrayRef,
+            )),
             Literal::Struct(struct_fields) => {
                 // Build a struct array recursively
                 let mut inner_fields = Vec::new();
@@ -2173,6 +2292,25 @@ where
                                 arrays
                                     .push(Arc::new(Float64Array::from(vec![Some(*v)])) as ArrayRef);
                             }
+                            AggregateValue::Decimal128 { value, scale } => {
+                                // Determine precision from the value
+                                let precision = if *value == 0 {
+                                    1
+                                } else {
+                                    (*value).abs().to_string().len() as u8
+                                };
+                                fields.push(Arc::new(Field::new(
+                                    alias,
+                                    DataType::Decimal128(precision, *scale),
+                                    true,
+                                )));
+                                let array = Decimal128Array::from(vec![Some(*value)])
+                                    .with_precision_and_scale(precision, *scale)
+                                    .map_err(|e| {
+                                        Error::Internal(format!("invalid Decimal128: {}", e))
+                                    })?;
+                                arrays.push(Arc::new(array) as ArrayRef);
+                            }
                             AggregateValue::String(s) => {
                                 fields.push(Arc::new(Field::new(alias, DataType::Utf8, true)));
                                 arrays
@@ -2552,6 +2690,24 @@ where
                     AggregateValue::Null
                 } else {
                     AggregateValue::String(string_array.value(0).to_string())
+                };
+                results.insert(field.name().to_string(), value);
+            }
+            // Try Decimal128Array for SUM/AVG on Decimal columns
+            else if let Some(decimal_array) = array.as_any().downcast_ref::<Decimal128Array>() {
+                if decimal_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        decimal_array.len()
+                    )));
+                }
+                let value = if decimal_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::Decimal128 {
+                        value: decimal_array.value(0),
+                        scale: decimal_array.scale(),
+                    }
                 };
                 results.insert(field.name().to_string(), value);
             } else {
@@ -3553,6 +3709,75 @@ where
         ))
     }
 
+    /// Infer the Arrow data type for a computed expression in GROUP BY context
+    fn infer_computed_expression_type(
+        expr: &ScalarExpr<String>,
+        base_schema: &Schema,
+        column_lookup_map: &FxHashMap<String, usize>,
+        sample_batch: &RecordBatch,
+    ) -> Option<DataType> {
+        use llkv_expr::expr::AggregateCall;
+
+        // If it's a simple aggregate, return its result type
+        if let ScalarExpr::Aggregate(agg_call) = expr {
+            return match agg_call {
+                AggregateCall::CountStar
+                | AggregateCall::Count { .. }
+                | AggregateCall::CountNulls(_) => Some(DataType::Int64),
+                AggregateCall::Sum { expr: agg_expr, .. }
+                | AggregateCall::Total { expr: agg_expr, .. }
+                | AggregateCall::Avg { expr: agg_expr, .. }
+                | AggregateCall::Min(agg_expr)
+                | AggregateCall::Max(agg_expr) => {
+                    // For aggregate functions, infer the type from the expression
+                    if let Some(col_name) = try_extract_simple_column(agg_expr) {
+                        let idx = resolve_column_name_to_index(col_name, column_lookup_map)?;
+                        Some(base_schema.field(idx).data_type().clone())
+                    } else {
+                        // Complex expression - evaluate to determine scale, but use conservative precision
+                        // For SUM/TOTAL/AVG of decimal expressions, the result can grow beyond the sample value
+                        if sample_batch.num_rows() > 0 {
+                            let mut computed_values = Vec::new();
+                            if let Ok(value) =
+                                Self::evaluate_expr_with_plan_value_aggregates_and_row(
+                                    agg_expr,
+                                    &FxHashMap::default(),
+                                    Some(sample_batch),
+                                    Some(column_lookup_map),
+                                    0,
+                                )
+                            {
+                                computed_values.push(value);
+                                if let Ok(array) = plan_values_to_arrow_array(&computed_values) {
+                                    match array.data_type() {
+                                        // If it's Decimal128, use maximum precision to avoid overflow in aggregates
+                                        DataType::Decimal128(_, scale) => {
+                                            return Some(DataType::Decimal128(38, *scale));
+                                        }
+                                        // If evaluation returned NULL, fall back to Float64
+                                        DataType::Null => {
+                                            return Some(DataType::Float64);
+                                        }
+                                        other => {
+                                            return Some(other.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Unable to determine type, fall back to Float64
+                        Some(DataType::Float64)
+                    }
+                }
+                AggregateCall::GroupConcat { .. } => Some(DataType::Utf8),
+            };
+        }
+
+        // For other expressions, could try evaluating with sample data
+        // but for now return None to fall back to Float64
+        None
+    }
+
     fn build_group_by_output_columns(
         &self,
         plan: &SelectPlan,
@@ -3611,11 +3836,18 @@ where
                         source: OutputSource::TableColumn { index: *index },
                     });
                 }
-                SelectProjection::Computed { expr: _, alias } => {
-                    // For GROUP BY with aggregates, we don't evaluate the expression here
-                    // because it may contain aggregate functions. We'll evaluate it later
-                    // per group. For now, assume Float64 as a conservative type.
-                    let field = Field::new(alias.clone(), DataType::Float64, true);
+                SelectProjection::Computed { expr, alias } => {
+                    // For GROUP BY with aggregates, we need to infer the type from the expression
+                    // If it's a simple aggregate, use the aggregate's result type
+                    // Otherwise, we'll need to evaluate a sample to determine the type
+                    let inferred_type = Self::infer_computed_expression_type(
+                        expr,
+                        base_schema,
+                        column_lookup_map,
+                        _sample_batch,
+                    )
+                    .unwrap_or(DataType::Float64);
+                    let field = Field::new(alias.clone(), inferred_type, true);
                     columns.push(OutputColumn {
                         field,
                         source: OutputSource::Computed {
@@ -4444,6 +4676,25 @@ where
                                         .push(Arc::new(Float64Array::from(vec![Some(*v)]))
                                             as ArrayRef);
                                 }
+                                AggregateValue::Decimal128 { value, scale } => {
+                                    // Determine precision from the value
+                                    let precision = if *value == 0 {
+                                        1
+                                    } else {
+                                        (*value).abs().to_string().len() as u8
+                                    };
+                                    fields.push(arrow::datatypes::Field::new(
+                                        alias,
+                                        DataType::Decimal128(precision, *scale),
+                                        true,
+                                    ));
+                                    let array = Decimal128Array::from(vec![Some(*value)])
+                                        .with_precision_and_scale(precision, *scale)
+                                        .map_err(|e| {
+                                            Error::Internal(format!("invalid Decimal128: {}", e))
+                                        })?;
+                                    arrays.push(Arc::new(array) as ArrayRef);
+                                }
                                 AggregateValue::String(s) => {
                                     fields.push(arrow::datatypes::Field::new(
                                         alias,
@@ -4579,9 +4830,6 @@ where
     ///
     /// For other aggregates (e.g. MIN, MAX, COUNT, etc.):
     /// - Only allows types in the `allowed` list
-    ///
-    /// This is the SINGLE centralized function for all aggregate type handling.
-    /// No need to update multiple call sites when adding type support.
     fn validate_aggregate_type(
         data_type: Option<DataType>,
         func_name: &str,
@@ -4598,11 +4846,15 @@ where
         if matches!(func_name, "SUM" | "AVG" | "TOTAL" | "MIN" | "MAX") {
             match dt {
                 // Numeric types used directly
-                DataType::Int64 | DataType::Float64 => Ok(dt),
+                DataType::Int64 | DataType::Float64 | DataType::Decimal128(_, _) => Ok(dt),
 
                 // SQLite-compatible coercion: strings, booleans, dates -> Float64
                 // Actual conversion happens in llkv-aggregate::array_value_to_numeric
                 DataType::Utf8 | DataType::Boolean | DataType::Date32 => Ok(DataType::Float64),
+
+                // Null type can occur when expression is all NULLs - aggregate result will be NULL
+                // Use Float64 as a safe default type for the aggregate accumulator
+                DataType::Null => Ok(DataType::Float64),
 
                 _ => Err(Error::InvalidArgumentError(format!(
                     "{func_name} aggregate not supported for column type {:?}",
@@ -5261,6 +5513,25 @@ where
                     AggregateValue::String(string_array.value(0).to_string())
                 };
                 results.insert(alias, value);
+            } else if let Some(decimal_array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+            {
+                if decimal_array.len() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Expected single value from aggregate, got {}",
+                        decimal_array.len()
+                    )));
+                }
+                let value = if decimal_array.is_null(0) {
+                    AggregateValue::Null
+                } else {
+                    AggregateValue::Decimal128 {
+                        value: decimal_array.value(0),
+                        scale: decimal_array.scale(),
+                    }
+                };
+                results.insert(alias, value);
             } else {
                 return Err(Error::Internal(format!(
                     "Unexpected array type from aggregate: {:?}",
@@ -5289,6 +5560,9 @@ where
                 (PlanValue::Integer(l), PlanValue::Float(r)) => (*l as f64).partial_cmp(r),
                 (PlanValue::Float(l), PlanValue::Integer(r)) => l.partial_cmp(&(*r as f64)),
                 (PlanValue::String(l), PlanValue::String(r)) => Some(l.cmp(r)),
+                (PlanValue::Interval(l), PlanValue::Interval(r)) => {
+                    Some(compare_interval_values(*l, *r))
+                }
                 _ => None,
             }
         }
@@ -5370,6 +5644,28 @@ where
                             CompareOp::GtEq => l >= r,
                         }))
                     }
+                    (PlanValue::Interval(l), PlanValue::Interval(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        let ordering = compare_interval_values(l, r);
+                        Ok(Some(match op {
+                            CompareOp::Eq => ordering == std::cmp::Ordering::Equal,
+                            CompareOp::NotEq => ordering != std::cmp::Ordering::Equal,
+                            CompareOp::Lt => ordering == std::cmp::Ordering::Less,
+                            CompareOp::LtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                                )
+                            }
+                            CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
+                            CompareOp::GtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                                )
+                            }
+                        }))
+                    }
                     _ => Ok(Some(false)),
                 }
             }
@@ -5430,6 +5726,9 @@ where
                         (PlanValue::Integer(a), PlanValue::Float(b)) => (*a as f64) == *b,
                         (PlanValue::Float(a), PlanValue::Integer(b)) => *a == (*b as f64),
                         (PlanValue::String(a), PlanValue::String(b)) => a == b,
+                        (PlanValue::Interval(a), PlanValue::Interval(b)) => {
+                            compare_interval_values(*a, *b) == std::cmp::Ordering::Equal
+                        }
                         _ => false,
                     };
 
@@ -5598,10 +5897,13 @@ where
         match expr {
             ScalarExpr::Literal(Literal::Integer(v)) => Ok(PlanValue::Integer(*v as i64)),
             ScalarExpr::Literal(Literal::Float(v)) => Ok(PlanValue::Float(*v)),
+            ScalarExpr::Literal(Literal::Decimal(value)) => Ok(PlanValue::Decimal(*value)),
             ScalarExpr::Literal(Literal::Boolean(v)) => {
                 Ok(PlanValue::Integer(if *v { 1 } else { 0 }))
             }
             ScalarExpr::Literal(Literal::String(s)) => Ok(PlanValue::String(s.clone())),
+            ScalarExpr::Literal(Literal::Date32(days)) => Ok(PlanValue::Date32(*days)),
+            ScalarExpr::Literal(Literal::Interval(interval)) => Ok(PlanValue::Interval(*interval)),
             ScalarExpr::Literal(Literal::Null) => Ok(PlanValue::Null),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
@@ -5687,6 +5989,28 @@ where
                             CompareOp::GtEq => l >= r,
                         }
                     }
+                    (PlanValue::Interval(l), PlanValue::Interval(r)) => {
+                        use llkv_expr::expr::CompareOp;
+                        let ordering = compare_interval_values(*l, *r);
+                        match op {
+                            CompareOp::Eq => ordering == std::cmp::Ordering::Equal,
+                            CompareOp::NotEq => ordering != std::cmp::Ordering::Equal,
+                            CompareOp::Lt => ordering == std::cmp::Ordering::Less,
+                            CompareOp::LtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                                )
+                            }
+                            CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
+                            CompareOp::GtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                                )
+                            }
+                        }
+                    }
                     _ => false,
                 };
 
@@ -5757,6 +6081,15 @@ where
                             return Ok(PlanValue::Null);
                         }
 
+                        if matches!(left_val, PlanValue::Interval(_))
+                            || matches!(right_val, PlanValue::Interval(_))
+                        {
+                            return Err(Error::InvalidArgumentError(
+                                "interval arithmetic not supported in aggregate expressions".into(),
+                            ));
+                        }
+
+                        // Special case: integer division
                         if matches!(op, BinaryOp::Divide)
                             && let (PlanValue::Integer(lhs), PlanValue::Integer(rhs)) =
                                 (&left_val, &right_val)
@@ -5772,6 +6105,102 @@ where
                             return Ok(PlanValue::Integer(lhs / rhs));
                         }
 
+                        // Check if either operand is Decimal - if so, use exact Decimal arithmetic
+                        let has_decimal = matches!(&left_val, PlanValue::Decimal(_))
+                            || matches!(&right_val, PlanValue::Decimal(_));
+
+                        if has_decimal {
+                            use llkv_expr::decimal::DecimalValue;
+
+                            // Convert both operands to Decimal
+                            let left_dec = match &left_val {
+                                PlanValue::Integer(i) => DecimalValue::from_i64(*i),
+                                PlanValue::Float(_f) => {
+                                    // For Float, we lose some precision but maintain the value
+                                    return Err(Error::InvalidArgumentError(
+                                        "Cannot perform exact decimal arithmetic with Float operands"
+                                            .into(),
+                                    ));
+                                }
+                                PlanValue::Decimal(d) => *d,
+                                other => {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "Non-numeric value {:?} in binary operation",
+                                        other
+                                    )));
+                                }
+                            };
+
+                            let right_dec = match &right_val {
+                                PlanValue::Integer(i) => DecimalValue::from_i64(*i),
+                                PlanValue::Float(_f) => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "Cannot perform exact decimal arithmetic with Float operands"
+                                            .into(),
+                                    ));
+                                }
+                                PlanValue::Decimal(d) => *d,
+                                other => {
+                                    return Err(Error::InvalidArgumentError(format!(
+                                        "Non-numeric value {:?} in binary operation",
+                                        other
+                                    )));
+                                }
+                            };
+
+                            // Perform exact decimal arithmetic
+                            let result_dec = match op {
+                                BinaryOp::Add => left_dec.checked_add(right_dec).map_err(|e| {
+                                    Error::InvalidArgumentError(format!(
+                                        "Decimal addition overflow: {}",
+                                        e
+                                    ))
+                                })?,
+                                BinaryOp::Subtract => {
+                                    left_dec.checked_sub(right_dec).map_err(|e| {
+                                        Error::InvalidArgumentError(format!(
+                                            "Decimal subtraction overflow: {}",
+                                            e
+                                        ))
+                                    })?
+                                }
+                                BinaryOp::Multiply => {
+                                    left_dec.checked_mul(right_dec).map_err(|e| {
+                                        Error::InvalidArgumentError(format!(
+                                            "Decimal multiplication overflow: {}",
+                                            e
+                                        ))
+                                    })?
+                                }
+                                BinaryOp::Divide => {
+                                    // Check for division by zero first
+                                    if right_dec.raw_value() == 0 {
+                                        return Ok(PlanValue::Null);
+                                    }
+                                    // For division, preserve scale of left operand
+                                    let target_scale = left_dec.scale();
+                                    left_dec.checked_div(right_dec, target_scale).map_err(|e| {
+                                        Error::InvalidArgumentError(format!(
+                                            "Decimal division error: {}",
+                                            e
+                                        ))
+                                    })?
+                                }
+                                BinaryOp::Modulo => {
+                                    return Err(Error::InvalidArgumentError(
+                                        "Modulo not supported for Decimal types".into(),
+                                    ));
+                                }
+                                BinaryOp::And
+                                | BinaryOp::Or
+                                | BinaryOp::BitwiseShiftLeft
+                                | BinaryOp::BitwiseShiftRight => unreachable!(),
+                            };
+
+                            return Ok(PlanValue::Decimal(result_dec));
+                        }
+
+                        // No decimals - use Float or Integer arithmetic as before
                         let left_is_float = matches!(&left_val, PlanValue::Float(_));
                         let right_is_float = matches!(&right_val, PlanValue::Float(_));
 
@@ -5922,8 +6351,29 @@ where
                         PlanValue::String(s) => Ok(PlanValue::String(s)),
                         PlanValue::Integer(i) => Ok(PlanValue::String(i.to_string())),
                         PlanValue::Float(f) => Ok(PlanValue::String(f.to_string())),
+                        PlanValue::Interval(_) => Err(Error::InvalidArgumentError(
+                            "Cannot cast interval to string in aggregate expressions".into(),
+                        )),
                         _ => Err(Error::InvalidArgumentError(format!(
                             "Cannot cast {:?} to string",
+                            value
+                        ))),
+                    },
+                    DataType::Interval(IntervalUnit::MonthDayNano) => match value {
+                        PlanValue::Interval(interval) => Ok(PlanValue::Interval(interval)),
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Cannot cast {:?} to interval",
+                            value
+                        ))),
+                    },
+                    DataType::Date32 => match value {
+                        PlanValue::Date32(days) => Ok(PlanValue::Date32(days)),
+                        PlanValue::String(text) => {
+                            let days = parse_date32_literal(&text)?;
+                            Ok(PlanValue::Date32(days))
+                        }
+                        _ => Err(Error::InvalidArgumentError(format!(
+                            "Cannot cast {:?} to date",
                             value
                         ))),
                     },
@@ -6043,6 +6493,9 @@ where
             (PlanValue::Float(left), PlanValue::Float(right)) => left == right,
             (PlanValue::String(left), PlanValue::String(right)) => left == right,
             (PlanValue::Struct(left), PlanValue::Struct(right)) => left == right,
+            (PlanValue::Interval(left), PlanValue::Interval(right)) => {
+                compare_interval_values(*left, *right) == std::cmp::Ordering::Equal
+            }
             _ => operand == candidate,
         }
     }
@@ -6057,13 +6510,24 @@ where
         match expr {
             ScalarExpr::Literal(Literal::Integer(v)) => Ok(Some(*v as i64)),
             ScalarExpr::Literal(Literal::Float(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Decimal(value)) => {
+                if let Some(int) = decimal_exact_i64(*value) {
+                    Ok(Some(int))
+                } else {
+                    Ok(Some(value.to_f64() as i64))
+                }
+            }
             ScalarExpr::Literal(Literal::Boolean(v)) => Ok(Some(if *v { 1 } else { 0 })),
             ScalarExpr::Literal(Literal::String(_)) => Err(Error::InvalidArgumentError(
                 "String literals not supported in aggregate expressions".into(),
             )),
+            ScalarExpr::Literal(Literal::Date32(days)) => Ok(Some(*days as i64)),
             ScalarExpr::Literal(Literal::Null) => Ok(None),
             ScalarExpr::Literal(Literal::Struct(_)) => Err(Error::InvalidArgumentError(
                 "Struct literals not supported in aggregate expressions".into(),
+            )),
+            ScalarExpr::Literal(Literal::Interval(_)) => Err(Error::InvalidArgumentError(
+                "Interval literals not supported in aggregate-only expressions".into(),
             )),
             ScalarExpr::Column(_) => Err(Error::InvalidArgumentError(
                 "Column references not supported in aggregate-only expressions".into(),
@@ -6227,6 +6691,8 @@ enum ColumnAccessor {
     Float64(Arc<Float64Array>),
     Boolean(Arc<BooleanArray>),
     Utf8(Arc<StringArray>),
+    Date32(Arc<Date32Array>),
+    Interval(Arc<IntervalMonthDayNanoArray>),
     Null(usize),
 }
 
@@ -6265,6 +6731,22 @@ impl ColumnAccessor {
                     .clone();
                 Ok(Self::Utf8(Arc::new(typed)))
             }
+            DataType::Date32 => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| Error::Internal("expected Date32 array".into()))?
+                    .clone();
+                Ok(Self::Date32(Arc::new(typed)))
+            }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| Error::Internal("expected IntervalMonthDayNano array".into()))?
+                    .clone();
+                Ok(Self::Interval(Arc::new(typed)))
+            }
             DataType::Null => Ok(Self::Null(array.len())),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported column type {:?} in cross product filter",
@@ -6279,6 +6761,8 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => array.len(),
             ColumnAccessor::Boolean(array) => array.len(),
             ColumnAccessor::Utf8(array) => array.len(),
+            ColumnAccessor::Date32(array) => array.len(),
+            ColumnAccessor::Interval(array) => array.len(),
             ColumnAccessor::Null(len) => *len,
         }
     }
@@ -6289,6 +6773,8 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => array.is_null(idx),
             ColumnAccessor::Boolean(array) => array.is_null(idx),
             ColumnAccessor::Utf8(array) => array.is_null(idx),
+            ColumnAccessor::Date32(array) => array.is_null(idx),
+            ColumnAccessor::Interval(array) => array.is_null(idx),
             ColumnAccessor::Null(_) => true,
         }
     }
@@ -6302,6 +6788,10 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => Ok(Literal::Float(array.value(idx))),
             ColumnAccessor::Boolean(array) => Ok(Literal::Boolean(array.value(idx))),
             ColumnAccessor::Utf8(array) => Ok(Literal::String(array.value(idx).to_string())),
+            ColumnAccessor::Date32(array) => Ok(Literal::Date32(array.value(idx))),
+            ColumnAccessor::Interval(array) => Ok(Literal::Interval(interval_value_from_arrow(
+                array.value(idx),
+            ))),
             ColumnAccessor::Null(_) => Ok(Literal::Null),
         }
     }
@@ -6312,6 +6802,8 @@ impl ColumnAccessor {
             ColumnAccessor::Float64(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Boolean(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Utf8(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Date32(array) => Arc::clone(array) as ArrayRef,
+            ColumnAccessor::Interval(array) => Arc::clone(array) as ArrayRef,
             ColumnAccessor::Null(len) => new_null_array(&DataType::Null, *len),
         }
     }
@@ -6322,6 +6814,7 @@ enum ValueArray {
     Numeric(NumericArray),
     Boolean(Arc<BooleanArray>),
     Utf8(Arc<StringArray>),
+    Interval(Arc<IntervalMonthDayNanoArray>),
     Null(usize),
 }
 
@@ -6344,6 +6837,14 @@ impl ValueArray {
                     .clone();
                 Ok(Self::Utf8(Arc::new(typed)))
             }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .ok_or_else(|| Error::Internal("expected IntervalMonthDayNano array".into()))?
+                    .clone();
+                Ok(Self::Interval(Arc::new(typed)))
+            }
             DataType::Null => Ok(Self::Null(array.len())),
             DataType::Int8
             | DataType::Int16
@@ -6353,6 +6854,7 @@ impl ValueArray {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
+            | DataType::Date32
             | DataType::Float32
             | DataType::Float64 => {
                 let numeric = NumericArray::try_from_arrow(&array)?;
@@ -6370,6 +6872,7 @@ impl ValueArray {
             ValueArray::Numeric(array) => array.len(),
             ValueArray::Boolean(array) => array.len(),
             ValueArray::Utf8(array) => array.len(),
+            ValueArray::Interval(array) => array.len(),
             ValueArray::Null(len) => *len,
         }
     }
@@ -6453,6 +6956,26 @@ fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<Ar
         Literal::String(v) => {
             let values: Vec<Option<String>> = (0..len).map(|_| Some(v.clone())).collect();
             Ok(Arc::new(StringArray::from(values)) as ArrayRef)
+        }
+        Literal::Date32(days) => {
+            let values = vec![*days; len];
+            Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
+        }
+        Literal::Decimal(value) => {
+            let iter = std::iter::repeat_n(value.raw_value(), len);
+            let array = Decimal128Array::from_iter_values(iter)
+                .with_precision_and_scale(value.precision(), value.scale())
+                .map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "failed to synthesize decimal literal array: {err}"
+                    ))
+                })?;
+            Ok(Arc::new(array) as ArrayRef)
+        }
+        Literal::Interval(interval) => {
+            let value = interval_value_to_arrow(*interval);
+            let values = vec![value; len];
+            Ok(Arc::new(IntervalMonthDayNanoArray::from(values)) as ArrayRef)
         }
         Literal::Null => Ok(new_null_array(&DataType::Null, len)),
         Literal::Struct(_) => Err(Error::InvalidArgumentError(
@@ -6709,6 +7232,35 @@ impl CrossProductExpressionContext {
                     }
                     Ok(out)
                 }
+                ColumnAccessor::Date32(array) => {
+                    let predicate = build_fixed_width_predicate::<Int32Type>(&filter.op)
+                        .map_err(Error::predicate_build)?;
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                        } else {
+                            let value = array.value(idx);
+                            out.push(Some(predicate.matches(&value)));
+                        }
+                    }
+                    Ok(out)
+                }
+                ColumnAccessor::Interval(array) => {
+                    let array = array.as_ref();
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if array.is_null(idx) {
+                            out.push(None);
+                            continue;
+                        }
+                        let literal =
+                            Literal::Interval(interval_value_from_arrow(array.value(idx)));
+                        let matches = evaluate_filter_against_literal(&literal, &filter.op)?;
+                        out.push(Some(matches));
+                    }
+                    Ok(out)
+                }
                 ColumnAccessor::Null(len) => Ok(vec![None; len]),
             },
         }
@@ -6769,6 +7321,40 @@ impl CrossProductExpressionContext {
                 }
                 Ok(out)
             }
+            (ValueArray::Interval(lhs), ValueArray::Interval(rhs)) => {
+                let lhs = lhs.as_ref();
+                let rhs = rhs.as_ref();
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if lhs.is_null(idx) || rhs.is_null(idx) {
+                        out.push(None);
+                    } else {
+                        let lhs_val = interval_value_from_arrow(lhs.value(idx));
+                        let rhs_val = interval_value_from_arrow(rhs.value(idx));
+                        let ordering = compare_interval_values(lhs_val, rhs_val);
+                        let result = match op {
+                            CompareOp::Eq => ordering == std::cmp::Ordering::Equal,
+                            CompareOp::NotEq => ordering != std::cmp::Ordering::Equal,
+                            CompareOp::Lt => ordering == std::cmp::Ordering::Less,
+                            CompareOp::LtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                                )
+                            }
+                            CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
+                            CompareOp::GtEq => {
+                                matches!(
+                                    ordering,
+                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                                )
+                            }
+                        };
+                        out.push(Some(result));
+                    }
+                }
+                Ok(out)
+            }
             _ => Err(Error::InvalidArgumentError(
                 "unsupported comparison between mismatched types in cross product filter".into(),
             )),
@@ -6817,6 +7403,16 @@ impl CrossProductExpressionContext {
                 Ok(out)
             }
             ValueArray::Utf8(arr) => {
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    let is_null = arr.is_null(idx);
+                    let result = if negated { !is_null } else { is_null };
+                    out.push(Some(result));
+                }
+                Ok(out)
+            }
+            ValueArray::Interval(arr) => {
+                let arr = arr.as_ref();
                 let mut out = Vec::with_capacity(len);
                 for idx in 0..len {
                     let is_null = arr.is_null(idx);
@@ -6936,6 +7532,46 @@ impl CrossProductExpressionContext {
                                 } else if array.value(idx) == target_value {
                                     has_match = true;
                                     break;
+                                }
+                            }
+                            ValueArray::Null(_) => saw_null = true,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(
+                                    "type mismatch in IN list evaluation".into(),
+                                ));
+                            }
+                        }
+                    }
+                    out.push(finalize_in_list_result(has_match, saw_null, negated));
+                }
+                Ok(out)
+            }
+            ValueArray::Interval(target_interval) => {
+                let target_interval = target_interval.as_ref();
+                let mut out = Vec::with_capacity(len);
+                for idx in 0..len {
+                    if target_interval.is_null(idx) {
+                        out.push(None);
+                        continue;
+                    }
+                    let target_value = interval_value_from_arrow(target_interval.value(idx));
+                    let mut has_match = false;
+                    let mut saw_null = false;
+                    for candidate in &list_values {
+                        match candidate {
+                            ValueArray::Interval(array) => {
+                                let array = array.as_ref();
+                                if array.is_null(idx) {
+                                    saw_null = true;
+                                } else {
+                                    let candidate_value =
+                                        interval_value_from_arrow(array.value(idx));
+                                    if compare_interval_values(target_value, candidate_value)
+                                        == std::cmp::Ordering::Equal
+                                    {
+                                        has_match = true;
+                                        break;
+                                    }
                                 }
                             }
                             ValueArray::Null(_) => saw_null = true,
@@ -7280,12 +7916,21 @@ fn encode_plan_value(buf: &mut Vec<u8>, value: &PlanValue) {
             buf.push(2);
             buf.extend_from_slice(&v.to_bits().to_be_bytes());
         }
+        PlanValue::Decimal(decimal) => {
+            buf.push(7);
+            buf.extend_from_slice(&decimal.raw_value().to_be_bytes());
+            buf.push(decimal.scale().to_be_bytes()[0]);
+        }
         PlanValue::String(s) => {
             buf.push(3);
             let bytes = s.as_bytes();
             let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             buf.extend_from_slice(&len.to_be_bytes());
             buf.extend_from_slice(bytes);
+        }
+        PlanValue::Date32(days) => {
+            buf.push(5);
+            buf.extend_from_slice(&days.to_be_bytes());
         }
         PlanValue::Struct(map) => {
             buf.push(4);
@@ -7300,6 +7945,12 @@ fn encode_plan_value(buf: &mut Vec<u8>, value: &PlanValue) {
                 buf.extend_from_slice(key_bytes);
                 encode_plan_value(buf, val);
             }
+        }
+        PlanValue::Interval(interval) => {
+            buf.push(6);
+            buf.extend_from_slice(&interval.months.to_be_bytes());
+            buf.extend_from_slice(&interval.days.to_be_bytes());
+            buf.extend_from_slice(&interval.nanos.to_be_bytes());
         }
     }
 }
@@ -7419,6 +8070,13 @@ fn group_key_value(array: &ArrayRef, row_idx: usize) -> ExecutorResult<GroupKeyV
                 ));
             }
             Ok(GroupKeyValue::Int(value as i64))
+        }
+        DataType::Date32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast to Date32Array".into()))?;
+            Ok(GroupKeyValue::Int(values.value(row_idx) as i64))
         }
         DataType::Boolean => {
             let values = array
@@ -7941,7 +8599,9 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     fn literal_to_i128_from_integer_like(literal: &Literal) -> Option<i128> {
         match literal {
             Literal::Integer(value) => Some(*value),
+            Literal::Decimal(value) => value.rescale(0).ok().map(|integral| integral.raw_value()),
             Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
+            Literal::Date32(value) => Some(*value as i128),
             _ => None,
         }
     }
@@ -7982,7 +8642,9 @@ fn literal_to_f64(literal: &Literal) -> Option<f64> {
     match literal {
         Literal::Integer(value) => Some(*value as f64),
         Literal::Float(value) => Some(*value),
+        Literal::Decimal(value) => Some(value.to_f64()),
         Literal::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
+        Literal::Date32(value) => Some(*value as f64),
         _ => None,
     }
 }
@@ -7991,7 +8653,9 @@ fn literal_to_i128(literal: &Literal) -> Option<i128> {
     match literal {
         Literal::Integer(value) => Some(*value),
         Literal::Float(value) => Some(*value as i128),
+        Literal::Decimal(value) => value.rescale(0).ok().map(|integral| integral.raw_value()),
         Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
+        Literal::Date32(value) => Some(*value as i128),
         _ => None,
     }
 }
@@ -8001,6 +8665,8 @@ fn literal_truthiness(literal: &Literal) -> Option<bool> {
         Literal::Boolean(value) => Some(*value),
         Literal::Integer(value) => Some(*value != 0),
         Literal::Float(value) => Some(*value != 0.0),
+        Literal::Decimal(value) => Some(decimal_truthy(*value)),
+        Literal::Date32(value) => Some(*value != 0),
         Literal::Null => None,
         _ => None,
     }
@@ -8010,6 +8676,8 @@ fn plan_value_truthiness(value: &PlanValue) -> Option<bool> {
     match value {
         PlanValue::Integer(v) => Some(*v != 0),
         PlanValue::Float(v) => Some(*v != 0.0),
+        PlanValue::Decimal(v) => Some(decimal_truthy(*v)),
+        PlanValue::Date32(v) => Some(*v != 0),
         PlanValue::Null => None,
         _ => None,
     }
@@ -8117,6 +8785,7 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
             Literal::String(text) => text.clone(),
             Literal::Integer(value) => value.to_string(),
             Literal::Float(value) => value.to_string(),
+            Literal::Decimal(value) => value.to_string(),
             Literal::Boolean(value) => {
                 if *value {
                     "1".to_string()
@@ -8124,11 +8793,51 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
                     "0".to_string()
                 }
             }
-            Literal::Struct(_) | Literal::Null => return None,
+            Literal::Date32(days) => format_date32_literal(*days).ok()?,
+            Literal::Struct(_) | Literal::Null | Literal::Interval(_) => return None,
         })),
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
-            literal_to_i128(literal).map(Literal::Integer)
+        DataType::Decimal128(precision, scale) => {
+            literal_to_decimal_literal(literal, *precision, *scale)
         }
+        DataType::Decimal256(precision, scale) => {
+            literal_to_decimal_literal(literal, *precision, *scale)
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => match literal {
+            Literal::Interval(interval) => Some(Literal::Interval(*interval)),
+            Literal::Null => Some(Literal::Null),
+            _ => None,
+        },
+        DataType::Date32 => match literal {
+            Literal::Null => Some(Literal::Null),
+            Literal::Date32(days) => Some(Literal::Date32(*days)),
+            Literal::String(text) => parse_date32_literal(text).ok().map(Literal::Date32),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn literal_to_decimal_literal(literal: &Literal, precision: u8, scale: i8) -> Option<Literal> {
+    match literal {
+        Literal::Decimal(value) => align_decimal_to_scale(*value, precision, scale)
+            .ok()
+            .map(Literal::Decimal),
+        Literal::Integer(value) => {
+            let int = i64::try_from(*value).ok()?;
+            decimal_from_i64(int, precision, scale)
+                .ok()
+                .map(Literal::Decimal)
+        }
+        Literal::Float(value) => decimal_from_f64(*value, precision, scale)
+            .ok()
+            .map(Literal::Decimal),
+        Literal::Boolean(value) => {
+            let int = if *value { 1 } else { 0 };
+            decimal_from_i64(int, precision, scale)
+                .ok()
+                .map(Literal::Decimal)
+        }
+        Literal::Null => Some(Literal::Null),
         _ => None,
     }
 }
@@ -8476,7 +9185,13 @@ fn literal_compare(lhs: &Literal, rhs: &Literal) -> Option<std::cmp::Ordering> {
         (Literal::Float(a), Literal::Float(b)) => a.partial_cmp(b),
         (Literal::Integer(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
         (Literal::Float(a), Literal::Integer(b)) => a.partial_cmp(&(*b as f64)),
+        (Literal::Date32(a), Literal::Date32(b)) => Some(a.cmp(b)),
+        (Literal::Date32(a), Literal::Integer(b)) => Some((*a as i128).cmp(b)),
+        (Literal::Integer(a), Literal::Date32(b)) => Some(a.cmp(&(*b as i128))),
+        (Literal::Date32(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
+        (Literal::Float(a), Literal::Date32(b)) => a.partial_cmp(&(*b as f64)),
         (Literal::String(a), Literal::String(b)) => Some(a.cmp(b)),
+        (Literal::Interval(a), Literal::Interval(b)) => Some(compare_interval_values(*a, *b)),
         _ => None,
     }
 }
@@ -8488,7 +9203,13 @@ fn literal_equals(lhs: &Literal, rhs: &Literal) -> Option<bool> {
         (Literal::Integer(_), Literal::Integer(_))
         | (Literal::Integer(_), Literal::Float(_))
         | (Literal::Float(_), Literal::Integer(_))
-        | (Literal::Float(_), Literal::Float(_)) => {
+        | (Literal::Float(_), Literal::Float(_))
+        | (Literal::Date32(_), Literal::Date32(_))
+        | (Literal::Date32(_), Literal::Integer(_))
+        | (Literal::Integer(_), Literal::Date32(_))
+        | (Literal::Date32(_), Literal::Float(_))
+        | (Literal::Float(_), Literal::Date32(_))
+        | (Literal::Interval(_), Literal::Interval(_)) => {
             literal_compare(lhs, rhs).map(|cmp| cmp == std::cmp::Ordering::Equal)
         }
         _ => None,
@@ -8502,6 +9223,14 @@ fn literal_string(literal: &Literal, case_sensitive: bool) -> Option<String> {
                 Some(value.clone())
             } else {
                 Some(value.to_ascii_lowercase())
+            }
+        }
+        Literal::Date32(value) => {
+            let formatted = format_date32_literal(*value).ok()?;
+            if case_sensitive {
+                Some(formatted)
+            } else {
+                Some(formatted.to_ascii_lowercase())
             }
         }
         _ => None,
@@ -8588,6 +9317,17 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
                 .ok_or_else(|| Error::Internal("failed to downcast uint64 array".into()))?;
             Ok(Literal::Integer(array.value(idx) as i128))
         }
+        DataType::Decimal128(_, scale) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast decimal128 array".into()))?;
+            let raw = array.value(idx);
+            let decimal = DecimalValue::new(raw, *scale).map_err(|err| {
+                Error::InvalidArgumentError(format!("invalid decimal value: {err}"))
+            })?;
+            Ok(Literal::Decimal(decimal))
+        }
         DataType::Float32 => {
             let array = array
                 .as_any()
@@ -8602,6 +9342,13 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
                 .ok_or_else(|| Error::Internal("failed to downcast float64 array".into()))?;
             Ok(Literal::Float(array.value(idx)))
         }
+        DataType::Date32 => {
+            let array = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| Error::Internal("failed to downcast date32 array".into()))?;
+            Ok(Literal::Date32(array.value(idx)))
+        }
         DataType::Utf8 => {
             let array = array
                 .as_any()
@@ -8615,6 +9362,15 @@ fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Litera
                 .downcast_ref::<LargeStringArray>()
                 .ok_or_else(|| Error::Internal("failed to downcast large utf8 array".into()))?;
             Ok(Literal::String(array.value(idx).to_string()))
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .ok_or_else(|| Error::Internal("failed to downcast interval array".into()))?;
+            Ok(Literal::Interval(interval_value_from_arrow(
+                array.value(idx),
+            )))
         }
         DataType::Struct(fields) => {
             let struct_array = array
@@ -9605,6 +10361,58 @@ fn build_comparison_mask(column: &dyn Array, value: &PlanValue) -> ExecutorResul
             }
             Ok(builder.finish())
         }
+        PlanValue::Decimal(expected) => match column.data_type() {
+            DataType::Decimal128(precision, scale) => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::Internal("failed to downcast to Decimal128Array".into())
+                    })?;
+                let expected_aligned = align_decimal_to_scale(*expected, *precision, *scale)
+                    .map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "decimal literal {expected} incompatible with DECIMAL({}, {}): {err}",
+                            precision, scale
+                        ))
+                    })?;
+                let mut builder = BooleanBuilder::with_capacity(arr.len());
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        builder.append_value(false);
+                    } else {
+                        let actual = DecimalValue::new(arr.value(i), *scale).map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "invalid decimal value stored in column: {err}"
+                            ))
+                        })?;
+                        builder.append_value(actual.raw_value() == expected_aligned.raw_value());
+                    }
+                }
+                Ok(builder.finish())
+            }
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Boolean => {
+                if let Some(int_value) = decimal_exact_i64(*expected) {
+                    return build_comparison_mask(column, &PlanValue::Integer(int_value));
+                }
+                Ok(BooleanArray::from(vec![false; column.len()]))
+            }
+            DataType::Float32 | DataType::Float64 => {
+                build_comparison_mask(column, &PlanValue::Float(expected.to_f64()))
+            }
+            _ => Err(Error::Internal(format!(
+                "unsupported decimal type for IN list: {:?}",
+                column.data_type()
+            ))),
+        },
         PlanValue::String(val) => {
             let mut builder = BooleanBuilder::with_capacity(column.len());
             let arr = column
@@ -9613,6 +10421,62 @@ fn build_comparison_mask(column: &dyn Array, value: &PlanValue) -> ExecutorResul
                 .ok_or_else(|| Error::Internal("failed to downcast to StringArray".into()))?;
             for i in 0..arr.len() {
                 builder.append_value(!arr.is_null(i) && arr.value(i) == val.as_str());
+            }
+            Ok(builder.finish())
+        }
+        PlanValue::Date32(days) => {
+            let mut builder = BooleanBuilder::with_capacity(column.len());
+            match column.data_type() {
+                DataType::Date32 => {
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<Date32Array>()
+                        .ok_or_else(|| {
+                            Error::Internal("failed to downcast to Date32Array".into())
+                        })?;
+                    for i in 0..arr.len() {
+                        builder.append_value(!arr.is_null(i) && arr.value(i) == *days);
+                    }
+                }
+                _ => {
+                    return Err(Error::Internal(format!(
+                        "unsupported DATE type for IN list: {:?}",
+                        column.data_type()
+                    )));
+                }
+            }
+            Ok(builder.finish())
+        }
+        PlanValue::Interval(interval) => {
+            let mut builder = BooleanBuilder::with_capacity(column.len());
+            match column.data_type() {
+                DataType::Interval(IntervalUnit::MonthDayNano) => {
+                    let arr = column
+                        .as_any()
+                        .downcast_ref::<IntervalMonthDayNanoArray>()
+                        .ok_or_else(|| {
+                            Error::Internal(
+                                "failed to downcast to IntervalMonthDayNanoArray".into(),
+                            )
+                        })?;
+                    let expected = *interval;
+                    for i in 0..arr.len() {
+                        if arr.is_null(i) {
+                            builder.append_value(false);
+                        } else {
+                            let candidate = interval_value_from_arrow(arr.value(i));
+                            let matches = compare_interval_values(expected, candidate)
+                                == std::cmp::Ordering::Equal;
+                            builder.append_value(matches);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Error::Internal(format!(
+                        "unsupported INTERVAL type for IN list: {:?}",
+                        column.data_type()
+                    )));
+                }
             }
             Ok(builder.finish())
         }
@@ -9632,6 +10496,68 @@ fn array_value_equals_plan_value(
 
     match literal {
         PlanValue::Null => Ok(array.is_null(row_idx)),
+        PlanValue::Decimal(expected) => match array.data_type() {
+            DataType::Decimal128(precision, scale) => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::Internal("failed to downcast to Decimal128Array".into())
+                    })?;
+                let actual = DecimalValue::new(arr.value(row_idx), *scale).map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "invalid decimal value retrieved from column: {err}"
+                    ))
+                })?;
+                let expected_aligned = align_decimal_to_scale(*expected, *precision, *scale)
+                    .map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "failed to align decimal literal for comparison: {err}"
+                        ))
+                    })?;
+                Ok(actual.raw_value() == expected_aligned.raw_value())
+            }
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                if let Some(int_value) = decimal_exact_i64(*expected) {
+                    array_value_equals_plan_value(array, row_idx, &PlanValue::Integer(int_value))
+                } else {
+                    Ok(false)
+                }
+            }
+            DataType::Float32 | DataType::Float64 => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                array_value_equals_plan_value(array, row_idx, &PlanValue::Float(expected.to_f64()))
+            }
+            DataType::Boolean => {
+                if array.is_null(row_idx) {
+                    return Ok(false);
+                }
+                if let Some(int_value) = decimal_exact_i64(*expected) {
+                    array_value_equals_plan_value(array, row_idx, &PlanValue::Integer(int_value))
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "decimal literal comparison not supported for {:?}",
+                array.data_type()
+            ))),
+        },
         PlanValue::Integer(expected) => match array.data_type() {
             DataType::Int8 => Ok(!array.is_null(row_idx)
                 && array
@@ -9752,6 +10678,41 @@ fn array_value_equals_plan_value(
                 array.data_type()
             ))),
         },
+        PlanValue::Date32(expected) => match array.data_type() {
+            DataType::Date32 => Ok(!array.is_null(row_idx)
+                && array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .expect("date32 array")
+                    .value(row_idx)
+                    == *expected),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "literal date comparison not supported for {:?}",
+                array.data_type()
+            ))),
+        },
+        PlanValue::Interval(expected) => {
+            match array.data_type() {
+                DataType::Interval(IntervalUnit::MonthDayNano) => {
+                    if array.is_null(row_idx) {
+                        Ok(false)
+                    } else {
+                        let value = array
+                            .as_any()
+                            .downcast_ref::<IntervalMonthDayNanoArray>()
+                            .expect("interval array")
+                            .value(row_idx);
+                        let arrow_value = interval_value_from_arrow(value);
+                        Ok(compare_interval_values(*expected, arrow_value)
+                            == std::cmp::Ordering::Equal)
+                    }
+                }
+                _ => Err(Error::InvalidArgumentError(format!(
+                    "literal interval comparison not supported for {:?}",
+                    array.data_type()
+                ))),
+            }
+        }
         PlanValue::Struct(_) => Err(Error::InvalidArgumentError(
             "struct literals are not supported in join filters".into(),
         )),
@@ -11369,9 +12330,9 @@ fn sort_record_batch_with_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::array::{Array, ArrayRef, Date32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use llkv_expr::expr::BinaryOp;
+    use llkv_expr::expr::{BinaryOp, CompareOp};
     use llkv_expr::literal::Literal;
     use llkv_storage::pager::MemPager;
     use std::sync::Arc;
@@ -11420,6 +12381,58 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("int64 addition result");
         assert_eq!(added_array.values(), &[6, 7, 8]);
+    }
+
+    #[test]
+    fn cross_product_filter_handles_date32_columns() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "orders.o_orderdate",
+            DataType::Date32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Date32Array::from(vec![0, 1, 3])) as ArrayRef],
+        )
+        .expect("valid batch");
+
+        let lookup = build_cross_product_column_lookup(schema.as_ref(), &[], &[], &[]);
+        let mut ctx = CrossProductExpressionContext::new(schema.as_ref(), lookup)
+            .expect("context builds from schema");
+
+        let field_id = ctx
+            .schema()
+            .columns
+            .first()
+            .expect("schema exposes date column")
+            .field_id;
+
+        let predicate = LlkvExpr::Compare {
+            left: ScalarExpr::Column(field_id),
+            op: CompareOp::GtEq,
+            right: ScalarExpr::Literal(Literal::Date32(1)),
+        };
+
+        let truths = ctx
+            .evaluate_predicate_truths(&predicate, &batch, &mut |_, _, _, _| Ok(None))
+            .expect("date comparison evaluates");
+
+        assert_eq!(truths, vec![Some(false), Some(true), Some(true)]);
+    }
+
+    #[test]
+    fn group_by_handles_date32_columns() {
+        let array: ArrayRef = Arc::new(Date32Array::from(vec![Some(3), None, Some(-7)]));
+
+        let first = group_key_value(&array, 0).expect("extract first group key");
+        assert_eq!(first, GroupKeyValue::Int(3));
+
+        let second = group_key_value(&array, 1).expect("extract second group key");
+        assert_eq!(second, GroupKeyValue::Null);
+
+        let third = group_key_value(&array, 2).expect("extract third group key");
+        assert_eq!(third, GroupKeyValue::Int(-7));
     }
 
     #[test]

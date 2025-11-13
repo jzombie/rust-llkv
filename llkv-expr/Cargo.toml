@@ -14,4 +14,5 @@ readme = "README.md"
 [dependencies]
 arrow.workspace = true
 arrow-array.workspace = true
+arrow-buffer.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }

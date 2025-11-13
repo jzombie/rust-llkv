@@ -7,9 +7,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field};
+use arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+    IntervalMonthDayNanoArray, StringArray,
+};
+use arrow::datatypes::{DataType, Field, IntervalUnit};
 use arrow::record_batch::RecordBatch;
+use llkv_expr::decimal::DecimalValue;
+use llkv_expr::literal::IntervalValue;
 use llkv_result::{Error, Result as LlkvResult};
 
 use crate::plans::PlanValue;
@@ -21,9 +26,11 @@ pub enum CanonicalScalar {
     Int64(i64),
     Float(u64),
     FloatNaN,
+    Decimal(DecimalValue),
     Utf8(Arc<str>),
     Boolean(bool),
     Date32(i32),
+    Interval(IntervalValue),
 }
 
 impl CanonicalScalar {
@@ -33,7 +40,10 @@ impl CanonicalScalar {
             PlanValue::Null => Ok(CanonicalScalar::Null),
             PlanValue::Integer(v) => Ok(CanonicalScalar::Int64(*v)),
             PlanValue::Float(v) => Ok(Self::from_f64(*v)),
+            PlanValue::Decimal(v) => Ok(CanonicalScalar::Decimal(*v)),
             PlanValue::String(v) => Ok(CanonicalScalar::Utf8(Arc::<str>::from(v.as_str()))),
+            PlanValue::Date32(days) => Ok(CanonicalScalar::Date32(*days)),
+            PlanValue::Interval(interval) => Ok(CanonicalScalar::Interval(*interval)),
             PlanValue::Struct(_) => Err(Error::InvalidArgumentError(
                 "struct values are not supported in canonical scalar conversion".into(),
             )),
@@ -65,6 +75,23 @@ impl CanonicalScalar {
                         )
                     })?;
                 Ok(Self::from_f64(values.value(row_idx)))
+            }
+            DataType::Decimal128(_, scale) => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "expected DECIMAL128 array when building canonical scalar".into(),
+                        )
+                    })?;
+                let raw = values.value(row_idx);
+                let decimal = DecimalValue::new(raw, *scale).map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "failed to build canonical decimal scalar: {err}"
+                    ))
+                })?;
+                Ok(CanonicalScalar::Decimal(decimal))
             }
             DataType::Utf8 => {
                 let values = array
@@ -102,6 +129,28 @@ impl CanonicalScalar {
                 Ok(CanonicalScalar::Date32(values.value(row_idx)))
             }
             DataType::Null => Ok(CanonicalScalar::Null),
+            DataType::Interval(unit) => match unit {
+                IntervalUnit::MonthDayNano => {
+                    let values = array
+                        .as_any()
+                        .downcast_ref::<IntervalMonthDayNanoArray>()
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "expected INTERVAL MonthDayNano array when building canonical scalar"
+                                    .into(),
+                            )
+                        })?;
+                    let raw = values.value(row_idx);
+                    Ok(CanonicalScalar::Interval(IntervalValue::new(
+                        raw.months,
+                        raw.days,
+                        raw.nanoseconds,
+                    )))
+                }
+                other => Err(Error::InvalidArgumentError(format!(
+                    "building canonical scalar is not supported for interval unit {other:?}"
+                ))),
+            },
             other => Err(Error::InvalidArgumentError(format!(
                 "building canonical scalar is not supported for column type {other:?}"
             ))),
