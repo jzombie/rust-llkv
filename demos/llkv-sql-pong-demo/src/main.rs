@@ -1,3 +1,5 @@
+// TODO: If running in development mode, include warning about unoptimized performance.
+
 use std::cell::RefCell;
 use std::io::{Write, stdout};
 use std::sync::{Arc, OnceLock};

@@ -1,3 +1,5 @@
+// TODO: If running in development mode, include warning about unoptimized performance.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::process;
 use std::sync::Arc;
