@@ -10,3 +10,10 @@
 
 - Ideally, we should also track how often the pager is being paged (and subsequently, how often existing chunks are overwritten, etc.) during these large imports to help ease storage thrashing and potential waste due to append-only nature.
 
+- Capture loader timing per stage: break load_table_with_rows into phases (row formatting, FK cache validation, INSERT execution, flush) and emit tracing spans or metrics. If the extra minute sits in SQL planning vs. storage writes, we’ll know.
+
+- Tune hint math based on telemetry: once we see actual chunk sizes and pager churn, adjust ColumnStoreWriteHints::from_config (e.g., reduce recommended_insert_batch_rows only for varwidth-heavy tables, or grow TARGET_CHUNK_BYTES when the pager has headroom) instead of reverting to hard-coded defaults.
+
+- Explore FK cache lifetime: now that batch sizes dropped, we can revisit dropping caches even earlier (per chunk) or parallelizing constraint checks; telemetry will show whether FK validation still dominates.
+
+- Optional follow-up: add a “fast path” for append-only tables with no FK/unique checks—if telemetry says constraint work is negligible, skip this; otherwise, this could reclaim the lost minute without raising memory.
