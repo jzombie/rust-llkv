@@ -21,11 +21,14 @@ use arrow::{
     datatypes::{DataType, TimeUnit},
     record_batch::RecordBatch,
 };
-use chrono::{DateTime, Duration, NaiveDate, Utc};
 use llkv_sql::SqlEngine;
 use rust_decimal::{
     Decimal,
     prelude::{FromPrimitive, ToPrimitive},
+};
+use time::{
+    Date, Duration, Month, OffsetDateTime, format_description::FormatItem,
+    macros::format_description,
 };
 
 use crate::queries::{QueryOptions, RenderedQuery, StatementKind, render_tpch_query};
@@ -33,6 +36,9 @@ use crate::{Result, SchemaPaths, TpchError};
 
 const QUALIFICATION_QUERY_COUNT: u8 = 22;
 const FLOAT_TOLERANCE: f64 = 1e-9;
+const DATE_ONLY_FORMAT: &[FormatItem<'static>] = format_description!("[year]-[month]-[day]");
+const DATETIME_FORMAT: &[FormatItem<'static>] =
+    format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
 
 static COLUMN_KINDS: OnceLock<Vec<Vec<ValueKind>>> = OnceLock::new();
 
@@ -289,10 +295,9 @@ fn extract_string(array: &ArrayRef, row: usize) -> Result<String> {
                 .downcast_ref::<arrow::array::Date64Array>()
                 .ok_or_else(|| TpchError::Parse("expected Date64 array".into()))?
                 .value(row);
-            let dt = DateTime::<Utc>::from_timestamp_millis(millis)
-                .ok_or_else(|| TpchError::Parse("invalid Date64 value".into()))?
-                .naive_utc();
-            Ok(dt.date().format("%Y-%m-%d").to_string())
+            let dt = OffsetDateTime::from_unix_timestamp_nanos(millis as i128 * 1_000_000)
+                .map_err(|_| TpchError::Parse("invalid Date64 value".into()))?;
+            Ok(format_date(dt.date()))
         }
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             let micros = array
@@ -300,10 +305,9 @@ fn extract_string(array: &ArrayRef, row: usize) -> Result<String> {
                 .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
                 .ok_or_else(|| TpchError::Parse("expected TimestampMicrosecond array".into()))?
                 .value(row);
-            let dt = DateTime::<Utc>::from_timestamp_micros(micros)
-                .ok_or_else(|| TpchError::Parse("invalid timestamp".into()))?
-                .naive_utc();
-            Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            let dt = OffsetDateTime::from_unix_timestamp_nanos(micros as i128 * 1_000)
+                .map_err(|_| TpchError::Parse("invalid timestamp".into()))?;
+            Ok(format_datetime(dt))
         }
         // Fallback to string formatting for numeric arrays when they are projected into
         // character columns (should not happen in canonical queries, but keeps the
@@ -506,11 +510,24 @@ fn extract_float(array: &ArrayRef, row: usize) -> Result<f64> {
 }
 
 fn date32_to_string(days: i32) -> String {
-    let base = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
-    base.checked_add_signed(Duration::days(days as i64))
-        .unwrap_or(base)
-        .format("%Y-%m-%d")
-        .to_string()
+    let base = unix_epoch_date();
+    let delta = Duration::days(days as i64);
+    let date = base.checked_add(delta).unwrap_or(base);
+    format_date(date)
+}
+
+fn unix_epoch_date() -> Date {
+    Date::from_calendar_date(1970, Month::January, 1).expect("valid epoch")
+}
+
+fn format_date(date: Date) -> String {
+    date.format(DATE_ONLY_FORMAT)
+        .unwrap_or_else(|_| "1970-01-01".to_string())
+}
+
+fn format_datetime(dt: OffsetDateTime) -> String {
+    dt.format(DATETIME_FORMAT)
+        .unwrap_or_else(|_| "1970-01-01 00:00:00".to_string())
 }
 
 fn format_value(value: &QualificationValue) -> String {

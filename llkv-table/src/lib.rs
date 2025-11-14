@@ -69,7 +69,7 @@ pub use constraints::{
     validate_foreign_key_rows, validate_foreign_keys,
 };
 pub use ddl::CatalogDdl;
-pub use diagnostics::{TablePagerIngestionSample, TablePagerIngestionDiagnostics};
+pub use diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
 pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;

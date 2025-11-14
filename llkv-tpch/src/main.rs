@@ -13,7 +13,7 @@ use llkv::{
     SqlEngine,
     storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, PagerDiagnostics},
 };
-use llkv_table::diagnostics::{TablePagerIngestionSample, TablePagerIngestionDiagnostics};
+use llkv_table::diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
 use llkv_tpch::qualification::{QualificationOptions, QualificationStatus};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
 use llkv_tpch::{

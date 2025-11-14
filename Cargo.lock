@@ -490,9 +490,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "145052bdd345b87320e369255277e3fb5152762ad123a901ef5c262dd38fe8d2"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
- "wasm-bindgen",
  "windows-link 0.2.0",
 ]
 
@@ -1844,7 +1842,6 @@ name = "llkv-tpch"
 version = "0.8.2-alpha"
 dependencies = [
  "arrow",
- "chrono",
  "clap",
  "llkv",
  "llkv-sql",
@@ -1853,6 +1850,7 @@ dependencies = [
  "rust_decimal",
  "sqlparser",
  "thiserror",
+ "time",
  "tpchgen",
  "tracing",
  "tracing-subscriber",
@@ -3010,6 +3008,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91e7d9e3bb61134e77bde20dd4825b97c010155709965fedf0f49bb138e52a9d"
 dependencies = [
  "deranged",
+ "itoa",
  "num-conv",
  "powerfmt",
  "serde",

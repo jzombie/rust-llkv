@@ -77,7 +77,12 @@ impl TablePagerIngestionDiagnostics {
     }
 
     /// Complete a table ingest span and store the resulting diagnostics entry.
-    pub fn finish_table(&self, table: &str, rows: usize, elapsed: Duration) -> TablePagerIngestionSample {
+    pub fn finish_table(
+        &self,
+        table: &str,
+        rows: usize,
+        elapsed: Duration,
+    ) -> TablePagerIngestionSample {
         let start_snapshot = {
             let mut starts = self.table_starts.lock().unwrap();
             starts
