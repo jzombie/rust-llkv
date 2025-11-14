@@ -36,7 +36,7 @@ use llkv_runtime::{
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use llkv_table::resolvers::QualifiedTableName;
-use llkv_table::{CatalogDdl, TriggerEventMeta, TriggerTimingMeta};
+use llkv_table::{CatalogDdl, ConstraintEnforcementMode, TriggerEventMeta, TriggerTimingMeta};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -6941,6 +6941,38 @@ impl SqlEngine {
 
                         Ok(RuntimeStatementResult::NoOp)
                     }
+                    "constraint_enforcement_mode" => {
+                        if values.len() != 1 {
+                            return Err(Error::InvalidArgumentError(
+                                "SET constraint_enforcement_mode expects exactly one value".into(),
+                            ));
+                        }
+
+                        let normalized = match &values[0] {
+                            SqlExpr::Value(value_with_span) => value_with_span
+                                .value
+                                .clone()
+                                .into_string()
+                                .map(|s| s.to_ascii_lowercase()),
+                            SqlExpr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                            _ => None,
+                        };
+
+                        let mode = match normalized.as_deref() {
+                            Some("immediate") => ConstraintEnforcementMode::Immediate,
+                            Some("deferred") => ConstraintEnforcementMode::Deferred,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported value for SET constraint_enforcement_mode: {}",
+                                    values[0]
+                                )));
+                            }
+                        };
+
+                        self.engine.session().set_constraint_enforcement_mode(mode);
+
+                        Ok(RuntimeStatementResult::NoOp)
+                    }
                     "immediate_transaction_mode" => {
                         if values.len() != 1 {
                             return Err(Error::InvalidArgumentError(
@@ -11039,6 +11071,59 @@ mod tests {
             }
         }
         values
+    }
+
+    #[test]
+    fn set_constraint_mode_updates_session() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Immediate
+        );
+
+        engine
+            .execute("SET constraint_enforcement_mode = deferred")
+            .expect("set deferred mode");
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Deferred
+        );
+
+        engine
+            .execute("SET constraint_enforcement_mode = IMMEDIATE")
+            .expect("set immediate mode");
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Immediate
+        );
+    }
+
+    #[test]
+    fn set_constraint_mode_is_session_scoped() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(Arc::clone(&pager));
+        let shared_context = engine.runtime_context();
+        let peer = SqlEngine::with_context(
+            Arc::clone(&shared_context),
+            engine.default_nulls_first_for_tests(),
+        );
+
+        engine
+            .execute("SET constraint_enforcement_mode = deferred")
+            .expect("set deferred mode");
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Deferred
+        );
+        assert_eq!(
+            peer.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Immediate
+        );
     }
 
     #[test]

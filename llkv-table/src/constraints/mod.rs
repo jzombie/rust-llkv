@@ -12,9 +12,9 @@ mod types;
 mod validation;
 
 pub use types::{
-    CheckConstraint, ConstraintExpressionRef, ConstraintId, ConstraintKind, ConstraintRecord,
-    ConstraintState, ForeignKeyAction, ForeignKeyConstraint, PrimaryKeyConstraint,
-    UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
+    CheckConstraint, ConstraintEnforcementMode, ConstraintExpressionRef, ConstraintId,
+    ConstraintKind, ConstraintRecord, ConstraintState, ForeignKeyAction, ForeignKeyConstraint,
+    PrimaryKeyConstraint, UniqueConstraint, decode_constraint_row_id, encode_constraint_row_id,
 };
 
 pub use service::{

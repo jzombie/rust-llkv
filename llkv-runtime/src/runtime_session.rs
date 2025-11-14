@@ -7,7 +7,8 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::types::TableId;
 use llkv_table::{
-    SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation,
+    ConstraintEnforcementMode, SingleColumnIndexDescriptor, canonical_table_name,
+    validate_alter_table_operation,
 };
 
 use crate::{
@@ -132,6 +133,7 @@ pub struct RuntimeSession {
         RuntimeTransactionContext<MemPager>,
     >,
     namespaces: Arc<SessionNamespaces>,
+    constraint_mode: Arc<RwLock<ConstraintEnforcementMode>>,
 }
 
 impl RuntimeSession {
@@ -142,20 +144,74 @@ impl RuntimeSession {
         >,
         namespaces: Arc<SessionNamespaces>,
     ) -> Self {
-        Self { inner, namespaces }
+        let session = Self {
+            inner,
+            namespaces,
+            constraint_mode: Arc::new(RwLock::new(ConstraintEnforcementMode::Immediate)),
+        };
+        session.apply_constraint_mode_to_base(ConstraintEnforcementMode::Immediate);
+        session
     }
 
     /// Clone this session (reuses the same underlying TransactionSession).
     /// This is necessary to maintain transaction state across Engine clones.
     pub(crate) fn clone_session(&self) -> Self {
-        Self {
+        let session = Self {
             inner: self.inner.clone_session(),
             namespaces: self.namespaces.clone(),
-        }
+            constraint_mode: Arc::clone(&self.constraint_mode),
+        };
+        let mode = session.constraint_enforcement_mode();
+        session.apply_constraint_mode_to_base(mode);
+        session
+    }
+
+    fn new_temp_tx_context(
+        &self,
+        context: Arc<RuntimeContext<BoxedPager>>,
+    ) -> RuntimeTransactionContext<BoxedPager> {
+        let tx = RuntimeTransactionContext::new(context);
+        tx.set_constraint_mode(self.constraint_enforcement_mode());
+        tx
     }
 
     pub fn namespace_registry(&self) -> Arc<RwLock<RuntimeStorageNamespaceRegistry>> {
         self.namespaces.registry()
+    }
+
+    fn apply_constraint_mode_to_base(&self, mode: ConstraintEnforcementMode) {
+        self.inner.context().set_constraint_mode(mode);
+    }
+
+    pub fn set_constraint_enforcement_mode(&self, mode: ConstraintEnforcementMode) {
+        let previous = {
+            let mut guard = self
+                .constraint_mode
+                .write()
+                .expect("constraint mode lock poisoned");
+            if *guard == mode {
+                None
+            } else {
+                let old = *guard;
+                *guard = mode;
+                Some(old)
+            }
+        };
+        if let Some(old) = previous {
+            tracing::warn!(
+                "Session constraint enforcement mode changed from {:?} to {:?}",
+                old,
+                mode
+            );
+        }
+        self.apply_constraint_mode_to_base(mode);
+    }
+
+    pub fn constraint_enforcement_mode(&self) -> ConstraintEnforcementMode {
+        *self
+            .constraint_mode
+            .read()
+            .expect("constraint mode lock poisoned")
     }
 
     fn resolve_namespace_for_table(&self, canonical: &str) -> RuntimeNamespaceId {
@@ -187,7 +243,7 @@ impl RuntimeSession {
         };
 
         let temp_context = temp_namespace.context();
-        let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+        let temp_tx_context = self.new_temp_tx_context(temp_context);
         let execution = TransactionContext::execute_select(&temp_tx_context, plan)?;
         let schema = execution.schema();
         let batches = execution.collect()?;
@@ -221,7 +277,9 @@ impl RuntimeSession {
     }
 
     fn base_transaction_context(&self) -> Arc<BaseTxnContext> {
-        Arc::clone(self.inner.context())
+        let ctx = Arc::clone(self.inner.context());
+        ctx.set_constraint_mode(self.constraint_enforcement_mode());
+        ctx
     }
 
     fn with_autocommit_transaction_context<F, T>(&self, f: F) -> Result<T>
@@ -335,6 +393,7 @@ impl RuntimeSession {
         // No data copying occurs at BEGIN - this is pure MVCC.
 
         let staging_wrapper = Arc::new(RuntimeTransactionContext::new(staging_ctx));
+        staging_wrapper.set_constraint_mode(self.constraint_enforcement_mode());
 
         self.inner.begin_transaction(staging_wrapper)?;
         Ok(RuntimeStatementResult::Transaction {
@@ -580,7 +639,7 @@ impl RuntimeSession {
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::insert(&temp_tx_context, plan)? {
                     TransactionResult::Insert { .. } => {}
                     _ => {
@@ -735,7 +794,7 @@ impl RuntimeSession {
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
                 let table_name = plan.table.clone();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::update(&temp_tx_context, plan)? {
                     TransactionResult::Update { rows_updated, .. } => {
                         Ok(RuntimeStatementResult::Update {
@@ -802,7 +861,7 @@ impl RuntimeSession {
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
                 let table_name = plan.table.clone();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::delete(&temp_tx_context, plan)? {
                     TransactionResult::Delete { rows_deleted } => {
                         Ok(RuntimeStatementResult::Delete {
@@ -867,7 +926,7 @@ impl RuntimeSession {
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
                 let table_name = plan.table.clone();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::truncate(&temp_tx_context, plan)? {
                     TransactionResult::Delete { rows_deleted } => {
                         Ok(RuntimeStatementResult::Delete {

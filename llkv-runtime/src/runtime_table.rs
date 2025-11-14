@@ -9,6 +9,7 @@ use llkv_plan::{
 };
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
+use llkv_table::ConstraintEnforcementMode;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{RuntimeContext, RuntimeLazyFrame, RuntimeStatementResult, canonical_table_name};
@@ -406,7 +407,8 @@ where
             on_conflict: InsertConflictAction::None,
         };
         let snapshot = self.context.default_snapshot();
-        self.context.insert(plan, snapshot)
+        self.context
+            .insert(plan, snapshot, ConstraintEnforcementMode::Immediate)
     }
 
     pub fn insert_batches(&self, batches: Vec<RecordBatch>) -> Result<RuntimeStatementResult<P>> {
@@ -417,7 +419,8 @@ where
             on_conflict: InsertConflictAction::None,
         };
         let snapshot = self.context.default_snapshot();
-        self.context.insert(plan, snapshot)
+        self.context
+            .insert(plan, snapshot, ConstraintEnforcementMode::Immediate)
     }
 
     pub fn insert_lazy(&self, frame: RuntimeLazyFrame<P>) -> Result<RuntimeStatementResult<P>> {
