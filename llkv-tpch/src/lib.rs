@@ -610,12 +610,65 @@ pub fn load_tpch_data_with_toolkit(
     toolkit.load_data(engine, schema_name, scale_factor, batch_size)
 }
 
+/// Resolve the loader batch size using column-store write hints.
+///
+/// When `batch_override` is `None`, the column store's recommended insert batch rows
+/// are used. Explicit overrides are clamped to the store's maximum to avoid building
+/// enormous literal INSERT statements that would be split immediately during ingest.
+pub fn resolve_loader_batch_size(engine: &SqlEngine, batch_override: Option<usize>) -> usize {
+    let hints = engine.column_store_write_hints();
+    let requested = batch_override
+        .unwrap_or(hints.recommended_insert_batch_rows)
+        .max(1);
+    let resolved = hints.clamp_insert_batch_rows(requested);
+    if let Some(explicit) = batch_override {
+        if resolved != explicit {
+            tracing::warn!(
+                target: "tpch-loader",
+                requested = explicit,
+                resolved,
+                max = hints.max_insert_batch_rows,
+                "clamped batch size override to column-store limit"
+            );
+        }
+    }
+    resolved
+}
+
 /// Read a text file and wrap IO errors with the target path.
 pub(crate) fn read_file(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|source| TpchError::Io {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llkv::storage::MemPager;
+    use std::sync::Arc;
+
+    #[test]
+    fn resolve_batch_size_defaults_to_hints() {
+        let engine = SqlEngine::new(Arc::new(MemPager::default()));
+        let hints = engine.column_store_write_hints();
+        assert_eq!(
+            resolve_loader_batch_size(&engine, None),
+            hints.recommended_insert_batch_rows
+        );
+    }
+
+    #[test]
+    fn resolve_batch_size_clamps_override() {
+        let engine = SqlEngine::new(Arc::new(MemPager::default()));
+        let hints = engine.column_store_write_hints();
+        let requested = hints.max_insert_batch_rows * 5;
+        assert_eq!(
+            resolve_loader_batch_size(&engine, Some(requested)),
+            hints.max_insert_batch_rows
+        );
+    }
 }
 
 /// Execute a SQL batch against the provided engine, ignoring whitespace-only fragments.

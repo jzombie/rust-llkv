@@ -25,12 +25,13 @@ use llkv_plan::{SubqueryCorrelatedColumnTracker, SubqueryCorrelatedTracker, Tran
 use llkv_result::Error;
 use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
-    CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction, ForeignKeySpec,
-    IndexColumnPlan, InsertConflictAction, InsertPlan, InsertSource, MultiColumnUniqueSpec,
-    OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan,
-    RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult,
-    SelectPlan, SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnStoreWriteHints, CreateIndexPlan,
+    CreateTablePlan, CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction,
+    ForeignKeySpec, IndexColumnPlan, InsertConflictAction, InsertPlan, InsertSource,
+    MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement,
+    PlanValue, ReindexPlan, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
+    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
+    extract_rows_from_range,
 };
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
@@ -542,7 +543,7 @@ impl Clone for SqlEngine {
 #[allow(dead_code)]
 impl SqlEngine {
     /// Instantiate a new SQL engine from an existing context.
-    /// 
+    ///
     /// The `default_nulls_first` parameter controls the default sort order for `NULL` values.
     pub fn with_context(context: Arc<SqlContext>, default_nulls_first: bool) -> Self {
         Self::from_runtime_engine(
@@ -558,6 +559,11 @@ impl SqlEngine {
     /// hook—for example, enabling specialized constraint caches or inspecting catalog state.
     pub fn runtime_context(&self) -> Arc<SqlContext> {
         self.engine.context()
+    }
+
+    /// Fetch write-sizing hints from the underlying column store.
+    pub fn column_store_write_hints(&self) -> ColumnStoreWriteHints {
+        self.runtime_context().column_store_write_hints()
     }
 
     fn from_runtime_engine(
@@ -890,7 +896,6 @@ impl SqlEngine {
         })
         .to_string()
     }
-
 
     /// Toggle literal `INSERT` buffering for the engine.
     ///

@@ -9,7 +9,7 @@ use crate::{
     RuntimeSession, RuntimeStatementResult, RuntimeTableHandle, RuntimeTransactionContext,
     TXN_ID_AUTO_COMMIT, canonical_table_name, is_table_missing_error,
 };
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ColumnStoreWriteHints};
 use llkv_executor::{ExecutorMultiColumnUnique, ExecutorTable};
 use llkv_plan::{
     AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateTableSource, CreateViewPlan,
@@ -255,6 +255,11 @@ where
     /// Return the column store for catalog operations.
     pub fn store(&self) -> &Arc<ColumnStore<P>> {
         &self.store
+    }
+
+    /// Expose storage-level write sizing hints for bulk ingest callers.
+    pub fn column_store_write_hints(&self) -> ColumnStoreWriteHints {
+        self.store.write_hints()
     }
 
     /// Set a fallback context for cross-pager table lookups. The fallback uses BoxedPager

@@ -13,13 +13,20 @@ use llkv_tpch::qualification::{QualificationOptions, QualificationStatus};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
 use llkv_tpch::{
     LoadSummary, SchemaPaths, TableLoadEvent, TpchError, TpchToolkit, install_default_schema,
-    load_tpch_data,
+    load_tpch_data, resolve_loader_batch_size,
 };
 
 const DEFAULT_SCALE_FACTOR: f64 = 0.01;
 
-// TODO: Keep at 10x or is this absurd?
-const DEFAULT_BATCH_SIZE: usize = 65_536 * 10;
+fn parse_batch_size(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid batch size '{value}': {err}"))?;
+    if parsed == 0 {
+        return Err("batch size must be greater than zero".into());
+    }
+    Ok(parsed)
+}
 
 fn main() {
     // Initialize tracing subscriber to respect RUST_LOG environment variable
@@ -75,6 +82,9 @@ struct LoadArgs {
     /// Override a positional parameter, e.g. --param 3=VALUE.
     #[arg(long = "param", value_name = "INDEX=VALUE", value_parser = parse_param)]
     params: Vec<(usize, String)>,
+    /// Override the loader batch size (rows per INSERT statement).
+    #[arg(long = "batch-size", value_name = "ROWS", value_parser = parse_batch_size)]
+    batch_size: Option<usize>,
 }
 
 #[derive(Args, Clone)]
@@ -96,6 +106,9 @@ struct QueryArgs {
     /// Override a positional parameter, e.g. --param 3=VALUE.
     #[arg(long = "param", value_name = "INDEX=VALUE", value_parser = parse_param)]
     params: Vec<(usize, String)>,
+    /// Override the loader batch size (rows per INSERT statement).
+    #[arg(long = "batch-size", value_name = "ROWS", value_parser = parse_batch_size)]
+    batch_size: Option<usize>,
 }
 
 #[derive(Args, Clone)]
@@ -121,6 +134,9 @@ struct QualifyArgs {
     /// Select the bundled qualification dataset scale (ref_data/<scale>).
     #[arg(long = "ref-scale", value_name = "NAME", default_value = "1")]
     ref_scale: String,
+    /// Override the loader batch size (rows per INSERT statement).
+    #[arg(long = "batch-size", value_name = "ROWS", value_parser = parse_batch_size)]
+    batch_size: Option<usize>,
 }
 
 fn run() -> Result<(), TpchError> {
@@ -169,18 +185,19 @@ fn run_install() -> Result<(), TpchError> {
 
 fn run_load_command(args: LoadArgs) -> Result<(), TpchError> {
     let execution = build_query_execution(&args.queries, args.stream, &args.params);
-    run_load_internal(args.scale, execution)
+    run_load_internal(args.scale, execution, args.batch_size)
 }
 
 fn run_query_command(args: QueryArgs) -> Result<(), TpchError> {
     let execution = build_query_execution(&args.queries, args.stream, &args.params)
         .ok_or_else(|| TpchError::Parse("no TPC-H queries provided".to_string()))?;
-    run_load_internal(args.scale, Some(execution))
+    run_load_internal(args.scale, Some(execution), args.batch_size)
 }
 
 fn run_load_internal(
     scale_factor: f64,
     execution: Option<QueryExecution>,
+    batch_override: Option<usize>,
 ) -> Result<(), TpchError> {
     let engine = SqlEngine::new(Arc::new(MemPager::default()));
     let schema = install_default_schema(&engine)?;
@@ -190,12 +207,16 @@ fn run_load_internal(
         schema.schema_name, scale_factor
     );
 
-    let summary = load_tpch_data(
-        &engine,
-        &schema.schema_name,
-        scale_factor,
-        DEFAULT_BATCH_SIZE,
-    )?;
+    let batch_size = resolve_loader_batch_size(&engine, batch_override);
+    tracing::info!(
+        target: "tpch-loader",
+        batch_size,
+        override_rows = ?batch_override,
+        "resolved loader batch size"
+    );
+    println!("  -> Using loader batch size of {batch_size} rows");
+
+    let summary = load_tpch_data(&engine, &schema.schema_name, scale_factor, batch_size)?;
     print_load_summary(&summary);
 
     let query_specs = vec![
@@ -249,11 +270,20 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
         schema.schema_name, args.scale
     );
 
+    let batch_size = resolve_loader_batch_size(&engine, args.batch_size);
+    tracing::info!(
+        target: "tpch-loader",
+        batch_size,
+        override_rows = ?args.batch_size,
+        "resolved loader batch size for qualification"
+    );
+    println!("  -> Using loader batch size of {batch_size} rows");
+
     let summary = toolkit.load_data_with_progress(
         &engine,
         &schema.schema_name,
         args.scale,
-        DEFAULT_BATCH_SIZE,
+        batch_size,
         |event| match event {
             TableLoadEvent::Begin {
                 table,

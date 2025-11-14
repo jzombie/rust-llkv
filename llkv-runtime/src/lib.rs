@@ -57,6 +57,7 @@ pub use runtime_table::{
     row,
 };
 
+pub use llkv_column_map::store::ColumnStoreWriteHints;
 pub use llkv_executor::SelectExecution;
 pub use llkv_plan::{
     AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, CreateIndexPlan,
