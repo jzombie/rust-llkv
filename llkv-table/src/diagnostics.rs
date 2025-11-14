@@ -1,9 +1,11 @@
 //! Table-level pager diagnostics built on top of pager statistics.
 //!
-//! Storage exposes raw pager counters via [`PagerDiagnostics`], but tables sit several
-//! layers above the pager and need to correlate ingest events with those counters.
-//! This module tracks per-table spans so higher-level tools (such as loaders) can
-//! reason about overwrite rates and batch behavior.
+//! - [`llkv_storage::pager::PagerDiagnostics`] captures raw [`IoStatsSnapshot`] values.
+//! - This module wraps that handle so table loaders can bracket ingest work with
+//!   [`TablePagerIngestionDiagnostics::begin_table`] / [`TablePagerIngestionDiagnostics::finish_table`] and receive
+//!   a [`TablePagerIngestionSample`] (table-scoped snapshot delta).
+//! - Consumers format `TablePagerIngestionSample` for reporting, while [`TablePagerIngestionDiagnostics`]
+//!   keeps the mutex bookkeeping out of the application layer.
 
 use llkv_storage::pager::{IoStatsSnapshot, PagerDiagnostics};
 use std::collections::HashMap;
@@ -12,7 +14,7 @@ use std::time::Duration;
 
 /// Captures pager I/O metrics for a single table ingest span.
 #[derive(Clone, Debug)]
-pub struct TablePagerDiagnostic {
+pub struct TablePagerIngestionSample {
     /// Logical table name for the recorded span.
     pub table: String,
     /// Rows written while the table ingest was active.
@@ -23,15 +25,42 @@ pub struct TablePagerDiagnostic {
     pub delta: IoStatsSnapshot,
 }
 
-/// Tracks per-table pager spans over the course of a loader run.
-#[derive(Debug)]
-pub struct TablePagerDiagnostics {
-    pager: Arc<PagerDiagnostics>,
-    table_starts: Mutex<HashMap<String, IoStatsSnapshot>>,
-    completed: Mutex<Vec<TablePagerDiagnostic>>,
+impl TablePagerIngestionSample {
+    /// Overwrite percentage (0-100) derived from [`IoStatsSnapshot::overwrite_put_bytes`].
+    pub fn overwrite_pct(&self) -> f64 {
+        self.delta.overwrite_pct()
+    }
+
+    /// Average physical put operations per batch for this table ingest.
+    pub fn puts_per_batch(&self) -> f64 {
+        self.delta.puts_per_batch()
+    }
+
+    /// Average physical get operations per batch for this table ingest.
+    pub fn gets_per_batch(&self) -> f64 {
+        self.delta.gets_per_batch()
+    }
+
+    /// Fresh bytes written during this ingest converted to mebibytes.
+    pub fn fresh_mib(&self) -> f64 {
+        self.delta.fresh_mib()
+    }
+
+    /// Overwrite bytes written during this ingest converted to mebibytes.
+    pub fn overwrite_mib(&self) -> f64 {
+        self.delta.overwrite_mib()
+    }
 }
 
-impl TablePagerDiagnostics {
+/// Tracks per-table pager spans over the course of a loader run.
+#[derive(Debug)]
+pub struct TablePagerIngestionDiagnostics {
+    pager: Arc<PagerDiagnostics>,
+    table_starts: Mutex<HashMap<String, IoStatsSnapshot>>,
+    completed: Mutex<Vec<TablePagerIngestionSample>>,
+}
+
+impl TablePagerIngestionDiagnostics {
     /// Create diagnostics bound to the provided pager statistics helper.
     pub fn new(pager: Arc<PagerDiagnostics>) -> Self {
         Self {
@@ -48,12 +77,7 @@ impl TablePagerDiagnostics {
     }
 
     /// Complete a table ingest span and store the resulting diagnostics entry.
-    pub fn complete_table(
-        &self,
-        table: &str,
-        rows: usize,
-        elapsed: Duration,
-    ) -> TablePagerDiagnostic {
+    pub fn finish_table(&self, table: &str, rows: usize, elapsed: Duration) -> TablePagerIngestionSample {
         let start_snapshot = {
             let mut starts = self.table_starts.lock().unwrap();
             starts
@@ -61,7 +85,7 @@ impl TablePagerDiagnostics {
                 .unwrap_or_else(|| self.pager.snapshot())
         };
         let delta = self.pager.delta_since(&start_snapshot);
-        let entry = TablePagerDiagnostic {
+        let entry = TablePagerIngestionSample {
             table: table.to_string(),
             rows,
             elapsed,
@@ -72,7 +96,7 @@ impl TablePagerDiagnostics {
     }
 
     /// Inspect the completed per-table diagnostics.
-    pub fn completed_tables(&self) -> Vec<TablePagerDiagnostic> {
+    pub fn completed_tables(&self) -> Vec<TablePagerIngestionSample> {
         self.completed.lock().unwrap().clone()
     }
 

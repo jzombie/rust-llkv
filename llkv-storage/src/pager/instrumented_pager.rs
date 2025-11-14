@@ -117,6 +117,53 @@ impl IoStatsSnapshot {
             unknown_put_bytes: delta!(unknown_put_bytes),
         }
     }
+
+    fn bytes_to_mib(bytes: u64) -> f64 {
+        bytes as f64 / (1024.0 * 1024.0)
+    }
+
+    fn ops_per_batch(ops: u64, batches: u64) -> f64 {
+        if batches == 0 {
+            0.0
+        } else {
+            ops as f64 / batches as f64
+        }
+    }
+
+    /// Fresh-write bytes converted to mebibytes.
+    pub fn fresh_mib(&self) -> f64 {
+        Self::bytes_to_mib(self.fresh_put_bytes)
+    }
+
+    /// Overwrite bytes converted to mebibytes.
+    pub fn overwrite_mib(&self) -> f64 {
+        Self::bytes_to_mib(self.overwritten_put_bytes)
+    }
+
+    /// Unknown-write bytes converted to mebibytes.
+    pub fn unknown_mib(&self) -> f64 {
+        Self::bytes_to_mib(self.unknown_put_bytes)
+    }
+
+    /// Overwrite percentage relative to fresh + overwrite bytes.
+    pub fn overwrite_pct(&self) -> f64 {
+        let total = self.fresh_put_bytes + self.overwritten_put_bytes;
+        if total == 0 {
+            0.0
+        } else {
+            (self.overwritten_put_bytes as f64 / total as f64) * 100.0
+        }
+    }
+
+    /// Average physical put operations per batch.
+    pub fn puts_per_batch(&self) -> f64 {
+        Self::ops_per_batch(self.physical_puts, self.put_batches)
+    }
+
+    /// Average physical get operations per batch.
+    pub fn gets_per_batch(&self) -> f64 {
+        Self::ops_per_batch(self.physical_gets, self.get_batches)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

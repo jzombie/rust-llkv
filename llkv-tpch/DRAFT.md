@@ -3,7 +3,7 @@ Quick profiling:
 ```sh
 cargo build --release -p llkv-tpch             
 samply record --profile-name llkv-tpch -- \
-  target/release/llkv-tpch qualify --scale 1 --ref-scale 1 --query 1
+  target/release/llkv-tpch qualify --scale 1 --ref-scale 1 --query 1 --pager-diagnostics
 ```
 
 -----

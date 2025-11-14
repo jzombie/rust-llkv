@@ -1,3 +1,10 @@
+//! Pager-level diagnostics utilities.
+//!
+//! These helpers live alongside the pager because they only depend on the raw
+//! [`IoStats`] counters and never reference tables or schemas. Downstream crates
+//! clone the [`PagerDiagnostics`] handle to capture snapshots (`IoStatsSnapshot`)
+//! and build whatever reporting they need.
+
 use super::{IoStats, IoStatsSnapshot};
 use std::sync::Arc;
 
