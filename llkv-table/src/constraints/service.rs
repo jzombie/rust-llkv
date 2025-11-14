@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use super::types::ForeignKeyAction;
+use super::types::{ConstraintId, ForeignKeyAction};
 use super::validation::validate_foreign_key_rows;
 use super::validation::{
     ConstraintColumnInfo, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
@@ -108,6 +108,8 @@ where
             return Ok(());
         }
 
+        let mut parent_key_cache: FxHashMap<ConstraintId, FxHashSet<UniqueKey>> =
+            FxHashMap::default();
         let field_lookup = build_field_lookup(schema_field_ids);
         let mut table_to_row_index: Vec<Option<usize>> = vec![None; schema_field_ids.len()];
         for (row_pos, &schema_idx) in column_order.iter().enumerate() {
@@ -128,21 +130,29 @@ where
                 referencing_table_id,
             )?;
 
-            let parent_rows = fetch_parent_rows(ForeignKeyRowFetch {
-                referenced_table_id: detail.referenced_table_id,
-                referenced_table_canonical: &detail.referenced_table_canonical,
-                referenced_field_ids: &detail.referenced_field_ids,
+            if !parent_key_cache.contains_key(&detail.constraint_id) {
+                let parent_rows = fetch_parent_rows(ForeignKeyRowFetch {
+                    referenced_table_id: detail.referenced_table_id,
+                    referenced_table_canonical: &detail.referenced_table_canonical,
+                    referenced_field_ids: &detail.referenced_field_ids,
+                })?;
+
+                let key_set = canonical_parent_keys(detail, parent_rows)?;
+                parent_key_cache.insert(detail.constraint_id, key_set);
+            }
+
+            let parent_keys = parent_key_cache.get(&detail.constraint_id).ok_or_else(|| {
+                Error::Internal("foreign key cache missing populated entry for constraint".into())
             })?;
 
-            let parent_keys = canonical_parent_keys(detail, parent_rows);
-            let candidate_keys = candidate_child_keys(&referencing_positions, rows)?;
+            let candidate_keys = candidate_child_keys(detail, &referencing_positions, rows)?;
 
             validate_foreign_key_rows(
                 detail.constraint_name.as_deref(),
                 &detail.referencing_table_display,
                 &detail.referenced_table_display,
                 &detail.referenced_column_names,
-                &parent_keys,
+                parent_keys,
                 &candidate_keys,
             )?;
         }
@@ -384,7 +394,7 @@ where
                 referenced_field_ids: &detail.referenced_field_ids,
             })?;
 
-            let parent_keys = canonical_parent_keys(&detail, parent_rows);
+            let parent_keys = canonical_parent_keys(&detail, parent_rows)?;
             if parent_keys.is_empty() {
                 continue;
             }
@@ -404,11 +414,11 @@ where
                     continue;
                 }
 
-                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                    continue;
-                }
+                let child_key =
+                    build_composite_unique_key(&values, &detail.referencing_column_names)?;
+                let Some(child_key) = child_key else { continue };
 
-                if parent_keys.iter().all(|key| key != &values) {
+                if !parent_keys.contains(&child_key) {
                     continue;
                 }
 
@@ -496,7 +506,7 @@ where
                 referenced_field_ids: &detail.referenced_field_ids,
             })?;
 
-            let parent_keys = canonical_parent_keys(&detail, parent_rows);
+            let parent_keys = canonical_parent_keys(&detail, parent_rows)?;
             if parent_keys.is_empty() {
                 continue;
             }
@@ -518,12 +528,12 @@ where
                     continue;
                 }
 
-                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                    continue;
-                }
+                let child_key =
+                    build_composite_unique_key(&values, &detail.referencing_column_names)?;
+                let Some(child_key) = child_key else { continue };
 
                 // If a child row references one of the parent keys being updated, fail
-                if parent_keys.iter().any(|key| key == &values) {
+                if parent_keys.contains(&child_key) {
                     let constraint_label =
                         detail.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
                     return Err(Error::ConstraintError(format!(
@@ -709,42 +719,43 @@ fn referencing_row_positions(
 fn canonical_parent_keys(
     detail: &ForeignKeyView,
     parent_rows: Vec<Vec<PlanValue>>,
-) -> Vec<Vec<PlanValue>> {
-    parent_rows
-        .into_iter()
-        .filter(|values| values.len() == detail.referenced_field_ids.len())
-        .filter(|values| !values.iter().any(|value| matches!(value, PlanValue::Null)))
-        .collect()
+) -> LlkvResult<FxHashSet<UniqueKey>> {
+    let mut keys = FxHashSet::default();
+    for values in parent_rows {
+        if values.len() != detail.referenced_field_ids.len() {
+            continue;
+        }
+
+        let key = build_composite_unique_key(&values, &detail.referenced_column_names)?;
+        if let Some(key) = key {
+            keys.insert(key);
+        }
+    }
+
+    Ok(keys)
 }
 
 fn candidate_child_keys(
+    detail: &ForeignKeyView,
     positions: &[usize],
     rows: &[Vec<PlanValue>],
-) -> LlkvResult<Vec<Vec<PlanValue>>> {
+) -> LlkvResult<Vec<UniqueKey>> {
     let mut keys = Vec::new();
 
     for row in rows {
-        let mut key: Vec<PlanValue> = Vec::with_capacity(positions.len());
-        let mut contains_null = false;
+        let mut values: Vec<PlanValue> = Vec::with_capacity(positions.len());
 
         for &row_pos in positions {
             let value = row.get(row_pos).cloned().ok_or_else(|| {
                 Error::InvalidArgumentError("INSERT row is missing a required column value".into())
             })?;
-
-            if matches!(value, PlanValue::Null) {
-                contains_null = true;
-                break;
-            }
-
-            key.push(value);
+            values.push(value);
         }
 
-        if contains_null {
-            continue;
+        let key = build_composite_unique_key(&values, &detail.referencing_column_names)?;
+        if let Some(key) = key {
+            keys.push(key);
         }
-
-        keys.push(key);
     }
 
     Ok(keys)
