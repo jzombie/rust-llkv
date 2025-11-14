@@ -1,19 +1,24 @@
 // TODO: If running in development mode, include warning about unoptimized performance.
 
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::path::PathBuf;
 use std::process;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow::util::pretty::print_batches;
 use clap::{Args, Parser, Subcommand};
-use llkv::{SqlEngine, storage::MemPager};
+use llkv::{
+    SqlEngine,
+    storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager},
+};
 use llkv_tpch::qualification::{QualificationOptions, QualificationStatus};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
 use llkv_tpch::{
     LoadSummary, SchemaPaths, TableLoadEvent, TpchError, TpchToolkit, install_default_schema,
-    load_tpch_data, resolve_loader_batch_size,
+    resolve_loader_batch_size,
 };
 
 const DEFAULT_SCALE_FACTOR: f64 = 0.01;
@@ -26,6 +31,216 @@ fn parse_batch_size(value: &str) -> Result<usize, String> {
         return Err("batch size must be greater than zero".into());
     }
     Ok(parsed)
+}
+
+fn diagnostics_requested(cli_flag: bool) -> bool {
+    if cli_flag {
+        return true;
+    }
+    match env::var("LLKV_TPCH_PAGER_DIAGNOSTICS") {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                true
+            } else {
+                !matches!(normalized.as_str(), "0" | "false" | "off")
+            }
+        }
+        Err(env::VarError::NotPresent) => false,
+        Err(env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                target: "tpch-loader",
+                "LLKV_TPCH_PAGER_DIAGNOSTICS is not valid UTF-8; enabling diagnostics"
+            );
+            true
+        }
+    }
+}
+
+fn build_engine_with_diagnostics(enable: bool) -> (SqlEngine, Option<Arc<IoStats>>) {
+    if enable {
+        let (pager, stats) = InstrumentedPager::new(MemPager::default());
+        (SqlEngine::new(Arc::new(pager)), Some(stats))
+    } else {
+        (SqlEngine::new(Arc::new(MemPager::default())), None)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes == 0 {
+        return "0.00 MiB".to_string();
+    }
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.2} MiB")
+}
+
+struct TableDiagnostic {
+    name: String,
+    rows: usize,
+    elapsed: Duration,
+    delta: IoStatsSnapshot,
+}
+
+struct PagerDiagnostics {
+    stats: Arc<IoStats>,
+    run_start: IoStatsSnapshot,
+    table_starts: Mutex<HashMap<String, IoStatsSnapshot>>,
+    completed: Mutex<Vec<TableDiagnostic>>,
+}
+
+impl PagerDiagnostics {
+    fn new(stats: Arc<IoStats>) -> Self {
+        let run_start = stats.snapshot();
+        Self {
+            stats,
+            run_start,
+            table_starts: Mutex::new(HashMap::new()),
+            completed: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn handle_event(&self, event: &TableLoadEvent) {
+        match event {
+            TableLoadEvent::Begin { table, .. } => {
+                let mut starts = self.table_starts.lock().unwrap();
+                starts.insert((*table).to_string(), self.stats.snapshot());
+            }
+            TableLoadEvent::Complete {
+                table,
+                rows,
+                elapsed,
+            } => {
+                let start = {
+                    let mut starts = self.table_starts.lock().unwrap();
+                    starts
+                        .remove(*table)
+                        .unwrap_or_else(|| self.stats.snapshot())
+                };
+                let end = self.stats.snapshot();
+                let delta = end.delta_since(&start);
+                self.render_table_block(table, *rows, *elapsed, &delta);
+                let mut completed = self.completed.lock().unwrap();
+                completed.push(TableDiagnostic {
+                    name: (*table).to_string(),
+                    rows: *rows,
+                    elapsed: *elapsed,
+                    delta,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn render_table_block(
+        &self,
+        table: &str,
+        rows: usize,
+        elapsed: Duration,
+        delta: &IoStatsSnapshot,
+    ) {
+        let fresh_bytes = format_bytes(delta.fresh_put_bytes);
+        let overwrite_bytes = format_bytes(delta.overwritten_put_bytes);
+        let unknown_bytes = format_bytes(delta.unknown_put_bytes);
+        let total_bytes = delta.fresh_put_bytes + delta.overwritten_put_bytes;
+        let overwrite_pct = if total_bytes == 0 {
+            0.0
+        } else {
+            (delta.overwritten_put_bytes as f64 / total_bytes as f64) * 100.0
+        };
+
+        println!("\n    [pager] {table}");
+        println!(
+            "        Rows {:>10} | Duration {:>6.2}s",
+            rows,
+            elapsed.as_secs_f64()
+        );
+        println!(
+            "        Fresh {:>5} puts ({fresh_bytes}) | Overwrite {:>5} puts ({overwrite_bytes}, {overwrite_pct:>5.1}%)",
+            delta.fresh_puts, delta.overwritten_puts,
+        );
+        if delta.unknown_puts > 0 {
+            println!(
+                "        Unknown {:>3} puts ({unknown_bytes})",
+                delta.unknown_puts
+            );
+        }
+        println!(
+            "        Alloc {:>6} keys ({:>3} batches) | Free {:>6} keys ({:>3} batches) | Put batches {:>3}",
+            delta.physical_allocs,
+            delta.alloc_batches,
+            delta.physical_frees,
+            delta.free_batches,
+            delta.put_batches,
+        );
+    }
+
+    fn print_table_summary(&self) {
+        let completed = self.completed.lock().unwrap();
+        if completed.is_empty() {
+            return;
+        }
+        println!(
+            "\nPager diagnostics summary:\n  {:<10} {:>10} {:>10} {:>14} {:>16} {:>12}",
+            "Table", "Rows", "Seconds", "Fresh MiB", "Overwrite MiB", "Overwrite%"
+        );
+        for entry in completed.iter() {
+            let fresh = bytes_to_mib(entry.delta.fresh_put_bytes);
+            let overwrite = bytes_to_mib(entry.delta.overwritten_put_bytes);
+            let pct = if (fresh + overwrite).abs() < f64::EPSILON {
+                0.0
+            } else {
+                (entry.delta.overwritten_put_bytes as f64
+                    / (entry.delta.fresh_put_bytes + entry.delta.overwritten_put_bytes) as f64)
+                    * 100.0
+            };
+            println!(
+                "  {:<10} {:>10} {:>10.2} {:>14.2} {:>16.2} {:>11.1}%",
+                entry.name,
+                entry.rows,
+                entry.elapsed.as_secs_f64(),
+                fresh,
+                overwrite,
+                pct,
+            );
+        }
+    }
+
+    fn print_totals(&self) {
+        let totals = self.stats.snapshot().delta_since(&self.run_start);
+        let fresh = format_bytes(totals.fresh_put_bytes);
+        let overwrite = format_bytes(totals.overwritten_put_bytes);
+        let pct = if totals.fresh_put_bytes + totals.overwritten_put_bytes == 0 {
+            0.0
+        } else {
+            (totals.overwritten_put_bytes as f64
+                / (totals.fresh_put_bytes + totals.overwritten_put_bytes) as f64)
+                * 100.0
+        };
+        println!("\nPager totals:");
+        println!(
+            "  Fresh puts {:>8} ({fresh}) | Overwrites {:>8} ({overwrite}, {pct:>5.1}%)",
+            totals.fresh_puts, totals.overwritten_puts
+        );
+        if totals.unknown_puts > 0 {
+            let unknown = format_bytes(totals.unknown_put_bytes);
+            println!("  Unknown puts {:>6} ({unknown})", totals.unknown_puts);
+        }
+        println!(
+            "  Alloc keys {:>8} ({:>4} batches) | Free keys {:>8} ({:>4} batches)",
+            totals.physical_allocs,
+            totals.alloc_batches,
+            totals.physical_frees,
+            totals.free_batches,
+        );
+        println!(
+            "  Batch calls -> get {:>6} | put {:>6}",
+            totals.get_batches, totals.put_batches
+        );
+    }
+}
+
+fn bytes_to_mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 fn main() {
@@ -85,6 +300,9 @@ struct LoadArgs {
     /// Override the loader batch size (rows per INSERT statement).
     #[arg(long = "batch-size", value_name = "ROWS", value_parser = parse_batch_size)]
     batch_size: Option<usize>,
+    /// Emit pager overwrite diagnostics during ingest (or set LLKV_TPCH_PAGER_DIAGNOSTICS=1).
+    #[arg(long = "pager-diagnostics")]
+    pager_diagnostics: bool,
 }
 
 #[derive(Args, Clone)]
@@ -109,6 +327,9 @@ struct QueryArgs {
     /// Override the loader batch size (rows per INSERT statement).
     #[arg(long = "batch-size", value_name = "ROWS", value_parser = parse_batch_size)]
     batch_size: Option<usize>,
+    /// Emit pager overwrite diagnostics during ingest (or set LLKV_TPCH_PAGER_DIAGNOSTICS=1).
+    #[arg(long = "pager-diagnostics")]
+    pager_diagnostics: bool,
 }
 
 #[derive(Args, Clone)]
@@ -137,6 +358,9 @@ struct QualifyArgs {
     /// Override the loader batch size (rows per INSERT statement).
     #[arg(long = "batch-size", value_name = "ROWS", value_parser = parse_batch_size)]
     batch_size: Option<usize>,
+    /// Emit pager overwrite diagnostics during ingest (or set LLKV_TPCH_PAGER_DIAGNOSTICS=1).
+    #[arg(long = "pager-diagnostics")]
+    pager_diagnostics: bool,
 }
 
 fn run() -> Result<(), TpchError> {
@@ -185,22 +409,26 @@ fn run_install() -> Result<(), TpchError> {
 
 fn run_load_command(args: LoadArgs) -> Result<(), TpchError> {
     let execution = build_query_execution(&args.queries, args.stream, &args.params);
-    run_load_internal(args.scale, execution, args.batch_size)
+    let diagnostics = diagnostics_requested(args.pager_diagnostics);
+    run_load_internal(args.scale, execution, args.batch_size, diagnostics)
 }
 
 fn run_query_command(args: QueryArgs) -> Result<(), TpchError> {
     let execution = build_query_execution(&args.queries, args.stream, &args.params)
         .ok_or_else(|| TpchError::Parse("no TPC-H queries provided".to_string()))?;
-    run_load_internal(args.scale, Some(execution), args.batch_size)
+    let diagnostics = diagnostics_requested(args.pager_diagnostics);
+    run_load_internal(args.scale, Some(execution), args.batch_size, diagnostics)
 }
 
 fn run_load_internal(
     scale_factor: f64,
     execution: Option<QueryExecution>,
     batch_override: Option<usize>,
+    diagnostics_enabled: bool,
 ) -> Result<(), TpchError> {
-    let engine = SqlEngine::new(Arc::new(MemPager::default()));
-    let schema = install_default_schema(&engine)?;
+    let (engine, stats_handle) = build_engine_with_diagnostics(diagnostics_enabled);
+    let toolkit = TpchToolkit::with_default_paths()?;
+    let schema = toolkit.install(&engine)?;
 
     println!(
         "Installing TPC-H schema '{}' and loading data at scale factor {:.3}",
@@ -216,8 +444,27 @@ fn run_load_internal(
     );
     println!("  -> Using loader batch size of {batch_size} rows");
 
-    let summary = load_tpch_data(&engine, &schema.schema_name, scale_factor, batch_size)?;
+    let diagnostics = stats_handle
+        .as_ref()
+        .map(|stats| Arc::new(PagerDiagnostics::new(Arc::clone(stats))));
+    let diagnostics_hook = diagnostics.clone();
+    let summary = toolkit.load_data_with_progress(
+        &engine,
+        &schema.schema_name,
+        scale_factor,
+        batch_size,
+        |event| {
+            if let Some(diag) = diagnostics_hook.as_ref() {
+                diag.handle_event(&event);
+            }
+        },
+    )?;
     print_load_summary(&summary);
+
+    if let Some(diag) = diagnostics.as_ref() {
+        diag.print_table_summary();
+        diag.print_totals();
+    }
 
     let query_specs = vec![
         (
@@ -262,7 +509,11 @@ fn run_load_internal(
 
 fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     let toolkit = TpchToolkit::with_default_paths()?;
-    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+    let diagnostics_flag = diagnostics_requested(args.pager_diagnostics);
+    let (engine, stats_handle) = build_engine_with_diagnostics(diagnostics_flag);
+    let diagnostics = stats_handle
+        .as_ref()
+        .map(|stats| Arc::new(PagerDiagnostics::new(Arc::clone(stats))));
     let schema = toolkit.install(&engine)?;
 
     println!(
@@ -279,47 +530,57 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     );
     println!("  -> Using loader batch size of {batch_size} rows");
 
+    let diagnostics_hook = diagnostics.clone();
     let summary = toolkit.load_data_with_progress(
         &engine,
         &schema.schema_name,
         args.scale,
         batch_size,
-        |event| match event {
-            TableLoadEvent::Begin {
-                table,
-                estimated_rows,
-            } => {
-                if let Some(rows) = estimated_rows {
-                    println!("  -> Loading {table} (~{rows} rows)...");
-                } else {
-                    println!("  -> Loading {table}...");
+        |event| {
+            if let Some(diag) = diagnostics_hook.as_ref() {
+                diag.handle_event(&event);
+            }
+            match event {
+                TableLoadEvent::Begin {
+                    table,
+                    estimated_rows,
+                } => {
+                    if let Some(rows) = estimated_rows {
+                        println!("  -> Loading {table} (~{rows} rows)...");
+                    } else {
+                        println!("  -> Loading {table}...");
+                    }
                 }
-            }
-            TableLoadEvent::Progress {
-                table,
-                rows,
-                elapsed,
-                since_last,
-            } => {
-                println!(
-                    "     {table}: {rows} rows loaded... (+{:.2}s, total {:.2}s)",
-                    since_last.as_secs_f64(),
-                    elapsed.as_secs_f64()
-                );
-            }
-            TableLoadEvent::Complete {
-                table,
-                rows,
-                elapsed,
-            } => {
-                println!(
-                    "     finished {table} ({rows} rows) in {:.2}s",
-                    elapsed.as_secs_f64()
-                );
+                TableLoadEvent::Progress {
+                    table,
+                    rows,
+                    elapsed,
+                    since_last,
+                } => {
+                    println!(
+                        "     {table}: {rows} rows loaded... (+{:.2}s, total {:.2}s)",
+                        since_last.as_secs_f64(),
+                        elapsed.as_secs_f64()
+                    );
+                }
+                TableLoadEvent::Complete {
+                    table,
+                    rows,
+                    elapsed,
+                } => {
+                    println!(
+                        "     finished {table} ({rows} rows) in {:.2}s",
+                        elapsed.as_secs_f64()
+                    );
+                }
             }
         },
     )?;
     print_load_summary(&summary);
+    if let Some(diag) = diagnostics.as_ref() {
+        diag.print_table_summary();
+        diag.print_totals();
+    }
 
     let mut options = if let Some(dir) = &args.dataset_dir {
         QualificationOptions::new(dir.clone())

@@ -156,7 +156,7 @@ pub mod storage {
     //! This module provides the `Pager` trait and concrete implementations
     //! for both in-memory and persistent storage backends.
 
-    pub use llkv_storage::pager::{MemPager, Pager};
+    pub use llkv_storage::pager::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, Pager};
 
     // SimdRDrivePager is only available when llkv-storage is built with simd-r-drive-support
     #[cfg(feature = "simd-r-drive-support")]
