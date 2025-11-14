@@ -35,6 +35,7 @@ pub mod catalog;
 pub mod constants;
 pub mod constraints;
 pub mod ddl;
+pub mod diagnostics;
 pub mod gather;
 pub mod metadata;
 mod planner;
@@ -68,6 +69,7 @@ pub use constraints::{
     validate_foreign_key_rows, validate_foreign_keys,
 };
 pub use ddl::CatalogDdl;
+pub use diagnostics::{TablePagerDiagnostic, TablePagerDiagnostics};
 pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::CATALOG_TABLE_ID;

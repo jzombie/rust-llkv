@@ -11,6 +11,9 @@ use std::sync::Arc;
 pub mod instrumented_pager;
 pub use instrumented_pager::*;
 
+pub mod diagnostics;
+pub use diagnostics::*;
+
 pub mod mem_pager;
 pub use mem_pager::*;
 

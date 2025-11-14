@@ -1848,6 +1848,7 @@ dependencies = [
  "clap",
  "llkv",
  "llkv-sql",
+ "llkv-table",
  "regex",
  "rust_decimal",
  "sqlparser",

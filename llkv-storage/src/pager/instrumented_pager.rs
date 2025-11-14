@@ -212,9 +212,11 @@ where
             .fetch_add(puts.len() as u64, Ordering::Relaxed);
         self.stats.put_batches.fetch_add(1, Ordering::Relaxed);
         for put in puts {
-            if let BatchPut::Raw { key, bytes } = put {
-                let classification = self.tracker.classify_put(*key);
-                self.stats.record_put(classification, bytes.len());
+            match put {
+                BatchPut::Raw { key, bytes } => {
+                    let classification = self.tracker.classify_put(*key);
+                    self.stats.record_put(classification, bytes.len());
+                }
             }
         }
         self.inner.batch_put(puts)

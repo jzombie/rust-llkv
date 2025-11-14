@@ -12,6 +12,7 @@ arrow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 llkv.workspace = true
+llkv-table.workspace = true
 llkv-sql.workspace = true
 regex.workspace = true
 rust_decimal.workspace = true

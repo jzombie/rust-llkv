@@ -1,19 +1,19 @@
 // TODO: If running in development mode, include warning about unoptimized performance.
 
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::PathBuf;
 use std::process;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::util::pretty::print_batches;
 use clap::{Args, Parser, Subcommand};
 use llkv::{
     SqlEngine,
-    storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager},
+    storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, PagerDiagnostics},
 };
+use llkv_table::diagnostics::{TablePagerDiagnostic, TablePagerDiagnostics};
 use llkv_tpch::qualification::{QualificationOptions, QualificationStatus};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
 use llkv_tpch::{
@@ -74,173 +74,104 @@ fn format_bytes(bytes: u64) -> String {
     format!("{mib:.2} MiB")
 }
 
-struct TableDiagnostic {
-    name: String,
-    rows: usize,
-    elapsed: Duration,
-    delta: IoStatsSnapshot,
-}
-
-struct PagerDiagnostics {
-    stats: Arc<IoStats>,
-    run_start: IoStatsSnapshot,
-    table_starts: Mutex<HashMap<String, IoStatsSnapshot>>,
-    completed: Mutex<Vec<TableDiagnostic>>,
-}
-
-impl PagerDiagnostics {
-    fn new(stats: Arc<IoStats>) -> Self {
-        let run_start = stats.snapshot();
-        Self {
-            stats,
-            run_start,
-            table_starts: Mutex::new(HashMap::new()),
-            completed: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn handle_event(&self, event: &TableLoadEvent) {
-        match event {
-            TableLoadEvent::Begin { table, .. } => {
-                let mut starts = self.table_starts.lock().unwrap();
-                starts.insert((*table).to_string(), self.stats.snapshot());
-            }
-            TableLoadEvent::Complete {
-                table,
-                rows,
-                elapsed,
-            } => {
-                let start = {
-                    let mut starts = self.table_starts.lock().unwrap();
-                    starts
-                        .remove(*table)
-                        .unwrap_or_else(|| self.stats.snapshot())
-                };
-                let end = self.stats.snapshot();
-                let delta = end.delta_since(&start);
-                self.render_table_block(table, *rows, *elapsed, &delta);
-                let mut completed = self.completed.lock().unwrap();
-                completed.push(TableDiagnostic {
-                    name: (*table).to_string(),
-                    rows: *rows,
-                    elapsed: *elapsed,
-                    delta,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    fn render_table_block(
-        &self,
-        table: &str,
-        rows: usize,
-        elapsed: Duration,
-        delta: &IoStatsSnapshot,
-    ) {
-        let fresh_bytes = format_bytes(delta.fresh_put_bytes);
-        let overwrite_bytes = format_bytes(delta.overwritten_put_bytes);
-        let unknown_bytes = format_bytes(delta.unknown_put_bytes);
-        let total_bytes = delta.fresh_put_bytes + delta.overwritten_put_bytes;
-        let overwrite_pct = if total_bytes == 0 {
-            0.0
-        } else {
-            (delta.overwritten_put_bytes as f64 / total_bytes as f64) * 100.0
-        };
-
-        println!("\n    [pager] {table}");
-        println!(
-            "        Rows {:>10} | Duration {:>6.2}s",
-            rows,
-            elapsed.as_secs_f64()
-        );
-        println!(
-            "        Fresh {:>5} puts ({fresh_bytes}) | Overwrite {:>5} puts ({overwrite_bytes}, {overwrite_pct:>5.1}%)",
-            delta.fresh_puts, delta.overwritten_puts,
-        );
-        if delta.unknown_puts > 0 {
-            println!(
-                "        Unknown {:>3} puts ({unknown_bytes})",
-                delta.unknown_puts
-            );
-        }
-        println!(
-            "        Alloc {:>6} keys ({:>3} batches) | Free {:>6} keys ({:>3} batches) | Put batches {:>3}",
-            delta.physical_allocs,
-            delta.alloc_batches,
-            delta.physical_frees,
-            delta.free_batches,
-            delta.put_batches,
-        );
-    }
-
-    fn print_table_summary(&self) {
-        let completed = self.completed.lock().unwrap();
-        if completed.is_empty() {
-            return;
-        }
-        println!(
-            "\nPager diagnostics summary:\n  {:<10} {:>10} {:>10} {:>14} {:>16} {:>12}",
-            "Table", "Rows", "Seconds", "Fresh MiB", "Overwrite MiB", "Overwrite%"
-        );
-        for entry in completed.iter() {
-            let fresh = bytes_to_mib(entry.delta.fresh_put_bytes);
-            let overwrite = bytes_to_mib(entry.delta.overwritten_put_bytes);
-            let pct = if (fresh + overwrite).abs() < f64::EPSILON {
-                0.0
-            } else {
-                (entry.delta.overwritten_put_bytes as f64
-                    / (entry.delta.fresh_put_bytes + entry.delta.overwritten_put_bytes) as f64)
-                    * 100.0
-            };
-            println!(
-                "  {:<10} {:>10} {:>10.2} {:>14.2} {:>16.2} {:>11.1}%",
-                entry.name,
-                entry.rows,
-                entry.elapsed.as_secs_f64(),
-                fresh,
-                overwrite,
-                pct,
-            );
-        }
-    }
-
-    fn print_totals(&self) {
-        let totals = self.stats.snapshot().delta_since(&self.run_start);
-        let fresh = format_bytes(totals.fresh_put_bytes);
-        let overwrite = format_bytes(totals.overwritten_put_bytes);
-        let pct = if totals.fresh_put_bytes + totals.overwritten_put_bytes == 0 {
-            0.0
-        } else {
-            (totals.overwritten_put_bytes as f64
-                / (totals.fresh_put_bytes + totals.overwritten_put_bytes) as f64)
-                * 100.0
-        };
-        println!("\nPager totals:");
-        println!(
-            "  Fresh puts {:>8} ({fresh}) | Overwrites {:>8} ({overwrite}, {pct:>5.1}%)",
-            totals.fresh_puts, totals.overwritten_puts
-        );
-        if totals.unknown_puts > 0 {
-            let unknown = format_bytes(totals.unknown_put_bytes);
-            println!("  Unknown puts {:>6} ({unknown})", totals.unknown_puts);
-        }
-        println!(
-            "  Alloc keys {:>8} ({:>4} batches) | Free keys {:>8} ({:>4} batches)",
-            totals.physical_allocs,
-            totals.alloc_batches,
-            totals.physical_frees,
-            totals.free_batches,
-        );
-        println!(
-            "  Batch calls -> get {:>6} | put {:>6}",
-            totals.get_batches, totals.put_batches
-        );
-    }
-}
-
 fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn render_table_block(entry: &TablePagerDiagnostic) {
+    let fresh_bytes = format_bytes(entry.delta.fresh_put_bytes);
+    let overwrite_bytes = format_bytes(entry.delta.overwritten_put_bytes);
+    let unknown_bytes = format_bytes(entry.delta.unknown_put_bytes);
+    let total_bytes = entry.delta.fresh_put_bytes + entry.delta.overwritten_put_bytes;
+    let overwrite_pct = if total_bytes == 0 {
+        0.0
+    } else {
+        (entry.delta.overwritten_put_bytes as f64 / total_bytes as f64) * 100.0
+    };
+
+    println!("\n    [pager] {}", entry.table);
+    println!(
+        "        Rows {:>10} | Duration {:>6.2}s",
+        entry.rows,
+        entry.elapsed.as_secs_f64()
+    );
+    println!(
+        "        Fresh {:>5} puts ({fresh_bytes}) | Overwrite {:>5} puts ({overwrite_bytes}, {overwrite_pct:>5.1}%)",
+        entry.delta.fresh_puts, entry.delta.overwritten_puts,
+    );
+    if entry.delta.unknown_puts > 0 {
+        println!(
+            "        Unknown {:>3} puts ({unknown_bytes})",
+            entry.delta.unknown_puts
+        );
+    }
+    println!(
+        "        Alloc {:>6} keys ({:>3} batches) | Free {:>6} keys ({:>3} batches) | Put batches {:>3}",
+        entry.delta.physical_allocs,
+        entry.delta.alloc_batches,
+        entry.delta.physical_frees,
+        entry.delta.free_batches,
+        entry.delta.put_batches,
+    );
+}
+
+fn print_table_summary(entries: &[TablePagerDiagnostic]) {
+    if entries.is_empty() {
+        return;
+    }
+    println!(
+        "\nPager diagnostics summary:\n  {:<10} {:>10} {:>10} {:>14} {:>16} {:>12}",
+        "Table", "Rows", "Seconds", "Fresh MiB", "Overwrite MiB", "Overwrite%"
+    );
+    for entry in entries {
+        let fresh = bytes_to_mib(entry.delta.fresh_put_bytes);
+        let overwrite = bytes_to_mib(entry.delta.overwritten_put_bytes);
+        let pct = if (fresh + overwrite).abs() < f64::EPSILON {
+            0.0
+        } else {
+            (entry.delta.overwritten_put_bytes as f64
+                / (entry.delta.fresh_put_bytes + entry.delta.overwritten_put_bytes) as f64)
+                * 100.0
+        };
+        println!(
+            "  {:<10} {:>10} {:>10.2} {:>14.2} {:>16.2} {:>11.1}%",
+            entry.table,
+            entry.rows,
+            entry.elapsed.as_secs_f64(),
+            fresh,
+            overwrite,
+            pct,
+        );
+    }
+}
+
+fn print_pager_totals(totals: &IoStatsSnapshot) {
+    let fresh = format_bytes(totals.fresh_put_bytes);
+    let overwrite = format_bytes(totals.overwritten_put_bytes);
+    let pct = if totals.fresh_put_bytes + totals.overwritten_put_bytes == 0 {
+        0.0
+    } else {
+        (totals.overwritten_put_bytes as f64
+            / (totals.fresh_put_bytes + totals.overwritten_put_bytes) as f64)
+            * 100.0
+    };
+    println!("\nPager totals:");
+    println!(
+        "  Fresh puts {:>8} ({fresh}) | Overwrites {:>8} ({overwrite}, {pct:>5.1}%)",
+        totals.fresh_puts, totals.overwritten_puts
+    );
+    if totals.unknown_puts > 0 {
+        let unknown = format_bytes(totals.unknown_put_bytes);
+        println!("  Unknown puts {:>6} ({unknown})", totals.unknown_puts);
+    }
+    println!(
+        "  Alloc keys {:>8} ({:>4} batches) | Free keys {:>8} ({:>4} batches)",
+        totals.physical_allocs, totals.alloc_batches, totals.physical_frees, totals.free_batches,
+    );
+    println!(
+        "  Batch calls -> get {:>6} | put {:>6}",
+        totals.get_batches, totals.put_batches
+    );
 }
 
 fn main() {
@@ -444,9 +375,10 @@ fn run_load_internal(
     );
     println!("  -> Using loader batch size of {batch_size} rows");
 
-    let diagnostics = stats_handle
-        .as_ref()
-        .map(|stats| Arc::new(PagerDiagnostics::new(Arc::clone(stats))));
+    let diagnostics = stats_handle.as_ref().map(|stats| {
+        let pager = Arc::new(PagerDiagnostics::new(Arc::clone(stats)));
+        Arc::new(TablePagerDiagnostics::new(pager))
+    });
     let diagnostics_hook = diagnostics.clone();
     let summary = toolkit.load_data_with_progress(
         &engine,
@@ -455,15 +387,28 @@ fn run_load_internal(
         batch_size,
         |event| {
             if let Some(diag) = diagnostics_hook.as_ref() {
-                diag.handle_event(&event);
+                match event {
+                    TableLoadEvent::Begin { table, .. } => {
+                        diag.begin_table(table);
+                    }
+                    TableLoadEvent::Complete {
+                        table,
+                        rows,
+                        elapsed,
+                    } => {
+                        let entry = diag.complete_table(table, rows, elapsed);
+                        render_table_block(&entry);
+                    }
+                    _ => {}
+                }
             }
         },
     )?;
     print_load_summary(&summary);
 
     if let Some(diag) = diagnostics.as_ref() {
-        diag.print_table_summary();
-        diag.print_totals();
+        print_table_summary(&diag.completed_tables());
+        print_pager_totals(&diag.totals());
     }
 
     let query_specs = vec![
@@ -511,9 +456,10 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     let toolkit = TpchToolkit::with_default_paths()?;
     let diagnostics_flag = diagnostics_requested(args.pager_diagnostics);
     let (engine, stats_handle) = build_engine_with_diagnostics(diagnostics_flag);
-    let diagnostics = stats_handle
-        .as_ref()
-        .map(|stats| Arc::new(PagerDiagnostics::new(Arc::clone(stats))));
+    let diagnostics = stats_handle.as_ref().map(|stats| {
+        let pager = Arc::new(PagerDiagnostics::new(Arc::clone(stats)));
+        Arc::new(TablePagerDiagnostics::new(pager))
+    });
     let schema = toolkit.install(&engine)?;
 
     println!(
@@ -538,7 +484,18 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
         batch_size,
         |event| {
             if let Some(diag) = diagnostics_hook.as_ref() {
-                diag.handle_event(&event);
+                match event {
+                    TableLoadEvent::Begin { table, .. } => diag.begin_table(table),
+                    TableLoadEvent::Complete {
+                        table,
+                        rows,
+                        elapsed,
+                    } => {
+                        let entry = diag.complete_table(table, rows, elapsed);
+                        render_table_block(&entry);
+                    }
+                    _ => {}
+                }
             }
             match event {
                 TableLoadEvent::Begin {
@@ -578,8 +535,8 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     )?;
     print_load_summary(&summary);
     if let Some(diag) = diagnostics.as_ref() {
-        diag.print_table_summary();
-        diag.print_totals();
+        print_table_summary(&diag.completed_tables());
+        print_pager_totals(&diag.totals());
     }
 
     let mut options = if let Some(dir) = &args.dataset_dir {

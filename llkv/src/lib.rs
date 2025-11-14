@@ -118,7 +118,7 @@
 //!
 //! ```rust
 //! use std::sync::Arc;
-//! use llkv::{SqlEngine, MemPager};
+//! use llkv::{SqlEngine, storage::MemPager};
 //!
 //! let engine = SqlEngine::new(Arc::new(MemPager::default()));
 //! let results = engine.execute("SELECT 42 AS answer").unwrap();
@@ -156,7 +156,9 @@ pub mod storage {
     //! This module provides the `Pager` trait and concrete implementations
     //! for both in-memory and persistent storage backends.
 
-    pub use llkv_storage::pager::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, Pager};
+    pub use llkv_storage::pager::{
+        InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, Pager, PagerDiagnostics,
+    };
 
     // SimdRDrivePager is only available when llkv-storage is built with simd-r-drive-support
     #[cfg(feature = "simd-r-drive-support")]
