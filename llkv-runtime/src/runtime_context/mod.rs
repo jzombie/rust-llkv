@@ -21,8 +21,8 @@ use llkv_table::catalog::TableCatalog;
 use llkv_table::{
     CatalogDdl, CatalogManager, ConstraintService, MetadataManager, MultiColumnUniqueRegistration,
     SingleColumnIndexDescriptor, SingleColumnIndexRegistration, SysCatalog, TableId,
-    TriggerEventMeta, TriggerTimingMeta, ensure_multi_column_unique, ensure_single_column_unique,
-    validate_alter_table_operation,
+    TriggerEventMeta, TriggerTimingMeta, UniqueKey, build_composite_unique_key,
+    ensure_multi_column_unique, ensure_single_column_unique, validate_alter_table_operation,
 };
 use llkv_transaction::{TransactionManager, TransactionSnapshot, TxnId, TxnIdManager};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1012,7 +1012,13 @@ where
             let snapshot = self.default_snapshot();
             let existing_rows =
                 self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
-            ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
+            let mut existing_keys: Vec<UniqueKey> = Vec::with_capacity(existing_rows.len());
+            for values in existing_rows {
+                if let Some(key) = build_composite_unique_key(&values, &column_names)? {
+                    existing_keys.push(key);
+                }
+            }
+            ensure_multi_column_unique(&existing_keys, &[] as &[UniqueKey], &column_names)?;
 
             let executor_entry = ExecutorMultiColumnUnique {
                 index_name: index_name.clone(),

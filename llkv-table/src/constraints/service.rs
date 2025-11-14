@@ -216,16 +216,42 @@ where
             }
 
             let existing_rows = fetch_multi_column_rows(&constraint.field_ids)?;
-            let new_rows = collect_row_sets(rows, &schema_to_row_index, &constraint.schema_indices);
-            ensure_multi_column_unique(&existing_rows, &new_rows, &constraint.column_names)?;
+            let existing_keys =
+                rows_to_unique_keys(existing_rows, &constraint.column_names, NullKeyMode::Skip)?;
+            let new_keys = collect_unique_keys_from_rows(
+                rows,
+                &schema_to_row_index,
+                &constraint.schema_indices,
+                &constraint.column_names,
+                NullKeyMode::Skip,
+            )?;
+            ensure_multi_column_unique(&existing_keys, &new_keys, &constraint.column_names)?;
         }
 
         if let Some(pk) = primary_key
             && !pk.schema_indices.is_empty()
         {
+            let (pk_label, pk_display) = primary_key_context(&pk.column_names);
             let existing_rows = fetch_multi_column_rows(&pk.field_ids)?;
-            let new_rows = collect_row_sets(rows, &schema_to_row_index, &pk.schema_indices);
-            ensure_primary_key(&existing_rows, &new_rows, &pk.column_names)?;
+            let existing_keys = rows_to_unique_keys(
+                existing_rows,
+                &pk.column_names,
+                NullKeyMode::PrimaryKey {
+                    label: pk_label,
+                    display: &pk_display,
+                },
+            )?;
+            let new_keys = collect_unique_keys_from_rows(
+                rows,
+                &schema_to_row_index,
+                &pk.schema_indices,
+                &pk.column_names,
+                NullKeyMode::PrimaryKey {
+                    label: pk_label,
+                    display: &pk_display,
+                },
+            )?;
+            ensure_primary_key(&existing_keys, &new_keys, &pk.column_names)?;
         }
 
         Ok(())
@@ -271,9 +297,27 @@ where
         }
 
         let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
+        let (pk_label, pk_display) = primary_key_context(&primary_key.column_names);
         let existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
-        let new_rows = collect_row_sets(rows, &schema_to_row_index, &primary_key.schema_indices);
-        ensure_primary_key(&existing_rows, &new_rows, &primary_key.column_names)
+        let existing_keys = rows_to_unique_keys(
+            existing_rows,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
+        let new_keys = collect_unique_keys_from_rows(
+            rows,
+            &schema_to_row_index,
+            &primary_key.schema_indices,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
+        ensure_primary_key(&existing_keys, &new_keys, &primary_key.column_names)
     }
 
     /// Validate UPDATE operations that modify primary key columns. Ensures that updated
@@ -302,31 +346,35 @@ where
 
         let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
 
-        let mut existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
-        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-        for row_values in existing_rows.drain(..) {
-            if let Some(key) = build_composite_unique_key(&row_values, &primary_key.column_names)? {
-                existing_keys.insert(key);
-            }
-        }
+        let (pk_label, pk_display) = primary_key_context(&primary_key.column_names);
+        let existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
+        let existing_key_vec = rows_to_unique_keys(
+            existing_rows,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
+        let mut existing_keys: FxHashSet<UniqueKey> = existing_key_vec.into_iter().collect();
 
         for key in original_keys.iter().flatten() {
             existing_keys.remove(key);
         }
 
-        let (pk_label, pk_display) = primary_key_context(&primary_key.column_names);
         let mut new_seen: FxHashSet<UniqueKey> = FxHashSet::default();
-        let new_row_sets =
-            collect_row_sets(rows, &schema_to_row_index, &primary_key.schema_indices);
+        let new_keys = collect_unique_keys_from_rows(
+            rows,
+            &schema_to_row_index,
+            &primary_key.schema_indices,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
 
-        for values in new_row_sets {
-            let key = build_composite_unique_key(&values, &primary_key.column_names)?;
-            let key = key.ok_or_else(|| {
-                Error::ConstraintError(format!(
-                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-                ))
-            })?;
-
+        for key in new_keys {
             if existing_keys.contains(&key) {
                 return Err(Error::ConstraintError(format!(
                     "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
@@ -657,26 +705,75 @@ fn primary_key_context(column_names: &[String]) -> (&'static str, String) {
     }
 }
 
-fn collect_row_sets(
+#[derive(Clone, Copy)]
+enum NullKeyMode<'a> {
+    Skip,
+    PrimaryKey {
+        label: &'static str,
+        display: &'a str,
+    },
+}
+
+fn rows_to_unique_keys<'a>(
+    rows: Vec<Vec<PlanValue>>,
+    column_names: &[String],
+    mode: NullKeyMode<'a>,
+) -> LlkvResult<Vec<UniqueKey>> {
+    let mut keys = Vec::with_capacity(rows.len());
+    for values in rows {
+        push_unique_key(&mut keys, &values, column_names, mode)?;
+    }
+    Ok(keys)
+}
+
+fn collect_unique_keys_from_rows<'a>(
     rows: &[Vec<PlanValue>],
     schema_to_row_index: &[Option<usize>],
     schema_indices: &[usize],
-) -> Vec<Vec<PlanValue>> {
-    rows.iter()
-        .map(|row| {
-            schema_indices
-                .iter()
-                .map(|&schema_idx| {
-                    schema_to_row_index
-                        .get(schema_idx)
-                        .and_then(|opt| {
-                            opt.map(|row_pos| row.get(row_pos).cloned().unwrap_or(PlanValue::Null))
-                        })
-                        .unwrap_or(PlanValue::Null)
-                })
-                .collect()
-        })
-        .collect()
+    column_names: &[String],
+    mode: NullKeyMode<'a>,
+) -> LlkvResult<Vec<UniqueKey>> {
+    if schema_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut keys = Vec::with_capacity(rows.len());
+    let mut buffer = Vec::with_capacity(schema_indices.len());
+    for row in rows {
+        buffer.clear();
+        for &schema_idx in schema_indices {
+            let value = schema_to_row_index
+                .get(schema_idx)
+                .and_then(|opt| *opt)
+                .and_then(|row_pos| row.get(row_pos).cloned())
+                .unwrap_or(PlanValue::Null);
+            buffer.push(value);
+        }
+
+        push_unique_key(&mut keys, &buffer, column_names, mode)?;
+    }
+
+    Ok(keys)
+}
+
+fn push_unique_key<'a>(
+    keys: &mut Vec<UniqueKey>,
+    values: &[PlanValue],
+    column_names: &[String],
+    mode: NullKeyMode<'a>,
+) -> LlkvResult<()> {
+    match build_composite_unique_key(values, column_names)? {
+        Some(key) => {
+            keys.push(key);
+            Ok(())
+        }
+        None => match mode {
+            NullKeyMode::Skip => Ok(()),
+            NullKeyMode::PrimaryKey { label, display } => Err(Error::ConstraintError(format!(
+                "constraint failed: NOT NULL constraint failed for PRIMARY KEY {label} '{display}'"
+            ))),
+        },
+    }
 }
 
 fn referencing_row_positions(
