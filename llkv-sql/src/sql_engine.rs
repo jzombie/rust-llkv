@@ -541,6 +541,25 @@ impl Clone for SqlEngine {
 
 #[allow(dead_code)]
 impl SqlEngine {
+    /// Instantiate a new SQL engine from an existing context.
+    /// 
+    /// The `default_nulls_first` parameter controls the default sort order for `NULL` values.
+    pub fn with_context(context: Arc<SqlContext>, default_nulls_first: bool) -> Self {
+        Self::from_runtime_engine(
+            RuntimeEngine::from_context(context),
+            default_nulls_first,
+            false,
+        )
+    }
+
+    /// Expose the underlying runtime context for advanced callers (bulk loaders, tooling).
+    ///
+    /// This should only be used when the higher-level SQL interface lacks the necessary
+    /// hook—for example, enabling specialized constraint caches or inspecting catalog state.
+    pub fn runtime_context(&self) -> Arc<SqlContext> {
+        self.engine.context()
+    }
+
     fn from_runtime_engine(
         engine: RuntimeEngine,
         default_nulls_first: bool,
@@ -872,17 +891,6 @@ impl SqlEngine {
         .to_string()
     }
 
-    pub(crate) fn context_arc(&self) -> Arc<SqlContext> {
-        self.engine.context()
-    }
-
-    pub fn with_context(context: Arc<SqlContext>, default_nulls_first: bool) -> Self {
-        Self::from_runtime_engine(
-            RuntimeEngine::from_context(context),
-            default_nulls_first,
-            false,
-        )
-    }
 
     /// Toggle literal `INSERT` buffering for the engine.
     ///

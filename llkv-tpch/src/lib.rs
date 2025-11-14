@@ -434,32 +434,43 @@ impl TpchToolkit {
         I: Iterator<Item = String>,
         F: FnMut(usize),
     {
-        let mut batch = Vec::with_capacity(batch_size);
-        let mut row_count = 0usize;
+        let canonical_name = format!("{}.{}", schema_name, table.name).to_ascii_lowercase();
+        let cache_enabled = self.enable_fk_cache_for_table(engine, &canonical_name);
 
-        for line in rows {
-            if line.is_empty() {
-                continue;
-            }
-            let row_sql = self.format_row_values(table, &line)?;
-            batch.push(row_sql);
-            row_count += 1;
-            if batch.len() == batch_size {
-                self.flush_insert(engine, schema_name, table, &batch)?;
-                batch.clear();
-            }
-            if row_count % Self::PROGRESS_REPORT_INTERVAL == 0 {
-                if let Some(callback) = progress.as_mut() {
-                    callback(row_count);
+        let result = (|| -> Result<usize> {
+            let mut batch = Vec::with_capacity(batch_size);
+            let mut row_count = 0usize;
+
+            for line in rows {
+                if line.is_empty() {
+                    continue;
+                }
+                let row_sql = self.format_row_values(table, &line)?;
+                batch.push(row_sql);
+                row_count += 1;
+                if batch.len() == batch_size {
+                    self.flush_insert(engine, schema_name, table, &batch)?;
+                    batch.clear();
+                }
+                if row_count % Self::PROGRESS_REPORT_INTERVAL == 0 {
+                    if let Some(callback) = progress.as_mut() {
+                        callback(row_count);
+                    }
                 }
             }
+
+            if !batch.is_empty() {
+                self.flush_insert(engine, schema_name, table, &batch)?;
+            }
+
+            Ok(row_count)
+        })();
+
+        if cache_enabled {
+            self.clear_fk_cache_for_table(engine, &canonical_name);
         }
 
-        if !batch.is_empty() {
-            self.flush_insert(engine, schema_name, table, &batch)?;
-        }
-
-        Ok(row_count)
+        result
     }
 
     /// Convert a raw delimited line into a parenthesized SQL value tuple.
@@ -505,6 +516,37 @@ impl TpchToolkit {
         sql.push_str(&rows.join(", "));
         sql.push(';');
         run_sql(engine, &sql)
+    }
+
+    fn enable_fk_cache_for_table(&self, engine: &SqlEngine, canonical_name: &str) -> bool {
+        let context = engine.runtime_context();
+        match context.table_catalog().table_id(canonical_name) {
+            Some(table_id) => {
+                context.enable_foreign_key_cache(table_id);
+                true
+            }
+            None => {
+                tracing::warn!(
+                    target: "tpch-loader",
+                    table = canonical_name,
+                    "skipping foreign key cache enable; table id not found"
+                );
+                false
+            }
+        }
+    }
+
+    fn clear_fk_cache_for_table(&self, engine: &SqlEngine, canonical_name: &str) {
+        let context = engine.runtime_context();
+        if let Some(table_id) = context.table_catalog().table_id(canonical_name) {
+            context.clear_foreign_key_cache(table_id);
+        } else {
+            tracing::warn!(
+                target: "tpch-loader",
+                table = canonical_name,
+                "foreign key cache already dropped before cleanup"
+            );
+        }
     }
 }
 

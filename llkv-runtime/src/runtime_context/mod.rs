@@ -489,6 +489,16 @@ where
         Arc::clone(&self.catalog)
     }
 
+    /// Enable caching of parent key sets for the specified referencing table.
+    pub fn enable_foreign_key_cache(&self, table_id: TableId) {
+        self.constraint_service.enable_foreign_key_cache(table_id);
+    }
+
+    /// Clear cached foreign key parent sets for the specified referencing table.
+    pub fn clear_foreign_key_cache(&self, table_id: TableId) {
+        self.constraint_service.clear_foreign_key_cache(table_id);
+    }
+
     /// Access the catalog manager for type registry, view management, and metadata operations.
     pub fn catalog(&self) -> &CatalogManager<P> {
         &self.catalog_service

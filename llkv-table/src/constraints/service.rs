@@ -19,7 +19,7 @@ use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Column metadata required to validate NOT NULL and CHECK constraints during inserts.
 #[derive(Clone, Debug)]
@@ -73,6 +73,8 @@ where
 {
     metadata: Arc<MetadataManager<P>>,
     catalog: Arc<TableCatalog>,
+    fk_parent_caches:
+        Arc<RwLock<FxHashMap<TableId, FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>>>>,
 }
 
 impl<P> ConstraintService<P>
@@ -81,7 +83,30 @@ where
 {
     /// Create a new constraint validation service.
     pub fn new(metadata: Arc<MetadataManager<P>>, catalog: Arc<TableCatalog>) -> Self {
-        Self { metadata, catalog }
+        Self {
+            metadata,
+            catalog,
+            fk_parent_caches: Arc::new(RwLock::new(FxHashMap::default())),
+        }
+    }
+
+    /// Enable parent-key caching for a referencing table during foreign key validation.
+    pub fn enable_foreign_key_cache(&self, referencing_table_id: TableId) {
+        let mut caches = self
+            .fk_parent_caches
+            .write()
+            .expect("foreign key cache poisoned");
+        caches
+            .entry(referencing_table_id)
+            .or_insert_with(FxHashMap::default);
+    }
+
+    /// Clear any cached parent keys associated with the provided referencing table.
+    pub fn clear_foreign_key_cache(&self, referencing_table_id: TableId) {
+        self.fk_parent_caches
+            .write()
+            .expect("foreign key cache poisoned")
+            .remove(&referencing_table_id);
     }
 
     /// Validate that incoming INSERT rows satisfy the table's foreign key constraints.
@@ -108,7 +133,8 @@ where
             return Ok(());
         }
 
-        let mut parent_key_cache: FxHashMap<ConstraintId, FxHashSet<UniqueKey>> =
+        let caching_enabled = self.is_foreign_key_cache_enabled(referencing_table_id);
+        let mut parent_key_cache: FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>> =
             FxHashMap::default();
         let field_lookup = build_field_lookup(schema_field_ids);
         let mut table_to_row_index: Vec<Option<usize>> = vec![None; schema_field_ids.len()];
@@ -130,20 +156,13 @@ where
                 referencing_table_id,
             )?;
 
-            if !parent_key_cache.contains_key(&detail.constraint_id) {
-                let parent_rows = fetch_parent_rows(ForeignKeyRowFetch {
-                    referenced_table_id: detail.referenced_table_id,
-                    referenced_table_canonical: &detail.referenced_table_canonical,
-                    referenced_field_ids: &detail.referenced_field_ids,
-                })?;
-
-                let key_set = canonical_parent_keys(detail, parent_rows)?;
-                parent_key_cache.insert(detail.constraint_id, key_set);
-            }
-
-            let parent_keys = parent_key_cache.get(&detail.constraint_id).ok_or_else(|| {
-                Error::Internal("foreign key cache missing populated entry for constraint".into())
-            })?;
+            let parent_keys = self.resolve_parent_keys(
+                referencing_table_id,
+                detail,
+                caching_enabled,
+                &mut parent_key_cache,
+                &mut fetch_parent_rows,
+            )?;
 
             let candidate_keys = candidate_child_keys(detail, &referencing_positions, rows)?;
 
@@ -152,7 +171,7 @@ where
                 &detail.referencing_table_display,
                 &detail.referenced_table_display,
                 &detail.referenced_column_names,
-                parent_keys,
+                parent_keys.as_ref(),
                 &candidate_keys,
             )?;
         }
@@ -630,6 +649,81 @@ where
         }
 
         Ok(details_out)
+    }
+
+    fn is_foreign_key_cache_enabled(&self, table_id: TableId) -> bool {
+        self.fk_parent_caches
+            .read()
+            .expect("foreign key cache poisoned")
+            .contains_key(&table_id)
+    }
+
+    fn cached_parent_keys(
+        &self,
+        table_id: TableId,
+        constraint_id: ConstraintId,
+    ) -> Option<Arc<FxHashSet<UniqueKey>>> {
+        self.fk_parent_caches
+            .read()
+            .expect("foreign key cache poisoned")
+            .get(&table_id)
+            .and_then(|cache| cache.get(&constraint_id).map(Arc::clone))
+    }
+
+    fn store_cached_parent_keys(
+        &self,
+        table_id: TableId,
+        constraint_id: ConstraintId,
+        keys: FxHashSet<UniqueKey>,
+    ) -> Arc<FxHashSet<UniqueKey>> {
+        let mut caches = self
+            .fk_parent_caches
+            .write()
+            .expect("foreign key cache poisoned");
+        let Some(entry) = caches.get_mut(&table_id) else {
+            return Arc::new(keys);
+        };
+
+        let arc_keys = Arc::new(keys);
+        entry.insert(constraint_id, Arc::clone(&arc_keys));
+        arc_keys
+    }
+
+    fn resolve_parent_keys<F>(
+        &self,
+        referencing_table_id: TableId,
+        detail: &ForeignKeyView,
+        caching_enabled: bool,
+        local_cache: &mut FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>,
+        fetch_parent_rows: &mut F,
+    ) -> LlkvResult<Arc<FxHashSet<UniqueKey>>>
+    where
+        F: FnMut(ForeignKeyRowFetch<'_>) -> LlkvResult<Vec<Vec<PlanValue>>>,
+    {
+        if caching_enabled {
+            if let Some(keys) = self.cached_parent_keys(referencing_table_id, detail.constraint_id)
+            {
+                return Ok(keys);
+            }
+        } else if let Some(keys) = local_cache.get(&detail.constraint_id) {
+            return Ok(Arc::clone(keys));
+        }
+
+        let parent_rows = fetch_parent_rows(ForeignKeyRowFetch {
+            referenced_table_id: detail.referenced_table_id,
+            referenced_table_canonical: &detail.referenced_table_canonical,
+            referenced_field_ids: &detail.referenced_field_ids,
+        })?;
+
+        let key_set = canonical_parent_keys(detail, parent_rows)?;
+
+        if caching_enabled {
+            Ok(self.store_cached_parent_keys(referencing_table_id, detail.constraint_id, key_set))
+        } else {
+            let arc_keys = Arc::new(key_set);
+            local_cache.insert(detail.constraint_id, Arc::clone(&arc_keys));
+            Ok(arc_keys)
+        }
     }
 }
 
