@@ -10,6 +10,7 @@ use llkv_sql::{
     SqlEngine, canonical_table_ident, normalize_table_constraint,
     order_create_tables_by_foreign_keys, tpch::strip_tpch_connect_statements,
 };
+use llkv_table::ConstraintEnforcementMode;
 use regex::Regex;
 use sqlparser::ast::{
     AlterTableOperation, CreateTable, DataType, Ident, ObjectNamePart, Statement, TableConstraint,
@@ -257,93 +258,107 @@ impl TpchToolkit {
                 "batch size must be greater than zero".into(),
             ));
         }
-
-        let mut tables = Vec::with_capacity(8);
-
-        macro_rules! load_table_with_progress {
-            ($collection:ident, $table_name:literal, $iter:expr) => {{
-                let expected = self.table_schema($table_name)?.info.base_rows;
-                on_progress(TableLoadEvent::Begin {
-                    table: $table_name,
-                    estimated_rows: Some(estimate_rows(expected, scale_factor)),
-                });
-                let started = Instant::now();
-                let mut last_report = started;
-                let summary = {
-                    let iter = $iter;
-                    let rows = iter.map(|row| row.to_string());
-                    let mut forward = |rows_loaded: usize| {
-                        let now = Instant::now();
-                        let elapsed = now.duration_since(started);
-                        let since_last = now.duration_since(last_report);
-                        last_report = now;
-                        on_progress(TableLoadEvent::Progress {
-                            table: $table_name,
-                            rows: rows_loaded,
-                            elapsed,
-                            since_last,
-                        });
-                    };
-                    self.load_table_with_rows(
-                        engine,
-                        schema_name,
-                        $table_name,
-                        rows,
-                        batch_size,
-                        Some(&mut forward),
-                    )?
-                };
-                on_progress(TableLoadEvent::Complete {
-                    table: $table_name,
-                    rows: summary.rows,
-                    elapsed: started.elapsed(),
-                });
-                $collection.push(summary);
-            }};
+        let session = engine.session();
+        let previous_mode = session.constraint_enforcement_mode();
+        let changed_mode = previous_mode != ConstraintEnforcementMode::Deferred;
+        if changed_mode {
+            session.set_constraint_enforcement_mode(ConstraintEnforcementMode::Deferred);
         }
 
-        load_table_with_progress!(
-            tables,
-            "REGION",
-            RegionGenerator::new(scale_factor, 1, 1).iter()
-        );
-        load_table_with_progress!(
-            tables,
-            "NATION",
-            NationGenerator::new(scale_factor, 1, 1).iter()
-        );
-        load_table_with_progress!(
-            tables,
-            "SUPPLIER",
-            SupplierGenerator::new(scale_factor, 1, 1).iter()
-        );
-        load_table_with_progress!(
-            tables,
-            "CUSTOMER",
-            CustomerGenerator::new(scale_factor, 1, 1).iter()
-        );
-        load_table_with_progress!(
-            tables,
-            "PART",
-            PartGenerator::new(scale_factor, 1, 1).iter()
-        );
-        load_table_with_progress!(
-            tables,
-            "PARTSUPP",
-            PartSuppGenerator::new(scale_factor, 1, 1).iter()
-        );
-        load_table_with_progress!(
-            tables,
-            "ORDERS",
-            OrderGenerator::new(scale_factor, 1, 1).iter()
-        );
-        load_table_with_progress!(
-            tables,
-            "LINEITEM",
-            LineItemGenerator::new(scale_factor, 1, 1).iter()
-        );
+        let result = (|| -> Result<LoadSummary> {
+            let mut tables = Vec::with_capacity(8);
 
-        Ok(LoadSummary { tables })
+            macro_rules! load_table_with_progress {
+                ($collection:ident, $table_name:literal, $iter:expr) => {{
+                    let expected = self.table_schema($table_name)?.info.base_rows;
+                    on_progress(TableLoadEvent::Begin {
+                        table: $table_name,
+                        estimated_rows: Some(estimate_rows(expected, scale_factor)),
+                    });
+                    let started = Instant::now();
+                    let mut last_report = started;
+                    let summary = {
+                        let iter = $iter;
+                        let rows = iter.map(|row| row.to_string());
+                        let mut forward = |rows_loaded: usize| {
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(started);
+                            let since_last = now.duration_since(last_report);
+                            last_report = now;
+                            on_progress(TableLoadEvent::Progress {
+                                table: $table_name,
+                                rows: rows_loaded,
+                                elapsed,
+                                since_last,
+                            });
+                        };
+                        self.load_table_with_rows(
+                            engine,
+                            schema_name,
+                            $table_name,
+                            rows,
+                            batch_size,
+                            Some(&mut forward),
+                        )?
+                    };
+                    on_progress(TableLoadEvent::Complete {
+                        table: $table_name,
+                        rows: summary.rows,
+                        elapsed: started.elapsed(),
+                    });
+                    $collection.push(summary);
+                }};
+            }
+
+            load_table_with_progress!(
+                tables,
+                "REGION",
+                RegionGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
+                "NATION",
+                NationGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
+                "SUPPLIER",
+                SupplierGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
+                "CUSTOMER",
+                CustomerGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
+                "PART",
+                PartGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
+                "PARTSUPP",
+                PartSuppGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
+                "ORDERS",
+                OrderGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
+                "LINEITEM",
+                LineItemGenerator::new(scale_factor, 1, 1).iter()
+            );
+
+            Ok(LoadSummary { tables })
+        })();
+
+        if changed_mode {
+            session.set_constraint_enforcement_mode(previous_mode);
+        }
+
+        result
     }
 
     /// Execute a TPC-H qualification run using the provided answer set configuration.
