@@ -17,7 +17,9 @@ use llkv_tpch::{
 };
 
 const DEFAULT_SCALE_FACTOR: f64 = 0.01;
-const DEFAULT_BATCH_SIZE: usize = 65_536;
+
+// TODO: Keep at 10x or is this absurd?
+const DEFAULT_BATCH_SIZE: usize = 65_536 * 10;
 
 fn main() {
     // Initialize tracing subscriber to respect RUST_LOG environment variable
