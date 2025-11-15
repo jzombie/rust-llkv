@@ -1127,6 +1127,7 @@ fn parse_decimal_literal(raw: &str, target_scale: i8, column_name: &str) -> Resu
     }
 }
 
+// TODO: This should be refactored and centralized.
 fn classify_value_kind(
     table_name: &str,
     column_name: &str,
