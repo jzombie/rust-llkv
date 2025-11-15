@@ -9,14 +9,14 @@ use llkv::Error as LlkvError;
 use llkv_expr::decimal::DecimalValue;
 use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue, parse_date32_literal};
 use llkv_sql::{
-    SqlEngine, canonical_table_ident, normalize_table_constraint,
-    order_create_tables_by_foreign_keys, tpch::strip_tpch_connect_statements,
+    SqlEngine, SqlTypeFamily, canonical_table_ident, classify_sql_data_type,
+    normalize_table_constraint, order_create_tables_by_foreign_keys,
+    tpch::strip_tpch_connect_statements,
 };
 use llkv_table::ConstraintEnforcementMode;
 use regex::Regex;
 use sqlparser::ast::{
-    AlterTableOperation, CreateTable, DataType, ExactNumberInfo, Ident, ObjectNamePart, Statement,
-    TableConstraint,
+    AlterTableOperation, CreateTable, Ident, ObjectNamePart, Statement, TableConstraint,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -1010,7 +1010,24 @@ fn build_columns(table_name: &str, table: &CreateTable) -> Result<Vec<TableColum
     let mut columns = Vec::with_capacity(table.columns.len());
     for column_def in &table.columns {
         let name = column_def.name.value.clone();
-        let value_kind = classify_value_kind(table_name, &name, &column_def.data_type)?;
+        let family = classify_sql_data_type(&column_def.data_type).map_err(|err| {
+            TpchError::Parse(format!(
+                "unsupported SQL type for column {}.{}: {}",
+                table_name, name, err
+            ))
+        })?;
+        let value_kind = match family {
+            SqlTypeFamily::String => ColumnValueKind::String,
+            SqlTypeFamily::Integer => ColumnValueKind::Integer,
+            SqlTypeFamily::Decimal { scale } => ColumnValueKind::Decimal { scale },
+            SqlTypeFamily::Date32 => ColumnValueKind::Date32,
+            SqlTypeFamily::Binary => {
+                return Err(TpchError::Parse(format!(
+                    "column {}.{} uses a binary type that the TPCH loader cannot parse",
+                    table_name, name
+                )));
+            }
+        };
         columns.push(TableColumn { name, value_kind });
     }
 
@@ -1125,105 +1142,4 @@ fn parse_decimal_literal(raw: &str, target_scale: i8, column_name: &str) -> Resu
             ))
         })
     }
-}
-
-// TODO: This should be refactored and centralized.
-fn classify_value_kind(
-    table_name: &str,
-    column_name: &str,
-    data_type: &DataType,
-) -> Result<ColumnValueKind> {
-    let kind = match data_type {
-        DataType::Character(_)
-        | DataType::Char(_)
-        | DataType::CharacterVarying(_)
-        | DataType::CharVarying(_)
-        | DataType::Varchar(_)
-        | DataType::Nvarchar(_)
-        | DataType::CharacterLargeObject(_)
-        | DataType::CharLargeObject(_)
-        | DataType::Clob(_)
-        | DataType::Text
-        | DataType::String(_)
-        | DataType::Uuid
-        | DataType::Binary(_)
-        | DataType::Varbinary(_)
-        | DataType::Blob(_)
-        | DataType::TinyBlob
-        | DataType::MediumBlob
-        | DataType::LongBlob
-        | DataType::Bytes(_)
-        | DataType::JSON
-        | DataType::JSONB => ColumnValueKind::String,
-        DataType::Date | DataType::Date32 => ColumnValueKind::Date32,
-        DataType::Decimal(info)
-        | DataType::DecimalUnsigned(info)
-        | DataType::Numeric(info)
-        | DataType::Dec(info)
-        | DataType::DecUnsigned(info)
-        | DataType::BigDecimal(info)
-        | DataType::BigNumeric(info) => ColumnValueKind::Decimal {
-            scale: decimal_scale(info, table_name, column_name)?,
-        },
-        DataType::TinyInt(_)
-        | DataType::TinyIntUnsigned(_)
-        | DataType::UTinyInt
-        | DataType::Int2(_)
-        | DataType::Int2Unsigned(_)
-        | DataType::SmallInt(_)
-        | DataType::SmallIntUnsigned(_)
-        | DataType::USmallInt
-        | DataType::MediumInt(_)
-        | DataType::MediumIntUnsigned(_)
-        | DataType::Int(_)
-        | DataType::Int4(_)
-        | DataType::Int8(_)
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Int128
-        | DataType::Int256
-        | DataType::Integer(_)
-        | DataType::IntUnsigned(_)
-        | DataType::Int4Unsigned(_)
-        | DataType::IntegerUnsigned(_)
-        | DataType::HugeInt
-        | DataType::UHugeInt
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::UInt128
-        | DataType::UInt256
-        | DataType::BigInt(_)
-        | DataType::BigIntUnsigned(_)
-        | DataType::UBigInt
-        | DataType::Int8Unsigned(_)
-        | DataType::Signed
-        | DataType::SignedInteger
-        | DataType::Unsigned
-        | DataType::UnsignedInteger => ColumnValueKind::Integer,
-        other => {
-            return Err(TpchError::Parse(format!(
-                "unsupported data type '{}' for column {}.{}",
-                other, table_name, column_name
-            )));
-        }
-    };
-
-    Ok(kind)
-}
-
-fn decimal_scale(info: &ExactNumberInfo, table_name: &str, column_name: &str) -> Result<i8> {
-    let raw_scale = match info {
-        ExactNumberInfo::None | ExactNumberInfo::Precision(_) => 0,
-        ExactNumberInfo::PrecisionAndScale(_, scale) => *scale,
-    };
-    if !(i64::from(i8::MIN)..=i64::from(i8::MAX)).contains(&raw_scale) {
-        return Err(TpchError::Parse(format!(
-            "scale {} for column {}.{} exceeds i8 range",
-            raw_scale, table_name, column_name
-        )));
-    }
-    Ok(raw_scale as i8)
 }

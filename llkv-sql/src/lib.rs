@@ -36,6 +36,8 @@ pub use sql_engine::{
 
 pub mod tpch;
 
+pub mod sql_types;
+
 mod interval;
 
 mod sql_value;
@@ -45,6 +47,8 @@ mod ddl_utils;
 pub use ddl_utils::{
     canonical_table_ident, normalize_table_constraint, order_create_tables_by_foreign_keys,
 };
+
+pub use sql_types::{SqlTypeFamily, classify_sql_data_type};
 
 pub use llkv_runtime::{RuntimeStatementResult, SelectExecution};
 pub use llkv_transaction::TransactionKind;
