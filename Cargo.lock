@@ -1844,6 +1844,8 @@ dependencies = [
  "arrow",
  "clap",
  "llkv",
+ "llkv-expr",
+ "llkv-plan",
  "llkv-sql",
  "llkv-table",
  "regex",

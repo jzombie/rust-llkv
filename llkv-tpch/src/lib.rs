@@ -6,6 +6,8 @@
 //! unmodified while still producing a structured manifest the caller can inspect.
 
 use llkv::Error as LlkvError;
+use llkv_expr::decimal::DecimalValue;
+use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue, parse_date32_literal};
 use llkv_sql::{
     SqlEngine, canonical_table_ident, normalize_table_constraint,
     order_create_tables_by_foreign_keys, tpch::strip_tpch_connect_statements,
@@ -13,7 +15,8 @@ use llkv_sql::{
 use llkv_table::ConstraintEnforcementMode;
 use regex::Regex;
 use sqlparser::ast::{
-    AlterTableOperation, CreateTable, DataType, Ident, ObjectNamePart, Statement, TableConstraint,
+    AlterTableOperation, CreateTable, DataType, ExactNumberInfo, Ident, ObjectNamePart, Statement,
+    TableConstraint,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -131,13 +134,21 @@ struct TableSchema {
     create_table: CreateTable,
     info: TpchTableInfo,
     columns: Vec<TableColumn>,
-    column_list_sql: String,
+    column_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct TableColumn {
     name: String,
-    requires_quotes: bool,
+    value_kind: ColumnValueKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnValueKind {
+    String,
+    Integer,
+    Decimal { scale: i8 },
+    Date32,
 }
 
 impl TpchToolkit {
@@ -167,11 +178,7 @@ impl TpchToolkit {
             })?;
 
             let columns = build_columns(&table_name, &table)?;
-            let column_list_sql = columns
-                .iter()
-                .map(|col| col.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let column_names = columns.iter().map(|column| column.name.clone()).collect();
 
             let info = build_table_info(&table_name, &raw_tables);
 
@@ -180,7 +187,7 @@ impl TpchToolkit {
                 create_table: table,
                 info,
                 columns,
-                column_list_sql,
+                column_names,
             };
 
             if tables_by_name.insert(table_name.clone(), schema).is_some() {
@@ -453,15 +460,15 @@ impl TpchToolkit {
         let cache_enabled = self.enable_fk_cache_for_table(engine, &canonical_name);
 
         let result = (|| -> Result<usize> {
-            let mut batch = Vec::with_capacity(batch_size);
+            let mut batch: Vec<Vec<PlanValue>> = Vec::with_capacity(batch_size);
             let mut row_count = 0usize;
 
             for line in rows {
                 if line.is_empty() {
                     continue;
                 }
-                let row_sql = self.format_row_values(table, &line)?;
-                batch.push(row_sql);
+                let row_values = self.parse_row_values(table, &line)?;
+                batch.push(row_values);
                 row_count += 1;
                 if batch.len() == batch_size {
                     self.flush_insert(engine, schema_name, table, &batch)?;
@@ -488,12 +495,12 @@ impl TpchToolkit {
         result
     }
 
-    /// Convert a raw delimited line into a parenthesized SQL value tuple.
+    /// Convert a raw delimited line into a typed value vector aligned with the table schema.
     ///
     /// # Errors
     ///
     /// Returns [`TpchError::Parse`] when the column count does not match the table schema.
-    fn format_row_values(&self, table: &TableSchema, line: &str) -> Result<String> {
+    fn parse_row_values(&self, table: &TableSchema, line: &str) -> Result<Vec<PlanValue>> {
         let raw_fields: Vec<&str> = line.trim_end_matches('|').split('|').collect();
         if raw_fields.len() != table.columns.len() {
             return Err(TpchError::Parse(format!(
@@ -504,33 +511,35 @@ impl TpchToolkit {
             )));
         }
 
-        let formatted_values: Vec<String> = raw_fields
+        raw_fields
             .iter()
             .zip(table.columns.iter())
-            .map(|(raw, column)| format_value(column, raw))
-            .collect();
-
-        Ok(format!("({})", formatted_values.join(", ")))
+            .map(|(raw, column)| parse_column_value(column, raw))
+            .collect()
     }
 
-    /// Execute a batched INSERT for pre-formatted row values.
+    /// Execute a batched INSERT using prepared plan rows.
     fn flush_insert(
         &self,
         engine: &SqlEngine,
         schema_name: &str,
         table: &TableSchema,
-        rows: &[String],
+        rows: &[Vec<PlanValue>],
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut sql = format!(
-            "INSERT INTO {}.{} ({}) VALUES ",
-            schema_name, table.name, table.column_list_sql
-        );
-        sql.push_str(&rows.join(", "));
-        sql.push(';');
-        run_sql(engine, &sql)
+        let plan = InsertPlan {
+            table: format!("{}.{}", schema_name, table.name),
+            columns: table.column_names.clone(),
+            source: InsertSource::Rows(rows.to_vec()),
+            on_conflict: InsertConflictAction::None,
+        };
+        engine
+            .session()
+            .execute_insert_plan(plan)
+            .map(|_| ())
+            .map_err(TpchError::Sql)
     }
 
     fn enable_fk_cache_for_table(&self, engine: &SqlEngine, canonical_name: &str) -> bool {
@@ -983,10 +992,9 @@ fn estimate_rows(base_rows: u64, scale_factor: f64) -> usize {
 
 /// Derive ordered column metadata from a parsed `CREATE TABLE` statement.
 ///
-/// The returned list mirrors the definition order and marks columns that need
-/// quoting when we render load batches by delegating to
-/// [`column_requires_quotes`]. This keeps value formatting aligned with the
-/// upstream schema so bulk inserts can stream rows without additional lookups.
+/// The returned list mirrors the definition order and records how each column
+/// should be converted into a [`PlanValue`] so bulk inserts can stream typed
+/// rows directly into prepared plans.
 ///
 /// # Errors
 ///
@@ -1002,44 +1010,11 @@ fn build_columns(table_name: &str, table: &CreateTable) -> Result<Vec<TableColum
     let mut columns = Vec::with_capacity(table.columns.len());
     for column_def in &table.columns {
         let name = column_def.name.value.clone();
-        let requires_quotes = column_requires_quotes(&column_def.data_type);
-        columns.push(TableColumn {
-            name,
-            requires_quotes,
-        });
+        let value_kind = classify_value_kind(table_name, &name, &column_def.data_type)?;
+        columns.push(TableColumn { name, value_kind });
     }
 
     Ok(columns)
-}
-
-/// Determine whether a column data type must be wrapped in single quotes.
-///
-/// Textual and temporal types require quoting so the generated INSERT batches remain
-/// valid SQL and preserve formatting. Numeric types stay unquoted to avoid implicit casts.
-fn column_requires_quotes(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Character(_)
-            | DataType::Char(_)
-            | DataType::CharacterVarying(_)
-            | DataType::CharVarying(_)
-            | DataType::Varchar(_)
-            | DataType::Nvarchar(_)
-            | DataType::CharacterLargeObject(_)
-            | DataType::CharLargeObject(_)
-            | DataType::Clob(_)
-            | DataType::Text
-            | DataType::String(_)
-            | DataType::Uuid
-            | DataType::Date
-            | DataType::Datetime(_)
-            | DataType::Datetime64(_, _)
-            | DataType::Timestamp(_, _)
-            | DataType::TimestampNtz
-            | DataType::Time(_, _)
-            | DataType::JSON
-            | DataType::JSONB
-    )
 }
 
 /// Populate `TpchTableInfo` from parsed `driver.c` metadata, falling back to defaults.
@@ -1065,14 +1040,189 @@ fn build_table_info(name: &str, raw_tables: &HashMap<String, RawTableDef>) -> Tp
     }
 }
 
-/// Convert a raw generator field into a SQL literal, escaping quotes as needed.
-fn format_value(column: &TableColumn, raw: &str) -> String {
-    if raw.is_empty() {
-        return "''".into();
+fn parse_column_value(column: &TableColumn, raw: &str) -> Result<PlanValue> {
+    match column.value_kind {
+        ColumnValueKind::String => Ok(PlanValue::String(raw.to_string())),
+        ColumnValueKind::Integer => {
+            if raw.is_empty() {
+                return Err(TpchError::Parse(format!(
+                    "missing integer value for column {}",
+                    column.name
+                )));
+            }
+            let value = raw.parse::<i64>().map_err(|err| {
+                TpchError::Parse(format!(
+                    "invalid integer literal '{}' for column {}: {}",
+                    raw, column.name, err
+                ))
+            })?;
+            Ok(PlanValue::Integer(value))
+        }
+        ColumnValueKind::Decimal { scale } => {
+            if raw.is_empty() {
+                return Err(TpchError::Parse(format!(
+                    "missing decimal value for column {}",
+                    column.name
+                )));
+            }
+            let decimal = parse_decimal_literal(raw, scale, &column.name)?;
+            Ok(PlanValue::Decimal(decimal))
+        }
+        ColumnValueKind::Date32 => {
+            if raw.is_empty() {
+                return Err(TpchError::Parse(format!(
+                    "missing date value for column {}",
+                    column.name
+                )));
+            }
+            let days = parse_date32_literal(raw).map_err(|err| {
+                TpchError::Parse(format!(
+                    "invalid DATE literal '{}' for column {}: {}",
+                    raw, column.name, err
+                ))
+            })?;
+            Ok(PlanValue::Date32(days))
+        }
     }
-    if column.requires_quotes {
-        format!("'{}'", raw.replace('\'', "''"))
+}
+
+fn parse_decimal_literal(raw: &str, target_scale: i8, column_name: &str) -> Result<DecimalValue> {
+    let (value, scale) = if let Some(dot) = raw.find('.') {
+        let integer_part = &raw[..dot];
+        let fractional = &raw[dot + 1..];
+        let combined = format!("{}{}", integer_part, fractional);
+        let parsed = combined.parse::<i128>().map_err(|err| {
+            TpchError::Parse(format!(
+                "invalid decimal literal '{}' for column {}: {}",
+                raw, column_name, err
+            ))
+        })?;
+        (parsed, fractional.len() as i8)
     } else {
-        raw.to_string()
+        let parsed = raw.parse::<i128>().map_err(|err| {
+            TpchError::Parse(format!(
+                "invalid decimal literal '{}' for column {}: {}",
+                raw, column_name, err
+            ))
+        })?;
+        (parsed, 0)
+    };
+
+    let decimal = DecimalValue::new(value, scale).map_err(|err| {
+        TpchError::Parse(format!(
+            "invalid decimal literal '{}' for column {}: {}",
+            raw, column_name, err
+        ))
+    })?;
+
+    if scale == target_scale {
+        Ok(decimal)
+    } else {
+        decimal.rescale(target_scale).map_err(|err| {
+            TpchError::Parse(format!(
+                "unable to rescale decimal literal '{}' for column {}: {}",
+                raw, column_name, err
+            ))
+        })
     }
+}
+
+fn classify_value_kind(
+    table_name: &str,
+    column_name: &str,
+    data_type: &DataType,
+) -> Result<ColumnValueKind> {
+    let kind = match data_type {
+        DataType::Character(_)
+        | DataType::Char(_)
+        | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::Varchar(_)
+        | DataType::Nvarchar(_)
+        | DataType::CharacterLargeObject(_)
+        | DataType::CharLargeObject(_)
+        | DataType::Clob(_)
+        | DataType::Text
+        | DataType::String(_)
+        | DataType::Uuid
+        | DataType::Binary(_)
+        | DataType::Varbinary(_)
+        | DataType::Blob(_)
+        | DataType::TinyBlob
+        | DataType::MediumBlob
+        | DataType::LongBlob
+        | DataType::Bytes(_)
+        | DataType::JSON
+        | DataType::JSONB => ColumnValueKind::String,
+        DataType::Date | DataType::Date32 => ColumnValueKind::Date32,
+        DataType::Decimal(info)
+        | DataType::DecimalUnsigned(info)
+        | DataType::Numeric(info)
+        | DataType::Dec(info)
+        | DataType::DecUnsigned(info)
+        | DataType::BigDecimal(info)
+        | DataType::BigNumeric(info) => ColumnValueKind::Decimal {
+            scale: decimal_scale(info, table_name, column_name)?,
+        },
+        DataType::TinyInt(_)
+        | DataType::TinyIntUnsigned(_)
+        | DataType::UTinyInt
+        | DataType::Int2(_)
+        | DataType::Int2Unsigned(_)
+        | DataType::SmallInt(_)
+        | DataType::SmallIntUnsigned(_)
+        | DataType::USmallInt
+        | DataType::MediumInt(_)
+        | DataType::MediumIntUnsigned(_)
+        | DataType::Int(_)
+        | DataType::Int4(_)
+        | DataType::Int8(_)
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Int128
+        | DataType::Int256
+        | DataType::Integer(_)
+        | DataType::IntUnsigned(_)
+        | DataType::Int4Unsigned(_)
+        | DataType::IntegerUnsigned(_)
+        | DataType::HugeInt
+        | DataType::UHugeInt
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::UInt128
+        | DataType::UInt256
+        | DataType::BigInt(_)
+        | DataType::BigIntUnsigned(_)
+        | DataType::UBigInt
+        | DataType::Int8Unsigned(_)
+        | DataType::Signed
+        | DataType::SignedInteger
+        | DataType::Unsigned
+        | DataType::UnsignedInteger => ColumnValueKind::Integer,
+        other => {
+            return Err(TpchError::Parse(format!(
+                "unsupported data type '{}' for column {}.{}",
+                other, table_name, column_name
+            )));
+        }
+    };
+
+    Ok(kind)
+}
+
+fn decimal_scale(info: &ExactNumberInfo, table_name: &str, column_name: &str) -> Result<i8> {
+    let raw_scale = match info {
+        ExactNumberInfo::None | ExactNumberInfo::Precision(_) => 0,
+        ExactNumberInfo::PrecisionAndScale(_, scale) => *scale,
+    };
+    if !(i64::from(i8::MIN)..=i64::from(i8::MAX)).contains(&raw_scale) {
+        return Err(TpchError::Parse(format!(
+            "scale {} for column {}.{} exceeds i8 range",
+            raw_scale, table_name, column_name
+        )));
+    }
+    Ok(raw_scale as i8)
 }

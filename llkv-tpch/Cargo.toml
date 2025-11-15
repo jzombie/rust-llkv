@@ -13,6 +13,8 @@ clap.workspace = true
 llkv.workspace = true
 llkv-table.workspace = true
 llkv-sql.workspace = true
+llkv-plan.workspace = true
+llkv-expr.workspace = true
 regex.workspace = true
 rust_decimal.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
