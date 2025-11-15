@@ -7,10 +7,13 @@ use std::process;
 use std::sync::Arc;
 use std::time::Instant;
 
+use arrow::array::{Array, ArrayRef, Int32Array, StringArray, StringBuilder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use clap::{Args, Parser, Subcommand};
 use llkv::{
-    SqlEngine,
+    Error as LlkvError, SqlEngine,
     storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, PagerDiagnostics},
 };
 use llkv_table::diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
@@ -409,6 +412,9 @@ fn run_load_internal(
         print_pager_totals(&diag.totals());
     }
 
+    verify_schema_overview(&engine, &schema.schema_name)?;
+    maybe_run_query_validation(&toolkit, &engine, &schema.schema_name, scale_factor)?;
+
     let query_specs = vec![
         (
             "TPCD.LINEITEM row count",
@@ -599,6 +605,112 @@ fn print_load_summary(summary: &LoadSummary) {
     }
 }
 
+fn verify_schema_overview(engine: &SqlEngine, schema: &str) -> Result<(), TpchError> {
+    let safe_schema = escape_identifier(schema);
+    println!("\nSchema verification for '{schema}':");
+
+    let tables_sql = format!(
+        "SELECT table_name, table_type FROM information_schema.tables \
+         WHERE table_schema = '{safe_schema}' ORDER BY table_name;"
+    );
+    print_query(engine, "Tables present", &tables_sql)?;
+
+    let constraints = load_constraints(engine, schema)?;
+    let key_usage = load_key_column_usage(engine, schema)?;
+    let referential = load_referential_constraints(engine, schema)?;
+    let mut column_usage_schemas = BTreeSet::new();
+    column_usage_schemas.insert(schema.to_string());
+    for target in referential.values() {
+        column_usage_schemas.insert(target.unique_schema.clone());
+    }
+    let constraint_columns = load_constraint_column_usage(engine, &column_usage_schemas)?;
+
+    let pk_batch = build_constraint_overview_batch(&constraints, &key_usage)?;
+    print_result_batch("Primary/Unique constraints", pk_batch)?;
+
+    let fk_batch = build_foreign_key_overview_batch(
+        &constraints,
+        &key_usage,
+        &constraint_columns,
+        &referential,
+    )?;
+    print_result_batch("Foreign key definitions", fk_batch)?;
+
+    Ok(())
+}
+
+fn maybe_run_query_validation(
+    toolkit: &TpchToolkit,
+    engine: &SqlEngine,
+    schema: &str,
+    scale_factor: f64,
+) -> Result<(), TpchError> {
+    println!("\nValidating TPC-H query answers (focus: Q1)");
+    let Some(scale_label) = qualification_scale_label(scale_factor) else {
+        println!(
+            "  - Skipping query validation: no reference dataset for scale factor {:.3}",
+            scale_factor
+        );
+        return Ok(());
+    };
+
+    let dataset_dir = toolkit.schema_paths().ref_data_dir(&scale_label);
+    if !dataset_dir.is_dir() {
+        println!(
+            "  - Skipping query validation: reference dataset missing at {}",
+            dataset_dir.display()
+        );
+        return Ok(());
+    }
+
+    let mut options = QualificationOptions::from_scale(toolkit.schema_paths(), &scale_label);
+    options = options.with_stream_number(1).with_queries(vec![1]);
+    let reports = toolkit.run_qualification(engine, schema, &options)?;
+    if let Some(report) = reports.first() {
+        if report.passed() {
+            println!(
+                "  - Q{:02} PASS (expected {} rows, actual {})",
+                report.query, report.expected_row_count, report.actual_row_count
+            );
+        } else {
+            println!(
+                "  - Q{:02} FAIL (expected {} rows, actual {})",
+                report.query, report.expected_row_count, report.actual_row_count
+            );
+            if !report.missing_rows.is_empty() {
+                println!("    missing rows:");
+                for row in &report.missing_rows {
+                    println!("      {}", row.join(" | "));
+                }
+            }
+            if !report.extra_rows.is_empty() {
+                println!("    extra rows:");
+                for row in &report.extra_rows {
+                    println!("      {}", row.join(" | "));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn qualification_scale_label(scale_factor: f64) -> Option<String> {
+    if scale_factor <= 0.0 {
+        return None;
+    }
+    let rounded = scale_factor.round();
+    if (scale_factor - rounded).abs() < 1e-9 {
+        Some(format!("{:.0}", rounded))
+    } else {
+        None
+    }
+}
+
+fn escape_identifier(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchError> {
     println!("\n{label}");
 
@@ -620,6 +732,388 @@ fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchErr
         }
     }
     print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))
+}
+
+fn print_result_batch(label: &str, batch: Option<RecordBatch>) -> Result<(), TpchError> {
+    println!("\n{label}");
+    if let Some(batch) = batch {
+        let batches = vec![batch];
+        print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))
+    } else {
+        println!("  (no rows)");
+        Ok(())
+    }
+}
+
+fn build_constraint_overview_batch(
+    constraints: &BTreeMap<ConstraintKey, ConstraintMeta>,
+    key_usage: &BTreeMap<ConstraintKey, Vec<KeyColumn>>,
+) -> Result<Option<RecordBatch>, TpchError> {
+    let mut entries: Vec<&ConstraintMeta> = constraints
+        .values()
+        .filter(|meta| matches!(meta.constraint_type.as_str(), "PRIMARY KEY" | "UNIQUE"))
+        .collect();
+    entries.sort_by(|a, b| {
+        a.table_name
+            .cmp(&b.table_name)
+            .then_with(|| a.constraint_name.cmp(&b.constraint_name))
+    });
+
+    let mut rows = Vec::new();
+    for meta in entries {
+        let key = ConstraintKey::new(&meta.schema, &meta.constraint_name);
+        if let Some(columns) = key_usage.get(&key) {
+            for column in columns {
+                rows.push(vec![
+                    meta.table_name.clone(),
+                    meta.constraint_name.clone(),
+                    meta.constraint_type.clone(),
+                    column.column_name.clone(),
+                ]);
+            }
+        }
+    }
+
+    build_string_batch(
+        &[
+            "table_name",
+            "constraint_name",
+            "constraint_type",
+            "column_name",
+        ],
+        rows,
+    )
+}
+
+fn build_foreign_key_overview_batch(
+    constraints: &BTreeMap<ConstraintKey, ConstraintMeta>,
+    key_usage: &BTreeMap<ConstraintKey, Vec<KeyColumn>>,
+    referenced_columns: &BTreeMap<ConstraintKey, ConstraintColumns>,
+    referential: &BTreeMap<ConstraintKey, UniqueConstraintRef>,
+) -> Result<Option<RecordBatch>, TpchError> {
+    let mut entries: Vec<&ConstraintMeta> = constraints
+        .values()
+        .filter(|meta| meta.constraint_type.eq_ignore_ascii_case("FOREIGN KEY"))
+        .collect();
+    entries.sort_by(|a, b| {
+        a.table_name
+            .cmp(&b.table_name)
+            .then_with(|| a.constraint_name.cmp(&b.constraint_name))
+    });
+
+    let mut rows = Vec::new();
+    for meta in entries {
+        let key = ConstraintKey::new(&meta.schema, &meta.constraint_name);
+        let Some(columns) = key_usage.get(&key) else {
+            continue;
+        };
+        let Some(target) = referential.get(&key) else {
+            continue;
+        };
+        let reference_key = ConstraintKey::new(&target.unique_schema, &target.unique_name);
+        let referenced_entry = referenced_columns.get(&reference_key);
+        let referenced_table = referenced_entry
+            .map(|entry| entry.table_name.clone())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        for (idx, column) in columns.iter().enumerate() {
+            let referenced_column = referenced_entry
+                .and_then(|entry| entry.columns.get(idx))
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            rows.push(vec![
+                meta.table_name.clone(),
+                meta.constraint_name.clone(),
+                column.column_name.clone(),
+                referenced_table.clone(),
+                referenced_column,
+            ]);
+        }
+    }
+
+    build_string_batch(
+        &[
+            "table_name",
+            "constraint_name",
+            "column_name",
+            "referenced_table",
+            "referenced_column",
+        ],
+        rows,
+    )
+}
+
+fn build_string_batch(
+    headers: &[&str],
+    rows: Vec<Vec<String>>,
+) -> Result<Option<RecordBatch>, TpchError> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builders: Vec<StringBuilder> = headers.iter().map(|_| StringBuilder::new()).collect();
+
+    for row in rows {
+        for (idx, value) in row.into_iter().enumerate() {
+            builders[idx].append_value(&value);
+        }
+    }
+
+    let fields: Vec<Field> = headers
+        .iter()
+        .map(|name| Field::new(*name, DataType::Utf8, false))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+
+    let mut columns = Vec::with_capacity(builders.len());
+    for mut builder in builders {
+        let array = builder.finish();
+        columns.push(Arc::new(array) as ArrayRef);
+    }
+
+    let batch = RecordBatch::try_new(schema, columns).map_err(|err| TpchError::Sql(err.into()))?;
+    Ok(Some(batch))
+}
+
+fn load_constraints(
+    engine: &SqlEngine,
+    schema: &str,
+) -> Result<BTreeMap<ConstraintKey, ConstraintMeta>, TpchError> {
+    let safe_schema = escape_identifier(schema);
+    let sql = format!(
+        "SELECT constraint_schema, constraint_name, table_name, constraint_type \
+         FROM information_schema.table_constraints \
+         WHERE table_schema = '{safe_schema}';"
+    );
+    let batches = engine.sql(&sql)?;
+    let mut constraints = BTreeMap::new();
+
+    for batch in batches {
+        let schema_col = downcast_string_column(&batch, "constraint_schema")?;
+        let name_col = downcast_string_column(&batch, "constraint_name")?;
+        let table_col = downcast_string_column(&batch, "table_name")?;
+        let type_col = downcast_string_column(&batch, "constraint_type")?;
+
+        for row in 0..batch.num_rows() {
+            let schema_value = string_value(schema_col, row);
+            let name_value = name_col.value(row);
+            let key = ConstraintKey::new(&schema_value, name_value);
+            constraints.insert(
+                key,
+                ConstraintMeta {
+                    schema: schema_value,
+                    table_name: table_col.value(row).to_string(),
+                    constraint_name: name_value.to_string(),
+                    constraint_type: type_col.value(row).to_string(),
+                },
+            );
+        }
+    }
+
+    Ok(constraints)
+}
+
+fn load_key_column_usage(
+    engine: &SqlEngine,
+    schema: &str,
+) -> Result<BTreeMap<ConstraintKey, Vec<KeyColumn>>, TpchError> {
+    let safe_schema = escape_identifier(schema);
+    let sql = format!(
+        "SELECT constraint_schema, constraint_name, column_name, ordinal_position \
+         FROM information_schema.key_column_usage \
+         WHERE constraint_schema = '{safe_schema}' \
+         ORDER BY constraint_schema, constraint_name, ordinal_position;"
+    );
+    let batches = engine.sql(&sql)?;
+    let mut usage = BTreeMap::new();
+
+    for batch in batches {
+        let schema_col = downcast_string_column(&batch, "constraint_schema")?;
+        let name_col = downcast_string_column(&batch, "constraint_name")?;
+        let column_col = downcast_string_column(&batch, "column_name")?;
+        let ordinal_col = downcast_int32_column(&batch, "ordinal_position")?;
+
+        for row in 0..batch.num_rows() {
+            let schema_value = string_value(schema_col, row);
+            let name_value = name_col.value(row);
+            let key = ConstraintKey::new(&schema_value, name_value);
+            let ordinal = ordinal_col.value(row);
+            usage.entry(key).or_insert_with(Vec::new).push(KeyColumn {
+                ordinal,
+                column_name: column_col.value(row).to_string(),
+            });
+        }
+    }
+
+    for columns in usage.values_mut() {
+        columns.sort_by_key(|column| column.ordinal);
+    }
+
+    Ok(usage)
+}
+
+fn load_referential_constraints(
+    engine: &SqlEngine,
+    schema: &str,
+) -> Result<BTreeMap<ConstraintKey, UniqueConstraintRef>, TpchError> {
+    let safe_schema = escape_identifier(schema);
+    let sql = format!(
+        "SELECT constraint_schema, constraint_name, unique_constraint_schema, unique_constraint_name \
+         FROM information_schema.referential_constraints \
+         WHERE constraint_schema = '{safe_schema}';"
+    );
+    let batches = engine.sql(&sql)?;
+    let mut mapping = BTreeMap::new();
+
+    for batch in batches {
+        let schema_col = downcast_string_column(&batch, "constraint_schema")?;
+        let name_col = downcast_string_column(&batch, "constraint_name")?;
+        let unique_schema_col = downcast_string_column(&batch, "unique_constraint_schema")?;
+        let unique_name_col = downcast_string_column(&batch, "unique_constraint_name")?;
+
+        for row in 0..batch.num_rows() {
+            let schema_value = string_value(schema_col, row);
+            let name_value = name_col.value(row);
+            let key = ConstraintKey::new(&schema_value, name_value);
+            mapping.insert(
+                key,
+                UniqueConstraintRef {
+                    unique_schema: string_value(unique_schema_col, row),
+                    unique_name: unique_name_col.value(row).to_string(),
+                },
+            );
+        }
+    }
+
+    Ok(mapping)
+}
+
+fn load_constraint_column_usage(
+    engine: &SqlEngine,
+    schemas: &BTreeSet<String>,
+) -> Result<BTreeMap<ConstraintKey, ConstraintColumns>, TpchError> {
+    if schemas.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut columns = BTreeMap::new();
+    for schema_name in schemas {
+        let safe_schema = escape_identifier(schema_name);
+        let sql = format!(
+            "SELECT constraint_schema, constraint_name, table_schema, table_name, column_name \
+             FROM information_schema.constraint_column_usage \
+             WHERE constraint_schema = '{safe_schema}' \
+             ORDER BY constraint_schema, constraint_name;"
+        );
+        let batches = engine.sql(&sql)?;
+
+        for batch in batches {
+            let schema_col = downcast_string_column(&batch, "constraint_schema")?;
+            let name_col = downcast_string_column(&batch, "constraint_name")?;
+            let table_schema_col = downcast_string_column(&batch, "table_schema")?;
+            let table_name_col = downcast_string_column(&batch, "table_name")?;
+            let column_col = downcast_string_column(&batch, "column_name")?;
+
+            for row in 0..batch.num_rows() {
+                let schema_value = string_value(schema_col, row);
+                let name_value = name_col.value(row);
+                let key = ConstraintKey::new(&schema_value, name_value);
+                let entry = columns.entry(key).or_insert_with(|| ConstraintColumns {
+                    schema: table_schema_col.value(row).to_string(),
+                    table_name: table_name_col.value(row).to_string(),
+                    columns: Vec::new(),
+                });
+                entry.columns.push(column_col.value(row).to_string());
+            }
+        }
+    }
+
+    Ok(columns)
+}
+
+fn downcast_string_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a StringArray, TpchError> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| internal_error(format!("missing column '{name}' in result")))?;
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| internal_error(format!("column '{name}' is not Utf8")))
+}
+
+fn downcast_int32_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a Int32Array, TpchError> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| internal_error(format!("missing column '{name}' in result")))?;
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| internal_error(format!("column '{name}' is not Int32")))
+}
+
+fn string_value(column: &StringArray, row: usize) -> String {
+    if column.is_null(row) {
+        String::new()
+    } else {
+        column.value(row).to_string()
+    }
+}
+
+fn internal_error(message: impl Into<String>) -> TpchError {
+    TpchError::Sql(LlkvError::Internal(message.into()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ConstraintKey {
+    schema: String,
+    name: String,
+}
+
+impl ConstraintKey {
+    fn new(schema: &str, name: &str) -> Self {
+        Self {
+            schema: schema.to_ascii_lowercase(),
+            name: name.to_ascii_lowercase(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConstraintMeta {
+    schema: String,
+    table_name: String,
+    constraint_name: String,
+    constraint_type: String,
+}
+
+#[derive(Debug, Clone)]
+struct KeyColumn {
+    ordinal: i32,
+    column_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct ConstraintColumns {
+    #[allow(dead_code)]
+    schema: String,
+    table_name: String,
+    columns: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UniqueConstraintRef {
+    unique_schema: String,
+    unique_name: String,
 }
 
 struct QueryExecution {

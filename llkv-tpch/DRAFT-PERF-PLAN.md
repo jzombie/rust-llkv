@@ -19,3 +19,24 @@
 [ ] Optional follow-up: add a “fast path” for append-only tables with no FK/unique checks—if telemetry says constraint work is negligible, skip this; otherwise, this could reclaim the lost minute without raising memory.
 
 [ ] Batch pager key allocations. Current diagnostics show alloc_batches == physical_allocs because upstream layers call `alloc_many(1)` per chunk. Introduce small key pools (per ColumnWriter or reservation helper) so we request dozens/hundreds of keys at a time, which should shrink alloc batch counts and pager contention.
+
+
+=====
+
+## Bulk ingest parity plan (target: ≤15 s SF1 on laptop)
+
+[ ] **Arrow-native batch ingest.** Replace the loader's `Vec<Vec<PlanValue>>` batches with Arrow `RecordBatch` producers and add `InsertSource::ArrowBatch` so the runtime receives typed column data directly. Executor must feed those batches through the existing `TableInserter` path so foreign keys, uniques, and triggers still fire.
+
+[ ] **Column-store slice appends.** Extend `ColumnStore`/`ColumnWriter` with an `append_batch` API that ingests entire Arrow arrays (or contiguous slices) per column. This removes the per-value descriptor lookups visible in Instruments and is required to make Arrow-native batches pay off.
+
+[ ] **Constraint-friendly bulk mode.** Keep FK/unique enforcement correct while avoiding per-row scans by (a) logging candidate keys during insert, (b) running streaming validators once the batch completes, and (c) integrating with the existing FK cache lifetime controls. This combines with the deferred-enforcement checkbox above.
+
+[ ] **FK cache instrumentation + tuning.** Add tracing around `enable_fk_cache_for_table`/`clear_fk_cache_for_table` to confirm cache reuse. If caches churn every batch, introduce per-table reuse windows or chunk-level invalidation.
+
+[ ] **Parallel table loading.** Allow independent tables (REGION/NATION/SUPPLIER/CUSTOMER) to load concurrently once the loader emits Arrow batches. Rayon-style task fan-out should be enough; coordination layer must keep schema install + FK ordering deterministic.
+
+[ ] **I/O + tpchgen profiling.** Run `fs_usage`/`iostat` + tpchgen timing to guarantee we are CPU-bound. If file generation dominates, precompute `.tbl` files or pipe from `tpchgen --threads` so we benchmark the storage stack rather than the generator.
+
+[ ] **Benchmark harness + regression targets.** Add a `cargo bench -p llkv-tpch --bench ingest` (or a Criterion harness) that loads SF0.1, SF1, and SF10, recording wall-clock + rows/sec. Track these against DuckDB COPY numbers so we know when we close the gap.
+
+[ ] **Optional fast path:** once Arrow batches land, expose an “unsafe” bulk-ingest toggle for tables without FK/unique constraints. This lets append-only analytical tables skip even the deferred checks when the user opts in.

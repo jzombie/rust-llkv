@@ -1,5 +1,6 @@
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::ops::Bound;
@@ -26,17 +27,21 @@ use llkv_result::Error;
 use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
     AggregateExpr, AssignmentValue, ColumnAssignment, ColumnStoreWriteHints, CreateIndexPlan,
-    CreateTablePlan, CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction,
-    ForeignKeySpec, IndexColumnPlan, InsertConflictAction, InsertPlan, InsertSource,
-    MultiColumnUniqueSpec, OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement,
-    PlanValue, ReindexPlan, RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession,
-    RuntimeStatementResult, SelectPlan, SelectProjection, TruncatePlan, UpdatePlan,
-    extract_rows_from_range,
+    CreateTablePlan, CreateTableSource, CreateViewPlan, DeletePlan,
+    ForeignKeyAction as PlanForeignKeyAction, ForeignKeySpec, IndexColumnPlan,
+    InsertConflictAction, InsertPlan, InsertSource, MultiColumnUniqueSpec, OrderByPlan,
+    OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan,
+    RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult,
+    SelectPlan, SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use llkv_table::resolvers::QualifiedTableName;
-use llkv_table::{CatalogDdl, ConstraintEnforcementMode, TriggerEventMeta, TriggerTimingMeta};
+use llkv_table::{
+    CatalogDdl, ConstraintEnforcementMode, ConstraintId, ConstraintKind, FieldId,
+    ForeignKeyAction as CatalogForeignKeyAction, TableConstraintSummaryView, TableId,
+    TriggerEventMeta, TriggerTimingMeta,
+};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -2458,10 +2463,10 @@ impl SqlEngine {
     fn map_referential_action(
         action: Option<ReferentialAction>,
         kind: &str,
-    ) -> SqlResult<ForeignKeyAction> {
+    ) -> SqlResult<PlanForeignKeyAction> {
         match action {
-            None | Some(ReferentialAction::NoAction) => Ok(ForeignKeyAction::NoAction),
-            Some(ReferentialAction::Restrict) => Ok(ForeignKeyAction::Restrict),
+            None | Some(ReferentialAction::NoAction) => Ok(PlanForeignKeyAction::NoAction),
+            Some(ReferentialAction::Restrict) => Ok(PlanForeignKeyAction::Restrict),
             Some(other) => Err(Error::InvalidArgumentError(format!(
                 "FOREIGN KEY ON {kind} {:?} is not supported yet",
                 other
@@ -3376,6 +3381,46 @@ impl SqlEngine {
                     view,
                 )
             }
+            "table_constraints" => {
+                let view = self.build_information_schema_table_constraints_view()?;
+                self.execute_inline_view(
+                    select,
+                    query,
+                    "information_schema.table_constraints".to_string(),
+                    alias.as_deref(),
+                    view,
+                )
+            }
+            "key_column_usage" => {
+                let view = self.build_information_schema_key_column_usage_view()?;
+                self.execute_inline_view(
+                    select,
+                    query,
+                    "information_schema.key_column_usage".to_string(),
+                    alias.as_deref(),
+                    view,
+                )
+            }
+            "constraint_column_usage" => {
+                let view = self.build_information_schema_constraint_column_usage_view()?;
+                self.execute_inline_view(
+                    select,
+                    query,
+                    "information_schema.constraint_column_usage".to_string(),
+                    alias.as_deref(),
+                    view,
+                )
+            }
+            "referential_constraints" => {
+                let view = self.build_information_schema_referential_constraints_view()?;
+                self.execute_inline_view(
+                    select,
+                    query,
+                    "information_schema.referential_constraints".to_string(),
+                    alias.as_deref(),
+                    view,
+                )
+            }
             _ => Ok(None),
         }
     }
@@ -3589,6 +3634,411 @@ impl SqlEngine {
         Ok(view)
     }
 
+    fn collect_information_schema_cache(&self) -> SqlResult<InformationSchemaCache> {
+        let context = self.engine.context();
+        let catalog = context.catalog();
+        let mut table_names = catalog.table_names();
+        table_names.sort_by_key(|name| name.to_ascii_lowercase());
+
+        let mut tables = Vec::new();
+        for name in table_names {
+            let qualified = QualifiedTableName::from(name.as_str());
+            let schema = qualified.schema().map(|s| s.to_string());
+            let table_name = qualified.table().to_string();
+            let (_, canonical) = llkv_table::canonical_table_name(name.as_str())?;
+            let Some(table_id) = catalog.table_id(&canonical) else {
+                continue;
+            };
+
+            let TableConstraintSummaryView {
+                table_meta: _,
+                column_metas,
+                constraint_records,
+                multi_column_uniques,
+                constraint_names,
+            } = catalog.table_constraint_summary(&canonical)?;
+
+            let mut column_names = FxHashMap::default();
+            for meta in column_metas.into_iter().flatten() {
+                let name = meta
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| Self::default_column_name(meta.col_id));
+                column_names.insert(meta.col_id, name);
+            }
+
+            let mut constraints = Vec::new();
+            for record in constraint_records
+                .into_iter()
+                .filter(|record| record.is_active())
+            {
+                let constraint_id = Some(record.constraint_id);
+                match record.kind {
+                    ConstraintKind::PrimaryKey(payload) => {
+                        let name = Self::constraint_name_or_fallback(
+                            constraint_names.get(&record.constraint_id),
+                            &table_name,
+                            InformationSchemaConstraintType::PrimaryKey,
+                            constraint_id,
+                        );
+                        constraints.push(InformationSchemaConstraint {
+                            constraint_id,
+                            constraint_name: name,
+                            constraint_type: InformationSchemaConstraintType::PrimaryKey,
+                            column_ids: payload.field_ids,
+                            referenced_table_id: None,
+                            referenced_column_ids: Vec::new(),
+                            on_delete: None,
+                            on_update: None,
+                        });
+                    }
+                    ConstraintKind::Unique(payload) => {
+                        let name = Self::constraint_name_or_fallback(
+                            constraint_names.get(&record.constraint_id),
+                            &table_name,
+                            InformationSchemaConstraintType::Unique,
+                            constraint_id,
+                        );
+                        constraints.push(InformationSchemaConstraint {
+                            constraint_id,
+                            constraint_name: name,
+                            constraint_type: InformationSchemaConstraintType::Unique,
+                            column_ids: payload.field_ids,
+                            referenced_table_id: None,
+                            referenced_column_ids: Vec::new(),
+                            on_delete: None,
+                            on_update: None,
+                        });
+                    }
+                    ConstraintKind::ForeignKey(payload) => {
+                        let name = Self::constraint_name_or_fallback(
+                            constraint_names.get(&record.constraint_id),
+                            &table_name,
+                            InformationSchemaConstraintType::ForeignKey,
+                            constraint_id,
+                        );
+                        constraints.push(InformationSchemaConstraint {
+                            constraint_id,
+                            constraint_name: name,
+                            constraint_type: InformationSchemaConstraintType::ForeignKey,
+                            column_ids: payload.referencing_field_ids,
+                            referenced_table_id: Some(payload.referenced_table),
+                            referenced_column_ids: payload.referenced_field_ids,
+                            on_delete: Some(payload.on_delete),
+                            on_update: Some(payload.on_update),
+                        });
+                    }
+                    ConstraintKind::Check(payload) => {
+                        let name = Self::constraint_name_or_fallback(
+                            constraint_names.get(&record.constraint_id),
+                            &table_name,
+                            InformationSchemaConstraintType::Check,
+                            constraint_id,
+                        );
+                        constraints.push(InformationSchemaConstraint {
+                            constraint_id,
+                            constraint_name: name,
+                            constraint_type: InformationSchemaConstraintType::Check,
+                            column_ids: payload.field_ids,
+                            referenced_table_id: None,
+                            referenced_column_ids: Vec::new(),
+                            on_delete: None,
+                            on_update: None,
+                        });
+                    }
+                }
+            }
+
+            for unique in multi_column_uniques
+                .into_iter()
+                .filter(|entry| entry.unique)
+            {
+                let name = unique
+                    .index_name
+                    .clone()
+                    .unwrap_or_else(|| unique.canonical_name.clone());
+                constraints.push(InformationSchemaConstraint {
+                    constraint_id: None,
+                    constraint_name: name,
+                    constraint_type: InformationSchemaConstraintType::Unique,
+                    column_ids: unique.column_ids,
+                    referenced_table_id: None,
+                    referenced_column_ids: Vec::new(),
+                    on_delete: None,
+                    on_update: None,
+                });
+            }
+
+            Self::sort_information_schema_constraints(&mut constraints);
+
+            let snapshot = InformationSchemaTableSnapshot {
+                schema,
+                table_name,
+                table_id,
+                column_names,
+                constraints,
+            };
+            tables.push(snapshot);
+        }
+
+        let mut table_index = FxHashMap::default();
+        for (idx, snapshot) in tables.iter().enumerate() {
+            table_index.insert(snapshot.table_id, idx);
+        }
+
+        let mut unique_lookup = FxHashMap::default();
+        for snapshot in &tables {
+            for constraint in snapshot
+                .constraints
+                .iter()
+                .filter(|c| c.constraint_type.is_unique_like())
+            {
+                if constraint.column_ids.is_empty() {
+                    continue;
+                }
+                let key = InformationSchemaCache::constraint_key(
+                    snapshot.table_id,
+                    &constraint.column_ids,
+                );
+                unique_lookup
+                    .entry(key)
+                    .or_insert_with(|| InformationSchemaUniqueRef {
+                        constraint_name: constraint.constraint_name.clone(),
+                        schema: snapshot.schema.clone(),
+                    });
+            }
+        }
+
+        Ok(InformationSchemaCache {
+            tables,
+            table_index,
+            unique_lookup,
+        })
+    }
+
+    fn build_information_schema_table_constraints_view(&self) -> SqlResult<InlineView> {
+        let cache = self.collect_information_schema_cache()?;
+        let mut view = InlineView::new(vec![
+            InlineColumn::utf8("constraint_catalog", true),
+            InlineColumn::utf8("constraint_schema", true),
+            InlineColumn::utf8("constraint_name", false),
+            InlineColumn::utf8("table_schema", true),
+            InlineColumn::utf8("table_name", false),
+            InlineColumn::utf8("constraint_type", false),
+            InlineColumn::utf8("is_deferrable", false),
+            InlineColumn::utf8("initially_deferred", false),
+            InlineColumn::utf8("enforced", false),
+        ]);
+
+        for snapshot in &cache.tables {
+            for constraint in &snapshot.constraints {
+                view.add_row(vec![
+                    InlineValue::String(None), // constraint_catalog
+                    InlineValue::String(snapshot.schema.clone()),
+                    InlineValue::String(Some(constraint.constraint_name.clone())),
+                    InlineValue::String(snapshot.schema.clone()),
+                    InlineValue::String(Some(snapshot.table_name.clone())),
+                    InlineValue::String(Some(constraint.constraint_type.label().into())),
+                    InlineValue::String(Some("NO".into())),
+                    InlineValue::String(Some("NO".into())),
+                    InlineValue::String(Some("YES".into())),
+                ])?;
+            }
+        }
+
+        Ok(view)
+    }
+
+    fn build_information_schema_key_column_usage_view(&self) -> SqlResult<InlineView> {
+        let cache = self.collect_information_schema_cache()?;
+        let mut view = InlineView::new(vec![
+            InlineColumn::utf8("constraint_catalog", true),
+            InlineColumn::utf8("constraint_schema", true),
+            InlineColumn::utf8("constraint_name", false),
+            InlineColumn::utf8("table_schema", true),
+            InlineColumn::utf8("table_name", false),
+            InlineColumn::utf8("column_name", false),
+            InlineColumn::int32("ordinal_position", false),
+            InlineColumn::int32("position_in_unique_constraint", true),
+        ]);
+
+        for snapshot in &cache.tables {
+            for constraint in &snapshot.constraints {
+                if !constraint.constraint_type.is_key_usage_member() {
+                    continue;
+                }
+                for (idx, field_id) in constraint.column_ids.iter().enumerate() {
+                    let column_name = snapshot.column_name(*field_id);
+                    let ordinal = (idx + 1) as i32;
+                    let position_in_unique = if constraint.constraint_type
+                        == InformationSchemaConstraintType::ForeignKey
+                    {
+                        Some(ordinal)
+                    } else {
+                        None
+                    };
+                    view.add_row(vec![
+                        InlineValue::String(None),
+                        InlineValue::String(snapshot.schema.clone()),
+                        InlineValue::String(Some(constraint.constraint_name.clone())),
+                        InlineValue::String(snapshot.schema.clone()),
+                        InlineValue::String(Some(snapshot.table_name.clone())),
+                        InlineValue::String(Some(column_name)),
+                        InlineValue::Int32(Some(ordinal)),
+                        InlineValue::Int32(position_in_unique),
+                    ])?;
+                }
+            }
+        }
+
+        Ok(view)
+    }
+
+    fn build_information_schema_constraint_column_usage_view(&self) -> SqlResult<InlineView> {
+        let cache = self.collect_information_schema_cache()?;
+        let mut view = InlineView::new(vec![
+            InlineColumn::utf8("constraint_catalog", true),
+            InlineColumn::utf8("constraint_schema", true),
+            InlineColumn::utf8("constraint_name", false),
+            InlineColumn::utf8("table_schema", true),
+            InlineColumn::utf8("table_name", false),
+            InlineColumn::utf8("column_name", false),
+        ]);
+
+        for snapshot in &cache.tables {
+            for constraint in &snapshot.constraints {
+                if !constraint.constraint_type.is_unique_like() {
+                    continue;
+                }
+                for field_id in &constraint.column_ids {
+                    let column_name = snapshot.column_name(*field_id);
+                    view.add_row(vec![
+                        InlineValue::String(None),
+                        InlineValue::String(snapshot.schema.clone()),
+                        InlineValue::String(Some(constraint.constraint_name.clone())),
+                        InlineValue::String(snapshot.schema.clone()),
+                        InlineValue::String(Some(snapshot.table_name.clone())),
+                        InlineValue::String(Some(column_name)),
+                    ])?;
+                }
+            }
+        }
+
+        Ok(view)
+    }
+
+    fn build_information_schema_referential_constraints_view(&self) -> SqlResult<InlineView> {
+        let cache = self.collect_information_schema_cache()?;
+        let mut view = InlineView::new(vec![
+            InlineColumn::utf8("constraint_catalog", true),
+            InlineColumn::utf8("constraint_schema", true),
+            InlineColumn::utf8("constraint_name", false),
+            InlineColumn::utf8("unique_constraint_catalog", true),
+            InlineColumn::utf8("unique_constraint_schema", true),
+            InlineColumn::utf8("unique_constraint_name", false),
+            InlineColumn::utf8("match_option", false),
+            InlineColumn::utf8("update_rule", false),
+            InlineColumn::utf8("delete_rule", false),
+            InlineColumn::utf8("is_deferrable", false),
+            InlineColumn::utf8("initially_deferred", false),
+        ]);
+
+        for snapshot in &cache.tables {
+            for constraint in &snapshot.constraints {
+                if constraint.constraint_type != InformationSchemaConstraintType::ForeignKey {
+                    continue;
+                }
+                let Some(referenced_table_id) = constraint.referenced_table_id else {
+                    continue;
+                };
+                let Some(unique_ref) =
+                    cache.lookup_unique(referenced_table_id, &constraint.referenced_column_ids)
+                else {
+                    continue;
+                };
+                let update_rule = constraint
+                    .on_update
+                    .map(Self::format_fk_action)
+                    .unwrap_or("NO ACTION");
+                let delete_rule = constraint
+                    .on_delete
+                    .map(Self::format_fk_action)
+                    .unwrap_or("NO ACTION");
+
+                view.add_row(vec![
+                    InlineValue::String(None),
+                    InlineValue::String(snapshot.schema.clone()),
+                    InlineValue::String(Some(constraint.constraint_name.clone())),
+                    InlineValue::String(None),
+                    InlineValue::String(unique_ref.schema.clone()),
+                    InlineValue::String(Some(unique_ref.constraint_name.clone())),
+                    InlineValue::String(Some("SIMPLE".into())),
+                    InlineValue::String(Some(update_rule.into())),
+                    InlineValue::String(Some(delete_rule.into())),
+                    InlineValue::String(Some("NO".into())),
+                    InlineValue::String(Some("NO".into())),
+                ])?;
+            }
+        }
+
+        Ok(view)
+    }
+
+    fn constraint_name_or_fallback(
+        stored: Option<&String>,
+        table_name: &str,
+        constraint_type: InformationSchemaConstraintType,
+        constraint_id: Option<ConstraintId>,
+    ) -> String {
+        if let Some(name) = stored {
+            if !name.trim().is_empty() {
+                return name.clone();
+            }
+        }
+
+        match constraint_id {
+            Some(id) => format!("{}_{}_{}", table_name, constraint_type.slug(), id),
+            None => format!("{}_{}_auto", table_name, constraint_type.slug()),
+        }
+    }
+
+    fn sort_information_schema_constraints(constraints: &mut [InformationSchemaConstraint]) {
+        constraints.sort_by(|a, b| {
+            let name_cmp = a
+                .constraint_name
+                .to_ascii_lowercase()
+                .cmp(&b.constraint_name.to_ascii_lowercase());
+            if name_cmp != Ordering::Equal {
+                return name_cmp;
+            }
+            match (a.constraint_id, b.constraint_id) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        });
+    }
+
+    fn default_column_name(field_id: FieldId) -> String {
+        format!("col_{}", field_id)
+    }
+
+    fn format_fk_action(action: CatalogForeignKeyAction) -> &'static str {
+        match action {
+            CatalogForeignKeyAction::NoAction => "NO ACTION",
+            CatalogForeignKeyAction::Restrict => "RESTRICT",
+        }
+    }
+
+    fn normalized_constraint_key(
+        table_id: TableId,
+        columns: &[FieldId],
+    ) -> (TableId, Vec<FieldId>) {
+        let mut normalized = columns.to_vec();
+        normalized.sort_unstable();
+        (table_id, normalized)
+    }
     fn handle_create_table_as(
         &self,
         display_name: String,
@@ -7671,6 +8121,114 @@ enum InlineValue {
     Int32(Option<i32>),
     Bool(Option<bool>),
     Null,
+}
+
+#[derive(Clone, Debug)]
+struct InformationSchemaTableSnapshot {
+    schema: Option<String>,
+    table_name: String,
+    table_id: TableId,
+    column_names: FxHashMap<FieldId, String>,
+    constraints: Vec<InformationSchemaConstraint>,
+}
+
+impl InformationSchemaTableSnapshot {
+    fn column_name(&self, field_id: FieldId) -> String {
+        self.column_names
+            .get(&field_id)
+            .cloned()
+            .unwrap_or_else(|| SqlEngine::default_column_name(field_id))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InformationSchemaConstraint {
+    constraint_id: Option<ConstraintId>,
+    constraint_name: String,
+    constraint_type: InformationSchemaConstraintType,
+    column_ids: Vec<FieldId>,
+    referenced_table_id: Option<TableId>,
+    referenced_column_ids: Vec<FieldId>,
+    on_delete: Option<CatalogForeignKeyAction>,
+    on_update: Option<CatalogForeignKeyAction>,
+}
+
+#[derive(Clone, Debug)]
+struct InformationSchemaUniqueRef {
+    constraint_name: String,
+    schema: Option<String>,
+}
+
+struct InformationSchemaCache {
+    tables: Vec<InformationSchemaTableSnapshot>,
+    table_index: FxHashMap<TableId, usize>,
+    unique_lookup: FxHashMap<(TableId, Vec<FieldId>), InformationSchemaUniqueRef>,
+}
+
+impl InformationSchemaCache {
+    fn constraint_key(table_id: TableId, columns: &[FieldId]) -> (TableId, Vec<FieldId>) {
+        SqlEngine::normalized_constraint_key(table_id, columns)
+    }
+
+    fn lookup_unique(
+        &self,
+        table_id: TableId,
+        columns: &[FieldId],
+    ) -> Option<&InformationSchemaUniqueRef> {
+        let key = Self::constraint_key(table_id, columns);
+        self.unique_lookup.get(&key)
+    }
+
+    #[allow(dead_code)]
+    fn table_snapshot(&self, table_id: TableId) -> Option<&InformationSchemaTableSnapshot> {
+        self.table_index
+            .get(&table_id)
+            .and_then(|idx| self.tables.get(*idx))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InformationSchemaConstraintType {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+    Check,
+}
+
+impl InformationSchemaConstraintType {
+    fn label(self) -> &'static str {
+        match self {
+            InformationSchemaConstraintType::PrimaryKey => "PRIMARY KEY",
+            InformationSchemaConstraintType::Unique => "UNIQUE",
+            InformationSchemaConstraintType::ForeignKey => "FOREIGN KEY",
+            InformationSchemaConstraintType::Check => "CHECK",
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            InformationSchemaConstraintType::PrimaryKey => "primary_key",
+            InformationSchemaConstraintType::Unique => "unique",
+            InformationSchemaConstraintType::ForeignKey => "foreign_key",
+            InformationSchemaConstraintType::Check => "check",
+        }
+    }
+
+    fn is_unique_like(self) -> bool {
+        matches!(
+            self,
+            InformationSchemaConstraintType::PrimaryKey | InformationSchemaConstraintType::Unique
+        )
+    }
+
+    fn is_key_usage_member(self) -> bool {
+        matches!(
+            self,
+            InformationSchemaConstraintType::PrimaryKey
+                | InformationSchemaConstraintType::Unique
+                | InformationSchemaConstraintType::ForeignKey
+        )
+    }
 }
 
 struct InlineView {

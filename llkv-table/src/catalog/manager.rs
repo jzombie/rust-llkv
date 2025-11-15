@@ -1346,12 +1346,14 @@ where
         let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
         let constraint_records = self.metadata.constraint_records(table_id)?;
         let multi_column_uniques = self.metadata.multi_column_uniques(table_id)?;
+        let constraint_names = self.metadata.constraint_names(table_id)?;
 
         Ok(TableConstraintSummaryView {
             table_meta,
             column_metas,
             constraint_records,
             multi_column_uniques,
+            constraint_names,
         })
     }
 
