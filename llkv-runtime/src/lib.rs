@@ -84,6 +84,35 @@ fn is_table_missing_error(err: &Error) -> bool {
     matches!(err, Error::CatalogError(message) if message.contains("does not exist"))
 }
 
+/// Extract the primary table name from a plan statement for error reporting.
+///
+/// Returns the fully-qualified table name (e.g., `"schema.table"` or just `"table"`)
+/// for statements that operate on a specific table. Used by error mapping logic to
+/// provide clearer "table not found" messages when catalog lookups fail.
+///
+/// # Returns
+///
+/// - `Some(String)` containing the table name for table-specific operations
+/// - `None` for statements without a primary table (e.g., transactions, DROP INDEX)
+///
+/// # Ownership
+///
+/// Returns an owned `String` rather than a borrowed `&str` because:
+///
+/// - For `SELECT` statements, the qualified name is computed dynamically by joining
+///   the schema and table components (e.g., `format!("{}.{}", schema, table)`), so
+///   there is no existing string slice to borrow.
+/// - For other statements, the name already exists as an owned `String` in the plan,
+///   so cloning maintains API consistency and simplifies error handling.
+/// - This function is called once per statement execution for error mapping, not in
+///   performance-critical hot paths, so the allocation cost is negligible.
+///
+/// # Schema-Qualified Names
+///
+/// For `SELECT` queries involving schema-qualified tables (e.g., `information_schema.columns`),
+/// this returns the full qualified name rather than just the table component. This ensures
+/// error messages correctly identify which schema namespace failed the lookup, which is
+/// especially important for distinguishing user tables from system tables.
 pub fn statement_table_name(statement: &PlanStatement) -> Option<String> {
     match statement {
         PlanStatement::CreateTable(plan) => Some(plan.name.clone()),
