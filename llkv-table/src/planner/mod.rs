@@ -9,13 +9,13 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
-    Int64Array, IntervalMonthDayNanoArray, OffsetSizeTrait, RecordBatch, StringArray, UInt64Array,
-    new_null_array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+    IntervalMonthDayNanoArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
+    UInt64Array, new_null_array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
-use arrow_array::types::IntervalMonthDayNanoType;
+use arrow_array::types::{Int32Type, Int64Type, IntervalMonthDayNanoType};
 use time::{Date, Month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +114,7 @@ macro_rules! impl_single_column_reject_chunk_with_rids {
         }
     };
 }
+
 macro_rules! impl_single_column_emit_sorted_run {
     (
         $_base:ident,
@@ -2862,168 +2863,31 @@ where
         let logical_fields_arc = Arc::new(vec![lfid]);
         let numeric_fields_arc = Arc::new(FxHashSet::default());
 
+        let primitive_context = PrimitiveOrderContext::new(
+            &out_schema,
+            &logical_fields_arc,
+            &projection_evals_arc,
+            &passthrough_fields_arc,
+            &unique_index_arc,
+            &numeric_fields_arc,
+        );
+
         match order.transform {
             ScanOrderTransform::IdentityInt64 => {
-                let mut row_stream = RowStreamBuilder::new(
-                    store,
-                    self.table.table_id(),
-                    Arc::clone(&out_schema),
-                    Arc::clone(&logical_fields_arc),
-                    Arc::clone(&projection_evals_arc),
-                    Arc::clone(&passthrough_fields_arc),
-                    Arc::clone(&unique_index_arc),
-                    Arc::clone(&numeric_fields_arc),
-                    false,
-                    GatherNullPolicy::IncludeNulls,
-                    row_ids.clone(),
-                    STREAM_BATCH_ROWS,
-                )
-                .build()?;
-
-                let mut chunks: Vec<Int64Array> = Vec::new();
-                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
-
-                while let Some(chunk) = row_stream.next_chunk()? {
-                    let batch = chunk.to_record_batch();
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    if batch.num_columns() != 1 {
-                        return Err(Error::Internal(
-                            "ORDER BY gather produced unexpected column count".into(),
-                        ));
-                    }
-                    let array = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "ORDER BY integer expects Int64 column".into(),
-                            )
-                        })?
-                        .clone();
-
-                    let chunk_idx = chunks.len();
-                    let row_count = batch.num_rows();
-                    chunks.push(array);
-                    for offset in 0..row_count {
-                        positions.push((chunk_idx, offset));
-                    }
-                }
-
-                if positions.len() != row_ids.len() {
-                    return Err(Error::Internal(
-                        "ORDER BY gather produced inconsistent row counts".into(),
-                    ));
-                }
-
-                let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().copied().enumerate().collect();
-                indices.sort_by(|(ai, arid), (bi, brid)| {
-                    let (chunk_a, offset_a) = positions[*ai];
-                    let (chunk_b, offset_b) = positions[*bi];
-                    let array_a = &chunks[chunk_a];
-                    let array_b = &chunks[chunk_b];
-                    let left = if array_a.is_null(offset_a) {
-                        None
-                    } else {
-                        Some(array_a.value(offset_a))
-                    };
-                    let right = if array_b.is_null(offset_b) {
-                        None
-                    } else {
-                        Some(array_b.value(offset_b))
-                    };
-                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
-                    if ord == Ordering::Equal {
-                        arid.cmp(brid)
-                    } else {
-                        ord
-                    }
-                });
-                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+                row_ids = self.sort_row_ids_with_primitive_transform::<Int64Type>(
+                    row_ids,
+                    primitive_context,
+                    ascending,
+                    order.nulls_first,
+                )?;
             }
             ScanOrderTransform::IdentityInt32 => {
-                let mut row_stream = RowStreamBuilder::new(
-                    store,
-                    self.table.table_id(),
-                    Arc::clone(&out_schema),
-                    Arc::clone(&logical_fields_arc),
-                    Arc::clone(&projection_evals_arc),
-                    Arc::clone(&passthrough_fields_arc),
-                    Arc::clone(&unique_index_arc),
-                    Arc::clone(&numeric_fields_arc),
-                    false,
-                    GatherNullPolicy::IncludeNulls,
-                    row_ids.clone(),
-                    STREAM_BATCH_ROWS,
-                )
-                .build()?;
-
-                let mut chunks: Vec<Int32Array> = Vec::new();
-                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
-
-                while let Some(chunk) = row_stream.next_chunk()? {
-                    let batch = chunk.to_record_batch();
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    if batch.num_columns() != 1 {
-                        return Err(Error::Internal(
-                            "ORDER BY gather produced unexpected column count".into(),
-                        ));
-                    }
-                    let array = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<Int32Array>()
-                        .ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "ORDER BY integer expects Int32 column".into(),
-                            )
-                        })?
-                        .clone();
-
-                    let chunk_idx = chunks.len();
-                    let row_count = batch.num_rows();
-                    chunks.push(array);
-                    for offset in 0..row_count {
-                        positions.push((chunk_idx, offset));
-                    }
-                }
-
-                if positions.len() != row_ids.len() {
-                    return Err(Error::Internal(
-                        "ORDER BY gather produced inconsistent row counts".into(),
-                    ));
-                }
-
-                let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().copied().enumerate().collect();
-                indices.sort_by(|(ai, arid), (bi, brid)| {
-                    let (chunk_a, offset_a) = positions[*ai];
-                    let (chunk_b, offset_b) = positions[*bi];
-                    let array_a = &chunks[chunk_a];
-                    let array_b = &chunks[chunk_b];
-                    let left = if array_a.is_null(offset_a) {
-                        None
-                    } else {
-                        Some(array_a.value(offset_a))
-                    };
-                    let right = if array_b.is_null(offset_b) {
-                        None
-                    } else {
-                        Some(array_b.value(offset_b))
-                    };
-                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
-                    if ord == Ordering::Equal {
-                        arid.cmp(brid)
-                    } else {
-                        ord
-                    }
-                });
-                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+                row_ids = self.sort_row_ids_with_primitive_transform::<Int32Type>(
+                    row_ids,
+                    primitive_context,
+                    ascending,
+                    order.nulls_first,
+                )?;
             }
             ScanOrderTransform::IdentityUtf8 => {
                 let mut row_stream = RowStreamBuilder::new(
@@ -3174,6 +3038,94 @@ where
         }
 
         Ok(row_ids)
+    }
+
+    fn sort_row_ids_with_primitive_transform<T>(
+        &self,
+        row_ids: Vec<RowId>,
+        context: PrimitiveOrderContext<'_>,
+        ascending: bool,
+        nulls_first: bool,
+    ) -> LlkvResult<Vec<RowId>>
+    where
+        T: ArrowPrimitiveType,
+        T::Native: Ord,
+    {
+        let order_data = self.gather_primitive_order_chunks::<T>(&row_ids, context)?;
+
+        Ok(sort_by_primitive::<T>(
+            &row_ids,
+            &order_data.chunks,
+            &order_data.positions,
+            ascending,
+            nulls_first,
+        ))
+    }
+
+    fn gather_primitive_order_chunks<T>(
+        &self,
+        row_ids: &[RowId],
+        context: PrimitiveOrderContext<'_>,
+    ) -> LlkvResult<PrimitiveOrderData<T>>
+    where
+        T: ArrowPrimitiveType,
+    {
+        let mut row_stream = RowStreamBuilder::new(
+            self.table.store(),
+            self.table.table_id(),
+            Arc::clone(context.out_schema),
+            Arc::clone(context.logical_fields),
+            Arc::clone(context.projection_evals),
+            Arc::clone(context.passthrough_fields),
+            Arc::clone(context.unique_index),
+            Arc::clone(context.numeric_fields),
+            false,
+            GatherNullPolicy::IncludeNulls,
+            row_ids.to_vec(),
+            STREAM_BATCH_ROWS,
+        )
+        .build()?;
+
+        let mut chunks: Vec<PrimitiveArray<T>> = Vec::new();
+        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+
+        while let Some(chunk) = row_stream.next_chunk()? {
+            let batch = chunk.to_record_batch();
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if batch.num_columns() != 1 {
+                return Err(Error::Internal(
+                    "ORDER BY gather produced unexpected column count".into(),
+                ));
+            }
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<PrimitiveArray<T>>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "ORDER BY primitive expects {:?} column",
+                        T::DATA_TYPE
+                    ))
+                })?
+                .clone();
+
+            let chunk_idx = chunks.len();
+            let row_count = batch.num_rows();
+            chunks.push(array);
+            for offset in 0..row_count {
+                positions.push((chunk_idx, offset));
+            }
+        }
+
+        if positions.len() != row_ids.len() {
+            return Err(Error::Internal(
+                "ORDER BY gather produced inconsistent row counts".into(),
+            ));
+        }
+
+        Ok(PrimitiveOrderData { chunks, positions })
     }
 
     fn collect_all_row_ids_for_field(
@@ -4131,6 +4083,81 @@ fn compare_option_values<T: Ord>(
             }
         }
     }
+}
+
+struct PrimitiveOrderContext<'a> {
+    out_schema: &'a Arc<Schema>,
+    logical_fields: &'a Arc<Vec<LogicalFieldId>>,
+    projection_evals: &'a Arc<Vec<ProjectionEval>>,
+    passthrough_fields: &'a Arc<Vec<Option<FieldId>>>,
+    unique_index: &'a Arc<FxHashMap<LogicalFieldId, usize>>,
+    numeric_fields: &'a Arc<FxHashSet<FieldId>>,
+}
+
+impl<'a> PrimitiveOrderContext<'a> {
+    fn new(
+        out_schema: &'a Arc<Schema>,
+        logical_fields: &'a Arc<Vec<LogicalFieldId>>,
+        projection_evals: &'a Arc<Vec<ProjectionEval>>,
+        passthrough_fields: &'a Arc<Vec<Option<FieldId>>>,
+        unique_index: &'a Arc<FxHashMap<LogicalFieldId, usize>>,
+        numeric_fields: &'a Arc<FxHashSet<FieldId>>,
+    ) -> Self {
+        Self {
+            out_schema,
+            logical_fields,
+            projection_evals,
+            passthrough_fields,
+            unique_index,
+            numeric_fields,
+        }
+    }
+}
+
+struct PrimitiveOrderData<T>
+where
+    T: ArrowPrimitiveType,
+{
+    chunks: Vec<PrimitiveArray<T>>,
+    positions: Vec<(usize, usize)>,
+}
+
+/// Sorts row ids by the values stored in `chunks`, preserving stable ordering for ties.
+fn sort_by_primitive<T>(
+    row_ids: &[RowId],
+    chunks: &[PrimitiveArray<T>],
+    positions: &[(usize, usize)],
+    ascending: bool,
+    nulls_first: bool,
+) -> Vec<RowId>
+where
+    T: ArrowPrimitiveType,
+    T::Native: Ord,
+{
+    let mut indices: Vec<(usize, RowId)> = row_ids.iter().copied().enumerate().collect();
+    indices.sort_by(|(ai, arid), (bi, brid)| {
+        let (chunk_a, offset_a) = positions[*ai];
+        let (chunk_b, offset_b) = positions[*bi];
+        let array_a = &chunks[chunk_a];
+        let array_b = &chunks[chunk_b];
+        let left = if array_a.is_null(offset_a) {
+            None
+        } else {
+            Some(array_a.value(offset_a))
+        };
+        let right = if array_b.is_null(offset_b) {
+            None
+        } else {
+            Some(array_b.value(offset_b))
+        };
+        let ord = compare_option_values(left, right, ascending, nulls_first);
+        if ord == Ordering::Equal {
+            arid.cmp(brid)
+        } else {
+            ord
+        }
+    });
+    indices.into_iter().map(|(_, rid)| rid).collect()
 }
 
 fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {
