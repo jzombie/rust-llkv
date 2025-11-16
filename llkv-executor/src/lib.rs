@@ -9895,6 +9895,7 @@ where
     let transform = match order_plan.sort_type {
         OrderSortType::Native => match column.data_type {
             DataType::Int64 => ScanOrderTransform::IdentityInteger,
+            DataType::Int32 => ScanOrderTransform::IdentityInt32,
             DataType::Utf8 => ScanOrderTransform::IdentityUtf8,
             ref other => {
                 return Err(Error::InvalidArgumentError(format!(

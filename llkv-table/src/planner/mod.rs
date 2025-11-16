@@ -9,8 +9,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-    IntervalMonthDayNanoArray, OffsetSizeTrait, RecordBatch, StringArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array,
+    Int64Array, IntervalMonthDayNanoArray, OffsetSizeTrait, RecordBatch, StringArray, UInt64Array,
     new_null_array,
 };
 use arrow::compute;
@@ -2900,6 +2900,87 @@ where
                         .ok_or_else(|| {
                             Error::InvalidArgumentError(
                                 "ORDER BY integer expects Int64 column".into(),
+                            )
+                        })?
+                        .clone();
+
+                    let chunk_idx = chunks.len();
+                    let row_count = batch.num_rows();
+                    chunks.push(array);
+                    for offset in 0..row_count {
+                        positions.push((chunk_idx, offset));
+                    }
+                }
+
+                if positions.len() != row_ids.len() {
+                    return Err(Error::Internal(
+                        "ORDER BY gather produced inconsistent row counts".into(),
+                    ));
+                }
+
+                let mut indices: Vec<(usize, RowId)> =
+                    row_ids.iter().copied().enumerate().collect();
+                indices.sort_by(|(ai, arid), (bi, brid)| {
+                    let (chunk_a, offset_a) = positions[*ai];
+                    let (chunk_b, offset_b) = positions[*bi];
+                    let array_a = &chunks[chunk_a];
+                    let array_b = &chunks[chunk_b];
+                    let left = if array_a.is_null(offset_a) {
+                        None
+                    } else {
+                        Some(array_a.value(offset_a))
+                    };
+                    let right = if array_b.is_null(offset_b) {
+                        None
+                    } else {
+                        Some(array_b.value(offset_b))
+                    };
+                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
+                    if ord == Ordering::Equal {
+                        arid.cmp(brid)
+                    } else {
+                        ord
+                    }
+                });
+                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+            }
+            ScanOrderTransform::IdentityInt32 => {
+                let mut row_stream = RowStreamBuilder::new(
+                    store,
+                    self.table.table_id(),
+                    Arc::clone(&out_schema),
+                    Arc::clone(&logical_fields_arc),
+                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&passthrough_fields_arc),
+                    Arc::clone(&unique_index_arc),
+                    Arc::clone(&numeric_fields_arc),
+                    false,
+                    GatherNullPolicy::IncludeNulls,
+                    row_ids.clone(),
+                    STREAM_BATCH_ROWS,
+                )
+                .build()?;
+
+                let mut chunks: Vec<Int32Array> = Vec::new();
+                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+
+                while let Some(chunk) = row_stream.next_chunk()? {
+                    let batch = chunk.to_record_batch();
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if batch.num_columns() != 1 {
+                        return Err(Error::Internal(
+                            "ORDER BY gather produced unexpected column count".into(),
+                        ));
+                    }
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "ORDER BY integer expects Int32 column".into(),
                             )
                         })?
                         .clone();

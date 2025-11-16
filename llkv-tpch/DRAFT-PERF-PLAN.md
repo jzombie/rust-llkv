@@ -20,6 +20,8 @@
 
 [ ] Batch pager key allocations. Current diagnostics show alloc_batches == physical_allocs because upstream layers call `alloc_many(1)` per chunk. Introduce small key pools (per ColumnWriter or reservation helper) so we request dozens/hundreds of keys at a time, which should shrink alloc batch counts and pager contention.
 
+[ ] Unify ORDER BY comparator support. Int32 sorting now works after a targeted executor/planner patch, but we still maintain ad-hoc allowlists per type. Add a single comparator registry (or value-normalization helper) so ORDER BY automatically supports every scalar type with comparison semantics and we never repeat this fix.
+
 
 =====
 

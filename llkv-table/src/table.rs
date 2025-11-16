@@ -165,6 +165,8 @@ pub enum ScanOrderDirection {
 pub enum ScanOrderTransform {
     /// Sort integers as-is.
     IdentityInteger,
+    /// Sort 32-bit integers as-is.
+    IdentityInt32,
     /// Sort strings lexicographically.
     IdentityUtf8,
     /// Parse strings as integers, then sort numerically.
