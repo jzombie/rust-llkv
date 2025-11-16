@@ -658,6 +658,11 @@ where
             Error::InvalidArgumentError(format!("column '{}' not found in table", column_name))
         })?;
 
+        // Remove column from the column store
+        use llkv_column_map::types::{LogicalFieldId, Namespace};
+        let logical_field_id = LogicalFieldId::from_parts(Namespace::UserData, table_id, col_id);
+        self.store.remove_column(logical_field_id)?;
+
         // Delete from catalog
         let catalog = SysCatalog::new(&self.store);
         catalog.delete_col_meta(table_id, &[col_id])?;

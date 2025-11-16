@@ -86,7 +86,7 @@ See [dev-docs/high-level-crate-linkage.md](./dev-docs/high-level-crate-linkage.m
 	- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 	- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items`
 - Benchmark locally:
-	- `cargo bench --workspace` (benchmarks are currently run via Criterion).
+	- `cargo bench --workspace` (benchmarks are currently run via [Criterion](https://crates.io/crates/criterion)).
 - Refer to [dev-docs](./dev-docs/) for more information.
 
 ## License

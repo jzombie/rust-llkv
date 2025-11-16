@@ -492,6 +492,51 @@ where
             .collect()
     }
 
+    /// Remove a column from the column store catalog.
+    ///
+    /// This removes the column descriptor entry from the in-memory catalog and persists
+    /// the updated catalog. The actual column data pages remain in the pager but become
+    /// unreachable and will be garbage collected on compaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_id` - The logical field ID of the column to remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if catalog persistence fails.
+    pub fn remove_column(&self, field_id: LogicalFieldId) -> Result<()> {
+        // Remove from in-memory catalog
+        let removed = {
+            let mut catalog = self.catalog.write().unwrap();
+            catalog.map.remove(&field_id).is_some()
+        };
+
+        if !removed {
+            return Err(Error::NotFound);
+        }
+
+        // Also remove the associated row ID column
+        let rowid_field = rowid_fid(field_id);
+        {
+            let mut catalog = self.catalog.write().unwrap();
+            catalog.map.remove(&rowid_field);
+        }
+
+        // Persist updated catalog
+        let catalog_bytes = {
+            let catalog = self.catalog.read().unwrap();
+            catalog.to_bytes()
+        };
+        
+        self.pager.batch_put(&[BatchPut::Raw {
+            key: CATALOG_ROOT_PKEY,
+            bytes: catalog_bytes,
+        }])?;
+
+        Ok(())
+    }
+
     /// Check whether a specific row ID exists in a column.
     ///
     /// This uses presence indexes and binary search when available for fast lookups.

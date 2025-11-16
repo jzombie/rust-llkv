@@ -578,6 +578,11 @@ impl SqlEngine {
         Ok(())
     }
 
+    fn invalidate_information_schema(&self) {
+        self.information_schema_ready
+            .store(false, AtomicOrdering::Release);
+    }
+
     fn from_runtime_engine(
         engine: RuntimeEngine,
         default_nulls_first: bool,
@@ -631,19 +636,36 @@ impl SqlEngine {
             PlanStatement::CreateView(_) | PlanStatement::DropView(_)
         );
 
+        // Check if this statement modifies the schema structure
+        let modifies_schema = matches!(
+            &statement,
+            PlanStatement::CreateTable(_)
+                | PlanStatement::DropTable(_)
+                | PlanStatement::AlterTable(_)
+                | PlanStatement::CreateView(_)
+                | PlanStatement::DropView(_)
+        );
+
         let table = if should_map_error {
             llkv_runtime::statement_table_name(&statement)
         } else {
             None
         };
 
-        self.engine.execute_statement(statement).map_err(|err| {
+        let result = self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
             } else {
                 err
             }
-        })
+        });
+
+        // Invalidate information schema cache after successful schema modifications
+        if result.is_ok() && modifies_schema {
+            self.invalidate_information_schema();
+        }
+
+        result
     }
 
     /// Construct a new engine backed by the provided pager with insert buffering disabled.
@@ -4153,7 +4175,13 @@ impl SqlEngine {
         let operation = operations.into_iter().next().expect("checked length");
         match operation {
             AlterTableOperation::RenameTable { table_name } => {
-                let new_name = table_name.to_string();
+                let new_name_raw = table_name.to_string();
+                // Strip "TO " prefix if present (sqlparser may include it)
+                let new_name = new_name_raw
+                    .strip_prefix("TO ")
+                    .or_else(|| new_name_raw.strip_prefix("to "))
+                    .unwrap_or(&new_name_raw)
+                    .to_string();
                 self.handle_alter_table_rename(name, new_name, if_exists)
             }
             AlterTableOperation::RenameColumn {
@@ -4310,7 +4338,11 @@ impl SqlEngine {
         let plan = RenameTablePlan::new(&current_display, &new_display).if_exists(if_exists);
 
         match CatalogDdl::rename_table(self.engine.session(), plan) {
-            Ok(()) => Ok(RuntimeStatementResult::NoOp),
+            Ok(()) => {
+                // Invalidate information schema after successful rename
+                self.invalidate_information_schema();
+                Ok(RuntimeStatementResult::NoOp)
+            }
             Err(err) => Err(Self::map_table_error(&current_display, err)),
         }
     }

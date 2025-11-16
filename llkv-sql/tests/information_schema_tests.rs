@@ -514,3 +514,265 @@ fn test_information_schema_nullable_column_detection() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 2, "should have 2 columns");
 }
+
+#[test]
+fn test_information_schema_reflects_schema_changes() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    // Create initial table with 3 columns
+    engine
+        .execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price INTEGER);")
+        .expect("create table succeeds");
+
+    // Verify initial schema
+    let results = engine
+        .execute(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'products' 
+             ORDER BY ordinal_position;",
+        )
+        .expect("query initial columns succeeds");
+
+    let batches = extract_batches(results);
+    assert!(!batches.is_empty(), "should have initial results");
+    assert_eq!(batches[0].num_rows(), 3, "should have 3 initial columns");
+
+    let column_names = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(column_names.value(0), "id");
+    assert_eq!(column_names.value(1), "name");
+    assert_eq!(column_names.value(2), "price");
+
+    // Test 1: DROP COLUMN - remove 'price' column
+    engine
+        .execute("ALTER TABLE products DROP COLUMN price;")
+        .expect("drop column succeeds");
+
+    let results = engine
+        .execute(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'products' 
+             ORDER BY ordinal_position;",
+        )
+        .expect("query after drop column succeeds");
+
+    let batches = extract_batches(results);
+    assert_eq!(
+        batches[0].num_rows(),
+        2,
+        "should have 2 columns after drop"
+    );
+
+    let column_names = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(column_names.value(0), "id");
+    assert_eq!(column_names.value(1), "name");
+
+    // Test 2: RENAME COLUMN - rename 'name' to 'product_name'
+    engine
+        .execute("ALTER TABLE products RENAME COLUMN name TO product_name;")
+        .expect("rename column succeeds");
+
+    let results = engine
+        .execute(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'products' 
+             ORDER BY ordinal_position;",
+        )
+        .expect("query after rename column succeeds");
+
+    let batches = extract_batches(results);
+    assert_eq!(batches[0].num_rows(), 2, "should still have 2 columns");
+
+    let column_names = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(column_names.value(0), "id");
+    assert_eq!(
+        column_names.value(1), "product_name",
+        "column should be renamed"
+    );
+
+    // Test 3: ALTER COLUMN TYPE - change 'product_name' type (not a primary key)
+    engine
+        .execute("ALTER TABLE products ALTER COLUMN product_name SET DATA TYPE INTEGER;")
+        .expect("alter column type succeeds");
+
+    let results = engine
+        .execute(
+            "SELECT column_name, data_type FROM information_schema.columns 
+             WHERE table_name = 'products' AND column_name = 'product_name';",
+        )
+        .expect("query after alter column type succeeds");
+
+    let batches = extract_batches(results);
+    assert_eq!(batches[0].num_rows(), 1, "should find product_name column");
+
+    let data_types = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(data_types.value(0), "Int64", "column type should be changed");
+
+    // Test 4: RENAME TABLE - rename 'products' to 'items'
+    engine
+        .execute("ALTER TABLE products RENAME TO items;")
+        .expect("rename table succeeds");
+
+    // Verify old table name is gone by listing all non-information_schema tables
+    let results = engine
+        .execute(
+            "SELECT table_name FROM information_schema.tables 
+             WHERE table_schema IS NULL OR table_schema != 'information_schema'
+             ORDER BY table_name;",
+        )
+        .expect("query user tables succeeds");
+
+    let batches = extract_batches(results);
+    let table_names_arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let user_tables: Vec<&str> = (0..batches[0].num_rows())
+        .map(|i| table_names_arr.value(i))
+        .collect();
+    
+    assert!(
+        !user_tables.contains(&"products"),
+        "old table name 'products' should not exist"
+    );
+    assert!(
+        user_tables.contains(&"items"),
+        "new table name 'items' should exist"
+    );
+
+    // Verify new table name exists with correct columns
+    let results = engine
+        .execute(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'items' 
+             ORDER BY ordinal_position;",
+        )
+        .expect("query new table name succeeds");
+
+    let batches = extract_batches(results);
+    assert_eq!(batches[0].num_rows(), 2, "renamed table should have 2 columns");
+
+    let column_names = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(column_names.value(0), "id");
+    assert_eq!(column_names.value(1), "product_name");
+
+    // Test 5: DROP TABLE - remove 'items' table completely
+    engine
+        .execute("DROP TABLE items;")
+        .expect("drop table succeeds");
+
+    // Verify table is gone from information_schema.tables
+    let results = engine
+        .execute(
+            "SELECT table_name FROM information_schema.tables 
+             WHERE table_name = 'items';",
+        )
+        .expect("query for dropped table succeeds");
+
+    let batches = extract_batches(results);
+    assert_eq!(
+        batches[0].num_rows(),
+        0,
+        "dropped table should not exist in tables"
+    );
+
+    // Verify columns are gone from information_schema.columns
+    let results = engine
+        .execute(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'items';",
+        )
+        .expect("query for dropped table columns succeeds");
+
+    let batches = extract_batches(results);
+    assert_eq!(
+        batches[0].num_rows(),
+        0,
+        "dropped table columns should not exist"
+    );
+
+    // Test 6: CREATE TABLE after DROP - verify fresh state
+    engine
+        .execute("CREATE TABLE items (id INTEGER, description TEXT);")
+        .expect("recreate table succeeds");
+
+    let results = engine
+        .execute(
+            "SELECT column_name FROM information_schema.columns 
+             WHERE table_name = 'items' 
+             ORDER BY ordinal_position;",
+        )
+        .expect("query recreated table succeeds");
+
+    let batches = extract_batches(results);
+    assert_eq!(batches[0].num_rows(), 2, "recreated table should have 2 columns");
+
+    let column_names = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        column_names.value(0), "id",
+        "recreated table should have new schema"
+    );
+    assert_eq!(column_names.value(1), "description");
+}
+
+#[test]
+fn test_alter_table_drop_column_basic() {
+    let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+    // Create a table
+    engine
+        .execute("CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);")
+        .expect("create table succeeds");
+
+    // Verify initial structure by querying the table directly
+    engine
+        .execute("INSERT INTO test VALUES (1, 'test', 100);")
+        .expect("insert succeeds");
+
+    let results = engine
+        .execute("SELECT * FROM test;")
+        .expect("select succeeds");
+    let batches = extract_batches(results);
+    assert_eq!(batches[0].num_columns(), 3, "should have 3 columns initially");
+
+    // Drop a column
+    engine
+        .execute("ALTER TABLE test DROP COLUMN value;")
+        .expect("drop column succeeds");
+
+    // Query the table again to see if column was actually dropped
+    let results = engine
+        .execute("SELECT * FROM test;")
+        .expect("select after drop succeeds");
+    let batches = extract_batches(results);
+    
+    assert_eq!(
+        batches[0].num_columns(),
+        2,
+        "should have 2 columns after drop"
+    );
+}
