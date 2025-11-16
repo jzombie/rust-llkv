@@ -80,7 +80,8 @@ where
     // Optional fallback context for cross-namespace table lookups. Temporary namespaces use this
     // to access persistent tables while maintaining separate storage. The fallback shares the
     // same pager type as the primary context so executor tables can be reused without conversion.
-    fallback_lookup: Option<Arc<RuntimeContext<P>>>,
+    // Uses RwLock for interior mutability to allow setting fallback after Arc wrapping.
+    fallback_lookup: RwLock<Option<Arc<RuntimeContext<P>>>>,
 }
 
 impl<P> RuntimeContext<P>
@@ -243,7 +244,7 @@ where
             transaction_manager,
             txn_manager,
             txn_tables_with_new_rows: RwLock::new(FxHashMap::default()),
-            fallback_lookup: None,
+            fallback_lookup: RwLock::new(None),
         }
     }
 
@@ -265,9 +266,14 @@ where
     /// Set a fallback context for cross-pager table lookups. The fallback uses BoxedPager
     /// to enable access across different underlying pager types (e.g., temporary MemPager
     /// can fall back to persistent disk pager).
-    pub fn with_fallback_lookup(mut self, fallback: Arc<RuntimeContext<P>>) -> Self {
-        self.fallback_lookup = Some(fallback);
+    pub fn with_fallback_lookup(self, fallback: Arc<RuntimeContext<P>>) -> Self {
+        *self.fallback_lookup.write().unwrap() = Some(fallback);
         self
+    }
+
+    /// Set a fallback context after construction for contexts already wrapped in Arc.
+    pub fn set_fallback_lookup(&self, fallback: Arc<RuntimeContext<P>>) {
+        *self.fallback_lookup.write().unwrap() = Some(fallback);
     }
 
     /// Register a custom type alias (CREATE TYPE/DOMAIN).

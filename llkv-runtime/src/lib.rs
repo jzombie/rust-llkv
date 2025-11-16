@@ -84,22 +84,22 @@ fn is_table_missing_error(err: &Error) -> bool {
     matches!(err, Error::CatalogError(message) if message.contains("does not exist"))
 }
 
-pub fn statement_table_name(statement: &PlanStatement) -> Option<&str> {
+pub fn statement_table_name(statement: &PlanStatement) -> Option<String> {
     match statement {
-        PlanStatement::CreateTable(plan) => Some(plan.name.as_str()),
-        PlanStatement::DropTable(plan) => Some(plan.name.as_str()),
-        PlanStatement::CreateView(plan) => Some(plan.name.as_str()),
-        PlanStatement::DropView(plan) => Some(plan.name.as_str()),
-        PlanStatement::AlterTable(plan) => Some(plan.table_name.as_str()),
-        PlanStatement::CreateIndex(plan) => Some(plan.table.as_str()),
-        PlanStatement::Insert(plan) => Some(plan.table.as_str()),
-        PlanStatement::Update(plan) => Some(plan.table.as_str()),
-        PlanStatement::Delete(plan) => Some(plan.table.as_str()),
-        PlanStatement::Truncate(plan) => Some(plan.table.as_str()),
+        PlanStatement::CreateTable(plan) => Some(plan.name.clone()),
+        PlanStatement::DropTable(plan) => Some(plan.name.clone()),
+        PlanStatement::CreateView(plan) => Some(plan.name.clone()),
+        PlanStatement::DropView(plan) => Some(plan.name.clone()),
+        PlanStatement::AlterTable(plan) => Some(plan.table_name.clone()),
+        PlanStatement::CreateIndex(plan) => Some(plan.table.clone()),
+        PlanStatement::Insert(plan) => Some(plan.table.clone()),
+        PlanStatement::Update(plan) => Some(plan.table.clone()),
+        PlanStatement::Delete(plan) => Some(plan.table.clone()),
+        PlanStatement::Truncate(plan) => Some(plan.table.clone()),
         PlanStatement::Select(plan) => plan
             .tables
             .first()
-            .map(|table_ref| table_ref.table.as_str()),
+            .map(|table_ref| table_ref.qualified_name()),
         PlanStatement::DropIndex(_) => None,
         PlanStatement::Reindex(_) => None,
         PlanStatement::BeginTransaction

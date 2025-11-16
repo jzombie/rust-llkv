@@ -226,7 +226,7 @@ where
                     &*self.catalog
                 );
                 // Table not found in catalog - try fallback if available
-                if let Some(fallback) = &self.fallback_lookup {
+                if let Some(fallback) = self.fallback_lookup.read().unwrap().as_ref() {
                     tracing::debug!(
                         "[LAZY_LOAD] Table '{}' not found in catalog, trying fallback context",
                         canonical_name
@@ -247,7 +247,7 @@ where
             Ok(t) => t,
             Err(e) => {
                 // Table exists in catalog but not in our store - try fallback
-                if let Some(fallback) = &self.fallback_lookup {
+                if let Some(fallback) = self.fallback_lookup.read().unwrap().as_ref() {
                     tracing::debug!(
                         "[LAZY_LOAD] Table '{}' found in catalog but not in store ({}), trying fallback context",
                         canonical_name,
@@ -278,7 +278,7 @@ where
         let _table_meta = match table_meta {
             Some(meta) => meta,
             None => {
-                if let Some(fallback) = &self.fallback_lookup {
+                if let Some(fallback) = self.fallback_lookup.read().unwrap().as_ref() {
                     tracing::debug!(
                         "[LAZY_LOAD] Table '{}' metadata not found, trying fallback context",
                         canonical_name

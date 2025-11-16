@@ -59,16 +59,11 @@ pub(crate) struct SessionNamespaces {
 
 impl SessionNamespaces {
     pub(crate) fn new(base_context: Arc<RuntimeContext<BoxedPager>>) -> Self {
-        let persistent = Arc::new(PersistentRuntimeNamespace::new(
-            PERSISTENT_NAMESPACE_ID.to_string(),
-            Arc::clone(&base_context),
-        ));
-
         let mut registry = RuntimeStorageNamespaceRegistry::new(
-            RuntimeStorageNamespace::namespace_id(persistent.as_ref()).clone(),
+            PERSISTENT_NAMESPACE_ID.to_string(),
         );
-        registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
+        // Create information_schema namespace FIRST so we can set it as fallback for persistent
         let information_schema = {
             let key = Arc::as_ptr(&base_context) as usize;
             let namespace = {
@@ -104,6 +99,17 @@ impl SessionNamespaces {
             );
             namespace
         };
+
+        // Set information_schema as fallback for base_context so persistent namespace can resolve it
+        base_context.set_fallback_lookup(information_schema.context());
+
+        // Create persistent namespace using the base_context (now with fallback configured)
+        let persistent = Arc::new(PersistentRuntimeNamespace::new(
+            PERSISTENT_NAMESPACE_ID.to_string(),
+            Arc::clone(&base_context),
+        ));
+
+        registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
         let temporary = {
             // ARCHITECTURAL DECISION: Multi-pager arena via fallback lookup
