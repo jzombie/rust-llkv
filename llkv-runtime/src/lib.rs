@@ -28,6 +28,7 @@
 
 #![forbid(unsafe_code)]
 
+mod information_schema;
 pub mod runtime_storage_namespace;
 
 pub use runtime_storage_namespace::{

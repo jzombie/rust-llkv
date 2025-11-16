@@ -381,11 +381,14 @@ where
         let mut table_columns: Vec<TableColumn> = Vec::with_capacity(schema.fields().len());
 
         for (idx, field) in schema.fields().iter().enumerate() {
+            // TODO: Extend with other supported types
             let data_type = match field.data_type() {
                 DataType::Int64
+                | DataType::Int32
                 | DataType::Float64
                 | DataType::Utf8
                 | DataType::Date32
+                | DataType::Boolean
                 | DataType::Struct(_) => field.data_type().clone(),
                 other => {
                     return Err(Error::InvalidArgumentError(format!(

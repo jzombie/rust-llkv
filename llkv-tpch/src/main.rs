@@ -336,7 +336,9 @@ fn run_install() -> Result<(), TpchError> {
          ORDER BY table_name, ordinal_position;",
         schema.schema_name
     );
-    print_query(&engine, "information_schema.columns", &columns_sql)
+    print_query(&engine, "information_schema.columns", &columns_sql)?;
+
+    print_schema_constraints(&engine, &schema.schema_name)
 }
 
 fn run_load_command(args: LoadArgs) -> Result<(), TpchError> {
@@ -614,7 +616,10 @@ fn verify_schema_overview(engine: &SqlEngine, schema: &str) -> Result<(), TpchEr
          WHERE table_schema = '{safe_schema}' ORDER BY table_name;"
     );
     print_query(engine, "Tables present", &tables_sql)?;
+    print_schema_constraints(engine, schema)
+}
 
+fn print_schema_constraints(engine: &SqlEngine, schema: &str) -> Result<(), TpchError> {
     let constraints = load_constraints(engine, schema)?;
     let key_usage = load_key_column_usage(engine, schema)?;
     let referential = load_referential_constraints(engine, schema)?;
@@ -634,9 +639,7 @@ fn verify_schema_overview(engine: &SqlEngine, schema: &str) -> Result<(), TpchEr
         &constraint_columns,
         &referential,
     )?;
-    print_result_batch("Foreign key definitions", fk_batch)?;
-
-    Ok(())
+    print_result_batch("Foreign key relationships", fk_batch)
 }
 
 fn maybe_run_query_validation(

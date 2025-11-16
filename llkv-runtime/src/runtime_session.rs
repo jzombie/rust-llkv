@@ -12,6 +12,7 @@ use llkv_table::{
 };
 
 use crate::{
+    information_schema::refresh_information_schema,
     AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource,
     CreateViewPlan, DeletePlan, DropIndexPlan, DropTablePlan, DropViewPlan, InsertPlan,
     InsertSource, PlanColumnSpec, PlanOperation, PlanValue, RenameTablePlan, RuntimeContext,
@@ -107,6 +108,7 @@ impl SessionNamespaces {
     pub(crate) fn registry(&self) -> Arc<RwLock<RuntimeStorageNamespaceRegistry>> {
         Arc::clone(&self.registry)
     }
+
 }
 
 impl Drop for SessionNamespaces {
@@ -781,6 +783,18 @@ impl RuntimeSession {
                 table, other
             ))),
         }
+    }
+
+    /// Rebuilds `information_schema.*` tables in the persistent namespace only.
+    ///
+    /// This forwards to the runtime’s refresh helper, which issues in-memory CTAS
+    /// batches derived from catalog metadata. No user tables are scanned, no data
+    /// reaches the main pager heap, and the synthetic information-schema tables are
+    /// the only objects dropped and recreated.
+    pub fn refresh_information_schema(&self) -> Result<()> {
+        let persistent = self.persistent_namespace();
+        let context = persistent.context();
+        refresh_information_schema(&context)
     }
 
     pub fn execute_update_plan(&self, plan: UpdatePlan) -> Result<StatementResult> {
