@@ -5,7 +5,7 @@ use llkv_executor::ExecutorRowBatch;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
-use llkv_table::{CatalogDdl, SingleColumnIndexDescriptor, TableId};
+use llkv_table::{CatalogDdl, ConstraintEnforcementMode, SingleColumnIndexDescriptor, TableId};
 use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapshot, TxnId};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -29,6 +29,7 @@ where
 {
     ctx: Arc<RuntimeContext<P>>,
     snapshot: RwLock<TransactionSnapshot>,
+    constraint_mode: RwLock<ConstraintEnforcementMode>,
 }
 
 impl<P> RuntimeTransactionContext<P>
@@ -40,7 +41,22 @@ where
         Self {
             ctx,
             snapshot: RwLock::new(snapshot),
+            constraint_mode: RwLock::new(ConstraintEnforcementMode::Immediate),
         }
+    }
+
+    pub(crate) fn set_constraint_mode(&self, mode: ConstraintEnforcementMode) {
+        *self
+            .constraint_mode
+            .write()
+            .expect("constraint mode lock poisoned") = mode;
+    }
+
+    pub(crate) fn constraint_mode(&self) -> ConstraintEnforcementMode {
+        *self
+            .constraint_mode
+            .read()
+            .expect("constraint mode lock poisoned")
     }
 
     fn update_snapshot(&self, snapshot: TransactionSnapshot) {
@@ -166,7 +182,8 @@ where
             &*self.ctx.pager
         );
         let snapshot = self.current_snapshot();
-        let result = self.ctx().insert(plan, snapshot)?;
+        let mode = self.constraint_mode();
+        let result = self.ctx().insert(plan, snapshot, mode)?;
         Ok(convert_statement_result(result))
     }
 

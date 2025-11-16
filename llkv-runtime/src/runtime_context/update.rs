@@ -20,7 +20,9 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
-use llkv_table::{FieldId, RowId, UniqueKey, build_composite_unique_key};
+use llkv_table::{
+    ConstraintEnforcementMode, FieldId, RowId, UniqueKey, build_composite_unique_key,
+};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -408,6 +410,7 @@ where
                 new_rows,
                 column_names,
                 snapshot,
+                ConstraintEnforcementMode::Immediate,
             )?;
         }
 
@@ -748,6 +751,7 @@ where
                 new_rows,
                 column_names,
                 snapshot,
+                ConstraintEnforcementMode::Immediate,
             )?;
         }
 

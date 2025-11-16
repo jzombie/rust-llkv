@@ -25,17 +25,17 @@ use llkv_plan::{SubqueryCorrelatedColumnTracker, SubqueryCorrelatedTracker, Tran
 use llkv_result::Error;
 use llkv_runtime::TEMPORARY_NAMESPACE_ID;
 use llkv_runtime::{
-    AggregateExpr, AssignmentValue, ColumnAssignment, CreateIndexPlan, CreateTablePlan,
-    CreateTableSource, CreateViewPlan, DeletePlan, ForeignKeyAction, ForeignKeySpec,
-    IndexColumnPlan, InsertConflictAction, InsertPlan, InsertSource, MultiColumnUniqueSpec,
-    OrderByPlan, OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan,
+    AggregateExpr, AssignmentValue, ColumnAssignment, ColumnStoreWriteHints, CreateIndexPlan,
+    CreateTablePlan, CreateTableSource, CreateViewPlan, DeletePlan,
+    ForeignKeyAction as PlanForeignKeyAction, ForeignKeySpec, IndexColumnPlan,
+    InsertConflictAction, InsertPlan, InsertSource, MultiColumnUniqueSpec, OrderByPlan,
+    OrderSortType, OrderTarget, PlanColumnSpec, PlanStatement, PlanValue, ReindexPlan,
     RenameTablePlan, RuntimeContext, RuntimeEngine, RuntimeSession, RuntimeStatementResult,
     SelectPlan, SelectProjection, TruncatePlan, UpdatePlan, extract_rows_from_range,
 };
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
-use llkv_table::resolvers::QualifiedTableName;
-use llkv_table::{CatalogDdl, TriggerEventMeta, TriggerTimingMeta};
+use llkv_table::{CatalogDdl, ConstraintEnforcementMode, TriggerEventMeta, TriggerTimingMeta};
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -505,6 +505,7 @@ pub struct SqlEngine {
     /// harness) can opt in via [`SqlEngine::set_insert_buffering`] to trade immediate visibility
     /// for much lower planning overhead.
     insert_buffering_enabled: AtomicBool,
+    information_schema_ready: AtomicBool,
     statement_cache: RwLock<FxHashMap<String, Arc<PreparedPlan>>>,
 }
 
@@ -534,6 +535,9 @@ impl Clone for SqlEngine {
             insert_buffering_enabled: AtomicBool::new(
                 self.insert_buffering_enabled.load(AtomicOrdering::Relaxed),
             ),
+            information_schema_ready: AtomicBool::new(
+                self.information_schema_ready.load(AtomicOrdering::Relaxed),
+            ),
             statement_cache: RwLock::new(FxHashMap::default()),
         }
     }
@@ -541,6 +545,39 @@ impl Clone for SqlEngine {
 
 #[allow(dead_code)]
 impl SqlEngine {
+    /// Instantiate a new SQL engine from an existing context.
+    ///
+    /// The `default_nulls_first` parameter controls the default sort order for `NULL` values.
+    pub fn with_context(context: Arc<SqlContext>, default_nulls_first: bool) -> Self {
+        Self::from_runtime_engine(
+            RuntimeEngine::from_context(context),
+            default_nulls_first,
+            false,
+        )
+    }
+
+    /// Expose the underlying runtime context for advanced callers (bulk loaders, tooling).
+    ///
+    /// This should only be used when the higher-level SQL interface lacks the necessary
+    /// hook—for example, enabling specialized constraint caches or inspecting catalog state.
+    pub fn runtime_context(&self) -> Arc<SqlContext> {
+        self.engine.context()
+    }
+
+    /// Fetch write-sizing hints from the underlying column store.
+    pub fn column_store_write_hints(&self) -> ColumnStoreWriteHints {
+        self.runtime_context().column_store_write_hints()
+    }
+
+    fn ensure_information_schema_ready(&self) -> SqlResult<()> {
+        if !self.information_schema_ready.load(AtomicOrdering::Acquire) {
+            self.engine.refresh_information_schema()?;
+            self.information_schema_ready
+                .store(true, AtomicOrdering::Release);
+        }
+        Ok(())
+    }
+
     fn from_runtime_engine(
         engine: RuntimeEngine,
         default_nulls_first: bool,
@@ -551,6 +588,7 @@ impl SqlEngine {
             default_nulls_first: AtomicBool::new(default_nulls_first),
             insert_buffer: RefCell::new(None),
             insert_buffering_enabled: AtomicBool::new(insert_buffering_enabled),
+            information_schema_ready: AtomicBool::new(false),
             statement_cache: RwLock::new(FxHashMap::default()),
         }
     }
@@ -870,18 +908,6 @@ impl SqlEngine {
             }
         })
         .to_string()
-    }
-
-    pub(crate) fn context_arc(&self) -> Arc<SqlContext> {
-        self.engine.context()
-    }
-
-    pub fn with_context(context: Arc<SqlContext>, default_nulls_first: bool) -> Self {
-        Self::from_runtime_engine(
-            RuntimeEngine::from_context(context),
-            default_nulls_first,
-            false,
-        )
     }
 
     /// Toggle literal `INSERT` buffering for the engine.
@@ -2445,10 +2471,10 @@ impl SqlEngine {
     fn map_referential_action(
         action: Option<ReferentialAction>,
         kind: &str,
-    ) -> SqlResult<ForeignKeyAction> {
+    ) -> SqlResult<PlanForeignKeyAction> {
         match action {
-            None | Some(ReferentialAction::NoAction) => Ok(ForeignKeyAction::NoAction),
-            Some(ReferentialAction::Restrict) => Ok(ForeignKeyAction::Restrict),
+            None | Some(ReferentialAction::NoAction) => Ok(PlanForeignKeyAction::NoAction),
+            Some(ReferentialAction::Restrict) => Ok(PlanForeignKeyAction::Restrict),
             Some(other) => Err(Error::InvalidArgumentError(format!(
                 "FOREIGN KEY ON {kind} {:?} is not supported yet",
                 other
@@ -3298,75 +3324,6 @@ impl SqlEngine {
         self.execute_inline_view(select, query, table_name, alias.as_deref(), view)
     }
 
-    fn try_handle_information_schema(
-        &self,
-        query: &Query,
-    ) -> SqlResult<Option<RuntimeStatementResult<P>>> {
-        use sqlparser::ast::SetExpr;
-
-        let select = match query.body.as_ref() {
-            SetExpr::Select(select) => select,
-            _ => return Ok(None),
-        };
-
-        if select.from.len() != 1 {
-            return Ok(None);
-        }
-
-        let table_with_joins = &select.from[0];
-        let (schema_name, object_name, alias) = match &table_with_joins.relation {
-            TableFactor::Table {
-                name, alias, args, ..
-            } => {
-                if args.is_some() {
-                    return Ok(None);
-                }
-                let (schema, table) = parse_schema_qualified_name(name)?;
-                (schema, table, alias.as_ref().map(|a| a.name.value.clone()))
-            }
-            _ => return Ok(None),
-        };
-
-        let Some(schema) = schema_name else {
-            return Ok(None);
-        };
-
-        if !schema.eq_ignore_ascii_case("information_schema") {
-            return Ok(None);
-        }
-
-        if table_with_joins_has_join(table_with_joins) {
-            return Err(Error::InvalidArgumentError(
-                "information_schema tables do not support JOIN clauses".into(),
-            ));
-        }
-
-        let table_key = object_name.to_ascii_lowercase();
-        match table_key.as_str() {
-            "tables" => {
-                let view = self.build_information_schema_tables_view()?;
-                self.execute_inline_view(
-                    select,
-                    query,
-                    "information_schema.tables".to_string(),
-                    alias.as_deref(),
-                    view,
-                )
-            }
-            "columns" => {
-                let view = self.build_information_schema_columns_view()?;
-                self.execute_inline_view(
-                    select,
-                    query,
-                    "information_schema.columns".to_string(),
-                    alias.as_deref(),
-                    view,
-                )
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn execute_inline_view(
         &self,
         select: &Select,
@@ -3507,73 +3464,6 @@ impl SqlEngine {
             schema: working_schema,
             execution: Box::new(execution),
         }))
-    }
-
-    fn build_information_schema_tables_view(&self) -> SqlResult<InlineView> {
-        let context = self.engine.context();
-        let mut table_names = context.catalog().table_names();
-        table_names.sort_by_key(|a| a.to_ascii_lowercase());
-
-        let mut view = InlineView::new(vec![
-            InlineColumn::utf8("table_schema", true),
-            InlineColumn::utf8("table_name", false),
-            InlineColumn::utf8("table_type", false),
-        ]);
-
-        for name in table_names {
-            let qualified = QualifiedTableName::from(name.as_str());
-            let schema = qualified.schema().map(|s| s.to_string());
-            let table = qualified.table().to_string();
-            view.add_row(vec![
-                InlineValue::String(schema),
-                InlineValue::String(Some(table)),
-                InlineValue::String(Some("BASE TABLE".into())),
-            ])?;
-        }
-
-        Ok(view)
-    }
-
-    fn build_information_schema_columns_view(&self) -> SqlResult<InlineView> {
-        let context = self.engine.context();
-        let catalog = context.catalog();
-        let mut table_names = catalog.table_names();
-        table_names.sort_by_key(|a| a.to_ascii_lowercase());
-
-        let mut view = InlineView::new(vec![
-            InlineColumn::utf8("table_schema", true),
-            InlineColumn::utf8("table_name", false),
-            InlineColumn::utf8("column_name", false),
-            InlineColumn::int32("ordinal_position", false),
-            InlineColumn::utf8("data_type", false),
-            InlineColumn::bool("is_nullable", false),
-            InlineColumn::bool("is_primary_key", false),
-            InlineColumn::bool("is_unique", false),
-            InlineColumn::utf8("check_expression", true),
-        ]);
-
-        for name in table_names {
-            let qualified = QualifiedTableName::from(name.as_str());
-            let schema = qualified.schema().map(|s| s.to_string());
-            let table = qualified.table().to_string();
-            let (_, canonical) = llkv_table::canonical_table_name(name.as_str())?;
-            let columns = catalog.table_column_specs(&canonical)?;
-            for (idx, col) in columns.iter().enumerate() {
-                view.add_row(vec![
-                    InlineValue::String(schema.clone()),
-                    InlineValue::String(Some(table.clone())),
-                    InlineValue::String(Some(col.name.clone())),
-                    InlineValue::Int32(Some((idx + 1) as i32)),
-                    InlineValue::String(Some(col.data_type.to_string())),
-                    InlineValue::Bool(Some(col.nullable)),
-                    InlineValue::Bool(Some(col.primary_key)),
-                    InlineValue::Bool(Some(col.unique)),
-                    InlineValue::String(col.check_expr.clone()),
-                ])?;
-            }
-        }
-
-        Ok(view)
     }
 
     fn handle_create_table_as(
@@ -4983,6 +4873,8 @@ impl SqlEngine {
         query: Query,
         visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
+        self.ensure_information_schema_ready()?;
+
         if let Some(result) = self.try_execute_simple_view_select(&query, visited_views)? {
             return Ok(result);
         }
@@ -4997,10 +4889,6 @@ impl SqlEngine {
 
         // Check for pragma_table_info() table function first
         if let Some(result) = self.try_handle_pragma_table_info(&query)? {
-            return Ok(result);
-        }
-
-        if let Some(result) = self.try_handle_information_schema(&query)? {
             return Ok(result);
         }
 
@@ -6925,6 +6813,38 @@ impl SqlEngine {
                         let use_nulls_first = matches!(normalized.as_deref(), Some("nulls_first"));
                         self.default_nulls_first
                             .store(use_nulls_first, AtomicOrdering::Relaxed);
+
+                        Ok(RuntimeStatementResult::NoOp)
+                    }
+                    "constraint_enforcement_mode" => {
+                        if values.len() != 1 {
+                            return Err(Error::InvalidArgumentError(
+                                "SET constraint_enforcement_mode expects exactly one value".into(),
+                            ));
+                        }
+
+                        let normalized = match &values[0] {
+                            SqlExpr::Value(value_with_span) => value_with_span
+                                .value
+                                .clone()
+                                .into_string()
+                                .map(|s| s.to_ascii_lowercase()),
+                            SqlExpr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                            _ => None,
+                        };
+
+                        let mode = match normalized.as_deref() {
+                            Some("immediate") => ConstraintEnforcementMode::Immediate,
+                            Some("deferred") => ConstraintEnforcementMode::Deferred,
+                            _ => {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "unsupported value for SET constraint_enforcement_mode: {}",
+                                    values[0]
+                                )));
+                            }
+                        };
+
+                        self.engine.session().set_constraint_enforcement_mode(mode);
 
                         Ok(RuntimeStatementResult::NoOp)
                     }
@@ -11026,6 +10946,59 @@ mod tests {
             }
         }
         values
+    }
+
+    #[test]
+    fn set_constraint_mode_updates_session() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Immediate
+        );
+
+        engine
+            .execute("SET constraint_enforcement_mode = deferred")
+            .expect("set deferred mode");
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Deferred
+        );
+
+        engine
+            .execute("SET constraint_enforcement_mode = IMMEDIATE")
+            .expect("set immediate mode");
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Immediate
+        );
+    }
+
+    #[test]
+    fn set_constraint_mode_is_session_scoped() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(Arc::clone(&pager));
+        let shared_context = engine.runtime_context();
+        let peer = SqlEngine::with_context(
+            Arc::clone(&shared_context),
+            engine.default_nulls_first_for_tests(),
+        );
+
+        engine
+            .execute("SET constraint_enforcement_mode = deferred")
+            .expect("set deferred mode");
+
+        assert_eq!(
+            engine.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Deferred
+        );
+        assert_eq!(
+            peer.session().constraint_enforcement_mode(),
+            ConstraintEnforcementMode::Immediate
+        );
     }
 
     #[test]

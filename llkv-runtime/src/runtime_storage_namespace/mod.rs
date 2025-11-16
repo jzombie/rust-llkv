@@ -8,8 +8,8 @@ pub mod namespace;
 pub mod registry;
 
 pub use namespace::{
-    PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace, RuntimeNamespaceId,
-    RuntimeStorageNamespace, RuntimeStorageNamespaceOps, TEMPORARY_NAMESPACE_ID,
-    TemporaryRuntimeNamespace,
+    INFORMATION_SCHEMA_NAMESPACE_ID, PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace,
+    RuntimeNamespaceId, RuntimeStorageNamespace, RuntimeStorageNamespaceOps,
+    TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace,
 };
 pub use registry::RuntimeStorageNamespaceRegistry;

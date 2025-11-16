@@ -270,6 +270,7 @@ where
             column_metas,
             constraint_records,
             multi_column_uniques,
+            constraint_names: _constraint_names,
         } = summary;
 
         // If table_meta is None, the table metadata isn't in our context's store.

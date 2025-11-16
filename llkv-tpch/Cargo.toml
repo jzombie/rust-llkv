@@ -11,10 +11,15 @@ publish.workspace = true
 arrow.workspace = true
 clap.workspace = true
 llkv.workspace = true
+llkv-table.workspace = true
 llkv-sql.workspace = true
+llkv-plan.workspace = true
+llkv-expr.workspace = true
 regex.workspace = true
+rust_decimal.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
 thiserror.workspace = true
 tpchgen.workspace = true
+time.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

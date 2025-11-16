@@ -9,7 +9,7 @@ use crate::{
     RuntimeSession, RuntimeStatementResult, RuntimeTableHandle, RuntimeTransactionContext,
     TXN_ID_AUTO_COMMIT, canonical_table_name, is_table_missing_error,
 };
-use llkv_column_map::store::ColumnStore;
+use llkv_column_map::store::{ColumnStore, ColumnStoreWriteHints};
 use llkv_executor::{ExecutorMultiColumnUnique, ExecutorTable};
 use llkv_plan::{
     AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateTableSource, CreateViewPlan,
@@ -21,8 +21,8 @@ use llkv_table::catalog::TableCatalog;
 use llkv_table::{
     CatalogDdl, CatalogManager, ConstraintService, MetadataManager, MultiColumnUniqueRegistration,
     SingleColumnIndexDescriptor, SingleColumnIndexRegistration, SysCatalog, TableId,
-    TriggerEventMeta, TriggerTimingMeta, ensure_multi_column_unique, ensure_single_column_unique,
-    validate_alter_table_operation,
+    TriggerEventMeta, TriggerTimingMeta, UniqueKey, build_composite_unique_key,
+    ensure_multi_column_unique, ensure_single_column_unique, validate_alter_table_operation,
 };
 use llkv_transaction::{TransactionManager, TransactionSnapshot, TxnId, TxnIdManager};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -257,6 +257,11 @@ where
         &self.store
     }
 
+    /// Expose storage-level write sizing hints for bulk ingest callers.
+    pub fn column_store_write_hints(&self) -> ColumnStoreWriteHints {
+        self.store.write_hints()
+    }
+
     /// Set a fallback context for cross-pager table lookups. The fallback uses BoxedPager
     /// to enable access across different underlying pager types (e.g., temporary MemPager
     /// can fall back to persistent disk pager).
@@ -487,6 +492,16 @@ where
     /// Get the table catalog for schema and table name management.
     pub fn table_catalog(&self) -> Arc<TableCatalog> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Enable caching of parent key sets for the specified referencing table.
+    pub fn enable_foreign_key_cache(&self, table_id: TableId) {
+        self.constraint_service.enable_foreign_key_cache(table_id);
+    }
+
+    /// Clear cached foreign key parent sets for the specified referencing table.
+    pub fn clear_foreign_key_cache(&self, table_id: TableId) {
+        self.constraint_service.clear_foreign_key_cache(table_id);
     }
 
     /// Access the catalog manager for type registry, view management, and metadata operations.
@@ -1012,7 +1027,13 @@ where
             let snapshot = self.default_snapshot();
             let existing_rows =
                 self.scan_multi_column_values(table.as_ref(), &field_ids, snapshot)?;
-            ensure_multi_column_unique(&existing_rows, &[], &column_names)?;
+            let mut existing_keys: Vec<UniqueKey> = Vec::with_capacity(existing_rows.len());
+            for values in existing_rows {
+                if let Some(key) = build_composite_unique_key(&values, &column_names)? {
+                    existing_keys.push(key);
+                }
+            }
+            ensure_multi_column_unique(&existing_keys, &[] as &[UniqueKey], &column_names)?;
 
             let executor_entry = ExecutorMultiColumnUnique {
                 index_name: index_name.clone(),

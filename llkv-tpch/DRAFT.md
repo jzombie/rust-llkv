@@ -1,3 +1,13 @@
+Quick profiling:
+
+```sh
+cargo build --release -p llkv-tpch             
+samply record --profile-name llkv-tpch -- \
+  target/release/llkv-tpch qualify --scale 1 --ref-scale 1 --query 1 --pager-diagnostics
+```
+
+-----
+
 https://www.tpc.org/tpch/
 
 Downloads: https://www.tpc.org/tpc_documents_current_versions/current_specifications5.asp

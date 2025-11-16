@@ -15,6 +15,10 @@
 - Maintain the column catalog that maps `LogicalFieldId` to the physical keys storing metadata and data pages.
 - Provide gather, scan, and append APIs used by [`llkv-table`](../llkv-table/) and the executor layer.
 
+### Write-Sizing Hints & Loader Tuning
+
+`ColumnStore::write_hints()` exposes the storage layer’s current guidance for chunk sizing, insert batch rows, and variable-width fallbacks. Bulk data loaders should resolve their batch size through this API instead of hard-coding constants, in order to keep memory usage at a minimum and ease write thrashing.
+
 ## Logical vs Physical Keys
 
 - `LogicalFieldId` encodes namespace (user data, row-id shadow, MVCC metadata), table ID, and field ID to avoid collisions across tables.

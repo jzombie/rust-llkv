@@ -381,11 +381,14 @@ where
         let mut table_columns: Vec<TableColumn> = Vec::with_capacity(schema.fields().len());
 
         for (idx, field) in schema.fields().iter().enumerate() {
+            // TODO: Extend with other supported types
             let data_type = match field.data_type() {
                 DataType::Int64
+                | DataType::Int32
                 | DataType::Float64
                 | DataType::Utf8
                 | DataType::Date32
+                | DataType::Boolean
                 | DataType::Struct(_) => field.data_type().clone(),
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
@@ -1346,12 +1349,14 @@ where
         let column_metas = self.metadata.column_metas(table_id, &field_ids)?;
         let constraint_records = self.metadata.constraint_records(table_id)?;
         let multi_column_uniques = self.metadata.multi_column_uniques(table_id)?;
+        let constraint_names = self.metadata.constraint_names(table_id)?;
 
         Ok(TableConstraintSummaryView {
             table_meta,
             column_metas,
             constraint_records,
             multi_column_uniques,
+            constraint_names,
         })
     }
 

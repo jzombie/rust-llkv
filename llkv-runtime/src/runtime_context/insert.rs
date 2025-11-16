@@ -18,6 +18,7 @@ use llkv_executor::{
 use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
+use llkv_table::ConstraintEnforcementMode;
 use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ where
         &self,
         plan: InsertPlan,
         snapshot: TransactionSnapshot,
+        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
         let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
         let table = self.lookup_table(&canonical_name)?;
@@ -75,6 +77,7 @@ where
                 plan.columns,
                 plan.on_conflict,
                 snapshot,
+                constraint_mode,
             ),
             InsertSource::Batches(batches) => self.insert_batches(
                 table.as_ref(),
@@ -83,6 +86,7 @@ where
                 batches,
                 plan.columns,
                 snapshot,
+                constraint_mode,
             ),
             InsertSource::Select { .. } => Err(Error::Internal(
                 "InsertSource::Select should be materialized before reaching RuntimeContext::insert"
@@ -123,6 +127,7 @@ where
         columns: Vec<String>,
         on_conflict: InsertConflictAction,
         snapshot: TransactionSnapshot,
+        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
         match on_conflict {
             InsertConflictAction::None
@@ -130,7 +135,15 @@ where
             | InsertConflictAction::Fail
             | InsertConflictAction::Rollback => {
                 // Standard INSERT behavior - fail on constraint violation
-                self.insert_rows(table, display_name, canonical_name, rows, columns, snapshot)
+                self.insert_rows(
+                    table,
+                    display_name,
+                    canonical_name,
+                    rows,
+                    columns,
+                    snapshot,
+                    constraint_mode,
+                )
             }
             InsertConflictAction::Replace => self.insert_rows_or_replace(
                 table,
@@ -139,6 +152,7 @@ where
                 rows,
                 columns,
                 snapshot,
+                constraint_mode,
             ),
             InsertConflictAction::Ignore => self.insert_rows_or_ignore(
                 table,
@@ -147,6 +161,7 @@ where
                 rows,
                 columns,
                 snapshot,
+                constraint_mode,
             ),
         }
     }
@@ -160,6 +175,7 @@ where
         mut rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
+        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
         if rows.is_empty() {
             return Err(Error::InvalidArgumentError(
@@ -209,19 +225,27 @@ where
             }
         }
 
-        self.constraint_service.validate_insert_constraints(
-            &constraint_ctx.schema_field_ids,
-            &constraint_ctx.column_constraints,
-            &constraint_ctx.unique_columns,
-            &constraint_ctx.multi_column_uniques,
-            primary_key_spec,
-            &column_order,
-            &rows,
-            |field_id| self.scan_column_values(table, field_id, snapshot),
-            |field_ids| self.scan_multi_column_values(table, field_ids, snapshot),
-        )?;
+        if constraint_mode.is_immediate() {
+            self.constraint_service.validate_insert_constraints(
+                &constraint_ctx.schema_field_ids,
+                &constraint_ctx.column_constraints,
+                &constraint_ctx.unique_columns,
+                &constraint_ctx.multi_column_uniques,
+                primary_key_spec,
+                &column_order,
+                &rows,
+                |field_id| self.scan_column_values(table, field_id, snapshot),
+                |field_ids| self.scan_multi_column_values(table, field_ids, snapshot),
+            )?;
 
-        self.check_foreign_keys_on_insert(table, &display_name, &rows, &column_order, snapshot)?;
+            self.check_foreign_keys_on_insert(
+                table,
+                &display_name,
+                &rows,
+                &column_order,
+                snapshot,
+            )?;
+        }
 
         let row_count = rows.len();
         let mut column_values: Vec<Vec<PlanValue>> =
@@ -293,6 +317,7 @@ where
         rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
+        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
         // Get the constraint context to know which columns have uniqueness constraints
         let constraint_ctx = self.build_table_constraint_context(table)?;
@@ -331,7 +356,15 @@ where
         }
 
         // Now insert the new rows
-        self.insert_rows(table, display_name, canonical_name, rows, columns, snapshot)
+        self.insert_rows(
+            table,
+            display_name,
+            canonical_name,
+            rows,
+            columns,
+            snapshot,
+            constraint_mode,
+        )
     }
 
     /// INSERT OR IGNORE: insert rows, silently skipping any that violate constraints.
@@ -343,6 +376,7 @@ where
         rows: Vec<Vec<PlanValue>>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
+        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
         // Try inserting rows one at a time, counting successes
         let mut rows_inserted = 0;
@@ -355,6 +389,7 @@ where
                 vec![row],
                 columns.clone(),
                 snapshot,
+                constraint_mode,
             ) {
                 Ok(_) => {
                     rows_inserted += 1;
@@ -385,6 +420,7 @@ where
         batches: Vec<RecordBatch>,
         columns: Vec<String>,
         snapshot: TransactionSnapshot,
+        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
         if batches.is_empty() {
             return Ok(RuntimeStatementResult::Insert {
@@ -429,6 +465,7 @@ where
                 rows,
                 columns.clone(),
                 snapshot,
+                constraint_mode,
             )? {
                 RuntimeStatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;

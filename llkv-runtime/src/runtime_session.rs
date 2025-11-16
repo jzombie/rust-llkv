@@ -1,13 +1,15 @@
 // TODO: Implement a common trait (similar to CatalogDdl) for runtime sessions and llkv-transaction sessions
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::types::TableId;
 use llkv_table::{
-    SingleColumnIndexDescriptor, canonical_table_name, validate_alter_table_operation,
+    ConstraintEnforcementMode, SingleColumnIndexDescriptor, canonical_table_name,
+    validate_alter_table_operation,
 };
 
 use crate::{
@@ -16,12 +18,12 @@ use crate::{
     InsertSource, PlanColumnSpec, PlanOperation, PlanValue, RenameTablePlan, RuntimeContext,
     RuntimeStatementResult, RuntimeTransactionContext, SelectExecution, SelectPlan,
     SelectProjection, TransactionContext, TransactionKind, TransactionResult, TransactionSession,
-    UpdatePlan,
+    UpdatePlan, information_schema::refresh_information_schema,
 };
 use crate::{
-    PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace, RuntimeNamespaceId,
-    RuntimeStorageNamespace, RuntimeStorageNamespaceRegistry, TEMPORARY_NAMESPACE_ID,
-    TemporaryRuntimeNamespace,
+    INFORMATION_SCHEMA_NAMESPACE_ID, PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace,
+    RuntimeNamespaceId, RuntimeStorageNamespace, RuntimeStorageNamespaceRegistry,
+    TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace,
 };
 use llkv_plan::TruncatePlan;
 
@@ -29,9 +31,29 @@ type StatementResult = RuntimeStatementResult<BoxedPager>;
 type TxnResult = TransactionResult<BoxedPager>;
 type BaseTxnContext = RuntimeTransactionContext<BoxedPager>;
 
+const TEMPORARY_TABLE_ID_START: TableId = 0x8000;
+const INFORMATION_SCHEMA_TABLE_ID_START: TableId = 0xC000;
+
+static INFORMATION_SCHEMA_NAMESPACE_POOL: OnceLock<
+    Mutex<HashMap<usize, Weak<TemporaryRuntimeNamespace>>>,
+> = OnceLock::new();
+
+fn information_schema_namespace_pool()
+-> &'static Mutex<HashMap<usize, Weak<TemporaryRuntimeNamespace>>> {
+    INFORMATION_SCHEMA_NAMESPACE_POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn information_schema_read_only_error(operation: &str) -> Error {
+    Error::CatalogError(format!(
+        "information_schema is read-only: {} operations are not supported",
+        operation
+    ))
+}
+
 pub(crate) struct SessionNamespaces {
     persistent: Arc<PersistentRuntimeNamespace>,
     temporary: Option<Arc<TemporaryRuntimeNamespace>>,
+    information_schema: Arc<TemporaryRuntimeNamespace>,
     registry: Arc<RwLock<RuntimeStorageNamespaceRegistry>>,
 }
 
@@ -46,6 +68,42 @@ impl SessionNamespaces {
             RuntimeStorageNamespace::namespace_id(persistent.as_ref()).clone(),
         );
         registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
+
+        let information_schema = {
+            let key = Arc::as_ptr(&base_context) as usize;
+            let namespace = {
+                let mut pool = information_schema_namespace_pool()
+                    .lock()
+                    .expect("information_schema namespace pool poisoned");
+                if let Some(existing) = pool.get(&key).and_then(|weak| weak.upgrade()) {
+                    existing
+                } else {
+                    let shared_catalog = base_context.table_catalog();
+                    let mem_pager = Arc::new(MemPager::default());
+                    let boxed_pager = Arc::new(BoxedPager::from_arc(mem_pager));
+                    let context = Arc::new(RuntimeContext::new_with_catalog(
+                        boxed_pager,
+                        Arc::clone(&shared_catalog),
+                    ));
+                    context
+                        .ensure_next_table_id_at_least(INFORMATION_SCHEMA_TABLE_ID_START)
+                        .expect("failed to seed information_schema table id counter");
+
+                    let namespace = Arc::new(TemporaryRuntimeNamespace::new(
+                        INFORMATION_SCHEMA_NAMESPACE_ID.to_string(),
+                        context,
+                    ));
+                    pool.insert(key, Arc::downgrade(&namespace));
+                    namespace
+                }
+            };
+            registry.register_namespace(
+                Arc::clone(&namespace),
+                vec![INFORMATION_SCHEMA_NAMESPACE_ID.to_string()],
+                false,
+            );
+            namespace
+        };
 
         let temporary = {
             // ARCHITECTURAL DECISION: Multi-pager arena via fallback lookup
@@ -71,7 +129,6 @@ impl SessionNamespaces {
                     .with_fallback_lookup(Arc::clone(&base_context)),
             );
 
-            const TEMPORARY_TABLE_ID_START: TableId = 0x8000;
             temp_context
                 .ensure_next_table_id_at_least(TEMPORARY_TABLE_ID_START)
                 .expect("failed to seed temporary namespace table id counter");
@@ -91,6 +148,7 @@ impl SessionNamespaces {
         Self {
             persistent,
             temporary: Some(temporary),
+            information_schema,
             registry: Arc::new(RwLock::new(registry)),
         }
     }
@@ -101,6 +159,10 @@ impl SessionNamespaces {
 
     pub(crate) fn temporary(&self) -> Option<Arc<TemporaryRuntimeNamespace>> {
         self.temporary.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn information_schema(&self) -> Arc<TemporaryRuntimeNamespace> {
+        Arc::clone(&self.information_schema)
     }
 
     pub(crate) fn registry(&self) -> Arc<RwLock<RuntimeStorageNamespaceRegistry>> {
@@ -132,6 +194,7 @@ pub struct RuntimeSession {
         RuntimeTransactionContext<MemPager>,
     >,
     namespaces: Arc<SessionNamespaces>,
+    constraint_mode: Arc<RwLock<ConstraintEnforcementMode>>,
 }
 
 impl RuntimeSession {
@@ -142,20 +205,74 @@ impl RuntimeSession {
         >,
         namespaces: Arc<SessionNamespaces>,
     ) -> Self {
-        Self { inner, namespaces }
+        let session = Self {
+            inner,
+            namespaces,
+            constraint_mode: Arc::new(RwLock::new(ConstraintEnforcementMode::Immediate)),
+        };
+        session.apply_constraint_mode_to_base(ConstraintEnforcementMode::Immediate);
+        session
     }
 
     /// Clone this session (reuses the same underlying TransactionSession).
     /// This is necessary to maintain transaction state across Engine clones.
     pub(crate) fn clone_session(&self) -> Self {
-        Self {
+        let session = Self {
             inner: self.inner.clone_session(),
             namespaces: self.namespaces.clone(),
-        }
+            constraint_mode: Arc::clone(&self.constraint_mode),
+        };
+        let mode = session.constraint_enforcement_mode();
+        session.apply_constraint_mode_to_base(mode);
+        session
+    }
+
+    fn new_temp_tx_context(
+        &self,
+        context: Arc<RuntimeContext<BoxedPager>>,
+    ) -> RuntimeTransactionContext<BoxedPager> {
+        let tx = RuntimeTransactionContext::new(context);
+        tx.set_constraint_mode(self.constraint_enforcement_mode());
+        tx
     }
 
     pub fn namespace_registry(&self) -> Arc<RwLock<RuntimeStorageNamespaceRegistry>> {
         self.namespaces.registry()
+    }
+
+    fn apply_constraint_mode_to_base(&self, mode: ConstraintEnforcementMode) {
+        self.inner.context().set_constraint_mode(mode);
+    }
+
+    pub fn set_constraint_enforcement_mode(&self, mode: ConstraintEnforcementMode) {
+        let previous = {
+            let mut guard = self
+                .constraint_mode
+                .write()
+                .expect("constraint mode lock poisoned");
+            if *guard == mode {
+                None
+            } else {
+                let old = *guard;
+                *guard = mode;
+                Some(old)
+            }
+        };
+        if let Some(old) = previous {
+            tracing::warn!(
+                "Session constraint enforcement mode changed from {:?} to {:?}",
+                old,
+                mode
+            );
+        }
+        self.apply_constraint_mode_to_base(mode);
+    }
+
+    pub fn constraint_enforcement_mode(&self) -> ConstraintEnforcementMode {
+        *self
+            .constraint_mode
+            .read()
+            .expect("constraint mode lock poisoned")
     }
 
     fn resolve_namespace_for_table(&self, canonical: &str) -> RuntimeNamespaceId {
@@ -175,19 +292,19 @@ impl RuntimeSession {
         Some(self.resolve_namespace_for_table(&canonical))
     }
 
-    fn select_from_temporary(&self, plan: SelectPlan) -> Result<StatementResult> {
-        let temp_namespace = self
-            .temporary_namespace()
-            .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-
+    fn select_from_namespace(
+        &self,
+        namespace: Arc<TemporaryRuntimeNamespace>,
+        plan: SelectPlan,
+    ) -> Result<StatementResult> {
         let table_name = if plan.tables.len() == 1 {
             plan.tables[0].qualified_name()
         } else {
             String::new()
         };
 
-        let temp_context = temp_namespace.context();
-        let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+        let context = namespace.context();
+        let temp_tx_context = self.new_temp_tx_context(context);
         let execution = TransactionContext::execute_select(&temp_tx_context, plan)?;
         let schema = execution.schema();
         let batches = execution.collect()?;
@@ -220,8 +337,14 @@ impl RuntimeSession {
         self.namespaces.temporary()
     }
 
+    fn information_schema_namespace(&self) -> Arc<TemporaryRuntimeNamespace> {
+        self.namespaces.information_schema()
+    }
+
     fn base_transaction_context(&self) -> Arc<BaseTxnContext> {
-        Arc::clone(self.inner.context())
+        let ctx = Arc::clone(self.inner.context());
+        ctx.set_constraint_mode(self.constraint_enforcement_mode());
+        ctx
     }
 
     fn with_autocommit_transaction_context<F, T>(&self, f: F) -> Result<T>
@@ -335,6 +458,7 @@ impl RuntimeSession {
         // No data copying occurs at BEGIN - this is pure MVCC.
 
         let staging_wrapper = Arc::new(RuntimeTransactionContext::new(staging_ctx));
+        staging_wrapper.set_constraint_mode(self.constraint_enforcement_mode());
 
         self.inner.begin_transaction(staging_wrapper)?;
         Ok(RuntimeStatementResult::Transaction {
@@ -580,7 +704,7 @@ impl RuntimeSession {
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::insert(&temp_tx_context, plan)? {
                     TransactionResult::Insert { .. } => {}
                     _ => {
@@ -594,6 +718,7 @@ impl RuntimeSession {
                     table_name,
                 })
             }
+            INFORMATION_SCHEMA_NAMESPACE_ID => Err(information_schema_read_only_error("INSERT")),
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     match self.inner.execute_operation(PlanOperation::Insert(plan)) {
@@ -639,10 +764,17 @@ impl RuntimeSession {
 
     /// Select rows (outside or inside transaction).
     pub fn execute_select_plan(&self, plan: SelectPlan) -> Result<StatementResult> {
-        if let Some(namespace_id) = self.namespace_for_select_plan(&plan)
-            && namespace_id == TEMPORARY_NAMESPACE_ID
-        {
-            return self.select_from_temporary(plan);
+        if let Some(namespace_id) = self.namespace_for_select_plan(&plan) {
+            if namespace_id == TEMPORARY_NAMESPACE_ID {
+                let namespace = self
+                    .temporary_namespace()
+                    .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
+                return self.select_from_namespace(namespace, plan);
+            }
+            if namespace_id == INFORMATION_SCHEMA_NAMESPACE_ID {
+                let namespace = self.information_schema_namespace();
+                return self.select_from_namespace(namespace, plan);
+            }
         }
 
         if self.has_active_transaction() {
@@ -724,6 +856,24 @@ impl RuntimeSession {
         }
     }
 
+    /// Rebuilds `information_schema.*` tables inside the in-memory namespace.
+    ///
+    /// This forwards to the runtime’s refresh helper, which issues in-memory CTAS
+    /// batches derived from catalog metadata. No user tables are scanned, no data
+    /// reaches the persistent pager heap, and only the MemPager-backed
+    /// information_schema objects are dropped and recreated.
+    pub fn refresh_information_schema(&self) -> Result<()> {
+        let persistent = self.persistent_namespace();
+        let info_namespace = self.information_schema_namespace();
+        let registry = self.namespace_registry();
+        refresh_information_schema(
+            &persistent.context(),
+            &info_namespace.context(),
+            &registry,
+            info_namespace.namespace_id(),
+        )
+    }
+
     pub fn execute_update_plan(&self, plan: UpdatePlan) -> Result<StatementResult> {
         let (_, canonical_table) = canonical_table_name(&plan.table)?;
         let namespace_id = self.resolve_namespace_for_table(&canonical_table);
@@ -735,7 +885,7 @@ impl RuntimeSession {
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
                 let table_name = plan.table.clone();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::update(&temp_tx_context, plan)? {
                     TransactionResult::Update { rows_updated, .. } => {
                         Ok(RuntimeStatementResult::Update {
@@ -748,6 +898,7 @@ impl RuntimeSession {
                     )),
                 }
             }
+            INFORMATION_SCHEMA_NAMESPACE_ID => Err(information_schema_read_only_error("UPDATE")),
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     let table_name = plan.table.clone();
@@ -802,7 +953,7 @@ impl RuntimeSession {
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
                 let table_name = plan.table.clone();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::delete(&temp_tx_context, plan)? {
                     TransactionResult::Delete { rows_deleted } => {
                         Ok(RuntimeStatementResult::Delete {
@@ -815,6 +966,7 @@ impl RuntimeSession {
                     )),
                 }
             }
+            INFORMATION_SCHEMA_NAMESPACE_ID => Err(information_schema_read_only_error("DELETE")),
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     let table_name = plan.table.clone();
@@ -867,7 +1019,7 @@ impl RuntimeSession {
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 let temp_context = temp_namespace.context();
                 let table_name = plan.table.clone();
-                let temp_tx_context = RuntimeTransactionContext::new(temp_context);
+                let temp_tx_context = self.new_temp_tx_context(temp_context);
                 match TransactionContext::truncate(&temp_tx_context, plan)? {
                     TransactionResult::Delete { rows_deleted } => {
                         Ok(RuntimeStatementResult::Delete {
@@ -880,6 +1032,7 @@ impl RuntimeSession {
                     )),
                 }
             }
+            INFORMATION_SCHEMA_NAMESPACE_ID => Err(information_schema_read_only_error("TRUNCATE")),
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     let table_name = plan.table.clone();
@@ -943,6 +1096,9 @@ impl CatalogDdl for RuntimeSession {
         let plan = self.materialize_ctas_plan(plan)?;
 
         match target_namespace.as_str() {
+            INFORMATION_SCHEMA_NAMESPACE_ID => {
+                Err(information_schema_read_only_error("CREATE TABLE"))
+            }
             TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
@@ -1011,6 +1167,9 @@ impl CatalogDdl for RuntimeSession {
                     .unregister_table(&canonical_table);
                 Ok(RuntimeStatementResult::NoOp)
             }
+            INFORMATION_SCHEMA_NAMESPACE_ID => {
+                Err(information_schema_read_only_error("DROP TABLE"))
+            }
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
                     let referencing_tables = self.tables_referencing_in_transaction(&plan.name);
@@ -1075,6 +1234,9 @@ impl CatalogDdl for RuntimeSession {
             .to_ascii_lowercase();
 
         match target_namespace.as_str() {
+            INFORMATION_SCHEMA_NAMESPACE_ID => {
+                Err(information_schema_read_only_error("CREATE VIEW"))
+            }
             TEMPORARY_NAMESPACE_ID => {
                 let temp_namespace = self
                     .temporary_namespace()
@@ -1117,6 +1279,7 @@ impl CatalogDdl for RuntimeSession {
                     .unregister_table(&canonical_view);
                 Ok(())
             }
+            INFORMATION_SCHEMA_NAMESPACE_ID => Err(information_schema_read_only_error("DROP VIEW")),
             PERSISTENT_NAMESPACE_ID => {
                 let persistent_namespace = self.persistent_namespace();
                 persistent_namespace.drop_view(plan)
@@ -1156,6 +1319,9 @@ impl CatalogDdl for RuntimeSession {
                     Err(err) if plan.if_exists && super::is_table_missing_error(&err) => Ok(()),
                     Err(err) => Err(err),
                 }
+            }
+            INFORMATION_SCHEMA_NAMESPACE_ID => {
+                Err(information_schema_read_only_error("RENAME TABLE"))
             }
             PERSISTENT_NAMESPACE_ID => match self.run_autocommit_rename_table(plan.clone()) {
                 Ok(()) => Ok(()),
@@ -1197,6 +1363,9 @@ impl CatalogDdl for RuntimeSession {
                 validate_alter_table_operation(&plan.operation, &view, table_id, catalog_service)?;
 
                 Ok(temp_namespace.alter_table(plan)?)
+            }
+            INFORMATION_SCHEMA_NAMESPACE_ID => {
+                Err(information_schema_read_only_error("ALTER TABLE"))
             }
             PERSISTENT_NAMESPACE_ID => {
                 let persistent = self.persistent_namespace();
@@ -1242,6 +1411,9 @@ impl CatalogDdl for RuntimeSession {
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
                 Ok(temp_namespace.create_index(plan)?)
+            }
+            INFORMATION_SCHEMA_NAMESPACE_ID => {
+                Err(information_schema_read_only_error("CREATE INDEX"))
             }
             PERSISTENT_NAMESPACE_ID => {
                 if self.has_active_transaction() {
