@@ -570,10 +570,7 @@ impl SqlEngine {
     }
 
     fn ensure_information_schema_ready(&self) -> SqlResult<()> {
-        if !self
-            .information_schema_ready
-            .load(AtomicOrdering::Acquire)
-        {
+        if !self.information_schema_ready.load(AtomicOrdering::Acquire) {
             self.engine.refresh_information_schema()?;
             self.information_schema_ready
                 .store(true, AtomicOrdering::Release);

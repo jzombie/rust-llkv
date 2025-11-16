@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arrow::array::{ArrayRef, BooleanArray, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -9,17 +9,14 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::resolvers::QualifiedTableName;
 use llkv_table::{
-    CatalogDdl,
-    ConstraintId,
-    ConstraintKind,
-    FieldId,
-    ForeignKeyAction as CatalogForeignKeyAction,
-    TableConstraintSummaryView,
-    TableId,
+    CatalogDdl, ConstraintId, ConstraintKind, FieldId, ForeignKeyAction as CatalogForeignKeyAction,
+    TableConstraintSummaryView, TableId,
 };
 use rustc_hash::FxHashMap;
 
-use crate::{RuntimeContext, canonical_table_name};
+use crate::{
+    RuntimeContext, RuntimeNamespaceId, RuntimeStorageNamespaceRegistry, canonical_table_name,
+};
 
 #[derive(Clone)]
 pub(crate) struct InformationSchemaTableData {
@@ -64,58 +61,83 @@ pub(crate) fn build_information_schema_tables(
 /// This helper performs three high-level steps:
 /// 1. Snapshot table/constraint metadata directly from the catalog (no user data scan).
 /// 2. Materialize Arrow batches entirely in memory to represent each system table.
-/// 3. Drop and recreate the `information_schema.*` tables through `CatalogDdl` using
-///    `CreateTableSource::Batches`, which never touches the persistent pager heap.
+/// 3. Drop and recreate the `information_schema.*` tables inside the dedicated
+///    `information_schema` runtime namespace using `CreateTableSource::Batches`, which
+///    keeps all writes on a MemPager-backed heap.
 ///
-/// The recreated tables are real catalog entries that live in the persistent namespace,
-/// so regular SQL queries can join against them just like any other base table. The only
-/// difference is that their contents are regenerated on demand rather than being backed
-/// by user data pages. Because the batches are synthetic and scoped to catalog metadata,
-/// the refresh is safe to call from tooling like `llkv-tpch install`—it cannot dirty user
-/// tables, advance WAL state, or trigger full scans on the primary pager.
+/// The recreated tables stay queryable through regular SQL because the namespace
+/// registers its objects with the shared catalog, but their pages and metadata live in a
+/// transient pager arena that never touches persistent storage. The refresh is safe to
+/// call from tooling like `llkv-tpch install`—it cannot dirty user tables, advance WAL
+/// state, or trigger full scans on the primary pager.
 pub(crate) fn refresh_information_schema(
-    context: &Arc<RuntimeContext<BoxedPager>>,
+    source_context: &Arc<RuntimeContext<BoxedPager>>,
+    target_context: &Arc<RuntimeContext<BoxedPager>>,
+    registry: &Arc<RwLock<RuntimeStorageNamespaceRegistry>>,
+    namespace_id: &RuntimeNamespaceId,
 ) -> Result<()> {
-    let tables = build_information_schema_tables(context.as_ref())?;
-    recreate_information_schema_tables(context.as_ref(), tables)?;
+    let tables = build_information_schema_tables(source_context.as_ref())?;
+    recreate_information_schema_tables(
+        source_context.as_ref(),
+        target_context.as_ref(),
+        registry,
+        namespace_id,
+        tables,
+    )?;
 
     // Run a second pass for the metadata tables once the rest of the
     // information_schema objects exist so they list themselves and stay discoverable.
     let metadata_tables = vec![
-        build_tables_table(context.as_ref())?,
-        build_columns_table(context.as_ref())?,
+        build_tables_table(source_context.as_ref())?,
+        build_columns_table(source_context.as_ref())?,
     ];
-    recreate_information_schema_tables(context.as_ref(), metadata_tables)
+    recreate_information_schema_tables(
+        source_context.as_ref(),
+        target_context.as_ref(),
+        registry,
+        namespace_id,
+        metadata_tables,
+    )
 }
 
 fn recreate_information_schema_tables(
-    context: &RuntimeContext<BoxedPager>,
+    source_context: &RuntimeContext<BoxedPager>,
+    target_context: &RuntimeContext<BoxedPager>,
+    registry: &Arc<RwLock<RuntimeStorageNamespaceRegistry>>,
+    namespace_id: &RuntimeNamespaceId,
     tables: Vec<InformationSchemaTableData>,
 ) -> Result<()> {
-    let table_names: Vec<String> = tables.iter().map(|table| table.name.to_string()).collect();
-
-    for name in &table_names {
-        let plan = DropTablePlan::new(name.clone()).if_exists(true);
-        CatalogDdl::drop_table(context, plan)?;
-    }
-
     for table in tables {
-        let mut plan = CreateTablePlan::new(table.name);
+        let (display_name, canonical_name) = canonical_table_name(table.name)?;
+
+        let drop_plan = DropTablePlan::new(display_name.clone()).if_exists(true);
+        if !std::ptr::eq(source_context, target_context) {
+            CatalogDdl::drop_table(source_context, drop_plan.clone())?;
+        }
+        CatalogDdl::drop_table(target_context, drop_plan)?;
+        {
+            let mut guard = registry.write().expect("namespace registry poisoned");
+            guard.unregister_table(&canonical_name);
+        }
+
+        let mut plan = CreateTablePlan::new(display_name);
         plan.or_replace = true;
         plan.source = Some(CreateTableSource::Batches {
             schema: Arc::clone(&table.schema),
             batches: table.batches.clone(),
         });
         plan.columns.clear();
-        CatalogDdl::create_table(context, plan)?;
+        CatalogDdl::create_table(target_context, plan)?;
+        {
+            let mut guard = registry.write().expect("namespace registry poisoned");
+            guard.register_table(namespace_id, canonical_name.clone());
+        }
     }
 
     Ok(())
 }
 
-fn build_tables_table(
-    context: &RuntimeContext<BoxedPager>,
-) -> Result<InformationSchemaTableData> {
+fn build_tables_table(context: &RuntimeContext<BoxedPager>) -> Result<InformationSchemaTableData> {
     let catalog = context.catalog();
     let mut table_names = catalog.table_names();
     table_names.sort_by_key(|name| name.to_ascii_lowercase());
@@ -150,9 +172,7 @@ fn build_tables_table(
     ))
 }
 
-fn build_columns_table(
-    context: &RuntimeContext<BoxedPager>,
-) -> Result<InformationSchemaTableData> {
+fn build_columns_table(context: &RuntimeContext<BoxedPager>) -> Result<InformationSchemaTableData> {
     let catalog = context.catalog();
     let mut table_names = catalog.table_names();
     table_names.sort_by_key(|name| name.to_ascii_lowercase());
@@ -318,11 +338,7 @@ fn build_key_column_usage_table(
         Field::new("table_name", DataType::Utf8, false),
         Field::new("column_name", DataType::Utf8, false),
         Field::new("ordinal_position", DataType::Int32, false),
-        Field::new(
-            "position_in_unique_constraint",
-            DataType::Int32,
-            true,
-        ),
+        Field::new("position_in_unique_constraint", DataType::Int32, true),
     ];
     let schema = Arc::new(Schema::new(fields));
     let arrays: Vec<ArrayRef> = vec![
@@ -603,7 +619,10 @@ fn collect_information_schema_cache(
             }
         }
 
-        for unique in multi_column_uniques.into_iter().filter(|entry| entry.unique) {
+        for unique in multi_column_uniques
+            .into_iter()
+            .filter(|entry| entry.unique)
+        {
             let name = unique
                 .index_name
                 .clone()
@@ -641,10 +660,8 @@ fn collect_information_schema_cache(
             if constraint.column_ids.is_empty() {
                 continue;
             }
-            let key = InformationSchemaCache::constraint_key(
-                snapshot.table_id,
-                &constraint.column_ids,
-            );
+            let key =
+                InformationSchemaCache::constraint_key(snapshot.table_id, &constraint.column_ids);
             unique_lookup
                 .entry(key)
                 .or_insert_with(|| InformationSchemaUniqueRef {
