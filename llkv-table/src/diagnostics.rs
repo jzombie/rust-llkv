@@ -26,7 +26,7 @@ pub struct TablePagerIngestionSample {
 }
 
 impl TablePagerIngestionSample {
-    /// Overwrite percentage (0-100) derived from [`IoStatsSnapshot::overwrite_put_bytes`].
+    /// Overwrite percentage (0-100) derived from [`IoStatsSnapshot::overwritten_put_bytes`].
     pub fn overwrite_pct(&self) -> f64 {
         self.delta.overwrite_pct()
     }

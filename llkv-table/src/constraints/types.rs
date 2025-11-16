@@ -12,9 +12,10 @@ use bitcode::{Decode, Encode};
 use crate::types::{FieldId, RowId, TableId};
 
 /// Controls when constraint validation occurs for new writes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Default)]
 pub enum ConstraintEnforcementMode {
     /// Perform all constraint checks before rows become visible.
+    #[default]
     Immediate,
     /// Defer checks so callers can load data quickly and validate later.
     Deferred,
@@ -29,12 +30,6 @@ impl ConstraintEnforcementMode {
     #[inline]
     pub const fn is_deferred(self) -> bool {
         matches!(self, ConstraintEnforcementMode::Deferred)
-    }
-}
-
-impl Default for ConstraintEnforcementMode {
-    fn default() -> Self {
-        ConstraintEnforcementMode::Immediate
     }
 }
 

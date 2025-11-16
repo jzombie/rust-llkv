@@ -57,7 +57,7 @@ impl RuntimeEngine {
 
     /// Rebuilds the information schema tables strictly in-memory.
     ///
-    /// This forwards to [`information_schema::refresh_information_schema`], which
+    /// This forwards to [`RuntimeSession::refresh_information_schema`], which
     /// materializes the system tables from catalog metadata and issues CTAS commands
     /// without touching the primary pager heap or any user tables.
     pub fn refresh_information_schema(&self) -> Result<()> {

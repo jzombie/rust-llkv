@@ -21,6 +21,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
 
+type ForeignKeyConstraintCache = FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>;
+type ForeignKeyCacheMap = FxHashMap<TableId, ForeignKeyConstraintCache>;
+type SharedForeignKeyCaches = Arc<RwLock<ForeignKeyCacheMap>>;
+
 /// Column metadata required to validate NOT NULL and CHECK constraints during inserts.
 #[derive(Clone, Debug)]
 pub struct InsertColumnConstraint {
@@ -73,8 +77,7 @@ where
 {
     metadata: Arc<MetadataManager<P>>,
     catalog: Arc<TableCatalog>,
-    fk_parent_caches:
-        Arc<RwLock<FxHashMap<TableId, FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>>>>,
+    fk_parent_caches: SharedForeignKeyCaches,
 }
 
 impl<P> ConstraintService<P>
@@ -96,9 +99,7 @@ where
             .fk_parent_caches
             .write()
             .expect("foreign key cache poisoned");
-        caches
-            .entry(referencing_table_id)
-            .or_insert_with(FxHashMap::default);
+        caches.entry(referencing_table_id).or_default();
     }
 
     /// Clear any cached parent keys associated with the provided referencing table.

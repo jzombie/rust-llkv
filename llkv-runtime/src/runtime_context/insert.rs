@@ -79,15 +79,17 @@ where
                 snapshot,
                 constraint_mode,
             ),
-            InsertSource::Batches(batches) => self.insert_batches(
-                table.as_ref(),
-                display_name.clone(),
-                canonical_name.clone(),
-                batches,
-                plan.columns,
-                snapshot,
-                constraint_mode,
-            ),
+            InsertSource::Batches(batches) => {
+                let ctx = InsertExecContext::new(
+                    table.as_ref(),
+                    display_name.clone(),
+                    canonical_name.clone(),
+                    plan.columns,
+                    snapshot,
+                    constraint_mode,
+                );
+                self.insert_batches(ctx, batches)
+            }
             InsertSource::Select { .. } => Err(Error::Internal(
                 "InsertSource::Select should be materialized before reaching RuntimeContext::insert"
                     .into(),
@@ -117,7 +119,6 @@ where
     }
 
     /// Insert rows with conflict resolution handling.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_rows_with_conflict(
         &self,
         table: &ExecutorTable<P>,
@@ -129,54 +130,42 @@ where
         snapshot: TransactionSnapshot,
         constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
+        let ctx = InsertExecContext::new(
+            table,
+            display_name,
+            canonical_name,
+            columns,
+            snapshot,
+            constraint_mode,
+        );
+
         match on_conflict {
             InsertConflictAction::None
             | InsertConflictAction::Abort
             | InsertConflictAction::Fail
             | InsertConflictAction::Rollback => {
                 // Standard INSERT behavior - fail on constraint violation
-                self.insert_rows(
-                    table,
-                    display_name,
-                    canonical_name,
-                    rows,
-                    columns,
-                    snapshot,
-                    constraint_mode,
-                )
+                self.insert_rows(ctx.clone(), rows)
             }
-            InsertConflictAction::Replace => self.insert_rows_or_replace(
-                table,
-                display_name,
-                canonical_name,
-                rows,
-                columns,
-                snapshot,
-                constraint_mode,
-            ),
-            InsertConflictAction::Ignore => self.insert_rows_or_ignore(
-                table,
-                display_name,
-                canonical_name,
-                rows,
-                columns,
-                snapshot,
-                constraint_mode,
-            ),
+            InsertConflictAction::Replace => self.insert_rows_or_replace(ctx.clone(), rows),
+            InsertConflictAction::Ignore => self.insert_rows_or_ignore(ctx, rows),
         }
     }
 
     /// Insert rows into a table with full constraint and foreign key validation.
     pub(super) fn insert_rows(
         &self,
-        table: &ExecutorTable<P>,
-        display_name: String,
-        canonical_name: String,
+        ctx: InsertExecContext<'_, P>,
         mut rows: Vec<Vec<PlanValue>>,
-        columns: Vec<String>,
-        snapshot: TransactionSnapshot,
-        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
+        let InsertExecContext {
+            table,
+            display_name,
+            canonical_name,
+            columns,
+            snapshot,
+            constraint_mode,
+        } = ctx;
         if rows.is_empty() {
             return Err(Error::InvalidArgumentError(
                 "INSERT requires at least one row".into(),
@@ -311,19 +300,15 @@ where
     /// would be violated, delete the existing row(s) that conflict, then insert the new row.
     fn insert_rows_or_replace(
         &self,
-        table: &ExecutorTable<P>,
-        display_name: String,
-        canonical_name: String,
+        ctx: InsertExecContext<'_, P>,
         rows: Vec<Vec<PlanValue>>,
-        columns: Vec<String>,
-        snapshot: TransactionSnapshot,
-        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
+        let table = ctx.table;
         // Get the constraint context to know which columns have uniqueness constraints
         let constraint_ctx = self.build_table_constraint_context(table)?;
 
         // If columns is empty, it means "all columns in order"
-        let columns_for_search = if columns.is_empty() {
+        let columns_for_search = if ctx.columns.is_empty() {
             table
                 .schema
                 .columns
@@ -331,7 +316,7 @@ where
                 .map(|c| c.name.clone())
                 .collect()
         } else {
-            columns.clone()
+            ctx.columns.clone()
         };
 
         // Proactively find conflicting rows by scanning for matches on unique/primary key columns
@@ -340,57 +325,36 @@ where
             &rows,
             &columns_for_search,
             &constraint_ctx,
-            snapshot,
+            ctx.snapshot,
         )?;
 
         // Delete conflicting rows BEFORE inserting (without foreign key enforcement since we're replacing)
         if !row_ids.is_empty() {
             self.apply_delete(
                 table,
-                display_name.clone(),
-                canonical_name.clone(),
+                ctx.display_name.clone(),
+                ctx.canonical_name.clone(),
                 row_ids,
-                snapshot,
+                ctx.snapshot,
                 false, // Don't enforce foreign keys for REPLACE
             )?;
         }
 
         // Now insert the new rows
-        self.insert_rows(
-            table,
-            display_name,
-            canonical_name,
-            rows,
-            columns,
-            snapshot,
-            constraint_mode,
-        )
+        self.insert_rows(ctx, rows)
     }
 
     /// INSERT OR IGNORE: insert rows, silently skipping any that violate constraints.
     fn insert_rows_or_ignore(
         &self,
-        table: &ExecutorTable<P>,
-        display_name: String,
-        canonical_name: String,
+        ctx: InsertExecContext<'_, P>,
         rows: Vec<Vec<PlanValue>>,
-        columns: Vec<String>,
-        snapshot: TransactionSnapshot,
-        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
         // Try inserting rows one at a time, counting successes
         let mut rows_inserted = 0;
 
         for row in rows {
-            match self.insert_rows(
-                table,
-                display_name.clone(),
-                canonical_name.clone(),
-                vec![row],
-                columns.clone(),
-                snapshot,
-                constraint_mode,
-            ) {
+            match self.insert_rows(ctx.clone(), vec![row]) {
                 Ok(_) => {
                     rows_inserted += 1;
                 }
@@ -406,7 +370,7 @@ where
         }
 
         Ok(RuntimeStatementResult::Insert {
-            table_name: display_name,
+            table_name: ctx.display_name.clone(),
             rows_inserted,
         })
     }
@@ -414,25 +378,21 @@ where
     /// Multiple batches of rows into a table.
     pub(super) fn insert_batches(
         &self,
-        table: &ExecutorTable<P>,
-        display_name: String,
-        canonical_name: String,
+        ctx: InsertExecContext<'_, P>,
         batches: Vec<RecordBatch>,
-        columns: Vec<String>,
-        snapshot: TransactionSnapshot,
-        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
+        let table = ctx.table;
         if batches.is_empty() {
             return Ok(RuntimeStatementResult::Insert {
-                table_name: display_name,
+                table_name: ctx.display_name.clone(),
                 rows_inserted: 0,
             });
         }
 
-        let expected_len = if columns.is_empty() {
+        let expected_len = if ctx.columns.is_empty() {
             table.schema.columns.len()
         } else {
-            columns.len()
+            ctx.columns.len()
         };
         let mut total_rows_inserted = 0usize;
 
@@ -458,15 +418,7 @@ where
                 rows.push(row);
             }
 
-            match self.insert_rows(
-                table,
-                display_name.clone(),
-                canonical_name.clone(),
-                rows,
-                columns.clone(),
-                snapshot,
-                constraint_mode,
-            )? {
+            match self.insert_rows(ctx.clone(), rows)? {
                 RuntimeStatementResult::Insert { rows_inserted, .. } => {
                     total_rows_inserted += rows_inserted;
                 }
@@ -475,7 +427,7 @@ where
         }
 
         Ok(RuntimeStatementResult::Insert {
-            table_name: display_name,
+            table_name: ctx.display_name.clone(),
             rows_inserted: total_rows_inserted,
         })
     }
@@ -726,5 +678,56 @@ where
         }
 
         Ok(())
+    }
+}
+
+pub(super) struct InsertExecContext<'a, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    table: &'a ExecutorTable<P>,
+    display_name: String,
+    canonical_name: String,
+    columns: Vec<String>,
+    snapshot: TransactionSnapshot,
+    constraint_mode: ConstraintEnforcementMode,
+}
+
+impl<'a, P> InsertExecContext<'a, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub(super) fn new(
+        table: &'a ExecutorTable<P>,
+        display_name: String,
+        canonical_name: String,
+        columns: Vec<String>,
+        snapshot: TransactionSnapshot,
+        constraint_mode: ConstraintEnforcementMode,
+    ) -> Self {
+        Self {
+            table,
+            display_name,
+            canonical_name,
+            columns,
+            snapshot,
+            constraint_mode,
+        }
+    }
+}
+
+impl<'a, P> Clone for InsertExecContext<'a, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table,
+            display_name: self.display_name.clone(),
+            canonical_name: self.canonical_name.clone(),
+            columns: self.columns.clone(),
+            snapshot: self.snapshot,
+            constraint_mode: self.constraint_mode,
+        }
     }
 }

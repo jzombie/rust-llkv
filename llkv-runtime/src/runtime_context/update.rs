@@ -30,7 +30,9 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::{PreparedAssignmentValue, RuntimeContext, TableConstraintContext};
+use super::{
+    PreparedAssignmentValue, RuntimeContext, TableConstraintContext, insert::InsertExecContext,
+};
 
 impl<P> RuntimeContext<P>
 where
@@ -403,15 +405,15 @@ where
                 false,
             )?;
 
-            let _ = self.insert_rows(
+            let insert_ctx = InsertExecContext::new(
                 table,
                 display_name.clone(),
                 canonical_name,
-                new_rows,
                 column_names,
                 snapshot,
                 ConstraintEnforcementMode::Immediate,
-            )?;
+            );
+            let _ = self.insert_rows(insert_ctx, new_rows)?;
         }
 
         Ok(RuntimeStatementResult::Update {
@@ -744,15 +746,15 @@ where
                 false,
             )?;
 
-            let _ = self.insert_rows(
+            let insert_ctx = InsertExecContext::new(
                 table,
                 display_name.clone(),
                 canonical_name,
-                new_rows,
                 column_names,
                 snapshot,
                 ConstraintEnforcementMode::Immediate,
-            )?;
+            );
+            let _ = self.insert_rows(insert_ctx, new_rows)?;
         }
 
         Ok(RuntimeStatementResult::Update {
