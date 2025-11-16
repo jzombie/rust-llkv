@@ -1274,10 +1274,12 @@ where
         // 2. Aggregates like COUNT_NULLS that need to count NULL rows
         // We scan the MVCC created_by column which exists for every row.
         //
-        // WORKAROUND: For information_schema tables with non-trivial filters, try the
-        // complex path first, but fall back to trivial if it returns zero rows.
-        // Information schema tables have issues with complex filter evaluation when
-        // many columns are projected (root cause TBD in collect_row_ids_for_program).
+        // Historical note: information_schema tables used to have issues with complex
+        // filter evaluation when many columns were projected. We previously attempted
+        // to fall back to a "scan everything" path when the predicate returned zero
+        // matches. That trade-off caused incorrect results for legitimate empty
+        // queries (like looking up a dropped table), so we now trust the predicate
+        // evaluation and simply log when it yields zero rows.
         let is_info_schema = is_information_schema_table(self.table.table_id());
         let is_trivial = is_trivial_filter(filter_expr.as_ref());
 
@@ -1293,25 +1295,15 @@ where
                 .store()
                 .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
         } else if is_info_schema {
-            // Try complex path for information_schema with non-trivial filter
             let row_ids =
                 self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?;
             if row_ids.is_empty() {
                 tracing::debug!(
-                    "[SCAN_STREAM] information_schema table {}: complex filter returned 0 rows, \
-                     falling back to trivial path + post-filter",
+                    "[SCAN_STREAM] information_schema table {}: predicate returned 0 rows",
                     self.table.table_id()
                 );
-                // Fall back to scanning all rows - we'll need to apply filter later
-                use arrow::datatypes::UInt64Type;
-                use llkv_expr::typed_predicate::Predicate;
-                let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
-                self.table
-                    .store()
-                    .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
-            } else {
-                row_ids
             }
+            row_ids
         } else {
             self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?
         };
