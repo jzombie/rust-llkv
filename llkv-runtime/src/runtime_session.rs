@@ -59,9 +59,8 @@ pub(crate) struct SessionNamespaces {
 
 impl SessionNamespaces {
     pub(crate) fn new(base_context: Arc<RuntimeContext<BoxedPager>>) -> Self {
-        let mut registry = RuntimeStorageNamespaceRegistry::new(
-            PERSISTENT_NAMESPACE_ID.to_string(),
-        );
+        let mut registry =
+            RuntimeStorageNamespaceRegistry::new(PERSISTENT_NAMESPACE_ID.to_string());
 
         // Create information_schema namespace FIRST so we can set it as fallback for persistent
         let information_schema = {

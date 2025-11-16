@@ -15,11 +15,13 @@ use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 
 /// Helper to extract record batches from SELECT results
-fn extract_batches(mut results: Vec<RuntimeStatementResult<llkv_storage::pager::BoxedPager>>) -> Vec<RecordBatch> {
+fn extract_batches(
+    mut results: Vec<RuntimeStatementResult<llkv_storage::pager::BoxedPager>>,
+) -> Vec<RecordBatch> {
     if results.is_empty() {
         return vec![];
     }
-    
+
     match results.remove(0) {
         RuntimeStatementResult::Select { execution, .. } => {
             execution.collect().expect("collect query batches")
@@ -39,7 +41,9 @@ fn test_information_schema_lazy_refresh() {
 
     // Query information_schema.tables - should trigger refresh
     let results = engine
-        .execute("SELECT table_name FROM information_schema.tables WHERE table_name = 'test_table';")
+        .execute(
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'test_table';",
+        )
         .expect("query information_schema.tables succeeds");
 
     let batches = extract_batches(results);
@@ -48,7 +52,11 @@ fn test_information_schema_lazy_refresh() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 1, "should find test_table");
 
-    let table_name_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let table_name_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(table_name_col.value(0), "test_table");
 }
 
@@ -67,7 +75,7 @@ fn test_information_schema_columns_metadata() {
             "SELECT column_name, data_type, is_nullable 
              FROM information_schema.columns 
              WHERE table_name = 'sample' 
-             ORDER BY ordinal_position;"
+             ORDER BY ordinal_position;",
         )
         .expect("query information_schema.columns succeeds");
 
@@ -77,7 +85,11 @@ fn test_information_schema_columns_metadata() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 3, "should have 3 columns");
 
-    let column_names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let column_names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(column_names.value(0), "id");
     assert_eq!(column_names.value(1), "name");
     assert_eq!(column_names.value(2), "age");
@@ -113,7 +125,7 @@ fn test_information_schema_join_with_user_table() {
              JOIN column_policies AS p 
                ON p.table_name = c.table_name AND p.column_name = c.column_name 
              WHERE c.table_name = 'projects' 
-             ORDER BY c.ordinal_position;"
+             ORDER BY c.ordinal_position;",
         )
         .expect("join with information_schema succeeds");
 
@@ -123,11 +135,19 @@ fn test_information_schema_join_with_user_table() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 2, "should match 2 columns");
 
-    let column_names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let column_names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(column_names.value(0), "id");
     assert_eq!(column_names.value(1), "name");
 
-    let classifications = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    let classifications = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(classifications.value(0), "identifier");
     assert_eq!(classifications.value(1), "identity");
 }
@@ -156,7 +176,7 @@ fn test_information_schema_left_join() {
              LEFT JOIN metadata_tags AS t 
                ON t.table_name = c.table_name AND t.column_name = c.column_name 
              WHERE c.table_name = 'products' 
-             ORDER BY c.ordinal_position;"
+             ORDER BY c.ordinal_position;",
         )
         .expect("left join succeeds");
 
@@ -166,7 +186,11 @@ fn test_information_schema_left_join() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 3, "should show all 3 columns");
 
-    let column_names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let column_names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(column_names.value(0), "id");
     assert_eq!(column_names.value(1), "name");
     assert_eq!(column_names.value(2), "price");
@@ -200,7 +224,11 @@ fn test_information_schema_multiple_table_query() {
     let batch = &batches[0];
     assert!(batch.num_rows() >= 3, "should have at least 3 tables");
 
-    let table_names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let table_names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     let names: Vec<&str> = (0..batch.num_rows())
         .map(|i| table_names.value(i))
         .collect();
@@ -261,7 +289,7 @@ fn test_information_schema_table_constraints() {
             "SELECT constraint_type 
              FROM information_schema.table_constraints 
              WHERE table_name = 'constrained' 
-             ORDER BY constraint_type;"
+             ORDER BY constraint_type;",
         )
         .expect("query table_constraints succeeds");
 
@@ -285,7 +313,7 @@ fn test_information_schema_key_column_usage() {
         .execute(
             "SELECT column_name 
              FROM information_schema.key_column_usage 
-             WHERE table_name = 'keyed';"
+             WHERE table_name = 'keyed';",
         )
         .expect("query key_column_usage succeeds");
 
@@ -317,13 +345,16 @@ fn test_information_schema_subquery_with_join() {
                  SELECT 1 
                  FROM information_schema.columns AS c 
                  WHERE c.table_name = 'orders' AND c.column_name = 'order_id'
-             );"
+             );",
         )
         .expect("subquery with information_schema succeeds");
 
     // Should return the row since the column exists in information_schema
     let batches = extract_batches(results);
-    assert!(!batches.is_empty(), "should have results since column exists");
+    assert!(
+        !batches.is_empty(),
+        "should have results since column exists"
+    );
     assert_eq!(batches[0].num_rows(), 1, "should return one row");
 }
 
@@ -340,7 +371,7 @@ fn test_information_schema_aggregate_column_count() {
         .execute(
             "SELECT COUNT(*) AS column_count 
              FROM information_schema.columns 
-             WHERE table_name = 'wide_table';"
+             WHERE table_name = 'wide_table';",
         )
         .expect("aggregate query succeeds");
 
@@ -369,7 +400,7 @@ fn test_information_schema_cross_join() {
             "SELECT t.table_name, c.column_name 
              FROM information_schema.tables AS t 
              CROSS JOIN information_schema.columns AS c 
-             WHERE t.table_name = 'small_table' AND c.table_name = 'small_table';"
+             WHERE t.table_name = 'small_table' AND c.table_name = 'small_table';",
         )
         .expect("cross join succeeds");
 
@@ -410,7 +441,7 @@ fn test_information_schema_aliased_table_reference() {
         .execute(
             "SELECT cols.column_name, cols.data_type 
              FROM information_schema.columns AS cols 
-             WHERE cols.table_name = 'aliased';"
+             WHERE cols.table_name = 'aliased';",
         )
         .expect("aliased table reference succeeds");
 
@@ -435,7 +466,7 @@ fn test_information_schema_with_filter_and_order() {
             "SELECT column_name 
              FROM information_schema.columns 
              WHERE table_name = 'filtered' 
-             ORDER BY column_name DESC;"
+             ORDER BY column_name DESC;",
         )
         .expect("filtered and ordered query succeeds");
 
@@ -445,8 +476,16 @@ fn test_information_schema_with_filter_and_order() {
     let batch = &batches[0];
     assert_eq!(batch.num_rows(), 3, "should find 3 columns");
 
-    let column_names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    assert_eq!(column_names.value(0), "z_col", "should be sorted descending");
+    let column_names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        column_names.value(0),
+        "z_col",
+        "should be sorted descending"
+    );
     assert_eq!(column_names.value(1), "m_col");
     assert_eq!(column_names.value(2), "a_col");
 }
@@ -465,7 +504,7 @@ fn test_information_schema_nullable_column_detection() {
             "SELECT column_name, is_nullable 
              FROM information_schema.columns 
              WHERE table_name = 'nullability' 
-             ORDER BY ordinal_position;"
+             ORDER BY ordinal_position;",
         )
         .expect("nullable query succeeds");
 

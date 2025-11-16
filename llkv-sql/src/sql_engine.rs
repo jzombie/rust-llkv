@@ -1658,7 +1658,10 @@ impl SqlEngine {
                 // and ensures the schema is ready before any table resolution happens.
                 let query_sql = query.to_string();
                 eprintln!("🔍 Checking query SQL: {}", query_sql);
-                if query_sql.to_ascii_lowercase().contains("information_schema") {
+                if query_sql
+                    .to_ascii_lowercase()
+                    .contains("information_schema")
+                {
                     eprintln!("✓ Query mentions information_schema, refreshing!");
                     self.ensure_information_schema_ready()?;
                     eprintln!("✓ Refresh complete");
@@ -7527,10 +7530,7 @@ fn validate_create_table_definition(stmt: &sqlparser::ast::CreateTable) -> SqlRe
 /// - ❌ `CREATE TABLE information_schema (...)` - conflicts with system schema
 /// - ✅ `CREATE TABLE my_table (...)` - allowed
 /// - ✅ `CREATE TABLE myschema.information_schema (...)` - allowed (different namespace)
-fn validate_reserved_table_name(
-    schema: Option<&str>,
-    table_name: &str,
-) -> SqlResult<()> {
+fn validate_reserved_table_name(schema: Option<&str>, table_name: &str) -> SqlResult<()> {
     // If schema is explicitly provided, we're not in the default namespace
     if schema.is_some() {
         return Ok(());
