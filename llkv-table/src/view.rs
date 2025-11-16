@@ -4,6 +4,7 @@ use crate::MultiColumnIndexEntryMeta;
 use crate::constraints::{ConstraintId, ConstraintRecord, ForeignKeyAction};
 use crate::sys_catalog::{ColMeta, TableMeta};
 use crate::types::{FieldId, TableId};
+use rustc_hash::FxHashMap;
 
 /// Read-only view describing a resolved foreign key constraint.
 #[derive(Clone, Debug)]
@@ -41,4 +42,5 @@ pub struct TableConstraintSummaryView {
     pub column_metas: Vec<Option<ColMeta>>,
     pub constraint_records: Vec<ConstraintRecord>,
     pub multi_column_uniques: Vec<MultiColumnIndexEntryMeta>,
+    pub constraint_names: FxHashMap<ConstraintId, String>,
 }

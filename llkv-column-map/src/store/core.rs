@@ -116,6 +116,11 @@ where
         })
     }
 
+    /// Return heuristics that guide upstream writers when sizing batches.
+    pub fn write_hints(&self) -> ColumnStoreWriteHints {
+        ColumnStoreWriteHints::from_config(&self.cfg)
+    }
+
     /// Creates and persists an index for a column.
     ///
     /// Builds the specified index type for all existing data in the column and

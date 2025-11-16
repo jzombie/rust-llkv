@@ -163,8 +163,10 @@ pub enum ScanOrderDirection {
 /// Used to enable sorting on columns that need type coercion or conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOrderTransform {
-    /// Sort integers as-is.
-    IdentityInteger,
+    /// Sort 64-bit integers as-is.
+    IdentityInt64,
+    /// Sort 32-bit integers as-is.
+    IdentityInt32,
     /// Sort strings lexicographically.
     IdentityUtf8,
     /// Parse strings as integers, then sort numerically.

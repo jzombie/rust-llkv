@@ -28,6 +28,8 @@ pub type RuntimeNamespaceId = String;
 pub const PERSISTENT_NAMESPACE_ID: &str = "main";
 /// Canonical identifier for the temporary runtime namespace.
 pub const TEMPORARY_NAMESPACE_ID: &str = "temp";
+/// Identifier used for the in-memory information schema namespace.
+pub const INFORMATION_SCHEMA_NAMESPACE_ID: &str = "information_schema";
 
 /// Runtime-level namespace abstraction.
 ///

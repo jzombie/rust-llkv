@@ -20,7 +20,9 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
-use llkv_table::{FieldId, RowId, UniqueKey, build_composite_unique_key};
+use llkv_table::{
+    ConstraintEnforcementMode, FieldId, RowId, UniqueKey, build_composite_unique_key,
+};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -28,7 +30,9 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::{PreparedAssignmentValue, RuntimeContext, TableConstraintContext};
+use super::{
+    PreparedAssignmentValue, RuntimeContext, TableConstraintContext, insert::InsertExecContext,
+};
 
 impl<P> RuntimeContext<P>
 where
@@ -401,14 +405,15 @@ where
                 false,
             )?;
 
-            let _ = self.insert_rows(
+            let insert_ctx = InsertExecContext::new(
                 table,
                 display_name.clone(),
                 canonical_name,
-                new_rows,
                 column_names,
                 snapshot,
-            )?;
+                ConstraintEnforcementMode::Immediate,
+            );
+            let _ = self.insert_rows(insert_ctx, new_rows)?;
         }
 
         Ok(RuntimeStatementResult::Update {
@@ -741,14 +746,15 @@ where
                 false,
             )?;
 
-            let _ = self.insert_rows(
+            let insert_ctx = InsertExecContext::new(
                 table,
                 display_name.clone(),
                 canonical_name,
-                new_rows,
                 column_names,
                 snapshot,
-            )?;
+                ConstraintEnforcementMode::Immediate,
+            );
+            let _ = self.insert_rows(insert_ctx, new_rows)?;
         }
 
         Ok(RuntimeStatementResult::Update {

@@ -694,6 +694,17 @@ where
         Ok(state.current.constraints.values().cloned().collect())
     }
 
+    /// Return the map of constraint names keyed by identifier for the table.
+    pub fn constraint_names(
+        &self,
+        table_id: TableId,
+    ) -> LlkvResult<FxHashMap<ConstraintId, String>> {
+        self.ensure_table_state(table_id)?;
+        let tables = self.tables.read().unwrap();
+        let state = tables.get(&table_id).unwrap();
+        Ok(state.current.constraint_names.clone())
+    }
+
     /// Fetch a subset of constraint records by their identifiers.
     pub fn constraint_records_by_id(
         &self,

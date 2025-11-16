@@ -28,12 +28,13 @@
 
 #![forbid(unsafe_code)]
 
+mod information_schema;
 pub mod runtime_storage_namespace;
 
 pub use runtime_storage_namespace::{
-    PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace, RuntimeNamespaceId,
-    RuntimeStorageNamespace, RuntimeStorageNamespaceOps, RuntimeStorageNamespaceRegistry,
-    TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace,
+    INFORMATION_SCHEMA_NAMESPACE_ID, PERSISTENT_NAMESPACE_ID, PersistentRuntimeNamespace,
+    RuntimeNamespaceId, RuntimeStorageNamespace, RuntimeStorageNamespaceOps,
+    RuntimeStorageNamespaceRegistry, TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace,
 };
 
 mod runtime_statement_result;
@@ -57,6 +58,7 @@ pub use runtime_table::{
     row,
 };
 
+pub use llkv_column_map::store::ColumnStoreWriteHints;
 pub use llkv_executor::SelectExecution;
 pub use llkv_plan::{
     AggregateExpr, AlterTablePlan, AssignmentValue, ColumnAssignment, CreateIndexPlan,

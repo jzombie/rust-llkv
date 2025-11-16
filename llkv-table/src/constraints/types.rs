@@ -11,6 +11,28 @@ use bitcode::{Decode, Encode};
 
 use crate::types::{FieldId, RowId, TableId};
 
+/// Controls when constraint validation occurs for new writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Default)]
+pub enum ConstraintEnforcementMode {
+    /// Perform all constraint checks before rows become visible.
+    #[default]
+    Immediate,
+    /// Defer checks so callers can load data quickly and validate later.
+    Deferred,
+}
+
+impl ConstraintEnforcementMode {
+    #[inline]
+    pub const fn is_immediate(self) -> bool {
+        matches!(self, ConstraintEnforcementMode::Immediate)
+    }
+
+    #[inline]
+    pub const fn is_deferred(self) -> bool {
+        matches!(self, ConstraintEnforcementMode::Deferred)
+    }
+}
+
 /// Identifier assigned to a persisted constraint.
 ///
 /// Constraint IDs are scoped per-table and limited to 32 bits so they can be

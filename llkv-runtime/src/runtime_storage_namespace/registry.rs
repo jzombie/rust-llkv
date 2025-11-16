@@ -162,9 +162,16 @@ impl RuntimeStorageNamespaceRegistry {
     }
 
     pub fn namespace_for_table(&self, canonical: &str) -> RuntimeNamespaceId {
-        self.table_map
-            .get(canonical)
-            .cloned()
-            .unwrap_or_else(|| self.persistent_id.clone())
+        if let Some(namespace_id) = self.table_map.get(canonical) {
+            return namespace_id.clone();
+        }
+
+        if let Some((schema, _)) = canonical.split_once('.')
+            && let Some(namespace_id) = self.schema_map.get(schema)
+        {
+            return namespace_id.clone();
+        }
+
+        self.persistent_id.clone()
     }
 }

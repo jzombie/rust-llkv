@@ -6,25 +6,31 @@
 //! unmodified while still producing a structured manifest the caller can inspect.
 
 use llkv::Error as LlkvError;
+use llkv_expr::decimal::DecimalValue;
+use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue, parse_date32_literal};
 use llkv_sql::{
-    SqlEngine, canonical_table_ident, normalize_table_constraint,
-    order_create_tables_by_foreign_keys, tpch::strip_tpch_connect_statements,
+    SqlEngine, SqlTypeFamily, canonical_table_ident, classify_sql_data_type,
+    normalize_table_constraint, order_create_tables_by_foreign_keys,
+    tpch::strip_tpch_connect_statements,
 };
+use llkv_table::ConstraintEnforcementMode;
 use regex::Regex;
 use sqlparser::ast::{
-    AlterTableOperation, CreateTable, DataType, Ident, ObjectNamePart, Statement, TableConstraint,
+    AlterTableOperation, CreateTable, Ident, ObjectNamePart, Statement, TableConstraint,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tpchgen::generators::{
     CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
     PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 
+pub mod qualification;
 pub mod queries;
 
 pub const DEFAULT_SCHEMA_NAME: &str = "TPCD";
@@ -87,6 +93,25 @@ impl SchemaPaths {
     pub fn query_path(&self, query_number: u8) -> PathBuf {
         self.queries_dir.join(format!("{query_number}.sql"))
     }
+
+    /// Return the directory containing the bundled TPC-H tooling assets.
+    pub fn tools_root(&self) -> PathBuf {
+        self.dss_header
+            .parent()
+            .and_then(|dbgen| dbgen.parent())
+            .map(|root| root.to_path_buf())
+            .expect("SchemaPaths missing dbgen root")
+    }
+
+    /// Return the `ref_data/<scale>` directory that ships qualification artifacts.
+    pub fn ref_data_dir(&self, scale: impl AsRef<Path>) -> PathBuf {
+        self.tools_root().join("ref_data").join(scale)
+    }
+
+    /// Return the directory containing the TPC-H `check_answers` helpers.
+    pub fn check_answers_dir(&self) -> PathBuf {
+        self.tools_root().join("dbgen").join("check_answers")
+    }
 }
 
 impl Default for SchemaPaths {
@@ -109,16 +134,25 @@ struct TableSchema {
     create_table: CreateTable,
     info: TpchTableInfo,
     columns: Vec<TableColumn>,
-    column_list_sql: String,
+    column_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct TableColumn {
     name: String,
-    requires_quotes: bool,
+    value_kind: ColumnValueKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnValueKind {
+    String,
+    Integer,
+    Decimal { scale: i8 },
+    Date32,
 }
 
 impl TpchToolkit {
+    const PROGRESS_REPORT_INTERVAL: usize = 100_000;
     /// Build a toolkit by parsing the bundled TPC-H metadata at the provided paths.
     pub fn from_paths(paths: SchemaPaths) -> Result<Self> {
         let dss_header = read_file(&paths.dss_header)?;
@@ -144,11 +178,7 @@ impl TpchToolkit {
             })?;
 
             let columns = build_columns(&table_name, &table)?;
-            let column_list_sql = columns
-                .iter()
-                .map(|col| col.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let column_names = columns.iter().map(|column| column.name.clone()).collect();
 
             let info = build_table_info(&table_name, &raw_tables);
 
@@ -157,7 +187,7 @@ impl TpchToolkit {
                 create_table: table,
                 info,
                 columns,
-                column_list_sql,
+                column_names,
             };
 
             if tables_by_name.insert(table_name.clone(), schema).is_some() {
@@ -212,111 +242,145 @@ impl TpchToolkit {
         scale_factor: f64,
         batch_size: usize,
     ) -> Result<LoadSummary> {
+        self.load_data_with_progress(engine, schema_name, scale_factor, batch_size, |_| {})
+    }
+
+    /// Load all base tables while emitting status updates through the provided callback.
+    ///
+    /// The callback receives a [`TableLoadEvent`] for each table when loading starts and
+    /// again as batches progress and after the inserts finish.
+    pub fn load_data_with_progress<F>(
+        &self,
+        engine: &SqlEngine,
+        schema_name: &str,
+        scale_factor: f64,
+        batch_size: usize,
+        mut on_progress: F,
+    ) -> Result<LoadSummary>
+    where
+        F: FnMut(TableLoadEvent),
+    {
         if batch_size == 0 {
             return Err(TpchError::Parse(
                 "batch size must be greater than zero".into(),
             ));
         }
+        let session = engine.session();
+        let previous_mode = session.constraint_enforcement_mode();
+        let changed_mode = previous_mode != ConstraintEnforcementMode::Deferred;
+        if changed_mode {
+            session.set_constraint_enforcement_mode(ConstraintEnforcementMode::Deferred);
+        }
 
-        let mut tables = Vec::with_capacity(8);
+        let result = (|| -> Result<LoadSummary> {
+            let mut tables = Vec::with_capacity(8);
 
-        {
-            let generator = RegionGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+            macro_rules! load_table_with_progress {
+                ($collection:ident, $table_name:literal, $iter:expr) => {{
+                    let expected = self.table_schema($table_name)?.info.base_rows;
+                    on_progress(TableLoadEvent::Begin {
+                        table: $table_name,
+                        estimated_rows: Some(estimate_rows(expected, scale_factor)),
+                    });
+                    let started = Instant::now();
+                    let mut last_report = started;
+                    let summary = {
+                        let iter = $iter;
+                        let rows = iter.map(|row| row.to_string());
+                        let mut forward = |rows_loaded: usize| {
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(started);
+                            let since_last = now.duration_since(last_report);
+                            last_report = now;
+                            on_progress(TableLoadEvent::Progress {
+                                table: $table_name,
+                                rows: rows_loaded,
+                                elapsed,
+                                since_last,
+                            });
+                        };
+                        self.load_table_with_rows(
+                            engine,
+                            schema_name,
+                            $table_name,
+                            rows,
+                            batch_size,
+                            Some(&mut forward),
+                        )?
+                    };
+                    on_progress(TableLoadEvent::Complete {
+                        table: $table_name,
+                        rows: summary.rows,
+                        elapsed: started.elapsed(),
+                    });
+                    $collection.push(summary);
+                }};
+            }
+
+            load_table_with_progress!(
+                tables,
                 "REGION",
-                rows,
-                batch_size,
-            )?);
-        }
-
-        {
-            let generator = NationGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+                RegionGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
                 "NATION",
-                rows,
-                batch_size,
-            )?);
-        }
-
-        {
-            let generator = SupplierGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+                NationGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
                 "SUPPLIER",
-                rows,
-                batch_size,
-            )?);
-        }
-
-        {
-            let generator = CustomerGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+                SupplierGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
                 "CUSTOMER",
-                rows,
-                batch_size,
-            )?);
-        }
-
-        {
-            let generator = PartGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+                CustomerGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
                 "PART",
-                rows,
-                batch_size,
-            )?);
-        }
-
-        {
-            let generator = PartSuppGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+                PartGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
                 "PARTSUPP",
-                rows,
-                batch_size,
-            )?);
-        }
-
-        {
-            let generator = OrderGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+                PartSuppGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
                 "ORDERS",
-                rows,
-                batch_size,
-            )?);
-        }
-
-        {
-            let generator = LineItemGenerator::new(scale_factor, 1, 1);
-            let rows = generator.iter().map(|row| row.to_string());
-            tables.push(self.load_table_with_rows(
-                engine,
-                schema_name,
+                OrderGenerator::new(scale_factor, 1, 1).iter()
+            );
+            load_table_with_progress!(
+                tables,
                 "LINEITEM",
-                rows,
-                batch_size,
-            )?);
+                LineItemGenerator::new(scale_factor, 1, 1).iter()
+            );
+
+            Ok(LoadSummary { tables })
+        })();
+
+        if changed_mode {
+            session.set_constraint_enforcement_mode(previous_mode);
         }
 
-        Ok(LoadSummary { tables })
+        result
+    }
+
+    /// Execute a TPC-H qualification run using the provided answer set configuration.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`TpchError::Parse`] when the qualification assets are missing or malformed
+    /// and [`TpchError::Sql`] when query execution fails.
+    pub fn run_qualification(
+        &self,
+        engine: &SqlEngine,
+        schema_name: &str,
+        options: &qualification::QualificationOptions,
+    ) -> Result<Vec<qualification::QualificationReport>> {
+        qualification::run_qualification(engine, &self.schema_paths, schema_name, options)
     }
 
     /// Look up the parsed table schema by canonical TPC-H name.
@@ -356,19 +420,22 @@ impl TpchToolkit {
     }
 
     /// Load a single TPC-H table by streaming generated rows through batched inserts.
-    fn load_table_with_rows<I>(
+    fn load_table_with_rows<I, F>(
         &self,
         engine: &SqlEngine,
         schema_name: &str,
         table_name: &'static str,
         rows: I,
         batch_size: usize,
+        progress: Option<&mut F>,
     ) -> Result<LoadTableSummary>
     where
         I: Iterator<Item = String>,
+        F: FnMut(usize),
     {
         let table = self.table_schema(table_name)?;
-        let row_count = self.load_table_from_lines(engine, schema_name, table, rows, batch_size)?;
+        let row_count =
+            self.load_table_from_lines(engine, schema_name, table, rows, batch_size, progress)?;
         Ok(LoadTableSummary {
             table: table_name,
             rows: row_count,
@@ -376,46 +443,64 @@ impl TpchToolkit {
     }
 
     /// Consume delimited rows, format them into SQL literals, and flush them in batches.
-    fn load_table_from_lines<I>(
+    fn load_table_from_lines<I, F>(
         &self,
         engine: &SqlEngine,
         schema_name: &str,
         table: &TableSchema,
         rows: I,
         batch_size: usize,
+        mut progress: Option<&mut F>,
     ) -> Result<usize>
     where
         I: Iterator<Item = String>,
+        F: FnMut(usize),
     {
-        let mut batch = Vec::with_capacity(batch_size);
-        let mut row_count = 0usize;
+        let canonical_name = format!("{}.{}", schema_name, table.name).to_ascii_lowercase();
+        let cache_enabled = self.enable_fk_cache_for_table(engine, &canonical_name);
 
-        for line in rows {
-            if line.is_empty() {
-                continue;
+        let result = (|| -> Result<usize> {
+            let mut batch: Vec<Vec<PlanValue>> = Vec::with_capacity(batch_size);
+            let mut row_count = 0usize;
+
+            for line in rows {
+                if line.is_empty() {
+                    continue;
+                }
+                let row_values = self.parse_row_values(table, &line)?;
+                batch.push(row_values);
+                row_count += 1;
+                if batch.len() == batch_size {
+                    self.flush_insert(engine, schema_name, table, &batch)?;
+                    batch.clear();
+                }
+                if row_count.is_multiple_of(Self::PROGRESS_REPORT_INTERVAL)
+                    && let Some(callback) = progress.as_mut()
+                {
+                    callback(row_count);
+                }
             }
-            let row_sql = self.format_row_values(table, &line)?;
-            batch.push(row_sql);
-            row_count += 1;
-            if batch.len() == batch_size {
+
+            if !batch.is_empty() {
                 self.flush_insert(engine, schema_name, table, &batch)?;
-                batch.clear();
             }
+
+            Ok(row_count)
+        })();
+
+        if cache_enabled {
+            self.clear_fk_cache_for_table(engine, &canonical_name);
         }
 
-        if !batch.is_empty() {
-            self.flush_insert(engine, schema_name, table, &batch)?;
-        }
-
-        Ok(row_count)
+        result
     }
 
-    /// Convert a raw delimited line into a parenthesized SQL value tuple.
+    /// Convert a raw delimited line into a typed value vector aligned with the table schema.
     ///
     /// # Errors
     ///
     /// Returns [`TpchError::Parse`] when the column count does not match the table schema.
-    fn format_row_values(&self, table: &TableSchema, line: &str) -> Result<String> {
+    fn parse_row_values(&self, table: &TableSchema, line: &str) -> Result<Vec<PlanValue>> {
         let raw_fields: Vec<&str> = line.trim_end_matches('|').split('|').collect();
         if raw_fields.len() != table.columns.len() {
             return Err(TpchError::Parse(format!(
@@ -426,33 +511,66 @@ impl TpchToolkit {
             )));
         }
 
-        let formatted_values: Vec<String> = raw_fields
+        raw_fields
             .iter()
             .zip(table.columns.iter())
-            .map(|(raw, column)| format_value(column, raw))
-            .collect();
-
-        Ok(format!("({})", formatted_values.join(", ")))
+            .map(|(raw, column)| parse_column_value(column, raw))
+            .collect()
     }
 
-    /// Execute a batched INSERT for pre-formatted row values.
+    /// Execute a batched INSERT using prepared plan rows.
     fn flush_insert(
         &self,
         engine: &SqlEngine,
         schema_name: &str,
         table: &TableSchema,
-        rows: &[String],
+        rows: &[Vec<PlanValue>],
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut sql = format!(
-            "INSERT INTO {}.{} ({}) VALUES ",
-            schema_name, table.name, table.column_list_sql
-        );
-        sql.push_str(&rows.join(", "));
-        sql.push(';');
-        run_sql(engine, &sql)
+        let plan = InsertPlan {
+            table: format!("{}.{}", schema_name, table.name),
+            columns: table.column_names.clone(),
+            source: InsertSource::Rows(rows.to_vec()),
+            on_conflict: InsertConflictAction::None,
+        };
+        engine
+            .session()
+            .execute_insert_plan(plan)
+            .map(|_| ())
+            .map_err(TpchError::Sql)
+    }
+
+    fn enable_fk_cache_for_table(&self, engine: &SqlEngine, canonical_name: &str) -> bool {
+        let context = engine.runtime_context();
+        match context.table_catalog().table_id(canonical_name) {
+            Some(table_id) => {
+                context.enable_foreign_key_cache(table_id);
+                true
+            }
+            None => {
+                tracing::warn!(
+                    target: "tpch-loader",
+                    table = canonical_name,
+                    "skipping foreign key cache enable; table id not found"
+                );
+                false
+            }
+        }
+    }
+
+    fn clear_fk_cache_for_table(&self, engine: &SqlEngine, canonical_name: &str) {
+        let context = engine.runtime_context();
+        if let Some(table_id) = context.table_catalog().table_id(canonical_name) {
+            context.clear_foreign_key_cache(table_id);
+        } else {
+            tracing::warn!(
+                target: "tpch-loader",
+                table = canonical_name,
+                "foreign key cache already dropped before cleanup"
+            );
+        }
     }
 }
 
@@ -516,12 +634,65 @@ pub fn load_tpch_data_with_toolkit(
     toolkit.load_data(engine, schema_name, scale_factor, batch_size)
 }
 
+/// Resolve the loader batch size using column-store write hints.
+///
+/// When `batch_override` is `None`, the column store's recommended insert batch rows
+/// are used. Explicit overrides are clamped to the store's maximum to avoid building
+/// enormous literal INSERT statements that would be split immediately during ingest.
+pub fn resolve_loader_batch_size(engine: &SqlEngine, batch_override: Option<usize>) -> usize {
+    let hints = engine.column_store_write_hints();
+    let requested = batch_override
+        .unwrap_or(hints.recommended_insert_batch_rows)
+        .max(1);
+    let resolved = hints.clamp_insert_batch_rows(requested);
+    if let Some(explicit) = batch_override
+        && resolved != explicit
+    {
+        tracing::warn!(
+            target: "tpch-loader",
+            requested = explicit,
+            resolved,
+            max = hints.max_insert_batch_rows,
+            "clamped batch size override to column-store limit"
+        );
+    }
+    resolved
+}
+
 /// Read a text file and wrap IO errors with the target path.
 pub(crate) fn read_file(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|source| TpchError::Io {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llkv::storage::MemPager;
+    use std::sync::Arc;
+
+    #[test]
+    fn resolve_batch_size_defaults_to_hints() {
+        let engine = SqlEngine::new(Arc::new(MemPager::default()));
+        let hints = engine.column_store_write_hints();
+        assert_eq!(
+            resolve_loader_batch_size(&engine, None),
+            hints.recommended_insert_batch_rows
+        );
+    }
+
+    #[test]
+    fn resolve_batch_size_clamps_override() {
+        let engine = SqlEngine::new(Arc::new(MemPager::default()));
+        let hints = engine.column_store_write_hints();
+        let requested = hints.max_insert_batch_rows * 5;
+        assert_eq!(
+            resolve_loader_batch_size(&engine, Some(requested)),
+            hints.max_insert_batch_rows
+        );
+    }
 }
 
 /// Execute a SQL batch against the provided engine, ignoring whitespace-only fragments.
@@ -763,6 +934,26 @@ fn apply_constraints_to_tables(
 // TPC-H data loading helpers
 // -----------------------------------------------------------------------------
 
+/// Status updates emitted during table population.
+#[derive(Debug, Clone, Copy)]
+pub enum TableLoadEvent {
+    Begin {
+        table: &'static str,
+        estimated_rows: Option<usize>,
+    },
+    Progress {
+        table: &'static str,
+        rows: usize,
+        elapsed: Duration,
+        since_last: Duration,
+    },
+    Complete {
+        table: &'static str,
+        rows: usize,
+        elapsed: Duration,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadTableSummary {
     pub table: &'static str,
@@ -781,12 +972,29 @@ impl LoadSummary {
     }
 }
 
+fn estimate_rows(base_rows: u64, scale_factor: f64) -> usize {
+    if base_rows == 0 {
+        return 0;
+    }
+    let scaled = (base_rows as f64) * scale_factor;
+    if !scaled.is_finite() {
+        return 0;
+    }
+    let rounded = scaled.round();
+    if scale_factor > 0.0 && rounded < 1.0 {
+        1
+    } else if rounded <= 0.0 {
+        0
+    } else {
+        rounded as usize
+    }
+}
+
 /// Derive ordered column metadata from a parsed `CREATE TABLE` statement.
 ///
-/// The returned list mirrors the definition order and marks columns that need
-/// quoting when we render load batches by delegating to
-/// [`column_requires_quotes`]. This keeps value formatting aligned with the
-/// upstream schema so bulk inserts can stream rows without additional lookups.
+/// The returned list mirrors the definition order and records how each column
+/// should be converted into a [`PlanValue`] so bulk inserts can stream typed
+/// rows directly into prepared plans.
 ///
 /// # Errors
 ///
@@ -802,44 +1010,28 @@ fn build_columns(table_name: &str, table: &CreateTable) -> Result<Vec<TableColum
     let mut columns = Vec::with_capacity(table.columns.len());
     for column_def in &table.columns {
         let name = column_def.name.value.clone();
-        let requires_quotes = column_requires_quotes(&column_def.data_type);
-        columns.push(TableColumn {
-            name,
-            requires_quotes,
-        });
+        let family = classify_sql_data_type(&column_def.data_type).map_err(|err| {
+            TpchError::Parse(format!(
+                "unsupported SQL type for column {}.{}: {}",
+                table_name, name, err
+            ))
+        })?;
+        let value_kind = match family {
+            SqlTypeFamily::String => ColumnValueKind::String,
+            SqlTypeFamily::Integer => ColumnValueKind::Integer,
+            SqlTypeFamily::Decimal { scale } => ColumnValueKind::Decimal { scale },
+            SqlTypeFamily::Date32 => ColumnValueKind::Date32,
+            SqlTypeFamily::Binary => {
+                return Err(TpchError::Parse(format!(
+                    "column {}.{} uses a binary type that the TPCH loader cannot parse",
+                    table_name, name
+                )));
+            }
+        };
+        columns.push(TableColumn { name, value_kind });
     }
 
     Ok(columns)
-}
-
-/// Determine whether a column data type must be wrapped in single quotes.
-///
-/// Textual and temporal types require quoting so the generated INSERT batches remain
-/// valid SQL and preserve formatting. Numeric types stay unquoted to avoid implicit casts.
-fn column_requires_quotes(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Character(_)
-            | DataType::Char(_)
-            | DataType::CharacterVarying(_)
-            | DataType::CharVarying(_)
-            | DataType::Varchar(_)
-            | DataType::Nvarchar(_)
-            | DataType::CharacterLargeObject(_)
-            | DataType::CharLargeObject(_)
-            | DataType::Clob(_)
-            | DataType::Text
-            | DataType::String(_)
-            | DataType::Uuid
-            | DataType::Date
-            | DataType::Datetime(_)
-            | DataType::Datetime64(_, _)
-            | DataType::Timestamp(_, _)
-            | DataType::TimestampNtz
-            | DataType::Time(_, _)
-            | DataType::JSON
-            | DataType::JSONB
-    )
 }
 
 /// Populate `TpchTableInfo` from parsed `driver.c` metadata, falling back to defaults.
@@ -865,14 +1057,89 @@ fn build_table_info(name: &str, raw_tables: &HashMap<String, RawTableDef>) -> Tp
     }
 }
 
-/// Convert a raw generator field into a SQL literal, escaping quotes as needed.
-fn format_value(column: &TableColumn, raw: &str) -> String {
-    if raw.is_empty() {
-        return "''".into();
+fn parse_column_value(column: &TableColumn, raw: &str) -> Result<PlanValue> {
+    match column.value_kind {
+        ColumnValueKind::String => Ok(PlanValue::String(raw.to_string())),
+        ColumnValueKind::Integer => {
+            if raw.is_empty() {
+                return Err(TpchError::Parse(format!(
+                    "missing integer value for column {}",
+                    column.name
+                )));
+            }
+            let value = raw.parse::<i64>().map_err(|err| {
+                TpchError::Parse(format!(
+                    "invalid integer literal '{}' for column {}: {}",
+                    raw, column.name, err
+                ))
+            })?;
+            Ok(PlanValue::Integer(value))
+        }
+        ColumnValueKind::Decimal { scale } => {
+            if raw.is_empty() {
+                return Err(TpchError::Parse(format!(
+                    "missing decimal value for column {}",
+                    column.name
+                )));
+            }
+            let decimal = parse_decimal_literal(raw, scale, &column.name)?;
+            Ok(PlanValue::Decimal(decimal))
+        }
+        ColumnValueKind::Date32 => {
+            if raw.is_empty() {
+                return Err(TpchError::Parse(format!(
+                    "missing date value for column {}",
+                    column.name
+                )));
+            }
+            let days = parse_date32_literal(raw).map_err(|err| {
+                TpchError::Parse(format!(
+                    "invalid DATE literal '{}' for column {}: {}",
+                    raw, column.name, err
+                ))
+            })?;
+            Ok(PlanValue::Date32(days))
+        }
     }
-    if column.requires_quotes {
-        format!("'{}'", raw.replace('\'', "''"))
+}
+
+fn parse_decimal_literal(raw: &str, target_scale: i8, column_name: &str) -> Result<DecimalValue> {
+    let (value, scale) = if let Some(dot) = raw.find('.') {
+        let integer_part = &raw[..dot];
+        let fractional = &raw[dot + 1..];
+        let combined = format!("{}{}", integer_part, fractional);
+        let parsed = combined.parse::<i128>().map_err(|err| {
+            TpchError::Parse(format!(
+                "invalid decimal literal '{}' for column {}: {}",
+                raw, column_name, err
+            ))
+        })?;
+        (parsed, fractional.len() as i8)
     } else {
-        raw.to_string()
+        let parsed = raw.parse::<i128>().map_err(|err| {
+            TpchError::Parse(format!(
+                "invalid decimal literal '{}' for column {}: {}",
+                raw, column_name, err
+            ))
+        })?;
+        (parsed, 0)
+    };
+
+    let decimal = DecimalValue::new(value, scale).map_err(|err| {
+        TpchError::Parse(format!(
+            "invalid decimal literal '{}' for column {}: {}",
+            raw, column_name, err
+        ))
+    })?;
+
+    if scale == target_scale {
+        Ok(decimal)
+    } else {
+        decimal.rescale(target_scale).map_err(|err| {
+            TpchError::Parse(format!(
+                "unable to rescale decimal literal '{}' for column {}: {}",
+                raw, column_name, err
+            ))
+        })
     }
 }

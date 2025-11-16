@@ -98,15 +98,13 @@ pub fn validate_check_constraints(
 
 /// Ensure that the provided multi-column values maintain uniqueness.
 pub fn ensure_multi_column_unique(
-    existing_rows: &[Vec<PlanValue>],
-    new_rows: &[Vec<PlanValue>],
+    existing_keys: &[UniqueKey],
+    new_keys: &[UniqueKey],
     column_names: &[String],
 ) -> LlkvResult<()> {
-    let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-    for values in existing_rows {
-        if let Some(key) = build_composite_unique_key(values, column_names)?
-            && !existing_keys.insert(key.clone())
-        {
+    let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
+    for key in existing_keys {
+        if !seen.insert(key.clone()) {
             return Err(Error::ConstraintError(format!(
                 "constraint violation on columns '{}'",
                 column_names.join(", ")
@@ -114,11 +112,8 @@ pub fn ensure_multi_column_unique(
         }
     }
 
-    let mut new_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-    for values in new_rows {
-        if let Some(key) = build_composite_unique_key(values, column_names)?
-            && (existing_keys.contains(&key) || !new_keys.insert(key))
-        {
+    for key in new_keys {
+        if !seen.insert(key.clone()) {
             return Err(Error::ConstraintError(format!(
                 "constraint violation on columns '{}'",
                 column_names.join(", ")
@@ -792,8 +787,8 @@ pub fn ensure_single_column_unique(
 
 /// Ensure primary key values remain unique and non-null.
 pub fn ensure_primary_key(
-    existing_rows: &[Vec<PlanValue>],
-    new_rows: &[Vec<PlanValue>],
+    existing_keys: &[UniqueKey],
+    new_keys: &[UniqueKey],
     column_names: &[String],
 ) -> LlkvResult<()> {
     let pk_label = if column_names.len() == 1 {
@@ -809,37 +804,7 @@ pub fn ensure_primary_key(
 
     let mut seen: FxHashSet<UniqueKey> = FxHashSet::default();
 
-    for row_values in existing_rows {
-        if row_values.len() != column_names.len() {
-            continue;
-        }
-
-        let key = build_composite_unique_key(row_values, column_names)?;
-        let key = key.ok_or_else(|| {
-            Error::ConstraintError(format!(
-                "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-            ))
-        })?;
-
-        if !seen.insert(key.clone()) {
-            return Err(Error::ConstraintError(format!(
-                "Duplicate key violates primary key constraint on {pk_label} '{pk_display}' (PRIMARY KEY or UNIQUE constraint violation)"
-            )));
-        }
-    }
-
-    for row_values in new_rows {
-        if row_values.len() != column_names.len() {
-            continue;
-        }
-
-        let key = build_composite_unique_key(row_values, column_names)?;
-        let key = key.ok_or_else(|| {
-            Error::ConstraintError(format!(
-                "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-            ))
-        })?;
-
+    for key in existing_keys.iter().chain(new_keys.iter()) {
         if !seen.insert(key.clone()) {
             return Err(Error::ConstraintError(format!(
                 "Duplicate key violates primary key constraint on {pk_label} '{pk_display}' (PRIMARY KEY or UNIQUE constraint violation)"
@@ -856,34 +821,28 @@ pub fn validate_foreign_key_rows(
     referencing_table: &str,
     referenced_table: &str,
     referenced_column_names: &[String],
-    parent_keys: &[Vec<PlanValue>],
-    candidate_keys: &[Vec<PlanValue>],
+    parent_keys: &FxHashSet<UniqueKey>,
+    candidate_keys: &[UniqueKey],
 ) -> LlkvResult<()> {
     if parent_keys.is_empty() {
-        // If there are no parent keys, every non-null candidate will fail.
-        for key in candidate_keys {
-            if key.iter().all(|value| !matches!(value, PlanValue::Null)) {
-                let constraint_label = constraint_name.unwrap_or("FOREIGN KEY");
-                let referenced_columns = if referenced_column_names.is_empty() {
-                    String::from("<unknown>")
-                } else {
-                    referenced_column_names.join(", ")
-                };
-                return Err(Error::ConstraintError(format!(
-                    "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - does not exist in the referenced table",
-                    constraint_label, referencing_table, referenced_table, referenced_columns,
-                )));
-            }
+        if candidate_keys.is_empty() {
+            return Ok(());
         }
-        return Ok(());
+
+        let constraint_label = constraint_name.unwrap_or("FOREIGN KEY");
+        let referenced_columns = if referenced_column_names.is_empty() {
+            String::from("<unknown>")
+        } else {
+            referenced_column_names.join(", ")
+        };
+        return Err(Error::ConstraintError(format!(
+            "Violates foreign key constraint '{}' on table '{}' referencing '{}' (columns: {}) - does not exist in the referenced table",
+            constraint_label, referencing_table, referenced_table, referenced_columns,
+        )));
     }
 
     for key in candidate_keys {
-        if key.iter().any(|value| matches!(value, PlanValue::Null)) {
-            continue;
-        }
-
-        if parent_keys.iter().any(|existing| existing == key) {
+        if parent_keys.contains(key) {
             continue;
         }
 

@@ -60,3 +60,6 @@ use dtype_cache::DTypeCache;
 
 pub mod indexing;
 pub use indexing::*;
+
+mod write_hints;
+pub use write_hints::ColumnStoreWriteHints;

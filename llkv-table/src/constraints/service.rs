@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use super::types::ForeignKeyAction;
+use super::types::{ConstraintId, ForeignKeyAction};
 use super::validation::validate_foreign_key_rows;
 use super::validation::{
     ConstraintColumnInfo, UniqueKey, build_composite_unique_key, ensure_multi_column_unique,
@@ -19,7 +19,11 @@ use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+type ForeignKeyConstraintCache = FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>;
+type ForeignKeyCacheMap = FxHashMap<TableId, ForeignKeyConstraintCache>;
+type SharedForeignKeyCaches = Arc<RwLock<ForeignKeyCacheMap>>;
 
 /// Column metadata required to validate NOT NULL and CHECK constraints during inserts.
 #[derive(Clone, Debug)]
@@ -73,6 +77,7 @@ where
 {
     metadata: Arc<MetadataManager<P>>,
     catalog: Arc<TableCatalog>,
+    fk_parent_caches: SharedForeignKeyCaches,
 }
 
 impl<P> ConstraintService<P>
@@ -81,7 +86,28 @@ where
 {
     /// Create a new constraint validation service.
     pub fn new(metadata: Arc<MetadataManager<P>>, catalog: Arc<TableCatalog>) -> Self {
-        Self { metadata, catalog }
+        Self {
+            metadata,
+            catalog,
+            fk_parent_caches: Arc::new(RwLock::new(FxHashMap::default())),
+        }
+    }
+
+    /// Enable parent-key caching for a referencing table during foreign key validation.
+    pub fn enable_foreign_key_cache(&self, referencing_table_id: TableId) {
+        let mut caches = self
+            .fk_parent_caches
+            .write()
+            .expect("foreign key cache poisoned");
+        caches.entry(referencing_table_id).or_default();
+    }
+
+    /// Clear any cached parent keys associated with the provided referencing table.
+    pub fn clear_foreign_key_cache(&self, referencing_table_id: TableId) {
+        self.fk_parent_caches
+            .write()
+            .expect("foreign key cache poisoned")
+            .remove(&referencing_table_id);
     }
 
     /// Validate that incoming INSERT rows satisfy the table's foreign key constraints.
@@ -108,6 +134,9 @@ where
             return Ok(());
         }
 
+        let caching_enabled = self.is_foreign_key_cache_enabled(referencing_table_id);
+        let mut parent_key_cache: FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>> =
+            FxHashMap::default();
         let field_lookup = build_field_lookup(schema_field_ids);
         let mut table_to_row_index: Vec<Option<usize>> = vec![None; schema_field_ids.len()];
         for (row_pos, &schema_idx) in column_order.iter().enumerate() {
@@ -128,21 +157,22 @@ where
                 referencing_table_id,
             )?;
 
-            let parent_rows = fetch_parent_rows(ForeignKeyRowFetch {
-                referenced_table_id: detail.referenced_table_id,
-                referenced_table_canonical: &detail.referenced_table_canonical,
-                referenced_field_ids: &detail.referenced_field_ids,
-            })?;
+            let parent_keys = self.resolve_parent_keys(
+                referencing_table_id,
+                detail,
+                caching_enabled,
+                &mut parent_key_cache,
+                &mut fetch_parent_rows,
+            )?;
 
-            let parent_keys = canonical_parent_keys(detail, parent_rows);
-            let candidate_keys = candidate_child_keys(&referencing_positions, rows)?;
+            let candidate_keys = candidate_child_keys(detail, &referencing_positions, rows)?;
 
             validate_foreign_key_rows(
                 detail.constraint_name.as_deref(),
                 &detail.referencing_table_display,
                 &detail.referenced_table_display,
                 &detail.referenced_column_names,
-                &parent_keys,
+                parent_keys.as_ref(),
                 &candidate_keys,
             )?;
         }
@@ -206,16 +236,42 @@ where
             }
 
             let existing_rows = fetch_multi_column_rows(&constraint.field_ids)?;
-            let new_rows = collect_row_sets(rows, &schema_to_row_index, &constraint.schema_indices);
-            ensure_multi_column_unique(&existing_rows, &new_rows, &constraint.column_names)?;
+            let existing_keys =
+                rows_to_unique_keys(existing_rows, &constraint.column_names, NullKeyMode::Skip)?;
+            let new_keys = collect_unique_keys_from_rows(
+                rows,
+                &schema_to_row_index,
+                &constraint.schema_indices,
+                &constraint.column_names,
+                NullKeyMode::Skip,
+            )?;
+            ensure_multi_column_unique(&existing_keys, &new_keys, &constraint.column_names)?;
         }
 
         if let Some(pk) = primary_key
             && !pk.schema_indices.is_empty()
         {
+            let (pk_label, pk_display) = primary_key_context(&pk.column_names);
             let existing_rows = fetch_multi_column_rows(&pk.field_ids)?;
-            let new_rows = collect_row_sets(rows, &schema_to_row_index, &pk.schema_indices);
-            ensure_primary_key(&existing_rows, &new_rows, &pk.column_names)?;
+            let existing_keys = rows_to_unique_keys(
+                existing_rows,
+                &pk.column_names,
+                NullKeyMode::PrimaryKey {
+                    label: pk_label,
+                    display: &pk_display,
+                },
+            )?;
+            let new_keys = collect_unique_keys_from_rows(
+                rows,
+                &schema_to_row_index,
+                &pk.schema_indices,
+                &pk.column_names,
+                NullKeyMode::PrimaryKey {
+                    label: pk_label,
+                    display: &pk_display,
+                },
+            )?;
+            ensure_primary_key(&existing_keys, &new_keys, &pk.column_names)?;
         }
 
         Ok(())
@@ -261,9 +317,27 @@ where
         }
 
         let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
+        let (pk_label, pk_display) = primary_key_context(&primary_key.column_names);
         let existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
-        let new_rows = collect_row_sets(rows, &schema_to_row_index, &primary_key.schema_indices);
-        ensure_primary_key(&existing_rows, &new_rows, &primary_key.column_names)
+        let existing_keys = rows_to_unique_keys(
+            existing_rows,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
+        let new_keys = collect_unique_keys_from_rows(
+            rows,
+            &schema_to_row_index,
+            &primary_key.schema_indices,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
+        ensure_primary_key(&existing_keys, &new_keys, &primary_key.column_names)
     }
 
     /// Validate UPDATE operations that modify primary key columns. Ensures that updated
@@ -292,31 +366,35 @@ where
 
         let schema_to_row_index = build_schema_to_row_index(schema_field_ids.len(), column_order)?;
 
-        let mut existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
-        let mut existing_keys: FxHashSet<UniqueKey> = FxHashSet::default();
-        for row_values in existing_rows.drain(..) {
-            if let Some(key) = build_composite_unique_key(&row_values, &primary_key.column_names)? {
-                existing_keys.insert(key);
-            }
-        }
+        let (pk_label, pk_display) = primary_key_context(&primary_key.column_names);
+        let existing_rows = fetch_multi_column_rows(&primary_key.field_ids)?;
+        let existing_key_vec = rows_to_unique_keys(
+            existing_rows,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
+        let mut existing_keys: FxHashSet<UniqueKey> = existing_key_vec.into_iter().collect();
 
         for key in original_keys.iter().flatten() {
             existing_keys.remove(key);
         }
 
-        let (pk_label, pk_display) = primary_key_context(&primary_key.column_names);
         let mut new_seen: FxHashSet<UniqueKey> = FxHashSet::default();
-        let new_row_sets =
-            collect_row_sets(rows, &schema_to_row_index, &primary_key.schema_indices);
+        let new_keys = collect_unique_keys_from_rows(
+            rows,
+            &schema_to_row_index,
+            &primary_key.schema_indices,
+            &primary_key.column_names,
+            NullKeyMode::PrimaryKey {
+                label: pk_label,
+                display: &pk_display,
+            },
+        )?;
 
-        for values in new_row_sets {
-            let key = build_composite_unique_key(&values, &primary_key.column_names)?;
-            let key = key.ok_or_else(|| {
-                Error::ConstraintError(format!(
-                    "constraint failed: NOT NULL constraint failed for PRIMARY KEY {pk_label} '{pk_display}'"
-                ))
-            })?;
-
+        for key in new_keys {
             if existing_keys.contains(&key) {
                 return Err(Error::ConstraintError(format!(
                     "Duplicate key violates primary key constraint on {pk_label} '{}' (PRIMARY KEY or UNIQUE constraint violation)",
@@ -384,7 +462,7 @@ where
                 referenced_field_ids: &detail.referenced_field_ids,
             })?;
 
-            let parent_keys = canonical_parent_keys(&detail, parent_rows);
+            let parent_keys = canonical_parent_keys(&detail, parent_rows)?;
             if parent_keys.is_empty() {
                 continue;
             }
@@ -404,11 +482,11 @@ where
                     continue;
                 }
 
-                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                    continue;
-                }
+                let child_key =
+                    build_composite_unique_key(&values, &detail.referencing_column_names)?;
+                let Some(child_key) = child_key else { continue };
 
-                if parent_keys.iter().all(|key| key != &values) {
+                if !parent_keys.contains(&child_key) {
                     continue;
                 }
 
@@ -496,7 +574,7 @@ where
                 referenced_field_ids: &detail.referenced_field_ids,
             })?;
 
-            let parent_keys = canonical_parent_keys(&detail, parent_rows);
+            let parent_keys = canonical_parent_keys(&detail, parent_rows)?;
             if parent_keys.is_empty() {
                 continue;
             }
@@ -518,12 +596,12 @@ where
                     continue;
                 }
 
-                if values.iter().any(|value| matches!(value, PlanValue::Null)) {
-                    continue;
-                }
+                let child_key =
+                    build_composite_unique_key(&values, &detail.referencing_column_names)?;
+                let Some(child_key) = child_key else { continue };
 
                 // If a child row references one of the parent keys being updated, fail
-                if parent_keys.iter().any(|key| key == &values) {
+                if parent_keys.contains(&child_key) {
                     let constraint_label =
                         detail.constraint_name.as_deref().unwrap_or("FOREIGN KEY");
                     return Err(Error::ConstraintError(format!(
@@ -572,6 +650,81 @@ where
         }
 
         Ok(details_out)
+    }
+
+    fn is_foreign_key_cache_enabled(&self, table_id: TableId) -> bool {
+        self.fk_parent_caches
+            .read()
+            .expect("foreign key cache poisoned")
+            .contains_key(&table_id)
+    }
+
+    fn cached_parent_keys(
+        &self,
+        table_id: TableId,
+        constraint_id: ConstraintId,
+    ) -> Option<Arc<FxHashSet<UniqueKey>>> {
+        self.fk_parent_caches
+            .read()
+            .expect("foreign key cache poisoned")
+            .get(&table_id)
+            .and_then(|cache| cache.get(&constraint_id).map(Arc::clone))
+    }
+
+    fn store_cached_parent_keys(
+        &self,
+        table_id: TableId,
+        constraint_id: ConstraintId,
+        keys: FxHashSet<UniqueKey>,
+    ) -> Arc<FxHashSet<UniqueKey>> {
+        let mut caches = self
+            .fk_parent_caches
+            .write()
+            .expect("foreign key cache poisoned");
+        let Some(entry) = caches.get_mut(&table_id) else {
+            return Arc::new(keys);
+        };
+
+        let arc_keys = Arc::new(keys);
+        entry.insert(constraint_id, Arc::clone(&arc_keys));
+        arc_keys
+    }
+
+    fn resolve_parent_keys<F>(
+        &self,
+        referencing_table_id: TableId,
+        detail: &ForeignKeyView,
+        caching_enabled: bool,
+        local_cache: &mut FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>,
+        fetch_parent_rows: &mut F,
+    ) -> LlkvResult<Arc<FxHashSet<UniqueKey>>>
+    where
+        F: FnMut(ForeignKeyRowFetch<'_>) -> LlkvResult<Vec<Vec<PlanValue>>>,
+    {
+        if caching_enabled {
+            if let Some(keys) = self.cached_parent_keys(referencing_table_id, detail.constraint_id)
+            {
+                return Ok(keys);
+            }
+        } else if let Some(keys) = local_cache.get(&detail.constraint_id) {
+            return Ok(Arc::clone(keys));
+        }
+
+        let parent_rows = fetch_parent_rows(ForeignKeyRowFetch {
+            referenced_table_id: detail.referenced_table_id,
+            referenced_table_canonical: &detail.referenced_table_canonical,
+            referenced_field_ids: &detail.referenced_field_ids,
+        })?;
+
+        let key_set = canonical_parent_keys(detail, parent_rows)?;
+
+        if caching_enabled {
+            Ok(self.store_cached_parent_keys(referencing_table_id, detail.constraint_id, key_set))
+        } else {
+            let arc_keys = Arc::new(key_set);
+            local_cache.insert(detail.constraint_id, Arc::clone(&arc_keys));
+            Ok(arc_keys)
+        }
     }
 }
 
@@ -647,26 +800,75 @@ fn primary_key_context(column_names: &[String]) -> (&'static str, String) {
     }
 }
 
-fn collect_row_sets(
+#[derive(Clone, Copy)]
+enum NullKeyMode<'a> {
+    Skip,
+    PrimaryKey {
+        label: &'static str,
+        display: &'a str,
+    },
+}
+
+fn rows_to_unique_keys<'a>(
+    rows: Vec<Vec<PlanValue>>,
+    column_names: &[String],
+    mode: NullKeyMode<'a>,
+) -> LlkvResult<Vec<UniqueKey>> {
+    let mut keys = Vec::with_capacity(rows.len());
+    for values in rows {
+        push_unique_key(&mut keys, &values, column_names, mode)?;
+    }
+    Ok(keys)
+}
+
+fn collect_unique_keys_from_rows<'a>(
     rows: &[Vec<PlanValue>],
     schema_to_row_index: &[Option<usize>],
     schema_indices: &[usize],
-) -> Vec<Vec<PlanValue>> {
-    rows.iter()
-        .map(|row| {
-            schema_indices
-                .iter()
-                .map(|&schema_idx| {
-                    schema_to_row_index
-                        .get(schema_idx)
-                        .and_then(|opt| {
-                            opt.map(|row_pos| row.get(row_pos).cloned().unwrap_or(PlanValue::Null))
-                        })
-                        .unwrap_or(PlanValue::Null)
-                })
-                .collect()
-        })
-        .collect()
+    column_names: &[String],
+    mode: NullKeyMode<'a>,
+) -> LlkvResult<Vec<UniqueKey>> {
+    if schema_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut keys = Vec::with_capacity(rows.len());
+    let mut buffer = Vec::with_capacity(schema_indices.len());
+    for row in rows {
+        buffer.clear();
+        for &schema_idx in schema_indices {
+            let value = schema_to_row_index
+                .get(schema_idx)
+                .and_then(|opt| *opt)
+                .and_then(|row_pos| row.get(row_pos).cloned())
+                .unwrap_or(PlanValue::Null);
+            buffer.push(value);
+        }
+
+        push_unique_key(&mut keys, &buffer, column_names, mode)?;
+    }
+
+    Ok(keys)
+}
+
+fn push_unique_key<'a>(
+    keys: &mut Vec<UniqueKey>,
+    values: &[PlanValue],
+    column_names: &[String],
+    mode: NullKeyMode<'a>,
+) -> LlkvResult<()> {
+    match build_composite_unique_key(values, column_names)? {
+        Some(key) => {
+            keys.push(key);
+            Ok(())
+        }
+        None => match mode {
+            NullKeyMode::Skip => Ok(()),
+            NullKeyMode::PrimaryKey { label, display } => Err(Error::ConstraintError(format!(
+                "constraint failed: NOT NULL constraint failed for PRIMARY KEY {label} '{display}'"
+            ))),
+        },
+    }
 }
 
 fn referencing_row_positions(
@@ -709,42 +911,43 @@ fn referencing_row_positions(
 fn canonical_parent_keys(
     detail: &ForeignKeyView,
     parent_rows: Vec<Vec<PlanValue>>,
-) -> Vec<Vec<PlanValue>> {
-    parent_rows
-        .into_iter()
-        .filter(|values| values.len() == detail.referenced_field_ids.len())
-        .filter(|values| !values.iter().any(|value| matches!(value, PlanValue::Null)))
-        .collect()
+) -> LlkvResult<FxHashSet<UniqueKey>> {
+    let mut keys = FxHashSet::default();
+    for values in parent_rows {
+        if values.len() != detail.referenced_field_ids.len() {
+            continue;
+        }
+
+        let key = build_composite_unique_key(&values, &detail.referenced_column_names)?;
+        if let Some(key) = key {
+            keys.insert(key);
+        }
+    }
+
+    Ok(keys)
 }
 
 fn candidate_child_keys(
+    detail: &ForeignKeyView,
     positions: &[usize],
     rows: &[Vec<PlanValue>],
-) -> LlkvResult<Vec<Vec<PlanValue>>> {
+) -> LlkvResult<Vec<UniqueKey>> {
     let mut keys = Vec::new();
 
     for row in rows {
-        let mut key: Vec<PlanValue> = Vec::with_capacity(positions.len());
-        let mut contains_null = false;
+        let mut values: Vec<PlanValue> = Vec::with_capacity(positions.len());
 
         for &row_pos in positions {
             let value = row.get(row_pos).cloned().ok_or_else(|| {
                 Error::InvalidArgumentError("INSERT row is missing a required column value".into())
             })?;
-
-            if matches!(value, PlanValue::Null) {
-                contains_null = true;
-                break;
-            }
-
-            key.push(value);
+            values.push(value);
         }
 
-        if contains_null {
-            continue;
+        let key = build_composite_unique_key(&values, &detail.referencing_column_names)?;
+        if let Some(key) = key {
+            keys.push(key);
         }
-
-        keys.push(key);
     }
 
     Ok(keys)
