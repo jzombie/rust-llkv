@@ -111,6 +111,42 @@ impl SessionNamespaces {
 
         registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
+        let information_schema = {
+            let key = Arc::as_ptr(&base_context) as usize;
+            let namespace = {
+                let mut pool = information_schema_namespace_pool()
+                    .lock()
+                    .expect("information_schema namespace pool poisoned");
+                if let Some(existing) = pool.get(&key).and_then(|weak| weak.upgrade()) {
+                    existing
+                } else {
+                    let shared_catalog = base_context.table_catalog();
+                    let mem_pager = Arc::new(MemPager::default());
+                    let boxed_pager = Arc::new(BoxedPager::from_arc(mem_pager));
+                    let context = Arc::new(RuntimeContext::new_with_catalog(
+                        boxed_pager,
+                        Arc::clone(&shared_catalog),
+                    ));
+                    context
+                        .ensure_next_table_id_at_least(INFORMATION_SCHEMA_TABLE_ID_START)
+                        .expect("failed to seed information_schema table id counter");
+
+                    let namespace = Arc::new(TemporaryRuntimeNamespace::new(
+                        INFORMATION_SCHEMA_NAMESPACE_ID.to_string(),
+                        context,
+                    ));
+                    pool.insert(key, Arc::downgrade(&namespace));
+                    namespace
+                }
+            };
+            registry.register_namespace(
+                Arc::clone(&namespace),
+                vec![INFORMATION_SCHEMA_NAMESPACE_ID.to_string()],
+                false,
+            );
+            namespace
+        };
+
         let temporary = {
             // ARCHITECTURAL DECISION: Multi-pager arena via fallback lookup
             //
