@@ -2863,7 +2863,7 @@ where
         let numeric_fields_arc = Arc::new(FxHashSet::default());
 
         match order.transform {
-            ScanOrderTransform::IdentityInteger => {
+            ScanOrderTransform::IdentityInt64 => {
                 let mut row_stream = RowStreamBuilder::new(
                     store,
                     self.table.table_id(),
