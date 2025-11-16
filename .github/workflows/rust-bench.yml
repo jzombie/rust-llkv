@@ -1,11 +1,11 @@
 name: rust-bench
 
 on:
-  # Gate benches on rust-lint success to cut CI time because Criterion runs are long.
-  workflow_run:
-    workflows: ["rust-lint"]
-    types: [completed]
-  workflow_dispatch:
+  push:
+    branches: [main]
+  # Only run benches for pull requests
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Ensure only one run per branch/PR at a time. If new commits are pushed,
 # older jobs will be automatically canceled.
@@ -21,7 +21,7 @@ jobs:
     # for pushes and manual `workflow_dispatch` events. GitHub exposes
     # `github.event.pull_request.draft` (true for draft PRs), so require it to
     # be false when the event is a pull_request.
-    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
 
     # runs-on: ubuntu-latest
     runs-on: [self-hosted, macOS, ARM64]
