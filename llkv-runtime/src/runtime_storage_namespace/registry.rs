@@ -166,10 +166,10 @@ impl RuntimeStorageNamespaceRegistry {
             return namespace_id.clone();
         }
 
-        if let Some((schema, _)) = canonical.split_once('.') {
-            if let Some(namespace_id) = self.schema_map.get(schema) {
-                return namespace_id.clone();
-            }
+        if let Some((schema, _)) = canonical.split_once('.')
+            && let Some(namespace_id) = self.schema_map.get(schema)
+        {
+            return namespace_id.clone();
         }
 
         self.persistent_id.clone()

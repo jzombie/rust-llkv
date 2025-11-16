@@ -809,10 +809,10 @@ fn constraint_name_or_fallback(
     constraint_type: InformationSchemaConstraintType,
     constraint_id: Option<ConstraintId>,
 ) -> String {
-    if let Some(name) = stored {
-        if !name.trim().is_empty() {
-            return name.clone();
-        }
+    if let Some(name) = stored
+        && !name.trim().is_empty()
+    {
+        return name.clone();
     }
 
     match constraint_id {

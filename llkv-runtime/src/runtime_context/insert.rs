@@ -37,7 +37,13 @@ where
         snapshot: TransactionSnapshot,
         constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
-        let (display_name, canonical_name) = canonical_table_name(&plan.table)?;
+        let InsertPlan {
+            table: table_name,
+            columns,
+            source,
+            on_conflict,
+        } = plan;
+        let (display_name, canonical_name) = canonical_table_name(&table_name)?;
         let table = self.lookup_table(&canonical_name)?;
 
         // Views are read-only - reject INSERT operations
@@ -68,28 +74,19 @@ where
             );
         }
 
-        let result = match plan.source {
-            InsertSource::Rows(rows) => self.insert_rows_with_conflict(
-                table.as_ref(),
-                display_name.clone(),
-                canonical_name.clone(),
-                rows,
-                plan.columns,
-                plan.on_conflict,
-                snapshot,
-                constraint_mode,
-            ),
-            InsertSource::Batches(batches) => {
-                let ctx = InsertExecContext::new(
-                    table.as_ref(),
-                    display_name.clone(),
-                    canonical_name.clone(),
-                    plan.columns,
-                    snapshot,
-                    constraint_mode,
-                );
-                self.insert_batches(ctx, batches)
-            }
+        let ctx = InsertExecContext::new(
+            table.as_ref(),
+            display_name.clone(),
+            canonical_name.clone(),
+            columns,
+            snapshot,
+            constraint_mode,
+        );
+
+        let result = match source {
+            InsertSource::Rows(rows) =>
+                self.insert_rows_with_conflict(ctx, rows, on_conflict),
+            InsertSource::Batches(batches) => self.insert_batches(ctx, batches),
             InsertSource::Select { .. } => Err(Error::Internal(
                 "InsertSource::Select should be materialized before reaching RuntimeContext::insert"
                     .into(),
@@ -121,24 +118,10 @@ where
     /// Insert rows with conflict resolution handling.
     pub(super) fn insert_rows_with_conflict(
         &self,
-        table: &ExecutorTable<P>,
-        display_name: String,
-        canonical_name: String,
+        ctx: InsertExecContext<'_, P>,
         rows: Vec<Vec<PlanValue>>,
-        columns: Vec<String>,
         on_conflict: InsertConflictAction,
-        snapshot: TransactionSnapshot,
-        constraint_mode: ConstraintEnforcementMode,
     ) -> Result<RuntimeStatementResult<P>> {
-        let ctx = InsertExecContext::new(
-            table,
-            display_name,
-            canonical_name,
-            columns,
-            snapshot,
-            constraint_mode,
-        );
-
         match on_conflict {
             InsertConflictAction::None
             | InsertConflictAction::Abort

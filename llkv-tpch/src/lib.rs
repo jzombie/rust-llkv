@@ -474,10 +474,10 @@ impl TpchToolkit {
                     self.flush_insert(engine, schema_name, table, &batch)?;
                     batch.clear();
                 }
-                if row_count % Self::PROGRESS_REPORT_INTERVAL == 0 {
-                    if let Some(callback) = progress.as_mut() {
-                        callback(row_count);
-                    }
+                if row_count.is_multiple_of(Self::PROGRESS_REPORT_INTERVAL)
+                    && let Some(callback) = progress.as_mut()
+                {
+                    callback(row_count);
                 }
             }
 
@@ -645,16 +645,16 @@ pub fn resolve_loader_batch_size(engine: &SqlEngine, batch_override: Option<usiz
         .unwrap_or(hints.recommended_insert_batch_rows)
         .max(1);
     let resolved = hints.clamp_insert_batch_rows(requested);
-    if let Some(explicit) = batch_override {
-        if resolved != explicit {
-            tracing::warn!(
-                target: "tpch-loader",
-                requested = explicit,
-                resolved,
-                max = hints.max_insert_batch_rows,
-                "clamped batch size override to column-store limit"
-            );
-        }
+    if let Some(explicit) = batch_override
+        && resolved != explicit
+    {
+        tracing::warn!(
+            target: "tpch-loader",
+            requested = explicit,
+            resolved,
+            max = hints.max_insert_batch_rows,
+            "clamped batch size override to column-store limit"
+        );
     }
     resolved
 }

@@ -397,7 +397,7 @@ fn extract_integer(array: &ArrayRef, row: usize) -> Result<i128> {
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| TpchError::Parse("expected Decimal128 array".into()))?
                 .value(row);
-            Ok(value as i128)
+            Ok(value)
         }
         _ => extract_string(array, row)?
             .parse::<i128>()
@@ -682,7 +682,7 @@ fn load_stream_parameters(
         let query = fields[0].parse::<u8>().map_err(|err| {
             TpchError::Parse(format!(
                 "unable to parse query number '{:?}' in {}: {err}",
-                fields.get(0),
+                fields.first(),
                 path.display()
             ))
         })?;
