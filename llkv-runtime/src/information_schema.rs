@@ -109,18 +109,26 @@ fn recreate_information_schema_tables(
 ) -> Result<()> {
     for table in tables {
         let (display_name, canonical_name) = canonical_table_name(table.name)?;
-
-        let drop_plan = DropTablePlan::new(display_name.clone()).if_exists(true);
         if !std::ptr::eq(source_context, target_context) {
-            CatalogDdl::drop_table(source_context, drop_plan.clone())?;
+            drop_table_if_registered(
+                source_context,
+                display_name.as_str(),
+                canonical_name.as_str(),
+                true,
+            )?;
         }
-        CatalogDdl::drop_table(target_context, drop_plan)?;
+        drop_table_if_registered(
+            target_context,
+            display_name.as_str(),
+            canonical_name.as_str(),
+            false,
+        )?;
         {
             let mut guard = registry.write().expect("namespace registry poisoned");
             guard.unregister_table(&canonical_name);
         }
 
-        let mut plan = CreateTablePlan::new(display_name);
+        let mut plan = CreateTablePlan::new(display_name.clone());
         plan.or_replace = true;
         plan.source = Some(CreateTableSource::Batches {
             schema: Arc::clone(&table.schema),
@@ -135,6 +143,24 @@ fn recreate_information_schema_tables(
     }
 
     Ok(())
+}
+
+fn drop_table_if_registered(
+    context: &RuntimeContext<BoxedPager>,
+    display_name: &str,
+    canonical_name: &str,
+    require_lookup: bool,
+) -> Result<()> {
+    if context.catalog().table_id(canonical_name).is_none() {
+        return Ok(());
+    }
+
+    if require_lookup && context.lookup_table(canonical_name).is_err() {
+        return Ok(());
+    }
+
+    let plan = DropTablePlan::new(display_name.to_string()).if_exists(true);
+    CatalogDdl::drop_table(context, plan)
 }
 
 fn build_tables_table(context: &RuntimeContext<BoxedPager>) -> Result<InformationSchemaTableData> {
