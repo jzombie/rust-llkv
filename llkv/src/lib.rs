@@ -109,7 +109,7 @@
 //!   concurrent sessions.
 //!
 //! See [dev-docs/high-level-crate-linkage.md](../dev-docs/high-level-crate-linkage.md)
-//! and the [DeepWiki architecture overview](https://deepwiki.com/jzombie/rust-llkv)
+//! and the [DeepWiki documentation](https://deepwiki.com/jzombie/rust-llkv)
 //! for diagrams and extended commentary.
 //!
 //! # Quick Start

@@ -51,7 +51,7 @@ The workspace is organized into six layers; higher layers depend on the ones bel
 - **Table and Metadata** ([`llkv-table`](./llkv-table/), [`llkv-column-map`](./llkv-column-map/)): Adds schema-aware table APIs, system catalog management, and logical field tracking atop the column store.
 - **Storage and I/O** ([`llkv-storage`](./llkv-storage/), [`simd-r-drive`](https://crates.io/crates/simd-r-drive)): Provides the `Pager` trait and concrete backends for zero-copy reads with SIMD-friendly alignment.
 
-See [dev-docs/high-level-crate-linkage.md](./dev-docs/high-level-crate-linkage.md) and the [DeepWiki Architecture][deepwiki-page] page for dependency details.
+See [dev-docs/high-level-crate-linkage.md](./dev-docs/high-level-crate-linkage.md) and the [DeepWiki documentation][deepwiki-page] page for dependency details.
 
 ## End-to-End Query Flow
 
