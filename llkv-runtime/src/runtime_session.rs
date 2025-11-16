@@ -7,8 +7,8 @@ use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::{
-    ConstraintEnforcementMode, SingleColumnIndexDescriptor, canonical_table_name,
-    validate_alter_table_operation, INFORMATION_SCHEMA_TABLE_ID_START, TEMPORARY_TABLE_ID_START,
+    ConstraintEnforcementMode, INFORMATION_SCHEMA_TABLE_ID_START, SingleColumnIndexDescriptor,
+    TEMPORARY_TABLE_ID_START, canonical_table_name, validate_alter_table_operation,
 };
 
 use crate::{

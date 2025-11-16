@@ -10,9 +10,15 @@ fn main() {
     println!("=== Testing Aggregates with information_schema ===\n");
 
     // Setup
-    engine.execute("CREATE TABLE test1 (id INT PRIMARY KEY, name TEXT);").unwrap();
-    engine.execute("CREATE TABLE test2 (id INT PRIMARY KEY, value INT, category TEXT);").unwrap();
-    engine.execute("INSERT INTO test2 VALUES (1, 100, 'A'), (2, 200, 'B'), (3, 150, 'A');").unwrap();
+    engine
+        .execute("CREATE TABLE test1 (id INT PRIMARY KEY, name TEXT);")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE test2 (id INT PRIMARY KEY, value INT, category TEXT);")
+        .unwrap();
+    engine
+        .execute("INSERT INTO test2 VALUES (1, 100, 'A'), (2, 200, 'B'), (3, 150, 'A');")
+        .unwrap();
 
     // Test 0: GROUP BY on regular table (baseline)
     println!("Test 0: GROUP BY on regular user table (baseline)");
@@ -26,7 +32,9 @@ fn main() {
 
     // Test 1: Simple COUNT without GROUP BY
     println!("Test 1: Simple COUNT on information_schema");
-    match engine.sql("SELECT COUNT(*) as total FROM information_schema.columns WHERE table_name = 'test1';") {
+    match engine
+        .sql("SELECT COUNT(*) as total FROM information_schema.columns WHERE table_name = 'test1';")
+    {
         Ok(batches) if !batches.is_empty() => {
             println!("{}\n", pretty_format_batches(&batches).unwrap());
         }

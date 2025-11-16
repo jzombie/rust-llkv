@@ -55,10 +55,10 @@ use simd_r_drive_entry_handle::EntryHandle;
 use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
+use crate::reserved::is_information_schema_table;
 use crate::scalar_eval::{
     NumericArray, NumericArrayMap, NumericKernels, NumericKind, NumericValue,
 };
-use crate::reserved::is_information_schema_table;
 use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
@@ -1280,7 +1280,7 @@ where
         // many columns are projected (root cause TBD in collect_row_ids_for_program).
         let is_info_schema = is_information_schema_table(self.table.table_id());
         let is_trivial = is_trivial_filter(filter_expr.as_ref());
-        
+
         let mut row_ids = if is_trivial {
             use arrow::datatypes::UInt64Type;
             use llkv_expr::typed_predicate::Predicate;
@@ -1294,7 +1294,8 @@ where
                 .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
         } else if is_info_schema {
             // Try complex path for information_schema with non-trivial filter
-            let row_ids = self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?;
+            let row_ids =
+                self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?;
             if row_ids.is_empty() {
                 tracing::debug!(
                     "[SCAN_STREAM] information_schema table {}: complex filter returned 0 rows, \

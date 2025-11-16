@@ -36,7 +36,9 @@ where
 
         // Check if any table in the query is from information_schema
         let is_information_schema = plan.tables.iter().any(|table_ref| {
-            table_ref.qualified_name().starts_with("information_schema.")
+            table_ref
+                .qualified_name()
+                .starts_with("information_schema.")
         });
 
         // Skip MVCC filtering for information_schema tables
