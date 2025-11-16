@@ -1657,18 +1657,11 @@ impl SqlEngine {
                 // This is a simple text-based check that catches all forms (quoted, unquoted, etc.)
                 // and ensures the schema is ready before any table resolution happens.
                 let query_sql = query.to_string();
-                eprintln!("🔍 Checking query SQL: {}", query_sql);
                 if query_sql
                     .to_ascii_lowercase()
                     .contains("information_schema")
                 {
-                    eprintln!("✓ Query mentions information_schema, refreshing!");
                     self.ensure_information_schema_ready()?;
-                    eprintln!("✓ Refresh complete");
-                    let catalog = self.engine.context().table_catalog();
-                    eprintln!("📋 Tables after refresh: {:?}", catalog.table_names());
-                } else {
-                    eprintln!("✗ Query does NOT mention information_schema");
                 }
                 self.handle_query(*query)
             }

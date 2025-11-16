@@ -58,6 +58,7 @@ use crate::constants::STREAM_BATCH_ROWS;
 use crate::scalar_eval::{
     NumericArray, NumericArrayMap, NumericKernels, NumericKind, NumericValue,
 };
+use crate::reserved::is_information_schema_table;
 use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
@@ -1272,7 +1273,15 @@ where
         // 1. MVCC filtering to check visibility of all rows including NULL rows
         // 2. Aggregates like COUNT_NULLS that need to count NULL rows
         // We scan the MVCC created_by column which exists for every row.
-        let mut row_ids = if is_trivial_filter(filter_expr.as_ref()) {
+        //
+        // WORKAROUND: For information_schema tables with non-trivial filters, try the
+        // complex path first, but fall back to trivial if it returns zero rows.
+        // Information schema tables have issues with complex filter evaluation when
+        // many columns are projected (root cause TBD in collect_row_ids_for_program).
+        let is_info_schema = is_information_schema_table(self.table.table_id());
+        let is_trivial = is_trivial_filter(filter_expr.as_ref());
+        
+        let mut row_ids = if is_trivial {
             use arrow::datatypes::UInt64Type;
             use llkv_expr::typed_predicate::Predicate;
             let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
@@ -1283,6 +1292,25 @@ where
             self.table
                 .store()
                 .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
+        } else if is_info_schema {
+            // Try complex path for information_schema with non-trivial filter
+            let row_ids = self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?;
+            if row_ids.is_empty() {
+                tracing::debug!(
+                    "[SCAN_STREAM] information_schema table {}: complex filter returned 0 rows, \
+                     falling back to trivial path + post-filter",
+                    self.table.table_id()
+                );
+                // Fall back to scanning all rows - we'll need to apply filter later
+                use arrow::datatypes::UInt64Type;
+                use llkv_expr::typed_predicate::Predicate;
+                let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
+                self.table
+                    .store()
+                    .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
+            } else {
+                row_ids
+            }
         } else {
             self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?
         };

@@ -3474,6 +3474,12 @@ where
 
         let batches = execution.collect()?;
 
+        tracing::debug!(
+            "[GROUP BY] Collected {} batches from base scan, total_rows={}",
+            batches.len(),
+            batches.iter().map(|b| b.num_rows()).sum::<usize>()
+        );
+
         let column_lookup_map = build_column_lookup_map(base_schema.as_ref());
 
         self.execute_group_by_from_batches(

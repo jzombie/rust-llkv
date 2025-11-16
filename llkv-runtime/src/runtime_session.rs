@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager};
-use llkv_table::types::TableId;
 use llkv_table::{
     ConstraintEnforcementMode, SingleColumnIndexDescriptor, canonical_table_name,
-    validate_alter_table_operation,
+    validate_alter_table_operation, INFORMATION_SCHEMA_TABLE_ID_START, TEMPORARY_TABLE_ID_START,
 };
 
 use crate::{
@@ -30,9 +29,6 @@ use llkv_plan::TruncatePlan;
 type StatementResult = RuntimeStatementResult<BoxedPager>;
 type TxnResult = TransactionResult<BoxedPager>;
 type BaseTxnContext = RuntimeTransactionContext<BoxedPager>;
-
-const TEMPORARY_TABLE_ID_START: TableId = 0x8000;
-const INFORMATION_SCHEMA_TABLE_ID_START: TableId = 0xC000;
 
 static INFORMATION_SCHEMA_NAMESPACE_POOL: OnceLock<
     Mutex<HashMap<usize, Weak<TemporaryRuntimeNamespace>>>,
