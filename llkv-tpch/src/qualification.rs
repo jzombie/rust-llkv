@@ -145,6 +145,9 @@ pub fn run_qualification(
     let mut reports = Vec::with_capacity(options.queries().len());
 
     for &query in options.queries() {
+        print!("  Q{:02}: executing... ", query);
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        
         let kinds = column_kinds
             .get((query - 1) as usize)
             .ok_or_else(|| TpchError::Parse(format!("no column metadata for query {query}")))?;
@@ -159,11 +162,17 @@ pub fn run_qualification(
             &stream_parameters,
         )?;
         let actual_rows = execute_query(engine, &rendered, kinds)?;
+        
+        print!("comparing... ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        
         let diff = diff_rows(&expected_rows, &actual_rows, kinds);
 
         let status = if diff.missing.is_empty() && diff.extra.is_empty() {
+            println!("PASS ({} rows)", actual_rows.len());
             QualificationStatus::Pass
         } else {
+            println!("FAIL (expected {}, actual {})", expected_rows.len(), actual_rows.len());
             QualificationStatus::Fail
         };
 
@@ -236,13 +245,19 @@ fn execute_query(
 ) -> Result<Vec<QualificationRow>> {
     let mut last_set = None;
 
-    for statement in &rendered.statements {
+    for (idx, statement) in rendered.statements.iter().enumerate() {
         match statement.kind {
             StatementKind::Command => {
+                print!("[cmd {}]... ", idx + 1);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
                 engine.execute(&statement.sql).map(|_| ())?;
             }
             StatementKind::Query => {
+                print!("[query {}]... ", idx + 1);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
                 let batches = engine.sql(&statement.sql)?;
+                print!("[collect]... ");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
                 let rows = collect_rows(&batches, kinds)?;
                 last_set = Some(rows);
             }
