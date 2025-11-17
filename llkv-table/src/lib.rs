@@ -73,8 +73,8 @@ pub use diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample}
 pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::{
-    is_information_schema_table, CATALOG_TABLE_ID, INFORMATION_SCHEMA_TABLE_ID_START,
-    TEMPORARY_TABLE_ID_START,
+    CATALOG_TABLE_ID, INFORMATION_SCHEMA_TABLE_ID_START, TEMPORARY_TABLE_ID_START,
+    is_information_schema_table,
 };
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};

@@ -560,11 +560,7 @@ fn test_information_schema_reflects_schema_changes() {
         .expect("query after drop column succeeds");
 
     let batches = extract_batches(results);
-    assert_eq!(
-        batches[0].num_rows(),
-        2,
-        "should have 2 columns after drop"
-    );
+    assert_eq!(batches[0].num_rows(), 2, "should have 2 columns after drop");
 
     let column_names = batches[0]
         .column(0)
@@ -597,7 +593,8 @@ fn test_information_schema_reflects_schema_changes() {
         .unwrap();
     assert_eq!(column_names.value(0), "id");
     assert_eq!(
-        column_names.value(1), "product_name",
+        column_names.value(1),
+        "product_name",
         "column should be renamed"
     );
 
@@ -621,7 +618,11 @@ fn test_information_schema_reflects_schema_changes() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(data_types.value(0), "Int64", "column type should be changed");
+    assert_eq!(
+        data_types.value(0),
+        "Int64",
+        "column type should be changed"
+    );
 
     // Test 4: RENAME TABLE - rename 'products' to 'items'
     engine
@@ -646,7 +647,7 @@ fn test_information_schema_reflects_schema_changes() {
     let user_tables: Vec<&str> = (0..batches[0].num_rows())
         .map(|i| table_names_arr.value(i))
         .collect();
-    
+
     assert!(
         !user_tables.contains(&"products"),
         "old table name 'products' should not exist"
@@ -666,7 +667,11 @@ fn test_information_schema_reflects_schema_changes() {
         .expect("query new table name succeeds");
 
     let batches = extract_batches(results);
-    assert_eq!(batches[0].num_rows(), 2, "renamed table should have 2 columns");
+    assert_eq!(
+        batches[0].num_rows(),
+        2,
+        "renamed table should have 2 columns"
+    );
 
     let column_names = batches[0]
         .column(0)
@@ -725,7 +730,11 @@ fn test_information_schema_reflects_schema_changes() {
         .expect("query recreated table succeeds");
 
     let batches = extract_batches(results);
-    assert_eq!(batches[0].num_rows(), 2, "recreated table should have 2 columns");
+    assert_eq!(
+        batches[0].num_rows(),
+        2,
+        "recreated table should have 2 columns"
+    );
 
     let column_names = batches[0]
         .column(0)
@@ -733,7 +742,8 @@ fn test_information_schema_reflects_schema_changes() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(
-        column_names.value(0), "id",
+        column_names.value(0),
+        "id",
         "recreated table should have new schema"
     );
     assert_eq!(column_names.value(1), "description");
@@ -757,7 +767,11 @@ fn test_alter_table_drop_column_basic() {
         .execute("SELECT * FROM test;")
         .expect("select succeeds");
     let batches = extract_batches(results);
-    assert_eq!(batches[0].num_columns(), 3, "should have 3 columns initially");
+    assert_eq!(
+        batches[0].num_columns(),
+        3,
+        "should have 3 columns initially"
+    );
 
     // Drop a column
     engine
@@ -769,7 +783,7 @@ fn test_alter_table_drop_column_basic() {
         .execute("SELECT * FROM test;")
         .expect("select after drop succeeds");
     let batches = extract_batches(results);
-    
+
     assert_eq!(
         batches[0].num_columns(),
         2,
