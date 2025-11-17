@@ -485,10 +485,23 @@ where
         table_id: TableId,
         column_field_ids: &[FieldId],
     ) -> LlkvResult<()> {
+        use llkv_column_map::types::LogicalFieldId;
+
         self.metadata
             .prepare_table_drop(table_id, column_field_ids)?;
         self.metadata.flush_table(table_id)?;
         self.metadata.remove_table_state(table_id);
+
+        for field_id in column_field_ids {
+            let logical_field_id = LogicalFieldId::for_user(table_id, *field_id);
+            self.store.remove_column(logical_field_id)?;
+        }
+
+        self.store
+            .remove_column(LogicalFieldId::for_mvcc_created_by(table_id))?;
+        self.store
+            .remove_column(LogicalFieldId::for_mvcc_deleted_by(table_id))?;
+
         if let Some(table_id_from_catalog) = self.catalog.table_id(canonical_name) {
             let _ = self.catalog.unregister_table(table_id_from_catalog);
         } else {
