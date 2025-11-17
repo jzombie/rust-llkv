@@ -17,7 +17,7 @@ use llkv::{
     storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, PagerDiagnostics},
 };
 use llkv_table::diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
-use llkv_tpch::qualification::{QualificationOptions, QualificationStatus};
+use llkv_tpch::qualification::{QualificationOptions, QualificationStatus, verify_qualification_assets};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
 use llkv_tpch::{
     LoadSummary, SchemaPaths, TableLoadEvent, TpchError, TpchToolkit, install_default_schema,
@@ -555,6 +555,8 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
         options = options.with_queries(args.queries.clone());
     }
 
+    options = ensure_dataset_available(&toolkit, options)?;
+
     let reports = toolkit.run_qualification(&engine, &schema.schema_name, &options)?;
 
     println!(
@@ -594,6 +596,30 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     println!("\nSummary: {passed}/{} queries passed", reports.len());
 
     Ok(())
+}
+
+fn ensure_dataset_available(
+    toolkit: &TpchToolkit,
+    options: QualificationOptions,
+) -> Result<QualificationOptions, TpchError> {
+    match verify_qualification_assets(&options) {
+        Ok(()) => Ok(options),
+        Err(primary_err) => {
+            let fallback_dir = toolkit.schema_paths().check_answers_dir();
+            if fallback_dir != options.dataset_dir() {
+                let fallback = options.clone().with_dataset(fallback_dir);
+                if verify_qualification_assets(&fallback).is_ok() {
+                    println!(
+                        "Qualification dataset '{}' missing canonical results; using fallback '{}'",
+                        options.dataset_dir().display(),
+                        fallback.dataset_dir().display()
+                    );
+                    return Ok(fallback);
+                }
+            }
+            Err(primary_err)
+        }
+    }
 }
 
 fn print_load_summary(summary: &LoadSummary) {

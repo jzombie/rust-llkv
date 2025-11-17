@@ -80,11 +80,17 @@ impl QualificationOptions {
         self
     }
 
+    /// Override the dataset directory while preserving other parameters.
+    pub fn with_dataset(mut self, dataset_dir: impl Into<PathBuf>) -> Self {
+        self.dataset_dir = dataset_dir.into();
+        self
+    }
+
     pub fn dataset_dir(&self) -> &Path {
         &self.dataset_dir
     }
 
-    fn queries(&self) -> &[u8] {
+    pub fn queries(&self) -> &[u8] {
         &self.queries
     }
 
@@ -172,6 +178,34 @@ pub fn run_qualification(
     }
 
     Ok(reports)
+}
+
+/// Ensure all required qualification artifacts exist before running comparisons.
+pub fn verify_qualification_assets(options: &QualificationOptions) -> Result<()> {
+    let dir = options.dataset_dir();
+    if !dir.is_dir() {
+        return Err(TpchError::Parse(format!(
+            "qualification dataset directory '{}' does not exist",
+            dir.display()
+        )));
+    }
+    let subparam_path = dir.join(format!("subparam_{}", options.stream_number()));
+    if !subparam_path.is_file() {
+        return Err(TpchError::Parse(format!(
+            "qualification dataset missing stream parameters file '{}'",
+            subparam_path.display()
+        )));
+    }
+    for &query in options.queries() {
+        let answer_path = dir.join(format!("q{query}.out"));
+        if !answer_path.is_file() {
+            return Err(TpchError::Parse(format!(
+                "qualification dataset missing answer set '{}'",
+                answer_path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn render_query(
