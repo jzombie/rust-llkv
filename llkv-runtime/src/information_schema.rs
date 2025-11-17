@@ -109,7 +109,16 @@ fn recreate_information_schema_tables(
 ) -> Result<()> {
     for table in tables {
         let (display_name, canonical_name) = canonical_table_name(table.name)?;
-        if !std::ptr::eq(source_context, target_context) {
+        let drop_from_source = if !std::ptr::eq(source_context, target_context) {
+            let owner = {
+                let guard = registry.read().expect("namespace registry poisoned");
+                guard.namespace_for_table(&canonical_name)
+            };
+            owner != *namespace_id
+        } else {
+            false
+        };
+        if drop_from_source {
             drop_table_if_registered(
                 source_context,
                 display_name.as_str(),

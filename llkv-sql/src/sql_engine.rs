@@ -578,6 +578,11 @@ impl SqlEngine {
         Ok(())
     }
 
+    fn invalidate_information_schema(&self) {
+        self.information_schema_ready
+            .store(false, AtomicOrdering::Release);
+    }
+
     fn from_runtime_engine(
         engine: RuntimeEngine,
         default_nulls_first: bool,
@@ -631,19 +636,36 @@ impl SqlEngine {
             PlanStatement::CreateView(_) | PlanStatement::DropView(_)
         );
 
+        // Check if this statement modifies the schema structure
+        let modifies_schema = matches!(
+            &statement,
+            PlanStatement::CreateTable(_)
+                | PlanStatement::DropTable(_)
+                | PlanStatement::AlterTable(_)
+                | PlanStatement::CreateView(_)
+                | PlanStatement::DropView(_)
+        );
+
         let table = if should_map_error {
-            llkv_runtime::statement_table_name(&statement).map(str::to_string)
+            llkv_runtime::statement_table_name(&statement)
         } else {
             None
         };
 
-        self.engine.execute_statement(statement).map_err(|err| {
+        let result = self.engine.execute_statement(statement).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
             } else {
                 err
             }
-        })
+        });
+
+        // Invalidate information schema cache after successful schema modifications
+        if result.is_ok() && modifies_schema {
+            self.invalidate_information_schema();
+        }
+
+        result
     }
 
     /// Construct a new engine backed by the provided pager with insert buffering disabled.
@@ -1653,6 +1675,16 @@ impl SqlEngine {
             }
             Statement::Query(query) => {
                 tracing::trace!("DEBUG SQL execute_statement_non_transactional: Query");
+                // Eagerly refresh information_schema if the SQL text mentions it.
+                // This is a simple text-based check that catches all forms (quoted, unquoted, etc.)
+                // and ensures the schema is ready before any table resolution happens.
+                let query_sql = query.to_string();
+                if query_sql
+                    .to_ascii_lowercase()
+                    .contains("information_schema")
+                {
+                    self.ensure_information_schema_ready()?;
+                }
                 self.handle_query(*query)
             }
             Statement::Update {
@@ -1911,6 +1943,9 @@ impl SqlEngine {
         validate_create_table_common(&stmt)?;
 
         let (mut schema_name, table_name) = parse_schema_qualified_name(&stmt.name)?;
+
+        // Validate that the table name doesn't conflict with reserved schemas
+        validate_reserved_table_name(schema_name.as_deref(), &table_name)?;
 
         let namespace = if stmt.temporary {
             if schema_name.is_some() {
@@ -4140,7 +4175,13 @@ impl SqlEngine {
         let operation = operations.into_iter().next().expect("checked length");
         match operation {
             AlterTableOperation::RenameTable { table_name } => {
-                let new_name = table_name.to_string();
+                let new_name_raw = table_name.to_string();
+                // Strip "TO " prefix if present (sqlparser may include it)
+                let new_name = new_name_raw
+                    .strip_prefix("TO ")
+                    .or_else(|| new_name_raw.strip_prefix("to "))
+                    .unwrap_or(&new_name_raw)
+                    .to_string();
                 self.handle_alter_table_rename(name, new_name, if_exists)
             }
             AlterTableOperation::RenameColumn {
@@ -4297,7 +4338,11 @@ impl SqlEngine {
         let plan = RenameTablePlan::new(&current_display, &new_display).if_exists(if_exists);
 
         match CatalogDdl::rename_table(self.engine.session(), plan) {
-            Ok(()) => Ok(RuntimeStatementResult::NoOp),
+            Ok(()) => {
+                // Invalidate information schema after successful rename
+                self.invalidate_information_schema();
+                Ok(RuntimeStatementResult::NoOp)
+            }
             Err(err) => Err(Self::map_table_error(&current_display, err)),
         }
     }
@@ -4864,6 +4909,7 @@ impl SqlEngine {
     }
 
     fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
+        tracing::debug!("handle_query: query={:?}", query);
         let mut visited_views = FxHashSet::default();
         self.execute_query_with_view_support(query, &mut visited_views)
     }
@@ -4873,7 +4919,13 @@ impl SqlEngine {
         query: Query,
         visited_views: &mut FxHashSet<String>,
     ) -> SqlResult<RuntimeStatementResult<P>> {
-        self.ensure_information_schema_ready()?;
+        // Lazily refresh information_schema only if this query references it.
+        // This must happen before any table resolution to ensure the schema tables exist.
+        let needs_info_schema = query_references_information_schema(&query);
+        if needs_info_schema {
+            tracing::debug!("Query references information_schema, ensuring it's ready");
+            self.ensure_information_schema_ready()?;
+        }
 
         if let Some(result) = self.try_execute_simple_view_select(&query, visited_views)? {
             return Ok(result);
@@ -7490,6 +7542,33 @@ fn validate_create_table_definition(stmt: &sqlparser::ast::CreateTable) -> SqlRe
             }
         }
     }
+    Ok(())
+}
+
+/// Validate that a table name does not conflict with reserved schema names.
+///
+/// SQL databases reserve certain schema names (like `information_schema`) that cannot
+/// be used as unqualified table names in the default namespace. This prevents user tables
+/// from shadowing system tables.
+///
+/// # Examples
+/// - ❌ `CREATE TABLE information_schema (...)` - conflicts with system schema
+/// - ✅ `CREATE TABLE my_table (...)` - allowed
+/// - ✅ `CREATE TABLE myschema.information_schema (...)` - allowed (different namespace)
+fn validate_reserved_table_name(schema: Option<&str>, table_name: &str) -> SqlResult<()> {
+    // If schema is explicitly provided, we're not in the default namespace
+    if schema.is_some() {
+        return Ok(());
+    }
+
+    // Check if the unqualified table name conflicts with a reserved schema
+    let canonical = table_name.to_ascii_lowercase();
+    if canonical == "information_schema" {
+        return Err(Error::InvalidArgumentError(
+            "table name 'information_schema' is reserved (conflicts with system schema)".into(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -10692,6 +10771,80 @@ fn extract_constant_select_rows(select: &Select) -> SqlResult<Option<Vec<Vec<Pla
     }
 
     Ok(Some(vec![row]))
+}
+
+/// Check if a query references any information_schema tables.
+///
+/// This traverses the query AST to detect references to tables in the `information_schema` namespace,
+/// allowing the engine to lazily refresh information_schema only when needed.
+fn query_references_information_schema(query: &Query) -> bool {
+    fn check_set_expr(expr: &SetExpr) -> bool {
+        match expr {
+            SetExpr::Select(select) => {
+                for table_with_joins in &select.from {
+                    if check_table_with_joins(table_with_joins) {
+                        return true;
+                    }
+                }
+                false
+            }
+            SetExpr::Query(query) => check_set_expr(&query.body),
+            SetExpr::SetOperation { left, right, .. } => {
+                check_set_expr(left) || check_set_expr(right)
+            }
+            SetExpr::Values(_)
+            | SetExpr::Insert(_)
+            | SetExpr::Update(_)
+            | SetExpr::Table(_)
+            | SetExpr::Delete(_)
+            | SetExpr::Merge(_) => false,
+        }
+    }
+
+    fn check_table_with_joins(item: &TableWithJoins) -> bool {
+        if check_table_factor(&item.relation) {
+            return true;
+        }
+        for join in &item.joins {
+            if check_table_factor(&join.relation) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn check_table_factor(factor: &TableFactor) -> bool {
+        match factor {
+            TableFactor::Table { name, .. } => {
+                // Check each part of the table name for "information_schema"
+                for part in &name.0 {
+                    if let ObjectNamePart::Identifier(ident) = part {
+                        let value_lower = ident.value.to_ascii_lowercase();
+                        tracing::debug!("Checking table name part: '{}'", value_lower);
+                        // Check if this part is "information_schema" (unqualified)
+                        if value_lower == "information_schema" {
+                            tracing::debug!("  -> Found information_schema!");
+                            return true;
+                        }
+                        // Check if this part contains "information_schema." as a prefix
+                        // (for quoted identifiers like "information_schema.columns")
+                        if value_lower.starts_with("information_schema.") {
+                            tracing::debug!("  -> Found information_schema. prefix!");
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => check_table_with_joins(table_with_joins),
+            TableFactor::Derived { subquery, .. } => check_set_expr(&subquery.body),
+            _ => false,
+        }
+    }
+
+    check_set_expr(&query.body)
 }
 
 fn extract_single_table(from: &[TableWithJoins]) -> SqlResult<(String, String)> {

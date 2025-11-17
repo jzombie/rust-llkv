@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BoxedPager, MemPager};
-use llkv_table::types::TableId;
 use llkv_table::{
-    ConstraintEnforcementMode, SingleColumnIndexDescriptor, canonical_table_name,
-    validate_alter_table_operation,
+    ConstraintEnforcementMode, INFORMATION_SCHEMA_TABLE_ID_START, SingleColumnIndexDescriptor,
+    TEMPORARY_TABLE_ID_START, canonical_table_name, validate_alter_table_operation,
 };
 
 use crate::{
@@ -30,9 +29,6 @@ use llkv_plan::TruncatePlan;
 type StatementResult = RuntimeStatementResult<BoxedPager>;
 type TxnResult = TransactionResult<BoxedPager>;
 type BaseTxnContext = RuntimeTransactionContext<BoxedPager>;
-
-const TEMPORARY_TABLE_ID_START: TableId = 0x8000;
-const INFORMATION_SCHEMA_TABLE_ID_START: TableId = 0xC000;
 
 static INFORMATION_SCHEMA_NAMESPACE_POOL: OnceLock<
     Mutex<HashMap<usize, Weak<TemporaryRuntimeNamespace>>>,
@@ -59,14 +55,55 @@ pub(crate) struct SessionNamespaces {
 
 impl SessionNamespaces {
     pub(crate) fn new(base_context: Arc<RuntimeContext<BoxedPager>>) -> Self {
+        let mut registry =
+            RuntimeStorageNamespaceRegistry::new(PERSISTENT_NAMESPACE_ID.to_string());
+
+        // Create information_schema namespace FIRST so we can set it as fallback for persistent
+        let information_schema = {
+            let key = Arc::as_ptr(&base_context) as usize;
+            let namespace = {
+                let mut pool = information_schema_namespace_pool()
+                    .lock()
+                    .expect("information_schema namespace pool poisoned");
+                if let Some(existing) = pool.get(&key).and_then(|weak| weak.upgrade()) {
+                    existing
+                } else {
+                    let shared_catalog = base_context.table_catalog();
+                    let mem_pager = Arc::new(MemPager::default());
+                    let boxed_pager = Arc::new(BoxedPager::from_arc(mem_pager));
+                    let context = Arc::new(RuntimeContext::new_with_catalog(
+                        boxed_pager,
+                        Arc::clone(&shared_catalog),
+                    ));
+                    context
+                        .ensure_next_table_id_at_least(INFORMATION_SCHEMA_TABLE_ID_START)
+                        .expect("failed to seed information_schema table id counter");
+
+                    let namespace = Arc::new(TemporaryRuntimeNamespace::new(
+                        INFORMATION_SCHEMA_NAMESPACE_ID.to_string(),
+                        context,
+                    ));
+                    pool.insert(key, Arc::downgrade(&namespace));
+                    namespace
+                }
+            };
+            registry.register_namespace(
+                Arc::clone(&namespace),
+                vec![INFORMATION_SCHEMA_NAMESPACE_ID.to_string()],
+                false,
+            );
+            namespace
+        };
+
+        // Set information_schema as fallback for base_context so persistent namespace can resolve it
+        base_context.set_fallback_lookup(information_schema.context());
+
+        // Create persistent namespace using the base_context (now with fallback configured)
         let persistent = Arc::new(PersistentRuntimeNamespace::new(
             PERSISTENT_NAMESPACE_ID.to_string(),
             Arc::clone(&base_context),
         ));
 
-        let mut registry = RuntimeStorageNamespaceRegistry::new(
-            RuntimeStorageNamespace::namespace_id(persistent.as_ref()).clone(),
-        );
         registry.register_namespace(Arc::clone(&persistent), Vec::<String>::new(), false);
 
         let information_schema = {

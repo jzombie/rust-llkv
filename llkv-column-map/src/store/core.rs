@@ -492,6 +492,146 @@ where
             .collect()
     }
 
+    /// Remove a column from the column store catalog.
+    ///
+    /// This removes the column descriptor entry from the in-memory catalog and persists
+    /// the updated catalog. The actual column data pages remain in the pager but become
+    /// unreachable and will be garbage collected on compaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `field_id` - The logical field ID of the column to remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column doesn't exist or if catalog persistence fails.
+    pub fn remove_column(&self, field_id: LogicalFieldId) -> Result<()> {
+        let rowid_field = rowid_fid(field_id);
+        let (descriptor_pk, rowid_descriptor_pk) = {
+            let catalog = self.catalog.read().unwrap();
+            let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+            let rowid_descriptor_pk = catalog.map.get(&rowid_field).copied();
+            (descriptor_pk, rowid_descriptor_pk)
+        };
+
+        let mut free_keys: FxHashSet<PhysicalKey> = FxHashSet::default();
+        self.collect_descriptor_allocations(descriptor_pk, &mut free_keys)?;
+        if let Some(rid_pk) = rowid_descriptor_pk {
+            self.collect_descriptor_allocations(rid_pk, &mut free_keys)?;
+        }
+
+        // Remove catalog entries for both the value and row-id columns.
+        let mut catalog = self.catalog.write().unwrap();
+        let removed_value = catalog.map.remove(&field_id).is_some();
+        let removed_rowid = catalog.map.remove(&rowid_field);
+        drop(catalog);
+
+        if !removed_value {
+            return Err(Error::NotFound);
+        }
+
+        // Persist updated catalog
+        let catalog_bytes = {
+            let catalog = self.catalog.read().unwrap();
+            catalog.to_bytes()
+        };
+
+        self.pager.batch_put(&[BatchPut::Raw {
+            key: CATALOG_ROOT_PKEY,
+            bytes: catalog_bytes,
+        }])?;
+
+        if !free_keys.is_empty() {
+            let mut frees: Vec<PhysicalKey> = free_keys.into_iter().collect();
+            frees.sort_unstable();
+            if let Err(err) = self.pager.free_many(&frees) {
+                // Attempt to restore catalog entries before bubbling the error up.
+                let mut catalog = self.catalog.write().unwrap();
+                catalog.map.insert(field_id, descriptor_pk);
+                if let Some(rid_pk) = rowid_descriptor_pk.or(removed_rowid) {
+                    catalog.map.insert(rowid_field, rid_pk);
+                }
+                drop(catalog);
+
+                let restore_bytes = {
+                    let catalog = self.catalog.read().unwrap();
+                    catalog.to_bytes()
+                };
+
+                let _ = self.pager.batch_put(&[BatchPut::Raw {
+                    key: CATALOG_ROOT_PKEY,
+                    bytes: restore_bytes,
+                }]);
+
+                return Err(err);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn collect_descriptor_allocations(
+        &self,
+        descriptor_pk: PhysicalKey,
+        keys: &mut FxHashSet<PhysicalKey>,
+    ) -> Result<()> {
+        if descriptor_pk == 0 {
+            return Ok(());
+        }
+
+        let Some(GetResult::Raw { bytes, .. }) = self
+            .pager
+            .batch_get(&[BatchGet::Raw { key: descriptor_pk }])?
+            .pop()
+        else {
+            return Ok(());
+        };
+
+        keys.insert(descriptor_pk);
+
+        let descriptor = ColumnDescriptor::from_le_bytes(bytes.as_ref());
+        let mut page_pk = descriptor.head_page_pk;
+
+        while page_pk != 0 {
+            let page_blob = self
+                .pager
+                .batch_get(&[BatchGet::Raw { key: page_pk }])?
+                .pop()
+                .and_then(|r| match r {
+                    GetResult::Raw { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .ok_or(Error::NotFound)?;
+            let page_bytes = page_blob.as_ref();
+            if page_bytes.len() < DescriptorPageHeader::DISK_SIZE {
+                return Err(Error::Internal("descriptor page truncated".into()));
+            }
+            let header =
+                DescriptorPageHeader::from_le_bytes(&page_bytes[..DescriptorPageHeader::DISK_SIZE]);
+            keys.insert(page_pk);
+
+            let mut offset = DescriptorPageHeader::DISK_SIZE;
+            for _ in 0..header.entry_count as usize {
+                let end = offset + ChunkMetadata::DISK_SIZE;
+                if end > page_bytes.len() {
+                    break;
+                }
+                let meta = ChunkMetadata::from_le_bytes(&page_bytes[offset..end]);
+                if meta.chunk_pk != 0 {
+                    keys.insert(meta.chunk_pk);
+                }
+                if meta.value_order_perm_pk != 0 {
+                    keys.insert(meta.value_order_perm_pk);
+                }
+                offset = end;
+            }
+
+            page_pk = header.next_page_pk;
+        }
+
+        Ok(())
+    }
+
     /// Check whether a specific row ID exists in a column.
     ///
     /// This uses presence indexes and binary search when available for fast lookups.

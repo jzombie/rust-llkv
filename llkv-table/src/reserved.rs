@@ -31,6 +31,26 @@ use crate::types::{FieldId, RowId, TableId};
 /// The system catalog table (reserved).
 pub const CATALOG_TABLE_ID: TableId = 0;
 
+/// Starting table ID for temporary tables.
+///
+/// Temporary tables are allocated starting from this ID to ensure they never
+/// conflict with persistent user tables. The range 0x8000-0xBFFF is reserved
+/// for temporary tables.
+pub const TEMPORARY_TABLE_ID_START: TableId = 0x8000;
+
+/// Starting table ID for information_schema tables.
+///
+/// Information schema tables are allocated starting from this ID to ensure
+/// they never conflict with user tables or temporary tables. This constant
+/// is re-exported from llkv-table and imported by higher layers.
+pub const INFORMATION_SCHEMA_TABLE_ID_START: TableId = 0xC000;
+
+/// Check if a table ID belongs to the information_schema namespace.
+#[inline]
+pub fn is_information_schema_table(id: TableId) -> bool {
+    id >= INFORMATION_SCHEMA_TABLE_ID_START
+}
+
 /// Check if a table ID is reserved and cannot be used for user tables.
 #[inline]
 pub fn is_reserved_table_id(id: TableId) -> bool {

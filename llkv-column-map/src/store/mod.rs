@@ -8,10 +8,6 @@
 //! happy—descriptor iterators stream chunk metadata under tight memory budgets
 //! while projection and filtering visitors preserve dialect semantics.
 //!
-//! Updates here should keep the rustdoc narrative aligned with the
-//! [workspace README](../../README.md) and accompanying DeepWiki article so the
-//! story remains coherent for newcomers evaluating the project.
-//!
 //! # Layout
 //! - [`core`]: ColumnStore implementation, ingestion, and metadata handling
 //! - [`catalog`], [`descriptor`], [`layout`]: Persistent metadata structures

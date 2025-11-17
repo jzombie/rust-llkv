@@ -20,6 +20,9 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     /// Execute a SELECT plan while enforcing MVCC visibility rules.
+    ///
+    /// For information_schema tables, MVCC filtering is skipped since they contain
+    /// metadata created in a separate context and should always be fully visible.
     pub(crate) fn execute_select(
         self: &Arc<Self>,
         plan: SelectPlan,
@@ -30,11 +33,24 @@ where
         });
 
         let executor = QueryExecutor::new(provider);
-        let row_filter: Arc<dyn RowIdFilter<P>> = Arc::new(MvccRowIdFilter::new(
-            Arc::clone(&self.txn_manager),
-            snapshot,
-        ));
 
-        executor.execute_select_with_filter(plan, Some(row_filter))
+        // Check if any table in the query is from information_schema
+        let is_information_schema = plan.tables.iter().any(|table_ref| {
+            table_ref
+                .qualified_name()
+                .starts_with("information_schema.")
+        });
+
+        // Skip MVCC filtering for information_schema tables
+        let row_filter = if is_information_schema {
+            None
+        } else {
+            Some(Arc::new(MvccRowIdFilter::new(
+                Arc::clone(&self.txn_manager),
+                snapshot,
+            )) as Arc<dyn RowIdFilter<P>>)
+        };
+
+        executor.execute_select_with_filter(plan, row_filter)
     }
 }

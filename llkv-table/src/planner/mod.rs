@@ -55,6 +55,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
+use crate::reserved::is_information_schema_table;
 use crate::scalar_eval::{
     NumericArray, NumericArrayMap, NumericKernels, NumericKind, NumericValue,
 };
@@ -1272,7 +1273,17 @@ where
         // 1. MVCC filtering to check visibility of all rows including NULL rows
         // 2. Aggregates like COUNT_NULLS that need to count NULL rows
         // We scan the MVCC created_by column which exists for every row.
-        let mut row_ids = if is_trivial_filter(filter_expr.as_ref()) {
+        //
+        // Historical note: information_schema tables used to have issues with complex
+        // filter evaluation when many columns were projected. We previously attempted
+        // to fall back to a "scan everything" path when the predicate returned zero
+        // matches. That trade-off caused incorrect results for legitimate empty
+        // queries (like looking up a dropped table), so we now trust the predicate
+        // evaluation and simply log when it yields zero rows.
+        let is_info_schema = is_information_schema_table(self.table.table_id());
+        let is_trivial = is_trivial_filter(filter_expr.as_ref());
+
+        let mut row_ids = if is_trivial {
             use arrow::datatypes::UInt64Type;
             use llkv_expr::typed_predicate::Predicate;
             let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
@@ -1283,6 +1294,16 @@ where
             self.table
                 .store()
                 .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
+        } else if is_info_schema {
+            let row_ids =
+                self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?;
+            if row_ids.is_empty() {
+                tracing::debug!(
+                    "[SCAN_STREAM] information_schema table {}: predicate returned 0 rows",
+                    self.table.table_id()
+                );
+            }
+            row_ids
         } else {
             self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?
         };
