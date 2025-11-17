@@ -94,7 +94,7 @@ impl QualificationOptions {
         &self.queries
     }
 
-    fn stream_number(&self) -> u32 {
+    pub fn stream_number(&self) -> u32 {
         self.stream_number
     }
 }

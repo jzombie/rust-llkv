@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,7 +18,9 @@ use llkv::{
     storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, PagerDiagnostics},
 };
 use llkv_table::diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
-use llkv_tpch::qualification::{QualificationOptions, QualificationStatus, verify_qualification_assets};
+use llkv_tpch::qualification::{
+    QualificationOptions, QualificationStatus, verify_qualification_assets,
+};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
 use llkv_tpch::{
     LoadSummary, SchemaPaths, TableLoadEvent, TpchError, TpchToolkit, install_default_schema,
@@ -182,7 +185,8 @@ fn main() {
         .init();
 
     if let Err(err) = run() {
-        tracing::debug!("tpch bootstrap failed: {err}");
+        // Explicitly using `eprintln!` to render errors to stderr
+        eprintln!("tpch bootstrap failed: {err}");
         process::exit(1);
     }
 }
@@ -604,22 +608,93 @@ fn ensure_dataset_available(
 ) -> Result<QualificationOptions, TpchError> {
     match verify_qualification_assets(&options) {
         Ok(()) => Ok(options),
-        Err(primary_err) => {
-            let fallback_dir = toolkit.schema_paths().check_answers_dir();
-            if fallback_dir != options.dataset_dir() {
-                let fallback = options.clone().with_dataset(fallback_dir);
-                if verify_qualification_assets(&fallback).is_ok() {
-                    println!(
-                        "Qualification dataset '{}' missing canonical results; using fallback '{}'",
-                        options.dataset_dir().display(),
-                        fallback.dataset_dir().display()
-                    );
-                    return Ok(fallback);
-                }
-            }
-            Err(primary_err)
-        }
+        Err(primary_err) => match materialize_bundled_answers(toolkit, &options)? {
+            Some(fallback) => Ok(fallback),
+            None => Err(primary_err),
+        },
     }
+}
+
+fn materialize_bundled_answers(
+    toolkit: &TpchToolkit,
+    options: &QualificationOptions,
+) -> Result<Option<QualificationOptions>, TpchError> {
+    let answers_dir = toolkit.schema_paths().answers_dir();
+    if !answers_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let stream = options.stream_number();
+    let subparam_name = format!("subparam_{stream}");
+    let subparam_src = options.dataset_dir().join(&subparam_name);
+    if !subparam_src.is_file() {
+        return Ok(None);
+    }
+
+    let cache_root = toolkit
+        .schema_paths()
+        .tools_root()
+        .join("qualification_cache");
+    ensure_directory(&cache_root)?;
+
+    let dataset_label = options
+        .dataset_dir()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_dataset_label)
+        .unwrap_or_else(|| "dataset".to_string());
+    let overlay_dir = cache_root.join(format!("{dataset_label}_stream{stream}"));
+    ensure_directory(&overlay_dir)?;
+
+    copy_if_missing(&subparam_src, &overlay_dir.join(&subparam_name))?;
+
+    for &query in options.queries() {
+        let filename = format!("q{query}.out");
+        let src = answers_dir.join(&filename);
+        if !src.is_file() {
+            return Ok(None);
+        }
+        let dst = overlay_dir.join(&filename);
+        copy_if_missing(&src, &dst)?;
+    }
+
+    let fallback = options.clone().with_dataset(overlay_dir);
+    verify_qualification_assets(&fallback)?;
+    println!(
+        "Qualification dataset '{}' missing canonical results; using fallback answers from '{}'",
+        options.dataset_dir().display(),
+        answers_dir.display()
+    );
+    Ok(Some(fallback))
+}
+
+fn sanitize_dataset_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn ensure_directory(path: &Path) -> Result<(), TpchError> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(path).map_err(|source| TpchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn copy_if_missing(src: &Path, dst: &Path) -> Result<(), TpchError> {
+    if dst.is_file() {
+        return Ok(());
+    }
+    fs::copy(src, dst)
+        .map(|_| ())
+        .map_err(|source| TpchError::Io {
+            path: dst.to_path_buf(),
+            source,
+        })
 }
 
 fn print_load_summary(summary: &LoadSummary) {
