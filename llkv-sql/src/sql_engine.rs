@@ -7069,10 +7069,7 @@ impl SqlEngine {
             let plan = ReindexPlan::new(display_name.clone()).with_canonical(canonical_name);
 
             let statement = PlanStatement::Reindex(plan);
-            self.engine.execute_statement(statement).map_err(|err| {
-                tracing::error!("REINDEX failed for '{}': {}", display_name, err);
-                err
-            })
+            self.engine.execute_statement(statement)
         } else {
             // Other VACUUM variants are not supported
             Err(Error::InvalidArgumentError(
