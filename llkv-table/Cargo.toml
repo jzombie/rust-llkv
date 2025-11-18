@@ -1,62 +1,25 @@
 [package]
 name = "llkv-table"
-description = "Columnar table using the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-keywords = ["database", "table", "columnar", "arrow", "storage"]
-categories = ["database-implementations", "data-structures"]
-readme = "README.md"
 
 [dependencies]
-arrow.workspace = true
-arrow-array.workspace = true
-arrow-schema.workspace = true
-bitcode.workspace = true
-crossbeam-channel.workspace = true
-llkv-column-map.workspace = true
-llkv-expr.workspace = true
-llkv-result.workspace = true
-llkv-storage.workspace = true
-llkv-plan.workspace = true
-sqlparser.workspace = true
-rand.workspace = true
-rayon.workspace = true
-rustc-hash.workspace = true
-simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
-tracing.workspace = true
-time.workspace = true
+async-trait = { workspace = true }
+arrow = { workspace = true }
+datafusion.workspace = true
+datafusion-catalog.workspace = true
+datafusion-datasource.workspace = true
+llkv-column-map = { workspace = true }
+llkv-result = { workspace = true }
+llkv-storage = { workspace = true }
+simd-r-drive-entry-handle = { workspace = true }
 
 [dev-dependencies]
-criterion.workspace = true
-llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
-llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
-tempfile.workspace = true
-
-[[bench]]
-name = "string_substring_bench"
-harness = false
-
-[[bench]]
-name = "string_substring_fused_vs_sequential"
-harness = false
-
-[[bench]]
-name = "table_math_bench"
-harness = false
-
-[[bench]]
-name = "table_layer_overhead_bench"
-harness = false
-
-# [profile.bench]
-# opt-level = 3
-# lto = "thin"
-# codegen-units = 1
-# debug = false
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

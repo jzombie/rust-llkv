@@ -21,7 +21,7 @@ llkv-result = { path = "./llkv-result", version = "0.8.2-alpha" }
 # llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.2-alpha" }
 # llkv-sql = { path = "./llkv-sql", version = "0.8.2-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.8.2-alpha" }
-# llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
+llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.2-alpha" }
 # llkv-transaction = { path = "./llkv-transaction", version = "0.8.2-alpha" }
 simd-r-drive = "0.14.0-alpha"
@@ -41,6 +41,9 @@ clap = { version = "4.5.18", features = ["derive"] }
 criterion = "0.7.0"
 crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
+datafusion = "50.3.0"
+datafusion-catalog = "50.3.0"
+datafusion-datasource = "50.3.0"
 indoc = "2.0.7"
 libtest-mimic = "0.8"
 line-ending = "1.5.1"
@@ -82,7 +85,7 @@ members = [
     # "llkv-slt-tester",
     # "llkv-sql",
     "llkv-storage",
-    # "llkv-table",
+    "llkv-table",
     "llkv-test-utils",
     # "llkv-tpch",
     # "llkv-transaction",

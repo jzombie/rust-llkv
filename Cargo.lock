@@ -2141,6 +2141,7 @@ dependencies = [
  "llkv-column-map",
  "llkv-result",
  "llkv-storage",
+ "llkv-table",
  "simd-r-drive-entry-handle",
  "tokio",
 ]
@@ -2167,6 +2168,22 @@ dependencies = [
  "simd-r-drive",
  "simd-r-drive-entry-handle",
  "tempfile",
+]
+
+[[package]]
+name = "llkv-table"
+version = "0.8.2-alpha"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "datafusion-catalog",
+ "datafusion-datasource",
+ "llkv-column-map",
+ "llkv-result",
+ "llkv-storage",
+ "simd-r-drive-entry-handle",
+ "tokio",
 ]
 
 [[package]]
