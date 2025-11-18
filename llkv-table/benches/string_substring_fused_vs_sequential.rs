@@ -99,11 +99,11 @@ fn bench_planner_fused(table: &Table, scenario: Scenario) -> usize {
     let filter = Expr::And(vec![
         Expr::Pred(Filter {
             field_id: FIELD_ID,
-            op: Operator::contains("needle", scenario.contains_case_sensitive),
+            op: Operator::contains("needle".to_string(), scenario.contains_case_sensitive),
         }),
         Expr::Pred(Filter {
             field_id: FIELD_ID,
-            op: Operator::starts_with("row-", scenario.starts_with_case_sensitive),
+            op: Operator::starts_with("row-".to_string(), scenario.starts_with_case_sensitive),
         }),
     ]);
 
@@ -125,12 +125,12 @@ fn run_store_sequential(table: &Table, scenario: Scenario) -> usize {
     use llkv_column_map::store::scan::filter::Utf8Filter;
     let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
     let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains(
-        "needle",
+        "needle".to_string(),
         scenario.contains_case_sensitive,
     ))
     .unwrap();
     let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
-        "row-",
+        "row-".to_string(),
         scenario.starts_with_case_sensitive,
     ))
     .unwrap();
@@ -163,12 +163,12 @@ fn run_store_sequential(table: &Table, scenario: Scenario) -> usize {
 fn run_store_fused(table: &Table, scenario: Scenario) -> usize {
     let lf = LogicalFieldId::for_user(TABLE_ID, FIELD_ID);
     let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains(
-        "needle",
+        "needle".to_string(),
         scenario.contains_case_sensitive,
     ))
     .unwrap();
     let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
-        "row-",
+        "row-".to_string(),
         scenario.starts_with_case_sensitive,
     ))
     .unwrap();
