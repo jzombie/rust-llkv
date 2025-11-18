@@ -49,6 +49,7 @@ mod tests {
     use arrow::array::{Int32Array, StringArray, UInt64Array};
     use datafusion::prelude::SessionContext;
     use llkv_storage::pager::MemPager;
+    use arrow::util::pretty::pretty_format_batches;
     
     fn build_demo_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -62,6 +63,90 @@ mod tests {
         let statuses = Arc::new(StringArray::from(vec![Some("active"), None, Some("vip")]));
 
         RecordBatch::try_new(schema, vec![user_ids, scores, statuses]).expect("batch")
+    }
+
+    #[tokio::test]
+    async fn datafusion_joins_llkv_tables() {
+        let pager = Arc::new(MemPager::default());
+        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
+
+        // Create users table
+        let users_schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::UInt64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let users_batch = RecordBatch::try_new(
+            users_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Diana"])),
+            ],
+        )
+        .expect("users batch");
+
+        let mut users_builder =
+            LlkvTableBuilder::new(Arc::clone(&store), 1, users_schema).expect("users builder");
+        users_builder
+            .append_batch(&users_batch)
+            .expect("users append");
+        let users_provider = users_builder.finish().expect("users provider");
+
+        // Create orders table
+        let orders_schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::UInt64, false),
+            Field::new("user_id", DataType::UInt64, false),
+            Field::new("amount", DataType::Int32, false),
+        ]));
+        let orders_batch = RecordBatch::try_new(
+            orders_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![101_u64, 102, 103, 104, 105])),
+                Arc::new(UInt64Array::from(vec![1_u64, 2, 1, 3, 2])),
+                Arc::new(Int32Array::from(vec![50, 75, 120, 30, 90])),
+            ],
+        )
+        .expect("orders batch");
+
+        let mut orders_builder =
+            LlkvTableBuilder::new(Arc::clone(&store), 2, orders_schema).expect("orders builder");
+        orders_builder
+            .append_batch(&orders_batch)
+            .expect("orders append");
+        let orders_provider = orders_builder.finish().expect("orders provider");
+
+        // Register tables and perform join
+        let ctx = SessionContext::new();
+        ctx.register_table("users", Arc::new(users_provider))
+            .expect("register users");
+        ctx.register_table("orders", Arc::new(orders_provider))
+            .expect("register orders");
+
+        let df = ctx
+            .sql(
+                "SELECT u.name, o.order_id, o.amount \
+                 FROM users u \
+                 INNER JOIN orders o ON u.user_id = o.user_id \
+                 ORDER BY u.name, o.order_id",
+            )
+            .await
+            .expect("sql");
+        let results = df.collect().await.expect("collect");
+        let formatted = pretty_format_batches(&results).expect("format").to_string();
+
+        let expected = vec![
+            "+---------+----------+--------+",
+            "| name    | order_id | amount |",
+            "+---------+----------+--------+",
+            "| Alice   | 101      | 50     |",
+            "| Alice   | 103      | 120    |",
+            "| Bob     | 102      | 75     |",
+            "| Bob     | 105      | 90     |",
+            "| Charlie | 104      | 30     |",
+            "+---------+----------+--------+",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted.trim(), expected.trim());
     }
 
     #[tokio::test]
