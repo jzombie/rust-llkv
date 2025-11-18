@@ -437,4 +437,53 @@ mod tests {
 
         assert_eq!(formatted.trim(), expected.trim());
     }
+
+    // TODO: Implement DELETE
+    #[tokio::test]
+    async fn datafusion_delete_statement_is_rejected() {
+        let pager = Arc::new(MemPager::default());
+        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
+
+        let schema = build_demo_batch().schema();
+        let mut builder = LlkvTableBuilder::new(Arc::clone(&store), 1, schema).expect("builder");
+        builder.append_batch(&build_demo_batch()).expect("append");
+        let provider = builder.finish().expect("provider");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("llkv_demo", Arc::new(provider))
+            .expect("register");
+
+        let delete_df = ctx
+            .sql("DELETE FROM llkv_demo WHERE user_id = 2")
+            .await
+            .expect("DELETE planning");
+        let err = delete_df
+            .collect()
+            .await
+            .expect_err("DELETE execution should fail for LlkvTableProvider");
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("delete"),
+            "unexpected error for DELETE: {err:?}"
+        );
+
+        let df = ctx
+            .sql("SELECT user_id, score FROM llkv_demo ORDER BY user_id")
+            .await
+            .expect("sql");
+        let results = df.collect().await.expect("collect");
+        let formatted = pretty_format_batches(&results).expect("format").to_string();
+
+        let expected = vec![
+            "+---------+-------+",
+            "| user_id | score |",
+            "+---------+-------+",
+            "| 1       | 42    |",
+            "| 2       | 7     |",
+            "| 3       | 99    |",
+            "+---------+-------+",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted.trim(), expected.trim());
+    }
 }
