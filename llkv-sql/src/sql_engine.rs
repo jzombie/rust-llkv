@@ -8723,6 +8723,140 @@ fn translate_between_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
+fn translate_like_expr(
+    engine: &SqlEngine,
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    like_expr: &SqlExpr,
+    pattern_expr: &SqlExpr,
+    negated: bool,
+    outer_scopes: &[IdentifierContext],
+    scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
+    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+    // Translate the target expression (must be a column reference)
+    let target_scalar = translate_scalar_with_context_scoped(
+        engine,
+        resolver,
+        context,
+        like_expr,
+        outer_scopes,
+        correlated_tracker.reborrow(),
+        Some(&mut *scalar_subqueries),
+    )?;
+
+    let llkv_expr::expr::ScalarExpr::Column(column) = target_scalar else {
+        return Err(Error::InvalidArgumentError(
+            "LIKE expression target must be a column reference".into(),
+        ));
+    };
+
+    // Extract the pattern string literal
+    let SqlExpr::Value(pattern_value) = pattern_expr else {
+        return Err(Error::InvalidArgumentError(
+            "LIKE pattern must be a string literal".into(),
+        ));
+    };
+
+    let (Value::SingleQuotedString(pattern_str) | Value::DoubleQuotedString(pattern_str)) =
+        &pattern_value.value
+    else {
+        return Err(Error::InvalidArgumentError(
+            "LIKE pattern must be a quoted string".into(),
+        ));
+    };
+
+    // Optimize common LIKE patterns to use specialized operators
+    let operator = if let Some(optimized_op) = try_optimize_like_pattern(pattern_str) {
+        optimized_op
+    } else {
+        // TODO: Implement full pattern matching with % and _ wildcards
+        return Err(Error::InvalidArgumentError(format!(
+            "LIKE pattern '{}' requires full wildcard support (not yet implemented)",
+            pattern_str
+        )));
+    };
+
+    let filter = llkv_expr::expr::Filter {
+        field_id: column,
+        op: operator,
+    };
+
+    let result = llkv_expr::expr::Expr::Pred(filter);
+
+    if negated {
+        Ok(llkv_expr::expr::Expr::not(result))
+    } else {
+        Ok(result)
+    }
+}
+
+/// Try to optimize SQL LIKE patterns to specialized operators.
+///
+/// Returns `Some(operator)` if the pattern can be optimized, `None` otherwise.
+///
+/// Supported optimizations:
+/// - `pattern%` → `StartsWith(pattern)`
+/// - `%pattern` → `EndsWith(pattern)`
+/// - `%pattern%` → `Contains(pattern)`
+/// - Exact match (no wildcards) → `Equals(pattern)`
+fn try_optimize_like_pattern(pattern: &str) -> Option<llkv_expr::expr::Operator<'static>> {
+    let bytes = pattern.as_bytes();
+    
+    // Check if pattern has any underscore wildcards (can't optimize those)
+    if pattern.contains('_') {
+        return None;
+    }
+
+    // Count percent signs
+    let percent_count = pattern.chars().filter(|&c| c == '%').count();
+
+    match percent_count {
+        0 => {
+            // No wildcards - exact match
+            Some(llkv_expr::expr::Operator::Equals(Literal::from(pattern)))
+        }
+        1 => {
+            if bytes.first() == Some(&b'%') {
+                // %pattern - ends with
+                let suffix = pattern[1..].to_string();
+                Some(llkv_expr::expr::Operator::EndsWith {
+                    pattern: suffix,
+                    case_sensitive: true,
+                })
+            } else if bytes.last() == Some(&b'%') {
+                // pattern% - starts with
+                let prefix = pattern[..pattern.len() - 1].to_string();
+                Some(llkv_expr::expr::Operator::StartsWith {
+                    pattern: prefix,
+                    case_sensitive: true,
+                })
+            } else {
+                // % in the middle - can't optimize
+                None
+            }
+        }
+        2 => {
+            if bytes.first() == Some(&b'%') && bytes.last() == Some(&b'%') {
+                // %pattern% - contains
+                let substring = pattern[1..pattern.len() - 1].to_string();
+                Some(llkv_expr::expr::Operator::Contains {
+                    pattern: substring,
+                    case_sensitive: true,
+                })
+            } else {
+                // Multiple % in other positions - can't optimize
+                None
+            }
+        }
+        _ => {
+            // Multiple % signs in complex positions - can't optimize
+            None
+        }
+    }
+}
+
 fn correlated_scalar_from_resolution(
     placeholder: String,
     resolution: &ColumnResolution,
@@ -9076,6 +9210,32 @@ fn translate_condition_with_context(
                             negated: *negated,
                         },
                     )));
+                }
+                SqlExpr::Like {
+                    negated,
+                    expr: like_expr,
+                    pattern,
+                    escape_char,
+                    any: _,
+                } => {
+                    if escape_char.is_some() {
+                        return Err(Error::InvalidArgumentError(
+                            "LIKE with ESCAPE clause is not supported".into(),
+                        ));
+                    }
+
+                    let result = translate_like_expr(
+                        engine,
+                        resolver,
+                        context.clone(),
+                        like_expr,
+                        pattern,
+                        *negated,
+                        outer_scopes,
+                        scalar_subqueries,
+                        correlated_tracker.reborrow(),
+                    )?;
+                    work_stack.push(ConditionFrame::Leaf(result));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(

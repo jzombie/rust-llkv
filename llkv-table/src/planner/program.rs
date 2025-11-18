@@ -117,21 +117,21 @@ impl OwnedOperator {
                 pattern,
                 case_sensitive,
             } => Operator::StartsWith {
-                pattern: pattern.as_str(),
+                pattern: pattern.clone(),
                 case_sensitive: *case_sensitive,
             },
             Self::EndsWith {
                 pattern,
                 case_sensitive,
             } => Operator::EndsWith {
-                pattern: pattern.as_str(),
+                pattern: pattern.clone(),
                 case_sensitive: *case_sensitive,
             },
             Self::Contains {
                 pattern,
                 case_sensitive,
             } => Operator::Contains {
-                pattern: pattern.as_str(),
+                pattern: pattern.clone(),
                 case_sensitive: *case_sensitive,
             },
             Self::IsNull => Operator::IsNull,
