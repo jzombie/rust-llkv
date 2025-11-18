@@ -147,7 +147,7 @@ pub fn run_qualification(
     for &query in options.queries() {
         print!("  Q{:02}: executing... ", query);
         std::io::Write::flush(&mut std::io::stdout()).ok();
-        
+
         let kinds = column_kinds
             .get((query - 1) as usize)
             .ok_or_else(|| TpchError::Parse(format!("no column metadata for query {query}")))?;
@@ -162,17 +162,21 @@ pub fn run_qualification(
             &stream_parameters,
         )?;
         let actual_rows = execute_query(engine, &rendered, kinds)?;
-        
+
         print!("comparing... ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
-        
+
         let diff = diff_rows(&expected_rows, &actual_rows, kinds);
 
         let status = if diff.missing.is_empty() && diff.extra.is_empty() {
             println!("PASS ({} rows)", actual_rows.len());
             QualificationStatus::Pass
         } else {
-            println!("FAIL (expected {}, actual {})", expected_rows.len(), actual_rows.len());
+            println!(
+                "FAIL (expected {}, actual {})",
+                expected_rows.len(),
+                actual_rows.len()
+            );
             QualificationStatus::Fail
         };
 

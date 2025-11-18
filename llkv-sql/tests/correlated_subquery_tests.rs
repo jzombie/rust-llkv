@@ -8,12 +8,20 @@ fn test_correlated_scalar_subquery_simple() {
     let engine = SqlEngine::new(pager);
 
     // Create outer table
-    engine.execute("CREATE TABLE outer_table (id INTEGER, value INTEGER)").unwrap();
-    engine.execute("INSERT INTO outer_table VALUES (1, 10), (2, 20)").unwrap();
+    engine
+        .execute("CREATE TABLE outer_table (id INTEGER, value INTEGER)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO outer_table VALUES (1, 10), (2, 20)")
+        .unwrap();
 
     // Create inner table
-    engine.execute("CREATE TABLE inner_table (outer_id INTEGER, amount INTEGER)").unwrap();
-    engine.execute("INSERT INTO inner_table VALUES (1, 5), (1, 3), (2, 8)").unwrap();
+    engine
+        .execute("CREATE TABLE inner_table (outer_id INTEGER, amount INTEGER)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO inner_table VALUES (1, 5), (1, 3), (2, 8)")
+        .unwrap();
 
     // Correlated scalar subquery
     let sql = "SELECT id, value, (SELECT MIN(amount) FROM inner_table WHERE outer_id = id) as min_amount FROM outer_table";
@@ -43,15 +51,29 @@ fn test_correlated_scalar_subquery_cross_product() {
     // Outer query: cross product of part, supplier, partsupp
     // Subquery: cross product of partsupp, supplier (NO part)
     // Correlated column: p_partkey from outer query's part table
-    
-    engine.execute("CREATE TABLE part (p_partkey INTEGER, p_name TEXT, p_size INTEGER)").unwrap();
-    engine.execute("INSERT INTO part VALUES (1, 'Widget', 10), (2, 'Gadget', 20)").unwrap();
-    
-    engine.execute("CREATE TABLE supplier (s_suppkey INTEGER, s_name TEXT)").unwrap();
-    engine.execute("INSERT INTO supplier VALUES (1, 'Supplier A'), (2, 'Supplier B')").unwrap();
-    
-    engine.execute("CREATE TABLE partsupp (ps_partkey INTEGER, ps_suppkey INTEGER, ps_supplycost INTEGER)").unwrap();
-    engine.execute("INSERT INTO partsupp VALUES (1, 1, 100), (1, 2, 90), (2, 1, 150), (2, 2, 140)").unwrap();
+
+    engine
+        .execute("CREATE TABLE part (p_partkey INTEGER, p_name TEXT, p_size INTEGER)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO part VALUES (1, 'Widget', 10), (2, 'Gadget', 20)")
+        .unwrap();
+
+    engine
+        .execute("CREATE TABLE supplier (s_suppkey INTEGER, s_name TEXT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO supplier VALUES (1, 'Supplier A'), (2, 'Supplier B')")
+        .unwrap();
+
+    engine
+        .execute(
+            "CREATE TABLE partsupp (ps_partkey INTEGER, ps_suppkey INTEGER, ps_supplycost INTEGER)",
+        )
+        .unwrap();
+    engine
+        .execute("INSERT INTO partsupp VALUES (1, 1, 100), (1, 2, 90), (2, 1, 150), (2, 2, 140)")
+        .unwrap();
 
     // Query structure similar to Q2:
     // Outer: SELECT ... FROM part, supplier, partsupp WHERE ...
@@ -68,7 +90,7 @@ fn test_correlated_scalar_subquery_cross_product() {
                 AND s_suppkey = ps_suppkey
           )
     "#;
-    
+
     eprintln!("\n=== Executing cross product correlated subquery ===\n");
     let result = engine.sql(sql);
 

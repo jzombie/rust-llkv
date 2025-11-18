@@ -15,8 +15,8 @@
 //! in a future refactoring.
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal128Builder,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
     IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
@@ -890,6 +890,21 @@ where
         }
     }
 
+    fn evaluate_scalar_subquery_array(
+        &self,
+        context: &mut CrossProductExpressionContext,
+        subquery: &llkv_plan::ScalarSubquery,
+        batch: &RecordBatch,
+    ) -> ExecutorResult<ArrayRef> {
+        let mut values = Vec::with_capacity(batch.num_rows());
+        for row_idx in 0..batch.num_rows() {
+            let literal =
+                self.evaluate_scalar_subquery_literal(context, subquery, batch, row_idx)?;
+            values.push(literal);
+        }
+        literals_to_array(&values)
+    }
+
     fn evaluate_projection_expression(
         &self,
         context: &mut CrossProductExpressionContext,
@@ -1327,6 +1342,12 @@ where
             &table_indices,
         );
 
+        let scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> = plan
+            .scalar_subqueries
+            .iter()
+            .map(|subquery| (subquery.id, subquery))
+            .collect();
+
         if let Some(filter_wrapper) = remaining_filter.as_ref() {
             let mut filter_context = CrossProductExpressionContext::new(
                 combined_schema.as_ref(),
@@ -1349,10 +1370,21 @@ where
                     .iter()
                     .map(|subquery| (subquery.id, subquery))
                     .collect();
+            let mut predicate_scalar_ids = FxHashSet::default();
+            collect_predicate_scalar_subquery_ids(&translated_filter, &mut predicate_scalar_ids);
 
             let mut filtered_batches = Vec::with_capacity(combined_batches.len());
             for batch in combined_batches.into_iter() {
                 filter_context.reset();
+                for subquery_id in &predicate_scalar_ids {
+                    let info = scalar_lookup.get(subquery_id).ok_or_else(|| {
+                        Error::Internal("missing scalar subquery metadata".into())
+                    })?;
+                    let array =
+                        self.evaluate_scalar_subquery_array(&mut filter_context, info, &batch)?;
+                    let accessor = ColumnAccessor::from_array(&array)?;
+                    filter_context.register_scalar_subquery_column(*subquery_id, accessor);
+                }
                 let mask = filter_context.evaluate_predicate_mask(
                     &translated_filter,
                     &batch,
@@ -1425,12 +1457,6 @@ where
                 ))
             })?
         };
-
-        let scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> = plan
-            .scalar_subqueries
-            .iter()
-            .map(|subquery| (subquery.id, subquery))
-            .collect();
 
         // Apply SELECT projections if specified
         if !plan.projections.is_empty() {
@@ -6688,6 +6714,7 @@ struct CrossProductExpressionContext {
     field_id_to_index: FxHashMap<FieldId, usize>,
     numeric_cache: FxHashMap<FieldId, NumericArray>,
     column_cache: FxHashMap<FieldId, ColumnAccessor>,
+    scalar_subquery_columns: FxHashMap<SubqueryId, ColumnAccessor>,
     next_field_id: FieldId,
 }
 
@@ -6990,6 +7017,237 @@ fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<Ar
     }
 }
 
+fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
+    #[derive(Copy, Clone, Eq, PartialEq)]
+    enum LiteralArrayKind {
+        Null,
+        Integer,
+        Float,
+        Boolean,
+        String,
+        Date32,
+        Interval,
+        Decimal,
+    }
+
+    if values.is_empty() {
+        return Ok(new_null_array(&DataType::Null, 0));
+    }
+
+    let mut has_integer = false;
+    let mut has_float = false;
+    let mut has_decimal = false;
+    let mut has_boolean = false;
+    let mut has_string = false;
+    let mut has_date = false;
+    let mut has_interval = false;
+
+    for literal in values {
+        match literal {
+            Literal::Null => {}
+            Literal::Integer(_) => {
+                has_integer = true;
+            }
+            Literal::Float(_) => {
+                has_float = true;
+            }
+            Literal::Decimal(_) => {
+                has_decimal = true;
+            }
+            Literal::Boolean(_) => {
+                has_boolean = true;
+            }
+            Literal::String(_) => {
+                has_string = true;
+            }
+            Literal::Date32(_) => {
+                has_date = true;
+            }
+            Literal::Interval(_) => {
+                has_interval = true;
+            }
+            Literal::Struct(_) => {
+                return Err(Error::InvalidArgumentError(
+                    "struct scalar subquery results are not supported".into(),
+                ));
+            }
+        }
+    }
+
+    let mixed_numeric = has_integer as u8 + has_float as u8 + has_decimal as u8;
+    if has_string && (has_boolean || has_date || has_interval || mixed_numeric > 0)
+        || has_boolean && (has_date || has_interval || mixed_numeric > 0)
+        || has_date && (has_interval || mixed_numeric > 0)
+        || has_interval && (mixed_numeric > 0)
+    {
+        return Err(Error::InvalidArgumentError(
+            "mixed scalar subquery result types are not supported".into(),
+        ));
+    }
+
+    let target_kind = if has_string {
+        LiteralArrayKind::String
+    } else if has_interval {
+        LiteralArrayKind::Interval
+    } else if has_date {
+        LiteralArrayKind::Date32
+    } else if has_boolean {
+        LiteralArrayKind::Boolean
+    } else if has_float {
+        LiteralArrayKind::Float
+    } else if has_decimal {
+        LiteralArrayKind::Decimal
+    } else if has_integer {
+        LiteralArrayKind::Integer
+    } else {
+        LiteralArrayKind::Null
+    };
+
+    match target_kind {
+        LiteralArrayKind::Null => Ok(new_null_array(&DataType::Null, values.len())),
+        LiteralArrayKind::Integer => {
+            let mut coerced: Vec<Option<i64>> = Vec::with_capacity(values.len());
+            for literal in values {
+                match literal {
+                    Literal::Null => coerced.push(None),
+                    Literal::Integer(value) => {
+                        let v = i64::try_from(*value).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "scalar subquery integer result exceeds supported range".into(),
+                            )
+                        })?;
+                        coerced.push(Some(v));
+                    }
+                    _ => unreachable!("non-integer value encountered in integer array"),
+                }
+            }
+            let array = Int64Array::from_iter(coerced);
+            Ok(Arc::new(array) as ArrayRef)
+        }
+        LiteralArrayKind::Float => {
+            let mut coerced: Vec<Option<f64>> = Vec::with_capacity(values.len());
+            for literal in values {
+                match literal {
+                    Literal::Null => coerced.push(None),
+                    Literal::Integer(_) | Literal::Float(_) | Literal::Decimal(_) => {
+                        let value = literal_to_f64(literal).ok_or_else(|| {
+                            Error::InvalidArgumentError(
+                                "failed to coerce scalar subquery value to FLOAT".into(),
+                            )
+                        })?;
+                        coerced.push(Some(value));
+                    }
+                    _ => unreachable!("non-numeric value encountered in float array"),
+                }
+            }
+            let array = Float64Array::from_iter(coerced);
+            Ok(Arc::new(array) as ArrayRef)
+        }
+        LiteralArrayKind::Boolean => {
+            let iter = values.iter().map(|literal| match literal {
+                Literal::Null => None,
+                Literal::Boolean(flag) => Some(*flag),
+                _ => unreachable!("non-boolean value encountered in boolean array"),
+            });
+            let array = BooleanArray::from_iter(iter);
+            Ok(Arc::new(array) as ArrayRef)
+        }
+        LiteralArrayKind::String => {
+            let iter = values.iter().map(|literal| match literal {
+                Literal::Null => None,
+                Literal::String(value) => Some(value.clone()),
+                _ => unreachable!("non-string value encountered in string array"),
+            });
+            let array = StringArray::from_iter(iter);
+            Ok(Arc::new(array) as ArrayRef)
+        }
+        LiteralArrayKind::Date32 => {
+            let iter = values.iter().map(|literal| match literal {
+                Literal::Null => None,
+                Literal::Date32(days) => Some(*days),
+                _ => unreachable!("non-date value encountered in date array"),
+            });
+            let array = Date32Array::from_iter(iter);
+            Ok(Arc::new(array) as ArrayRef)
+        }
+        LiteralArrayKind::Interval => {
+            let iter = values.iter().map(|literal| match literal {
+                Literal::Null => None,
+                Literal::Interval(interval) => Some(interval_value_to_arrow(*interval)),
+                _ => unreachable!("non-interval value encountered in interval array"),
+            });
+            let array = IntervalMonthDayNanoArray::from_iter(iter);
+            Ok(Arc::new(array) as ArrayRef)
+        }
+        LiteralArrayKind::Decimal => {
+            let mut target_scale: Option<i8> = None;
+            for literal in values {
+                if let Literal::Decimal(value) = literal {
+                    target_scale = Some(match target_scale {
+                        Some(scale) => scale.max(value.scale()),
+                        None => value.scale(),
+                    });
+                }
+            }
+            let target_scale = target_scale.expect("decimal literal expected");
+
+            let mut max_precision: u8 = 1;
+            let mut aligned: Vec<Option<DecimalValue>> = Vec::with_capacity(values.len());
+            for literal in values {
+                match literal {
+                    Literal::Null => aligned.push(None),
+                    Literal::Decimal(value) => {
+                        let adjusted = if value.scale() != target_scale {
+                            value.rescale(target_scale).map_err(|err| {
+                                Error::InvalidArgumentError(format!(
+                                    "failed to align decimal scale: {err}"
+                                ))
+                            })?
+                        } else {
+                            *value
+                        };
+                        max_precision = max_precision.max(adjusted.precision());
+                        aligned.push(Some(adjusted));
+                    }
+                    Literal::Integer(value) => {
+                        let decimal = DecimalValue::new(*value, 0)
+                            .map_err(|err| {
+                                Error::InvalidArgumentError(format!(
+                                    "failed to build decimal from integer: {err}"
+                                ))
+                            })?
+                            .rescale(target_scale)
+                            .map_err(|err| {
+                                Error::InvalidArgumentError(format!(
+                                    "failed to align integer decimal scale: {err}"
+                                ))
+                            })?;
+                        max_precision = max_precision.max(decimal.precision());
+                        aligned.push(Some(decimal));
+                    }
+                    _ => unreachable!("unexpected literal in decimal array"),
+                }
+            }
+
+            let mut builder = Decimal128Builder::new()
+                .with_precision_and_scale(max_precision, target_scale)
+                .map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "invalid Decimal128 precision/scale: {err}"
+                    ))
+                })?;
+            for value in aligned {
+                match value {
+                    Some(decimal) => builder.append_value(decimal.raw_value()),
+                    None => builder.append_null(),
+                }
+            }
+            let array = builder.finish();
+            Ok(Arc::new(array) as ArrayRef)
+        }
+    }
+}
+
 impl CrossProductExpressionContext {
     fn new(schema: &Schema, lookup: FxHashMap<String, usize>) -> ExecutorResult<Self> {
         let mut columns = Vec::with_capacity(schema.fields().len());
@@ -7024,6 +7282,7 @@ impl CrossProductExpressionContext {
             field_id_to_index,
             numeric_cache: FxHashMap::default(),
             column_cache: FxHashMap::default(),
+            scalar_subquery_columns: FxHashMap::default(),
             next_field_id,
         })
     }
@@ -7039,6 +7298,7 @@ impl CrossProductExpressionContext {
     fn reset(&mut self) {
         self.numeric_cache.clear();
         self.column_cache.clear();
+        self.scalar_subquery_columns.clear();
     }
 
     fn allocate_synthetic_field_id(&mut self) -> ExecutorResult<FieldId> {
@@ -7050,6 +7310,14 @@ impl CrossProductExpressionContext {
         let field_id = self.next_field_id;
         self.next_field_id = self.next_field_id.saturating_add(1);
         Ok(field_id)
+    }
+
+    fn register_scalar_subquery_column(
+        &mut self,
+        subquery_id: SubqueryId,
+        accessor: ColumnAccessor,
+    ) {
+        self.scalar_subquery_columns.insert(subquery_id, accessor);
     }
 
     #[cfg(test)]
@@ -7681,9 +7949,18 @@ impl CrossProductExpressionContext {
             ScalarExpr::Case { .. } => self.evaluate_numeric(expr, batch),
             ScalarExpr::Coalesce(_) => self.evaluate_numeric(expr, batch),
             ScalarExpr::Random => self.evaluate_numeric(expr, batch),
-            ScalarExpr::ScalarSubquery(_) => Err(Error::InvalidArgumentError(
-                "scalar subqueries are not supported in cross product filters".into(),
-            )),
+            ScalarExpr::ScalarSubquery(subquery) => {
+                let accessor = self
+                    .scalar_subquery_columns
+                    .get(&subquery.id)
+                    .ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "scalar subqueries are not supported in cross product filters".into(),
+                        )
+                    })?
+                    .clone();
+                Ok(accessor.as_array_ref())
+            }
         }
     }
 
@@ -9447,6 +9724,36 @@ fn collect_scalar_subquery_ids(expr: &ScalarExpr<FieldId>, ids: &mut FxHashSet<S
         | ScalarExpr::Column(_)
         | ScalarExpr::Literal(_)
         | ScalarExpr::Random => {}
+    }
+}
+
+fn collect_predicate_scalar_subquery_ids(
+    expr: &LlkvExpr<'static, FieldId>,
+    ids: &mut FxHashSet<SubqueryId>,
+) {
+    match expr {
+        LlkvExpr::And(children) | LlkvExpr::Or(children) => {
+            for child in children {
+                collect_predicate_scalar_subquery_ids(child, ids);
+            }
+        }
+        LlkvExpr::Not(inner) => collect_predicate_scalar_subquery_ids(inner, ids),
+        LlkvExpr::Compare { left, right, .. } => {
+            collect_scalar_subquery_ids(left, ids);
+            collect_scalar_subquery_ids(right, ids);
+        }
+        LlkvExpr::InList { expr, list, .. } => {
+            collect_scalar_subquery_ids(expr, ids);
+            for item in list {
+                collect_scalar_subquery_ids(item, ids);
+            }
+        }
+        LlkvExpr::IsNull { expr, .. } => {
+            collect_scalar_subquery_ids(expr, ids);
+        }
+        LlkvExpr::Exists(_) | LlkvExpr::Pred(_) | LlkvExpr::Literal(_) => {
+            // EXISTS subqueries handled separately.
+        }
     }
 }
 
