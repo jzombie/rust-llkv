@@ -10,14 +10,11 @@ publish = true
 # llkv = { path = "./llkv", version = "0.8.2-alpha" }
 # llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.2-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.8.2-alpha" }
-# llkv-csv = { path = "./llkv-csv", version = "0.8.2-alpha" }
-# llkv-executor = { path = "./llkv-executor", version = "0.8.2-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.8.2-alpha" }
 llkv-fusion = { path = "./llkv-fusion", version = "0.8.2-alpha" }
 # llkv-join = { path = "./llkv-join", version = "0.8.2-alpha" }
 # llkv-plan = { path = "./llkv-plan", version = "0.8.2-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.8.2-alpha" }
-# llkv-runtime = { path = "./llkv-runtime", version = "0.8.2-alpha" }
 # llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.2-alpha" }
 # llkv-sql = { path = "./llkv-sql", version = "0.8.2-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.8.2-alpha" }
@@ -74,9 +71,6 @@ members = [
     # "llkv",
     # "llkv-aggregate",
     "llkv-column-map",
-    # "llkv-csv",
-    # "llkv-runtime",
-    # "llkv-executor",
     "llkv-expr",
     "llkv-fusion",
     # "llkv-join",
