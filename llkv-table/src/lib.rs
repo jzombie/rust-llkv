@@ -28,10 +28,7 @@ use datafusion::catalog::Session;
 use datafusion::common::stats::{Precision, Statistics};
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::execution::context::QueryPlanner;
-use datafusion::logical_expr::{DmlStatement, Expr, LogicalPlan, TableProviderFilterPushDown};
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion_datasource::memory::MemorySourceConfig;
 use llkv_column_map::store::{
     ColumnStore, FIELD_ID_META_KEY, GatherNullPolicy, ROW_ID_COLUMN_NAME,

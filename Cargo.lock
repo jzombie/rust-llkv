@@ -2176,6 +2176,7 @@ version = "0.8.2-alpha"
 dependencies = [
  "arrow",
  "async-trait",
+ "criterion",
  "datafusion",
  "datafusion-catalog",
  "datafusion-datasource",

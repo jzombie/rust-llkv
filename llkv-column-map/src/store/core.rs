@@ -1245,17 +1245,74 @@ where
             }
         }
 
+        // Compute incoming row_id range once for optimization checks
+        let (incoming_min, incoming_max) = if !rid_in.is_empty() {
+            let mut min_val = rid_in.value(0);
+            let mut max_val = rid_in.value(0);
+            for i in 1..rid_in.len() {
+                let rid = rid_in.value(i);
+                if rid < min_val {
+                    min_val = rid;
+                }
+                if rid > max_val {
+                    max_val = rid;
+                }
+            }
+            (min_val, max_val)
+        } else {
+            (0, 0)
+        };
+
+        // OPTIMIZATION: Early exit if incoming row_id range doesn't overlap with existing chunks.
+        // This makes append-only workloads O(1) instead of O(n).
+        let n = metas_data.len().min(metas_rid.len());
+        if n > 0 && !rid_in.is_empty() {
+            // Check if incoming range overlaps with ANY existing chunk
+            let mut has_overlap = false;
+            for meta_rid in metas_rid.iter().take(n) {
+                // Check for range overlap: [a, b] overlaps [c, d] if a <= d AND c <= b
+                if incoming_min <= meta_rid.max_val_u64 && meta_rid.min_val_u64 <= incoming_max {
+                    has_overlap = true;
+                    break;
+                }
+            }
+
+            if !has_overlap {
+                // No overlap means these are all new rows - skip expensive chunk scanning
+                tracing::trace!(
+                    ?field_id,
+                    incoming_min,
+                    incoming_max,
+                    "lww_rewrite: no overlap detected, skipping chunk scan (O(1) fast path)"
+                );
+                return Ok(FxHashSet::default());
+            }
+        }
+
         // Scan row_id chunks to find hits, bucketed by chunk index.
         let mut rewritten_ids = FxHashSet::default();
         let mut hit_up: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
         let mut hit_del: FxHashMap<usize, Vec<u64>> = FxHashMap::default();
 
-        let n = metas_data.len().min(metas_rid.len());
         if n > 0 {
-            // Fetch only row_id chunks to locate matches.
-            let mut gets_rid = Vec::with_capacity(n);
-            for rm in metas_rid.iter().take(n) {
-                gets_rid.push(BatchGet::Raw { key: rm.chunk_pk });
+            // Filter chunks by row_id range overlap before fetching
+            let mut chunks_to_fetch = Vec::new();
+            for (idx, meta_rid) in metas_rid.iter().enumerate().take(n) {
+                if incoming_min <= meta_rid.max_val_u64 && meta_rid.min_val_u64 <= incoming_max {
+                    chunks_to_fetch.push(idx);
+                }
+            }
+
+            if chunks_to_fetch.is_empty() {
+                return Ok(FxHashSet::default());
+            }
+
+            // Fetch only overlapping row_id chunks to locate matches.
+            let mut gets_rid = Vec::with_capacity(chunks_to_fetch.len());
+            for &idx in &chunks_to_fetch {
+                gets_rid.push(BatchGet::Raw {
+                    key: metas_rid[idx].chunk_pk,
+                });
             }
             let rid_results = self.pager.batch_get(&gets_rid)?;
             let mut rid_blobs: FxHashMap<PhysicalKey, EntryHandle> = FxHashMap::default();
@@ -1265,7 +1322,8 @@ where
                 }
             }
 
-            for (i, meta_rid) in metas_rid.iter().enumerate().take(n) {
+            for &idx in &chunks_to_fetch {
+                let meta_rid = &metas_rid[idx];
                 if let Some(rid_blob) = rid_blobs.get(&meta_rid.chunk_pk) {
                     let rid_arr_any = deserialize_array(rid_blob.clone())?;
                     let rid_arr = rid_arr_any
@@ -1276,9 +1334,9 @@ where
                         let rid = rid_arr.value(j);
                         if incoming_ids.contains(&rid) {
                             if ids_to_delete.contains(&rid) {
-                                hit_del.entry(i).or_default().push(rid);
+                                hit_del.entry(idx).or_default().push(rid);
                             } else if ids_to_upsert.contains(&rid) {
-                                hit_up.entry(i).or_default().push(rid);
+                                hit_up.entry(idx).or_default().push(rid);
                             }
                             rewritten_ids.insert(rid);
                         }
