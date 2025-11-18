@@ -164,6 +164,7 @@ impl LlkvSltRunner {
     /// Internal async helper that performs the actual SLT execution.
     ///
     /// This handles all the parsing, preprocessing, and test execution logic.
+    #[allow(clippy::print_stderr)]
     async fn run_slt_text_async<F, Fut, D, E>(
         text: &str,
         origin: &Path,

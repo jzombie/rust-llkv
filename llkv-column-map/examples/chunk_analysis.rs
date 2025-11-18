@@ -33,6 +33,7 @@ impl ChunkAnalyzer {
         }
     }
 
+    #[allow(clippy::print_stdout)]
     fn report(&self) {
         println!("=== Chunk Analysis ===");
         println!("Total chunks: {}", self.chunks.len());
@@ -64,6 +65,7 @@ impl PrimitiveSortedVisitor for ChunkAnalyzer {}
 impl PrimitiveWithRowIdsVisitor for ChunkAnalyzer {}
 impl PrimitiveSortedWithRowIdsVisitor for ChunkAnalyzer {}
 
+#[allow(clippy::print_stdout)]
 fn main() {
     println!("Analyzing chunk fragmentation...\n");
 

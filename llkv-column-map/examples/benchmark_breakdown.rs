@@ -43,6 +43,7 @@ impl PrimitiveSortedVisitor for SumVisitor {}
 impl PrimitiveWithRowIdsVisitor for SumVisitor {}
 impl PrimitiveSortedWithRowIdsVisitor for SumVisitor {}
 
+#[allow(clippy::print_stdout)]
 fn main() {
     println!("=== Analyzing Criterion benchmark overhead ===\n");
 

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use arrow::util::pretty::print_batches;
 use llkv_csv::{CsvReadOptions, CsvReader, CsvResult};
 
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 fn main() -> CsvResult<()> {
     let mut args = env::args().skip(1);
     let path = match args.next() {

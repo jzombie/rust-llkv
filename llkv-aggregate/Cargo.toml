@@ -17,3 +17,6 @@ llkv-column-map.workspace = true
 llkv-result.workspace = true
 llkv-plan.workspace = true
 rustc-hash.workspace = true
+
+[lints]
+workspace = true

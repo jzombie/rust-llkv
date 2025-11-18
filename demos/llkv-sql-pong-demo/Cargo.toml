@@ -20,3 +20,6 @@ llkv-sql.workspace = true
 llkv-storage.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

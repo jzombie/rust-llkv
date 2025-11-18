@@ -23,6 +23,7 @@ fn field_with_fid(name: &str, dt: DataType, fid: FieldId, nullable: bool) -> Fie
     )]))
 }
 
+#[allow(clippy::print_stdout)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing streaming optimization with real data...");
 

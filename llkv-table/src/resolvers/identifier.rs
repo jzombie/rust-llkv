@@ -1,13 +1,16 @@
 use crate::catalog::{TableCatalog, TableMetadataView};
 use crate::types::TableId;
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_expr::expr::ScalarExpr;
 use llkv_result::{Error, Result};
+use rustc_hash::FxHashSet;
 
 /// Context for resolving identifiers (e.g., default table from FROM clause).
 #[derive(Clone, Debug, Default)]
 pub struct IdentifierContext {
     default_table_id: Option<TableId>,
     table_alias: Option<String>,
+    available_columns: Option<FxHashSet<String>>,
 }
 
 impl IdentifierContext {
@@ -15,11 +18,17 @@ impl IdentifierContext {
         Self {
             default_table_id,
             table_alias: None,
+            available_columns: None,
         }
     }
 
     pub fn with_table_alias(mut self, alias: Option<String>) -> Self {
         self.table_alias = alias.map(|value| value.to_ascii_lowercase());
+        self
+    }
+
+    pub fn with_available_columns(mut self, columns: FxHashSet<String>) -> Self {
+        self.available_columns = Some(columns);
         self
     }
 
@@ -29,6 +38,20 @@ impl IdentifierContext {
 
     pub fn table_alias(&self) -> Option<&str> {
         self.table_alias.as_deref()
+    }
+
+    pub fn tracks_available_columns(&self) -> bool {
+        self.available_columns.is_some()
+    }
+
+    pub fn has_available_column_for(&self, parts: &[String]) -> bool {
+        let Some(columns) = &self.available_columns else {
+            return false;
+        };
+        let Some(last) = parts.last() else {
+            return false;
+        };
+        columns.contains(&last.to_ascii_lowercase())
     }
 }
 
@@ -42,6 +65,11 @@ pub struct ColumnResolution {
 impl ColumnResolution {
     pub fn column(&self) -> &str {
         &self.column
+    }
+
+    pub fn with_column(mut self, column: String) -> Self {
+        self.column = column;
+        self
     }
 
     pub fn field_path(&self) -> &[String] {
@@ -125,7 +153,26 @@ impl<'a> IdentifierResolver<'a> {
         }
 
         let alias_active = context.table_alias().is_some();
-        resolve_identifier_parts(effective_parts, &table_meta, alias_active)
+        let resolution = resolve_identifier_parts(effective_parts, &table_meta, alias_active)?;
+
+        if let Some(field_resolver) = self.catalog.field_resolver(table_id) {
+            if field_resolver.field_exists(resolution.column()) {
+                return Ok(resolution);
+            }
+
+            if resolution.field_path().is_empty()
+                && let Some(canonical) = canonicalize_rowid_alias(resolution.column())
+            {
+                return Ok(resolution.with_column(canonical.to_string()));
+            }
+
+            return Err(Error::InvalidArgumentError(format!(
+                "Binder Error: does not have a column named '{}'",
+                resolution.column()
+            )));
+        }
+
+        Ok(resolution)
     }
 }
 
@@ -190,5 +237,13 @@ fn resolve_identifier_parts(
 impl TableCatalog {
     pub fn identifier_resolver(&self) -> IdentifierResolver<'_> {
         IdentifierResolver { catalog: self }
+    }
+}
+
+pub fn canonicalize_rowid_alias(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case(ROW_ID_COLUMN_NAME) {
+        Some(ROW_ID_COLUMN_NAME)
+    } else {
+        None
     }
 }

@@ -15,6 +15,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
 
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_executor::{SelectExecution, push_query_label};
 use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::Literal;
@@ -128,6 +129,18 @@ impl ParameterState {
 
     fn max_index(&self) -> usize {
         self.max_index
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubqueryMaterializationMode {
+    ExecuteScalarSubqueries,
+    PreserveScalarSubqueries,
+}
+
+impl SubqueryMaterializationMode {
+    fn executes_scalar_subqueries(self) -> bool {
+        matches!(self, SubqueryMaterializationMode::ExecuteScalarSubqueries)
     }
 }
 
@@ -1849,6 +1862,20 @@ impl SqlEngine {
         Ok(tables)
     }
 
+    fn collect_available_columns_for_tables(
+        &self,
+        tables: &[llkv_plan::TableRef],
+    ) -> SqlResult<FxHashSet<String>> {
+        let mut columns = FxHashSet::default();
+        for table_ref in tables {
+            let display_name = table_ref.qualified_name();
+            let canonical = display_name.to_ascii_lowercase();
+            let table_columns = self.collect_known_columns(&display_name, &canonical)?;
+            columns.extend(table_columns);
+        }
+        Ok(columns)
+    }
+
     fn collect_known_columns(
         &self,
         display_name: &str,
@@ -1866,10 +1893,12 @@ impl SqlEngine {
             .session()
             .table_column_specs_from_transaction(canonical_name)
         {
-            return Ok(specs
+            let mut columns = specs
                 .into_iter()
                 .map(|spec| spec.name.to_ascii_lowercase())
-                .collect());
+                .collect();
+            Self::inject_system_column_aliases(&mut columns);
+            return Ok(columns);
         }
 
         // Otherwise, look it up in the committed catalog
@@ -1877,19 +1906,24 @@ impl SqlEngine {
             .map_err(|e| arrow::error::ArrowError::ExternalError(Box::new(e)))?;
 
         match context.catalog().table_column_specs(&canonical_name) {
-            Ok(specs) if !specs.is_empty() => Ok(specs
-                .into_iter()
-                .map(|spec| spec.name.to_ascii_lowercase())
-                .collect()),
+            Ok(specs) if !specs.is_empty() => {
+                let mut columns = specs
+                    .into_iter()
+                    .map(|spec| spec.name.to_ascii_lowercase())
+                    .collect();
+                Self::inject_system_column_aliases(&mut columns);
+                Ok(columns)
+            }
             Ok(_) => {
                 if let Some(table_id) = context.catalog().table_id(&canonical_name)
                     && let Some(resolver) = context.catalog().field_resolver(table_id)
                 {
-                    let fallback: FxHashSet<String> = resolver
+                    let mut fallback: FxHashSet<String> = resolver
                         .field_names()
                         .into_iter()
                         .map(|name| name.to_ascii_lowercase())
                         .collect();
+                    Self::inject_system_column_aliases(&mut fallback);
                     tracing::debug!(
                         "collect_known_columns: using resolver fallback for '{}': {:?}",
                         display_name,
@@ -1907,6 +1941,10 @@ impl SqlEngine {
                 }
             }
         }
+    }
+
+    fn inject_system_column_aliases(columns: &mut FxHashSet<String>) {
+        columns.insert(ROW_ID_COLUMN_NAME.to_ascii_lowercase());
     }
 
     fn parse_view_query(sql: &str) -> SqlResult<Query> {
@@ -3795,7 +3833,10 @@ impl SqlEngine {
                 Err(Error::InvalidArgumentError(msg))
                     if msg.contains("unsupported literal expression") =>
                 {
-                    let normalized_expr = self.materialize_in_subquery(expr.clone())?;
+                    let normalized_expr = self.materialize_in_subquery(
+                        expr.clone(),
+                        SubqueryMaterializationMode::ExecuteScalarSubqueries,
+                    )?;
                     let translated = translate_scalar_with_context(
                         &resolver,
                         IdentifierContext::new(table_id),
@@ -3813,8 +3854,12 @@ impl SqlEngine {
 
         let filter = match selection {
             Some(expr) => {
-                let materialized_expr = self.materialize_in_subquery(expr)?;
+                let materialized_expr = self.materialize_in_subquery(
+                    expr,
+                    SubqueryMaterializationMode::ExecuteScalarSubqueries,
+                )?;
                 let mut subqueries = Vec::new();
+                let mut scalar_subqueries = Vec::new();
                 let predicate = translate_condition_with_context(
                     self,
                     &resolver,
@@ -3822,15 +3867,20 @@ impl SqlEngine {
                     &materialized_expr,
                     &[],
                     &mut subqueries,
+                    &mut scalar_subqueries,
                     None,
                 )?;
-                if subqueries.is_empty() {
-                    Some(predicate)
-                } else {
+                if !subqueries.is_empty() {
                     return Err(Error::InvalidArgumentError(
                         "EXISTS subqueries are not supported in UPDATE WHERE clauses".into(),
                     ));
                 }
+                if !scalar_subqueries.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "scalar subqueries are not supported in UPDATE WHERE clauses".into(),
+                    ));
+                }
+                Some(predicate)
             }
             None => None,
         };
@@ -3916,8 +3966,12 @@ impl SqlEngine {
         let table_id = catalog.table_id(&canonical_name);
 
         let filter = if let Some(expr) = selection {
-            let materialized_expr = self.materialize_in_subquery(expr)?;
+            let materialized_expr = self.materialize_in_subquery(
+                expr,
+                SubqueryMaterializationMode::ExecuteScalarSubqueries,
+            )?;
             let mut subqueries = Vec::new();
+            let mut scalar_subqueries = Vec::new();
             let predicate = translate_condition_with_context(
                 self,
                 &resolver,
@@ -3925,11 +3979,17 @@ impl SqlEngine {
                 &materialized_expr,
                 &[],
                 &mut subqueries,
+                &mut scalar_subqueries,
                 None,
             )?;
             if !subqueries.is_empty() {
                 return Err(Error::InvalidArgumentError(
                     "EXISTS subqueries are not supported in DELETE WHERE clauses".into(),
+                ));
+            }
+            if !scalar_subqueries.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "scalar subqueries are not supported in DELETE WHERE clauses".into(),
                 ));
             }
             Some(predicate)
@@ -4636,7 +4696,11 @@ impl SqlEngine {
         Ok(SqlExpr::Value(final_value))
     }
 
-    fn materialize_in_subquery(&self, root_expr: SqlExpr) -> SqlResult<SqlExpr> {
+    fn materialize_in_subquery(
+        &self,
+        root_expr: SqlExpr,
+        mode: SubqueryMaterializationMode,
+    ) -> SqlResult<SqlExpr> {
         // Stack-based iterative traversal to avoid recursion
         enum WorkItem {
             Process(Box<SqlExpr>),
@@ -4764,8 +4828,12 @@ impl SqlEngine {
                             });
                         }
                         SqlExpr::Subquery(subquery) => {
-                            let scalar_expr = self.materialize_scalar_subquery(*subquery)?;
-                            result_stack.push(scalar_expr);
+                            if mode.executes_scalar_subqueries() {
+                                let scalar_expr = self.materialize_scalar_subquery(*subquery)?;
+                                result_stack.push(scalar_expr);
+                            } else {
+                                result_stack.push(SqlExpr::Subquery(subquery));
+                            }
                         }
                         SqlExpr::Case {
                             case_token,
@@ -4775,17 +4843,22 @@ impl SqlEngine {
                             else_result,
                         } => {
                             let new_operand = match operand {
-                                Some(expr) => Some(Box::new(self.materialize_in_subquery(*expr)?)),
+                                Some(expr) => {
+                                    Some(Box::new(self.materialize_in_subquery(*expr, mode)?))
+                                }
                                 None => None,
                             };
                             let mut new_conditions = Vec::with_capacity(conditions.len());
                             for branch in conditions {
-                                let condition = self.materialize_in_subquery(branch.condition)?;
-                                let result = self.materialize_in_subquery(branch.result)?;
+                                let condition =
+                                    self.materialize_in_subquery(branch.condition, mode)?;
+                                let result = self.materialize_in_subquery(branch.result, mode)?;
                                 new_conditions.push(sqlparser::ast::CaseWhen { condition, result });
                             }
                             let new_else = match else_result {
-                                Some(expr) => Some(Box::new(self.materialize_in_subquery(*expr)?)),
+                                Some(expr) => {
+                                    Some(Box::new(self.materialize_in_subquery(*expr, mode)?))
+                                }
                                 None => None,
                             };
                             result_stack.push(SqlExpr::Case {
@@ -6066,8 +6139,10 @@ impl SqlEngine {
             let (display_name, canonical_name) = extract_single_table(&select.from)?;
             let table_id = catalog.table_id(&canonical_name);
             let mut p = SelectPlan::new(display_name.clone());
-            let single_table_context =
-                IdentifierContext::new(table_id).with_table_alias(table_alias.clone());
+            let available_columns = self.collect_known_columns(&display_name, &canonical_name)?;
+            let single_table_context = IdentifierContext::new(table_id)
+                .with_table_alias(table_alias.clone())
+                .with_available_columns(available_columns);
             if let Some(alias) = table_alias.as_ref() {
                 validate_projection_alias_qualifiers(&select.projection, alias)?;
             }
@@ -6091,6 +6166,7 @@ impl SqlEngine {
             // Multiple tables or explicit joins - treat as cross product for now
             let (tables, join_metadata, extracted_filters) = extract_tables(&select.from)?;
             join_conditions = extracted_filters;
+            let available_columns = self.collect_available_columns_for_tables(&tables)?;
             let mut p = SelectPlan::with_tables(tables).with_joins(join_metadata);
             // For multi-table queries, we'll build projections differently
             // For now, just handle simple column references
@@ -6103,14 +6179,20 @@ impl SqlEngine {
                 correlated_tracker.reborrow(),
             )?;
             p = p.with_projections(projections);
-            (p, IdentifierContext::new(None))
+            (
+                p,
+                IdentifierContext::new(None).with_available_columns(available_columns),
+            )
         };
 
         let mut filter_components: Vec<llkv_expr::expr::Expr<'static, String>> = Vec::new();
         let mut all_subqueries = Vec::new();
 
         if let Some(expr) = &select.selection {
-            let materialized_expr = self.materialize_in_subquery(expr.clone())?;
+            let materialized_expr = self.materialize_in_subquery(
+                expr.clone(),
+                SubqueryMaterializationMode::PreserveScalarSubqueries,
+            )?;
             filter_components.push(translate_condition_with_context(
                 self,
                 resolver,
@@ -6118,6 +6200,7 @@ impl SqlEngine {
                 &materialized_expr,
                 outer_scopes,
                 &mut all_subqueries,
+                &mut scalar_subqueries,
                 correlated_tracker.reborrow(),
             )?);
         }
@@ -6130,7 +6213,10 @@ impl SqlEngine {
                 continue;
             };
 
-            let materialized_expr = self.materialize_in_subquery(join_expr.clone())?;
+            let materialized_expr = self.materialize_in_subquery(
+                join_expr.clone(),
+                SubqueryMaterializationMode::PreserveScalarSubqueries,
+            )?;
             let translated = translate_condition_with_context(
                 self,
                 resolver,
@@ -6138,6 +6224,7 @@ impl SqlEngine {
                 &materialized_expr,
                 outer_scopes,
                 &mut all_subqueries,
+                &mut scalar_subqueries,
                 correlated_tracker.reborrow(),
             )?;
 
@@ -6157,7 +6244,10 @@ impl SqlEngine {
         }
 
         let having_expr = if let Some(having) = &select.having {
-            let materialized_expr = self.materialize_in_subquery(having.clone())?;
+            let materialized_expr = self.materialize_in_subquery(
+                having.clone(),
+                SubqueryMaterializationMode::PreserveScalarSubqueries,
+            )?;
             let translated = translate_condition_with_context(
                 self,
                 resolver,
@@ -6165,6 +6255,7 @@ impl SqlEngine {
                 &materialized_expr,
                 outer_scopes,
                 &mut all_subqueries,
+                &mut scalar_subqueries,
                 correlated_tracker.reborrow(),
             )?;
             Some(translated)
@@ -6370,7 +6461,10 @@ impl SqlEngine {
         context: IdentifierContext,
         expr: &SqlExpr,
     ) -> SqlResult<String> {
-        let normalized_expr = self.materialize_in_subquery(expr.clone())?;
+        let normalized_expr = self.materialize_in_subquery(
+            expr.clone(),
+            SubqueryMaterializationMode::ExecuteScalarSubqueries,
+        )?;
         let scalar = translate_scalar_with_context(resolver, context, &normalized_expr)?;
         match scalar {
             llkv_expr::expr::ScalarExpr::Column(column) => Ok(column),
@@ -6646,7 +6740,10 @@ impl SqlEngine {
                         let normalized_expr = if matches!(expr, SqlExpr::Subquery(_)) {
                             expr.clone()
                         } else {
-                            self.materialize_in_subquery(expr.clone())?
+                            self.materialize_in_subquery(
+                                expr.clone(),
+                                SubqueryMaterializationMode::PreserveScalarSubqueries,
+                            )?
                         };
                         let scalar = {
                             let tracker_view = correlated_tracker.reborrow();
@@ -6707,7 +6804,10 @@ impl SqlEngine {
                         let normalized_expr = if matches!(expr, SqlExpr::Subquery(_)) {
                             expr.clone()
                         } else {
-                            self.materialize_in_subquery(expr.clone())?
+                            self.materialize_in_subquery(
+                                expr.clone(),
+                                SubqueryMaterializationMode::PreserveScalarSubqueries,
+                            )?
                         };
                         let scalar = {
                             let tracker_view = correlated_tracker.reborrow();
@@ -8573,13 +8673,16 @@ struct BetweenBounds<'a> {
     upper: &'a SqlExpr,
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
 fn translate_between_expr(
+    engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     between_expr: &SqlExpr,
     bounds: BetweenBounds<'_>,
     negated: bool,
     outer_scopes: &[IdentifierContext],
+    scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
     mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     let lower_op = if negated {
@@ -8594,21 +8697,25 @@ fn translate_between_expr(
     };
 
     let lower_bound = translate_comparison_with_context(
+        engine,
         resolver,
         context.clone(),
         between_expr,
         lower_op,
         bounds.lower,
         outer_scopes,
+        scalar_subqueries,
         correlated_tracker.reborrow(),
     )?;
     let upper_bound = translate_comparison_with_context(
+        engine,
         resolver,
         context,
         between_expr,
         upper_op,
         bounds.upper,
         outer_scopes,
+        scalar_subqueries,
         correlated_tracker,
     )?;
 
@@ -8663,7 +8770,23 @@ fn resolve_identifier_expr(
     tracker: SubqueryCorrelatedTracker<'_>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     match resolver.resolve(&parts, context.clone()) {
-        Ok(resolution) => Ok(resolution.into_scalar_expr()),
+        Ok(resolution) => {
+            let use_scope_check =
+                context.default_table_id().is_none() && context.tracks_available_columns();
+            if use_scope_check && !context.has_available_column_for(&parts) {
+                if let Some(expr) =
+                    resolve_correlated_identifier(resolver, &parts, outer_scopes, tracker)?
+                {
+                    return Ok(expr);
+                } else {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Binder Error: does not have a column named '{}'",
+                        parts.join(".")
+                    )));
+                }
+            }
+            Ok(resolution.into_scalar_expr())
+        }
         Err(err) => {
             if let Some(expr) =
                 resolve_correlated_identifier(resolver, &parts, outer_scopes, tracker)?
@@ -8676,6 +8799,7 @@ fn resolve_identifier_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
 fn translate_condition_with_context(
     engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
@@ -8683,6 +8807,7 @@ fn translate_condition_with_context(
     expr: &SqlExpr,
     outer_scopes: &[IdentifierContext],
     subqueries: &mut Vec<llkv_plan::FilterSubquery>,
+    scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
     mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     // Iterative postorder traversal using the TransformFrame pattern.
@@ -8729,12 +8854,14 @@ fn translate_condition_with_context(
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
                         let result = translate_comparison_with_context(
+                            engine,
                             resolver,
                             context.clone(),
                             left,
                             op.clone(),
                             right,
                             outer_scopes,
+                            scalar_subqueries,
                             correlated_tracker.reborrow(),
                         )?;
                         work_stack.push(ConditionFrame::Leaf(result));
@@ -8759,6 +8886,7 @@ fn translate_condition_with_context(
                     {
                         let negated_mode = !*inner_negated;
                         let between_expr_result = translate_between_expr(
+                            engine,
                             resolver,
                             context.clone(),
                             between_expr,
@@ -8768,6 +8896,7 @@ fn translate_condition_with_context(
                             },
                             negated_mode,
                             outer_scopes,
+                            scalar_subqueries,
                             correlated_tracker.reborrow(),
                         )?;
                         work_stack.push(ConditionFrame::Leaf(between_expr_result));
@@ -8785,11 +8914,13 @@ fn translate_condition_with_context(
                 }
                 SqlExpr::IsNull(inner) => {
                     let scalar = translate_scalar_with_context_scoped(
+                        engine,
                         resolver,
                         context.clone(),
                         inner,
                         outer_scopes,
                         correlated_tracker.reborrow(),
+                        Some(&mut *scalar_subqueries),
                     )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
@@ -8816,11 +8947,13 @@ fn translate_condition_with_context(
                 }
                 SqlExpr::IsNotNull(inner) => {
                     let scalar = translate_scalar_with_context_scoped(
+                        engine,
                         resolver,
                         context.clone(),
                         inner,
                         outer_scopes,
                         correlated_tracker.reborrow(),
+                        Some(&mut *scalar_subqueries),
                     )?;
                     match scalar {
                         llkv_expr::expr::ScalarExpr::Column(column) => {
@@ -8859,20 +8992,24 @@ fn translate_condition_with_context(
                         work_stack.push(ConditionFrame::Leaf(result));
                     } else {
                         let target = translate_scalar_with_context_scoped(
+                            engine,
                             resolver,
                             context.clone(),
                             in_expr,
                             outer_scopes,
                             correlated_tracker.reborrow(),
+                            Some(&mut *scalar_subqueries),
                         )?;
                         let mut values = Vec::with_capacity(list.len());
                         for value_expr in list {
                             let scalar = translate_scalar_with_context_scoped(
+                                engine,
                                 resolver,
                                 context.clone(),
                                 value_expr,
                                 outer_scopes,
                                 correlated_tracker.reborrow(),
+                                Some(&mut *scalar_subqueries),
                             )?;
                             values.push(scalar);
                         }
@@ -8896,6 +9033,7 @@ fn translate_condition_with_context(
                     high,
                 } => {
                     let between_expr_result = translate_between_expr(
+                        engine,
                         resolver,
                         context.clone(),
                         between_expr,
@@ -8905,6 +9043,7 @@ fn translate_condition_with_context(
                         },
                         *negated,
                         outer_scopes,
+                        scalar_subqueries,
                         correlated_tracker.reborrow(),
                     )?;
                     work_stack.push(ConditionFrame::Leaf(between_expr_result));
@@ -9064,14 +9203,16 @@ fn peel_unparenthesized_not_chain(expr: &SqlExpr) -> (usize, &SqlExpr) {
     }
     (count, current)
 }
-
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
 fn translate_comparison_with_context(
+    engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     left: &SqlExpr,
     op: BinaryOperator,
     right: &SqlExpr,
     outer_scopes: &[IdentifierContext],
+    scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
     mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
 ) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
     let (not_count, comparison_left) = peel_unparenthesized_not_chain(left);
@@ -9079,16 +9220,26 @@ fn translate_comparison_with_context(
     let left_scalar = {
         let tracker = correlated_tracker.reborrow();
         translate_scalar_with_context_scoped(
+            engine,
             resolver,
             context.clone(),
             comparison_left,
             outer_scopes,
             tracker,
+            Some(scalar_subqueries),
         )?
     };
     let right_scalar = {
         let tracker = correlated_tracker.reborrow();
-        translate_scalar_with_context_scoped(resolver, context, right, outer_scopes, tracker)?
+        translate_scalar_with_context_scoped(
+            engine,
+            resolver,
+            context,
+            right,
+            outer_scopes,
+            tracker,
+            Some(scalar_subqueries),
+        )?
     };
     let compare_op = match op {
         BinaryOperator::Eq => llkv_expr::expr::CompareOp::Eq,
@@ -9204,20 +9355,29 @@ fn translate_scalar_with_context(
 }
 
 fn translate_scalar_with_context_scoped(
+    engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
     context: IdentifierContext,
     expr: &SqlExpr,
     outer_scopes: &[IdentifierContext],
     correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
+    scalar_subqueries: Option<&mut Vec<llkv_plan::ScalarSubquery>>,
 ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
     let mut tracker = SubqueryCorrelatedTracker::from_option(correlated_tracker);
+    let mut planner = scalar_subqueries.map(|storage| ScalarSubqueryPlanner {
+        engine,
+        scalar_subqueries: storage,
+    });
+    let resolver_opt = planner
+        .as_mut()
+        .map(|builder| builder as &mut dyn ScalarSubqueryResolver);
     translate_scalar_internal(
         expr,
         Some(resolver),
         Some(&context),
         outer_scopes,
         &mut tracker,
-        None,
+        resolver_opt,
     )
 }
 
@@ -10298,7 +10458,6 @@ impl<'engine, 'vec> ScalarSubqueryResolver for ScalarSubqueryPlanner<'engine, 'v
     ) -> SqlResult<llkv_expr::expr::ScalarExpr<String>> {
         let mut nested_scopes = outer_scopes.to_vec();
         nested_scopes.push(context.clone());
-
         let mut tracker = SubqueryCorrelatedColumnTracker::new();
         let mut nested_filter_subqueries = Vec::new();
 

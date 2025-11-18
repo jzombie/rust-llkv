@@ -162,6 +162,7 @@ fn summarize_pairs(pairs: &[(LogicalFieldId, usize)]) -> AppendSummary {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn print_data_summary(label: &str, a: &AppendSummary) {
     println!("== {} ==", label);
     match a.uniform_rows_per_col {
@@ -184,6 +185,7 @@ fn print_data_summary(label: &str, a: &AppendSummary) {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn show_phase_with_data(
     label: &str,
     stats: &Arc<IoStats>,
@@ -205,6 +207,7 @@ fn show_phase_with_data(
     *prev = now;
 }
 
+#[allow(clippy::print_stdout)]
 fn show_phase(label: &str, stats: &Arc<IoStats>, prev: &mut CountsSnapshot) {
     println!("== {} ==", label);
     let now = CountsSnapshot::from(stats);
@@ -223,6 +226,7 @@ fn show_phase(label: &str, stats: &Arc<IoStats>, prev: &mut CountsSnapshot) {
 
 // -------- sample read report + ASCII storage summary ------------------------
 
+#[allow(clippy::print_stdout)]
 fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
     use arrow::array::UInt64Array;
     use llkv_column_map::store::scan::{PrimitiveVisitor, ScanOptions};
@@ -282,6 +286,7 @@ fn print_read_report_scan(store: &ColumnStore<InstrumentedPager<MemPager>>) {
 
 // -------- main walkthrough ---------------------------------------------------
 
+#[allow(clippy::print_stdout)]
 fn main() {
     let (pager, stats) = InstrumentedPager::new(MemPager::default());
     let pager_arc = Arc::new(pager);

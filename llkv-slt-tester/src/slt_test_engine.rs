@@ -98,6 +98,7 @@ impl QueryStats {
     }
 
     /// Print statistics as a formatted Arrow table
+    #[allow(clippy::print_stdout)]
     pub fn print_summary(&self) {
         if self.total_queries == 0 && self.total_statements == 0 {
             println!("\n📊 No queries or statements executed");
@@ -125,6 +126,7 @@ impl QueryStats {
     }
 
     /// Print top N slowest queries in Arrow table format
+    #[allow(clippy::print_stdout)]
     pub fn print_slowest_queries(&self, n: usize) {
         let slowest = self.slowest_queries(n);
         if slowest.is_empty() {

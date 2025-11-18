@@ -29,3 +29,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
+
+[lints]
+workspace = true

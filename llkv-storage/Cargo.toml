@@ -27,3 +27,6 @@ simd-r-drive-support = ["simd-r-drive"]
 llkv-storage = { path = ".", features = ["debug", "simd-r-drive-support"] }
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 tempfile.workspace = true
+
+[lints]
+workspace = true

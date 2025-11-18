@@ -112,6 +112,11 @@ impl SchemaPaths {
     pub fn check_answers_dir(&self) -> PathBuf {
         self.tools_root().join("dbgen").join("check_answers")
     }
+
+    /// Return the directory containing the bundled canonical answer sets.
+    pub fn answers_dir(&self) -> PathBuf {
+        self.tools_root().join("dbgen").join("answers")
+    }
 }
 
 impl Default for SchemaPaths {

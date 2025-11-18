@@ -48,6 +48,7 @@ impl PrimitiveSortedVisitor for PerfTester {}
 impl PrimitiveWithRowIdsVisitor for PerfTester {}
 impl PrimitiveSortedWithRowIdsVisitor for PerfTester {}
 
+#[allow(clippy::print_stdout)]
 fn test_chunk_size(target_mb: usize, name: &str) {
     println!("=== Testing {} ===", name);
 
@@ -133,6 +134,7 @@ fn test_chunk_size(target_mb: usize, name: &str) {
     println!();
 }
 
+#[allow(clippy::print_stdout)]
 fn main() {
     println!("Testing different effective chunk sizes...\n");
 

@@ -80,15 +80,21 @@ impl QualificationOptions {
         self
     }
 
+    /// Override the dataset directory while preserving other parameters.
+    pub fn with_dataset(mut self, dataset_dir: impl Into<PathBuf>) -> Self {
+        self.dataset_dir = dataset_dir.into();
+        self
+    }
+
     pub fn dataset_dir(&self) -> &Path {
         &self.dataset_dir
     }
 
-    fn queries(&self) -> &[u8] {
+    pub fn queries(&self) -> &[u8] {
         &self.queries
     }
 
-    fn stream_number(&self) -> u32 {
+    pub fn stream_number(&self) -> u32 {
         self.stream_number
     }
 }
@@ -125,6 +131,7 @@ pub enum QualificationStatus {
 /// Each answer set must follow the format expected by the official TPC-H
 /// `check_answers` scripts: a single header line followed by pipe-delimited data
 /// rows without leading or trailing pipe characters.
+#[allow(clippy::print_stdout)]
 pub fn run_qualification(
     engine: &SqlEngine,
     paths: &SchemaPaths,
@@ -139,6 +146,9 @@ pub fn run_qualification(
     let mut reports = Vec::with_capacity(options.queries().len());
 
     for &query in options.queries() {
+        print!("  Q{:02}: executing... ", query);
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
         let kinds = column_kinds
             .get((query - 1) as usize)
             .ok_or_else(|| TpchError::Parse(format!("no column metadata for query {query}")))?;
@@ -153,11 +163,21 @@ pub fn run_qualification(
             &stream_parameters,
         )?;
         let actual_rows = execute_query(engine, &rendered, kinds)?;
+
+        print!("comparing... ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
         let diff = diff_rows(&expected_rows, &actual_rows, kinds);
 
         let status = if diff.missing.is_empty() && diff.extra.is_empty() {
+            println!("PASS ({} rows)", actual_rows.len());
             QualificationStatus::Pass
         } else {
+            println!(
+                "FAIL (expected {}, actual {})",
+                expected_rows.len(),
+                actual_rows.len()
+            );
             QualificationStatus::Fail
         };
 
@@ -172,6 +192,34 @@ pub fn run_qualification(
     }
 
     Ok(reports)
+}
+
+/// Ensure all required qualification artifacts exist before running comparisons.
+pub fn verify_qualification_assets(options: &QualificationOptions) -> Result<()> {
+    let dir = options.dataset_dir();
+    if !dir.is_dir() {
+        return Err(TpchError::Parse(format!(
+            "qualification dataset directory '{}' does not exist",
+            dir.display()
+        )));
+    }
+    let subparam_path = dir.join(format!("subparam_{}", options.stream_number()));
+    if !subparam_path.is_file() {
+        return Err(TpchError::Parse(format!(
+            "qualification dataset missing stream parameters file '{}'",
+            subparam_path.display()
+        )));
+    }
+    for &query in options.queries() {
+        let answer_path = dir.join(format!("q{query}.out"));
+        if !answer_path.is_file() {
+            return Err(TpchError::Parse(format!(
+                "qualification dataset missing answer set '{}'",
+                answer_path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn render_query(
@@ -195,6 +243,7 @@ fn render_query(
     render_tpch_query(paths, number, schema, &options)
 }
 
+#[allow(clippy::print_stdout)]
 fn execute_query(
     engine: &SqlEngine,
     rendered: &RenderedQuery,
@@ -202,13 +251,19 @@ fn execute_query(
 ) -> Result<Vec<QualificationRow>> {
     let mut last_set = None;
 
-    for statement in &rendered.statements {
+    for (idx, statement) in rendered.statements.iter().enumerate() {
         match statement.kind {
             StatementKind::Command => {
+                print!("[cmd {}]... ", idx + 1);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
                 engine.execute(&statement.sql).map(|_| ())?;
             }
             StatementKind::Query => {
+                print!("[query {}]... ", idx + 1);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
                 let batches = engine.sql(&statement.sql)?;
+                print!("[collect]... ");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
                 let rows = collect_rows(&batches, kinds)?;
                 last_set = Some(rows);
             }

@@ -921,6 +921,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::print_stdout)]
 fn beep() {
     print!("\x07");
     let _ = stdout().flush();

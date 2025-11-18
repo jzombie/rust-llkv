@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,7 +18,9 @@ use llkv::{
     storage::{InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, PagerDiagnostics},
 };
 use llkv_table::diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
-use llkv_tpch::qualification::{QualificationOptions, QualificationStatus};
+use llkv_tpch::qualification::{
+    QualificationOptions, QualificationStatus, verify_qualification_assets,
+};
 use llkv_tpch::queries::{QueryOptions, StatementKind, render_tpch_query};
 use llkv_tpch::{
     LoadSummary, SchemaPaths, TableLoadEvent, TpchError, TpchToolkit, install_default_schema,
@@ -77,6 +80,7 @@ fn format_bytes(bytes: u64) -> String {
     format!("{mib:.2} MiB")
 }
 
+#[allow(clippy::print_stdout)]
 fn render_table_block(entry: &TablePagerIngestionSample) {
     let fresh_bytes = format_bytes(entry.delta.fresh_put_bytes);
     let overwrite_bytes = format_bytes(entry.delta.overwritten_put_bytes);
@@ -120,6 +124,7 @@ fn render_table_block(entry: &TablePagerIngestionSample) {
     );
 }
 
+#[allow(clippy::print_stdout)]
 fn print_table_summary(entries: &[TablePagerIngestionSample]) {
     if entries.is_empty() {
         return;
@@ -144,6 +149,7 @@ fn print_table_summary(entries: &[TablePagerIngestionSample]) {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn print_pager_totals(totals: &IoStatsSnapshot) {
     let fresh = format_bytes(totals.fresh_put_bytes);
     let overwrite = format_bytes(totals.overwritten_put_bytes);
@@ -175,6 +181,7 @@ fn print_pager_totals(totals: &IoStatsSnapshot) {
     );
 }
 
+#[allow(clippy::print_stderr)]
 fn main() {
     // Initialize tracing subscriber to respect RUST_LOG environment variable
     tracing_subscriber::fmt()
@@ -182,7 +189,8 @@ fn main() {
         .init();
 
     if let Err(err) = run() {
-        tracing::debug!("tpch bootstrap failed: {err}");
+        // Explicitly using `eprintln!` to render errors to stderr
+        eprintln!("tpch bootstrap failed: {err}");
         process::exit(1);
     }
 }
@@ -305,6 +313,7 @@ fn run() -> Result<(), TpchError> {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn run_install() -> Result<(), TpchError> {
     let engine = SqlEngine::new(Arc::new(MemPager::default()));
     let schema = install_default_schema(&engine)?;
@@ -354,6 +363,7 @@ fn run_query_command(args: QueryArgs) -> Result<(), TpchError> {
     run_load_internal(args.scale, Some(execution), args.batch_size, diagnostics)
 }
 
+#[allow(clippy::print_stdout)]
 fn run_load_internal(
     scale_factor: f64,
     execution: Option<QueryExecution>,
@@ -458,6 +468,7 @@ fn run_load_internal(
     Ok(())
 }
 
+#[allow(clippy::print_stdout)]
 fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     let toolkit = TpchToolkit::with_default_paths()?;
     let diagnostics_flag = diagnostics_requested(args.pager_diagnostics);
@@ -539,6 +550,7 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
             }
         },
     )?;
+
     print_load_summary(&summary);
     if let Some(diag) = diagnostics.as_ref() {
         print_table_summary(&diag.completed_tables());
@@ -554,6 +566,8 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     if !args.queries.is_empty() {
         options = options.with_queries(args.queries.clone());
     }
+
+    options = ensure_dataset_available(&toolkit, options)?;
 
     let reports = toolkit.run_qualification(&engine, &schema.schema_name, &options)?;
 
@@ -596,6 +610,103 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     Ok(())
 }
 
+fn ensure_dataset_available(
+    toolkit: &TpchToolkit,
+    options: QualificationOptions,
+) -> Result<QualificationOptions, TpchError> {
+    match verify_qualification_assets(&options) {
+        Ok(()) => Ok(options),
+        Err(primary_err) => match materialize_bundled_answers(toolkit, &options)? {
+            Some(fallback) => Ok(fallback),
+            None => Err(primary_err),
+        },
+    }
+}
+
+#[allow(clippy::print_stdout)]
+fn materialize_bundled_answers(
+    toolkit: &TpchToolkit,
+    options: &QualificationOptions,
+) -> Result<Option<QualificationOptions>, TpchError> {
+    let answers_dir = toolkit.schema_paths().answers_dir();
+    if !answers_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let stream = options.stream_number();
+    let subparam_name = format!("subparam_{stream}");
+    let subparam_src = options.dataset_dir().join(&subparam_name);
+    if !subparam_src.is_file() {
+        return Ok(None);
+    }
+
+    let cache_root = toolkit
+        .schema_paths()
+        .tools_root()
+        .join("qualification_cache");
+    ensure_directory(&cache_root)?;
+
+    let dataset_label = options
+        .dataset_dir()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_dataset_label)
+        .unwrap_or_else(|| "dataset".to_string());
+    let overlay_dir = cache_root.join(format!("{dataset_label}_stream{stream}"));
+    ensure_directory(&overlay_dir)?;
+
+    copy_if_missing(&subparam_src, &overlay_dir.join(&subparam_name))?;
+
+    for &query in options.queries() {
+        let filename = format!("q{query}.out");
+        let src = answers_dir.join(&filename);
+        if !src.is_file() {
+            return Ok(None);
+        }
+        let dst = overlay_dir.join(&filename);
+        copy_if_missing(&src, &dst)?;
+    }
+
+    let fallback = options.clone().with_dataset(overlay_dir);
+    verify_qualification_assets(&fallback)?;
+    println!(
+        "Qualification dataset '{}' missing canonical results; using fallback answers from '{}'",
+        options.dataset_dir().display(),
+        answers_dir.display()
+    );
+    Ok(Some(fallback))
+}
+
+fn sanitize_dataset_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn ensure_directory(path: &Path) -> Result<(), TpchError> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(path).map_err(|source| TpchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn copy_if_missing(src: &Path, dst: &Path) -> Result<(), TpchError> {
+    if dst.is_file() {
+        return Ok(());
+    }
+    fs::copy(src, dst)
+        .map(|_| ())
+        .map_err(|source| TpchError::Io {
+            path: dst.to_path_buf(),
+            source,
+        })
+}
+
+#[allow(clippy::print_stdout)]
 fn print_load_summary(summary: &LoadSummary) {
     println!(
         "\nLoaded {} rows across {} tables:",
@@ -607,6 +718,7 @@ fn print_load_summary(summary: &LoadSummary) {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn verify_schema_overview(engine: &SqlEngine, schema: &str) -> Result<(), TpchError> {
     let safe_schema = escape_identifier(schema);
     println!("\nSchema verification for '{schema}':");
@@ -642,6 +754,7 @@ fn print_schema_constraints(engine: &SqlEngine, schema: &str) -> Result<(), Tpch
     print_result_batch("Foreign key relationships", fk_batch)
 }
 
+#[allow(clippy::print_stdout)]
 fn maybe_run_query_validation(
     toolkit: &TpchToolkit,
     engine: &SqlEngine,
@@ -714,6 +827,7 @@ fn escape_identifier(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+#[allow(clippy::print_stdout)]
 fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchError> {
     println!("\n{label}");
 
@@ -737,6 +851,7 @@ fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchErr
     print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))
 }
 
+#[allow(clippy::print_stdout)]
 fn print_result_batch(label: &str, batch: Option<RecordBatch>) -> Result<(), TpchError> {
     println!("\n{label}");
     if let Some(batch) = batch {
@@ -1155,6 +1270,7 @@ fn build_query_execution(
     })
 }
 
+#[allow(clippy::print_stdout)]
 fn run_tpch_queries(
     engine: &SqlEngine,
     schema: &str,

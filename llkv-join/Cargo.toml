@@ -31,3 +31,6 @@ tempfile.workspace = true
 [[bench]]
 name = "join_bench"
 harness = false
+
+[lints]
+workspace = true

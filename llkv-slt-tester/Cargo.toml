@@ -40,3 +40,6 @@ harness = false
 [[bench]]
 name = "test_perf_regression_bench"
 harness = false
+
+[lints]
+workspace = true

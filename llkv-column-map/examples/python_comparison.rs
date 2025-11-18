@@ -156,6 +156,7 @@ fn benchmark_arrow_direct() -> (u128, f64) {
     (final_sum, avg_time)
 }
 
+#[allow(clippy::print_stdout)]
 fn main() {
     println!("=== Direct comparison with Python benchmarks ===\n");
 
