@@ -80,6 +80,7 @@ fn format_bytes(bytes: u64) -> String {
     format!("{mib:.2} MiB")
 }
 
+#[allow(clippy::print_stdout)]
 fn render_table_block(entry: &TablePagerIngestionSample) {
     let fresh_bytes = format_bytes(entry.delta.fresh_put_bytes);
     let overwrite_bytes = format_bytes(entry.delta.overwritten_put_bytes);
@@ -123,6 +124,7 @@ fn render_table_block(entry: &TablePagerIngestionSample) {
     );
 }
 
+#[allow(clippy::print_stdout)]
 fn print_table_summary(entries: &[TablePagerIngestionSample]) {
     if entries.is_empty() {
         return;
@@ -147,6 +149,7 @@ fn print_table_summary(entries: &[TablePagerIngestionSample]) {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn print_pager_totals(totals: &IoStatsSnapshot) {
     let fresh = format_bytes(totals.fresh_put_bytes);
     let overwrite = format_bytes(totals.overwritten_put_bytes);
@@ -178,6 +181,7 @@ fn print_pager_totals(totals: &IoStatsSnapshot) {
     );
 }
 
+#[allow(clippy::print_stderr)]
 fn main() {
     // Initialize tracing subscriber to respect RUST_LOG environment variable
     tracing_subscriber::fmt()
@@ -309,6 +313,7 @@ fn run() -> Result<(), TpchError> {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn run_install() -> Result<(), TpchError> {
     let engine = SqlEngine::new(Arc::new(MemPager::default()));
     let schema = install_default_schema(&engine)?;
@@ -358,6 +363,7 @@ fn run_query_command(args: QueryArgs) -> Result<(), TpchError> {
     run_load_internal(args.scale, Some(execution), args.batch_size, diagnostics)
 }
 
+#[allow(clippy::print_stdout)]
 fn run_load_internal(
     scale_factor: f64,
     execution: Option<QueryExecution>,
@@ -462,6 +468,7 @@ fn run_load_internal(
     Ok(())
 }
 
+#[allow(clippy::print_stdout)]
 fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
     let toolkit = TpchToolkit::with_default_paths()?;
     let diagnostics_flag = diagnostics_requested(args.pager_diagnostics);
@@ -543,6 +550,7 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
             }
         },
     )?;
+
     print_load_summary(&summary);
     if let Some(diag) = diagnostics.as_ref() {
         print_table_summary(&diag.completed_tables());
@@ -615,6 +623,7 @@ fn ensure_dataset_available(
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn materialize_bundled_answers(
     toolkit: &TpchToolkit,
     options: &QualificationOptions,
@@ -697,6 +706,7 @@ fn copy_if_missing(src: &Path, dst: &Path) -> Result<(), TpchError> {
         })
 }
 
+#[allow(clippy::print_stdout)]
 fn print_load_summary(summary: &LoadSummary) {
     println!(
         "\nLoaded {} rows across {} tables:",
@@ -708,6 +718,7 @@ fn print_load_summary(summary: &LoadSummary) {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn verify_schema_overview(engine: &SqlEngine, schema: &str) -> Result<(), TpchError> {
     let safe_schema = escape_identifier(schema);
     println!("\nSchema verification for '{schema}':");
@@ -743,6 +754,7 @@ fn print_schema_constraints(engine: &SqlEngine, schema: &str) -> Result<(), Tpch
     print_result_batch("Foreign key relationships", fk_batch)
 }
 
+#[allow(clippy::print_stdout)]
 fn maybe_run_query_validation(
     toolkit: &TpchToolkit,
     engine: &SqlEngine,
@@ -815,6 +827,7 @@ fn escape_identifier(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+#[allow(clippy::print_stdout)]
 fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchError> {
     println!("\n{label}");
 
@@ -838,6 +851,7 @@ fn print_query(engine: &SqlEngine, label: &str, sql: &str) -> Result<(), TpchErr
     print_batches(&batches).map_err(|err| TpchError::Sql(err.into()))
 }
 
+#[allow(clippy::print_stdout)]
 fn print_result_batch(label: &str, batch: Option<RecordBatch>) -> Result<(), TpchError> {
     println!("\n{label}");
     if let Some(batch) = batch {
@@ -1256,6 +1270,7 @@ fn build_query_execution(
     })
 }
 
+#[allow(clippy::print_stdout)]
 fn run_tpch_queries(
     engine: &SqlEngine,
     schema: &str,

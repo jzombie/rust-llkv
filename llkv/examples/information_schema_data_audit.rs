@@ -10,6 +10,7 @@ use arrow::util::pretty::pretty_format_batches;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 fn main() {
     let engine = SqlEngine::new(Arc::new(MemPager::default()));
 

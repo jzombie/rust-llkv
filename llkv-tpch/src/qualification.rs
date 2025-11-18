@@ -131,6 +131,7 @@ pub enum QualificationStatus {
 /// Each answer set must follow the format expected by the official TPC-H
 /// `check_answers` scripts: a single header line followed by pipe-delimited data
 /// rows without leading or trailing pipe characters.
+#[allow(clippy::print_stdout)]
 pub fn run_qualification(
     engine: &SqlEngine,
     paths: &SchemaPaths,
@@ -242,6 +243,7 @@ fn render_query(
     render_tpch_query(paths, number, schema, &options)
 }
 
+#[allow(clippy::print_stdout)]
 fn execute_query(
     engine: &SqlEngine,
     rendered: &RenderedQuery,

@@ -6,6 +6,7 @@ use arrow::util::pretty::pretty_format_batches;
 use llkv::{Error as LlkvError, RuntimeStatementResult, SqlEngine, storage::MemPager};
 use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
 
+#[allow(clippy::print_stdout)]
 fn print_banner() {
     // Use Cargo package metadata baked into the binary at compile time
     const NAME: &str = env!("CARGO_PKG_NAME");
@@ -16,6 +17,7 @@ fn print_banner() {
     println!("Use \".open FILENAME\" to reopen on a persistent database.");
 }
 
+#[allow(clippy::print_stdout)]
 fn print_help() {
     println!(".help           Show this message");
     println!(".open FILE      Open persistent database file");
@@ -28,6 +30,7 @@ fn print_help() {
     println!("  --help                Show this usage information");
 }
 
+#[allow(clippy::print_stdout)]
 fn repl() -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -70,6 +73,7 @@ fn repl() -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 fn process_stream<R: std::io::Read>(reader: R) -> io::Result<()> {
     let mut buf = String::new();
     let mut rdr = std::io::BufReader::new(reader);
@@ -117,6 +121,7 @@ fn process_stream<R: std::io::Read>(reader: R) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::print_stderr)]
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
     let mut slt_target: Option<String> = None;

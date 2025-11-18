@@ -23,6 +23,7 @@ fn field_with_fid(name: &str, dt: DataType, fid: FieldId, nullable: bool) -> Fie
     )]))
 }
 
+#[allow(clippy::print_stdout)]
 fn benchmark_scenario(
     name: &str,
     table: &Table<MemPager>,
@@ -77,6 +78,7 @@ fn benchmark_scenario(
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Table Layer Performance Optimization Benchmark");
     println!("============================================");
@@ -183,6 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     });
 
+    #[allow(clippy::print_stdout)]
     benchmark_scenario(
         "Single Column, Bounded Filter",
         &table,

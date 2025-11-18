@@ -20,6 +20,7 @@ use llkv_table::expr::{Expr, Filter, Operator};
 use llkv_table::table::{ScanProjection, ScanStreamOptions};
 use tempfile::NamedTempFile;
 
+#[allow(clippy::print_stderr)]
 fn main() -> LlkvResult<()> {
     // Usage: ingest_and_stream <path-to-csv> [--no-print] [--null-token TOKEN] [--sample N] [--batch-size N]
     let args: Vec<String> = env::args().collect();
@@ -78,6 +79,7 @@ fn main() -> LlkvResult<()> {
     run(path, no_print, sample, batch_size, null_token)
 }
 
+#[allow(clippy::print_stdout)]
 fn run(
     path: PathBuf,
     no_print: bool,

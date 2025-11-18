@@ -1235,16 +1235,16 @@ where
         match self.transactions.lock() {
             Ok(mut guard) => {
                 if guard.remove(&self.session_id).is_some() {
-                    eprintln!(
-                        "Warning: TransactionSession dropped with active transaction - auto-rolling back"
+                    tracing::warn!(
+                        "TransactionSession dropped with active transaction - auto-rolling back"
                     );
                 }
             }
             Err(_) => {
                 // Mutex is poisoned, likely due to a panic elsewhere
                 // Don't panic again during cleanup
-                tracing::trace!(
-                    "Warning: TransactionSession dropped with poisoned transaction mutex"
+                tracing::warn!(
+                    "TransactionSession dropped with poisoned transaction mutex"
                 );
             }
         }

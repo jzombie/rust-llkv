@@ -44,6 +44,7 @@ fn create_table_with_rows(
     table
 }
 
+#[allow(clippy::print_stdout)]
 fn main() {
     let pager = Arc::new(MemPager::default());
     let left = create_table_with_rows(1, &pager, 16);

@@ -273,6 +273,7 @@ impl PrimitiveSortedWithRowIdsVisitor for CountingVisitor {
     }
 }
 
+#[allow(clippy::print_stdout)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pause_before_scan = env::args().skip(1).any(|arg| arg == "--pause-before-scan");
 

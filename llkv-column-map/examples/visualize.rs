@@ -145,6 +145,7 @@ fn batch_from_pairs(pairs: &[(LogicalFieldId, ArrayRef)]) -> RecordBatch {
 
 // ---------------- Main: multi-batch ingest then ONE colored DOT -------------
 
+#[allow(clippy::print_stdout)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pager = Arc::new(MemPager::default());
     // Keep a handle to the pager so we can walk storage for visualization.

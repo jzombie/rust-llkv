@@ -2,6 +2,7 @@ use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
 use std::sync::Arc;
 
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 #[test]
 fn test_correlated_scalar_subquery_simple() {
     let pager = Arc::new(MemPager::default());
@@ -42,6 +43,7 @@ fn test_correlated_scalar_subquery_simple() {
     }
 }
 
+#[allow(clippy::print_stdout, clippy::print_stderr)]
 #[test]
 fn test_correlated_scalar_subquery_cross_product() {
     let pager = Arc::new(MemPager::default());
