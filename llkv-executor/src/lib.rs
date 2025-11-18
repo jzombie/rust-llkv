@@ -16,9 +16,9 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal128Builder,
-    Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
-    IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int64Array,
+    Int64Builder, IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray,
+    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
@@ -926,9 +926,7 @@ where
         for subquery_id in &subquery_ids {
             let info = scalar_lookup
                 .get(subquery_id)
-                .ok_or_else(|| {
-                    Error::Internal("missing scalar subquery metadata".into())
-                })?;
+                .ok_or_else(|| Error::Internal("missing scalar subquery metadata".into()))?;
             let field_id = context.allocate_synthetic_field_id()?;
             let numeric = self.evaluate_scalar_subquery_numeric(context, info, batch)?;
             context.numeric_cache.insert(field_id, numeric);
@@ -3026,15 +3024,14 @@ where
                 "HAVING requires GROUP BY".into(),
             ));
         }
-        
+
         let has_filter_subqueries = plan
             .filter
             .as_ref()
             .is_some_and(|filter| !filter.subqueries.is_empty());
         let has_scalar_subqueries = !plan.scalar_subqueries.is_empty();
-        
-        if has_filter_subqueries || has_scalar_subqueries
-        {
+
+        if has_filter_subqueries || has_scalar_subqueries {
             return self.execute_projection_with_subqueries(table, display_name, plan, row_filter);
         }
 
@@ -3224,7 +3221,8 @@ where
                     // and evaluate scalar subqueries in the callback
                     let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                         Error::InvalidArgumentError(
-                            "table has no columns; cannot perform scalar subquery projection".into(),
+                            "table has no columns; cannot perform scalar subquery projection"
+                                .into(),
                         )
                     })?;
                     crate::translation::expression::full_table_scan_filter(field_id)
@@ -3322,11 +3320,9 @@ where
 
                     // Evaluate scalar subqueries in the filter for this batch
                     for (subquery_id, subquery) in filter_scalar_lookup.iter() {
-                        let result_array = match self.evaluate_scalar_subquery_numeric(
-                            context,
-                            subquery,
-                            &batch,
-                        ) {
+                        let result_array = match self
+                            .evaluate_scalar_subquery_numeric(context, subquery, &batch)
+                        {
                             Ok(array) => array,
                             Err(err) => {
                                 scan_error = Some(err);
@@ -3340,7 +3336,9 @@ where
                                 return;
                             }
                         };
-                        context.scalar_subquery_columns.insert(*subquery_id, accessor);
+                        context
+                            .scalar_subquery_columns
+                            .insert(*subquery_id, accessor);
                     }
                     let translated = translated_filter
                         .as_ref()
@@ -4528,11 +4526,10 @@ where
                     // Create a minimal context for evaluation (aggregates have no row context)
                     let base_schema = Arc::new(Schema::new(Vec::<Field>::new()));
                     let base_lookup = FxHashMap::default();
-                    let mut context = CrossProductExpressionContext::new(
-                        base_schema.as_ref(),
-                        base_lookup,
-                    )?;
-                    let empty_batch = RecordBatch::new_empty(Arc::new(Schema::new(Vec::<Field>::new())));
+                    let mut context =
+                        CrossProductExpressionContext::new(base_schema.as_ref(), base_lookup)?;
+                    let empty_batch =
+                        RecordBatch::new_empty(Arc::new(Schema::new(Vec::<Field>::new())));
 
                     // Evaluate each scalar subquery to a literal
                     let mut scalar_literals: FxHashMap<SubqueryId, Literal> = FxHashMap::default();
@@ -8258,9 +8255,9 @@ fn rewrite_scalar_expr_subqueries(
             op,
             right: Box::new(rewrite_scalar_expr_subqueries(*right, literals)?),
         }),
-        ScalarExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(
-            rewrite_scalar_expr_subqueries(*inner, literals)?,
-        ))),
+        ScalarExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(rewrite_scalar_expr_subqueries(
+            *inner, literals,
+        )?))),
         ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
             expr: Box::new(rewrite_scalar_expr_subqueries(*expr, literals)?),
             negated,

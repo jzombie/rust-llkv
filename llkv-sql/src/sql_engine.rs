@@ -8673,6 +8673,7 @@ struct BetweenBounds<'a> {
     upper: &'a SqlExpr,
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
 fn translate_between_expr(
     engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
@@ -8798,6 +8799,7 @@ fn resolve_identifier_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
 fn translate_condition_with_context(
     engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
@@ -9201,7 +9203,7 @@ fn peel_unparenthesized_not_chain(expr: &SqlExpr) -> (usize, &SqlExpr) {
     }
     (count, current)
 }
-
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
 fn translate_comparison_with_context(
     engine: &SqlEngine,
     resolver: &IdentifierResolver<'_>,
