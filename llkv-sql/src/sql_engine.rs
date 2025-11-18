@@ -6209,24 +6209,24 @@ impl SqlEngine {
         // safely push these predicates into the WHERE clause, while LEFT joins must retain
         // them on the join so that unmatched left rows are preserved.
         for (idx, join_expr_opt) in join_conditions.iter().enumerate() {
-            let Some(join_expr) = join_expr_opt else {
-                continue;
+            let translated = if let Some(join_expr) = join_expr_opt {
+                let materialized_expr = self.materialize_in_subquery(
+                    join_expr.clone(),
+                    SubqueryMaterializationMode::PreserveScalarSubqueries,
+                )?;
+                Some(translate_condition_with_context(
+                    self,
+                    resolver,
+                    id_context.clone(),
+                    &materialized_expr,
+                    outer_scopes,
+                    &mut all_subqueries,
+                    &mut scalar_subqueries,
+                    correlated_tracker.reborrow(),
+                )?)
+            } else {
+                None
             };
-
-            let materialized_expr = self.materialize_in_subquery(
-                join_expr.clone(),
-                SubqueryMaterializationMode::PreserveScalarSubqueries,
-            )?;
-            let translated = translate_condition_with_context(
-                self,
-                resolver,
-                id_context.clone(),
-                &materialized_expr,
-                outer_scopes,
-                &mut all_subqueries,
-                &mut scalar_subqueries,
-                correlated_tracker.reborrow(),
-            )?;
 
             let is_left_join = plan
                 .joins
@@ -6235,11 +6235,16 @@ impl SqlEngine {
                 .unwrap_or(false);
 
             if let Some(join_meta) = plan.joins.get_mut(idx) {
-                join_meta.on_condition = Some(translated.clone());
+                let expr_for_join = translated
+                    .clone()
+                    .unwrap_or_else(|| llkv_expr::expr::Expr::Literal(true));
+                join_meta.on_condition = Some(expr_for_join);
             }
 
-            if !is_left_join {
-                filter_components.push(translated);
+            if let Some(actual_expr) = translated {
+                if !is_left_join {
+                    filter_components.push(actual_expr);
+                }
             }
         }
 
@@ -8803,7 +8808,7 @@ fn translate_like_expr(
 /// - Exact match (no wildcards) → `Equals(pattern)`
 fn try_optimize_like_pattern(pattern: &str) -> Option<llkv_expr::expr::Operator<'static>> {
     let bytes = pattern.as_bytes();
-    
+
     // Check if pattern has any underscore wildcards (can't optimize those)
     if pattern.contains('_') {
         return None;
@@ -11229,7 +11234,23 @@ fn extract_tables(from: &[TableWithJoins]) -> SqlResult<ExtractedJoinData> {
     let mut join_filters = Vec::new();
 
     for item in from {
+        let prior_table_len = tables.len();
+        let prior_join_len = join_metadata.len();
+
         flatten_table_with_joins(item, &mut tables, &mut join_metadata, &mut join_filters)?;
+
+        let new_table_len = tables.len();
+        if prior_table_len > 0 && new_table_len > prior_table_len {
+            join_metadata.insert(
+                prior_join_len,
+                llkv_plan::JoinMetadata {
+                    left_table_index: prior_table_len - 1,
+                    join_type: llkv_plan::JoinPlan::Inner,
+                    on_condition: None,
+                },
+            );
+            join_filters.insert(prior_join_len, None);
+        }
     }
 
     Ok((tables, join_metadata, join_filters))
@@ -11864,6 +11885,70 @@ mod tests {
     }
 
     #[test]
+    fn extract_tables_inserts_cross_join_metadata_for_comma_lists() {
+        use sqlparser::ast::{SetExpr, Statement};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = GenericDialect {};
+        let sql = "SELECT * FROM tab0, tab1 AS cor0 CROSS JOIN tab2";
+        let statements = Parser::parse_sql(&dialect, sql).expect("parse sql");
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select.as_ref(),
+            other => panic!("unexpected query body: {other:?}"),
+        };
+
+        let (tables, join_metadata, join_filters) =
+            extract_tables(&select.from).expect("extract tables");
+
+        assert_eq!(tables.len(), 3, "expected three table refs");
+        assert_eq!(join_metadata.len(), 2, "expected two join edges");
+        assert_eq!(join_filters.len(), 2, "join filters mirror metadata len");
+
+        assert_eq!(join_metadata[0].left_table_index, 0, "implicit comma join");
+        assert_eq!(join_metadata[1].left_table_index, 1, "explicit cross join");
+    }
+
+    #[test]
+    fn implicit_cross_join_populates_literal_true_on_condition() {
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute(
+                "CREATE TABLE tab0(col0 INTEGER);
+                 CREATE TABLE tab1(col0 INTEGER);",
+            )
+            .expect("create tables");
+
+        let dialect = SQLiteDialect {};
+        let mut statements =
+            Parser::parse_sql(&dialect, "SELECT * FROM tab0, tab1").expect("parse sql");
+        let Statement::Query(query) = statements.pop().expect("statement") else {
+            unreachable!();
+        };
+        let plan = engine.build_select_plan(*query).expect("build select plan");
+
+        assert_eq!(plan.tables.len(), 2, "expected two tables");
+        assert_eq!(plan.joins.len(), 1, "expected implicit join edge");
+
+        let join_meta = &plan.joins[0];
+        match join_meta.on_condition.as_ref() {
+            Some(llkv_expr::expr::Expr::Literal(value)) => {
+                assert!(*value, "implicit join should be ON TRUE");
+            }
+            other => panic!("unexpected join predicate: {other:?}"),
+        }
+    }
+
+    #[test]
     fn not_between_null_bounds_matches_sqlite_behavior() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
@@ -12145,9 +12230,11 @@ mod tests {
 
         let plan = engine.build_select_plan(*query).expect("build select plan");
 
-        assert_eq!(plan.joins.len(), 1, "expected single explicit join entry");
-
-        let left_join = &plan.joins[0];
+        let left_join = plan
+            .joins
+            .iter()
+            .find(|join| join.join_type == llkv_plan::JoinPlan::Left)
+            .expect("expected explicit LEFT JOIN entry");
         let on_condition = left_join
             .on_condition
             .as_ref()

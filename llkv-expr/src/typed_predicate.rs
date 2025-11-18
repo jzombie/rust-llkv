@@ -553,13 +553,15 @@ mod tests {
         assert!(predicate.matches("x"));
         assert!(!predicate.matches("z"));
 
-        let sw_sensitive = build_var_width_predicate(&Operator::starts_with("pre".to_string(), true))
-            .expect("starts with predicate");
+        let sw_sensitive =
+            build_var_width_predicate(&Operator::starts_with("pre".to_string(), true))
+                .expect("starts with predicate");
         assert!(sw_sensitive.matches("prefix"));
         assert!(!sw_sensitive.matches("Prefix"));
 
-        let sw_insensitive = build_var_width_predicate(&Operator::starts_with("Pre".to_string(), false))
-            .expect("starts with predicate");
+        let sw_insensitive =
+            build_var_width_predicate(&Operator::starts_with("Pre".to_string(), false))
+                .expect("starts with predicate");
         assert!(sw_insensitive.matches("prefix"));
         assert!(sw_insensitive.matches("Prefix"));
 
@@ -568,8 +570,9 @@ mod tests {
         assert!(ew_sensitive.matches("datsuf"));
         assert!(!ew_sensitive.matches("datSuf"));
 
-        let ew_insensitive = build_var_width_predicate(&Operator::ends_with("SUF".to_string(), false))
-            .expect("ends with predicate");
+        let ew_insensitive =
+            build_var_width_predicate(&Operator::ends_with("SUF".to_string(), false))
+                .expect("ends with predicate");
         assert!(ew_insensitive.matches("datsuf"));
         assert!(ew_insensitive.matches("datSuf"));
 
@@ -578,8 +581,9 @@ mod tests {
         assert!(ct_sensitive.matches("amidst"));
         assert!(!ct_sensitive.matches("aMidst"));
 
-        let ct_insensitive = build_var_width_predicate(&Operator::contains("MiD".to_string(), false))
-            .expect("contains predicate");
+        let ct_insensitive =
+            build_var_width_predicate(&Operator::contains("MiD".to_string(), false))
+                .expect("contains predicate");
         assert!(ct_insensitive.matches("amidst"));
         assert!(ct_insensitive.matches("aMidst"));
     }

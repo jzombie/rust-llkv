@@ -1242,13 +1242,15 @@ where
                 // Start with the first table
                 let (first_ref, first_table) = &tables_with_handles[0];
                 let first_constraints = constraint_map.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
-                let mut accumulated = collect_table_data(0, first_ref, first_table.as_ref(), first_constraints)?;
+                let mut accumulated =
+                    collect_table_data(0, first_ref, first_table.as_ref(), first_constraints)?;
 
                 // Join each subsequent table
                 for idx in 1..tables_with_handles.len() {
                     let (right_ref, right_table) = &tables_with_handles[idx];
-                    let right_constraints = constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
-                    
+                    let right_constraints =
+                        constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
+
                     let join_metadata = join_lookup.get(&(idx - 1)).ok_or_else(|| {
                         Error::InvalidArgumentError(format!(
                             "No join condition found between table {} and {}. Multi-table queries require explicit JOIN syntax.",
@@ -1264,14 +1266,18 @@ where
                     };
 
                     // Collect right table data with pushdown filters
-                    let right_data = collect_table_data(idx, right_ref, right_table.as_ref(), right_constraints)?;
+                    let right_data = collect_table_data(
+                        idx,
+                        right_ref,
+                        right_table.as_ref(),
+                        right_constraints,
+                    )?;
 
                     // Extract join condition
-                    let condition = join_metadata.on_condition.as_ref().ok_or_else(|| {
-                        Error::InvalidArgumentError(
-                            "Multi-table join requires ON condition for each table".into()
-                        )
-                    })?;
+                    let condition_expr = join_metadata
+                        .on_condition
+                        .clone()
+                        .unwrap_or_else(|| LlkvExpr::Literal(true));
 
                     // For now, materialize accumulated result and perform join via llkv-join hash join
                     // This avoids full cartesian product while using our existing join implementation
@@ -1280,14 +1286,19 @@ where
                         &accumulated.batches,
                         &right_data.schema,
                         &right_data.batches,
-                        condition,
+                        &condition_expr,
                         join_type,
                     )?;
 
                     // Build combined schema
-                    let combined_fields: Vec<Field> = accumulated.schema.fields().iter()
+                    let combined_fields: Vec<Field> = accumulated
+                        .schema
+                        .fields()
+                        .iter()
                         .chain(right_data.schema.fields().iter())
-                        .map(|f| Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable()))
+                        .map(|f| {
+                            Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable())
+                        })
                         .collect();
                     let combined_schema = Arc::new(Schema::new(combined_fields));
 
@@ -1652,6 +1663,7 @@ struct JoinKeyBuild {
 }
 
 // Type alias for backward compatibility
+#[allow(dead_code)]
 type JoinKeyBuildEqualities = JoinKeyBuild;
 
 impl JoinKeyBuild {
@@ -2122,22 +2134,119 @@ fn execute_hash_join_batches(
         }
         JoinConditionAnalysis::AlwaysFalse => {
             // No matches - return empty result based on join type
-            let combined_fields: Vec<Field> = left_schema.fields().iter()
+            let combined_fields: Vec<Field> = left_schema
+                .fields()
+                .iter()
                 .chain(right_schema.fields().iter())
                 .map(|f| Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable()))
                 .collect();
             let combined_schema = Arc::new(Schema::new(combined_fields));
-            
-            return match join_type {
-                llkv_join::JoinType::Inner | llkv_join::JoinType::Semi | llkv_join::JoinType::Anti => {
-                    Ok(vec![RecordBatch::new_empty(combined_schema)])
+
+            let mut results = Vec::new();
+            match join_type {
+                llkv_join::JoinType::Inner
+                | llkv_join::JoinType::Semi
+                | llkv_join::JoinType::Anti => {
+                    results.push(RecordBatch::new_empty(combined_schema));
                 }
-                _ => {
-                    // For outer joins, need to return unmatched rows with nulls
-                    // This is complex - for now return empty and handle later if needed
-                    Ok(vec![RecordBatch::new_empty(combined_schema)])
+                llkv_join::JoinType::Left => {
+                    for left_batch in left_batches {
+                        let row_count = left_batch.num_rows();
+                        if row_count == 0 {
+                            continue;
+                        }
+                        let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                        columns.extend(left_batch.columns().iter().cloned());
+                        for field in right_schema.fields() {
+                            columns.push(new_null_array(field.data_type(), row_count));
+                        }
+                        results.push(
+                            RecordBatch::try_new(Arc::clone(&combined_schema), columns)
+                                .map_err(|err| {
+                                    Error::Internal(format!(
+                                        "failed to materialize LEFT JOIN null-extension batch: {err}"
+                                    ))
+                                })?,
+                        );
+                    }
+                    if results.is_empty() {
+                        results.push(RecordBatch::new_empty(combined_schema));
+                    }
                 }
-            };
+                llkv_join::JoinType::Right => {
+                    for right_batch in right_batches {
+                        let row_count = right_batch.num_rows();
+                        if row_count == 0 {
+                            continue;
+                        }
+                        let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                        for field in left_schema.fields() {
+                            columns.push(new_null_array(field.data_type(), row_count));
+                        }
+                        columns.extend(right_batch.columns().iter().cloned());
+                        results.push(
+                            RecordBatch::try_new(Arc::clone(&combined_schema), columns)
+                                .map_err(|err| {
+                                    Error::Internal(format!(
+                                        "failed to materialize RIGHT JOIN null-extension batch: {err}"
+                                    ))
+                                })?,
+                        );
+                    }
+                    if results.is_empty() {
+                        results.push(RecordBatch::new_empty(combined_schema));
+                    }
+                }
+                llkv_join::JoinType::Full => {
+                    for left_batch in left_batches {
+                        let row_count = left_batch.num_rows();
+                        if row_count == 0 {
+                            continue;
+                        }
+                        let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                        columns.extend(left_batch.columns().iter().cloned());
+                        for field in right_schema.fields() {
+                            columns.push(new_null_array(field.data_type(), row_count));
+                        }
+                        results.push(
+                            RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(
+                                |err| {
+                                    Error::Internal(format!(
+                                        "failed to materialize FULL JOIN left batch: {err}"
+                                    ))
+                                },
+                            )?,
+                        );
+                    }
+
+                    for right_batch in right_batches {
+                        let row_count = right_batch.num_rows();
+                        if row_count == 0 {
+                            continue;
+                        }
+                        let mut columns = Vec::with_capacity(combined_schema.fields().len());
+                        for field in left_schema.fields() {
+                            columns.push(new_null_array(field.data_type(), row_count));
+                        }
+                        columns.extend(right_batch.columns().iter().cloned());
+                        results.push(
+                            RecordBatch::try_new(Arc::clone(&combined_schema), columns).map_err(
+                                |err| {
+                                    Error::Internal(format!(
+                                        "failed to materialize FULL JOIN right batch: {err}"
+                                    ))
+                                },
+                            )?,
+                        );
+                    }
+
+                    if results.is_empty() {
+                        results.push(RecordBatch::new_empty(combined_schema));
+                    }
+                }
+            }
+
+            return Ok(results);
         }
         JoinConditionAnalysis::EquiPairs(pairs) => pairs,
     };
@@ -2147,7 +2256,7 @@ fn execute_hash_join_batches(
     for (idx, field) in left_schema.fields().iter().enumerate() {
         left_lookup.insert(field.name().to_ascii_lowercase(), idx);
     }
-    
+
     let mut right_lookup: FxHashMap<String, usize> = FxHashMap::default();
     for (idx, field) in right_schema.fields().iter().enumerate() {
         right_lookup.insert(field.name().to_ascii_lowercase(), idx);
@@ -2156,46 +2265,52 @@ fn execute_hash_join_batches(
     // Map join keys to column indices
     let mut left_key_indices = Vec::new();
     let mut right_key_indices = Vec::new();
-    
+
     for (lhs_col, rhs_col) in equalities {
         let lhs_lower = lhs_col.to_ascii_lowercase();
         let rhs_lower = rhs_col.to_ascii_lowercase();
-        
-        let (left_idx, right_idx) = match (left_lookup.get(&lhs_lower), right_lookup.get(&rhs_lower)) {
-            (Some(&l), Some(&r)) => (l, r),
-            (Some(_), None) => {
-                if left_lookup.contains_key(&rhs_lower) {
-                    return Err(Error::InvalidArgumentError(
-                        format!("Both join columns '{}' and '{}' are from left table", lhs_col, rhs_col)
-                    ));
+
+        let (left_idx, right_idx) =
+            match (left_lookup.get(&lhs_lower), right_lookup.get(&rhs_lower)) {
+                (Some(&l), Some(&r)) => (l, r),
+                (Some(_), None) => {
+                    if left_lookup.contains_key(&rhs_lower) {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Both join columns '{}' and '{}' are from left table",
+                            lhs_col, rhs_col
+                        )));
+                    }
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Join column '{}' not found in right table",
+                        rhs_col
+                    )));
                 }
-                return Err(Error::InvalidArgumentError(
-                    format!("Join column '{}' not found in right table", rhs_col)
-                ));
-            }
-            (None, Some(_)) => {
-                if right_lookup.contains_key(&lhs_lower) {
-                    return Err(Error::InvalidArgumentError(
-                        format!("Both join columns '{}' and '{}' are from right table", lhs_col, rhs_col)
-                    ));
+                (None, Some(_)) => {
+                    if right_lookup.contains_key(&lhs_lower) {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "Both join columns '{}' and '{}' are from right table",
+                            lhs_col, rhs_col
+                        )));
+                    }
+                    return Err(Error::InvalidArgumentError(format!(
+                        "Join column '{}' not found in left table",
+                        lhs_col
+                    )));
                 }
-                return Err(Error::InvalidArgumentError(
-                    format!("Join column '{}' not found in left table", lhs_col)
-                ));
-            }
-            (None, None) => {
-                // Try swapped
-                match (left_lookup.get(&rhs_lower), right_lookup.get(&lhs_lower)) {
-                    (Some(&l), Some(&r)) => (l, r),
-                    _ => {
-                        return Err(Error::InvalidArgumentError(
-                            format!("Join columns '{}' and '{}' not found in either table", lhs_col, rhs_col)
-                        ));
+                (None, None) => {
+                    // Try swapped
+                    match (left_lookup.get(&rhs_lower), right_lookup.get(&lhs_lower)) {
+                        (Some(&l), Some(&r)) => (l, r),
+                        _ => {
+                            return Err(Error::InvalidArgumentError(format!(
+                                "Join columns '{}' and '{}' not found in either table",
+                                lhs_col, rhs_col
+                            )));
+                        }
                     }
                 }
-            }
-        };
-        
+            };
+
         left_key_indices.push(left_idx);
         right_key_indices.push(right_idx);
     }
@@ -2203,7 +2318,7 @@ fn execute_hash_join_batches(
     // Build hash table from right side (build phase)
     // Key: hash of join column values, Value: (batch_idx, row_idx)
     let mut hash_table: FxHashMap<Vec<i64>, Vec<(usize, usize)>> = FxHashMap::default();
-    
+
     for (batch_idx, right_batch) in right_batches.iter().enumerate() {
         let num_rows = right_batch.num_rows();
         if num_rows == 0 {
@@ -2221,7 +2336,7 @@ fn execute_hash_join_batches(
             // Extract key values for this row
             let mut key_values = Vec::with_capacity(key_columns.len());
             let mut has_null = false;
-            
+
             for col in &key_columns {
                 if col.is_null(row_idx) {
                     has_null = true;
@@ -2246,7 +2361,9 @@ fn execute_hash_join_batches(
 
     // Probe phase: scan left side and emit matches
     let mut result_batches = Vec::new();
-    let combined_fields: Vec<Field> = left_schema.fields().iter()
+    let combined_fields: Vec<Field> = left_schema
+        .fields()
+        .iter()
         .chain(right_schema.fields().iter())
         .map(|f| Field::new(f.name().clone(), f.data_type().clone(), true)) // Make nullable for outer joins
         .collect();
@@ -2266,7 +2383,7 @@ fn execute_hash_join_batches(
 
         // Track which left rows matched (for outer joins)
         let mut left_matched = vec![false; num_rows];
-        
+
         // Collect matching row pairs
         let mut left_indices = Vec::new();
         let mut right_refs = Vec::new();
@@ -2275,7 +2392,7 @@ fn execute_hash_join_batches(
             // Extract key for this left row
             let mut key_values = Vec::with_capacity(left_key_columns.len());
             let mut has_null = false;
-            
+
             for col in &left_key_columns {
                 if col.is_null(left_row_idx) {
                     has_null = true;
@@ -2311,7 +2428,7 @@ fn execute_hash_join_batches(
                 &combined_schema,
                 join_type,
             )?;
-            
+
             if output_batch.num_rows() > 0 {
                 result_batches.push(output_batch);
             }
@@ -2331,29 +2448,66 @@ fn extract_key_value_as_i64(col: &ArrayRef, row_idx: usize) -> ExecutorResult<i6
     use arrow::datatypes::DataType;
 
     match col.data_type() {
-        DataType::Int8 => Ok(col.as_any().downcast_ref::<Int8Array>().unwrap().value(row_idx) as i64),
-        DataType::Int16 => Ok(col.as_any().downcast_ref::<Int16Array>().unwrap().value(row_idx) as i64),
-        DataType::Int32 => Ok(col.as_any().downcast_ref::<Int32Array>().unwrap().value(row_idx) as i64),
-        DataType::Int64 => Ok(col.as_any().downcast_ref::<Int64Array>().unwrap().value(row_idx)),
-        DataType::UInt8 => Ok(col.as_any().downcast_ref::<UInt8Array>().unwrap().value(row_idx) as i64),
-        DataType::UInt16 => Ok(col.as_any().downcast_ref::<UInt16Array>().unwrap().value(row_idx) as i64),
-        DataType::UInt32 => Ok(col.as_any().downcast_ref::<UInt32Array>().unwrap().value(row_idx) as i64),
+        DataType::Int8 => Ok(col
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap()
+            .value(row_idx) as i64),
+        DataType::Int16 => Ok(col
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap()
+            .value(row_idx) as i64),
+        DataType::Int32 => Ok(col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(row_idx) as i64),
+        DataType::Int64 => Ok(col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(row_idx)),
+        DataType::UInt8 => Ok(col
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .value(row_idx) as i64),
+        DataType::UInt16 => Ok(col
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap()
+            .value(row_idx) as i64),
+        DataType::UInt32 => Ok(col
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(row_idx) as i64),
         DataType::UInt64 => {
-            let val = col.as_any().downcast_ref::<UInt64Array>().unwrap().value(row_idx);
+            let val = col
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row_idx);
             Ok(val as i64) // May overflow but maintains hash consistency
         }
         DataType::Utf8 => {
             // Hash string to i64
-            let s = col.as_any().downcast_ref::<StringArray>().unwrap().value(row_idx);
+            let s = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row_idx);
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             let mut hasher = DefaultHasher::new();
             s.hash(&mut hasher);
             Ok(hasher.finish() as i64)
         }
-        _ => Err(Error::InvalidArgumentError(
-            format!("Unsupported join key type: {:?}", col.data_type())
-        )),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Unsupported join key type: {:?}",
+            col.data_type()
+        ))),
     }
 }
 
@@ -2374,16 +2528,16 @@ fn build_join_output_batch(
         llkv_join::JoinType::Inner => {
             // Only matched rows
             let left_indices_array = UInt32Array::from(left_indices.to_vec());
-            
+
             let mut output_columns = Vec::new();
-            
+
             // Take from left columns
             for col in left_batch.columns() {
                 let taken = take(col.as_ref(), &left_indices_array, None)
                     .map_err(|e| Error::Internal(format!("Failed to take left column: {}", e)))?;
                 output_columns.push(taken);
             }
-            
+
             // Gather from right columns
             for right_col_idx in 0..right_batches[0].num_columns() {
                 let mut values = Vec::with_capacity(right_refs.len());
@@ -2391,9 +2545,12 @@ fn build_join_output_batch(
                     let col = right_batches[batch_idx].column(right_col_idx);
                     values.push((col.clone(), row_idx));
                 }
-                
+
                 // Build array from gathered values
-                let right_col = gather_from_multiple_batches(&values, right_batches[0].column(right_col_idx).data_type())?;
+                let right_col = gather_from_multiple_batches(
+                    &values,
+                    right_batches[0].column(right_col_idx).data_type(),
+                )?;
                 output_columns.push(right_col);
             }
 
@@ -2403,12 +2560,12 @@ fn build_join_output_batch(
         llkv_join::JoinType::Left => {
             // All left rows + matched right rows (nulls for unmatched)
             let mut output_columns = Vec::new();
-            
+
             // Include all left columns as-is
             for col in left_batch.columns() {
                 output_columns.push(col.clone());
             }
-            
+
             // Build right columns with nulls for unmatched
             for right_col_idx in 0..right_batches[0].num_columns() {
                 let right_col = build_left_join_column(
@@ -2424,9 +2581,10 @@ fn build_join_output_batch(
             RecordBatch::try_new(Arc::clone(combined_schema), output_columns)
                 .map_err(|e| Error::Internal(format!("Failed to create left join batch: {}", e)))
         }
-        _ => Err(Error::InvalidArgumentError(
-            format!("{:?} join not yet implemented in batch join", join_type)
-        )),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "{:?} join not yet implemented in batch join",
+            join_type
+        ))),
     }
 }
 
@@ -2448,8 +2606,10 @@ fn gather_from_multiple_batches(
     // Optimize: if all values come from the same array, use take directly (vectorized, zero-copy)
     if values.len() > 1 {
         let first_array_ptr = Arc::as_ptr(&values[0].0);
-        let all_same_array = values.iter().all(|(arr, _)| Arc::as_ptr(arr) == first_array_ptr);
-        
+        let all_same_array = values
+            .iter()
+            .all(|(arr, _)| std::ptr::addr_eq(Arc::as_ptr(arr), first_array_ptr));
+
         if all_same_array {
             // Fast path: single source array - use Arrow's vectorized take kernel
             // This is SIMD-optimized and operates on buffers, not individual values
@@ -2463,11 +2623,11 @@ fn gather_from_multiple_batches(
     // Multiple source arrays: concatenate then take (still faster than element-by-element)
     // Build a unified index mapping
     use arrow::compute::concat;
-    
+
     // Group by unique array pointers
     let mut unique_arrays: Vec<(Arc<dyn Array>, Vec<usize>)> = Vec::new();
     let mut array_map: FxHashMap<*const dyn Array, usize> = FxHashMap::default();
-    
+
     for (arr, row_idx) in values {
         let ptr = Arc::as_ptr(arr) as *const dyn Array;
         if let Some(&idx) = array_map.get(&ptr) {
@@ -2478,7 +2638,7 @@ fn gather_from_multiple_batches(
             unique_arrays.push((Arc::clone(arr), vec![*row_idx]));
         }
     }
-    
+
     // If only one unique array, use fast path
     if unique_arrays.len() == 1 {
         let (arr, indices) = &unique_arrays[0];
@@ -2487,15 +2647,14 @@ fn gather_from_multiple_batches(
         return take(arr.as_ref(), &indices_array, None)
             .map_err(|e| Error::Internal(format!("Arrow take failed: {}", e)));
     }
-    
+
     // Multiple arrays: concat first, then take
-    let arrays_to_concat: Vec<&dyn Array> = unique_arrays.iter()
-        .map(|(arr, _)| arr.as_ref())
-        .collect();
-    
+    let arrays_to_concat: Vec<&dyn Array> =
+        unique_arrays.iter().map(|(arr, _)| arr.as_ref()).collect();
+
     let concatenated = concat(&arrays_to_concat)
         .map_err(|e| Error::Internal(format!("Arrow concat failed: {}", e)))?;
-    
+
     // Build adjusted indices for the concatenated array
     let mut offset = 0;
     let mut adjusted_indices = Vec::with_capacity(values.len());
@@ -2508,7 +2667,7 @@ fn gather_from_multiple_batches(
         }
         offset += arr_len;
     }
-    
+
     let indices_array = UInt32Array::from(adjusted_indices);
     take(&concatenated, &indices_array, None)
         .map_err(|e| Error::Internal(format!("Arrow take on concatenated failed: {}", e)))
@@ -2533,56 +2692,16 @@ fn execute_cross_join_batches(
     left: &RecordBatch,
     right: &RecordBatch,
 ) -> ExecutorResult<RecordBatch> {
-    // Create cartesian product
-    let left_rows = left.num_rows();
-    let right_rows = right.num_rows();
-    let total_rows = left_rows * right_rows;
-
-    if total_rows == 0 {
-        let combined_fields: Vec<Field> = left.schema().fields().iter()
-            .chain(right.schema().fields().iter())
-            .map(|f| Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable()))
-            .collect();
-        let combined_schema = Arc::new(Schema::new(combined_fields));
-        return Ok(RecordBatch::new_empty(combined_schema));
-    }
-
-    // Use Arrow's cross join
-    use arrow::compute::kernels::concat::concat;
-    
-    let mut result_columns = Vec::new();
-    
-    // Repeat each left column value for each right row
-    for col in left.columns() {
-        let mut repeated_chunks = Vec::new();
-        for _ in 0..right_rows {
-            repeated_chunks.push(col.clone());
-        }
-        let repeated = concat(&repeated_chunks.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
-            .map_err(|e| Error::Internal(format!("Failed to repeat left column: {}", e)))?;
-        result_columns.push(repeated);
-    }
-    
-    // Tile each right column for each left row
-    for col in right.columns() {
-        use arrow::compute::kernels::take::take;
-        let indices: Vec<u32> = (0..total_rows as u32)
-            .map(|i| i % right_rows as u32)
-            .collect();
-        let indices_array = arrow::array::UInt32Array::from(indices);
-        let tiled = take(col.as_ref(), &indices_array, None)
-            .map_err(|e| Error::Internal(format!("Failed to tile right column: {}", e)))?;
-        result_columns.push(tiled);
-    }
-
-    let combined_fields: Vec<Field> = left.schema().fields().iter()
+    let combined_fields: Vec<Field> = left
+        .schema()
+        .fields()
+        .iter()
         .chain(right.schema().fields().iter())
         .map(|f| Field::new(f.name().clone(), f.data_type().clone(), f.is_nullable()))
         .collect();
     let combined_schema = Arc::new(Schema::new(combined_fields));
 
-    RecordBatch::try_new(combined_schema, result_columns)
-        .map_err(|e| Error::Internal(format!("Failed to create cross join result: {}", e)))
+    cross_join_pair(left, right, &combined_schema)
 }
 
 /// Build a temporary in-memory table from RecordBatches for chained joins
@@ -2595,7 +2714,9 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     // This function is no longer needed with the new approach
-    Err(Error::Internal("build_temp_table_from_batches should not be called".into()))
+    Err(Error::Internal(
+        "build_temp_table_from_batches should not be called".into(),
+    ))
 }
 
 /// Build join keys from condition for accumulated multi-table join
@@ -2608,7 +2729,9 @@ fn build_join_keys_from_condition_indexed(
     _right_idx: usize,
 ) -> ExecutorResult<JoinKeyBuild> {
     // This function is no longer needed with the new approach
-    Err(Error::Internal("build_join_keys_from_condition_indexed should not be called".into()))
+    Err(Error::Internal(
+        "build_join_keys_from_condition_indexed should not be called".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -2703,6 +2826,54 @@ mod join_condition_tests {
             analyze_join_condition(&expr).expect("analysis succeeds"),
             JoinConditionAnalysis::AlwaysFalse
         ));
+    }
+}
+
+#[cfg(test)]
+mod cross_join_batch_tests {
+    use super::*;
+    use arrow::array::Int32Array;
+
+    #[test]
+    fn execute_cross_join_batches_emits_full_cartesian_product() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Int32, false)]));
+
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .expect("left batch");
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
+        )
+        .expect("right batch");
+
+        let result = execute_cross_join_batches(&left_batch, &right_batch).expect("cross join");
+
+        assert_eq!(result.num_rows(), 6);
+        assert_eq!(result.num_columns(), 2);
+
+        let left_values: Vec<i32> = {
+            let array = result
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            (0..array.len()).map(|idx| array.value(idx)).collect()
+        };
+        let right_values: Vec<i32> = {
+            let array = result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            (0..array.len()).map(|idx| array.value(idx)).collect()
+        };
+
+        assert_eq!(left_values, vec![1, 1, 1, 2, 2, 2]);
+        assert_eq!(right_values, vec![10, 20, 30, 10, 20, 30]);
     }
 }
 
