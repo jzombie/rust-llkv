@@ -24,3 +24,6 @@ llkv-result = { workspace = true }
 
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
+
+[lints]
+workspace = true

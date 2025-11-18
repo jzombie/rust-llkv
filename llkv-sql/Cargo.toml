@@ -31,3 +31,6 @@ rustc-hash.workspace = true
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 tempfile.workspace = true
+
+[lints]
+workspace = true

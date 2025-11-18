@@ -24,3 +24,6 @@ tracing.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 rand.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true
