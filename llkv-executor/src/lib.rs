@@ -40,9 +40,9 @@ use llkv_expr::typed_predicate::{
 };
 use llkv_join::cross_join_pair;
 use llkv_plan::{
-    AggregateExpr, AggregateFunction, CanonicalRow, CompoundOperator, CompoundQuantifier,
-    CompoundSelectComponent, CompoundSelectPlan, OrderByPlan, OrderSortType, OrderTarget,
-    PlanValue, SelectPlan, SelectProjection,
+    plan_value_from_literal, AggregateExpr, AggregateFunction, CanonicalRow, CompoundOperator,
+    CompoundQuantifier, CompoundSelectComponent, CompoundSelectPlan, OrderByPlan, OrderSortType,
+    OrderTarget, PlanValue, SelectPlan, SelectProjection,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -800,7 +800,15 @@ where
     ) -> ExecutorResult<Literal> {
         let bindings =
             collect_correlated_bindings(context, batch, row_idx, &subquery.correlated_columns)?;
-        let bound_plan = bind_select_plan(&subquery.plan, &bindings)?;
+        self.evaluate_scalar_subquery_with_bindings(subquery, &bindings)
+    }
+
+    fn evaluate_scalar_subquery_with_bindings(
+        &self,
+        subquery: &llkv_plan::ScalarSubquery,
+        bindings: &FxHashMap<String, Literal>,
+    ) -> ExecutorResult<Literal> {
+        let bound_plan = bind_select_plan(&subquery.plan, bindings)?;
         let execution = self.execute_select(bound_plan)?;
         let mut rows_seen: usize = 0;
         let mut result: Option<Literal> = None;
@@ -826,8 +834,9 @@ where
         if rows_seen == 0 {
             Ok(Literal::Null)
         } else {
-            result
-                .ok_or_else(|| Error::Internal("scalar subquery evaluation missing result".into()))
+            result.ok_or_else(|| {
+                Error::Internal("scalar subquery evaluation missing result".into())
+            })
         }
     }
 
@@ -837,16 +846,65 @@ where
         subquery: &llkv_plan::ScalarSubquery,
         batch: &RecordBatch,
     ) -> ExecutorResult<NumericArray> {
-        let mut values: Vec<Option<f64>> = Vec::with_capacity(batch.num_rows());
+        let row_count = batch.num_rows();
+        let mut row_job_indices: Vec<usize> = Vec::with_capacity(row_count);
+        let mut unique_bindings: Vec<FxHashMap<String, Literal>> = Vec::new();
+        let mut key_lookup: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
+
+        for row_idx in 0..row_count {
+            let bindings =
+                collect_correlated_bindings(context, batch, row_idx, &subquery.correlated_columns)?;
+
+            // Encode the correlated binding set so we can deduplicate identical subqueries.
+            let mut plan_values: Vec<PlanValue> =
+                Vec::with_capacity(subquery.correlated_columns.len());
+            for column in &subquery.correlated_columns {
+                let literal = bindings
+                    .get(&column.placeholder)
+                    .cloned()
+                    .unwrap_or(Literal::Null);
+                let plan_value = plan_value_from_literal(&literal).map_err(Error::from)?;
+                plan_values.push(plan_value);
+            }
+            let key = encode_row(&plan_values);
+
+            let job_idx = if let Some(&existing) = key_lookup.get(&key) {
+                existing
+            } else {
+                let idx = unique_bindings.len();
+                key_lookup.insert(key, idx);
+                unique_bindings.push(bindings);
+                idx
+            };
+            row_job_indices.push(job_idx);
+        }
+
+        // Execute each unique correlated subquery in parallel on the shared Rayon pool.
+        let job_results: Vec<ExecutorResult<Literal>> = llkv_column_map::parallel::with_thread_pool(
+            || {
+                unique_bindings
+                    .par_iter()
+                    .map(|bindings| {
+                        self.evaluate_scalar_subquery_with_bindings(subquery, bindings)
+                    })
+                    .collect()
+            },
+        );
+
+        let mut job_literals: Vec<Literal> = Vec::with_capacity(job_results.len());
+        for result in job_results {
+            job_literals.push(result?);
+        }
+
+        let mut values: Vec<Option<f64>> = Vec::with_capacity(row_count);
         let mut all_integer = true;
 
-        for row_idx in 0..batch.num_rows() {
-            let literal =
-                self.evaluate_scalar_subquery_literal(context, subquery, batch, row_idx)?;
+        for row_idx in 0..row_count {
+            let literal = &job_literals[row_job_indices[row_idx]];
             match literal {
                 Literal::Null => values.push(None),
                 Literal::Integer(value) => {
-                    let cast = i64::try_from(value).map_err(|_| {
+                    let cast = i64::try_from(*value).map_err(|_| {
                         Error::InvalidArgumentError(
                             "scalar subquery integer result exceeds supported range".into(),
                         )
@@ -855,14 +913,14 @@ where
                 }
                 Literal::Float(value) => {
                     all_integer = false;
-                    values.push(Some(value));
+                    values.push(Some(*value));
                 }
                 Literal::Boolean(flag) => {
-                    let numeric = if flag { 1.0 } else { 0.0 };
+                    let numeric = if *flag { 1.0 } else { 0.0 };
                     values.push(Some(numeric));
                 }
                 Literal::Decimal(decimal) => {
-                    if let Some(value) = decimal_exact_i64(decimal) {
+                    if let Some(value) = decimal_exact_i64(*decimal) {
                         values.push(Some(value as f64));
                     } else {
                         all_integer = false;
