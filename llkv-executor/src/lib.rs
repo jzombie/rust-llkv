@@ -16,7 +16,7 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal128Builder,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
+    Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
     IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
@@ -923,14 +923,16 @@ where
         collect_scalar_subquery_ids(&translated, &mut subquery_ids);
 
         let mut mapping: FxHashMap<SubqueryId, FieldId> = FxHashMap::default();
-        for subquery_id in subquery_ids {
+        for subquery_id in &subquery_ids {
             let info = scalar_lookup
-                .get(&subquery_id)
-                .ok_or_else(|| Error::Internal("missing scalar subquery metadata".into()))?;
+                .get(subquery_id)
+                .ok_or_else(|| {
+                    Error::Internal("missing scalar subquery metadata".into())
+                })?;
             let field_id = context.allocate_synthetic_field_id()?;
             let numeric = self.evaluate_scalar_subquery_numeric(context, info, batch)?;
             context.numeric_cache.insert(field_id, numeric);
-            mapping.insert(subquery_id, field_id);
+            mapping.insert(*subquery_id, field_id);
         }
 
         let rewritten = rewrite_scalar_expr_for_subqueries(&translated, &mapping);
@@ -3024,11 +3026,14 @@ where
                 "HAVING requires GROUP BY".into(),
             ));
         }
-        if plan
+        
+        let has_filter_subqueries = plan
             .filter
             .as_ref()
-            .is_some_and(|filter| !filter.subqueries.is_empty())
-            || !plan.scalar_subqueries.is_empty()
+            .is_some_and(|filter| !filter.subqueries.is_empty());
+        let has_scalar_subqueries = !plan.scalar_subqueries.is_empty();
+        
+        if has_filter_subqueries || has_scalar_subqueries
         {
             return self.execute_projection_with_subqueries(table, display_name, plan, row_filter);
         }
@@ -3192,6 +3197,19 @@ where
 
         let filter_wrapper_opt = plan.filter.as_ref();
 
+        // Check if the filter contains scalar subqueries that need to be handled
+        let mut filter_has_scalar_subqueries = false;
+        if let Some(filter_wrapper) = filter_wrapper_opt {
+            let translated = crate::translation::expression::translate_predicate(
+                filter_wrapper.predicate.clone(),
+                table_ref.schema.as_ref(),
+                |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
+            )?;
+            let mut scalar_filter_ids = FxHashSet::default();
+            collect_predicate_scalar_subquery_ids(&translated, &mut scalar_filter_ids);
+            filter_has_scalar_subqueries = !scalar_filter_ids.is_empty();
+        }
+
         let mut translated_filter: Option<llkv_expr::expr::Expr<'static, FieldId>> = None;
         let pushdown_filter = if let Some(filter_wrapper) = filter_wrapper_opt {
             let translated = crate::translation::expression::translate_predicate(
@@ -3199,9 +3217,21 @@ where
                 table_ref.schema.as_ref(),
                 |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
             )?;
-            if !filter_wrapper.subqueries.is_empty() {
+            if !filter_wrapper.subqueries.is_empty() || filter_has_scalar_subqueries {
                 translated_filter = Some(translated.clone());
-                strip_exists(&translated)
+                if filter_has_scalar_subqueries {
+                    // If filter has scalar subqueries, use full table scan for pushdown
+                    // and evaluate scalar subqueries in the callback
+                    let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "table has no columns; cannot perform scalar subquery projection".into(),
+                        )
+                    })?;
+                    crate::translation::expression::full_table_scan_filter(field_id)
+                } else {
+                    // Only EXISTS subqueries, strip them for pushdown
+                    strip_exists(&translated)
+                }
             } else {
                 translated
             }
@@ -3241,6 +3271,24 @@ where
             None
         };
 
+        // Collect scalar subqueries that appear in the filter
+        let mut filter_scalar_subquery_ids = FxHashSet::default();
+        if let Some(translated) = translated_filter.as_ref() {
+            collect_predicate_scalar_subquery_ids(translated, &mut filter_scalar_subquery_ids);
+        }
+
+        // Build lookup for filter scalar subqueries
+        let filter_scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> =
+            if !filter_scalar_subquery_ids.is_empty() {
+                plan.scalar_subqueries
+                    .iter()
+                    .filter(|subquery| filter_scalar_subquery_ids.contains(&subquery.id))
+                    .map(|subquery| (subquery.id, subquery))
+                    .collect()
+            } else {
+                FxHashMap::default()
+            };
+
         let options = ScanStreamOptions {
             include_nulls: true,
             order: None,
@@ -3271,6 +3319,29 @@ where
                 }
                 let effective_batch = if let Some(context) = filter_context.as_mut() {
                     context.reset();
+
+                    // Evaluate scalar subqueries in the filter for this batch
+                    for (subquery_id, subquery) in filter_scalar_lookup.iter() {
+                        let result_array = match self.evaluate_scalar_subquery_numeric(
+                            context,
+                            subquery,
+                            &batch,
+                        ) {
+                            Ok(array) => array,
+                            Err(err) => {
+                                scan_error = Some(err);
+                                return;
+                            }
+                        };
+                        let accessor = match ColumnAccessor::from_numeric_array(&result_array) {
+                            Ok(acc) => acc,
+                            Err(err) => {
+                                scan_error = Some(err);
+                                return;
+                            }
+                        };
+                        context.scalar_subquery_columns.insert(*subquery_id, accessor);
+                    }
                     let translated = translated_filter
                         .as_ref()
                         .expect("filter context requires translated filter");
@@ -4435,11 +4506,51 @@ where
                         "EXISTS subqueries not yet implemented in aggregate queries".into(),
                     ));
                 }
-                crate::translation::expression::translate_predicate(
+                let mut translated = crate::translation::expression::translate_predicate(
                     filter_wrapper.predicate.clone(),
                     table.schema.as_ref(),
                     |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
-                )?
+                )?;
+
+                // Check if filter contains scalar subqueries
+                let mut filter_scalar_ids = FxHashSet::default();
+                collect_predicate_scalar_subquery_ids(&translated, &mut filter_scalar_ids);
+
+                if !filter_scalar_ids.is_empty() {
+                    // Evaluate each scalar subquery and replace with literal
+                    let filter_scalar_lookup: FxHashMap<SubqueryId, &llkv_plan::ScalarSubquery> =
+                        plan.scalar_subqueries
+                            .iter()
+                            .filter(|subquery| filter_scalar_ids.contains(&subquery.id))
+                            .map(|subquery| (subquery.id, subquery))
+                            .collect();
+
+                    // Create a minimal context for evaluation (aggregates have no row context)
+                    let base_schema = Arc::new(Schema::new(Vec::<Field>::new()));
+                    let base_lookup = FxHashMap::default();
+                    let mut context = CrossProductExpressionContext::new(
+                        base_schema.as_ref(),
+                        base_lookup,
+                    )?;
+                    let empty_batch = RecordBatch::new_empty(Arc::new(Schema::new(Vec::<Field>::new())));
+
+                    // Evaluate each scalar subquery to a literal
+                    let mut scalar_literals: FxHashMap<SubqueryId, Literal> = FxHashMap::default();
+                    for (subquery_id, subquery) in filter_scalar_lookup.iter() {
+                        let literal = self.evaluate_scalar_subquery_literal(
+                            &mut context,
+                            subquery,
+                            &empty_batch,
+                            0,
+                        )?;
+                        scalar_literals.insert(*subquery_id, literal);
+                    }
+
+                    // Rewrite the filter to replace scalar subqueries with literals
+                    translated = rewrite_predicate_scalar_subqueries(translated, &scalar_literals)?;
+                }
+
+                translated
             }
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
@@ -6788,6 +6899,18 @@ impl ColumnAccessor {
         }
     }
 
+    fn from_numeric_array(numeric: &NumericArray) -> ExecutorResult<Self> {
+        // Convert all numeric values to Float64 for compatibility with filter evaluation
+        let mut float_builder = Float64Builder::with_capacity(numeric.len());
+        for idx in 0..numeric.len() {
+            match numeric.value(idx) {
+                None => float_builder.append_null(),
+                Some(value) => float_builder.append_value(value.as_f64()),
+            }
+        }
+        Ok(Self::Float64(Arc::new(float_builder.finish())))
+    }
+
     fn len(&self) -> usize {
         match self {
             ColumnAccessor::Int64(array) => array.len(),
@@ -8057,6 +8180,130 @@ fn strip_exists(expr: &LlkvExpr<'static, FieldId>) -> LlkvExpr<'static, FieldId>
         },
         LlkvExpr::Literal(value) => LlkvExpr::Literal(*value),
         LlkvExpr::Exists(_) => LlkvExpr::Literal(true),
+    }
+}
+
+fn rewrite_predicate_scalar_subqueries(
+    expr: LlkvExpr<'static, FieldId>,
+    literals: &FxHashMap<SubqueryId, Literal>,
+) -> ExecutorResult<LlkvExpr<'static, FieldId>> {
+    match expr {
+        LlkvExpr::And(children) => {
+            let rewritten: ExecutorResult<Vec<_>> = children
+                .into_iter()
+                .map(|child| rewrite_predicate_scalar_subqueries(child, literals))
+                .collect();
+            Ok(LlkvExpr::And(rewritten?))
+        }
+        LlkvExpr::Or(children) => {
+            let rewritten: ExecutorResult<Vec<_>> = children
+                .into_iter()
+                .map(|child| rewrite_predicate_scalar_subqueries(child, literals))
+                .collect();
+            Ok(LlkvExpr::Or(rewritten?))
+        }
+        LlkvExpr::Not(inner) => Ok(LlkvExpr::Not(Box::new(
+            rewrite_predicate_scalar_subqueries(*inner, literals)?,
+        ))),
+        LlkvExpr::Pred(filter) => Ok(LlkvExpr::Pred(filter)),
+        LlkvExpr::Compare { left, op, right } => Ok(LlkvExpr::Compare {
+            left: rewrite_scalar_expr_subqueries(left, literals)?,
+            op,
+            right: rewrite_scalar_expr_subqueries(right, literals)?,
+        }),
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(LlkvExpr::InList {
+            expr: rewrite_scalar_expr_subqueries(expr, literals)?,
+            list: list
+                .into_iter()
+                .map(|item| rewrite_scalar_expr_subqueries(item, literals))
+                .collect::<ExecutorResult<_>>()?,
+            negated,
+        }),
+        LlkvExpr::IsNull { expr, negated } => Ok(LlkvExpr::IsNull {
+            expr: rewrite_scalar_expr_subqueries(expr, literals)?,
+            negated,
+        }),
+        LlkvExpr::Literal(value) => Ok(LlkvExpr::Literal(value)),
+        LlkvExpr::Exists(subquery) => Ok(LlkvExpr::Exists(subquery)),
+    }
+}
+
+fn rewrite_scalar_expr_subqueries(
+    expr: ScalarExpr<FieldId>,
+    literals: &FxHashMap<SubqueryId, Literal>,
+) -> ExecutorResult<ScalarExpr<FieldId>> {
+    match expr {
+        ScalarExpr::ScalarSubquery(subquery) => {
+            let literal = literals.get(&subquery.id).ok_or_else(|| {
+                Error::Internal(format!(
+                    "missing literal for scalar subquery {:?}",
+                    subquery.id
+                ))
+            })?;
+            Ok(ScalarExpr::Literal(literal.clone()))
+        }
+        ScalarExpr::Column(fid) => Ok(ScalarExpr::Column(fid)),
+        ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit)),
+        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+            left: Box::new(rewrite_scalar_expr_subqueries(*left, literals)?),
+            op,
+            right: Box::new(rewrite_scalar_expr_subqueries(*right, literals)?),
+        }),
+        ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+            left: Box::new(rewrite_scalar_expr_subqueries(*left, literals)?),
+            op,
+            right: Box::new(rewrite_scalar_expr_subqueries(*right, literals)?),
+        }),
+        ScalarExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(
+            rewrite_scalar_expr_subqueries(*inner, literals)?,
+        ))),
+        ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(rewrite_scalar_expr_subqueries(*expr, literals)?),
+            negated,
+        }),
+        ScalarExpr::Aggregate(agg) => Ok(ScalarExpr::Aggregate(agg)),
+        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+            base: Box::new(rewrite_scalar_expr_subqueries(*base, literals)?),
+            field_name,
+        }),
+        ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+            expr: Box::new(rewrite_scalar_expr_subqueries(*expr, literals)?),
+            data_type,
+        }),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => Ok(ScalarExpr::Case {
+            operand: operand
+                .map(|e| rewrite_scalar_expr_subqueries(*e, literals))
+                .transpose()?
+                .map(Box::new),
+            branches: branches
+                .into_iter()
+                .map(|(when, then)| {
+                    Ok((
+                        rewrite_scalar_expr_subqueries(when, literals)?,
+                        rewrite_scalar_expr_subqueries(then, literals)?,
+                    ))
+                })
+                .collect::<ExecutorResult<_>>()?,
+            else_expr: else_expr
+                .map(|e| rewrite_scalar_expr_subqueries(*e, literals))
+                .transpose()?
+                .map(Box::new),
+        }),
+        ScalarExpr::Coalesce(items) => Ok(ScalarExpr::Coalesce(
+            items
+                .into_iter()
+                .map(|item| rewrite_scalar_expr_subqueries(item, literals))
+                .collect::<ExecutorResult<_>>()?,
+        )),
+        ScalarExpr::Random => Ok(ScalarExpr::Random),
     }
 }
 
