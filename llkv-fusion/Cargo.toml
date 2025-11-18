@@ -1,0 +1,24 @@
+[package]
+name = "llkv-fusion"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+datafusion = "50.3.0"
+datafusion-datasource = "50.3.0"
+async-trait = { workspace = true }
+arrow = { workspace = true }
+llkv-column-map = { workspace = true }
+llkv-result = { workspace = true }
+llkv-storage = { workspace = true }
+simd-r-drive-entry-handle = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
