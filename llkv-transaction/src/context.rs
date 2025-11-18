@@ -1243,9 +1243,7 @@ where
             Err(_) => {
                 // Mutex is poisoned, likely due to a panic elsewhere
                 // Don't panic again during cleanup
-                tracing::warn!(
-                    "TransactionSession dropped with poisoned transaction mutex"
-                );
+                tracing::warn!("TransactionSession dropped with poisoned transaction mutex");
             }
         }
     }
