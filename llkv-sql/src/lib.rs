@@ -147,36 +147,54 @@ impl SqlEngine {
                 Error::Internal(format!("CTAS planning failed for {table_name}: {e}"))
             })?;
         let df_schema = df.schema().clone();
-        let mut arrow_schema = Schema::from(df_schema);
-        if !columns.is_empty() {
-            if columns.len() != arrow_schema.fields().len() {
-                return Err(Error::Internal(format!(
-                    "CTAS column count mismatch: specified {} column(s) but query produced {}",
-                    columns.len(),
-                    arrow_schema.fields().len()
-                )));
-            }
-            let renamed_fields: Vec<Field> = arrow_schema
-                .fields()
-                .iter()
-                .zip(columns.iter())
-                .map(|(field, col)| {
-                    let metadata = field.metadata().clone();
-                    Field::new(
-                        &col.name.value,
-                        field.data_type().clone(),
-                        column_nullable(col) && field.is_nullable(),
-                    )
-                    .with_metadata(metadata)
-                })
-                .collect();
-            arrow_schema = Schema::new(renamed_fields);
-        }
-        let schema_ref = Arc::new(arrow_schema);
         let batches = df
             .collect()
             .await
             .map_err(|e| Error::Internal(format!("CTAS execution failed for {table_name}: {e}")))?;
+        let mut arrow_schema = Schema::from(df_schema);
+        if !columns.is_empty() && columns.len() != arrow_schema.fields().len() {
+            return Err(Error::Internal(format!(
+                "CTAS column count mismatch: specified {} column(s) but query produced {}",
+                columns.len(),
+                arrow_schema.fields().len()
+            )));
+        }
+        let actual_nullable: Vec<bool> = if let Some(first) = batches.first() {
+            first
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.is_nullable())
+                .collect()
+        } else {
+            arrow_schema
+                .fields()
+                .iter()
+                .map(|f| f.is_nullable())
+                .collect()
+        };
+        let renamed_fields: Vec<Field> = arrow_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| {
+                let metadata = field.metadata().clone();
+                let base_nullable = actual_nullable[idx];
+                if let Some(col) = columns.get(idx) {
+                    Field::new(
+                        &col.name.value,
+                        field.data_type().clone(),
+                        column_nullable(col) && base_nullable,
+                    )
+                    .with_metadata(metadata)
+                } else {
+                    Field::new(field.name(), field.data_type().clone(), base_nullable)
+                        .with_metadata(metadata)
+                }
+            })
+            .collect();
+        arrow_schema = Schema::new(renamed_fields);
+        let schema_ref = Arc::new(arrow_schema);
 
         let mut builder = self
             .catalog
