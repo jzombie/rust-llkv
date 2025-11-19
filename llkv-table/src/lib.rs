@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::stats::{Precision, Statistics};
@@ -160,6 +160,18 @@ where
     ) -> LlkvResult<Vec<RecordBatch>> {
         if row_ids.is_empty() {
             return Ok(vec![RecordBatch::new_empty(schema)]);
+        }
+
+        // Handle empty projection (no columns requested, but rows are needed for cardinality)
+        if field_ids.is_empty() {
+            let mut batches = Vec::new();
+            for chunk in row_ids.chunks(self.scan_batch_size) {
+                // Create a RecordBatch with no columns but with row_count set
+                let options = RecordBatchOptions::new().with_row_count(Some(chunk.len()));
+                let batch = RecordBatch::try_new_with_options(schema.clone(), vec![], &options)?;
+                batches.push(batch);
+            }
+            return Ok(batches);
         }
 
         let mut batches = Vec::new();

@@ -150,6 +150,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn datafusion_catalog_schema_joins() {
+        use datafusion::catalog::{CatalogProvider, SchemaProvider};
+        use datafusion_catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+
+        let pager = Arc::new(MemPager::default());
+        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
+
+        // Create products table in schema1
+        let products_schema = Arc::new(Schema::new(vec![
+            Field::new("product_id", DataType::UInt64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("price", DataType::Int32, false),
+        ]));
+        let products_batch = RecordBatch::try_new(
+            products_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![10_u64, 20, 30])),
+                Arc::new(StringArray::from(vec!["Widget", "Gadget", "Doohickey"])),
+                Arc::new(Int32Array::from(vec![100, 200, 150])),
+            ],
+        )
+        .expect("products batch");
+
+        let mut products_builder =
+            LlkvTableBuilder::new(Arc::clone(&store), 1, products_schema)
+                .expect("products builder");
+        products_builder
+            .append_batch(&products_batch)
+            .expect("products append");
+        let products_provider = products_builder.finish().expect("products provider");
+
+        // Create inventory table in schema2
+        let inventory_schema = Arc::new(Schema::new(vec![
+            Field::new("product_id", DataType::UInt64, false),
+            Field::new("warehouse", DataType::Utf8, false),
+            Field::new("quantity", DataType::Int32, false),
+        ]));
+        let inventory_batch = RecordBatch::try_new(
+            inventory_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![10_u64, 20, 10, 30])),
+                Arc::new(StringArray::from(vec!["East", "West", "West", "East"])),
+                Arc::new(Int32Array::from(vec![50, 75, 25, 100])),
+            ],
+        )
+        .expect("inventory batch");
+
+        let mut inventory_builder =
+            LlkvTableBuilder::new(Arc::clone(&store), 2, inventory_schema)
+                .expect("inventory builder");
+        inventory_builder
+            .append_batch(&inventory_batch)
+            .expect("inventory append");
+        let inventory_provider = inventory_builder.finish().expect("inventory provider");
+
+        // Set up catalog hierarchy: my_catalog -> schema1, schema2
+        let ctx = SessionContext::new();
+        
+        let catalog = Arc::new(MemoryCatalogProvider::new());
+        let schema1 = Arc::new(MemorySchemaProvider::new());
+        let schema2 = Arc::new(MemorySchemaProvider::new());
+
+        schema1
+            .register_table("products".to_string(), Arc::new(products_provider))
+            .expect("register products");
+        schema2
+            .register_table("inventory".to_string(), Arc::new(inventory_provider))
+            .expect("register inventory");
+
+        catalog
+            .register_schema("schema1", schema1)
+            .expect("register schema1");
+        catalog
+            .register_schema("schema2", schema2)
+            .expect("register schema2");
+
+        ctx.register_catalog("my_catalog", catalog);
+
+        // Set default catalog and query with schema qualification
+        ctx.sql("SET datafusion.catalog.default_catalog = 'my_catalog'")
+            .await
+            .expect("set catalog");
+
+        // First test: simple query from one schema
+        let df_simple = ctx
+            .sql("SELECT name, price FROM schema1.products ORDER BY name")
+            .await
+            .expect("simple sql");
+        let simple_results = df_simple.collect().await.expect("simple collect");
+        let simple_formatted = pretty_format_batches(&simple_results).expect("format").to_string();
+
+        let simple_expected = vec![
+            "+-----------+-------+",
+            "| name      | price |",
+            "+-----------+-------+",
+            "| Doohickey | 150   |",
+            "| Gadget    | 200   |",
+            "| Widget    | 100   |",
+            "+-----------+-------+",
+        ]
+        .join("\n");
+
+        assert_eq!(simple_formatted.trim(), simple_expected.trim());
+
+        // Second test: join across schemas
+        let df = ctx
+            .sql(
+                "SELECT p.name, i.warehouse, i.quantity, p.price \
+                 FROM schema1.products p \
+                 INNER JOIN schema2.inventory i ON p.product_id = i.product_id \
+                 ORDER BY p.name, i.warehouse",
+            )
+            .await
+            .expect("sql");
+        let results = df.collect().await.expect("collect");
+        let formatted = pretty_format_batches(&results).expect("format").to_string();
+
+        let expected = vec![
+            "+-----------+-----------+----------+-------+",
+            "| name      | warehouse | quantity | price |",
+            "+-----------+-----------+----------+-------+",
+            "| Doohickey | East      | 100      | 150   |",
+            "| Gadget    | West      | 75       | 200   |",
+            "| Widget    | East      | 50       | 100   |",
+            "| Widget    | West      | 25       | 100   |",
+            "+-----------+-----------+----------+-------+",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted.trim(), expected.trim());
+
+        // Test fully qualified table names
+        let df2 = ctx
+            .sql(
+                "SELECT COUNT(*) as total \
+                 FROM my_catalog.schema1.products",
+            )
+            .await
+            .expect("fully qualified sql");
+        let results2 = df2.collect().await.expect("collect");
+        let formatted2 = pretty_format_batches(&results2).expect("format").to_string();
+
+        let expected2 = vec![
+            "+-------+",
+            "| total |",
+            "+-------+",
+            "| 3     |",
+            "+-------+",
+        ]
+        .join("\n");
+
+        assert_eq!(formatted2.trim(), expected2.trim());
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "DELETE FROM llkv_demo is not yet implemented")]
     async fn datafusion_delete_statement_is_rejected() {
         use datafusion::execution::session_state::SessionStateBuilder;
