@@ -7,6 +7,7 @@
 //! planning, keeping LLKV storage as the backing store.
 
 use std::convert::TryFrom;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -18,8 +19,9 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType as SqlDataType, ObjectName,
-    ObjectNamePart, Query, Statement, StructField,
+    AccessExpr, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType as SqlDataType,
+    Expr as SqlExpr, Ident, ObjectName, ObjectNamePart, Query, Statement, StructField, Subscript,
+    Value, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::{DuckDbDialect, GenericDialect};
 use sqlparser::parser::Parser;
@@ -81,7 +83,8 @@ impl SqlEngine {
                 self.handle_create_table(create).await?;
                 Ok(SqlStatementResult::Statement { rows_affected: 0 })
             }
-            other => {
+            mut other => {
+                self.rewrite_struct_field_access(&mut other)?;
                 let sql = other.to_string();
                 self.execute_via_datafusion(&sql).await
             }
@@ -238,6 +241,11 @@ impl SqlEngine {
         }
         Ok(())
     }
+
+    fn rewrite_struct_field_access(&self, stmt: &mut Statement) -> Result<()> {
+        let mut rewriter = StructFieldAccessRewriter::new(&self.ctx);
+        rewriter.rewrite(stmt)
+    }
 }
 
 fn normalize_name(name: &ObjectName) -> Result<String> {
@@ -253,6 +261,91 @@ fn normalize_name(name: &ObjectName) -> Result<String> {
         parts.push(value);
     }
     Ok(parts.join("."))
+}
+
+struct StructFieldAccessRewriter<'a> {
+    ctx: &'a SessionContext,
+}
+
+impl<'a> StructFieldAccessRewriter<'a> {
+    fn new(ctx: &'a SessionContext) -> Self {
+        Self { ctx }
+    }
+
+    fn rewrite(&mut self, stmt: &mut Statement) -> Result<()> {
+        match stmt.visit(self) {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(err) => Err(err),
+        }
+    }
+
+    fn table_exists(&self, parts: &[String]) -> Result<bool> {
+        if parts.is_empty() {
+            return Ok(false);
+        }
+        let name = parts.join(".");
+        self.ctx.table_exist(&name).map_err(|e| {
+            Error::Internal(format!(
+                "failed to resolve table reference '{name}' while rewriting struct access: {e}"
+            ))
+        })
+    }
+
+    fn rewrite_compound_identifier(&self, ids: &[Ident]) -> Result<Option<SqlExpr>> {
+        if ids.len() < 3 {
+            return Ok(None);
+        }
+        let values: Vec<String> = ids.iter().map(|ident| ident.value.clone()).collect();
+        if values.len() < 3 {
+            return Ok(None);
+        }
+        let max_prefix = (values.len() - 2).min(3);
+        for prefix_len in (1..=max_prefix).rev() {
+            if !self.table_exists(&values[..prefix_len])? {
+                continue;
+            }
+            let remaining = &values[prefix_len..];
+            if remaining.len() < 2 {
+                continue;
+            }
+            let nested_fields = &remaining[1..];
+            if nested_fields.is_empty() {
+                continue;
+            }
+
+            let root_idents: Vec<Ident> = ids[..=prefix_len].to_vec();
+            let mut access_chain = Vec::with_capacity(nested_fields.len());
+            for field_name in nested_fields {
+                let literal =
+                    SqlExpr::Value(Value::SingleQuotedString(field_name.clone()).into());
+                access_chain.push(AccessExpr::Subscript(Subscript::Index { index: literal }));
+            }
+
+            return Ok(Some(SqlExpr::CompoundFieldAccess {
+                root: Box::new(SqlExpr::CompoundIdentifier(root_idents)),
+                access_chain,
+            }));
+        }
+
+        Ok(None)
+    }
+}
+
+impl<'a> VisitorMut for StructFieldAccessRewriter<'a> {
+    type Break = Error;
+
+    fn post_visit_expr(&mut self, expr: &mut SqlExpr) -> ControlFlow<Self::Break> {
+        if let SqlExpr::CompoundIdentifier(ids) = expr {
+            match self.rewrite_compound_identifier(ids) {
+                Ok(Some(new_expr)) => {
+                    *expr = new_expr;
+                }
+                Ok(None) => {}
+                Err(err) => return ControlFlow::Break(err),
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 fn build_schema(columns: &[ColumnDef]) -> Result<SchemaRef> {
