@@ -790,6 +790,8 @@ where
     D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
     E: std::fmt::Debug + Send + 'static,
 {
+    // Default to fail-fast unless LLKV_SLT_RUN_ALL=1 is set (useful for CI runs)
+    let fail_fast = std::env::var("LLKV_SLT_RUN_ALL").is_err();
     // Enable statistics collection if requested
     let stats_enabled = std::env::var("LLKV_SLT_STATS").is_ok();
     if stats_enabled {
@@ -818,6 +820,45 @@ where
         out
     };
 
+    if fail_fast {
+        // Sequential execution that stops at the first failure
+        let mut num_passed = 0u64;
+        for f in &files {
+            match execute_single_slt(&factory_factory, f) {
+                Ok(_) => num_passed += 1,
+                Err(e) => {
+                    eprintln!("{} failed: {}", f.display(), e);
+                    if stats_enabled
+                        && let Some(stats) = crate::slt_test_engine::take_stats()
+                    {
+                        stats.print_summary();
+                    }
+                    return Conclusion {
+                        num_filtered_out: 0,
+                        num_passed,
+                        num_failed: 1,
+                        num_ignored: 0,
+                        num_measured: 0,
+                    };
+                }
+            }
+        }
+
+        let conclusion = Conclusion {
+            num_filtered_out: 0,
+            num_passed,
+            num_failed: 0,
+            num_ignored: 0,
+            num_measured: 0,
+        };
+
+        if stats_enabled && let Some(stats) = crate::slt_test_engine::take_stats() {
+            stats.print_summary();
+        }
+
+        return conclusion;
+    }
+
     let base_parent = base.parent();
     let mut trials: Vec<Trial> = Vec::new();
     for f in files {
@@ -833,57 +874,13 @@ where
         let path_clone = f.clone();
         let factory_factory_clone = factory_factory.clone();
 
-        // Check if this is a .slturl pointer file
-        let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
-
         trials.push(Trial::test(name, move || {
-            let p = path_clone.clone();
-            let fac = factory_factory_clone();
-
             // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
-            // Default thread stack is ~2MB which is insufficient for complex SLT test queries
             std::thread::Builder::new()
                 .stack_size(SLT_HARNESS_STACK_SIZE)
                 .spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| Failed::from(format!("failed to build tokio runtime: {e}")))?;
-
-                    let res: Result<(), Error> = if is_url_pointer {
-                        // Read the URL from the pointer file and fetch remotely
-                        let url = std::fs::read_to_string(&p)
-                            .map_err(|e| {
-                                Error::Internal(format!("failed to read .slturl file: {e}"))
-                            })?
-                            .trim()
-                            .to_string();
-
-                        // Fetch and run the remote SLT file
-                        let response = reqwest::blocking::get(&url).map_err(|e| {
-                            Error::Internal(format!("failed to fetch SLT URL {url}: {e}"))
-                        })?;
-                        let script = response.text().map_err(|e| {
-                            Error::Internal(format!(
-                                "failed to read SLT response body for {url}: {e}"
-                            ))
-                        })?;
-
-                        let origin = std::path::PathBuf::from(format!("url:{}", url));
-                        rt.block_on(async move {
-                            LlkvSltRunner::run_slt_text_async(&script, origin.as_path(), fac).await
-                        })
-                    } else {
-                        // Run local .slt file as before
-                        let text = std::fs::read_to_string(&p).map_err(|e| {
-                            Error::Internal(format!("failed to read slt file: {}", e))
-                        })?;
-                        rt.block_on(async move {
-                            LlkvSltRunner::run_slt_text_async(&text, &p, fac).await
-                        })
-                    };
-
-                    res.map_err(|e| Failed::from(format!("slt runner error: {e}")))
+                    execute_single_slt(&factory_factory_clone, &path_clone)
+                        .map_err(|e| Failed::from(format!("slt runner error: {e}")))
                 })
                 .map_err(|e| Failed::from(format!("failed to spawn test thread: {e}")))?
                 .join()
@@ -899,6 +896,50 @@ where
     }
 
     conclusion
+}
+
+fn execute_single_slt<FF, F, Fut, D, E>(
+    factory_factory: &FF,
+    path: &Path,
+) -> Result<(), Error>
+where
+    FF: Fn() -> F + Send + Sync + 'static + Clone,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<D, E>> + Send + 'static,
+    D: AsyncDB<Error = Error, ColumnType = DefaultColumnType> + Send + 'static,
+    E: std::fmt::Debug + Send + 'static,
+{
+    let fac = factory_factory.clone()();
+    let is_url_pointer = path.extension().is_some_and(|ext| ext == "slturl");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Internal(format!("failed to build tokio runtime: {e}")))?;
+
+    if is_url_pointer {
+        // Read the URL from the pointer file and fetch remotely
+        let url = std::fs::read_to_string(path)
+            .map_err(|e| Error::Internal(format!("failed to read .slturl file: {e}")))?
+            .trim()
+            .to_string();
+
+        let response = reqwest::blocking::get(&url)
+            .map_err(|e| Error::Internal(format!("failed to fetch SLT URL {url}: {e}")))?;
+        let script = response.text().map_err(|e| {
+            Error::Internal(format!(
+                "failed to read SLT response body for {url}: {e}"
+            ))
+        })?;
+
+        let origin = std::path::PathBuf::from(format!("url:{}", url));
+        rt.block_on(async move { LlkvSltRunner::run_slt_text_async(&script, &origin, fac).await })
+    } else {
+        // Local .slt file – read from disk and execute
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::Internal(format!("failed to read slt file: {}", e)))?;
+        rt.block_on(async move { LlkvSltRunner::run_slt_text_async(&text, path, fac).await })
+    }
 }
 
 #[cfg(test)]
