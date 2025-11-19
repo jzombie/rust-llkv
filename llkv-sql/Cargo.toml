@@ -18,5 +18,8 @@ llkv-storage = { workspace = true }
 llkv-table = { workspace = true }
 sqlparser = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true }
+
 [lints]
 workspace = true

@@ -2389,6 +2389,7 @@ dependencies = [
  "llkv-storage",
  "llkv-table",
  "sqlparser 0.59.0",
+ "tokio",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@ use sqlparser::ast::{
     Expr as SqlExpr, Ident, ObjectName, ObjectNamePart, ObjectType, Query, SchemaName, Statement,
     StructField, Subscript, Value, VisitMut, VisitorMut,
 };
-use sqlparser::dialect::{DuckDbDialect, GenericDialect};
+use sqlparser::dialect::{DuckDbDialect, GenericDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 /// Result of executing a SQL statement.
@@ -62,11 +62,12 @@ impl SqlEngine {
     /// Execute raw SQL text, parsing statements to intercept DDL.
     pub async fn execute(&self, sql: &str) -> Result<Vec<SqlStatementResult>> {
         let duck = DuckDbDialect {};
-        let statements = match Parser::parse_sql(&duck, sql) {
-            Ok(statements) => statements,
-            Err(_) => Parser::parse_sql(&GenericDialect {}, sql)
-                .map_err(|e| Error::Internal(format!("failed to parse SQL statement(s): {e}")))?,
-        };
+        let sqlite = SQLiteDialect {};
+        let generic = GenericDialect {};
+        let statements = Parser::parse_sql(&duck, sql)
+            .or_else(|_| Parser::parse_sql(&sqlite, sql))
+            .or_else(|_| Parser::parse_sql(&generic, sql))
+            .map_err(|e| Error::Internal(format!("failed to parse SQL statement(s): {e}")))?;
         if statements.is_empty() {
             // Fallback to DataFusion directly if parsing produced no statements
             let result = self.execute_via_datafusion(sql).await?;
@@ -114,7 +115,7 @@ impl SqlEngine {
                 Ok(SqlStatementResult::Statement { rows_affected: 0 })
             }
             mut other => {
-                self.rewrite_struct_field_access(&mut other)?;
+                self.rewrite_statement_ast(&mut other)?;
                 let sql = other.to_string();
                 self.execute_via_datafusion(&sql).await
             }
@@ -278,8 +279,8 @@ impl SqlEngine {
         Ok(())
     }
 
-    fn rewrite_struct_field_access(&self, stmt: &mut Statement) -> Result<()> {
-        let mut rewriter = StructFieldAccessRewriter::new(&self.ctx);
+    fn rewrite_statement_ast(&self, stmt: &mut Statement) -> Result<()> {
+        let mut rewriter = SqlAstRewriter::new(&self.ctx);
         rewriter.rewrite(stmt)
     }
 
@@ -441,11 +442,11 @@ fn map_datafusion_error(prefix: &str, err: DataFusionError) -> Error {
     Error::Internal(format!("{prefix}: {decorated}"))
 }
 
-struct StructFieldAccessRewriter<'a> {
+struct SqlAstRewriter<'a> {
     ctx: &'a SessionContext,
 }
 
-impl<'a> StructFieldAccessRewriter<'a> {
+impl<'a> SqlAstRewriter<'a> {
     fn new(ctx: &'a SessionContext) -> Self {
         Self { ctx }
     }
@@ -509,20 +510,88 @@ impl<'a> StructFieldAccessRewriter<'a> {
     }
 }
 
-impl<'a> VisitorMut for StructFieldAccessRewriter<'a> {
+impl<'a> VisitorMut for SqlAstRewriter<'a> {
     type Break = Error;
 
     fn post_visit_expr(&mut self, expr: &mut SqlExpr) -> ControlFlow<Self::Break> {
-        if let SqlExpr::CompoundIdentifier(ids) = expr {
-            match self.rewrite_compound_identifier(ids) {
-                Ok(Some(new_expr)) => {
-                    *expr = new_expr;
+        match expr {
+            SqlExpr::CompoundIdentifier(ids) => {
+                match self.rewrite_compound_identifier(ids) {
+                    Ok(Some(new_expr)) => {
+                        *expr = new_expr;
+                    }
+                    Ok(None) => {}
+                    Err(err) => return ControlFlow::Break(err),
                 }
-                Ok(None) => {}
-                Err(err) => return ControlFlow::Break(err),
             }
+            SqlExpr::InList { list, negated, .. } if list.is_empty() => {
+                let value = Value::Boolean(*negated);
+                *expr = SqlExpr::Value(value.into());
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::BooleanArray;
+    use llkv_storage::pager::{BoxedPager, MemPager};
+    use sqlparser::ast::{SelectItem, SetExpr};
+    use sqlparser::dialect::SQLiteDialect;
+    use sqlparser::parser::Parser;
+    use tokio::runtime::Runtime;
+
+    #[test]
+    fn rewrite_empty_in_list_to_boolean_literal() {
+        let dialect = SQLiteDialect {};
+        let mut stmt = Parser::parse_sql(&dialect, "SELECT 1 IN ()")
+            .expect("parse sql")
+            .remove(0);
+        let ctx = SessionContext::new();
+        let mut rewriter = SqlAstRewriter::new(&ctx);
+        rewriter.rewrite(&mut stmt).expect("rewrite");
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let SqlExpr::Value(value_with_span) = (match query.body.as_ref() {
+            SetExpr::Select(select) => match &select.projection[0] {
+                SelectItem::UnnamedExpr(expr) => expr.clone(),
+                other => panic!("unexpected projection: {other:?}"),
+            },
+            other => panic!("unexpected body: {other:?}"),
+        }) else {
+            panic!("expression not rewritten to literal");
+        };
+        assert_eq!(value_with_span.value, Value::Boolean(false));
+    }
+
+    #[test]
+    fn execute_empty_in_list_returns_false() {
+        let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+        let engine = SqlEngine::new(pager).expect("sql engine");
+        let rt = Runtime::new().expect("runtime");
+        let mut results = rt
+            .block_on(engine.execute("SELECT 1 IN ()"))
+            .expect("execute");
+        assert_eq!(results.len(), 1);
+        match results.pop().unwrap() {
+            SqlStatementResult::Query { batches } => {
+                assert_eq!(batches.len(), 1);
+                let batch = &batches[0];
+                assert_eq!(batch.num_columns(), 1);
+                assert_eq!(batch.num_rows(), 1);
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("boolean array");
+                assert!(!array.value(0));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 }
 
