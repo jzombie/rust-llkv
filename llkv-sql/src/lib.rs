@@ -19,9 +19,9 @@ use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 use sqlparser::ast::{
     ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType as SqlDataType, ObjectName,
-    ObjectNamePart, Statement,
+    ObjectNamePart, Query, Statement, StructField,
 };
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{DuckDbDialect, GenericDialect};
 use sqlparser::parser::Parser;
 
 /// Result of executing a SQL statement.
@@ -56,27 +56,29 @@ impl SqlEngine {
 
     /// Execute raw SQL text, parsing statements to intercept DDL.
     pub async fn execute(&self, sql: &str) -> Result<Vec<SqlStatementResult>> {
-        let dialect = GenericDialect {};
-        match Parser::parse_sql(&dialect, sql) {
-            Ok(statements) if !statements.is_empty() => {
-                let mut out = Vec::with_capacity(statements.len());
-                for stmt in statements {
-                    out.push(self.execute_statement(stmt).await?);
-                }
-                Ok(out)
+        let duck = DuckDbDialect {};
+        let statements = match Parser::parse_sql(&duck, sql) {
+            Ok(statements) => statements,
+            Err(_) => Parser::parse_sql(&GenericDialect {}, sql)
+                .map_err(|e| Error::Internal(format!("failed to parse SQL statement(s): {e}")))?,
+        };
+        if statements.is_empty() {
+            // Fallback to DataFusion directly if parsing produced no statements
+            let result = self.execute_via_datafusion(sql).await?;
+            Ok(vec![result])
+        } else {
+            let mut out = Vec::with_capacity(statements.len());
+            for stmt in statements {
+                out.push(self.execute_statement(stmt).await?);
             }
-            _ => {
-                // Fallback to DataFusion directly if parsing failed or produced no statements
-                let result = self.execute_via_datafusion(sql).await?;
-                Ok(vec![result])
-            }
+            Ok(out)
         }
     }
 
     async fn execute_statement(&self, stmt: Statement) -> Result<SqlStatementResult> {
         match stmt {
             Statement::CreateTable(create) => {
-                self.handle_create_table(create)?;
+                self.handle_create_table(create).await?;
                 Ok(SqlStatementResult::Statement { rows_affected: 0 })
             }
             other => {
@@ -105,13 +107,7 @@ impl SqlEngine {
         }
     }
 
-    fn handle_create_table(&self, create: CreateTable) -> Result<()> {
-        if create.clone().query.is_some() {
-            return Err(Error::Internal(
-                "CREATE TABLE AS SELECT is not supported yet".into(),
-            ));
-        }
-
+    async fn handle_create_table(&self, mut create: CreateTable) -> Result<()> {
         if !create.constraints.is_empty() {
             return Err(Error::Internal(
                 "table constraints are not supported yet".into(),
@@ -125,9 +121,87 @@ impl SqlEngine {
             }
         }
 
-        let schema = build_schema(&create.columns)?;
-        self.catalog.create_table(&table_name, Arc::clone(&schema))?;
+        let columns = std::mem::take(&mut create.columns);
+        if let Some(query) = create.query {
+            return self
+                .handle_create_table_as_select(table_name, columns, *query)
+                .await;
+        }
+
+        let schema = build_schema(&columns)?;
+        self.catalog
+            .create_table(&table_name, Arc::clone(&schema))?;
         self.register_table(&table_name)?;
+        Ok(())
+    }
+
+    async fn handle_create_table_as_select(
+        &self,
+        table_name: String,
+        columns: Vec<ColumnDef>,
+        query: Query,
+    ) -> Result<()> {
+        let query_sql = query.to_string();
+        let df =
+            self.ctx.sql(&query_sql).await.map_err(|e| {
+                Error::Internal(format!("CTAS planning failed for {table_name}: {e}"))
+            })?;
+        let df_schema = df.schema().clone();
+        let mut arrow_schema = Schema::from(df_schema);
+        if !columns.is_empty() {
+            if columns.len() != arrow_schema.fields().len() {
+                return Err(Error::Internal(format!(
+                    "CTAS column count mismatch: specified {} column(s) but query produced {}",
+                    columns.len(),
+                    arrow_schema.fields().len()
+                )));
+            }
+            let renamed_fields: Vec<Field> = arrow_schema
+                .fields()
+                .iter()
+                .zip(columns.iter())
+                .map(|(field, col)| {
+                    let metadata = field.metadata().clone();
+                    Field::new(
+                        &col.name.value,
+                        field.data_type().clone(),
+                        column_nullable(col) && field.is_nullable(),
+                    )
+                    .with_metadata(metadata)
+                })
+                .collect();
+            arrow_schema = Schema::new(renamed_fields);
+        }
+        let schema_ref = Arc::new(arrow_schema);
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| Error::Internal(format!("CTAS execution failed for {table_name}: {e}")))?;
+
+        let mut builder = self
+            .catalog
+            .create_table(&table_name, Arc::clone(&schema_ref))?;
+        let mut row_count = 0usize;
+        for batch in &batches {
+            builder.append_batch(batch).map_err(|e| {
+                Error::Internal(format!(
+                    "failed to append CTAS batch into {table_name}: {e}"
+                ))
+            })?;
+            row_count += batch.num_rows();
+        }
+        let provider = builder.finish().map_err(|e| {
+            Error::Internal(format!("failed to finalize CTAS table {table_name}: {e}"))
+        })?;
+
+        if row_count > 0 {
+            let new_row_ids: Vec<u64> = (1..=row_count as u64).collect();
+            self.catalog.update_table_rows(&table_name, new_row_ids)?;
+        }
+
+        self.ctx
+            .register_table(&table_name, Arc::new(provider))
+            .map_err(|e| Error::Internal(format!("failed to register table {table_name}: {e}")))?;
         Ok(())
     }
 
@@ -246,10 +320,21 @@ fn map_sql_type(sql_type: &SqlDataType) -> Result<DataType> {
         Timestamp(_, _) | TimestampNtz | Datetime(_) | Datetime64(_, _) => {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         }
+        Struct(fields, _) => DataType::Struct(map_struct_fields(fields)?.into()),
+        Custom(name, _) => {
+            let ident = name.to_string();
+            if ident.eq_ignore_ascii_case("row") || ident.eq_ignore_ascii_case("struct") {
+                map_custom_struct_type(sql_type)?
+            } else {
+                return Err(Error::Internal(format!(
+                    "unsupported SQL data type: {sql_type:?}"
+                )));
+            }
+        }
         _ => {
             return Err(Error::Internal(format!(
                 "unsupported SQL data type: {sql_type:?}"
-            )))
+            )));
         }
     };
     Ok(dt)
@@ -317,4 +402,69 @@ fn map_exact_number(info: &sqlparser::ast::ExactNumberInfo) -> (u8, i8) {
             i8::try_from(*s).unwrap_or(0),
         ),
     }
+}
+
+fn map_struct_fields(fields: &[StructField]) -> Result<Vec<Field>> {
+    if fields.is_empty() {
+        return Err(Error::Internal(
+            "STRUCT/ROW types must define at least one field".into(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(fields.len());
+    for (idx, field) in fields.iter().enumerate() {
+        let name = field
+            .field_name
+            .as_ref()
+            .map(|ident| ident.value.clone())
+            .unwrap_or_else(|| format!("field_{:02}", idx + 1));
+        let data_type = map_sql_type(&field.field_type)?;
+        out.push(Field::new(&name, data_type, true));
+    }
+    Ok(out)
+}
+
+fn map_custom_struct_type(sql_type: &SqlDataType) -> Result<DataType> {
+    let modifiers = match sql_type {
+        SqlDataType::Custom(_, values) => values,
+        _ => return Err(Error::Internal("ROW/STRUCT type modifiers missing".into())),
+    };
+    if modifiers.len() < 2 || modifiers.len() % 2 != 0 {
+        return Err(Error::Internal(
+            "ROW/STRUCT types must define name/type pairs".into(),
+        ));
+    }
+
+    let mut fields = Vec::new();
+    for chunk in modifiers.chunks(2) {
+        let name = chunk[0].trim();
+        let ty_sql = chunk[1].trim();
+        if name.is_empty() || ty_sql.is_empty() {
+            return Err(Error::Internal(
+                "ROW/STRUCT type modifiers must include non-empty name/type".into(),
+            ));
+        }
+        let parsed_type = parse_type_fragment(ty_sql.to_string())?;
+        let data_type = map_sql_type(&parsed_type)?;
+        fields.push(Field::new(name, data_type, true));
+    }
+
+    Ok(DataType::Struct(fields.into()))
+}
+
+fn parse_type_fragment(type_sql: String) -> Result<SqlDataType> {
+    let ddl = format!("CREATE TABLE __temp(__col {type_sql})");
+    let duck = DuckDbDialect {};
+    let generic = GenericDialect {};
+    let stmts = Parser::parse_sql(&duck, &ddl).or_else(|_| Parser::parse_sql(&generic, &ddl));
+    let stmts =
+        stmts.map_err(|e| Error::Internal(format!("failed to parse ROW field type: {e}")))?;
+    if let Some(Statement::CreateTable(table)) = stmts.into_iter().next() {
+        if let Some(column) = table.columns.first() {
+            return Ok(column.data_type.clone());
+        }
+    }
+    Err(Error::Internal(
+        "failed to parse ROW/STRUCT field type".into(),
+    ))
 }

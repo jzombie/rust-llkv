@@ -226,10 +226,7 @@ pub fn make_in_memory_factory_factory() -> impl Fn() -> HarnessFactory + Clone {
                 n
             );
             Box::pin(async move {
-                tracing::debug!(
-                    "[FACTORY] Factory #{}: Created DataFusion harness",
-                    n
-                );
+                tracing::debug!("[FACTORY] Factory #{}: Created DataFusion harness", n);
                 EngineHarness::new().map_err(|_| ())
             })
         });

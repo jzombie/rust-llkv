@@ -1,3 +1,5 @@
+#![recursion_limit = "65536"]
+
 //! DataFusion integration helpers for LLKV storage.
 //!
 //! This crate wires [`llkv-column-map`] and [`llkv-storage`] into a
@@ -25,11 +27,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 
+use crate::catalog::TableCatalog;
 use arrow::array::{ArrayRef, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
-use crate::catalog::TableCatalog;
 use datafusion::catalog::Session;
 use datafusion::common::stats::{Precision, Statistics};
 use datafusion::common::{DataFusionError, Result as DataFusionResult, SchemaExt};
@@ -482,8 +484,7 @@ where
                 rows.extend(&appended);
             }
             if let Some(hook) = &self.catalog_hook {
-                hook.update(&appended)
-                    .map_err(map_storage_error)?;
+                hook.update(&appended).map_err(map_storage_error)?;
             }
         }
 
@@ -565,11 +566,7 @@ where
             self.catalog_hook.clone(),
         )?;
 
-        Ok(Arc::new(DataSinkExec::new(
-            input,
-            Arc::new(sink),
-            None,
-        )))
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
 }
 

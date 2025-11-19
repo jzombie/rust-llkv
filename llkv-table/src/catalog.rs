@@ -22,6 +22,10 @@ use std::sync::{Arc, RwLock};
 
 use arrow::array::{Array, BinaryArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::ipc::{
+    convert::try_schema_from_flatbuffer_bytes,
+    writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
+};
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
@@ -46,52 +50,12 @@ fn catalog_metadata_field() -> LogicalFieldId {
 struct TableMetadata {
     table_id: TableId,
     table_name: String,
-    /// Serialized Arrow schema fields.
-    schema_fields: Vec<SerializedField>,
+    /// Serialized Arrow schema as JSON bytes.
+    schema_bytes: Vec<u8>,
     /// Logical field IDs for each column.
     logical_fields: Vec<u64>,
     /// Row IDs that exist in this table.
     row_ids: Vec<RowId>,
-}
-
-/// Serializable representation of an Arrow field.
-#[derive(Debug, Clone, Encode, Decode)]
-struct SerializedField {
-    name: String,
-    data_type: String,
-    nullable: bool,
-}
-
-impl SerializedField {
-    fn from_arrow_field(field: &Field) -> Self {
-        Self {
-            name: field.name().to_string(),
-            data_type: format!("{:?}", field.data_type()),
-            nullable: field.is_nullable(),
-        }
-    }
-
-    fn to_arrow_field(&self) -> LlkvResult<Field> {
-        let data_type = Self::parse_data_type(&self.data_type)?;
-        Ok(Field::new(&self.name, data_type, self.nullable))
-    }
-
-    /// Parse DataType from debug string representation.
-    fn parse_data_type(s: &str) -> LlkvResult<DataType> {
-        // Basic type parsing - extend as needed
-        match s {
-            "Utf8" => Ok(DataType::Utf8),
-            "Int32" => Ok(DataType::Int32),
-            "Int64" => Ok(DataType::Int64),
-            "UInt64" => Ok(DataType::UInt64),
-            "Float64" => Ok(DataType::Float64),
-            "Boolean" => Ok(DataType::Boolean),
-            _ => Err(LlkvError::Internal(format!(
-                "unsupported data type for catalog persistence: {}",
-                s
-            ))),
-        }
-    }
 }
 
 /// Persistent catalog for LLKV tables.
@@ -143,7 +107,11 @@ where
     ///
     /// Returns an error if a table with this name already exists or if the
     /// schema contains unsupported data types.
-    pub fn create_table(self: &Arc<Self>, name: &str, schema: SchemaRef) -> LlkvResult<LlkvTableBuilder<P>> {
+    pub fn create_table(
+        self: &Arc<Self>,
+        name: &str,
+        schema: SchemaRef,
+    ) -> LlkvResult<LlkvTableBuilder<P>> {
         // Check if table already exists
         {
             let tables = self.tables.read().unwrap();
@@ -166,22 +134,15 @@ where
         };
 
         // Create the builder
-        let mut builder =
-            LlkvTableBuilder::new(Arc::clone(&self.store), table_id, schema.clone())?;
-        builder.attach_catalog_hook(CatalogHook::new(
-            name.to_string(),
-            Arc::downgrade(self),
-        ));
+        let mut builder = LlkvTableBuilder::new(Arc::clone(&self.store), table_id, schema.clone())?;
+        builder.attach_catalog_hook(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
 
         // Store initial metadata (empty row_ids)
+        let schema_bytes = Self::serialize_schema(schema.as_ref())?;
         let metadata = TableMetadata {
             table_id,
             table_name: name.to_string(),
-            schema_fields: schema
-                .fields()
-                .iter()
-                .map(|f| SerializedField::from_arrow_field(f.as_ref()))
-                .collect(),
+            schema_bytes,
             logical_fields: (1..=schema.fields().len() as u32)
                 .map(|fid| LogicalFieldId::for_user(table_id, fid).into())
                 .collect(),
@@ -201,18 +162,16 @@ where
     /// Get a table provider for an existing table.
     ///
     /// Returns `None` if no table with the given name exists.
-    pub fn get_table(self: &Arc<Self>, name: &str) -> LlkvResult<Option<Arc<LlkvTableProvider<P>>>> {
+    pub fn get_table(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> LlkvResult<Option<Arc<LlkvTableProvider<P>>>> {
         let tables = self.tables.read().unwrap();
         let Some(metadata) = tables.get(name) else {
             return Ok(None);
         };
 
-        let schema_fields: Vec<Field> = metadata
-            .schema_fields
-            .iter()
-            .map(|f| f.to_arrow_field())
-            .collect::<LlkvResult<Vec<_>>>()?;
-        let schema = Arc::new(Schema::new(schema_fields));
+        let schema = Arc::new(Self::deserialize_schema(&metadata.schema_bytes)?);
 
         let logical_fields: Vec<LogicalFieldId> = metadata
             .logical_fields
@@ -364,5 +323,21 @@ where
         self.store.append(&batch)?;
 
         Ok(())
+    }
+
+    fn serialize_schema(schema: &Schema) -> LlkvResult<Vec<u8>> {
+        let data_gen = IpcDataGenerator::default();
+        let mut tracker = DictionaryTracker::new(true);
+        let encoded = data_gen.schema_to_bytes_with_dictionary_tracker(
+            schema,
+            &mut tracker,
+            &IpcWriteOptions::default(),
+        );
+        Ok(encoded.ipc_message)
+    }
+
+    fn deserialize_schema(bytes: &[u8]) -> LlkvResult<Schema> {
+        try_schema_from_flatbuffer_bytes(bytes)
+            .map_err(|e| LlkvError::Internal(format!("failed to deserialize schema metadata: {e}")))
     }
 }
