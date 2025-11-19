@@ -2308,6 +2308,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
+name = "llkv"
+version = "0.8.2-alpha"
+dependencies = [
+ "arrow",
+ "llkv-result",
+ "llkv-slt-tester",
+ "llkv-sql",
+ "llkv-storage",
+ "tokio",
+]
+
+[[package]]
 name = "llkv-column-map"
 version = "0.8.2-alpha"
 dependencies = [

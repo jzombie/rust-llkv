@@ -118,10 +118,13 @@
 //!
 //! ```rust
 //! use std::sync::Arc;
-//! use llkv::{SqlEngine, storage::MemPager};
+//! use llkv::{SqlEngine, storage::{BoxedPager, MemPager}};
+//! use tokio::runtime::Runtime;
 //!
-//! let engine = SqlEngine::new(Arc::new(MemPager::default()));
-//! let results = engine.execute("SELECT 42 AS answer").unwrap();
+//! let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+//! let engine = SqlEngine::new(pager).unwrap();
+//! let runtime = Runtime::new().unwrap();
+//! let results = runtime.block_on(engine.execute("SELECT 42 AS answer")).unwrap();
 //! ```
 //!
 //! # Architecture
@@ -147,7 +150,7 @@
 //! [`simd-r-drive`]: https://crates.io/crates/simd-r-drive
 
 // Re-export the SQL engine as the primary user-facing API
-pub use llkv_sql::SqlEngine;
+pub use llkv_sql::{SqlEngine, SqlStatementResult};
 
 // Re-export storage pager abstractions
 pub mod storage {
@@ -157,7 +160,8 @@ pub mod storage {
     //! for both in-memory and persistent storage backends.
 
     pub use llkv_storage::pager::{
-        InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, Pager, PagerDiagnostics,
+        BoxedPager, InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, Pager,
+        PagerDiagnostics,
     };
 
     // SimdRDrivePager is only available when llkv-storage is built with simd-r-drive-support
@@ -167,6 +171,3 @@ pub mod storage {
 
 // Re-export result types for error handling
 pub use llkv_result::{Error, Result};
-
-// Re-export runtime types that users might need when working with statement results
-pub use llkv_runtime::RuntimeStatementResult;

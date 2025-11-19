@@ -3,8 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::util::pretty::pretty_format_batches;
-use llkv::{Error as LlkvError, RuntimeStatementResult, SqlEngine, storage::MemPager};
+use llkv::{
+    Error as LlkvError, SqlEngine, SqlStatementResult,
+    storage::{BoxedPager, MemPager},
+};
 use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
+use tokio::runtime::Runtime;
 
 #[allow(clippy::print_stdout)]
 fn print_banner() {
@@ -22,7 +26,7 @@ fn print_help() {
     println!(".help           Show this message");
     println!(".open FILE      Open persistent database file");
     println!(".exit/.quit     Exit the REPL");
-    println!("Any other line is echoed as SQL (no execution in this stub)");
+    println!("Any other line is executed as SQL against the in-memory pager");
     println!();
     println!("Command-line options:");
     println!("  --slt PATH            Run a single SLT file or directory");
@@ -30,8 +34,59 @@ fn print_help() {
     println!("  --help                Show this usage information");
 }
 
+struct SqlRunner {
+    engine: SqlEngine,
+    runtime: Runtime,
+}
+
+impl SqlRunner {
+    fn in_memory() -> Result<Self, LlkvError> {
+        let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+        let engine = SqlEngine::new(pager)?;
+        let runtime = Runtime::new()
+            .map_err(|e| LlkvError::Internal(format!("failed to create Tokio runtime: {}", e)))?;
+        Ok(Self { engine, runtime })
+    }
+
+    fn execute(&self, sql: &str) -> Result<(), LlkvError> {
+        if sql.trim().is_empty() {
+            return Ok(());
+        }
+        let results = self.runtime.block_on(self.engine.execute(sql))?;
+        if results.is_empty() {
+            println!("(no statements executed)");
+        } else {
+            for result in results {
+                Self::print_result(result);
+            }
+        }
+        Ok(())
+    }
+
+    fn print_result(result: SqlStatementResult) {
+        match result {
+            SqlStatementResult::Query { batches } => {
+                if batches.is_empty() {
+                    println!("(no rows)");
+                } else {
+                    match pretty_format_batches(&batches) {
+                        Ok(table) => println!("{}", table),
+                        Err(e) => eprintln!(
+                            "Query executed but failed to format batches: {:?}",
+                            e
+                        ),
+                    }
+                }
+            }
+            SqlStatementResult::Statement { rows_affected } => {
+                println!("Statement OK (rows affected: {})", rows_affected);
+            }
+        }
+    }
+}
+
 #[allow(clippy::print_stdout)]
-fn repl() -> io::Result<()> {
+fn repl(runner: &SqlRunner) -> io::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut line = String::new();
@@ -64,59 +119,27 @@ fn repl() -> io::Result<()> {
                 ".exit" | ".quit" => break,
                 _ => println!("Unknown command: {}", cmd),
             }
-        } else {
-            // Echo SQL - placeholder for future execution
-            println!("SQL> {}", input);
-        }
+        } else if let Err(e) = runner.execute(input) {
+            eprintln!("Execution failed: {}", e);
+        };
     }
 
     Ok(())
 }
 
 #[allow(clippy::print_stdout, clippy::print_stderr)]
-fn process_stream<R: std::io::Read>(reader: R) -> io::Result<()> {
+fn process_stream<R: std::io::Read>(runner: &SqlRunner, reader: R) -> io::Result<()> {
     let mut buf = String::new();
     let mut rdr = std::io::BufReader::new(reader);
     rdr.read_to_string(&mut buf)?;
-    // Create an in-memory SQL engine for this session (mirrors examples/simple_query.rs)
-    let engine = SqlEngine::new(Arc::new(MemPager::default()));
 
     let sql = buf.trim();
     if sql.is_empty() {
         return Ok(());
     }
 
-    match engine.execute(sql) {
-        Ok(results) => {
-            for res in results {
-                match res {
-                    RuntimeStatementResult::Select { execution, .. } => match execution.collect() {
-                        Ok(batches) => {
-                            if batches.is_empty() {
-                                println!("No batches returned");
-                            } else {
-                                match pretty_format_batches(&batches) {
-                                    Ok(s) => println!("{}", s),
-                                    Err(e) => eprintln!(
-                                        "Query executed but failed to format batches: {:?}",
-                                        e
-                                    ),
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to collect SELECT results: {:?}", e);
-                        }
-                    },
-                    other => {
-                        println!("OK: {:?}", other);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Execution failed: {:?}", e);
-        }
+    if let Err(e) = runner.execute(sql) {
+        eprintln!("Execution failed: {}", e);
     }
     Ok(())
 }
@@ -174,17 +197,25 @@ fn main() {
         return;
     }
 
+    let sql_runner = match SqlRunner::in_memory() {
+        Ok(runner) => runner,
+        Err(e) => {
+            eprintln!("Failed to initialize SQL engine: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     print_banner();
 
     if !std::io::stdin().is_terminal() {
-        if let Err(e) = process_stream(std::io::stdin()) {
+        if let Err(e) = process_stream(&sql_runner, std::io::stdin()) {
             eprintln!("Error processing stdin: {}", e);
             std::process::exit(1);
         }
         return;
     }
 
-    if let Err(e) = repl() {
+    if let Err(e) = repl(&sql_runner) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
