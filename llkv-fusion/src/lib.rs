@@ -517,4 +517,252 @@ mod persistence_tests {
             assert_eq!(formatted.trim(), expected.trim());
         }
     }
+
+    #[tokio::test]
+    async fn federated_query_across_pagers() {
+        use llkv_storage::pager::SimdRDrivePager;
+        use llkv_table::catalog::TableCatalog;
+        use tempfile::TempDir;
+
+        // Create temporary directories for the databases
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let sales_path = temp_dir.path().join("sales.db");
+        let inventory_path = temp_dir.path().join("inventory.db");
+
+        // Pager 1 - sales database with orders table
+        let sales_pager = Arc::new(
+            SimdRDrivePager::open(&sales_path).expect("open sales pager"),
+        );
+        let sales_catalog = TableCatalog::open(Arc::clone(&sales_pager)).expect("open sales catalog");
+
+        let orders_schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::UInt64, false),
+            Field::new("product_id", DataType::UInt64, false),
+            Field::new("customer", DataType::Utf8, false),
+            Field::new("quantity", DataType::Int32, false),
+        ]));
+
+        let orders_batch = RecordBatch::try_new(
+            orders_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![1001_u64, 1002, 1003, 1004])),
+                Arc::new(UInt64Array::from(vec![10_u64, 20, 10, 30])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol", "Dave"])),
+                Arc::new(Int32Array::from(vec![5, 3, 2, 10])),
+            ],
+        )
+        .expect("orders batch");
+
+        let mut orders_builder = sales_catalog
+            .create_table("orders", orders_schema)
+            .expect("create orders table");
+
+        orders_builder
+            .append_batch(&orders_batch)
+            .expect("append orders");
+
+        let _orders_provider = orders_builder.finish().expect("finish orders");
+
+        // Update catalog with row IDs
+        sales_catalog
+            .update_table_rows("orders", (1..=4).collect())
+            .expect("update orders rows");
+
+        // Pager 2 - inventory database with products table
+        let inventory_pager = Arc::new(
+            SimdRDrivePager::open(&inventory_path).expect("open inventory pager"),
+        );
+        let inventory_catalog =
+            TableCatalog::open(Arc::clone(&inventory_pager)).expect("open inventory catalog");
+
+        let products_schema = Arc::new(Schema::new(vec![
+            Field::new("product_id", DataType::UInt64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("price", DataType::Int32, false),
+        ]));
+
+        let products_batch = RecordBatch::try_new(
+            products_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![10_u64, 20, 30])),
+                Arc::new(StringArray::from(vec!["Widget", "Gadget", "Doohickey"])),
+                Arc::new(Int32Array::from(vec![100, 200, 150])),
+            ],
+        )
+        .expect("products batch");
+
+        let mut products_builder = inventory_catalog
+            .create_table("products", products_schema)
+            .expect("create products table");
+
+        products_builder
+            .append_batch(&products_batch)
+            .expect("append products");
+
+        let _products_provider = products_builder.finish().expect("finish products");
+
+        // Update catalog with row IDs
+        inventory_catalog
+            .update_table_rows("products", (1..=3).collect())
+            .expect("update products rows");
+
+        // Register tables from both catalogs into DataFusion
+        let ctx = SessionContext::new();
+
+        let orders_table = sales_catalog
+            .get_table("orders")
+            .expect("get orders")
+            .expect("orders should exist");
+
+        let products_table = inventory_catalog
+            .get_table("products")
+            .expect("get products")
+            .expect("products should exist");
+
+        ctx.register_table("orders", orders_table)
+            .expect("register orders");
+        ctx.register_table("products", products_table)
+            .expect("register products");
+
+        // Test 1: Query each table independently
+        let orders_df = ctx
+            .sql("SELECT customer, quantity FROM orders ORDER BY customer")
+            .await
+            .expect("query orders");
+
+        let orders_results = orders_df.collect().await.expect("collect orders");
+        let orders_formatted =
+            pretty_format_batches(&orders_results).expect("format orders").to_string();
+
+        let expected_orders = vec![
+            "+----------+----------+",
+            "| customer | quantity |",
+            "+----------+----------+",
+            "| Alice    | 5        |",
+            "| Bob      | 3        |",
+            "| Carol    | 2        |",
+            "| Dave     | 10       |",
+            "+----------+----------+",
+        ]
+        .join("\n");
+
+        assert_eq!(orders_formatted.trim(), expected_orders.trim());
+
+        let products_df = ctx
+            .sql("SELECT name, price FROM products ORDER BY name")
+            .await
+            .expect("query products");
+
+        let products_results = products_df.collect().await.expect("collect products");
+        let products_formatted = pretty_format_batches(&products_results)
+            .expect("format products")
+            .to_string();
+
+        let expected_products = vec![
+            "+-----------+-------+",
+            "| name      | price |",
+            "+-----------+-------+",
+            "| Doohickey | 150   |",
+            "| Gadget    | 200   |",
+            "| Widget    | 100   |",
+            "+-----------+-------+",
+        ]
+        .join("\n");
+
+        assert_eq!(products_formatted.trim(), expected_products.trim());
+
+        // Test 2: Federated query - join across pagers!
+        let join_df = ctx
+            .sql(
+                "SELECT o.customer, p.name, o.quantity, p.price, (o.quantity * p.price) as total \
+                 FROM orders o \
+                 INNER JOIN products p ON o.product_id = p.product_id \
+                 ORDER BY o.customer",
+            )
+            .await
+            .expect("federated join query");
+
+        let join_results = join_df.collect().await.expect("collect join");
+        let join_formatted = pretty_format_batches(&join_results)
+            .expect("format join")
+            .to_string();
+
+        let expected_join = vec![
+            "+----------+-----------+----------+-------+-------+",
+            "| customer | name      | quantity | price | total |",
+            "+----------+-----------+----------+-------+-------+",
+            "| Alice    | Widget    | 5        | 100   | 500   |",
+            "| Bob      | Gadget    | 3        | 200   | 600   |",
+            "| Carol    | Widget    | 2        | 100   | 200   |",
+            "| Dave     | Doohickey | 10       | 150   | 1500  |",
+            "+----------+-----------+----------+-------+-------+",
+        ]
+        .join("\n");
+
+        assert_eq!(join_formatted.trim(), expected_join.trim());
+
+        // Test 3: Verify data persists - reopen catalogs and query again
+        drop(sales_catalog);
+        drop(inventory_catalog);
+
+        let sales_catalog_reopened =
+            TableCatalog::open(sales_pager).expect("reopen sales catalog");
+        let inventory_catalog_reopened =
+            TableCatalog::open(inventory_pager).expect("reopen inventory catalog");
+
+        // Verify tables are still in the catalogs
+        let sales_tables = sales_catalog_reopened.list_tables();
+        let inventory_tables = inventory_catalog_reopened.list_tables();
+
+        assert!(sales_tables.contains(&"orders".to_string()));
+        assert!(inventory_tables.contains(&"products".to_string()));
+
+        // Re-register and query
+        let ctx2 = SessionContext::new();
+
+        let orders_table2 = sales_catalog_reopened
+            .get_table("orders")
+            .expect("get orders 2")
+            .expect("orders should exist 2");
+
+        let products_table2 = inventory_catalog_reopened
+            .get_table("products")
+            .expect("get products 2")
+            .expect("products should exist 2");
+
+        ctx2.register_table("orders", orders_table2)
+            .expect("register orders 2");
+        ctx2.register_table("products", products_table2)
+            .expect("register products 2");
+
+        // Run the same join query - should work with persisted data
+        let join_df2 = ctx2
+            .sql(
+                "SELECT o.customer, p.name, o.quantity * p.price as total \
+                 FROM orders o \
+                 INNER JOIN products p ON o.product_id = p.product_id \
+                 WHERE o.quantity > 2 \
+                 ORDER BY total DESC",
+            )
+            .await
+            .expect("federated join query 2");
+
+        let join_results2 = join_df2.collect().await.expect("collect join 2");
+        let join_formatted2 = pretty_format_batches(&join_results2)
+            .expect("format join 2")
+            .to_string();
+
+        let expected_join2 = vec![
+            "+----------+-----------+-------+",
+            "| customer | name      | total |",
+            "+----------+-----------+-------+",
+            "| Dave     | Doohickey | 1500  |",
+            "| Bob      | Gadget    | 600   |",
+            "| Alice    | Widget    | 500   |",
+            "+----------+-----------+-------+",
+        ]
+        .join("\n");
+
+        assert_eq!(join_formatted2.trim(), expected_join2.trim());
+    }
 }

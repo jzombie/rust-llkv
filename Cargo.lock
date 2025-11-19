@@ -2173,6 +2173,7 @@ dependencies = [
  "llkv-storage",
  "llkv-table",
  "simd-r-drive-entry-handle",
+ "tempfile",
  "tokio",
 ]
 
