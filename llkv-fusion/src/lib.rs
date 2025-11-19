@@ -17,18 +17,21 @@
 //!   [`datafusion::datasource::TableProvider`] by gathering LLKV rows in
 //!   scan-sized chunks and surfacing them through a
 //!   [`datafusion_datasource::memory::MemorySourceConfig`].
-//! - [`LlkvQueryPlanner`]: intercepts `DELETE` statements during physical
-//!   planning and executes them through LLKV's storage layer.
+//! - [`LlkvQueryPlanner`]: intercepts DDL (CREATE TABLE) and DML (INSERT, DELETE)
+//!   operations during physical planning and executes them through LLKV's
+//!   storage layer.
 
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::common::Result as DataFusionResult;
+use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::logical_expr::{DmlStatement, LogicalPlan};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use llkv_storage::pager::BoxedPager;
+use llkv_table::catalog::TableCatalog;
 
 pub use llkv_table::{LlkvTableBuilder, LlkvTableProvider};
 
@@ -299,11 +302,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "DELETE FROM llkv_demo is not yet implemented")]
+    #[should_panic(expected = "DELETE FROM llkv_demo not yet implemented")]
     async fn datafusion_delete_statement_is_rejected() {
         use datafusion::execution::session_state::SessionStateBuilder;
+        use llkv_storage::pager::BoxedPager;
+        use llkv_table::catalog::TableCatalog;
 
-        let pager = Arc::new(MemPager::default());
+        let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+        let catalog = Arc::new(TableCatalog::open(Arc::clone(&pager)).expect("catalog"));
         let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
 
         let schema = build_demo_batch().schema();
@@ -314,7 +320,7 @@ mod tests {
         // Create context with custom query planner that intercepts DELETE
         let session_state = SessionStateBuilder::new()
             .with_default_features()
-            .with_query_planner(Arc::new(LlkvQueryPlanner::new()))
+            .with_query_planner(Arc::new(LlkvQueryPlanner::new(catalog)))
             .build();
         let ctx = SessionContext::new_with_state(session_state);
         ctx.register_table("llkv_demo", Arc::new(provider))
@@ -330,45 +336,44 @@ mod tests {
     }
 }
 
-/// Custom physical planner that intercepts DELETE operations.
+/// Custom physical planner that intercepts DDL and DML operations.
 ///
-/// DataFusion 50.3.0 parses `DELETE FROM table WHERE ...` into
-/// [`LogicalPlan::Dml`] with [`WriteOp::Delete`], but provides no physical
-/// execution path. This planner detects such plans during physical plan
-/// generation and routes them through LLKV's storage layer.
+/// DataFusion 50.3.0 parses SQL DDL/DML statements into logical plans but
+/// provides limited physical execution paths. This planner intercepts:
+/// - `CREATE TABLE` - routes through LLKV's [`TableCatalog`](llkv_table::catalog::TableCatalog)
+/// - `INSERT INTO` - appends data through [`LlkvTableBuilder`]
+/// - `DELETE FROM` - executes deletions through LLKV's storage layer
 ///
 /// # Usage
 ///
-/// Register with a [`SessionContext`] using
-/// [`SessionContext::with_query_planner`]:
-///
 /// ```ignore
-/// let ctx = SessionContext::new()
-///     .with_query_planner(Arc::new(LlkvQueryPlanner::new()));
+/// use datafusion::prelude::SessionContext;
+/// use llkv_fusion::LlkvQueryPlanner;
+///
+/// let catalog = Arc::new(TableCatalog::open(pager)?);
+/// let ctx = SessionContext::new();
+/// ctx.register_catalog("llkv", Arc::new(LlkvCatalogProvider::new(catalog)));
 /// ```
 pub struct LlkvQueryPlanner {
+    catalog: Arc<TableCatalog<BoxedPager>>,
     fallback: Arc<dyn PhysicalPlanner>,
 }
 
 impl fmt::Debug for LlkvQueryPlanner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LlkvQueryPlanner").finish_non_exhaustive()
+        f.debug_struct("LlkvQueryPlanner")
+            .field("catalog", &"<TableCatalog>")
+            .finish()
     }
 }
 
 impl LlkvQueryPlanner {
-    /// Construct a new planner that delegates to DataFusion's default planner
-    /// for all non-DELETE operations.
-    pub fn new() -> Self {
+    /// Construct a new planner with a catalog reference.
+    pub fn new(catalog: Arc<TableCatalog<BoxedPager>>) -> Self {
         Self {
+            catalog,
             fallback: Arc::new(DefaultPhysicalPlanner::default()),
         }
-    }
-}
-
-impl Default for LlkvQueryPlanner {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -379,18 +384,22 @@ impl QueryPlanner for LlkvQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &datafusion::execution::context::SessionState,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Intercept DELETE operations
+        // Note: DataFusion 50.3.0 doesn't parse CREATE TABLE into LogicalPlan::Ddl
+        // CREATE TABLE must be intercepted at SQL string level before calling ctx.sql()
+
+        // Note: INSERT INTO is handled by TableProvider::insert_into() method
+
+        // Intercept DELETE
         if let LogicalPlan::Dml(DmlStatement {
             table_name,
             op: datafusion::logical_expr::WriteOp::Delete,
             ..
         }) = logical_plan
         {
-            // TODO: Implement DELETE execution
-            todo!(
-                "DELETE FROM {} is not yet implemented",
-                table_name.to_string()
-            );
+            return Err(DataFusionError::NotImplemented(format!(
+                "DELETE FROM {} not yet implemented",
+                table_name
+            )));
         }
 
         // Delegate everything else to the default planner

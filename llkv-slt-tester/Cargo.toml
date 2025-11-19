@@ -14,12 +14,10 @@ readme = "README.md"
 [dependencies]
 arrow = { workspace = true, default-features = false }
 async-trait.workspace = true
-datafusion = { workspace = true }
 libtest-mimic.workspace = true
-llkv-column-map.workspace = true
+llkv-sql.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
-llkv-table.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
 sqllogictest.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "llkv-sql"
+description = "SQL front-end for LLKV backed by DataFusion + llkv-fusion."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+datafusion = { workspace = true }
+llkv-fusion = { workspace = true }
+llkv-result = { workspace = true }
+llkv-storage = { workspace = true }
+llkv-table = { workspace = true }
+sqlparser = { workspace = true }
+
+[lints]
+workspace = true
