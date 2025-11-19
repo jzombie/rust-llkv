@@ -37,6 +37,7 @@ async-trait = "0.1.89"
 bitcode = "0.6.7"
 clap = { version = "4.5.18", features = ["derive"] }
 criterion = "0.7.0"
+futures = "0.3.31"
 crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
 datafusion = "50.3.0"

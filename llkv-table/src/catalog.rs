@@ -30,7 +30,7 @@ use llkv_result::{Error as LlkvError, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{LlkvTableBuilder, LlkvTableProvider};
+use crate::{CatalogHook, LlkvTableBuilder, LlkvTableProvider};
 
 /// Reserved table ID for the system catalog metadata.
 const CATALOG_TABLE_ID: TableId = 0;
@@ -143,7 +143,7 @@ where
     ///
     /// Returns an error if a table with this name already exists or if the
     /// schema contains unsupported data types.
-    pub fn create_table(&self, name: &str, schema: SchemaRef) -> LlkvResult<LlkvTableBuilder<P>> {
+    pub fn create_table(self: &Arc<Self>, name: &str, schema: SchemaRef) -> LlkvResult<LlkvTableBuilder<P>> {
         // Check if table already exists
         {
             let tables = self.tables.read().unwrap();
@@ -166,7 +166,12 @@ where
         };
 
         // Create the builder
-        let builder = LlkvTableBuilder::new(Arc::clone(&self.store), table_id, schema.clone())?;
+        let mut builder =
+            LlkvTableBuilder::new(Arc::clone(&self.store), table_id, schema.clone())?;
+        builder.attach_catalog_hook(CatalogHook::new(
+            name.to_string(),
+            Arc::downgrade(self),
+        ));
 
         // Store initial metadata (empty row_ids)
         let metadata = TableMetadata {
@@ -196,7 +201,7 @@ where
     /// Get a table provider for an existing table.
     ///
     /// Returns `None` if no table with the given name exists.
-    pub fn get_table(&self, name: &str) -> LlkvResult<Option<Arc<LlkvTableProvider<P>>>> {
+    pub fn get_table(self: &Arc<Self>, name: &str) -> LlkvResult<Option<Arc<LlkvTableProvider<P>>>> {
         let tables = self.tables.read().unwrap();
         let Some(metadata) = tables.get(name) else {
             return Ok(None);
@@ -215,11 +220,15 @@ where
             .map(|&id| LogicalFieldId::from(id))
             .collect();
 
-        let provider = LlkvTableProvider::new(
+        let row_ids = Arc::new(RwLock::new(metadata.row_ids.clone()));
+        let hook = CatalogHook::new(name.to_string(), Arc::downgrade(self));
+        let provider = LlkvTableProvider::with_catalog_hook(
             Arc::clone(&self.store),
             schema,
             logical_fields,
-            Arc::new(metadata.row_ids.clone()),
+            row_ids,
+            super::DEFAULT_SCAN_BATCH_SIZE,
+            hook,
         )?;
 
         Ok(Some(Arc::new(provider)))

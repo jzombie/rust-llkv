@@ -2416,6 +2416,7 @@ dependencies = [
  "datafusion",
  "datafusion-catalog",
  "datafusion-datasource",
+ "futures",
  "llkv-column-map",
  "llkv-result",
  "llkv-storage",

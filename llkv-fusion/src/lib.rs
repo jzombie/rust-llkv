@@ -17,9 +17,6 @@
 //!   [`datafusion::datasource::TableProvider`] by gathering LLKV rows in
 //!   scan-sized chunks and surfacing them through a
 //!   [`datafusion_datasource::memory::MemorySourceConfig`].
-//! - [`LlkvQueryPlanner`]: intercepts DDL (CREATE TABLE) and DML (INSERT, DELETE)
-//!   operations during physical planning and executes them through LLKV's
-//!   storage layer.
 
 use std::fmt;
 use std::sync::Arc;
@@ -337,23 +334,6 @@ mod tests {
 }
 
 /// Custom physical planner that intercepts DDL and DML operations.
-///
-/// DataFusion 50.3.0 parses SQL DDL/DML statements into logical plans but
-/// provides limited physical execution paths. This planner intercepts:
-/// - `CREATE TABLE` - routes through LLKV's [`TableCatalog`](llkv_table::catalog::TableCatalog)
-/// - `INSERT INTO` - appends data through [`LlkvTableBuilder`]
-/// - `DELETE FROM` - executes deletions through LLKV's storage layer
-///
-/// # Usage
-///
-/// ```ignore
-/// use datafusion::prelude::SessionContext;
-/// use llkv_fusion::LlkvQueryPlanner;
-///
-/// let catalog = Arc::new(TableCatalog::open(pager)?);
-/// let ctx = SessionContext::new();
-/// ctx.register_catalog("llkv", Arc::new(LlkvCatalogProvider::new(catalog)));
-/// ```
 pub struct LlkvQueryPlanner {
     catalog: Arc<TableCatalog<BoxedPager>>,
     fallback: Arc<dyn PhysicalPlanner>,
@@ -384,11 +364,6 @@ impl QueryPlanner for LlkvQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &datafusion::execution::context::SessionState,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Note: DataFusion 50.3.0 doesn't parse CREATE TABLE into LogicalPlan::Ddl
-        // CREATE TABLE must be intercepted at SQL string level before calling ctx.sql()
-
-        // Note: INSERT INTO is handled by TableProvider::insert_into() method
-
         // Intercept DELETE
         if let LogicalPlan::Dml(DmlStatement {
             table_name,
@@ -428,7 +403,7 @@ mod persistence_tests {
 
         // Inner scope 1: Create table schema, insert data, then drop everything except pager
         {
-            let catalog = TableCatalog::open(Arc::clone(&pager)).expect("open catalog");
+            let catalog = Arc::new(TableCatalog::open(Arc::clone(&pager)).expect("open catalog"));
 
             let users_schema = Arc::new(Schema::new(vec![
                 Field::new("user_id", DataType::UInt64, false),
@@ -481,7 +456,7 @@ mod persistence_tests {
 
         // Inner scope 2: Reopen the catalog with the same pager and verify data persists
         {
-            let catalog = TableCatalog::open(Arc::clone(&pager)).expect("reopen catalog");
+            let catalog = Arc::new(TableCatalog::open(Arc::clone(&pager)).expect("reopen catalog"));
 
             // List tables to verify it was persisted
             let tables = catalog.list_tables();
@@ -538,7 +513,7 @@ mod persistence_tests {
         // Pager 1 - sales database with orders table
         let sales_pager = Arc::new(SimdRDrivePager::open(&sales_path).expect("open sales pager"));
         let sales_catalog =
-            TableCatalog::open(Arc::clone(&sales_pager)).expect("open sales catalog");
+            Arc::new(TableCatalog::open(Arc::clone(&sales_pager)).expect("open sales catalog"));
 
         let orders_schema = Arc::new(Schema::new(vec![
             Field::new("order_id", DataType::UInt64, false),
@@ -576,8 +551,9 @@ mod persistence_tests {
         // Pager 2 - inventory database with products table
         let inventory_pager =
             Arc::new(SimdRDrivePager::open(&inventory_path).expect("open inventory pager"));
-        let inventory_catalog =
-            TableCatalog::open(Arc::clone(&inventory_pager)).expect("open inventory catalog");
+        let inventory_catalog = Arc::new(
+            TableCatalog::open(Arc::clone(&inventory_pager)).expect("open inventory catalog"),
+        );
 
         let products_schema = Arc::new(Schema::new(vec![
             Field::new("product_id", DataType::UInt64, false),
@@ -710,9 +686,10 @@ mod persistence_tests {
         drop(sales_catalog);
         drop(inventory_catalog);
 
-        let sales_catalog_reopened = TableCatalog::open(sales_pager).expect("reopen sales catalog");
+        let sales_catalog_reopened =
+            Arc::new(TableCatalog::open(sales_pager).expect("reopen sales catalog"));
         let inventory_catalog_reopened =
-            TableCatalog::open(inventory_pager).expect("reopen inventory catalog");
+            Arc::new(TableCatalog::open(inventory_pager).expect("reopen inventory catalog"));
 
         // Verify tables are still in the catalogs
         let sales_tables = sales_catalog_reopened.list_tables();
