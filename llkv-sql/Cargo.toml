@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 arrow = { workspace = true }
 datafusion = { workspace = true }
+datafusion-catalog = { workspace = true }
 llkv-fusion = { workspace = true }
 llkv-result = { workspace = true }
 llkv-storage = { workspace = true }

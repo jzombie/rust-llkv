@@ -12,16 +12,19 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
+use datafusion_catalog::memory::MemorySchemaProvider;
+use datafusion_catalog::CatalogProvider;
 use llkv_fusion::LlkvQueryPlanner;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 use sqlparser::ast::{
     AccessExpr, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType as SqlDataType,
-    Expr as SqlExpr, Ident, ObjectName, ObjectNamePart, Query, Statement, StructField, Subscript,
-    Value, VisitMut, VisitorMut,
+    Expr as SqlExpr, Ident, ObjectName, ObjectNamePart, ObjectType, Query, SchemaName, Statement,
+    StructField, Subscript, Value, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::{DuckDbDialect, GenericDialect};
 use sqlparser::parser::Parser;
@@ -79,8 +82,35 @@ impl SqlEngine {
 
     async fn execute_statement(&self, stmt: Statement) -> Result<SqlStatementResult> {
         match stmt {
+            Statement::CreateSchema {
+                schema_name,
+                if_not_exists,
+                ..
+            } => {
+                self.handle_create_schema(schema_name, if_not_exists)?;
+                Ok(SqlStatementResult::Statement { rows_affected: 0 })
+            }
             Statement::CreateTable(create) => {
                 self.handle_create_table(create).await?;
+                Ok(SqlStatementResult::Statement { rows_affected: 0 })
+            }
+            Statement::Drop {
+                object_type: ObjectType::Table,
+                if_exists,
+                names,
+                ..
+            } => {
+                self.handle_drop_table(names, if_exists)?;
+                Ok(SqlStatementResult::Statement { rows_affected: 0 })
+            }
+            Statement::Drop {
+                object_type: ObjectType::Schema,
+                if_exists,
+                cascade,
+                names,
+                ..
+            } => {
+                self.handle_drop_schema(names, cascade, if_exists)?;
                 Ok(SqlStatementResult::Statement { rows_affected: 0 })
             }
             mut other => {
@@ -96,12 +126,12 @@ impl SqlEngine {
             .ctx
             .sql(sql)
             .await
-            .map_err(|e| Error::Internal(format!("DataFusion planning failed: {}", e)))?;
+            .map_err(|e| map_datafusion_error("DataFusion planning failed", e))?;
 
         let batches = df
             .collect()
             .await
-            .map_err(|e| Error::Internal(format!("DataFusion execution failed: {}", e)))?;
+            .map_err(|e| map_datafusion_error("DataFusion execution failed", e))?;
 
         if batches.is_empty() || batches[0].num_columns() == 0 {
             Ok(SqlStatementResult::Statement { rows_affected: 0 })
@@ -147,13 +177,18 @@ impl SqlEngine {
         let query_sql = query.to_string();
         let df =
             self.ctx.sql(&query_sql).await.map_err(|e| {
-                Error::Internal(format!("CTAS planning failed for {table_name}: {e}"))
+                map_datafusion_error(
+                    &format!("CTAS planning failed for {table_name}"),
+                    e,
+                )
             })?;
         let df_schema = df.schema().clone();
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| Error::Internal(format!("CTAS execution failed for {table_name}: {e}")))?;
+        let batches = df.collect().await.map_err(|e| {
+            map_datafusion_error(
+                &format!("CTAS execution failed for {table_name}"),
+                e,
+            )
+        })?;
         let mut arrow_schema = Schema::from(df_schema);
         if !columns.is_empty() && columns.len() != arrow_schema.fields().len() {
             return Err(Error::Internal(format!(
@@ -234,6 +269,7 @@ impl SqlEngine {
     }
 
     fn register_table(&self, name: &str) -> Result<()> {
+        self.ensure_schema_registered_for_table(name)?;
         if let Some(provider) = self.catalog.get_table(name)? {
             self.ctx
                 .register_table(name, provider)
@@ -245,6 +281,131 @@ impl SqlEngine {
     fn rewrite_struct_field_access(&self, stmt: &mut Statement) -> Result<()> {
         let mut rewriter = StructFieldAccessRewriter::new(&self.ctx);
         rewriter.rewrite(stmt)
+    }
+
+    fn ensure_schema_registered_for_table(&self, table_name: &str) -> Result<()> {
+        if let Some(schema) = extract_schema_from_table_name(table_name) {
+            let catalog = self.default_catalog()?;
+            if catalog.schema(&schema).is_none() {
+                catalog
+                    .register_schema(&schema, Arc::new(MemorySchemaProvider::new()))
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "failed to register schema '{schema}' for table {table_name}: {e}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn default_catalog(&self) -> Result<Arc<dyn CatalogProvider>> {
+        let state = self.ctx.state();
+        let catalog_name = state.config().options().catalog.default_catalog.clone();
+        self.ctx.catalog(&catalog_name).ok_or_else(|| {
+            Error::Internal(format!("default catalog '{catalog_name}' is not available"))
+        })
+    }
+
+    fn handle_create_schema(&self, schema_name: SchemaName, if_not_exists: bool) -> Result<()> {
+        let name = match schema_name {
+            SchemaName::Simple(object_name) => normalize_name(&object_name)?,
+            other => {
+                return Err(Error::Internal(format!(
+                    "CREATE SCHEMA variant '{other}' is not supported yet"
+                )));
+            }
+        };
+
+        let catalog = self.default_catalog()?;
+        if catalog.schema(&name).is_some() {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Internal(format!(
+                "schema '{name}' already exists"
+            )));
+        }
+        catalog
+            .register_schema(&name, Arc::new(MemorySchemaProvider::new()))
+            .map_err(|e| Error::Internal(format!("failed to register schema '{name}': {e}")))?;
+        Ok(())
+    }
+
+    fn handle_drop_schema(
+        &self,
+        names: Vec<ObjectName>,
+        cascade: bool,
+        if_exists: bool,
+    ) -> Result<()> {
+        for name in names {
+            let schema = normalize_name(&name)?;
+            self.drop_schema(&schema, cascade, if_exists)?;
+        }
+        Ok(())
+    }
+
+    fn handle_drop_table(&self, names: Vec<ObjectName>, if_exists: bool) -> Result<()> {
+        for name in names {
+            let table_name = normalize_name(&name)?;
+            match self.catalog.drop_table(&table_name) {
+                Ok(true) => {
+                    let _ = self.ctx.deregister_table(&table_name);
+                }
+                Ok(false) => {
+                    if !if_exists {
+                        return Err(Error::Internal(format!(
+                            "table '{table_name}' does not exist"
+                        )));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_schema(&self, schema: &str, cascade: bool, if_exists: bool) -> Result<()> {
+        let mut tables_to_drop: Vec<String> = self
+            .catalog
+            .list_tables()
+            .into_iter()
+            .filter(|table| match extract_schema_from_table_name(table) {
+                Some(existing_schema) => existing_schema == schema,
+                None => false,
+            })
+            .collect();
+
+        if !tables_to_drop.is_empty() && !cascade {
+            return Err(Error::Internal(format!(
+                "schema '{schema}' is not empty; use DROP SCHEMA ... CASCADE"
+            )));
+        }
+
+        for table in tables_to_drop.drain(..) {
+            if self.catalog.drop_table(&table)? {
+                self.ctx
+                    .deregister_table(&table)
+                    .map_err(|e| Error::Internal(format!("failed to deregister table {table}: {e}")))?;
+            }
+        }
+
+        let catalog = self.default_catalog()?;
+        match catalog.deregister_schema(schema, cascade) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                if if_exists {
+                    Ok(())
+                } else {
+                    Err(Error::Internal(format!(
+                        "schema '{schema}' does not exist"
+                    )))
+                }
+            }
+            Err(e) => Err(Error::Internal(format!(
+                "failed to drop schema '{schema}': {e}"
+            ))),
+        }
     }
 }
 
@@ -261,6 +422,23 @@ fn normalize_name(name: &ObjectName) -> Result<String> {
         parts.push(value);
     }
     Ok(parts.join("."))
+}
+
+fn extract_schema_from_table_name(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(parts[parts.len() - 2].to_string())
+}
+
+fn map_datafusion_error(prefix: &str, err: DataFusionError) -> Error {
+    let msg = err.to_string();
+    let mut decorated = msg.clone();
+    if msg.to_lowercase().contains("not found") {
+        decorated = format!("{msg}; does not exist");
+    }
+    Error::Internal(format!("{prefix}: {decorated}"))
 }
 
 struct StructFieldAccessRewriter<'a> {

@@ -216,6 +216,29 @@ where
         tables.keys().cloned().collect()
     }
 
+    /// Remove a table from the catalog and delete its persisted columns.
+    pub fn drop_table(&self, name: &str) -> LlkvResult<bool> {
+        let metadata = {
+            let tables = self.tables.read().unwrap();
+            tables.get(name).cloned()
+        };
+
+        let Some(metadata) = metadata else {
+            return Ok(false);
+        };
+
+        for field in &metadata.logical_fields {
+            let field_id = LogicalFieldId::from(*field);
+            self.store.remove_column(field_id)?;
+        }
+
+        let mut tables = self.tables.write().unwrap();
+        tables.remove(name);
+        drop(tables);
+        self.persist_metadata()?;
+        Ok(true)
+    }
+
     /// Get the underlying column store.
     pub fn store(&self) -> &Arc<ColumnStore<P>> {
         &self.store
