@@ -405,3 +405,116 @@ impl QueryPlanner for LlkvQueryPlanner {
             .await
     }
 }
+
+#[cfg(test)]
+mod persistence_tests {
+    use arrow::array::{Int32Array, StringArray, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use arrow::util::pretty::pretty_format_batches;
+    use datafusion::prelude::SessionContext;
+    use llkv_storage::pager::MemPager;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn table_persists_across_scopes() {
+        use llkv_table::catalog::TableCatalog;
+
+        // Outer scope: create a persistent pager that will outlive the table creation
+        let pager = Arc::new(MemPager::default());
+        
+        // Inner scope 1: Create table schema, insert data, then drop everything except pager
+        {
+            let catalog = TableCatalog::open(Arc::clone(&pager)).expect("open catalog");
+            
+            let users_schema = Arc::new(Schema::new(vec![
+                Field::new("user_id", DataType::UInt64, false),
+                Field::new("username", DataType::Utf8, false),
+                Field::new("age", DataType::Int32, false),
+            ]));
+            
+            let users_batch = RecordBatch::try_new(
+                users_schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(vec![1_u64, 2, 3, 4])),
+                    Arc::new(StringArray::from(vec!["alice", "bob", "carol", "dave"])),
+                    Arc::new(Int32Array::from(vec![30, 25, 35, 28])),
+                ],
+            )
+            .expect("users batch");
+            
+            let mut users_builder = catalog
+                .create_table("users", users_schema)
+                .expect("create users table");
+            
+            users_builder
+                .append_batch(&users_batch)
+                .expect("users append");
+            
+            let users_provider = users_builder.finish().expect("users provider");
+            
+            // Update catalog with the new row IDs (1, 2, 3, 4)
+            let new_row_ids: Vec<u64> = (1..=users_batch.num_rows() as u64).collect();
+            catalog
+                .update_table_rows("users", new_row_ids)
+                .expect("update row ids");
+            
+            // Verify the data is immediately queryable
+            let ctx = SessionContext::new();
+            ctx.register_table("users", Arc::new(users_provider))
+                .expect("register users");
+            
+            let df = ctx
+                .sql("SELECT COUNT(*) as cnt FROM users")
+                .await
+                .expect("count sql");
+            
+            let results = df.collect().await.expect("count collect");
+            let formatted = pretty_format_batches(&results).expect("format").to_string();
+            assert!(formatted.contains("| 4"));
+            
+            // Everything except `pager` drops here - catalog metadata is persisted
+        }
+        
+        // Inner scope 2: Reopen the catalog with the same pager and verify data persists
+        {
+            let catalog = TableCatalog::open(Arc::clone(&pager)).expect("reopen catalog");
+            
+            // List tables to verify it was persisted
+            let tables = catalog.list_tables();
+            assert!(tables.contains(&"users".to_string()), "users table should be in catalog");
+            
+            // Get the table provider - this reconstructs it from persisted metadata
+            let users_provider = catalog
+                .get_table("users")
+                .expect("get users table")
+                .expect("users table should exist");
+            
+            // Query the table through DataFusion
+            let ctx = SessionContext::new();
+            ctx.register_table("users", users_provider)
+                .expect("register users");
+            
+            let df = ctx
+                .sql("SELECT username, age FROM users WHERE age > 27 ORDER BY username")
+                .await
+                .expect("sql");
+            
+            let results = df.collect().await.expect("collect");
+            let formatted = pretty_format_batches(&results).expect("format").to_string();
+            
+            let expected = vec![
+                "+----------+-----+",
+                "| username | age |",
+                "+----------+-----+",
+                "| alice    | 30  |",
+                "| carol    | 35  |",
+                "| dave     | 28  |",
+                "+----------+-----+",
+            ]
+            .join("\n");
+            
+            assert_eq!(formatted.trim(), expected.trim());
+        }
+    }
+}

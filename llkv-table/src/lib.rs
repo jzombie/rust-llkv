@@ -15,6 +15,10 @@
 //!   [`MemorySourceConfig`].
 //! - [`LlkvQueryPlanner`]: intercepts `DELETE` statements during physical
 //!   planning and executes them through LLKV's storage layer.
+//! - [`catalog::TableCatalog`]: persistent catalog for table metadata, allowing
+//!   tables to be discovered and reconstructed across process restarts.
+
+pub mod catalog;
 
 use std::any::Any;
 use std::fmt;
