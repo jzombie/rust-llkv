@@ -10,10 +10,10 @@ use arrow::datatypes::ArrowPrimitiveType;
 use arrow::error::Result as ArrowResult;
 
 use crate::parallel;
+use crate::predicate::{Predicate, PredicateValue};
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
 use crate::types::{LogicalFieldId, RowId};
-use llkv_expr::typed_predicate::{Predicate, PredicateValue};
 use llkv_result::{Error, Result};
 use simd_r_drive_entry_handle::EntryHandle;
 

@@ -2135,7 +2135,6 @@ dependencies = [
  "arrow-ord",
  "criterion",
  "line-ending",
- "llkv-expr",
  "llkv-result",
  "llkv-storage",
  "llkv-test-utils",
@@ -2147,16 +2146,6 @@ dependencies = [
  "simd-r-drive-entry-handle",
  "thiserror",
  "tracing",
-]
-
-[[package]]
-name = "llkv-expr"
-version = "0.8.2-alpha"
-dependencies = [
- "arrow",
- "arrow-array",
- "arrow-buffer",
- "llkv-test-utils",
 ]
 
 [[package]]

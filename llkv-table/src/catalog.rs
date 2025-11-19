@@ -143,11 +143,7 @@ where
     ///
     /// Returns an error if a table with this name already exists or if the
     /// schema contains unsupported data types.
-    pub fn create_table(
-        &self,
-        name: &str,
-        schema: SchemaRef,
-    ) -> LlkvResult<LlkvTableBuilder<P>> {
+    pub fn create_table(&self, name: &str, schema: SchemaRef) -> LlkvResult<LlkvTableBuilder<P>> {
         // Check if table already exists
         {
             let tables = self.tables.read().unwrap();
@@ -236,9 +232,9 @@ where
     /// data.
     pub fn update_table_rows(&self, name: &str, new_row_ids: Vec<RowId>) -> LlkvResult<()> {
         let mut tables = self.tables.write().unwrap();
-        let metadata = tables
-            .get_mut(name)
-            .ok_or_else(|| LlkvError::InvalidArgumentError(format!("table '{}' not found", name)))?;
+        let metadata = tables.get_mut(name).ok_or_else(|| {
+            LlkvError::InvalidArgumentError(format!("table '{}' not found", name))
+        })?;
 
         metadata.row_ids.extend(new_row_ids);
         drop(tables);
@@ -301,9 +297,8 @@ where
                                 tables.insert(metadata.table_name.clone(), metadata);
                             }
 
-                            *self.next_table_id.write().unwrap() = max_table_id
-                                .checked_add(1)
-                                .unwrap_or_else(|| {
+                            *self.next_table_id.write().unwrap() =
+                                max_table_id.checked_add(1).unwrap_or_else(|| {
                                     // If we overflow, just use max value
                                     u16::MAX
                                 });

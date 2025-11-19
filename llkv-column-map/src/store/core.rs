@@ -1,4 +1,5 @@
 use super::*;
+use crate::predicate::Predicate;
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
@@ -10,7 +11,6 @@ use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use llkv_expr::typed_predicate::Predicate;
 use llkv_result::{Error, Result};
 use llkv_storage::{
     constants::CATALOG_ROOT_PKEY,

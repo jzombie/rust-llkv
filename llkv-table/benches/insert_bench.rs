@@ -23,13 +23,13 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use arrow::array::{
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use llkv_column_map::store::ColumnStore;
 use llkv_storage::pager::MemPager;
@@ -71,10 +71,18 @@ fn build_batch(schema: &Arc<Schema>, start: usize, end: usize) -> RecordBatch {
     let col_u64_2: Vec<u64> = (start..end).map(|i| (i as u64) * 13).collect();
     let col_i64_1: Vec<i64> = (start..end).map(|i| (i as i64) * 11).collect();
     let col_i64_2: Vec<i64> = (start..end).map(|i| (i as i64) * 17).collect();
-    let col_u32_1: Vec<u32> = (start..end).map(|i| ((i * 19) & 0xFFFFFFFF) as u32).collect();
-    let col_u32_2: Vec<u32> = (start..end).map(|i| ((i * 23) & 0xFFFFFFFF) as u32).collect();
-    let col_i32_1: Vec<i32> = (start..end).map(|i| ((i * 29) & 0x7FFFFFFF) as i32).collect();
-    let col_i32_2: Vec<i32> = (start..end).map(|i| ((i * 31) & 0x7FFFFFFF) as i32).collect();
+    let col_u32_1: Vec<u32> = (start..end)
+        .map(|i| ((i * 19) & 0xFFFFFFFF) as u32)
+        .collect();
+    let col_u32_2: Vec<u32> = (start..end)
+        .map(|i| ((i * 23) & 0xFFFFFFFF) as u32)
+        .collect();
+    let col_i32_1: Vec<i32> = (start..end)
+        .map(|i| ((i * 29) & 0x7FFFFFFF) as i32)
+        .collect();
+    let col_i32_2: Vec<i32> = (start..end)
+        .map(|i| ((i * 31) & 0x7FFFFFFF) as i32)
+        .collect();
     let col_u16_1: Vec<u16> = (start..end).map(|i| ((i * 37) & 0xFFFF) as u16).collect();
     let col_u16_2: Vec<u16> = (start..end).map(|i| ((i * 41) & 0xFFFF) as u16).collect();
     let col_i16_1: Vec<i16> = (start..end).map(|i| ((i * 43) & 0x7FFF) as i16).collect();
