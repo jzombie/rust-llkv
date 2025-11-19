@@ -1,45 +1,34 @@
 //! DataFusion integration helpers for LLKV storage.
 //!
 //! This crate wires [`llkv-column-map`] and [`llkv-storage`] into a
-//! [`datafusion`] [`TableProvider`] so DataFusion's query engine can operate
-//! directly on LLKV's persisted columnar data. The integration is intentionally
-//! minimal—writes flow through [`ColumnStore::append`], while reads rely on the
-//! store's projection utilities to materialize [`RecordBatch`]es for DataFusion.
+//! [`datafusion`] [`datafusion::datasource::TableProvider`] so DataFusion's
+//! query engine can operate directly on LLKV's persisted columnar data. The
+//! integration is intentionally minimal—writes flow through
+//! [`llkv_column_map::store::ColumnStore::append`], while reads rely on the
+//! store's projection utilities to materialize
+//! [`arrow::record_batch::RecordBatch`]es for DataFusion.
 //!
 //! The primary entry points are:
-//! - [`LlkvTableBuilder`]: registers logical columns inside a [`ColumnStore`],
+//! - [`LlkvTableBuilder`]: registers logical columns inside a
+//!   [`llkv_column_map::store::ColumnStore`],
 //!   appends Arrow batches (with automatic `rowid` management), and tracks the
 //!   row IDs that back each insert.
-//! - [`LlkvTableProvider`]: implements DataFusion's [`TableProvider`] by
-//!   gathering LLKV rows in scan-sized chunks and surfacing them through a
-//!   [`MemorySourceConfig`].
+//! - [`LlkvTableProvider`]: implements DataFusion's
+//!   [`datafusion::datasource::TableProvider`] by gathering LLKV rows in
+//!   scan-sized chunks and surfacing them through a
+//!   [`datafusion_datasource::memory::MemorySourceConfig`].
 //! - [`LlkvQueryPlanner`]: intercepts `DELETE` statements during physical
 //!   planning and executes them through LLKV's storage layer.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, UInt64Builder};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use datafusion::catalog::Session;
-use datafusion::common::stats::{Precision, Statistics};
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
-use datafusion::datasource::{TableProvider, TableType};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::execution::context::QueryPlanner;
-use datafusion::logical_expr::{DmlStatement, Expr, LogicalPlan, TableProviderFilterPushDown};
+use datafusion::logical_expr::{DmlStatement, LogicalPlan};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use datafusion_datasource::memory::MemorySourceConfig;
-use llkv_column_map::store::{
-    ColumnStore, FIELD_ID_META_KEY, GatherNullPolicy, ROW_ID_COLUMN_NAME,
-};
-use llkv_column_map::types::{LogicalFieldId, RowId, TableId};
-use llkv_result::{Error as LlkvError, Result as LlkvResult};
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
 
 pub use llkv_table::{LlkvTableBuilder, LlkvTableProvider};
 
@@ -47,10 +36,13 @@ pub use llkv_table::{LlkvTableBuilder, LlkvTableProvider};
 mod tests {
     use super::*;
     use arrow::array::{Int32Array, StringArray, UInt64Array};
-    use datafusion::prelude::SessionContext;
-    use llkv_storage::pager::MemPager;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use arrow::util::pretty::pretty_format_batches;
-    
+    use datafusion::prelude::SessionContext;
+    use llkv_column_map::store::ColumnStore;
+    use llkv_storage::pager::MemPager;
+
     fn build_demo_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::UInt64, false),
@@ -173,9 +165,8 @@ mod tests {
         )
         .expect("products batch");
 
-        let mut products_builder =
-            LlkvTableBuilder::new(Arc::clone(&store), 1, products_schema)
-                .expect("products builder");
+        let mut products_builder = LlkvTableBuilder::new(Arc::clone(&store), 1, products_schema)
+            .expect("products builder");
         products_builder
             .append_batch(&products_batch)
             .expect("products append");
@@ -197,9 +188,8 @@ mod tests {
         )
         .expect("inventory batch");
 
-        let mut inventory_builder =
-            LlkvTableBuilder::new(Arc::clone(&store), 2, inventory_schema)
-                .expect("inventory builder");
+        let mut inventory_builder = LlkvTableBuilder::new(Arc::clone(&store), 2, inventory_schema)
+            .expect("inventory builder");
         inventory_builder
             .append_batch(&inventory_batch)
             .expect("inventory append");
@@ -207,7 +197,7 @@ mod tests {
 
         // Set up catalog hierarchy: my_catalog -> schema1, schema2
         let ctx = SessionContext::new();
-        
+
         let catalog = Arc::new(MemoryCatalogProvider::new());
         let schema1 = Arc::new(MemorySchemaProvider::new());
         let schema2 = Arc::new(MemorySchemaProvider::new());
@@ -239,7 +229,9 @@ mod tests {
             .await
             .expect("simple sql");
         let simple_results = df_simple.collect().await.expect("simple collect");
-        let simple_formatted = pretty_format_batches(&simple_results).expect("format").to_string();
+        let simple_formatted = pretty_format_batches(&simple_results)
+            .expect("format")
+            .to_string();
 
         let simple_expected = vec![
             "+-----------+-------+",
@@ -290,7 +282,9 @@ mod tests {
             .await
             .expect("fully qualified sql");
         let results2 = df2.collect().await.expect("collect");
-        let formatted2 = pretty_format_batches(&results2).expect("format").to_string();
+        let formatted2 = pretty_format_batches(&results2)
+            .expect("format")
+            .to_string();
 
         let expected2 = vec![
             "+-------+",
@@ -330,7 +324,7 @@ mod tests {
             .sql("DELETE FROM llkv_demo WHERE user_id = 2")
             .await
             .expect("DELETE planning");
-        
+
         // This will panic with todo!() - demonstrating interception works
         let _results = delete_df.collect().await.unwrap();
     }
@@ -422,17 +416,17 @@ mod persistence_tests {
 
         // Outer scope: create a persistent pager that will outlive the table creation
         let pager = Arc::new(MemPager::default());
-        
+
         // Inner scope 1: Create table schema, insert data, then drop everything except pager
         {
             let catalog = TableCatalog::open(Arc::clone(&pager)).expect("open catalog");
-            
+
             let users_schema = Arc::new(Schema::new(vec![
                 Field::new("user_id", DataType::UInt64, false),
                 Field::new("username", DataType::Utf8, false),
                 Field::new("age", DataType::Int32, false),
             ]));
-            
+
             let users_batch = RecordBatch::try_new(
                 users_schema.clone(),
                 vec![
@@ -442,67 +436,70 @@ mod persistence_tests {
                 ],
             )
             .expect("users batch");
-            
+
             let mut users_builder = catalog
                 .create_table("users", users_schema)
                 .expect("create users table");
-            
+
             users_builder
                 .append_batch(&users_batch)
                 .expect("users append");
-            
+
             let users_provider = users_builder.finish().expect("users provider");
-            
+
             // Update catalog with the new row IDs (1, 2, 3, 4)
             let new_row_ids: Vec<u64> = (1..=users_batch.num_rows() as u64).collect();
             catalog
                 .update_table_rows("users", new_row_ids)
                 .expect("update row ids");
-            
+
             // Verify the data is immediately queryable
             let ctx = SessionContext::new();
             ctx.register_table("users", Arc::new(users_provider))
                 .expect("register users");
-            
+
             let df = ctx
                 .sql("SELECT COUNT(*) as cnt FROM users")
                 .await
                 .expect("count sql");
-            
+
             let results = df.collect().await.expect("count collect");
             let formatted = pretty_format_batches(&results).expect("format").to_string();
             assert!(formatted.contains("| 4"));
-            
+
             // Everything except `pager` drops here - catalog metadata is persisted
         }
-        
+
         // Inner scope 2: Reopen the catalog with the same pager and verify data persists
         {
             let catalog = TableCatalog::open(Arc::clone(&pager)).expect("reopen catalog");
-            
+
             // List tables to verify it was persisted
             let tables = catalog.list_tables();
-            assert!(tables.contains(&"users".to_string()), "users table should be in catalog");
-            
+            assert!(
+                tables.contains(&"users".to_string()),
+                "users table should be in catalog"
+            );
+
             // Get the table provider - this reconstructs it from persisted metadata
             let users_provider = catalog
                 .get_table("users")
                 .expect("get users table")
                 .expect("users table should exist");
-            
+
             // Query the table through DataFusion
             let ctx = SessionContext::new();
             ctx.register_table("users", users_provider)
                 .expect("register users");
-            
+
             let df = ctx
                 .sql("SELECT username, age FROM users WHERE age > 27 ORDER BY username")
                 .await
                 .expect("sql");
-            
+
             let results = df.collect().await.expect("collect");
             let formatted = pretty_format_batches(&results).expect("format").to_string();
-            
+
             let expected = vec![
                 "+----------+-----+",
                 "| username | age |",
@@ -513,7 +510,7 @@ mod persistence_tests {
                 "+----------+-----+",
             ]
             .join("\n");
-            
+
             assert_eq!(formatted.trim(), expected.trim());
         }
     }
@@ -530,10 +527,9 @@ mod persistence_tests {
         let inventory_path = temp_dir.path().join("inventory.db");
 
         // Pager 1 - sales database with orders table
-        let sales_pager = Arc::new(
-            SimdRDrivePager::open(&sales_path).expect("open sales pager"),
-        );
-        let sales_catalog = TableCatalog::open(Arc::clone(&sales_pager)).expect("open sales catalog");
+        let sales_pager = Arc::new(SimdRDrivePager::open(&sales_path).expect("open sales pager"));
+        let sales_catalog =
+            TableCatalog::open(Arc::clone(&sales_pager)).expect("open sales catalog");
 
         let orders_schema = Arc::new(Schema::new(vec![
             Field::new("order_id", DataType::UInt64, false),
@@ -569,9 +565,8 @@ mod persistence_tests {
             .expect("update orders rows");
 
         // Pager 2 - inventory database with products table
-        let inventory_pager = Arc::new(
-            SimdRDrivePager::open(&inventory_path).expect("open inventory pager"),
-        );
+        let inventory_pager =
+            Arc::new(SimdRDrivePager::open(&inventory_path).expect("open inventory pager"));
         let inventory_catalog =
             TableCatalog::open(Arc::clone(&inventory_pager)).expect("open inventory catalog");
 
@@ -631,8 +626,9 @@ mod persistence_tests {
             .expect("query orders");
 
         let orders_results = orders_df.collect().await.expect("collect orders");
-        let orders_formatted =
-            pretty_format_batches(&orders_results).expect("format orders").to_string();
+        let orders_formatted = pretty_format_batches(&orders_results)
+            .expect("format orders")
+            .to_string();
 
         let expected_orders = vec![
             "+----------+----------+",
@@ -705,8 +701,7 @@ mod persistence_tests {
         drop(sales_catalog);
         drop(inventory_catalog);
 
-        let sales_catalog_reopened =
-            TableCatalog::open(sales_pager).expect("reopen sales catalog");
+        let sales_catalog_reopened = TableCatalog::open(sales_pager).expect("reopen sales catalog");
         let inventory_catalog_reopened =
             TableCatalog::open(inventory_pager).expect("reopen inventory catalog");
 
