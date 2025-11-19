@@ -15,8 +15,8 @@ use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use datafusion_catalog::memory::MemorySchemaProvider;
 use datafusion_catalog::CatalogProvider;
+use datafusion_catalog::memory::MemorySchemaProvider;
 use llkv_fusion::LlkvQueryPlanner;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
@@ -128,13 +128,14 @@ impl SqlEngine {
             .sql(sql)
             .await
             .map_err(|e| map_datafusion_error("DataFusion planning failed", e))?;
+        let schema_is_empty = df.schema().fields().is_empty();
 
         let batches = df
             .collect()
             .await
             .map_err(|e| map_datafusion_error("DataFusion execution failed", e))?;
 
-        if batches.is_empty() || batches[0].num_columns() == 0 {
+        if schema_is_empty {
             Ok(SqlStatementResult::Statement { rows_affected: 0 })
         } else {
             Ok(SqlStatementResult::Query { batches })
@@ -176,19 +177,12 @@ impl SqlEngine {
         query: Query,
     ) -> Result<()> {
         let query_sql = query.to_string();
-        let df =
-            self.ctx.sql(&query_sql).await.map_err(|e| {
-                map_datafusion_error(
-                    &format!("CTAS planning failed for {table_name}"),
-                    e,
-                )
-            })?;
+        let df = self.ctx.sql(&query_sql).await.map_err(|e| {
+            map_datafusion_error(&format!("CTAS planning failed for {table_name}"), e)
+        })?;
         let df_schema = df.schema().clone();
         let batches = df.collect().await.map_err(|e| {
-            map_datafusion_error(
-                &format!("CTAS execution failed for {table_name}"),
-                e,
-            )
+            map_datafusion_error(&format!("CTAS execution failed for {table_name}"), e)
         })?;
         let mut arrow_schema = Schema::from(df_schema);
         if !columns.is_empty() && columns.len() != arrow_schema.fields().len() {
@@ -323,9 +317,7 @@ impl SqlEngine {
             if if_not_exists {
                 return Ok(());
             }
-            return Err(Error::Internal(format!(
-                "schema '{name}' already exists"
-            )));
+            return Err(Error::Internal(format!("schema '{name}' already exists")));
         }
         catalog
             .register_schema(&name, Arc::new(MemorySchemaProvider::new()))
@@ -385,9 +377,9 @@ impl SqlEngine {
 
         for table in tables_to_drop.drain(..) {
             if self.catalog.drop_table(&table)? {
-                self.ctx
-                    .deregister_table(&table)
-                    .map_err(|e| Error::Internal(format!("failed to deregister table {table}: {e}")))?;
+                self.ctx.deregister_table(&table).map_err(|e| {
+                    Error::Internal(format!("failed to deregister table {table}: {e}"))
+                })?;
             }
         }
 
@@ -398,9 +390,7 @@ impl SqlEngine {
                 if if_exists {
                     Ok(())
                 } else {
-                    Err(Error::Internal(format!(
-                        "schema '{schema}' does not exist"
-                    )))
+                    Err(Error::Internal(format!("schema '{schema}' does not exist")))
                 }
             }
             Err(e) => Err(Error::Internal(format!(
@@ -495,8 +485,7 @@ impl<'a> SqlAstRewriter<'a> {
             let root_idents: Vec<Ident> = ids[..=prefix_len].to_vec();
             let mut access_chain = Vec::with_capacity(nested_fields.len());
             for field_name in nested_fields {
-                let literal =
-                    SqlExpr::Value(Value::SingleQuotedString(field_name.clone()).into());
+                let literal = SqlExpr::Value(Value::SingleQuotedString(field_name.clone()).into());
                 access_chain.push(AccessExpr::Subscript(Subscript::Index { index: literal }));
             }
 
@@ -515,15 +504,13 @@ impl<'a> VisitorMut for SqlAstRewriter<'a> {
 
     fn post_visit_expr(&mut self, expr: &mut SqlExpr) -> ControlFlow<Self::Break> {
         match expr {
-            SqlExpr::CompoundIdentifier(ids) => {
-                match self.rewrite_compound_identifier(ids) {
-                    Ok(Some(new_expr)) => {
-                        *expr = new_expr;
-                    }
-                    Ok(None) => {}
-                    Err(err) => return ControlFlow::Break(err),
+            SqlExpr::CompoundIdentifier(ids) => match self.rewrite_compound_identifier(ids) {
+                Ok(Some(new_expr)) => {
+                    *expr = new_expr;
                 }
-            }
+                Ok(None) => {}
+                Err(err) => return ControlFlow::Break(err),
+            },
             SqlExpr::InList { list, negated, .. } if list.is_empty() => {
                 let value = Value::Boolean(*negated);
                 *expr = SqlExpr::Value(value.into());
@@ -591,6 +578,45 @@ mod tests {
                 assert!(!array.value(0));
             }
             other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_empty_in_list_behaves_like_sqlite() {
+        let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+        let engine = SqlEngine::new(pager).expect("sql engine");
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(async {
+            engine
+                .execute("CREATE TABLE t1(x INTEGER, y TEXT);")
+                .await
+                .expect("create table");
+            engine
+                .execute("INSERT INTO t1 VALUES (1, 'true');")
+                .await
+                .expect("insert row");
+        });
+        let mut in_results = rt
+            .block_on(engine.execute("SELECT 1 FROM t1 WHERE 1 IN (2)"))
+            .expect("execute in");
+        assert_eq!(in_results.len(), 1);
+        match in_results.pop().unwrap() {
+            SqlStatementResult::Query { batches } => {
+                assert!(batches.iter().all(|b| b.num_rows() == 0));
+            }
+            other => panic!("unexpected IN result: {other:?}"),
+        }
+
+        let mut not_in_results = rt
+            .block_on(engine.execute("SELECT 1 FROM t1 WHERE 1 NOT IN (2)"))
+            .expect("execute not in");
+        assert_eq!(not_in_results.len(), 1);
+        match not_in_results.pop().unwrap() {
+            SqlStatementResult::Query { batches } => {
+                assert_eq!(batches.len(), 1);
+                assert_eq!(batches[0].num_rows(), 1);
+            }
+            other => panic!("unexpected NOT IN result: {other:?}"),
         }
     }
 }
