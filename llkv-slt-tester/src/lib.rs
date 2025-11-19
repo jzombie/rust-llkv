@@ -15,6 +15,7 @@
 //! - [`run_slt_harness`] and [`run_slt_harness_with_args`] for test discovery and execution
 //! - [`make_in_memory_factory_factory`] for creating in-memory test backends
 
+mod datafusion_harness;
 mod parser;
 mod runner;
 mod slt_test_engine;
@@ -26,8 +27,11 @@ pub use runner::{LlkvSltRunner, RuntimeKind};
 pub use runner::{run_slt_harness, run_slt_harness_with_args};
 pub use slt_test_engine::make_in_memory_factory_factory;
 
+// DataFusion harness API
+pub use datafusion_harness::{make_datafusion_factory, DataFusionHarness};
+
 // Statistics API
-pub use slt_test_engine::{QueryStats, enable_stats, take_stats};
+pub use slt_test_engine::{enable_stats, take_stats, QueryStats};
 
 // Parser utilities - only exported for testing purposes
 pub use parser::expand_loops_with_mapping;
