@@ -1,5 +1,3 @@
-#![recursion_limit = "65536"]
-
 //! DataFusion integration helpers for LLKV storage.
 //!
 //! This crate wires LLKV storage engines into [`datafusion`] [`TableProvider`]s.
