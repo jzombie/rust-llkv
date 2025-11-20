@@ -20,6 +20,7 @@ use crate::gather::{
     gather_rows_single_shot_string as shared_gather_rows_single_shot_string,
     gather_rows_single_shot_struct as shared_gather_rows_single_shot_struct,
 };
+use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::types::{LogicalFieldId, RowId};
 use arrow::array::{ArrayRef, OffsetSizeTrait, new_empty_array};
@@ -28,7 +29,6 @@ use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, GetResult, Pager},
-    serialization::deserialize_array,
     types::PhysicalKey,
 };
 use rustc_hash::{FxHashMap, FxHashSet};

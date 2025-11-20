@@ -11,6 +11,7 @@ use arrow::error::Result as ArrowResult;
 
 use crate::parallel;
 use crate::predicate::{Predicate, PredicateValue};
+use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
 use crate::types::{LogicalFieldId, RowId};
@@ -23,7 +24,7 @@ use super::{
 };
 use crate::store::ColumnStore;
 use llkv_storage::pager::{BatchGet, GetResult, Pager};
-use llkv_storage::serialization::deserialize_array;
+
 use rayon::prelude::*;
 
 // Packed bitset used by fused string predicate evaluation. Stores bits in u64 words

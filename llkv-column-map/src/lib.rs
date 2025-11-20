@@ -442,9 +442,11 @@ pub fn ensure_supported_arrow_type(dtype: &arrow::datatypes::DataType) -> Result
     )))
 }
 
+pub mod codecs;
 pub mod gather;
 pub mod parallel;
 pub mod predicate;
+pub mod serialization;
 pub mod store;
 pub mod types;
 
