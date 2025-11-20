@@ -138,14 +138,14 @@ fn bench_write(compression: Compression, _compression_name: &str) -> (usize, usi
         // Calculate approximate input size
         total_input_bytes += batch_with_mvcc.get_array_memory_size();
 
-        store.append(table_id, batch_with_mvcc).unwrap();
+        store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
     }
 
     // Calculate total storage size
     let keys = pager.enumerate_keys().unwrap();
     let mut total_storage_bytes = 0;
     for &key in &keys {
-        use llkv_storage::pager::{BatchGet, GetResult, Pager};
+        use llkv_storage::pager::{BatchGet, GetResult};
         if let Some(GetResult::Raw { bytes, .. }) =
             pager.batch_get(&[BatchGet::Raw { key }]).unwrap().first()
         {
@@ -170,7 +170,7 @@ fn bench_read(compression: Compression) -> usize {
         let start_row = (batch_idx * BATCH_SIZE) as u64;
         let batch = generate_batch(schema.clone(), start_row, BATCH_SIZE);
         let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
-        store.append(table_id, batch_with_mvcc).unwrap();
+        store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
     }
 
     // Read all data back

@@ -35,7 +35,7 @@ fn test_end_to_end_workflow() {
     .unwrap();
 
     let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
-    store.append(table_id, batch_with_mvcc).unwrap();
+    store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
 
     // Read back
     let results = store.scan_visible(table_id, 1, None).unwrap();
@@ -67,7 +67,7 @@ fn test_multiple_appends() {
     .unwrap();
 
     let batch1_mvcc = add_mvcc_columns(batch1, 1).unwrap();
-    store.append(table_id, batch1_mvcc).unwrap();
+    store.append_many(table_id, vec![batch1_mvcc]).unwrap();
 
     // Append second batch
     let batch2 = RecordBatch::try_new(
@@ -80,7 +80,7 @@ fn test_multiple_appends() {
     .unwrap();
 
     let batch2_mvcc = add_mvcc_columns(batch2, 2).unwrap();
-    store.append(table_id, batch2_mvcc).unwrap();
+    store.append_many(table_id, vec![batch2_mvcc]).unwrap();
 
     // Read all data
     let results = store.scan_visible(table_id, 2, None).unwrap();
@@ -115,7 +115,7 @@ fn test_persistence_across_reopens() {
         .unwrap();
 
         let batch_mvcc = add_mvcc_columns(batch, 1).unwrap();
-        store.append(tid, batch_mvcc).unwrap();
+        store.append_many(tid, vec![batch_mvcc]).unwrap();
 
         tid
     };

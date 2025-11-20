@@ -48,7 +48,7 @@ fn main() -> llkv_result::Result<()> {
 
         // Create table and append data
         let table_id = store.create_table("test", schema.clone())?;
-        store.append(table_id, batch_with_mvcc.clone())?;
+        store.append_many(table_id, vec![batch_with_mvcc.clone()])?;
 
         // Get all keys and calculate total size
         let keys = pager.enumerate_keys()?;

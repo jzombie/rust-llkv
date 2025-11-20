@@ -63,7 +63,7 @@ fn test_gc_after_appends() {
         .unwrap();
 
         let batch_with_mvcc = llkv_parquet_store::add_mvcc_columns(batch, 1).unwrap();
-        store.append(table_id, batch_with_mvcc).unwrap();
+        store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
     }
 
     // All keys are reachable, no garbage
@@ -99,7 +99,7 @@ fn test_gc_after_table_drop() {
         .unwrap();
 
         let batch_with_mvcc = llkv_parquet_store::add_mvcc_columns(batch, 1).unwrap();
-        store.append(table_id, batch_with_mvcc).unwrap();
+        store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
     }
 
     // Before drop: catalog + 2 files
@@ -141,7 +141,7 @@ fn test_gc_multiple_tables() {
         )
         .unwrap();
         let batch_with_mvcc = llkv_parquet_store::add_mvcc_columns(batch, 1).unwrap();
-        store.append(t1, batch_with_mvcc).unwrap();
+        store.append_many(t1, vec![batch_with_mvcc]).unwrap();
     }
 
     // Create table2 with 1 file
@@ -155,7 +155,7 @@ fn test_gc_multiple_tables() {
     )
     .unwrap();
     let batch_with_mvcc = llkv_parquet_store::add_mvcc_columns(batch, 1).unwrap();
-    store.append(t2, batch_with_mvcc).unwrap();
+    store.append_many(t2, vec![batch_with_mvcc]).unwrap();
 
     // Should have catalog + 3 files, no garbage
     let freed = store.garbage_collect().unwrap();
@@ -198,7 +198,7 @@ fn test_gc_simulated_leak() {
     )
     .unwrap();
     let batch_with_mvcc = llkv_parquet_store::add_mvcc_columns(batch, 1).unwrap();
-    store.append(table_id, batch_with_mvcc).unwrap();
+    store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
 
     // Simulate a leaked key by manually writing to the pager
     // (e.g., from a crashed transaction that allocated but never cataloged)

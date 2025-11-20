@@ -28,11 +28,18 @@ tokio = { workspace = true, features = ["rt"] }
 # Utilities
 rustc-hash = { workspace = true }
 simd-r-drive-entry-handle = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 criterion = { workspace = true }
+simsimd = "6.5.5"
+rand = { workspace = true }
 
 [[bench]]
 name = "compression_bench"
+harness = false
+
+[[bench]]
+name = "vector_bench"
 harness = false

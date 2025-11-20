@@ -92,7 +92,7 @@ where
 
     /// Set a new writer configuration.
     ///
-    /// This affects all subsequent `append()` operations.
+    /// This affects all subsequent `append_many()` operations.
     pub fn set_writer_config(&mut self, config: WriterConfig) {
         self.writer_config = config;
     }
@@ -125,42 +125,73 @@ where
         Ok(table_id)
     }
 
-    /// Append a RecordBatch to a table.
+    /// Append multiple RecordBatches to a table in a single transaction.
     ///
-    /// This writes the batch to a new Parquet file and updates the catalog.
-    /// MVCC columns (`created_by`, `deleted_by`) should already be present
-    /// in the batch.
-    pub fn append(&self, table_id: TableId, batch: RecordBatch) -> Result<()> {
-        // Write Parquet to memory using configured compression
-        let parquet_bytes =
-            crate::writer::write_parquet_to_memory_with_config(&batch, &self.writer_config)?;
+    /// This is more efficient than calling `append()` multiple times because
+    /// it only saves the catalog once at the end. Parquet encoding is parallelized
+    /// across batches using Rayon.
+    pub fn append_many(&self, table_id: TableId, batches: Vec<RecordBatch>) -> Result<()> {
+        if batches.is_empty() {
+            return Ok(());
+        }
 
-        // Allocate a key from the pager
-        let file_ids = self.pager.alloc_many(1)?;
-        let file_id = file_ids[0];
+        // Allocate all keys upfront
+        let file_ids = self.pager.alloc_many(batches.len())?;
 
-        // Store in pager
-        self.pager.batch_put(&[BatchPut::Raw {
-            key: file_id,
-            bytes: parquet_bytes.into(),
-        }])?;
+        // Parallelize Parquet encoding across all batches using Rayon
+        use rayon::prelude::*;
+        let results: Vec<_> = batches
+            .par_iter()
+            .zip(file_ids.par_iter())
+            .map(|(batch, file_id)| {
+                // Write Parquet to memory using configured compression
+                let parquet_bytes =
+                    crate::writer::write_parquet_to_memory_with_config(batch, &self.writer_config)?;
 
-        // Extract row ID range from batch
-        let (min_row_id, max_row_id) = extract_row_id_range(&batch)?;
+                // Extract row ID range from batch
+                let (min_row_id, max_row_id) = extract_row_id_range(batch)?;
 
-        // Update catalog
-        {
-            let mut catalog = self.catalog.write().unwrap();
-            let file_ref = ParquetFileRef {
+                Ok::<_, Error>((
+                    *file_id,
+                    parquet_bytes,
+                    batch.num_rows(),
+                    min_row_id,
+                    max_row_id,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Build puts and file refs from results
+        let mut puts = Vec::with_capacity(results.len());
+        let mut file_refs = Vec::with_capacity(results.len());
+
+        for (file_id, parquet_bytes, row_count, min_row_id, max_row_id) in results {
+            puts.push(BatchPut::Raw {
+                key: file_id,
+                bytes: parquet_bytes.into(),
+            });
+
+            file_refs.push(ParquetFileRef {
                 physical_key: file_id,
-                row_count: batch.num_rows() as u64,
+                row_count: row_count as u64,
                 min_row_id,
                 max_row_id,
                 column_stats: None, // TODO: Extract from Parquet metadata
-            };
-            catalog.add_file_to_table(table_id, file_ref)?;
+            });
         }
 
+        // Batch write all Parquet files
+        self.pager.batch_put(&puts)?;
+
+        // Update catalog with all file refs
+        {
+            let mut catalog = self.catalog.write().unwrap();
+            for file_ref in file_refs {
+                catalog.add_file_to_table(table_id, file_ref)?;
+            }
+        }
+
+        // Save catalog once
         self.save_catalog()?;
         Ok(())
     }
@@ -386,7 +417,7 @@ mod tests {
         // Add MVCC columns
         let batch_with_mvcc = crate::mvcc::add_mvcc_columns(batch, 1).unwrap();
 
-        store.append(table_id, batch_with_mvcc).unwrap();
+        store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
 
         // Read back
         let batches = store.read_table_files(table_id, None).unwrap();

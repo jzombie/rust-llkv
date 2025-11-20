@@ -6,7 +6,6 @@ license = "Apache-2.0"
 repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
-
 [workspace.dependencies]
 llkv = { path = "./llkv", version = "0.8.2-alpha" }
 # llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.2-alpha" }
