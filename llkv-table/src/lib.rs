@@ -7,8 +7,8 @@
 //! - [`parquet`]: Row-group based Parquet storage (via `llkv-parquet-store`).
 //! - [`column_map`]: Native columnar storage (via `llkv-column-map`).
 
-pub mod column_map;
-pub mod parquet;
+pub mod providers;
 
 // Re-export the Parquet implementation as the default for backward compatibility
-pub use parquet::{LlkvTableBuilder, LlkvTableProvider};
+pub use providers::column_map::ColumnMapTableProvider;
+pub use providers::parquet::{LlkvTableBuilder, LlkvTableProvider};
