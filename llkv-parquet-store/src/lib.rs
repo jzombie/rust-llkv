@@ -68,6 +68,7 @@
 
 mod catalog;
 mod compaction;
+mod external;
 mod gc;
 mod mvcc;
 mod reader;
@@ -78,6 +79,10 @@ mod writer;
 
 pub use catalog::{ParquetCatalog, ParquetFileRef, TableMetadata};
 pub use compaction::CompactionStrategy;
+pub use external::{
+    externalize_columns, internalize_columns, is_external_field, restore_schema_from_storage,
+    transform_schema_for_storage, EXTERNAL_STORAGE_KEY, EXTERNAL_STORAGE_VALUE,
+};
 pub use gc::{collect_reachable_keys, garbage_collect};
 pub use mvcc::{add_mvcc_columns, apply_mvcc_filter, deduplicate_by_row_id};
 pub use store::ParquetStore;

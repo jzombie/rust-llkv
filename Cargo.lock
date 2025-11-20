@@ -1140,6 +1140,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "bitcode",
+ "bytemuck",
  "bytes",
  "criterion",
  "datafusion-common",

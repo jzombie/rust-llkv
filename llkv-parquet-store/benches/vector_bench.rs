@@ -27,6 +27,7 @@ const VECTOR_BATCH_SIZE: usize = 65_000;
 
 mod parquet_based {
     use super::*;
+    use std::collections::HashMap;
 
     /// Generate a schema for storing 1024-dimensional float32 vectors.
     fn create_vector_schema() -> Arc<Schema> {
@@ -40,6 +41,28 @@ mod parquet_based {
                 ),
                 false,
             ),
+        ]))
+    }
+
+    /// Generate a schema with external storage for embeddings.
+    fn create_external_vector_schema() -> Arc<Schema> {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            llkv_parquet_store::EXTERNAL_STORAGE_KEY.to_string(),
+            llkv_parquet_store::EXTERNAL_STORAGE_VALUE.to_string(),
+        );
+
+        Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    VECTOR_DIM as i32,
+                ),
+                false,
+            )
+            .with_metadata(metadata),
         ]))
     }
 
@@ -112,17 +135,37 @@ mod parquet_based {
         (input_bytes, storage_bytes)
     }
 
-    /// Read all vectors and return total count.
+    /// Read all vectors and compute sum of all values (forces full data access).
     fn bench_read_vectors<P: Pager<Blob = EntryHandle>>(
         store: &ParquetStore<P>,
         table_id: TableId,
-    ) -> usize {
+    ) -> f64 {
         let batches: Vec<_> = store
             .scan(table_id, &[], None, None)
             .unwrap()
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        batches.iter().map(|b| b.num_rows()).sum()
+
+        let mut sum = 0.0f64;
+        for batch in batches {
+            let embedding_column = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+
+            let values = embedding_column
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
+
+            // Access ALL elements of ALL vectors to force full data materialization
+            for i in 0..(batch.num_rows() * VECTOR_DIM) {
+                sum += values.value(i) as f64;
+            }
+        }
+        sum
     }
 
     /// Setup store with pre-written vectors for read benchmarks.
@@ -271,8 +314,8 @@ mod parquet_based {
                 &compression,
                 |b, _comp| {
                     b.iter(|| {
-                        let total_rows = bench_read_vectors(&store, table_id);
-                        black_box(total_rows)
+                        let sum = bench_read_vectors(&store, table_id);
+                        black_box(sum)
                     });
                 },
             );
@@ -343,6 +386,116 @@ mod parquet_based {
 
         group.finish();
     }
+
+    /// Setup store with external storage for embeddings.
+    fn setup_store_for_read_external(
+        compression: Compression,
+    ) -> (Arc<ParquetStore<MemPager>>, TableId) {
+        let pager = Arc::new(MemPager::new());
+        let config = WriterConfig::default()
+            .with_compression(compression)
+            .with_max_row_group_size(VECTOR_BATCH_SIZE);
+
+        let store = Arc::new(ParquetStore::open_with_config(Arc::clone(&pager), config).unwrap());
+        let schema = create_external_vector_schema();
+        let table_id = store
+            .create_table("vectors_external", schema.clone())
+            .unwrap();
+
+        let num_batches = VECTOR_COUNT / VECTOR_BATCH_SIZE;
+        let mut batches = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let start_id = (batch_idx * VECTOR_BATCH_SIZE) as u64;
+            let batch = generate_vector_batch(schema.clone(), start_id, VECTOR_BATCH_SIZE);
+            let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
+            batches.push(batch_with_mvcc);
+        }
+        store.append_many(table_id, batches).unwrap();
+
+        (store, table_id)
+    }
+
+    /// Setup store with external storage for similarity search.
+    fn setup_store_for_similarity_external(
+        compression: Compression,
+    ) -> (Arc<ParquetStore<MemPager>>, TableId, Vec<f32>) {
+        let pager = Arc::new(MemPager::new());
+        let config = WriterConfig::default()
+            .with_compression(compression)
+            .with_max_row_group_size(VECTOR_BATCH_SIZE);
+
+        let store = Arc::new(ParquetStore::open_with_config(Arc::clone(&pager), config).unwrap());
+        let schema = create_external_vector_schema();
+        let table_id = store
+            .create_table("vectors_external", schema.clone())
+            .unwrap();
+
+        let num_batches = VECTOR_COUNT / VECTOR_BATCH_SIZE;
+        let mut batches = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let start_id = (batch_idx * VECTOR_BATCH_SIZE) as u64;
+            let batch = generate_vector_batch(schema.clone(), start_id, VECTOR_BATCH_SIZE);
+            let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
+            batches.push(batch_with_mvcc);
+        }
+        store.append_many(table_id, batches).unwrap();
+
+        let mut rng = rand::rng();
+        let query_vector: Vec<f32> = (0..VECTOR_DIM).map(|_| rng.random::<f32>()).collect();
+
+        (store, table_id, query_vector)
+    }
+
+    /// Benchmark read performance with external storage.
+    pub fn run_read_benchmark_external(c: &mut Criterion) {
+        let mut group = c.benchmark_group("parquet_vector_read_external");
+        group.throughput(Throughput::Elements(VECTOR_COUNT as u64));
+        group.sample_size(10);
+
+        let compressions = vec![(Compression::UNCOMPRESSED, "uncompressed")];
+
+        for (compression, name) in compressions {
+            let (store, table_id) = setup_store_for_read_external(compression);
+            group.bench_with_input(
+                BenchmarkId::from_parameter(name),
+                &compression,
+                |b, _comp| {
+                    b.iter(|| {
+                        let sum = bench_read_vectors(&store, table_id);
+                        black_box(sum)
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+
+    /// Benchmark similarity search with external storage.
+    pub fn run_similarity_benchmark_external(c: &mut Criterion) {
+        let mut group = c.benchmark_group("parquet_vector_similarity_external");
+        group.throughput(Throughput::Elements(VECTOR_COUNT as u64));
+        group.sample_size(10);
+
+        let compressions = vec![(Compression::UNCOMPRESSED, "uncompressed")];
+
+        for (compression, name) in compressions {
+            let (store, table_id, query_vector) = setup_store_for_similarity_external(compression);
+            group.bench_with_input(
+                BenchmarkId::from_parameter(name),
+                &compression,
+                |b, _comp| {
+                    b.iter(|| {
+                        let (count, similarity) =
+                            bench_vector_similarity_search(&store, table_id, &query_vector);
+                        black_box((count, similarity))
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
 }
 
 // ============================================================================
@@ -403,7 +556,9 @@ criterion_group!(
     flat_baseline::run_baseline_benchmark,
     // parquet_based::run_write_benchmark,
     parquet_based::run_read_benchmark,
-    parquet_based::run_similarity_benchmark,
+    parquet_based::run_read_benchmark_external,
+    // parquet_based::run_similarity_benchmark,
+    // parquet_based::run_similarity_benchmark_external,
     parquet_based::run_compression_analysis
 );
 criterion_main!(benches);

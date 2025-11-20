@@ -32,6 +32,7 @@ serde = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 
 # Utilities
+bytemuck = { workspace = true }
 rustc-hash = { workspace = true }
 simd-r-drive-entry-handle = { workspace = true }
 rayon = { workspace = true }

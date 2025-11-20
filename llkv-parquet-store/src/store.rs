@@ -130,6 +130,12 @@ where
     /// This is more efficient than calling `append()` multiple times because
     /// it only saves the catalog once at the end. Parquet encoding is parallelized
     /// across batches using Rayon.
+    ///
+    /// # External Storage
+    ///
+    /// Fields marked with `llkv:storage = "external"` metadata are stored directly
+    /// in the pager as raw buffers, with only their pager keys written to Parquet.
+    /// This bypasses Parquet decode overhead for large blob columns like embeddings.
     pub fn append_many(&self, table_id: TableId, batches: Vec<RecordBatch>) -> Result<()> {
         if batches.is_empty() {
             return Ok(());
@@ -144,11 +150,16 @@ where
             .par_iter()
             .zip(file_ids.par_iter())
             .map(|(batch, file_id)| {
-                // Write Parquet to memory using configured compression
-                let parquet_bytes =
-                    crate::writer::write_parquet_to_memory_with_config(batch, &self.writer_config)?;
+                // Transform batch: externalize columns marked for external storage
+                let transformed_batch = crate::external::externalize_columns(batch, &*self.pager)?;
 
-                // Extract row ID range from batch
+                // Write Parquet to memory using configured compression
+                let parquet_bytes = crate::writer::write_parquet_to_memory_with_config(
+                    &transformed_batch,
+                    &self.writer_config,
+                )?;
+
+                // Extract row ID range from original batch (not transformed)
                 let (min_row_id, max_row_id) = extract_row_id_range(batch)?;
 
                 // Extract column statistics from Parquet metadata
@@ -269,7 +280,7 @@ where
             projection,
             limit,
             rows_returned: 0,
-            _schema: schema,
+            original_schema: schema,
         })
     }
 
@@ -369,7 +380,7 @@ where
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
     rows_returned: usize,
-    _schema: SchemaRef,
+    original_schema: SchemaRef,
 }
 
 impl<'a, P> Iterator for ParquetScanIterator<'a, P>
@@ -405,6 +416,16 @@ where
                     Ok(deduped) => {
                         // Return first deduplicated batch (typically 1 batch per file)
                         if let Some(batch) = deduped.into_iter().next() {
+                            // Internalize external columns (fetch blobs from pager)
+                            let batch = match crate::external::internalize_columns(
+                                &batch,
+                                &self.original_schema,
+                                &*self.store.pager,
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => return Some(Err(e)),
+                            };
+
                             // Apply limit to this batch if needed
                             let batch = if let Some(limit) = self.limit {
                                 let remaining = limit.saturating_sub(self.rows_returned);
