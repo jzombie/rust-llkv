@@ -30,13 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nExecuting: UPDATE t1 SET x=3");
     engine.execute("UPDATE t1 SET x=3").await?;
 
-    // DIRECT column store check
-    println!("\nDirect ColumnStore check after UPDATE:");
-    let catalog = engine.catalog();
-    let store = catalog.store();
-    let field_id = LogicalFieldId::for_user_table_0(1); // First field of first table
-    let result = store.gather_rows(&[field_id], &[1, 2, 3], GatherNullPolicy::IncludeNulls)?;
-    println!("  gather_rows([1,2,3]): {:?}", result);
+    // DIRECT column store check - removed as store is no longer accessible directly
+    // println!("\nDirect ColumnStore check after UPDATE:");
+    // let catalog = engine.catalog();
+    // let store = catalog.store();
+    // let field_id = LogicalFieldId::for_user_table_0(1); // First field of first table
+    // let result = store.gather_rows(&[field_id], &[1, 2, 3], GatherNullPolicy::IncludeNulls)?;
+    // println!("  gather_rows([1,2,3]): {:?}", result);
 
     println!("\nAfter UPDATE - SQL:");
     let result = engine.execute("SELECT * FROM t1 ORDER BY y").await?;

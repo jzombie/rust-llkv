@@ -33,7 +33,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 use llkv_column_map::store::ColumnStore;
 use llkv_storage::pager::MemPager;
-use llkv_table::LlkvTableBuilder;
+use llkv_table::ColumnMapTableBuilder;
 
 const TOTAL_ROWS: usize = 1_000_000;
 const NUM_COLUMNS: usize = 20;
@@ -138,8 +138,7 @@ fn bench_consecutive_inserts(c: &mut Criterion) {
                     let pager = Arc::new(MemPager::new());
                     let store = Arc::new(ColumnStore::open(pager).expect("open store"));
                     let mut builder =
-                        LlkvTableBuilder::new(Arc::clone(&store), 1, Arc::clone(&schema))
-                            .expect("builder");
+                        ColumnMapTableBuilder::new(Arc::clone(&store), 1, Arc::clone(&schema));
 
                     let mut offset = 0;
                     while offset < TOTAL_ROWS {

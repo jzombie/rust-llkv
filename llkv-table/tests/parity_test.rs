@@ -44,7 +44,7 @@ async fn setup_parity_test_custom(
     // ColumnMap
     let cm_builder =
         ColumnMapTableBuilder::new(Arc::clone(&col_store), table_id_u64, schema.clone());
-    let cm_provider = Arc::new(cm_builder.finish());
+    let cm_provider = Arc::new(cm_builder.finish()?);
 
     // Parquet
     let _ = pq_store.create_table("test_table", full_schema.clone())?;

@@ -10,8 +10,10 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use llkv_column_map::store::ColumnStore;
-use llkv_fusion::{LlkvQueryPlanner, LlkvTableBuilder};
+use llkv_fusion::{ColumnMapTableBuilder, LlkvQueryPlanner};
 use llkv_storage::pager::MemPager;
+use llkv_table::catalog::TableCatalog;
+use llkv_table::providers::column_map::ColumnStoreBackend;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -20,13 +22,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pager = Arc::new(MemPager::default());
     let store = Arc::new(ColumnStore::open(pager)?);
 
+    // Create catalog
+    let backend = Box::new(ColumnStoreBackend::new(Arc::clone(&store)));
+    let catalog = TableCatalog::new(backend)?;
+
     // Create schema and insert data
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::UInt64, false),
         Field::new("value", DataType::Int32, false),
     ]));
 
-    let mut builder = LlkvTableBuilder::new(Arc::clone(&store), 1, schema.clone())?;
+    let mut builder = ColumnMapTableBuilder::new(Arc::clone(&store), 1, schema.clone());
 
     let batch = RecordBatch::try_new(
         schema,
@@ -42,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create DataFusion context with custom query planner
     let session_state = SessionStateBuilder::new()
         .with_default_features()
-        .with_query_planner(Arc::new(LlkvQueryPlanner::new()))
+        .with_query_planner(Arc::new(LlkvQueryPlanner::new(catalog)))
         .build();
 
     let ctx = SessionContext::new_with_state(session_state);

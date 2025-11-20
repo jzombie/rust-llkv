@@ -3,10 +3,10 @@
 use std::any::Any;
 use std::fmt;
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use arrow::array::UInt64Array;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{ArrayRef, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -29,7 +29,7 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanBuilder,
 };
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_column_map::types::{LogicalFieldId, RowId};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
@@ -37,7 +37,8 @@ use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::common::FIELD_ID_META_KEY;
+use crate::common::{FIELD_ID_META_KEY, ROW_ID_COLUMN_NAME, TableEventListener};
+use crate::traits::TableBuilder;
 
 /// Custom [`TableProvider`] that surfaces LLKV Column Map data to DataFusion.
 pub struct ColumnMapTableProvider<P>
@@ -47,6 +48,7 @@ where
     store: Arc<ColumnStore<P>>,
     schema: SchemaRef,
     table_id: u64,
+    row_ids: Arc<RwLock<Vec<RowId>>>,
 }
 
 impl<P> fmt::Debug for ColumnMapTableProvider<P>
@@ -65,12 +67,32 @@ impl<P> ColumnMapTableProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    pub fn new(store: Arc<ColumnStore<P>>, schema: SchemaRef, table_id: u64) -> Self {
+    pub fn new(
+        store: Arc<ColumnStore<P>>,
+        schema: SchemaRef,
+        table_id: u64,
+        row_ids: Arc<RwLock<Vec<RowId>>>,
+    ) -> Self {
         Self {
             store,
             schema,
             table_id,
+            row_ids,
         }
+    }
+
+    pub fn ingest_schema(&self) -> SchemaRef {
+        let mut fields = vec![Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false)];
+        fields.extend(self.schema.fields().iter().map(|f| f.as_ref().clone()));
+        Arc::new(Schema::new(fields))
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.row_ids.read().unwrap().len()
+    }
+
+    pub fn get_row_ids(&self) -> Vec<RowId> {
+        self.row_ids.read().unwrap().clone()
     }
 }
 
@@ -240,8 +262,13 @@ where
 
             // The batch returned by gather_rows has columns in order of field_ids.
             // We need to ensure the schema matches what DataFusion expects.
-            let batch_with_schema =
-                RecordBatch::try_new(output_schema.clone(), batch.columns().to_vec())?;
+            let batch_with_schema = if output_schema.fields().is_empty() {
+                let options = arrow::record_batch::RecordBatchOptions::new()
+                    .with_row_count(Some(chunk.len()));
+                RecordBatch::try_new_with_options(output_schema.clone(), vec![], &options)?
+            } else {
+                RecordBatch::try_new(output_schema.clone(), batch.columns().to_vec())?
+            };
             batches.push(batch_with_schema);
         }
 
@@ -266,7 +293,11 @@ where
             )));
         }
 
-        let sink = ColumnMapDataSink::new(Arc::clone(&self.store), self.schema.clone());
+        let sink = ColumnMapDataSink::new(
+            Arc::clone(&self.store),
+            self.schema.clone(),
+            Arc::clone(&self.row_ids),
+        );
 
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
@@ -278,6 +309,7 @@ where
 {
     store: Arc<ColumnStore<P>>,
     schema: SchemaRef,
+    row_ids: Arc<RwLock<Vec<RowId>>>,
 }
 
 impl<P> fmt::Debug for ColumnMapDataSink<P>
@@ -312,8 +344,16 @@ impl<P> ColumnMapDataSink<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    fn new(store: Arc<ColumnStore<P>>, schema: SchemaRef) -> Self {
-        Self { store, schema }
+    fn new(
+        store: Arc<ColumnStore<P>>,
+        schema: SchemaRef,
+        row_ids: Arc<RwLock<Vec<RowId>>>,
+    ) -> Self {
+        Self {
+            store,
+            schema,
+            row_ids,
+        }
     }
 }
 
@@ -340,19 +380,71 @@ where
             if batch.num_rows() == 0 {
                 continue;
             }
-            // Ensure batch has metadata
-            let batch_with_meta =
-                RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())?;
+
+            // 1. Determine Row IDs
+            let (row_ids_arr, user_columns) =
+                if let Ok(idx) = batch.schema().index_of(ROW_ID_COLUMN_NAME) {
+                    // Batch already has row_id
+                    let row_id_col = batch
+                        .column(idx)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution("row_id column must be UInt64".to_string())
+                        })?;
+
+                    let mut cols = batch.columns().to_vec();
+                    cols.remove(idx);
+                    (Arc::new(row_id_col.clone()) as ArrayRef, cols)
+                } else {
+                    // Generate row IDs
+                    let start_row_id = {
+                        let lock = self.row_ids.read().unwrap();
+                        lock.last().copied().unwrap_or(0) + 1
+                    };
+                    let num_rows = batch.num_rows();
+                    let new_row_ids: Vec<u64> =
+                        (0..num_rows).map(|i| start_row_id + i as u64).collect();
+                    (
+                        Arc::new(UInt64Array::from(new_row_ids)) as ArrayRef,
+                        batch.columns().to_vec(),
+                    )
+                };
+
+            // 2. Construct Schema with row_id
+            let mut fields = vec![Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false)];
+            fields.extend(self.schema.fields().iter().map(|f| f.as_ref().clone()));
+            let schema_with_row_id = Arc::new(Schema::new(fields));
+
+            // 3. Construct Columns
+            let mut columns = vec![row_ids_arr.clone()];
+            columns.extend(user_columns);
+
+            let batch_with_row_id = RecordBatch::try_new(schema_with_row_id, columns)?;
+
+            // 4. Append to Store
             self.store
-                .append(&batch_with_meta)
+                .append(&batch_with_row_id)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+            // 5. Update tracked row IDs
+            let new_row_ids_values = row_ids_arr
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values();
+            {
+                let mut lock = self.row_ids.write().unwrap();
+                lock.extend_from_slice(new_row_ids_values);
+            }
+
             total_rows += batch.num_rows() as u64;
         }
         Ok(total_rows)
     }
 }
 
-/// Builder for ColumnMap tables.
+/// Builder for creating and populating ColumnStore tables.
 pub struct ColumnMapTableBuilder<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
@@ -360,6 +452,8 @@ where
     store: Arc<ColumnStore<P>>,
     table_id: u64,
     schema: SchemaRef,
+    listener: Option<Box<dyn TableEventListener>>,
+    row_ids: Arc<RwLock<Vec<u64>>>,
 }
 
 impl<P> ColumnMapTableBuilder<P>
@@ -389,17 +483,101 @@ where
             store,
             table_id,
             schema: schema_with_meta,
+            listener: None,
+            row_ids: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    pub fn append_batch(&self, batch: &RecordBatch) -> LlkvResult<()> {
-        let batch_with_meta = RecordBatch::try_new(self.schema.clone(), batch.columns().to_vec())?;
-        self.store.append(&batch_with_meta)?;
+    pub fn with_listener(mut self, listener: Box<dyn TableEventListener>) -> Self {
+        self.listener = Some(listener);
+        self
+    }
+
+    pub fn append_batch(&mut self, batch: &RecordBatch) -> LlkvResult<()> {
+        // 1. Determine Row IDs
+        let (row_ids_arr, user_columns) = if let Ok(idx) =
+            batch.schema().index_of(ROW_ID_COLUMN_NAME)
+        {
+            // Batch already has row_id
+            let row_id_col = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution("row_id column must be UInt64".to_string())
+                })
+                .map_err(|e| e.to_string())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?; // Convert to IO error which LlkvError might wrap?
+
+            let mut cols = batch.columns().to_vec();
+            cols.remove(idx);
+            (Arc::new(row_id_col.clone()) as ArrayRef, cols)
+        } else {
+            // Generate row IDs
+            let start_row_id = {
+                let lock = self.row_ids.read().unwrap();
+                lock.last().copied().unwrap_or(0) + 1
+            };
+            let num_rows = batch.num_rows();
+            let new_row_ids: Vec<u64> = (0..num_rows).map(|i| start_row_id + i as u64).collect();
+            (
+                Arc::new(UInt64Array::from(new_row_ids)) as ArrayRef,
+                batch.columns().to_vec(),
+            )
+        };
+
+        // 2. Construct Schema with row_id
+        let mut fields = vec![Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false)];
+        fields.extend(self.schema.fields().iter().map(|f| f.as_ref().clone()));
+        let schema_with_row_id = Arc::new(Schema::new(fields));
+
+        // 3. Construct Columns
+        let mut columns = vec![row_ids_arr.clone()];
+        columns.extend(user_columns);
+
+        let batch_with_row_id = RecordBatch::try_new(schema_with_row_id, columns)?;
+
+        // 4. Append to Store
+        self.store.append(&batch_with_row_id)?;
+
+        // 5. Update tracked row IDs
+        let new_row_ids_values = row_ids_arr
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values();
+        {
+            let mut lock = self.row_ids.write().unwrap();
+            lock.extend_from_slice(new_row_ids_values);
+        }
+        if let Some(listener) = &self.listener {
+            listener.on_rows_appended(new_row_ids_values)?;
+        }
+
         Ok(())
     }
 
-    pub fn finish(self) -> ColumnMapTableProvider<P> {
-        ColumnMapTableProvider::new(self.store, self.schema, self.table_id)
+    pub fn finish(self) -> LlkvResult<ColumnMapTableProvider<P>> {
+        Ok(ColumnMapTableProvider::new(
+            self.store,
+            self.schema,
+            self.table_id,
+            self.row_ids,
+        ))
+    }
+}
+
+impl<P> TableBuilder for ColumnMapTableBuilder<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn append_batch(&mut self, batch: &RecordBatch) -> LlkvResult<()> {
+        self.append_batch(batch)
+    }
+
+    fn finish(self: Box<Self>) -> LlkvResult<Arc<dyn TableProvider>> {
+        let provider = (*self).finish()?;
+        Ok(Arc::new(provider))
     }
 }
 

@@ -12,6 +12,7 @@ publish.workspace = true
 arrow = { workspace = true }
 datafusion = { workspace = true }
 datafusion-catalog = { workspace = true }
+llkv-column-map.workspace = true
 llkv-fusion = { workspace = true }
 llkv-result = { workspace = true }
 llkv-storage = { workspace = true }

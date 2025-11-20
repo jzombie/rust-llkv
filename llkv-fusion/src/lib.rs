@@ -30,7 +30,9 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 
-pub use llkv_table::{LlkvTableBuilder, LlkvTableProvider};
+pub use llkv_table::{
+    ColumnMapTableBuilder, ColumnMapTableProvider, LlkvTableBuilder, LlkvTableProvider,
+};
 
 #[cfg(test)]
 mod tests {
@@ -76,8 +78,7 @@ mod tests {
         )
         .expect("users batch");
 
-        let mut users_builder =
-            LlkvTableBuilder::new(Arc::clone(&store), 1, users_schema).expect("users builder");
+        let mut users_builder = ColumnMapTableBuilder::new(Arc::clone(&store), 1, users_schema);
         users_builder
             .append_batch(&users_batch)
             .expect("users append");
@@ -99,8 +100,7 @@ mod tests {
         )
         .expect("orders batch");
 
-        let mut orders_builder =
-            LlkvTableBuilder::new(Arc::clone(&store), 2, orders_schema).expect("orders builder");
+        let mut orders_builder = ColumnMapTableBuilder::new(Arc::clone(&store), 2, orders_schema);
         orders_builder
             .append_batch(&orders_batch)
             .expect("orders append");
@@ -165,8 +165,8 @@ mod tests {
         )
         .expect("products batch");
 
-        let mut products_builder = LlkvTableBuilder::new(Arc::clone(&store), 1, products_schema)
-            .expect("products builder");
+        let mut products_builder =
+            ColumnMapTableBuilder::new(Arc::clone(&store), 1, products_schema);
         products_builder
             .append_batch(&products_batch)
             .expect("products append");
@@ -188,8 +188,8 @@ mod tests {
         )
         .expect("inventory batch");
 
-        let mut inventory_builder = LlkvTableBuilder::new(Arc::clone(&store), 2, inventory_schema)
-            .expect("inventory builder");
+        let mut inventory_builder =
+            ColumnMapTableBuilder::new(Arc::clone(&store), 2, inventory_schema);
         inventory_builder
             .append_batch(&inventory_batch)
             .expect("inventory append");
@@ -304,13 +304,15 @@ mod tests {
         use datafusion::execution::session_state::SessionStateBuilder;
         use llkv_storage::pager::BoxedPager;
         use llkv_table::catalog::TableCatalog;
+        use llkv_table::providers::column_map::ColumnStoreBackend;
 
         let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
-        let catalog = Arc::new(TableCatalog::open(Arc::clone(&pager)).expect("catalog"));
         let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
+        let backend = Box::new(ColumnStoreBackend::new(Arc::clone(&store)));
+        let catalog = TableCatalog::new(backend).expect("catalog");
 
         let schema = build_demo_batch().schema();
-        let mut builder = LlkvTableBuilder::new(Arc::clone(&store), 1, schema).expect("builder");
+        let mut builder = ColumnMapTableBuilder::new(Arc::clone(&store), 1, schema);
         builder.append_batch(&build_demo_batch()).expect("append");
         let provider = builder.finish().expect("provider");
 
@@ -335,7 +337,7 @@ mod tests {
 
 /// Custom physical planner that intercepts DDL and DML operations.
 pub struct LlkvQueryPlanner {
-    catalog: Arc<TableCatalog<BoxedPager>>,
+    catalog: Arc<TableCatalog>,
     fallback: Arc<dyn PhysicalPlanner>,
 }
 
@@ -349,7 +351,7 @@ impl fmt::Debug for LlkvQueryPlanner {
 
 impl LlkvQueryPlanner {
     /// Construct a new planner with a catalog reference.
-    pub fn new(catalog: Arc<TableCatalog<BoxedPager>>) -> Self {
+    pub fn new(catalog: Arc<TableCatalog>) -> Self {
         Self {
             catalog,
             fallback: Arc::new(DefaultPhysicalPlanner::default()),
@@ -396,14 +398,18 @@ mod persistence_tests {
 
     #[tokio::test]
     async fn table_persists_across_scopes() {
+        use llkv_column_map::store::ColumnStore;
         use llkv_table::catalog::TableCatalog;
+        use llkv_table::providers::column_map::ColumnStoreBackend;
 
         // Outer scope: create a persistent pager that will outlive the table creation
         let pager = Arc::new(MemPager::default());
 
         // Inner scope 1: Create table schema, insert data, then drop everything except pager
         {
-            let catalog = Arc::new(TableCatalog::open(Arc::clone(&pager)).expect("open catalog"));
+            let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
+            let backend = Box::new(ColumnStoreBackend::new(store));
+            let catalog = TableCatalog::new(backend).expect("open catalog");
 
             let users_schema = Arc::new(Schema::new(vec![
                 Field::new("user_id", DataType::UInt64, false),
@@ -439,7 +445,7 @@ mod persistence_tests {
 
             // Verify the data is immediately queryable
             let ctx = SessionContext::new();
-            ctx.register_table("users", Arc::new(users_provider))
+            ctx.register_table("users", users_provider)
                 .expect("register users");
 
             let df = ctx
@@ -456,7 +462,9 @@ mod persistence_tests {
 
         // Inner scope 2: Reopen the catalog with the same pager and verify data persists
         {
-            let catalog = Arc::new(TableCatalog::open(Arc::clone(&pager)).expect("reopen catalog"));
+            let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("reopen store"));
+            let backend = Box::new(ColumnStoreBackend::new(store));
+            let catalog = TableCatalog::new(backend).expect("reopen catalog");
 
             // List tables to verify it was persisted
             let tables = catalog.list_tables();
@@ -501,8 +509,10 @@ mod persistence_tests {
 
     #[tokio::test]
     async fn federated_query_across_pagers() {
+        use llkv_column_map::store::ColumnStore;
         use llkv_storage::pager::SimdRDrivePager;
         use llkv_table::catalog::TableCatalog;
+        use llkv_table::providers::column_map::ColumnStoreBackend;
         use tempfile::TempDir;
 
         // Create temporary directories for the databases
@@ -512,8 +522,10 @@ mod persistence_tests {
 
         // Pager 1 - sales database with orders table
         let sales_pager = Arc::new(SimdRDrivePager::open(&sales_path).expect("open sales pager"));
-        let sales_catalog =
-            Arc::new(TableCatalog::open(Arc::clone(&sales_pager)).expect("open sales catalog"));
+        let sales_store =
+            Arc::new(ColumnStore::open(Arc::clone(&sales_pager)).expect("open sales store"));
+        let sales_backend = Box::new(ColumnStoreBackend::new(sales_store));
+        let sales_catalog = TableCatalog::new(sales_backend).expect("open sales catalog");
 
         let orders_schema = Arc::new(Schema::new(vec![
             Field::new("order_id", DataType::UInt64, false),
@@ -551,9 +563,12 @@ mod persistence_tests {
         // Pager 2 - inventory database with products table
         let inventory_pager =
             Arc::new(SimdRDrivePager::open(&inventory_path).expect("open inventory pager"));
-        let inventory_catalog = Arc::new(
-            TableCatalog::open(Arc::clone(&inventory_pager)).expect("open inventory catalog"),
+        let inventory_store = Arc::new(
+            ColumnStore::open(Arc::clone(&inventory_pager)).expect("open inventory store"),
         );
+        let inventory_backend = Box::new(ColumnStoreBackend::new(inventory_store));
+        let inventory_catalog =
+            TableCatalog::new(inventory_backend).expect("open inventory catalog");
 
         let products_schema = Arc::new(Schema::new(vec![
             Field::new("product_id", DataType::UInt64, false),
@@ -686,10 +701,16 @@ mod persistence_tests {
         drop(sales_catalog);
         drop(inventory_catalog);
 
+        let sales_store = Arc::new(ColumnStore::open(sales_pager).expect("reopen sales store"));
+        let sales_backend = Box::new(ColumnStoreBackend::new(sales_store));
         let sales_catalog_reopened =
-            Arc::new(TableCatalog::open(sales_pager).expect("reopen sales catalog"));
+            TableCatalog::new(sales_backend).expect("reopen sales catalog");
+
+        let inventory_store =
+            Arc::new(ColumnStore::open(inventory_pager).expect("reopen inventory store"));
+        let inventory_backend = Box::new(ColumnStoreBackend::new(inventory_store));
         let inventory_catalog_reopened =
-            Arc::new(TableCatalog::open(inventory_pager).expect("reopen inventory catalog"));
+            TableCatalog::new(inventory_backend).expect("reopen inventory catalog");
 
         // Verify tables are still in the catalogs
         let sales_tables = sales_catalog_reopened.list_tables();

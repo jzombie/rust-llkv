@@ -20,42 +20,53 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{Array, BinaryArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::{
     convert::try_schema_from_flatbuffer_bytes,
     writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
 };
-use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
-use llkv_column_map::store::{ColumnStore, GatherNullPolicy, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, RowId, TableId};
 use llkv_result::{Error as LlkvError, Result as LlkvResult};
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::{CatalogHook, LlkvTableBuilder, LlkvTableProvider};
-
-/// Reserved table ID for the system catalog metadata.
-const CATALOG_TABLE_ID: TableId = 0;
-
-/// Get the field ID for the catalog metadata blob column (table 0, field 1).
-#[inline]
-fn catalog_metadata_field() -> LogicalFieldId {
-    LogicalFieldId::for_user(CATALOG_TABLE_ID, 1)
-}
+use crate::common::TableEventListener;
+use crate::traits::{CatalogBackend, TableBuilder};
+use datafusion::datasource::TableProvider;
 
 /// Serializable table metadata for persistence.
 #[derive(Debug, Clone, Encode, Decode)]
-struct TableMetadata {
-    table_id: TableId,
-    table_name: String,
+pub struct TableMetadata {
+    pub table_id: TableId,
+    pub table_name: String,
     /// Serialized Arrow schema as JSON bytes.
-    schema_bytes: Vec<u8>,
+    pub schema_bytes: Vec<u8>,
     /// Logical field IDs for each column.
-    logical_fields: Vec<u64>,
+    pub logical_fields: Vec<u64>,
     /// Row IDs that exist in this table.
-    row_ids: Vec<RowId>,
+    pub row_ids: Vec<RowId>,
+}
+
+struct CatalogHook {
+    table_name: String,
+    catalog: std::sync::Weak<TableCatalog>,
+}
+
+impl CatalogHook {
+    fn new(table_name: String, catalog: std::sync::Weak<TableCatalog>) -> Self {
+        Self {
+            table_name,
+            catalog,
+        }
+    }
+}
+
+impl TableEventListener for CatalogHook {
+    fn on_rows_appended(&self, row_ids: &[u64]) -> LlkvResult<()> {
+        if let Some(catalog) = self.catalog.upgrade() {
+            catalog.update_table_rows(&self.table_name, row_ids.to_vec())?;
+        }
+        Ok(())
+    }
 }
 
 /// Persistent catalog for LLKV tables.
@@ -63,55 +74,32 @@ struct TableMetadata {
 /// The catalog stores table metadata in the same pager as the table data,
 /// allowing tables to be discovered and reconstructed across process restarts.
 /// All operations are thread-safe via interior mutability.
-pub struct TableCatalog<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    store: Arc<ColumnStore<P>>,
+pub struct TableCatalog {
+    backend: Box<dyn CatalogBackend>,
     /// In-memory cache of table metadata, indexed by table name.
     tables: RwLock<HashMap<String, TableMetadata>>,
     /// Counter for assigning new table IDs (starts at 1, 0 is reserved).
     next_table_id: RwLock<TableId>,
 }
 
-impl<P> TableCatalog<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    /// Create or open a table catalog backed by the given pager.
-    ///
-    /// This loads existing table metadata from the catalog system table if it
-    /// exists, or initializes an empty catalog if this is the first open.
-    pub fn open(pager: Arc<P>) -> LlkvResult<Self> {
-        let store = Arc::new(ColumnStore::open(pager)?);
+impl TableCatalog {
+    /// Create a new table catalog with the given backend.
+    pub fn new(backend: Box<dyn CatalogBackend>) -> LlkvResult<Arc<Self>> {
         let mut catalog = Self {
-            store,
+            backend,
             tables: RwLock::new(HashMap::new()),
             next_table_id: RwLock::new(1),
         };
         catalog.load_metadata()?;
-        Ok(catalog)
+        Ok(Arc::new(catalog))
     }
 
     /// Register a new table with the given schema.
-    ///
-    /// Returns a builder that can be used to append data to the table. The
-    /// table metadata is persisted immediately upon registration.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Unique table name within this catalog
-    /// * `schema` - Arrow schema defining the table's columns
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a table with this name already exists or if the
-    /// schema contains unsupported data types.
     pub fn create_table(
         self: &Arc<Self>,
         name: &str,
         schema: SchemaRef,
-    ) -> LlkvResult<LlkvTableBuilder<P>> {
+    ) -> LlkvResult<Box<dyn TableBuilder>> {
         // Check if table already exists
         {
             let tables = self.tables.read().unwrap();
@@ -133,9 +121,14 @@ where
             id
         };
 
-        // Create the builder
-        let mut builder = LlkvTableBuilder::new(Arc::clone(&self.store), table_id, schema.clone())?;
-        builder.attach_catalog_hook(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
+        // Create the builder via backend
+        let listener = Box::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
+        let builder = self.backend.create_table_builder(
+            table_id as u64,
+            name,
+            schema.clone(),
+            Some(listener),
+        )?;
 
         // Store initial metadata (empty row_ids)
         let schema_bytes = Self::serialize_schema(schema.as_ref())?;
@@ -160,12 +153,7 @@ where
     }
 
     /// Get a table provider for an existing table.
-    ///
-    /// Returns `None` if no table with the given name exists.
-    pub fn get_table(
-        self: &Arc<Self>,
-        name: &str,
-    ) -> LlkvResult<Option<Arc<LlkvTableProvider<P>>>> {
+    pub fn get_table(self: &Arc<Self>, name: &str) -> LlkvResult<Option<Arc<dyn TableProvider>>> {
         let tables = self.tables.read().unwrap();
         let Some(metadata) = tables.get(name) else {
             return Ok(None);
@@ -173,41 +161,32 @@ where
 
         let schema = Arc::new(Self::deserialize_schema(&metadata.schema_bytes)?);
 
-        let logical_fields: Vec<LogicalFieldId> = metadata
-            .logical_fields
-            .iter()
-            .map(|&id| LogicalFieldId::from(id))
-            .collect();
-
-        let row_ids = Arc::new(RwLock::new(metadata.row_ids.clone()));
-        let hook = CatalogHook::new(name.to_string(), Arc::downgrade(self));
-        let provider = LlkvTableProvider::with_catalog_hook(
-            Arc::clone(&self.store),
+        // We need to pass row_ids to the backend so it can construct the provider
+        let provider = self.backend.get_table_provider(
+            metadata.table_id as u64,
+            name,
             schema,
-            logical_fields,
-            row_ids,
-            super::DEFAULT_SCAN_BATCH_SIZE,
-            hook,
+            &metadata.row_ids,
         )?;
 
-        Ok(Some(Arc::new(provider)))
+        Ok(Some(provider))
     }
 
-    /// Update table metadata after rows have been appended.
-    ///
-    /// This should be called after using [`LlkvTableBuilder::append_batch`] to
-    /// ensure the catalog's row ID tracking stays synchronized with the actual
-    /// data.
-    pub fn update_table_rows(&self, name: &str, new_row_ids: Vec<RowId>) -> LlkvResult<()> {
-        let mut tables = self.tables.write().unwrap();
-        let metadata = tables.get_mut(name).ok_or_else(|| {
+    /// Get a builder for an existing table to append data.
+    pub fn get_table_builder(self: &Arc<Self>, name: &str) -> LlkvResult<Box<dyn TableBuilder>> {
+        let tables = self.tables.read().unwrap();
+        let metadata = tables.get(name).ok_or_else(|| {
             LlkvError::InvalidArgumentError(format!("table '{}' not found", name))
         })?;
 
-        metadata.row_ids.extend(new_row_ids);
-        drop(tables);
+        let schema = Arc::new(Self::deserialize_schema(&metadata.schema_bytes)?);
 
-        self.persist_metadata()
+        // Create a builder for the existing table
+        // We attach the listener to ensure row counts are updated
+        let listener = Box::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
+
+        self.backend
+            .create_table_builder(metadata.table_id as u64, name, schema, Some(listener))
     }
 
     /// List all table names in the catalog.
@@ -227,10 +206,8 @@ where
             return Ok(false);
         };
 
-        for field in &metadata.logical_fields {
-            let field_id = LogicalFieldId::from(*field);
-            self.store.remove_column(field_id)?;
-        }
+        self.backend
+            .drop_table(metadata.table_id as u64, &metadata.logical_fields)?;
 
         let mut tables = self.tables.write().unwrap();
         tables.remove(name);
@@ -239,96 +216,36 @@ where
         Ok(true)
     }
 
-    /// Get the underlying column store.
-    pub fn store(&self) -> &Arc<ColumnStore<P>> {
-        &self.store
+    /// Update table metadata after rows have been appended.
+    pub fn update_table_rows(&self, name: &str, new_row_ids: Vec<RowId>) -> LlkvResult<()> {
+        let mut tables = self.tables.write().unwrap();
+        let metadata = tables.get_mut(name).ok_or_else(|| {
+            LlkvError::InvalidArgumentError(format!("table '{}' not found", name))
+        })?;
+
+        metadata.row_ids.extend(new_row_ids);
+        drop(tables);
+
+        self.persist_metadata()
     }
 
     /// Create a sort index on a column.
-    ///
-    /// # Arguments
-    ///
-    /// * `table_name` - Name of the table containing the column
-    /// * `column_name` - Name of the column to index (case-insensitive)
-    /// * `index_name` - Optional name for the index
-    /// * `unique` - Whether this is a unique index (not enforced at storage level, metadata only)
-    /// * `if_not_exists` - If true, don't fail if index already exists
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table or column doesn't exist, or if the index creation fails.
     pub fn create_index(
         &self,
-        table_name: &str,
-        column_name: &str,
+        _table_name: &str,
+        _column_name: &str,
         _index_name: Option<&str>,
         _unique: bool,
-        if_not_exists: bool,
+        _if_not_exists: bool,
     ) -> LlkvResult<()> {
-        // Get table metadata
-        let tables = self.tables.read().unwrap();
-        let metadata = tables.get(table_name).ok_or_else(|| {
-            LlkvError::InvalidArgumentError(format!("table '{}' not found", table_name))
-        })?;
-        let table_id = metadata.table_id;
-        let schema = Arc::new(Self::deserialize_schema(&metadata.schema_bytes)?);
-        drop(tables);
-
-        // Find column by name (case-insensitive)
-        let normalized_column_name = column_name.to_ascii_lowercase();
-        let column_index = schema
-            .fields()
-            .iter()
-            .position(|f| f.name().to_ascii_lowercase() == normalized_column_name)
-            .ok_or_else(|| {
-                LlkvError::InvalidArgumentError(format!(
-                    "column '{}' not found in table '{}'",
-                    column_name, table_name
-                ))
-            })?;
-
-        // Field ID is 1-based (column_index + 1)
-        let field_id = (column_index + 1) as u32;
-        let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-
-        // Check if index already exists
-        let existing_indexes = self.store.list_persisted_indexes(logical_field_id);
-        if let Ok(indexes) = existing_indexes {
-            if indexes.contains(&IndexKind::Sort) {
-                if if_not_exists {
-                    return Ok(());
-                }
-                return Err(LlkvError::InvalidArgumentError(format!(
-                    "index already exists on column '{}' in table '{}'",
-                    column_name, table_name
-                )));
-            }
-        }
-
-        // Create index directly on the column store
-        self.store
-            .register_index(logical_field_id, IndexKind::Sort)?;
-
-        Ok(())
+        // TODO: Add index support to CatalogBackend trait
+        // For now, this is a no-op or returns error
+        Err(LlkvError::Internal(
+            "Index creation not yet supported in decoupled catalog".into(),
+        ))
     }
 
     /// Create a multi-column index (metadata only).
-    ///
-    /// This registers a multi-column index in the catalog metadata but doesn't
-    /// create an actual materialized index structure. Multi-column index enforcement
-    /// is handled at the runtime/executor layer.
-    ///
-    /// # Arguments
-    ///
-    /// * `table_name` - Name of the table
-    /// * `column_names` - Names of the columns in the index
-    /// * `index_name` - Name for the index
-    /// * `unique` - Whether this is a unique index
-    /// * `if_not_exists` - If true, don't fail if index already exists
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the table doesn't exist or if any column is not found.
     pub fn create_multi_column_index(
         &self,
         _table_name: &str,
@@ -337,114 +254,36 @@ where
         _unique: bool,
         _if_not_exists: bool,
     ) -> LlkvResult<()> {
-        // Multi-column indexes require the full runtime infrastructure (CatalogManager)
-        // For now, this is a no-op that succeeds silently
-        // The runtime layer will handle multi-column index creation properly
         Ok(())
     }
 
-    /// Load catalog metadata from the system table.
+    /// Load catalog metadata from the backend.
     fn load_metadata(&mut self) -> LlkvResult<()> {
-        // Register the catalog metadata column if not already registered
-        self.store
-            .ensure_column_registered(catalog_metadata_field(), &DataType::Binary)?;
+        let all_metadata = self.backend.load_metadata()?;
 
-        // Try to load existing catalog data
-        // Row ID 1 contains the serialized catalog metadata
-        let row_ids = vec![1_u64];
-        let field_ids = vec![catalog_metadata_field()];
+        let mut tables = self.tables.write().unwrap();
+        let mut max_table_id: TableId = 0;
 
-        match self
-            .store
-            .gather_rows(&field_ids, &row_ids, GatherNullPolicy::IncludeNulls)
-        {
-            Ok(batch) => {
-                if batch.num_rows() > 0 {
-                    let binary_array = batch
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<BinaryArray>()
-                        .ok_or_else(|| {
-                            LlkvError::Internal("catalog metadata column is not Binary".into())
-                        })?;
-
-                    // Check if we actually have data (not null and not empty)
-                    if binary_array.is_valid(0) {
-                        let bytes = binary_array.value(0);
-                        if !bytes.is_empty() {
-                            let all_metadata: Vec<TableMetadata> =
-                                bitcode::decode(bytes).map_err(|e| {
-                                    LlkvError::Internal(format!("failed to decode catalog: {}", e))
-                                })?;
-
-                            let mut tables = self.tables.write().unwrap();
-                            let mut max_table_id: TableId = 0;
-
-                            for metadata in all_metadata {
-                                if metadata.table_id > max_table_id {
-                                    max_table_id = metadata.table_id;
-                                }
-                                tables.insert(metadata.table_name.clone(), metadata);
-                            }
-
-                            *self.next_table_id.write().unwrap() =
-                                max_table_id.checked_add(1).unwrap_or_else(|| {
-                                    // If we overflow, just use max value
-                                    u16::MAX
-                                });
-                        }
-                    }
-                }
+        for metadata in all_metadata {
+            if metadata.table_id > max_table_id {
+                max_table_id = metadata.table_id;
             }
-            Err(_) => {
-                // No catalog data exists yet, start fresh
-            }
+            tables.insert(metadata.table_name.clone(), metadata);
         }
 
+        *self.next_table_id.write().unwrap() =
+            max_table_id.checked_add(1).unwrap_or_else(|| u16::MAX);
+
         Ok(())
     }
 
-    /// Persist catalog metadata to the system table.
+    /// Persist catalog metadata to the backend.
     fn persist_metadata(&self) -> LlkvResult<()> {
-        // Serialize all table metadata
         let tables = self.tables.read().unwrap();
         let all_metadata: Vec<TableMetadata> = tables.values().cloned().collect();
         drop(tables);
 
-        let bytes = bitcode::encode(&all_metadata);
-
-        // Register the column if needed (this also registers the row_id shadow column)
-        self.store
-            .ensure_column_registered(catalog_metadata_field(), &DataType::Binary)?;
-
-        // The batch must have row_id as the first column, followed by the data columns
-        // The schema field names must match what ColumnStore expects
-        let field_with_metadata = {
-            let mut metadata = HashMap::new();
-            metadata.insert(
-                llkv_column_map::store::FIELD_ID_META_KEY.to_string(),
-                u64::from(catalog_metadata_field()).to_string(),
-            );
-            Field::new("catalog_metadata", DataType::Binary, false).with_metadata(metadata)
-        };
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("rowid", DataType::UInt64, false),
-            field_with_metadata,
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(arrow::array::UInt64Array::from(vec![1_u64])),
-                Arc::new(BinaryArray::from(vec![bytes.as_slice()])),
-            ],
-        )?;
-
-        // Use LWW rewrite to update the catalog metadata (row ID 1 will be overwritten)
-        self.store.append(&batch)?;
-
-        Ok(())
+        self.backend.persist_metadata(&all_metadata)
     }
 
     fn serialize_schema(schema: &Schema) -> LlkvResult<Vec<u8>> {
@@ -461,5 +300,35 @@ where
     fn deserialize_schema(bytes: &[u8]) -> LlkvResult<Schema> {
         try_schema_from_flatbuffer_bytes(bytes)
             .map_err(|e| LlkvError::Internal(format!("failed to deserialize schema metadata: {e}")))
+    }
+
+    /// Create a consistent snapshot of the catalog metadata.
+    pub fn snapshot(&self) -> TableCatalogSnapshot {
+        let tables = self.tables.read().unwrap();
+        TableCatalogSnapshot::new(tables.clone())
+    }
+}
+
+/// A read-only snapshot of the catalog state.
+#[derive(Clone)]
+pub struct TableCatalogSnapshot {
+    tables: HashMap<String, TableMetadata>,
+}
+
+impl TableCatalogSnapshot {
+    pub fn new(tables: HashMap<String, TableMetadata>) -> Self {
+        Self { tables }
+    }
+
+    pub fn table_id(&self, name: &str) -> Option<TableId> {
+        self.tables.get(name).map(|m| m.table_id)
+    }
+
+    pub fn table_exists(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
+    }
+
+    pub fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
     }
 }
