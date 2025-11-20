@@ -2,6 +2,7 @@
 
 use crate::catalog::{ParquetCatalog, ParquetFileRef};
 use crate::types::TableId;
+use crate::writer::WriterConfig;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
@@ -25,6 +26,7 @@ where
 {
     pager: Arc<P>,
     catalog: Arc<RwLock<ParquetCatalog>>,
+    writer_config: WriterConfig,
 }
 
 impl<P> Clone for ParquetStore<P>
@@ -35,6 +37,7 @@ where
         Self {
             pager: Arc::clone(&self.pager),
             catalog: Arc::clone(&self.catalog),
+            writer_config: self.writer_config.clone(),
         }
     }
 }
@@ -43,11 +46,19 @@ impl<P> ParquetStore<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Open or create a ParquetStore using the provided pager.
+    /// Open or create a ParquetStore using the provided pager with default configuration.
     ///
     /// Loads the catalog from the pager's reserved key, or initializes
     /// an empty catalog if none exists.
     pub fn open(pager: Arc<P>) -> Result<Self> {
+        Self::open_with_config(pager, WriterConfig::default())
+    }
+
+    /// Open or create a ParquetStore with custom writer configuration.
+    ///
+    /// Loads the catalog from the pager's reserved key, or initializes
+    /// an empty catalog if none exists.
+    pub fn open_with_config(pager: Arc<P>, writer_config: WriterConfig) -> Result<Self> {
         let catalog = match pager
             .batch_get(&[BatchGet::Raw {
                 key: PARQUET_CATALOG_ROOT_KEY,
@@ -70,7 +81,20 @@ where
         Ok(Self {
             pager,
             catalog: Arc::new(RwLock::new(catalog)),
+            writer_config,
         })
+    }
+
+    /// Get the current writer configuration.
+    pub fn writer_config(&self) -> &WriterConfig {
+        &self.writer_config
+    }
+
+    /// Set a new writer configuration.
+    ///
+    /// This affects all subsequent `append()` operations.
+    pub fn set_writer_config(&mut self, config: WriterConfig) {
+        self.writer_config = config;
     }
 
     /// Persist the catalog to the pager.
@@ -107,8 +131,9 @@ where
     /// MVCC columns (`created_by`, `deleted_by`) should already be present
     /// in the batch.
     pub fn append(&self, table_id: TableId, batch: RecordBatch) -> Result<()> {
-        // Write Parquet to memory
-        let parquet_bytes = crate::writer::write_parquet_to_memory(&batch)?;
+        // Write Parquet to memory using configured compression
+        let parquet_bytes =
+            crate::writer::write_parquet_to_memory_with_config(&batch, &self.writer_config)?;
 
         // Allocate a key from the pager
         let file_ids = self.pager.alloc_many(1)?;

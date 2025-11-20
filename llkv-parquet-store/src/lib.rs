@@ -81,6 +81,7 @@ pub use gc::{collect_reachable_keys, garbage_collect};
 pub use mvcc::{add_mvcc_columns, apply_mvcc_filter, deduplicate_by_row_id};
 pub use store::ParquetStore;
 pub use types::{FileId, TableId};
+pub use writer::WriterConfig;
 
 // Re-export common types for convenience
 pub use arrow::datatypes::SchemaRef;
