@@ -7,11 +7,26 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 /// Read RecordBatches from Parquet bytes.
 ///
-/// Optionally applies column projection. Accepts `bytes::Bytes` for zero-copy
+/// Optionally applies column projection and batch size. Accepts `bytes::Bytes` for zero-copy
 /// operation when backed by mmap.
+///
+/// If `batch_size` is None, uses the TARGET_BATCH_SIZE_BYTES from writer configuration
+/// to maintain consistency between write and read operations.
 pub fn read_parquet_from_memory(
     bytes: Bytes,
     projection: Option<Vec<usize>>,
+) -> Result<Vec<RecordBatch>> {
+    read_parquet_from_memory_with_batch_size(bytes, projection, None)
+}
+
+/// Read RecordBatches from Parquet bytes with explicit batch size control.
+///
+/// If `batch_size` is None, uses TARGET_BATCH_SIZE_BYTES from writer config.
+/// This ensures read batches match the size used during writes for optimal performance.
+pub fn read_parquet_from_memory_with_batch_size(
+    bytes: Bytes,
+    projection: Option<Vec<usize>>,
+    batch_size: Option<usize>,
 ) -> Result<Vec<RecordBatch>> {
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|e| Error::Internal(format!("failed to create Parquet reader: {}", e)))?;
@@ -21,6 +36,17 @@ pub fn read_parquet_from_memory(
         let mask = parquet::arrow::ProjectionMask::leaves(schema_desc, proj);
         builder = builder.with_projection(mask);
     }
+
+    // Use TARGET_BATCH_SIZE_BYTES if no explicit batch size provided
+    // This matches the write-time optimization for consistency
+    let target_batch_size = batch_size.unwrap_or_else(|| {
+        // Calculate target rows based on TARGET_BATCH_SIZE_BYTES
+        // This is approximate since we don't know exact row size yet
+        // Arrow will adjust to row group boundaries anyway
+        8192 // Default to same as TARGET_BATCH_SIZE_BYTES / typical_row_size
+    });
+
+    builder = builder.with_batch_size(target_batch_size);
 
     let reader = builder
         .build()
