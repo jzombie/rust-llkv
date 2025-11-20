@@ -273,26 +273,6 @@ where
         })
     }
 
-    // TODO: Make this iterator based
-    /// Scan a table with transaction visibility filtering.
-    ///
-    /// Only returns rows visible to the given transaction ID.
-    pub fn scan_visible(
-        &self,
-        table_id: TableId,
-        txn_id: u64,
-        projection: Option<Vec<usize>>,
-    ) -> Result<Vec<RecordBatch>> {
-        let batches = self
-            .scan(table_id, &[], projection, None)?
-            .collect::<Result<Vec<_>>>()?;
-
-        batches
-            .into_iter()
-            .map(|batch| crate::mvcc::apply_mvcc_filter(batch, txn_id))
-            .collect()
-    }
-
     /// List all tables in the catalog.
     pub fn list_tables(&self) -> Vec<String> {
         let catalog = self.catalog.read().unwrap();
@@ -430,12 +410,9 @@ where
                                 let remaining = limit.saturating_sub(self.rows_returned);
                                 if batch.num_rows() > remaining {
                                     // Slice the batch to only return up to limit
-                                    match batch.slice(0, remaining) {
-                                        sliced => {
-                                            self.rows_returned += sliced.num_rows();
-                                            sliced
-                                        }
-                                    }
+                                    let sliced = batch.slice(0, remaining);
+                                    self.rows_returned += sliced.num_rows();
+                                    sliced
                                 } else {
                                     self.rows_returned += batch.num_rows();
                                     batch

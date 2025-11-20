@@ -4,6 +4,7 @@ use arrow::array::{StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_parquet_store::{add_mvcc_columns, ParquetStore};
+use llkv_result::Result;
 use llkv_storage::pager::MemPager;
 use std::sync::Arc;
 
@@ -38,7 +39,11 @@ fn test_end_to_end_workflow() {
     store.append_many(table_id, vec![batch_with_mvcc]).unwrap();
 
     // Read back
-    let results = store.scan_visible(table_id, 1, None).unwrap();
+    let results: Vec<_> = store
+        .scan(table_id, &[], None, None)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].num_rows(), 3);
@@ -83,7 +88,11 @@ fn test_multiple_appends() {
     store.append_many(table_id, vec![batch2_mvcc]).unwrap();
 
     // Read all data
-    let results = store.scan_visible(table_id, 2, None).unwrap();
+    let results: Vec<_> = store
+        .scan(table_id, &[], None, None)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
 
     // Should have 2 batches (one per append)
     assert_eq!(results.len(), 2);
@@ -129,7 +138,11 @@ fn test_persistence_across_reopens() {
     assert_eq!(tables[0], "persistent");
 
     // Verify data
-    let results = store2.scan_visible(table_id, 1, None).unwrap();
+    let results: Vec<_> = store2
+        .scan(table_id, &[], None, None)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].num_rows(), 1);
 }
