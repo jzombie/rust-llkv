@@ -91,6 +91,52 @@ mod parquet_based {
         RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(embedding_array)]).unwrap()
     }
 
+    /// Generate all batches for VECTOR_COUNT vectors, including remainder batch.
+    /// Returns Vec of RecordBatch with MVCC columns added.
+    fn generate_all_batches(schema: Arc<Schema>) -> Vec<RecordBatch> {
+        let num_batches = VECTOR_COUNT / VECTOR_BATCH_SIZE;
+        let remainder = VECTOR_COUNT % VECTOR_BATCH_SIZE;
+        let mut batches = Vec::with_capacity(num_batches + if remainder > 0 { 1 } else { 0 });
+
+        for batch_idx in 0..num_batches {
+            let start_id = (batch_idx * VECTOR_BATCH_SIZE) as u64;
+            let batch = generate_vector_batch(schema.clone(), start_id, VECTOR_BATCH_SIZE);
+            let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
+            batches.push(batch_with_mvcc);
+        }
+
+        // Add remainder batch if needed
+        if remainder > 0 {
+            let start_id = (num_batches * VECTOR_BATCH_SIZE) as u64;
+            let batch = generate_vector_batch(schema.clone(), start_id, remainder);
+            let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
+            batches.push(batch_with_mvcc);
+        }
+
+        batches
+    }
+
+    /// Common setup function for creating and populating a store.
+    /// Returns (store, table_id).
+    fn setup_store_common(
+        compression: Compression,
+        schema: Arc<Schema>,
+        table_name: &str,
+    ) -> (Arc<ParquetStore<MemPager>>, TableId) {
+        let pager = Arc::new(MemPager::new());
+        let config = WriterConfig::default()
+            .with_compression(compression)
+            .with_max_row_group_size(VECTOR_BATCH_SIZE);
+
+        let store = Arc::new(ParquetStore::open_with_config(Arc::clone(&pager), config).unwrap());
+        let table_id = store.create_table(table_name, schema.clone()).unwrap();
+
+        let batches = generate_all_batches(schema);
+        store.append_many(table_id, batches).unwrap();
+
+        (store, table_id)
+    }
+
     /// Write vectors to ParquetStore and return (input_bytes, storage_bytes).
     fn bench_write_vectors(compression: Compression, _compression_name: &str) -> (usize, usize) {
         let pager = Arc::new(MemPager::new());
@@ -240,36 +286,18 @@ mod parquet_based {
     fn setup_store_for_similarity(
         compression: Compression,
     ) -> (Arc<ParquetStore<MemPager>>, TableId, Vec<f32>) {
-        let pager = Arc::new(MemPager::new());
-        let config = WriterConfig::default()
-            .with_compression(compression)
-            .with_max_row_group_size(VECTOR_BATCH_SIZE);
-
-        let store = Arc::new(ParquetStore::open_with_config(Arc::clone(&pager), config).unwrap());
         let schema = create_vector_schema();
-        let table_id = store.create_table("vectors", schema.clone()).unwrap();
-
-        let num_batches = VECTOR_COUNT / VECTOR_BATCH_SIZE;
-        let mut batches = Vec::with_capacity(num_batches);
-        for batch_idx in 0..num_batches {
-            let start_id = (batch_idx * VECTOR_BATCH_SIZE) as u64;
-            let batch = generate_vector_batch(schema.clone(), start_id, VECTOR_BATCH_SIZE);
-            let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
-            batches.push(batch_with_mvcc);
-        }
-        store.append_many(table_id, batches).unwrap();
+        let (store, table_id) = setup_store_common(compression, schema, "vectors");
 
         let mut rng = rand::rng();
         let query_vector: Vec<f32> = (0..VECTOR_DIM).map(|_| rng.random::<f32>()).collect();
 
         (store, table_id, query_vector)
-    }
-
-    // Benchmark entry point for write performance.
-    // pub fn run_write_benchmark(c: &mut Criterion) {
-    //     let mut group = c.benchmark_group("parquet_vector_write");
-    //     group.throughput(Throughput::Elements(VECTOR_COUNT as u64));
-    //     group.sample_size(10);
+    } // Benchmark entry point for write performance.
+      // pub fn run_write_benchmark(c: &mut Criterion) {
+      //     let mut group = c.benchmark_group("parquet_vector_write");
+      //     group.throughput(Throughput::Elements(VECTOR_COUNT as u64));
+      //     group.sample_size(10);
 
     //     let compressions = vec![
     //         (Compression::UNCOMPRESSED, "uncompressed"),
@@ -387,54 +415,16 @@ mod parquet_based {
     fn setup_store_for_read_external(
         compression: Compression,
     ) -> (Arc<ParquetStore<MemPager>>, TableId) {
-        let pager = Arc::new(MemPager::new());
-        let config = WriterConfig::default()
-            .with_compression(compression)
-            .with_max_row_group_size(VECTOR_BATCH_SIZE);
-
-        let store = Arc::new(ParquetStore::open_with_config(Arc::clone(&pager), config).unwrap());
         let schema = create_external_vector_schema();
-        let table_id = store
-            .create_table("vectors_external", schema.clone())
-            .unwrap();
-
-        let num_batches = VECTOR_COUNT / VECTOR_BATCH_SIZE;
-        let mut batches = Vec::with_capacity(num_batches);
-        for batch_idx in 0..num_batches {
-            let start_id = (batch_idx * VECTOR_BATCH_SIZE) as u64;
-            let batch = generate_vector_batch(schema.clone(), start_id, VECTOR_BATCH_SIZE);
-            let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
-            batches.push(batch_with_mvcc);
-        }
-        store.append_many(table_id, batches).unwrap();
-
-        (store, table_id)
+        setup_store_common(compression, schema, "vectors_external")
     }
 
     /// Setup store with external storage for similarity search.
     fn setup_store_for_similarity_external(
         compression: Compression,
     ) -> (Arc<ParquetStore<MemPager>>, TableId, Vec<f32>) {
-        let pager = Arc::new(MemPager::new());
-        let config = WriterConfig::default()
-            .with_compression(compression)
-            .with_max_row_group_size(VECTOR_BATCH_SIZE);
-
-        let store = Arc::new(ParquetStore::open_with_config(Arc::clone(&pager), config).unwrap());
         let schema = create_external_vector_schema();
-        let table_id = store
-            .create_table("vectors_external", schema.clone())
-            .unwrap();
-
-        let num_batches = VECTOR_COUNT / VECTOR_BATCH_SIZE;
-        let mut batches = Vec::with_capacity(num_batches);
-        for batch_idx in 0..num_batches {
-            let start_id = (batch_idx * VECTOR_BATCH_SIZE) as u64;
-            let batch = generate_vector_batch(schema.clone(), start_id, VECTOR_BATCH_SIZE);
-            let batch_with_mvcc = add_mvcc_columns(batch, 1).unwrap();
-            batches.push(batch_with_mvcc);
-        }
-        store.append_many(table_id, batches).unwrap();
+        let (store, table_id) = setup_store_common(compression, schema, "vectors_external");
 
         let mut rng = rand::rng();
         let query_vector: Vec<f32> = (0..VECTOR_DIM).map(|_| rng.random::<f32>()).collect();
