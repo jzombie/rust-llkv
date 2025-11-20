@@ -15,7 +15,7 @@ llkv-result = { path = "../llkv-result" }
 llkv-storage = { path = "../llkv-storage" }
 
 # Parquet support
-parquet = { version = "56.2.0", default-features = false, features = ["arrow", "async", "snap"] }
+parquet = { workspace = true, default-features = false, features = ["arrow", "async", "snap"] }
 bytes = "1.9"
 
 # Serialization
