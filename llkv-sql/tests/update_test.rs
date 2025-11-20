@@ -62,6 +62,7 @@ fn test_update_via_datafusion() {
             .await
             .expect("update range");
 
+        // TODO: Fix so that `SELECT *` doesn't show meta `row_id` by default
         let results_range = engine
             .execute("SELECT id, val FROM t1 ORDER BY id")
             .await
