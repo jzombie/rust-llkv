@@ -489,13 +489,22 @@ fn reconstruct_array_from_column_blob(
             // Reconstruct FixedSizeListArray from contiguous data
             match inner_field.data_type() {
                 DataType::Float32 => {
-                    let floats: &[f32] = bytemuck::cast_slice(column_bytes.as_ref());
+                    // Zero-copy construction: wrap the bytes directly in an Arrow buffer
+                    let total_bytes_needed =
+                        num_rows_needed * (*size as usize) * std::mem::size_of::<f32>();
+                    let slice = column_bytes.slice(..total_bytes_needed);
 
-                    // Take only the rows we need from the blob
-                    let total_floats_needed = num_rows_needed * (*size as usize);
-                    let floats_slice = &floats[..total_floats_needed];
+                    // Create Arrow buffer from bytes without copying
+                    let buffer = arrow::buffer::Buffer::from(slice);
+                    let values_array = Float32Array::new(
+                        arrow::buffer::ScalarBuffer::new(
+                            buffer,
+                            0,
+                            num_rows_needed * (*size as usize),
+                        ),
+                        None,
+                    );
 
-                    let values_array = Float32Array::from(floats_slice.to_vec());
                     let field = Arc::new(Field::new("item", DataType::Float32, false));
                     let list_array =
                         FixedSizeListArray::new(field, *size, Arc::new(values_array), None);
