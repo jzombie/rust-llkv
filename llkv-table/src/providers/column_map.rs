@@ -24,7 +24,7 @@ use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder,
 };
-use llkv_column_map::store::{ColumnStore, FIELD_ID_META_KEY, GatherNullPolicy};
+use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
@@ -32,6 +32,8 @@ use llkv_column_map::{
 use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
+
+use crate::common::{DEFAULT_SCAN_BATCH_SIZE, FIELD_ID_META_KEY};
 
 /// Custom [`TableProvider`] that surfaces LLKV Column Map data to DataFusion.
 pub struct ColumnMapTableProvider<P>

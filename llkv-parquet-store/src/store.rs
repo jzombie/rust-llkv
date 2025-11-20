@@ -6,6 +6,7 @@ use crate::writer::WriterConfig;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
+use llkv_storage::constants::ROW_ID_COLUMN_NAME;
 use llkv_storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use llkv_storage::types::PhysicalKey;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -171,11 +172,15 @@ where
         let mut new_row_ids = rustc_hash::FxHashSet::default();
         for batch in &batches {
             let row_id_col = batch
-                .column_by_name("row_id")
-                .ok_or_else(|| Error::InvalidArgumentError("missing row_id column".into()))?
+                .column_by_name(ROW_ID_COLUMN_NAME)
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!("missing {} column", ROW_ID_COLUMN_NAME))
+                })?
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
-                .ok_or_else(|| Error::InvalidArgumentError("row_id must be UInt64".into()))?;
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!("{} must be UInt64", ROW_ID_COLUMN_NAME))
+                })?;
 
             for i in 0..row_id_col.len() {
                 new_row_ids.insert(row_id_col.value(i));
@@ -231,7 +236,7 @@ where
                                 };
 
                                 let row_id_col = batch
-                                    .column_by_name("row_id")
+                                    .column_by_name(ROW_ID_COLUMN_NAME)
                                     .unwrap()
                                     .as_any()
                                     .downcast_ref::<arrow::array::UInt64Array>()

@@ -4,6 +4,7 @@ use arrow::array::{Array, BooleanArray, UInt64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
+use llkv_storage::constants::{CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, ROW_ID_COLUMN_NAME};
 use std::sync::Arc;
 
 /// Apply MVCC visibility filtering to a RecordBatch.
@@ -13,23 +14,29 @@ use std::sync::Arc;
 /// - `deleted_by_txn IS NULL OR deleted_by_txn > txn_id`
 pub fn apply_mvcc_filter(batch: RecordBatch, txn_id: u64) -> Result<RecordBatch> {
     let created_by = batch
-        .column_by_name("created_by_txn")
-        .ok_or_else(|| Error::InvalidArgumentError("missing created_by_txn column".into()))?;
+        .column_by_name(CREATED_BY_COLUMN_NAME)
+        .ok_or_else(|| {
+            Error::InvalidArgumentError(format!("missing {} column", CREATED_BY_COLUMN_NAME))
+        })?;
 
     let deleted_by = batch
-        .column_by_name("deleted_by_txn")
-        .ok_or_else(|| Error::InvalidArgumentError("missing deleted_by_txn column".into()))?;
+        .column_by_name(DELETED_BY_COLUMN_NAME)
+        .ok_or_else(|| {
+            Error::InvalidArgumentError(format!("missing {} column", DELETED_BY_COLUMN_NAME))
+        })?;
 
     if !matches!(created_by.data_type(), DataType::UInt64) {
-        return Err(Error::InvalidArgumentError(
-            "created_by_txn must be UInt64".into(),
-        ));
+        return Err(Error::InvalidArgumentError(format!(
+            "{} must be UInt64",
+            CREATED_BY_COLUMN_NAME
+        )));
     }
 
     if !matches!(deleted_by.data_type(), DataType::UInt64) {
-        return Err(Error::InvalidArgumentError(
-            "deleted_by_txn must be UInt64".into(),
-        ));
+        return Err(Error::InvalidArgumentError(format!(
+            "{} must be UInt64",
+            DELETED_BY_COLUMN_NAME
+        )));
     }
 
     let created_arr = created_by.as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -71,21 +78,27 @@ pub fn deduplicate_by_row_id(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatc
     let mut row_versions: FxHashMap<u64, (usize, usize, u64)> = FxHashMap::default();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
-        let row_id_col = batch
-            .column_by_name("row_id")
-            .ok_or_else(|| Error::InvalidArgumentError("missing row_id column".into()))?;
+        let row_id_col = batch.column_by_name(ROW_ID_COLUMN_NAME).ok_or_else(|| {
+            Error::InvalidArgumentError(format!("missing {} column", ROW_ID_COLUMN_NAME))
+        })?;
         let created_by_col = batch
-            .column_by_name("created_by_txn")
-            .ok_or_else(|| Error::InvalidArgumentError("missing created_by_txn column".into()))?;
+            .column_by_name(CREATED_BY_COLUMN_NAME)
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!("missing {} column", CREATED_BY_COLUMN_NAME))
+            })?;
 
         let row_ids = row_id_col
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::InvalidArgumentError("row_id must be UInt64".into()))?;
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!("{} must be UInt64", ROW_ID_COLUMN_NAME))
+            })?;
         let created_by = created_by_col
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::InvalidArgumentError("created_by_txn must be UInt64".into()))?;
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(format!("{} must be UInt64", CREATED_BY_COLUMN_NAME))
+            })?;
 
         for row_idx in 0..batch.num_rows() {
             let row_id = row_ids.value(row_idx);
@@ -109,8 +122,8 @@ pub fn deduplicate_by_row_id(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatc
     let mut result = Vec::new();
 
     for (batch_idx, batch) in batches.into_iter().enumerate() {
-        let row_id_col = batch.column_by_name("row_id").unwrap();
-        let created_by_col = batch.column_by_name("created_by_txn").unwrap();
+        let row_id_col = batch.column_by_name(ROW_ID_COLUMN_NAME).unwrap();
+        let created_by_col = batch.column_by_name(CREATED_BY_COLUMN_NAME).unwrap();
 
         let row_ids = row_id_col.as_any().downcast_ref::<UInt64Array>().unwrap();
         let created_by = created_by_col
@@ -162,12 +175,12 @@ pub fn add_mvcc_columns(batch: RecordBatch, txn_id: u64) -> Result<RecordBatch> 
     // Combine with existing columns
     let mut fields = batch.schema().fields().to_vec();
     fields.push(Arc::new(arrow::datatypes::Field::new(
-        "created_by_txn",
+        CREATED_BY_COLUMN_NAME,
         DataType::UInt64,
         false,
     )));
     fields.push(Arc::new(arrow::datatypes::Field::new(
-        "deleted_by_txn",
+        DELETED_BY_COLUMN_NAME,
         DataType::UInt64,
         true,
     )));
@@ -192,8 +205,8 @@ mod tests {
     fn test_apply_mvcc_filter() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::UInt64, false),
-            Field::new("created_by_txn", DataType::UInt64, false),
-            Field::new("deleted_by_txn", DataType::UInt64, true),
+            Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false),
+            Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, true),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -244,8 +257,8 @@ mod tests {
         let with_mvcc = add_mvcc_columns(batch, 42).unwrap();
 
         assert_eq!(with_mvcc.num_columns(), 4);
-        assert_eq!(with_mvcc.schema().field(2).name(), "created_by_txn");
-        assert_eq!(with_mvcc.schema().field(3).name(), "deleted_by_txn");
+        assert_eq!(with_mvcc.schema().field(2).name(), CREATED_BY_COLUMN_NAME);
+        assert_eq!(with_mvcc.schema().field(3).name(), DELETED_BY_COLUMN_NAME);
 
         let created = with_mvcc
             .column(2)
@@ -260,10 +273,10 @@ mod tests {
         use arrow::array::StringArray;
 
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            Arc::new(Field::new("row_id", DataType::UInt64, false)),
+            Arc::new(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false)),
             Arc::new(Field::new("name", DataType::Utf8, false)),
-            Arc::new(Field::new("created_by_txn", DataType::UInt64, false)),
-            Arc::new(Field::new("deleted_by_txn", DataType::UInt64, true)),
+            Arc::new(Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false)),
+            Arc::new(Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, true)),
         ]));
 
         // Batch 1: rows [1,2,3] at txn 1

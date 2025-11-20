@@ -31,8 +31,7 @@ use llkv_result::{Error as LlkvError, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-const ROW_ID_COLUMN_NAME: &str = "row_id";
-const DEFAULT_SCAN_BATCH_SIZE: usize = 1024;
+use crate::common::{DEFAULT_SCAN_BATCH_SIZE, ROW_ID_COLUMN_NAME};
 
 /// Custom [`TableProvider`] that surfaces LLKV Parquet data to DataFusion.
 pub struct LlkvTableProvider<P>

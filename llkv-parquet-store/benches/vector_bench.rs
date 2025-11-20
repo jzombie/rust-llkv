@@ -9,6 +9,7 @@ use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llkv_parquet_store::{add_mvcc_columns, ParquetStore, TableId, WriterConfig};
 use llkv_result::Result;
+use llkv_storage::constants::ROW_ID_COLUMN_NAME;
 use llkv_storage::pager::{BatchGet, GetResult, MemPager, Pager};
 use llkv_storage::types::PhysicalKey;
 use parquet::basic::Compression;
@@ -35,7 +36,7 @@ mod parquet_based {
     /// Generate a schema for storing 1024-dimensional float32 vectors.
     fn create_vector_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new(
                 "embedding",
                 DataType::FixedSizeList(
@@ -56,7 +57,7 @@ mod parquet_based {
         );
 
         Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
+            Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
             Field::new(
                 "embedding",
                 DataType::FixedSizeList(

@@ -2,7 +2,10 @@ use arrow::array::{Int32Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
-use llkv_column_map::store::{ColumnStore, FIELD_ID_META_KEY, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{
+    CREATED_BY_COLUMN_NAME, ColumnStore, DELETED_BY_COLUMN_NAME, FIELD_ID_META_KEY,
+    ROW_ID_COLUMN_NAME,
+};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_parquet_store::{ParquetStore, TableId};
 use llkv_storage::pager::MemPager;
@@ -22,6 +25,17 @@ async fn test_provider_parity() -> Result<(), Box<dyn std::error::Error>> {
         Field::new("name", DataType::Utf8, true),
     ]));
 
+    // Full Schema (System + User columns)
+    // Both stores use this schema structure. Note that ColumnMap additionally requires
+    // `FIELD_ID_META_KEY` metadata on user columns to map them to their physical storage location.
+    let mut full_fields = vec![
+        Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
+        Field::new(CREATED_BY_COLUMN_NAME, DataType::UInt64, false),
+        Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, true),
+    ];
+    full_fields.extend(schema.fields().iter().map(|f| f.as_ref().clone()));
+    let full_schema = Arc::new(Schema::new(full_fields));
+
     let table_id_u64 = 1;
     let table_id = TableId(table_id_u64);
 
@@ -32,16 +46,11 @@ async fn test_provider_parity() -> Result<(), Box<dyn std::error::Error>> {
     let cm_provider = Arc::new(cm_builder.finish());
 
     // Parquet
-    // ParquetStore needs table creation with FULL schema (including hidden columns)
-    // because LlkvTableProvider expects them to be present in the store.
-    let full_schema = Arc::new(Schema::new(vec![
-        Field::new("row_id", DataType::UInt64, false),
-        Field::new("created_by_txn", DataType::UInt64, false),
-        Field::new("deleted_by_txn", DataType::UInt64, true),
-        Field::new("id", DataType::Int32, false),
-        Field::new("name", DataType::Utf8, true),
-    ]));
-    let _ = pq_store.create_table("test_table", full_schema)?;
+    // ParquetStore operates as a "dumb" column store that persists exactly what it is given.
+    // It does not automatically inject MVCC columns during append; the caller (or upper layer)
+    // must provide them. Therefore, we manually construct batches with `created_by_txn` and
+    // `deleted_by_txn` to satisfy the store's schema requirements.
+    let _ = pq_store.create_table("test_table", full_schema.clone())?;
     let pq_provider = Arc::new(LlkvTableProvider::new(
         Arc::clone(&pq_store),
         table_id,
@@ -59,17 +68,11 @@ async fn test_provider_parity() -> Result<(), Box<dyn std::error::Error>> {
     let deleted_by = UInt64Array::from(vec![None, None, None]); // Not deleted
 
     let batch_pq = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("row_id", DataType::UInt64, false),
-            Field::new("created_by_txn", DataType::UInt64, false),
-            Field::new("deleted_by_txn", DataType::UInt64, true),
-            Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
-        ])),
+        full_schema.clone(),
         vec![
             Arc::new(row_ids.clone()),
-            Arc::new(created_by),
-            Arc::new(deleted_by),
+            Arc::new(created_by.clone()),
+            Arc::new(deleted_by.clone()),
             Arc::new(ids.clone()),
             Arc::new(names.clone()),
         ],
@@ -77,24 +80,44 @@ async fn test_provider_parity() -> Result<(), Box<dyn std::error::Error>> {
     pq_store.append_many(table_id, vec![batch_pq])?;
 
     // Ingest into ColumnMap
-    // We need to construct a schema with metadata for user columns, AND row_id.
-    let mut fields = vec![Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false)];
+    // We need to construct a schema with metadata for user columns.
+    // We start from full_schema to ensure parity, adding metadata where needed.
+    // Ingest into ColumnMap
+    // ColumnMap uses a `LogicalFieldId` mapping to locate columns in the pager. This mapping
+    // is passed via schema metadata. The test manually injects this metadata because we are
+    // bypassing the catalog/table layer that would normally handle this.
+    //
+    // Note: ColumnMap currently requires Field IDs for all columns except row_id.
+    // We skip MVCC columns here because we haven't assigned them Field IDs in this test setup,
+    // effectively testing it in a non-MVCC mode.
+    let mut cm_fields = Vec::with_capacity(full_schema.fields().len());
+    for f in full_schema.fields() {
+        let mut f = f.as_ref().clone();
 
-    for (i, f) in schema.fields().iter().enumerate() {
-        let mut metadata = f.metadata().clone();
-        let field_id =
-            LogicalFieldId::for_user(table_id_u64.try_into().unwrap(), (i + 1) as u64 as u32);
-        metadata.insert(
-            FIELD_ID_META_KEY.to_string(),
-            u64::from(field_id).to_string(),
-        );
-        fields.push(f.as_ref().clone().with_metadata(metadata));
+        if f.name() == ROW_ID_COLUMN_NAME {
+            cm_fields.push(f);
+        } else if let Ok(idx) = schema.index_of(f.name()) {
+            // If it's a user column (present in the user schema), add metadata
+            let mut metadata = f.metadata().clone();
+            let field_id =
+                LogicalFieldId::for_user(table_id_u64.try_into().unwrap(), (idx + 1) as u64 as u32);
+            metadata.insert(
+                FIELD_ID_META_KEY.to_string(),
+                u64::from(field_id).to_string(),
+            );
+            f.set_metadata(metadata);
+            cm_fields.push(f);
+        }
     }
 
-    let schema_cm = Arc::new(Schema::new(fields));
+    let schema_cm = Arc::new(Schema::new(cm_fields));
     let batch_cm = RecordBatch::try_new(
         schema_cm,
-        vec![Arc::new(row_ids), Arc::new(ids), Arc::new(names)],
+        vec![
+            Arc::new(row_ids.clone()),
+            Arc::new(ids.clone()),
+            Arc::new(names.clone()),
+        ],
     )?;
     col_store.append(&batch_cm)?;
 
