@@ -1053,10 +1053,10 @@ where
 
             // After processing all slices, stage the final writes for the updated tail pages
             // and the root descriptor objects themselves.
-            eprintln!(
-                "append: writing tail page field_id={:?} tail_page_pk={}",
-                field_id, data_descriptor.tail_page_pk
-            );
+            // eprintln!(
+            //     "append: writing tail page field_id={:?} tail_page_pk={}",
+            //     field_id, data_descriptor.tail_page_pk
+            // );
             all_puts.push(BatchPut::Raw {
                 key: data_descriptor.tail_page_pk,
                 bytes: data_tail_page,
