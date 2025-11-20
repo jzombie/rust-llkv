@@ -130,4 +130,14 @@ impl Pager for SimdRDrivePager {
         })?;
         Ok(())
     }
+
+    fn enumerate_keys(&self) -> Result<Vec<PhysicalKey>> {
+        let mut keys: Vec<PhysicalKey> = self
+            .ds
+            .iter_entries()
+            .map(|entry| entry.key_hash())
+            .collect();
+        keys.sort_unstable();
+        Ok(keys)
+    }
 }

@@ -2359,6 +2359,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-parquet-store"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "bitcode",
+ "bytes",
+ "criterion",
+ "llkv-result",
+ "llkv-storage",
+ "parquet",
+ "rustc-hash",
+ "serde",
+ "simd-r-drive-entry-handle",
+ "tokio",
+]
+
+[[package]]
 name = "llkv-result"
 version = "0.8.2-alpha"
 dependencies = [

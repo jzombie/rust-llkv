@@ -11,6 +11,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{Array, ArrayRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -22,9 +23,9 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 use sqlparser::ast::{
-    AccessExpr, ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable,
+    AccessExpr, Assignment, ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable,
     DataType as SqlDataType, Expr as SqlExpr, Ident, ObjectName, ObjectNamePart, ObjectType, Query,
-    SchemaName, Statement, StructField, Subscript, Value, VisitMut, VisitorMut,
+    SchemaName, Statement, StructField, Subscript, TableWithJoins, Value, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::{DuckDbDialect, GenericDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -57,6 +58,11 @@ impl SqlEngine {
         let engine = Self { ctx, catalog };
         engine.register_existing_tables()?;
         Ok(engine)
+    }
+
+    /// Get the underlying table catalog
+    pub fn catalog(&self) -> &Arc<TableCatalog<BoxedPager>> {
+        &self.catalog
     }
 
     /// Execute raw SQL text, parsing statements to intercept DDL.
@@ -98,6 +104,49 @@ impl SqlEngine {
             Statement::CreateIndex(create_index) => {
                 self.handle_create_index(create_index)?;
                 Ok(SqlStatementResult::Statement { rows_affected: 0 })
+            }
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+                or,
+                limit,
+            } => {
+                if from.is_some() {
+                    return Err(Error::Internal("UPDATE with FROM clause is not supported yet".into()));
+                }
+                if returning.is_some() {
+                    return Err(Error::Internal("UPDATE with RETURNING clause is not supported yet".into()));
+                }
+                if or.is_some() {
+                    return Err(Error::Internal("UPDATE with OR clause is not supported yet".into()));
+                }
+                if limit.is_some() {
+                    return Err(Error::Internal("UPDATE with LIMIT clause is not supported yet".into()));
+                }
+                let rows_affected = self.handle_update(table, assignments, selection).await?;
+                Ok(SqlStatementResult::Statement { rows_affected })
+            }
+            Statement::Delete(delete) => {
+                if delete.using.is_some() {
+                    return Err(Error::Internal("DELETE with USING clause is not supported yet".into()));
+                }
+                if delete.returning.is_some() {
+                    return Err(Error::Internal("DELETE with RETURNING clause is not supported yet".into()));
+                }
+                if !delete.order_by.is_empty() {
+                    return Err(Error::Internal("DELETE with ORDER BY is not supported yet".into()));
+                }
+                if delete.limit.is_some() {
+                    return Err(Error::Internal("DELETE with LIMIT is not supported yet".into()));
+                }
+                if !delete.tables.is_empty() {
+                    return Err(Error::Internal("DELETE with multiple tables is not supported yet".into()));
+                }
+                let rows_affected = self.handle_delete(delete.from, delete.selection).await?;
+                Ok(SqlStatementResult::Statement { rows_affected })
             }
             Statement::Drop {
                 object_type: ObjectType::Table,
@@ -270,9 +319,13 @@ impl SqlEngine {
     fn register_table(&self, name: &str) -> Result<()> {
         self.ensure_schema_registered_for_table(name)?;
         if let Some(provider) = self.catalog.get_table(name)? {
+            let row_ids = provider.get_row_ids();
+            eprintln!("[DEBUG register_table] Registering table '{}' with row_count={}, row_ids={:?}", 
+                name, provider.row_count(), row_ids);
             self.ctx
                 .register_table(name, provider)
                 .map_err(|e| Error::Internal(format!("failed to register table {name}: {e}")))?;
+            eprintln!("[DEBUG register_table] Successfully registered '{}'", name);
         }
         Ok(())
     }
@@ -403,6 +456,288 @@ impl SqlEngine {
         }
     }
 
+    async fn handle_update(
+        &self,
+        table: TableWithJoins,
+        assignments: Vec<Assignment>,
+        selection: Option<SqlExpr>,
+    ) -> Result<usize> {
+        use arrow::array::*;
+        
+        let table_name = match &table.relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => normalize_name(name)?,
+            _ => {
+                return Err(Error::Internal("UPDATE requires a simple table name".into()));
+            }
+        };
+
+        let provider = self.catalog.get_table(&table_name)?
+            .ok_or_else(|| Error::Internal(format!("table '{table_name}' does not exist")))?;
+
+        let ingest_schema = provider.ingest_schema();
+        
+        eprintln!("[DEBUG] Table '{}' ingest schema:", table_name);
+        for (i, field) in ingest_schema.fields().iter().enumerate() {
+            eprintln!("[DEBUG]   Field {}: name='{}', metadata={:?}", 
+                i, field.name(), field.metadata());
+        }
+
+        if !table.joins.is_empty() {
+            return Err(Error::Internal("UPDATE with JOIN is not supported yet".into()));
+        }
+
+        if assignments.is_empty() {
+            return Err(Error::Internal("UPDATE requires at least one SET assignment".into()));
+        }
+
+        let mut assignment_map: std::collections::HashMap<String, &SqlExpr> = std::collections::HashMap::new();
+        for assignment in &assignments {
+            let col_name = match &assignment.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                    let parts: Vec<String> = name.0.iter().map(|part| {
+                        match part {
+                            ObjectNamePart::Identifier(ident) => ident.value.clone(),
+                            ObjectNamePart::Function(func) => func.to_string(),
+                        }
+                    }).collect();
+                    parts.join(".").to_lowercase()
+                }
+                _ => return Err(Error::Internal("Complex assignment targets not supported yet".into())),
+            };
+            
+            // Validate column exists in ingest schema (skip rowid column at index 0)
+            let col_exists = ingest_schema.fields()
+                .iter()
+                .skip(1)
+                .any(|f| f.name().to_lowercase() == col_name);
+            
+            if !col_exists {
+                return Err(Error::Internal(format!("Column '{}' does not exist in table '{}'", col_name, table_name)));
+            }
+            
+            assignment_map.insert(col_name, &assignment.value);
+        }
+
+        let select_sql = if let Some(ref where_expr) = selection {
+            format!("SELECT * FROM {table_name} WHERE {where_expr}")
+        } else {
+            format!("SELECT * FROM {table_name}")
+        };
+
+        let df = self.ctx.sql(&select_sql).await.map_err(|e| {
+            map_datafusion_error("UPDATE SELECT failed", e)
+        })?;
+
+        let batches = df.collect().await.map_err(|e| {
+            map_datafusion_error("UPDATE SELECT collection failed", e)
+        })?;
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        let all_row_ids = provider.get_row_ids();
+        
+        let row_ids = if selection.is_some() {
+            // WHERE clause: map result rows to their actual row IDs
+            // Since we don't have rowid in the result, use first N row IDs
+            // This is still a limitation - proper implementation needs rowid in query
+            all_row_ids.into_iter().take(total_rows).collect::<Vec<_>>()
+        } else {
+            // No WHERE: update all rows
+            all_row_ids
+        };
+
+        let mut offset = 0;
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            let query_schema = batch.schema();
+            let batch_size = batch.num_rows();
+            
+            eprintln!("[DEBUG] Processing batch {}: {} rows", batch_idx, batch_size);
+            
+            let mut rowid_builder = UInt64Builder::with_capacity(batch_size);
+            for i in 0..batch_size {
+                let rid = row_ids[offset + i];
+                eprintln!("[DEBUG]   Row {} in batch -> rowid {}", i, rid);
+                rowid_builder.append_value(rid);
+            }
+            let rowid_array: ArrayRef = Arc::new(rowid_builder.finish());
+            
+            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(ingest_schema.fields().len());
+            new_columns.push(rowid_array);
+            
+            for ingest_idx in 1..ingest_schema.fields().len() {
+                let ingest_field = ingest_schema.field(ingest_idx);
+                let col_name_lower = ingest_field.name().to_lowercase();
+                
+                let query_idx = query_schema.index_of(ingest_field.name())
+                    .map_err(|_| Error::Internal(format!("Column '{}' not found in query result", ingest_field.name())))?;
+                
+                if let Some(value_expr) = assignment_map.get(&col_name_lower) {
+                    let new_column = self.evaluate_update_expression(
+                        value_expr,
+                        ingest_field.data_type(),
+                        batch.num_rows()
+                    )?;
+                    eprintln!("[DEBUG] Updating column '{}' (field_id from metadata: {:?})", 
+                        ingest_field.name(), 
+                        ingest_field.metadata().get("field_id"));
+                    new_columns.push(new_column);
+                } else {
+                    new_columns.push(batch.column(query_idx).clone());
+                }
+            }
+            
+            let updated_batch = RecordBatch::try_new(Arc::clone(&ingest_schema), new_columns)
+                .map_err(|e| Error::Internal(format!("Failed to create updated batch: {e}")))?;
+            
+            eprintln!("[DEBUG] Batch schema fields:");
+            for (i, field) in updated_batch.schema().fields().iter().enumerate() {
+                eprintln!("[DEBUG]   Field {}: name='{}', metadata={:?}", 
+                    i, field.name(), field.metadata());
+            }
+            eprintln!("[DEBUG] Batch has {} rows", updated_batch.num_rows());
+            eprintln!("[DEBUG] Batch columns:");
+            for (i, col) in updated_batch.columns().iter().enumerate() {
+                eprintln!("[DEBUG]   Column {}: {:?}", i, col);
+            }
+            
+            self.catalog.store().append(&updated_batch)?;
+            
+            offset += batch_size;
+        }
+        
+        eprintln!("[DEBUG] UPDATE wrote {} rows", total_rows);
+
+        // Re-register the table so DataFusion uses a fresh provider with updated data
+        // This is necessary because each get_table() call creates a new provider instance
+        // with its own row_ids snapshot
+        eprintln!("[DEBUG] Deregistering table '{}'", table_name);
+        let dereg_result = self.ctx.deregister_table(&table_name);
+        eprintln!("[DEBUG] Deregister result: {:?}", dereg_result);
+        
+        eprintln!("[DEBUG] Re-registering table '{}'", table_name);
+        self.register_table(&table_name)?;
+        eprintln!("[DEBUG] Re-registration complete");
+
+        Ok(total_rows)
+    }
+
+    async fn handle_delete(
+        &self,
+        from: sqlparser::ast::FromTable,
+        selection: Option<SqlExpr>,
+    ) -> Result<usize> {
+        let tables = match from {
+            sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
+            sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
+        };
+
+        if tables.is_empty() {
+            return Err(Error::Internal("DELETE requires a table".into()));
+        }
+        if tables.len() > 1 {
+            return Err(Error::Internal("DELETE from multiple tables not supported yet".into()));
+        }
+
+        let table_name = match &tables[0].relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => normalize_name(name)?,
+            _ => {
+                return Err(Error::Internal("DELETE requires a simple table name".into()));
+            }
+        };
+
+        let _table = self.catalog.get_table(&table_name)?
+            .ok_or_else(|| Error::Internal(format!("table '{table_name}' does not exist")))?;
+
+        if !tables[0].joins.is_empty() {
+            return Err(Error::Internal("DELETE with JOIN is not supported yet".into()));
+        }
+
+        // Delegate to DataFusion which will handle it through the planner
+        let delete_sql = if let Some(ref where_expr) = selection {
+            format!("DELETE FROM {table_name} WHERE {where_expr}")
+        } else {
+            format!("DELETE FROM {table_name}")
+        };
+
+        let result = self.execute_via_datafusion(&delete_sql).await?;
+        
+        match result {
+            SqlStatementResult::Statement { rows_affected } => Ok(rows_affected),
+            _ => Ok(0),
+        }
+    }
+
+    /// Evaluate a simple UPDATE SET expression into an Arrow array.
+    ///
+    /// Currently supports literals and NULL. Column references, arithmetic
+    /// expressions, and subqueries require implementing proper expression
+    /// evaluation against the existing row data.
+    fn evaluate_update_expression(
+        &self,
+        expr: &SqlExpr,
+        data_type: &DataType,
+        num_rows: usize,
+    ) -> Result<ArrayRef> {
+        use arrow::array::*;
+        
+        match expr {
+            SqlExpr::Value(value_with_span) => {
+                let value = &value_with_span.value;
+                match (value, data_type) {
+                    (Value::Number(n, _), DataType::Int64) => {
+                        let val = n.parse::<i64>()
+                            .map_err(|e| Error::Internal(format!("Failed to parse integer: {e}")))?;
+                        let mut builder = Int64Builder::with_capacity(num_rows);
+                        for _ in 0..num_rows {
+                            builder.append_value(val);
+                        }
+                        Ok(Arc::new(builder.finish()))
+                    }
+                    (Value::Number(n, _), DataType::Float64) => {
+                        let val = n.parse::<f64>()
+                            .map_err(|e| Error::Internal(format!("Failed to parse float: {e}")))?;
+                        let mut builder = Float64Builder::with_capacity(num_rows);
+                        for _ in 0..num_rows {
+                            builder.append_value(val);
+                        }
+                        Ok(Arc::new(builder.finish()))
+                    }
+                    (Value::SingleQuotedString(s) | Value::DoubleQuotedString(s), DataType::Utf8) => {
+                        let mut builder = StringBuilder::with_capacity(num_rows, s.len() * num_rows);
+                        for _ in 0..num_rows {
+                            builder.append_value(s);
+                        }
+                        Ok(Arc::new(builder.finish()))
+                    }
+                    (Value::Boolean(b), DataType::Boolean) => {
+                        let mut builder = BooleanBuilder::with_capacity(num_rows);
+                        for _ in 0..num_rows {
+                            builder.append_value(*b);
+                        }
+                        Ok(Arc::new(builder.finish()))
+                    }
+                    (Value::Null, _) => {
+                        Ok(arrow::array::new_null_array(data_type, num_rows))
+                    }
+                    _ => Err(Error::Internal(format!(
+                        "Unsupported UPDATE value type: {:?} for column type {:?}",
+                        value, data_type
+                    ))),
+                }
+            }
+            SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+                Err(Error::Internal("UPDATE with column expressions not yet supported; use literal values".into()))
+            }
+            _ => {
+                Err(Error::Internal(format!("Unsupported UPDATE expression: {}", expr)))
+            }
+        }
+    }
+
     fn handle_create_index(&self, create_index: CreateIndex) -> Result<()> {
         let table_name = normalize_name(&create_index.table_name)?;
 
@@ -515,6 +850,93 @@ fn map_datafusion_error(prefix: &str, err: DataFusionError) -> Error {
         decorated = format!("{msg}; does not exist");
     }
     Error::Internal(format!("{prefix}: {decorated}"))
+}
+
+/// Format an Arrow array value at the given index as a SQL literal string.
+fn format_arrow_value(array: &dyn Array, row_idx: usize) -> String {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    if array.is_null(row_idx) {
+        return "NULL".to_string();
+    }
+
+    match array.data_type() {
+        DataType::Int8 => {
+            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::Int16 => {
+            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::Int32 => {
+            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::UInt8 => {
+            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::UInt16 => {
+            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::UInt32 => {
+            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::UInt64 => {
+            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            arr.value(row_idx).to_string()
+        }
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            format!("'{}'", arr.value(row_idx).replace('\'', "''"))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            format!("'{}'", arr.value(row_idx).replace('\'', "''"))
+        }
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            if arr.value(row_idx) { "TRUE" } else { "FALSE" }.to_string()
+        }
+        DataType::Binary => {
+            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let bytes = arr.value(row_idx);
+            // Simple hex encoding without external crate
+            let hex_str: String = bytes.iter()
+                .map(|b| format!("{:02X}", b))
+                .collect();
+            format!("X'{}'", hex_str)
+        }
+        DataType::LargeBinary => {
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            let bytes = arr.value(row_idx);
+            // Simple hex encoding without external crate
+            let hex_str: String = bytes.iter()
+                .map(|b| format!("{:02X}", b))
+                .collect();
+            format!("X'{}'", hex_str)
+        }
+        _ => {
+            // For other types, use a simple string representation
+            format!("'{}'", array.to_data().buffers()[0].as_slice()[row_idx])
+        }
+    }
 }
 
 struct SqlAstRewriter<'a> {

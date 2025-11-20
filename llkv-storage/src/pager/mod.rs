@@ -68,6 +68,10 @@ impl Pager for BoxedPager {
     fn free_many(&self, keys: &[PhysicalKey]) -> Result<()> {
         self.inner.free_many(keys)
     }
+
+    fn enumerate_keys(&self) -> Result<Vec<PhysicalKey>> {
+        self.inner.enumerate_keys()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -101,4 +105,10 @@ pub trait Pager: Send + Sync + 'static {
     /// Batch free physical keys (best-effort). Implementations may ignore
     /// unknown keys. This enables real deletion from the store.
     fn free_many(&self, keys: &[PhysicalKey]) -> Result<()>;
+
+    /// Enumerate all physical keys currently stored in the pager.
+    ///
+    /// Returns a sorted vector of all keys that have blobs stored.
+    /// This is useful for garbage collection and diagnostics.
+    fn enumerate_keys(&self) -> Result<Vec<PhysicalKey>>;
 }

@@ -1,0 +1,34 @@
+[package]
+name = "llkv-parquet-store"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Parquet-based storage layer for LLKV, managing collections of Parquet files as pager blobs"
+repository = "https://github.com/jzombie/rust-llkv"
+
+[dependencies]
+# Workspace dependencies
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+llkv-result = { path = "../llkv-result" }
+llkv-storage = { path = "../llkv-storage" }
+
+# Parquet support
+parquet = { version = "56.2.0", default-features = false, features = ["arrow", "async", "snap"] }
+bytes = "1.9"
+
+# Serialization
+bitcode = { workspace = true }
+serde = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["rt"] }
+
+# Utilities
+rustc-hash = { workspace = true }
+simd-r-drive-entry-handle = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+criterion = { workspace = true }

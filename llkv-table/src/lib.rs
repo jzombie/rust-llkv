@@ -127,8 +127,14 @@ impl<P> LlkvTableProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    fn ingest_schema(&self) -> SchemaRef {
+    /// Get the ingest schema which includes rowid and field_id metadata
+    pub fn ingest_schema(&self) -> SchemaRef {
         Arc::clone(&self.ingest_schema)
+    }
+
+    /// Get all row IDs currently in the table
+    pub fn get_row_ids(&self) -> Vec<RowId> {
+        self.row_ids.read().unwrap().clone()
     }
 
     /// Construct a table provider with the default scan batch size.

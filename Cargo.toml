@@ -6,6 +6,7 @@ license = "Apache-2.0"
 repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
+
 [workspace.dependencies]
 llkv = { path = "./llkv", version = "0.8.2-alpha" }
 # llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.2-alpha" }
@@ -13,6 +14,7 @@ llkv-column-map = { path = "./llkv-column-map", version = "0.8.2-alpha" }
 # llkv-expr = { path = "./llkv-expr", version = "0.8.2-alpha" }
 llkv-fusion = { path = "./llkv-fusion", version = "0.8.2-alpha" }
 # llkv-join = { path = "./llkv-join", version = "0.8.2-alpha" }
+llkv-parquet-store = { path = "./llkv-parquet-store", version = "0.8.2-alpha" }
 # llkv-plan = { path = "./llkv-plan", version = "0.8.2-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.8.2-alpha" }
 # llkv-runtime = { path = "./llkv-runtime", version = "0.8.2-alpha" }
@@ -48,6 +50,7 @@ libtest-mimic = "0.8"
 line-ending = "1.5.1"
 modular-bitfield = "0.13.0"
 num_enum = "0.7.5"
+parquet = { version = "56.2.0", default-features = false, features = ["arrow", "async"] }
 rand = "0.9.1"
 rayon = "1.10.0"
 regex = "1.12.2"
@@ -76,6 +79,7 @@ members = [
     # "llkv-expr",
     "llkv-fusion",
     # "llkv-join",
+    "llkv-parquet-store",
     # "llkv-plan",
     "llkv-result",
     # "llkv-runtime",

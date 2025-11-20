@@ -97,4 +97,14 @@ impl Pager for MemPager {
         }
         Ok(())
     }
+
+    fn enumerate_keys(&self) -> Result<Vec<PhysicalKey>> {
+        let map = self
+            .blobs
+            .read()
+            .expect("MemPager blobs read lock poisoned");
+        let mut keys: Vec<PhysicalKey> = map.keys().copied().collect();
+        keys.sort_unstable();
+        Ok(keys)
+    }
 }
