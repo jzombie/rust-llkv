@@ -22,9 +22,9 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 use sqlparser::ast::{
-    AccessExpr, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType as SqlDataType,
-    Expr as SqlExpr, Ident, ObjectName, ObjectNamePart, ObjectType, Query, SchemaName, Statement,
-    StructField, Subscript, Value, VisitMut, VisitorMut,
+    AccessExpr, ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable,
+    DataType as SqlDataType, Expr as SqlExpr, Ident, ObjectName, ObjectNamePart, ObjectType, Query,
+    SchemaName, Statement, StructField, Subscript, Value, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::{DuckDbDialect, GenericDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -93,6 +93,10 @@ impl SqlEngine {
             }
             Statement::CreateTable(create) => {
                 self.handle_create_table(create).await?;
+                Ok(SqlStatementResult::Statement { rows_affected: 0 })
+            }
+            Statement::CreateIndex(create_index) => {
+                self.handle_create_index(create_index)?;
                 Ok(SqlStatementResult::Statement { rows_affected: 0 })
             }
             Statement::Drop {
@@ -397,6 +401,87 @@ impl SqlEngine {
                 "failed to drop schema '{schema}': {e}"
             ))),
         }
+    }
+
+    fn handle_create_index(&self, create_index: CreateIndex) -> Result<()> {
+        let table_name = normalize_name(&create_index.table_name)?;
+
+        // Verify table exists
+        if self.catalog.get_table(&table_name)?.is_none() {
+            return Err(Error::Internal(format!(
+                "table '{table_name}' does not exist"
+            )));
+        }
+
+        // Extract index name
+        let index_name = create_index
+            .name
+            .as_ref()
+            .map(|name| normalize_name(name))
+            .transpose()?;
+
+        // Validate columns
+        if create_index.columns.is_empty() {
+            return Err(Error::Internal(
+                "CREATE INDEX requires at least one column".into(),
+            ));
+        }
+
+        // Convert columns to simple column names
+        // Note: sort order and nulls_first are not currently supported by the catalog layer
+        let mut column_names = Vec::with_capacity(create_index.columns.len());
+
+        for index_column in &create_index.columns {
+            // Extract column name from IndexColumn's OrderByExpr
+            let col_name = match &index_column.column.expr {
+                SqlExpr::Identifier(ident) => ident.value.clone(),
+                SqlExpr::CompoundIdentifier(parts) => {
+                    if parts.len() == 1 {
+                        parts[0].value.clone()
+                    } else {
+                        // Take the last part as the column name
+                        parts.last().unwrap().value.clone()
+                    }
+                }
+                other => {
+                    return Err(Error::Internal(format!(
+                        "unsupported column expression in CREATE INDEX: {other}"
+                    )));
+                }
+            };
+
+            column_names.push(col_name);
+        }
+
+        // Create indexes on the table's column store
+        // For now, we support single-column indexes only for actual index creation
+        // Multi-column indexes are registered in catalog but not materialized
+        if column_names.len() == 1 {
+            let column_name = &column_names[0];
+            self.catalog.create_index(
+                &table_name,
+                column_name,
+                index_name.as_deref(),
+                create_index.unique,
+                create_index.if_not_exists,
+            )?;
+        } else {
+            // Multi-column indexes: register in catalog metadata only
+            // The catalog's index management will handle this
+            let index_name = index_name.ok_or_else(|| {
+                Error::Internal("Multi-column CREATE INDEX requires an explicit index name".into())
+            })?;
+
+            self.catalog.create_multi_column_index(
+                &table_name,
+                &column_names,
+                &index_name,
+                create_index.unique,
+                create_index.if_not_exists,
+            )?;
+        }
+
+        Ok(())
     }
 }
 

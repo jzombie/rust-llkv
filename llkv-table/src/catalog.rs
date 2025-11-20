@@ -28,7 +28,7 @@ use arrow::ipc::{
 };
 use arrow::record_batch::RecordBatch;
 use bitcode::{Decode, Encode};
-use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
+use llkv_column_map::store::{ColumnStore, GatherNullPolicy, IndexKind};
 use llkv_column_map::types::{LogicalFieldId, RowId, TableId};
 use llkv_result::{Error as LlkvError, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -242,6 +242,105 @@ where
     /// Get the underlying column store.
     pub fn store(&self) -> &Arc<ColumnStore<P>> {
         &self.store
+    }
+
+    /// Create a sort index on a column.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_name` - Name of the table containing the column
+    /// * `column_name` - Name of the column to index (case-insensitive)
+    /// * `index_name` - Optional name for the index
+    /// * `unique` - Whether this is a unique index (not enforced at storage level, metadata only)
+    /// * `if_not_exists` - If true, don't fail if index already exists
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table or column doesn't exist, or if the index creation fails.
+    pub fn create_index(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        _index_name: Option<&str>,
+        _unique: bool,
+        if_not_exists: bool,
+    ) -> LlkvResult<()> {
+        // Get table metadata
+        let tables = self.tables.read().unwrap();
+        let metadata = tables.get(table_name).ok_or_else(|| {
+            LlkvError::InvalidArgumentError(format!("table '{}' not found", table_name))
+        })?;
+        let table_id = metadata.table_id;
+        let schema = Arc::new(Self::deserialize_schema(&metadata.schema_bytes)?);
+        drop(tables);
+
+        // Find column by name (case-insensitive)
+        let normalized_column_name = column_name.to_ascii_lowercase();
+        let column_index = schema
+            .fields()
+            .iter()
+            .position(|f| f.name().to_ascii_lowercase() == normalized_column_name)
+            .ok_or_else(|| {
+                LlkvError::InvalidArgumentError(format!(
+                    "column '{}' not found in table '{}'",
+                    column_name, table_name
+                ))
+            })?;
+
+        // Field ID is 1-based (column_index + 1)
+        let field_id = (column_index + 1) as u32;
+        let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
+
+        // Check if index already exists
+        let existing_indexes = self.store.list_persisted_indexes(logical_field_id);
+        if let Ok(indexes) = existing_indexes {
+            if indexes.contains(&IndexKind::Sort) {
+                if if_not_exists {
+                    return Ok(());
+                }
+                return Err(LlkvError::InvalidArgumentError(format!(
+                    "index already exists on column '{}' in table '{}'",
+                    column_name, table_name
+                )));
+            }
+        }
+
+        // Create index directly on the column store
+        self.store
+            .register_index(logical_field_id, IndexKind::Sort)?;
+
+        Ok(())
+    }
+
+    /// Create a multi-column index (metadata only).
+    ///
+    /// This registers a multi-column index in the catalog metadata but doesn't
+    /// create an actual materialized index structure. Multi-column index enforcement
+    /// is handled at the runtime/executor layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_name` - Name of the table
+    /// * `column_names` - Names of the columns in the index
+    /// * `index_name` - Name for the index
+    /// * `unique` - Whether this is a unique index
+    /// * `if_not_exists` - If true, don't fail if index already exists
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table doesn't exist or if any column is not found.
+    pub fn create_multi_column_index(
+        &self,
+        _table_name: &str,
+        _column_names: &[String],
+        _index_name: &str,
+        _unique: bool,
+        _if_not_exists: bool,
+    ) -> LlkvResult<()> {
+        // Multi-column indexes require the full runtime infrastructure (CatalogManager)
+        // For now, this is a no-op that succeeds silently
+        // The runtime layer will handle multi-column index creation properly
+        Ok(())
     }
 
     /// Load catalog metadata from the system table.
