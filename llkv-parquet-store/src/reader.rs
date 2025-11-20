@@ -5,15 +5,14 @@ use bytes::Bytes;
 use llkv_result::{Error, Result};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-/// Read RecordBatches from in-memory Parquet bytes.
+/// Read RecordBatches from Parquet bytes.
 ///
-/// Optionally applies column projection.
+/// Optionally applies column projection. Accepts `bytes::Bytes` for zero-copy
+/// operation when backed by mmap.
 pub fn read_parquet_from_memory(
-    bytes: &[u8],
+    bytes: Bytes,
     projection: Option<Vec<usize>>,
 ) -> Result<Vec<RecordBatch>> {
-    let bytes = Bytes::copy_from_slice(bytes);
-
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|e| Error::Internal(format!("failed to create Parquet reader: {}", e)))?;
 
@@ -62,7 +61,7 @@ mod tests {
         .unwrap();
 
         let bytes = write_parquet_to_memory(&batch).unwrap();
-        let batches = read_parquet_from_memory(&bytes, None).unwrap();
+        let batches = read_parquet_from_memory(Bytes::from(bytes), None).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);
@@ -90,7 +89,7 @@ mod tests {
         let bytes = write_parquet_to_memory(&batch).unwrap();
 
         // Project only columns 0 and 2
-        let batches = read_parquet_from_memory(&bytes, Some(vec![0, 2])).unwrap();
+        let batches = read_parquet_from_memory(Bytes::from(bytes), Some(vec![0, 2])).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_columns(), 2);

@@ -153,7 +153,9 @@ where
 
                 // Extract column statistics from Parquet metadata
                 let column_stats = if self.writer_config.enable_statistics {
-                    crate::statistics::extract_statistics(&parquet_bytes).ok()
+                    // Convert to Bytes for zero-copy statistics extraction
+                    let bytes = bytes::Bytes::from(parquet_bytes.clone());
+                    crate::statistics::extract_statistics(bytes).ok()
                 } else {
                     None
                 };
@@ -415,8 +417,8 @@ where
             Err(e) => return Some(Err(e)),
         };
 
-        // Decode Parquet file with projection
-        match crate::reader::read_parquet_from_memory(bytes.as_ref(), self.projection.clone()) {
+        // Decode Parquet file with projection (zero-copy from mmap)
+        match crate::reader::read_parquet_from_memory(bytes.into_bytes(), self.projection.clone()) {
             Ok(batches) => {
                 // Apply LWW deduplication within this file
                 match crate::mvcc::deduplicate_by_row_id(batches) {

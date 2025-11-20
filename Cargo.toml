@@ -7,24 +7,24 @@ repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
-llkv = { path = "./llkv", version = "0.8.2-alpha" }
+# llkv = { path = "./llkv", version = "0.8.2-alpha" }
 # llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.2-alpha" }
-llkv-column-map = { path = "./llkv-column-map", version = "0.8.2-alpha" }
+# llkv-column-map = { path = "./llkv-column-map", version = "0.8.2-alpha" }
 # llkv-expr = { path = "./llkv-expr", version = "0.8.2-alpha" }
-llkv-fusion = { path = "./llkv-fusion", version = "0.8.2-alpha" }
+# llkv-fusion = { path = "./llkv-fusion", version = "0.8.2-alpha" }
 # llkv-join = { path = "./llkv-join", version = "0.8.2-alpha" }
 llkv-parquet-store = { path = "./llkv-parquet-store", version = "0.8.2-alpha" }
 # llkv-plan = { path = "./llkv-plan", version = "0.8.2-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.8.2-alpha" }
 # llkv-runtime = { path = "./llkv-runtime", version = "0.8.2-alpha" }
-llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.2-alpha" }
-llkv-sql = { path = "./llkv-sql", version = "0.8.2-alpha" }
+# llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.2-alpha" }
+# llkv-sql = { path = "./llkv-sql", version = "0.8.2-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.8.2-alpha" }
-llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
+# llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.2-alpha" }
 # llkv-transaction = { path = "./llkv-transaction", version = "0.8.2-alpha" }
-simd-r-drive = "0.14.0-alpha"
-simd-r-drive-entry-handle = "0.14.0-alpha"
+simd-r-drive = "0.16.0-alpha"
+simd-r-drive-entry-handle = { version = "0.16.0-alpha", features = ["bytes"] } 
 
 # Vendor crates
 # Note: A subset of these crates are used only for debug builds or examples;
@@ -72,20 +72,20 @@ walkdir = "2.5"
 
 [workspace]
 members = [
-    "llkv",
+    # "llkv",
     # "llkv-aggregate",
-    "llkv-column-map",
+    # "llkv-column-map",
     # "llkv-expr",
-    "llkv-fusion",
+    # "llkv-fusion",
     # "llkv-join",
     "llkv-parquet-store",
     # "llkv-plan",
     "llkv-result",
     # "llkv-runtime",
-    "llkv-slt-tester",
-    "llkv-sql",
+    # "llkv-slt-tester",
+    # "llkv-sql",
     "llkv-storage",
-    "llkv-table",
+    # "llkv-table",
     "llkv-test-utils",
     # "llkv-tpch",
     # "llkv-transaction",

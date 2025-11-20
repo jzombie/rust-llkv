@@ -12,8 +12,8 @@ use std::sync::Arc;
 ///
 /// Returns a map of column_name -> ColumnStats with min/max values
 /// aggregated across all row groups.
-pub fn extract_statistics(parquet_bytes: &[u8]) -> Result<HashMap<String, ColumnStats>> {
-    let bytes = bytes::Bytes::copy_from_slice(parquet_bytes);
+pub fn extract_statistics(parquet_bytes: bytes::Bytes) -> Result<HashMap<String, ColumnStats>> {
+    let bytes = parquet_bytes;
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|e| Error::Internal(format!("failed to read Parquet metadata: {}", e)))?;
@@ -130,7 +130,7 @@ mod tests {
         let config = WriterConfig::default().with_statistics(true);
         let bytes = write_parquet_to_memory_with_config(&batch, &config).unwrap();
 
-        let stats = extract_statistics(&bytes).unwrap();
+        let stats = extract_statistics(bytes::Bytes::from(bytes)).unwrap();
 
         // Should have stats for all non-MVCC columns
         assert!(stats.contains_key("row_id"));

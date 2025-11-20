@@ -17,7 +17,7 @@ llkv-result.workspace = true
 num_enum = { workspace = true }
 rustc-hash.workspace = true
 simd-r-drive = { workspace = true, optional = true }
-simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
+simd-r-drive-entry-handle = { workspace = true, features = ["bytes"] }
 
 [features]
 debug = []
