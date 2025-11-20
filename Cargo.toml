@@ -9,7 +9,7 @@ publish = true
 [workspace.dependencies]
 # llkv = { path = "./llkv", version = "0.8.2-alpha" }
 # llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.2-alpha" }
-# llkv-column-map = { path = "./llkv-column-map", version = "0.8.2-alpha" }
+llkv-column-map = { path = "./llkv-column-map", version = "0.8.2-alpha" }
 # llkv-expr = { path = "./llkv-expr", version = "0.8.2-alpha" }
 # llkv-fusion = { path = "./llkv-fusion", version = "0.8.2-alpha" }
 # llkv-join = { path = "./llkv-join", version = "0.8.2-alpha" }
@@ -75,7 +75,7 @@ walkdir = "2.5"
 members = [
     # "llkv",
     # "llkv-aggregate",
-    # "llkv-column-map",
+    "llkv-column-map",
     # "llkv-expr",
     # "llkv-fusion",
     # "llkv-join",

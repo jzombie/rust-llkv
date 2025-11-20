@@ -2110,6 +2110,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "line-ending"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "834e592123b39b7b3ba3fdc4b7e4822fad3ced449010f8229f843fe6dd1a33f1"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2120,6 +2126,27 @@ name = "litemap"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
+
+[[package]]
+name = "llkv-column-map"
+version = "0.8.2-alpha"
+dependencies = [
+ "arrow",
+ "arrow-ord",
+ "criterion",
+ "line-ending",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-test-utils",
+ "modular-bitfield",
+ "rand",
+ "rayon",
+ "roaring",
+ "rustc-hash",
+ "simd-r-drive-entry-handle",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "llkv-parquet-store"
@@ -2182,6 +2209,7 @@ dependencies = [
  "datafusion-catalog",
  "datafusion-datasource",
  "futures",
+ "llkv-column-map",
  "llkv-parquet-store",
  "llkv-result",
  "llkv-storage",
@@ -2275,6 +2303,27 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "modular-bitfield"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47a586be3f2f7e70a9d302c621447dba612d42069f3901258b2cf8ce96d855b1"
+dependencies = [
+ "modular-bitfield-impl",
+ "static_assertions",
+]
+
+[[package]]
+name = "modular-bitfield-impl"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8462d3cc74eaf4194f6c0bd7b18c6f3fa6293297f4bdb60fe4c4b022ea366e12"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -2773,6 +2822,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "roaring"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f08d6a905edb32d74a5d5737a0c9d7e950c312f3c46cb0ca0a2ca09ea11878a0"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2934,6 +2993,7 @@ dependencies = [
 name = "simd-r-drive-entry-handle"
 version = "0.16.0-alpha"
 dependencies = [
+ "arrow",
  "bytes",
  "crc32fast",
  "memmap2",
@@ -3018,6 +3078,12 @@ dependencies = [
  "psm",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strsim"
