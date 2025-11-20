@@ -15,7 +15,11 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 const TOTAL_ROWS: usize = 1_000_000;
+
+// Batch size for generating test data - ParquetStore will automatically
+// optimize this to ~4MB chunks (TARGET_BATCH_SIZE_BYTES) before writing
 const BATCH_SIZE: usize = 65_000;
+
 const NUM_BATCHES: usize = TOTAL_ROWS / BATCH_SIZE;
 
 /// Generate a 20-column schema with mixed data types.

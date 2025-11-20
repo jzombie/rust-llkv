@@ -19,6 +19,9 @@ use std::sync::Arc;
 
 const VECTOR_DIM: usize = 1024;
 const VECTOR_COUNT: usize = 1_000_000;
+
+// Batch size for generating test data - ParquetStore will automatically
+// optimize this to ~4MB chunks (TARGET_BATCH_SIZE_BYTES) before writing
 const VECTOR_BATCH_SIZE: usize = 65_000;
 
 // ============================================================================
