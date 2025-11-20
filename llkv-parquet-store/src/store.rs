@@ -458,21 +458,7 @@ where
         limit: Option<usize>,
     ) -> Result<impl Iterator<Item = Result<RecordBatch>> + '_> {
         // Get file list from catalog and prune based on filters
-        let (file_keys, schema) = {
-            let catalog = self.catalog.read().unwrap();
-            let (_, metadata) = catalog.get_table_by_id(table_id)?;
-            let schema = metadata.schema()?;
-
-            let mut file_keys = Vec::new();
-            for file_ref in &metadata.parquet_files {
-                // Apply file pruning based on column statistics and predicates
-                if filters.is_empty() || should_scan_file(file_ref, filters, &schema)? {
-                    file_keys.push(file_ref.physical_key);
-                }
-            }
-
-            (file_keys, schema)
-        };
+        let (file_keys, schema) = self.get_scan_files(table_id, filters)?;
 
         Ok(ParquetScanIterator {
             store: self,
@@ -483,6 +469,121 @@ where
             original_schema: schema,
             current_file_batches: Vec::new(),
         })
+    }
+
+    /// Parallel scan that processes all files using Rayon and returns all batches.
+    ///
+    /// This is faster than `scan()` for workloads that need to process all data,
+    /// such as aggregations or similarity search, but uses more memory since it
+    /// materializes all batches upfront.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use llkv_parquet_store::ParquetStore;
+    /// # use llkv_storage::pager::MemPager;
+    /// # use std::sync::Arc;
+    /// # fn main() -> llkv_result::Result<()> {
+    /// let pager = Arc::new(MemPager::new());
+    /// let store = ParquetStore::open(pager)?;
+    /// # let table_id = store.create_table("test", Arc::new(arrow::datatypes::Schema::empty()))?;
+    ///
+    /// // Process all batches in parallel
+    /// let batches = store.scan_parallel(table_id, &[], None, None)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scan_parallel(
+        &self,
+        table_id: TableId,
+        filters: &[datafusion_expr::Expr],
+        projection: Option<Vec<usize>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<RecordBatch>>
+    where
+        P: Sync,
+    {
+        use rayon::prelude::*;
+
+        // Get file list from catalog and prune based on filters
+        let (file_keys, schema) = self.get_scan_files(table_id, filters)?;
+
+        // Process files in parallel using Rayon
+        let batches: Result<Vec<Vec<RecordBatch>>> = file_keys
+            .par_iter()
+            .map(|&key| self.read_and_internalize_file(key, &schema, projection.clone()))
+            .collect();
+
+        let mut all_batches: Vec<RecordBatch> = batches?.into_iter().flatten().collect();
+
+        // Apply limit if specified
+        if let Some(limit) = limit {
+            let mut rows_collected = 0;
+            all_batches.retain_mut(|batch| {
+                if rows_collected >= limit {
+                    return false;
+                }
+                let remaining = limit - rows_collected;
+                if batch.num_rows() > remaining {
+                    *batch = batch.slice(0, remaining);
+                    rows_collected += remaining;
+                    true
+                } else {
+                    rows_collected += batch.num_rows();
+                    true
+                }
+            });
+        }
+
+        Ok(all_batches)
+    }
+
+    /// Helper: Get list of file keys to scan after applying filters.
+    fn get_scan_files(
+        &self,
+        table_id: TableId,
+        filters: &[datafusion_expr::Expr],
+    ) -> Result<(Vec<PhysicalKey>, SchemaRef)> {
+        let catalog = self.catalog.read().unwrap();
+        let (_, metadata) = catalog.get_table_by_id(table_id)?;
+        let schema = metadata.schema()?;
+
+        let mut file_keys = Vec::new();
+        for file_ref in &metadata.parquet_files {
+            // Apply file pruning based on column statistics and predicates
+            if filters.is_empty() || should_scan_file(file_ref, filters, &schema)? {
+                file_keys.push(file_ref.physical_key);
+            }
+        }
+
+        Ok((file_keys, schema))
+    }
+
+    /// Helper: Read a single Parquet file and internalize external columns.
+    fn read_and_internalize_file(
+        &self,
+        key: PhysicalKey,
+        schema: &SchemaRef,
+        projection: Option<Vec<usize>>,
+    ) -> Result<Vec<RecordBatch>> {
+        // Fetch file from pager
+        let bytes = self.pager.batch_get(&[BatchGet::Raw { key }])?;
+        let bytes = match bytes.into_iter().next() {
+            Some(GetResult::Raw { bytes, .. }) => bytes.into_bytes(),
+            _ => return Err(Error::Internal(format!("file key {} not found", key))),
+        };
+
+        // Decode Parquet file with projection
+        let file_batches = crate::reader::read_parquet_from_memory(bytes, projection)?;
+
+        // Apply LWW deduplication within this file
+        let deduped_batches = crate::mvcc::deduplicate_by_row_id(file_batches)?;
+
+        // Internalize external columns for all batches in this file
+        deduped_batches
+            .into_iter()
+            .map(|batch| crate::external::internalize_columns(&batch, schema, &*self.pager))
+            .collect()
     }
 
     /// List all tables in the catalog.
@@ -604,16 +705,7 @@ where
 
             // First, try to return a batch from the current file
             if let Some(batch) = self.current_file_batches.pop() {
-                // Internalize external columns (fetch blobs from pager) - done lazily per batch
-                let batch = match crate::external::internalize_columns(
-                    &batch,
-                    &self.original_schema,
-                    &*self.store.pager,
-                ) {
-                    Ok(b) => b,
-                    Err(e) => return Some(Err(e)),
-                };
-
+                // Batches are already internalized by read_and_internalize_file
                 // Apply limit to this batch if needed
                 let batch = if let Some(limit) = self.limit {
                     let remaining = limit.saturating_sub(self.rows_returned);
@@ -634,31 +726,18 @@ where
             // No more batches from current file, load next file
             let key = self.file_keys.next()?;
 
-            // Fetch single file from pager
-            let bytes = match self.store.pager.batch_get(&[BatchGet::Raw { key }]) {
-                Ok(mut results) => match results.pop() {
-                    Some(GetResult::Raw { bytes, .. }) => bytes,
-                    _ => return Some(Err(Error::Internal(format!("file key {} not found", key)))),
-                },
-                Err(e) => return Some(Err(e)),
-            };
-
-            // Decode Parquet file with projection
-            match crate::reader::read_parquet_from_memory(
-                bytes.into_bytes(),
+            // Use shared helper to read and internalize the file
+            match self.store.read_and_internalize_file(
+                key,
+                &self.original_schema,
                 self.projection.clone(),
             ) {
                 Ok(batches) => {
-                    // Apply LWW deduplication within this file
-                    match crate::mvcc::deduplicate_by_row_id(batches) {
-                        Ok(mut deduped) => {
-                            // Store batches in reverse order (we pop from the end)
-                            deduped.reverse();
-                            self.current_file_batches = deduped;
-                            // Continue loop to return first batch
-                        }
-                        Err(e) => return Some(Err(e)),
-                    }
+                    // Store batches in reverse order (we pop from the end)
+                    let mut reversed = batches;
+                    reversed.reverse();
+                    self.current_file_batches = reversed;
+                    // Continue loop to return first batch
                 }
                 Err(e) => return Some(Err(e)),
             }

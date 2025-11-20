@@ -136,15 +136,11 @@ mod parquet_based {
     }
 
     /// Read all vectors and compute sum of all values (forces full data access).
-    fn bench_read_vectors<P: Pager<Blob = EntryHandle>>(
+    fn bench_read_vectors<P: Pager<Blob = EntryHandle> + Sync>(
         store: &ParquetStore<P>,
         table_id: TableId,
     ) -> f64 {
-        let batches: Vec<_> = store
-            .scan(table_id, &[], None, None)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
+        let batches = store.scan_parallel(table_id, &[], None, None).unwrap();
 
         let mut sum = 0.0f64;
         for batch in batches {
@@ -160,9 +156,10 @@ mod parquet_based {
                 .downcast_ref::<Float32Array>()
                 .unwrap();
 
-            // Access ALL elements of ALL vectors to force full data materialization
-            for i in 0..(batch.num_rows() * VECTOR_DIM) {
-                sum += values.value(i) as f64;
+            // Access ALL elements using raw slice for better performance
+            let slice = values.values();
+            for &val in slice.iter() {
+                sum += val as f64;
             }
         }
         sum
@@ -193,16 +190,12 @@ mod parquet_based {
     }
 
     /// Perform brute-force cosine similarity search on vectors.
-    fn bench_vector_similarity_search<P: Pager<Blob = EntryHandle>>(
+    fn bench_vector_similarity_search<P: Pager<Blob = EntryHandle> + Sync>(
         store: &ParquetStore<P>,
         table_id: TableId,
         query_vector: &[f32],
     ) -> (usize, f64) {
-        let batches: Vec<_> = store
-            .scan(table_id, &[], None, None)
-            .unwrap()
-            .collect::<Result<Vec<_>>>()
-            .unwrap();
+        let batches = store.scan_parallel(table_id, &[], None, None).unwrap();
         let mut best_similarity = f64::NEG_INFINITY;
         let mut vectors_searched = 0;
 
