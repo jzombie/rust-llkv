@@ -7,7 +7,7 @@ use llkv_parquet_store::{
     add_mvcc_columns, ParquetStore, EXTERNAL_STORAGE_KEY, EXTERNAL_STORAGE_VALUE,
 };
 use llkv_result::Result;
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{MemPager, Pager};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -118,6 +118,56 @@ fn test_external_storage_multiple_batches() -> Result<()> {
 
     let total_rows: usize = read_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 250);
+
+    Ok(())
+}
+
+#[test]
+fn test_external_storage_gc() -> Result<()> {
+    let pager = Arc::new(MemPager::new());
+    let store = ParquetStore::open(Arc::clone(&pager))?;
+
+    let schema = create_external_vector_schema();
+    let table_id = store.create_table("vectors_external", schema.clone())?;
+
+    // Write some vectors
+    let batch = generate_vector_batch(schema.clone(), 0, 10);
+    let batch_with_mvcc = add_mvcc_columns(batch, 1)?;
+    store.append_many(table_id, vec![batch_with_mvcc])?;
+
+    // Count keys before GC (should include catalog, parquet file, and external blobs)
+    let all_keys_before = pager.enumerate_keys()?;
+    assert!(
+        all_keys_before.len() > 11,
+        "Expected at least catalog + file + 10 blobs"
+    );
+
+    // Collect reachable keys - should include external blob keys
+    let reachable = store.collect_reachable_keys()?;
+    assert!(
+        reachable.len() > 11,
+        "Reachable should include external blobs"
+    );
+
+    // Run GC - should free nothing since everything is reachable
+    let freed = store.garbage_collect()?;
+    assert_eq!(freed, 0, "No keys should be freed");
+
+    // Drop the table - frees Parquet file immediately but NOT external blobs
+    store.drop_table("vectors_external")?;
+
+    // Run GC again - should free only the external blobs (Parquet file already freed by drop_table)
+    let freed = store.garbage_collect()?;
+    assert_eq!(
+        freed, 10,
+        "Should free exactly 10 external blobs, got {}",
+        freed
+    );
+
+    // Only catalog key should remain
+    let all_keys_after = pager.enumerate_keys()?;
+    assert_eq!(all_keys_after.len(), 1, "Only catalog key should remain");
+    assert_eq!(all_keys_after[0], 0, "Remaining key should be catalog (0)");
 
     Ok(())
 }

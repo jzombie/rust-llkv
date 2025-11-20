@@ -320,9 +320,10 @@ where
     /// Returns a set containing:
     /// - Key 0 (catalog root)
     /// - All Parquet file keys from all tables
-    pub fn collect_reachable_keys(&self) -> rustc_hash::FxHashSet<PhysicalKey> {
+    /// - All external blob keys referenced in external storage columns
+    pub fn collect_reachable_keys(&self) -> Result<rustc_hash::FxHashSet<PhysicalKey>> {
         let catalog = self.catalog.read().unwrap();
-        crate::gc::collect_reachable_keys(&catalog)
+        crate::gc::collect_reachable_keys(&catalog, &*self.pager)
     }
 
     /// Identify and free all unreferenced blobs.

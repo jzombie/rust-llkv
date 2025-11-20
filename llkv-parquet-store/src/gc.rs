@@ -1,8 +1,9 @@
 //! Garbage collection utilities for ParquetStore.
 
 use crate::catalog::ParquetCatalog;
+use arrow::array::Array;
 use llkv_result::Result;
-use llkv_storage::pager::Pager;
+use llkv_storage::pager::{BatchGet, GetResult, Pager};
 use llkv_storage::types::PhysicalKey;
 use rustc_hash::FxHashSet;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -12,7 +13,14 @@ use simd_r_drive_entry_handle::EntryHandle;
 /// This includes:
 /// - The catalog root key itself (key 0)
 /// - All Parquet file keys from all tables
-pub fn collect_reachable_keys(catalog: &ParquetCatalog) -> FxHashSet<PhysicalKey> {
+/// - All external blob keys referenced in external storage columns
+pub fn collect_reachable_keys<P>(
+    catalog: &ParquetCatalog,
+    pager: &P,
+) -> Result<FxHashSet<PhysicalKey>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     let mut reachable = FxHashSet::default();
 
     // The catalog itself occupies key 0
@@ -20,12 +28,96 @@ pub fn collect_reachable_keys(catalog: &ParquetCatalog) -> FxHashSet<PhysicalKey
 
     // Collect all Parquet file keys from all tables
     for table_meta in catalog.tables.values() {
+        let schema = table_meta.schema()?;
+
+        // Check if any columns use external storage
+        let external_col_indices: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| crate::external::is_external_field(field))
+            .map(|(idx, _)| idx)
+            .collect();
+
         for file_ref in &table_meta.parquet_files {
+            // Add the Parquet file key itself
             reachable.insert(file_ref.physical_key);
+
+            // If this table has external columns, read the file to collect blob keys
+            if !external_col_indices.is_empty() {
+                if let Ok(blob_keys) = collect_external_keys_from_file(
+                    pager,
+                    file_ref.physical_key,
+                    &external_col_indices,
+                ) {
+                    reachable.extend(blob_keys);
+                }
+            }
         }
     }
 
-    reachable
+    Ok(reachable)
+}
+
+/// Extract external blob keys from a Parquet file.
+///
+/// Reads the specified columns (which should be FixedSizeBinary(8) key columns)
+/// and extracts the u64 keys they contain.
+fn collect_external_keys_from_file<P>(
+    pager: &P,
+    file_key: PhysicalKey,
+    external_col_indices: &[usize],
+) -> Result<Vec<PhysicalKey>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    // Fetch the Parquet file
+    let bytes = match pager.batch_get(&[BatchGet::Raw { key: file_key }])? {
+        mut results if results.len() == 1 => match results.pop() {
+            Some(GetResult::Raw { bytes, .. }) => bytes.into_bytes(),
+            _ => return Ok(Vec::new()),
+        },
+        _ => return Ok(Vec::new()),
+    };
+
+    // Read the Parquet file with projection to only external columns
+    let batches =
+        crate::reader::read_parquet_from_memory(bytes, Some(external_col_indices.to_vec()))?;
+
+    let mut blob_keys = Vec::new();
+
+    // Extract keys from each batch
+    // Note: After projection, column indices are renumbered (0, 1, 2...)
+    for batch in batches {
+        for projected_col_idx in 0..batch.num_columns() {
+            let array = batch.column(projected_col_idx);
+
+            // The column should be FixedSizeBinary(8) containing u64 keys
+            if let Some(fsb_array) = array
+                .as_any()
+                .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            {
+                for row_idx in 0..array.len() {
+                    let key_bytes = fsb_array.value(row_idx);
+                    if key_bytes.len() == 8 {
+                        let key = u64::from_le_bytes([
+                            key_bytes[0],
+                            key_bytes[1],
+                            key_bytes[2],
+                            key_bytes[3],
+                            key_bytes[4],
+                            key_bytes[5],
+                            key_bytes[6],
+                            key_bytes[7],
+                        ]);
+                        blob_keys.push(key);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(blob_keys)
 }
 
 /// Identify and free all unreferenced blobs in a pager.
@@ -48,8 +140,8 @@ where
     // Get all keys in the pager
     let all_keys: FxHashSet<PhysicalKey> = pager.enumerate_keys()?.into_iter().collect();
 
-    // Get all reachable keys from catalog
-    let reachable = collect_reachable_keys(catalog);
+    // Get all reachable keys from catalog (including external blob keys)
+    let reachable = collect_reachable_keys(catalog, pager)?;
 
     // Find unreferenced keys
     let unreferenced: Vec<PhysicalKey> = all_keys.difference(&reachable).copied().collect();
@@ -73,8 +165,11 @@ mod tests {
 
     #[test]
     fn test_collect_reachable_keys_empty() {
+        use llkv_storage::pager::MemPager;
+
         let catalog = ParquetCatalog::default();
-        let reachable = collect_reachable_keys(&catalog);
+        let pager = MemPager::new();
+        let reachable = collect_reachable_keys(&catalog, &pager).unwrap();
 
         // Only catalog key should be present
         assert_eq!(reachable.len(), 1);
@@ -83,6 +178,8 @@ mod tests {
 
     #[test]
     fn test_collect_reachable_keys_with_tables() {
+        use llkv_storage::pager::MemPager;
+
         let mut catalog = ParquetCatalog::default();
 
         // Create a table with some files
@@ -120,7 +217,8 @@ mod tests {
             column_stats: None,
         });
 
-        let reachable = collect_reachable_keys(&catalog);
+        let pager = MemPager::new();
+        let reachable = collect_reachable_keys(&catalog, &pager).unwrap();
 
         // Should have catalog + 3 file keys
         assert_eq!(reachable.len(), 4);
@@ -132,6 +230,8 @@ mod tests {
 
     #[test]
     fn test_collect_reachable_keys_multiple_tables() {
+        use llkv_storage::pager::MemPager;
+
         let mut catalog = ParquetCatalog::default();
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -168,7 +268,8 @@ mod tests {
             column_stats: None,
         });
 
-        let reachable = collect_reachable_keys(&catalog);
+        let pager = MemPager::new();
+        let reachable = collect_reachable_keys(&catalog, &pager).unwrap();
 
         // catalog + 1 file from table1 + 2 files from table2
         assert_eq!(reachable.len(), 4);
