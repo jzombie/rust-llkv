@@ -37,6 +37,7 @@ where
     pub fn new(
         store: Arc<ColumnStore<P>>,
         schema: SchemaRef,
+        _table_id: u64,
         row_ids: Arc<RwLock<Vec<RowId>>>,
         listener: Option<Arc<dyn TableEventListener>>,
     ) -> Self {
@@ -96,33 +97,45 @@ where
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> DataFusionResult<u64> {
-        eprintln!("ColumnMapDataSink::write_all called");
         let mut total_rows = 0;
 
         while let Some(batch_result) = data.next().await {
             let batch = batch_result?;
-            eprintln!("ColumnMapDataSink::write_all batch rows={}", batch.num_rows());
             if batch.num_rows() == 0 {
                 continue;
             }
 
             // 1. Get or Generate Row IDs
-            let (row_id_col, is_new_rows) =
-                if let Ok(idx) = batch.schema().index_of(ROW_ID_COLUMN_NAME) {
-                    (batch.column(idx).clone(), false)
+            let (row_id_col, is_new_rows) = {
+                let existing_col = if let Ok(idx) = batch.schema().index_of(ROW_ID_COLUMN_NAME) {
+                    Some(batch.column(idx).clone())
+                } else {
+                    None
+                };
+
+                // Check if existing column is valid (non-null)
+                let use_existing = if let Some(col) = &existing_col {
+                    col.null_count() != col.len()
+                } else {
+                    false
+                };
+
+                if use_existing {
+                    (existing_col.unwrap(), false)
                 } else {
                     // Generate new row IDs (INSERT path)
                     let num_rows = batch.num_rows();
                     let mut builder = UInt64Builder::with_capacity(num_rows);
                     let mut next_id = self.next_row_id.write().unwrap();
-                    let start_id = *next_id;
+                    // let start_id = *next_id; // Unused
 
                     for _ in 0..num_rows {
                         builder.append_value(*next_id);
                         *next_id += 1;
                     }
                     (Arc::new(builder.finish()) as ArrayRef, true)
-                };
+                }
+            };
 
             // 2. Update row_ids list if new
             if is_new_rows {
@@ -132,7 +145,7 @@ where
                     .unwrap()
                     .value(0);
                 let num_rows = batch.num_rows();
-                
+
                 let mut new_ids = Vec::with_capacity(num_rows);
                 {
                     let mut rids = self.row_ids.write().unwrap();
@@ -142,9 +155,11 @@ where
                         new_ids.push(rid);
                     }
                 }
-                
+
                 if let Some(listener) = &self.listener {
-                    listener.on_rows_appended(&new_ids).map_err(|e| DataFusionError::Internal(format!("failed to notify listener: {e}")))?;
+                    listener.on_rows_appended(&new_ids).map_err(|e| {
+                        DataFusionError::Internal(format!("failed to notify listener: {e}"))
+                    })?;
                 }
             }
 
@@ -162,26 +177,20 @@ where
 
             // Identify user columns in the batch (skip row_id if present)
             let batch_schema = batch.schema();
-            let mut batch_col_indices = (0..batch.num_columns()).collect::<Vec<_>>();
-            if let Ok(rid_idx) = batch_schema.index_of(ROW_ID_COLUMN_NAME) {
-                batch_col_indices.remove(rid_idx);
-            }
 
-            if batch_col_indices.len() != self.schema.fields().len() {
-                return Err(DataFusionError::Execution(format!(
-                    "Batch column count mismatch: expected {}, got {}",
-                    self.schema.fields().len(),
-                    batch_col_indices.len()
-                )));
-            }
+            // Iterate over batch columns and match with self.schema by name
+            for (i, field) in batch_schema.fields().iter().enumerate() {
+                if field.name() == ROW_ID_COLUMN_NAME {
+                    continue;
+                }
 
-            // Add user columns with metadata from self.schema
-            for (i, &batch_idx) in batch_col_indices.iter().enumerate() {
-                let field_with_meta = self.schema.field(i); // This has metadata
-                let col = batch.column(batch_idx);
+                if let Ok(idx) = self.schema.index_of(field.name()) {
+                    let field_with_meta = self.schema.field(idx);
+                    let col = batch.column(i);
 
-                new_fields.push(field_with_meta.clone());
-                new_columns.push(col.clone());
+                    new_fields.push(field_with_meta.clone());
+                    new_columns.push(col.clone());
+                }
             }
 
             let batch_to_append = RecordBatch::try_new(
@@ -197,6 +206,6 @@ where
             total_rows += batch_to_append.num_rows() as u64;
         }
 
-        Ok(total_rows)
+        Ok(total_rows as u64)
     }
 }

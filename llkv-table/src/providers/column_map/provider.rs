@@ -72,6 +72,19 @@ where
         row_ids: Arc<RwLock<Vec<RowId>>>,
         listener: Option<Arc<dyn TableEventListener>>,
     ) -> Self {
+        // Ensure schema has row_id column so DataFusion can plan updates
+        let schema = if schema.field_with_name(ROW_ID_COLUMN_NAME).is_ok() {
+            schema
+        } else {
+            let mut fields = schema.fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                ROW_ID_COLUMN_NAME,
+                DataType::UInt64,
+                true,
+            )));
+            Arc::new(Schema::new(fields))
+        };
+
         Self {
             store,
             schema,
@@ -93,6 +106,16 @@ where
 
     pub fn get_row_ids(&self) -> Vec<RowId> {
         self.row_ids.read().unwrap().clone()
+    }
+
+    pub fn create_sink(&self) -> Arc<dyn datafusion_datasource::sink::DataSink> {
+        Arc::new(crate::providers::column_map::sink::ColumnMapDataSink::new(
+            Arc::clone(&self.store),
+            self.schema.clone(),
+            self.table_id,
+            Arc::clone(&self.row_ids),
+            self.listener.clone(),
+        ))
     }
 }
 
@@ -234,16 +257,22 @@ where
 
         let mut field_ids = Vec::new();
         let mut output_schema_fields = Vec::new();
+        let mut row_id_indices = Vec::new();
 
-        for &idx in &projected_indices {
+        for (output_idx, &idx) in projected_indices.iter().enumerate() {
             let field = self.schema.field(idx);
             output_schema_fields.push(field.clone());
 
-            // Calculate the logical field ID.
-            // Note: This assumes the schema passed to the provider matches the user schema
-            // used to create the table, where indices map 1-to-1 to field IDs (offset by 1).
-            let field_id = LogicalFieldId::for_user(self.table_id as u16, (idx + 1) as u64 as u32);
-            field_ids.push(field_id);
+            if field.name() == ROW_ID_COLUMN_NAME {
+                row_id_indices.push(output_idx);
+            } else {
+                // Calculate the logical field ID.
+                // Note: This assumes the schema passed to the provider matches the user schema
+                // used to create the table, where indices map 1-to-1 to field IDs (offset by 1).
+                let field_id =
+                    LogicalFieldId::for_user(self.table_id as u16, (idx + 1) as u64 as u32);
+                field_ids.push(field_id);
+            }
         }
 
         // Debug: Print row IDs being gathered
@@ -260,15 +289,26 @@ where
                 .gather_rows(&field_ids, chunk, GatherNullPolicy::IncludeNulls)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-            // The batch returned by gather_rows has columns in order of field_ids.
-            // We need to ensure the schema matches what DataFusion expects.
-            let batch_with_schema = if output_schema.fields().is_empty() {
-                let options = arrow::record_batch::RecordBatchOptions::new()
-                    .with_row_count(Some(chunk.len()));
-                RecordBatch::try_new_with_options(output_schema.clone(), vec![], &options)?
-            } else {
-                RecordBatch::try_new(output_schema.clone(), batch.columns().to_vec())?
-            };
+            // Reconstruct batch with row_id columns if needed
+            let mut final_columns = Vec::with_capacity(output_schema.fields().len());
+            let mut user_col_iter = batch.columns().iter();
+
+            for output_idx in 0..output_schema.fields().len() {
+                if row_id_indices.contains(&output_idx) {
+                    let row_id_arr = UInt64Array::from(chunk.to_vec());
+                    final_columns.push(Arc::new(row_id_arr) as ArrayRef);
+                } else {
+                    if let Some(col) = user_col_iter.next() {
+                        final_columns.push(col.clone());
+                    } else {
+                        return Err(DataFusionError::Internal(
+                            "Mismatch in gathered columns".into(),
+                        ));
+                    }
+                }
+            }
+
+            let batch_with_schema = RecordBatch::try_new(output_schema.clone(), final_columns)?;
             batches.push(batch_with_schema);
         }
 
@@ -287,13 +327,7 @@ where
         input: Arc<dyn ExecutionPlan>,
         _op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let sink = Arc::new(crate::providers::column_map::sink::ColumnMapDataSink::new(
-            Arc::clone(&self.store),
-            self.schema.clone(),
-            Arc::clone(&self.row_ids),
-            self.listener.clone(),
-        ));
-
+        let sink = self.create_sink();
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 }

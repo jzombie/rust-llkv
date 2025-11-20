@@ -27,6 +27,7 @@ use datafusion::execution::context::QueryPlanner;
 use datafusion::logical_expr::{DmlStatement, LogicalPlan};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion_datasource::sink::DataSinkExec;
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 
@@ -366,6 +367,35 @@ impl QueryPlanner for LlkvQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &datafusion::execution::context::SessionState,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Intercept UPDATE
+        if let LogicalPlan::Dml(DmlStatement {
+            table_name,
+            op: datafusion::logical_expr::WriteOp::Update,
+            input,
+            ..
+        }) = logical_plan
+        {
+            let name = table_name.table();
+            let provider = self
+                .catalog
+                .get_table(name)
+                .map_err(|e| DataFusionError::Internal(e.to_string()))?
+                .ok_or_else(|| DataFusionError::Execution(format!("Table {} not found", name)))?;
+
+            // Check if it's ColumnMapTableProvider
+            if let Some(cmp) = provider
+                .as_any()
+                .downcast_ref::<ColumnMapTableProvider<BoxedPager>>()
+            {
+                let input_exec = self
+                    .fallback
+                    .create_physical_plan(input, session_state)
+                    .await?;
+                let sink = cmp.create_sink();
+                return Ok(Arc::new(DataSinkExec::new(input_exec, sink, None)));
+            }
+        }
+
         // Intercept DELETE
         if let LogicalPlan::Dml(DmlStatement {
             table_name,
