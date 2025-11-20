@@ -133,7 +133,7 @@ where
         table_id: u64,
         _name: &str,
         schema: SchemaRef,
-        listener: Option<Box<dyn TableEventListener>>,
+        listener: Option<Arc<dyn TableEventListener>>,
     ) -> LlkvResult<Box<dyn TableBuilder>> {
         let mut builder = ColumnMapTableBuilder::new(Arc::clone(&self.store), table_id, schema);
         if let Some(l) = listener {
@@ -147,6 +147,7 @@ where
         table_id: u64,
         schema: SchemaRef,
         row_ids: &[u64],
+        listener: Option<Arc<dyn TableEventListener>>,
     ) -> LlkvResult<Arc<dyn TableProvider>> {
         // Add metadata to schema fields
         let fields = schema
@@ -171,6 +172,7 @@ where
             schema_with_meta,
             table_id,
             row_ids,
+            listener,
         );
         Ok(Arc::new(provider))
     }

@@ -30,7 +30,7 @@ pub trait CatalogBackend: Send + Sync {
         table_id: u64,
         name: &str,
         schema: SchemaRef,
-        listener: Option<Box<dyn TableEventListener>>,
+        listener: Option<Arc<dyn TableEventListener>>,
     ) -> Result<Box<dyn TableBuilder>>;
 
     /// Get a provider for an existing table.
@@ -39,6 +39,7 @@ pub trait CatalogBackend: Send + Sync {
         table_id: u64,
         schema: SchemaRef,
         row_ids: &[u64],
+        listener: Option<Arc<dyn TableEventListener>>,
     ) -> Result<Arc<dyn TableProvider>>;
 
     /// Drop a table from storage.

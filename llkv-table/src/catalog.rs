@@ -122,7 +122,7 @@ impl TableCatalog {
         };
 
         // Create the builder via backend
-        let listener = Box::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
+        let listener = Arc::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
         let builder = self.backend.create_table_builder(
             table_id as u64,
             name,
@@ -161,10 +161,15 @@ impl TableCatalog {
 
         let schema = Arc::new(Self::deserialize_schema(&metadata.schema_bytes)?);
 
+        let listener = Arc::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
+
         // We need to pass row_ids to the backend so it can construct the provider
-        let provider =
-            self.backend
-                .get_table_provider(metadata.table_id as u64, schema, &metadata.row_ids)?;
+        let provider = self.backend.get_table_provider(
+            metadata.table_id as u64,
+            schema,
+            &metadata.row_ids,
+            Some(listener),
+        )?;
 
         Ok(Some(provider))
     }
@@ -180,7 +185,7 @@ impl TableCatalog {
 
         // Create a builder for the existing table
         // We attach the listener to ensure row counts are updated
-        let listener = Box::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
+        let listener = Arc::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
 
         self.backend
             .create_table_builder(metadata.table_id as u64, name, schema, Some(listener))

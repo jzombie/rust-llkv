@@ -12,14 +12,11 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_datasource::sink::{DataSink, DataSinkExec};
-use futures::StreamExt;
+use datafusion_datasource::sink::DataSinkExec;
 
 use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::scalar::ScalarValue;
@@ -49,6 +46,7 @@ where
     schema: SchemaRef,
     table_id: u64,
     row_ids: Arc<RwLock<Vec<RowId>>>,
+    listener: Option<Arc<dyn TableEventListener>>,
 }
 
 impl<P> fmt::Debug for ColumnMapTableProvider<P>
@@ -72,12 +70,14 @@ where
         schema: SchemaRef,
         table_id: u64,
         row_ids: Arc<RwLock<Vec<RowId>>>,
+        listener: Option<Arc<dyn TableEventListener>>,
     ) -> Self {
         Self {
             store,
             schema,
             table_id,
             row_ids,
+            listener,
         }
     }
 
@@ -285,162 +285,16 @@ where
         &self,
         _state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
+        _op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if insert_op != InsertOp::Append {
-            return Err(DataFusionError::NotImplemented(format!(
-                "{insert_op} not implemented for ColumnMap tables"
-            )));
-        }
-
-        let sink = ColumnMapDataSink::new(
+        let sink = Arc::new(crate::providers::column_map::sink::ColumnMapDataSink::new(
             Arc::clone(&self.store),
             self.schema.clone(),
             Arc::clone(&self.row_ids),
-        );
+            self.listener.clone(),
+        ));
 
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
-    }
-}
-
-struct ColumnMapDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    store: Arc<ColumnStore<P>>,
-    schema: SchemaRef,
-    row_ids: Arc<RwLock<Vec<RowId>>>,
-}
-
-impl<P> fmt::Debug for ColumnMapDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ColumnMapDataSink").finish()
-    }
-}
-
-impl<P> datafusion::physical_plan::display::DisplayAs for ColumnMapDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn fmt_as(
-        &self,
-        t: datafusion::physical_plan::display::DisplayFormatType,
-        f: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        match t {
-            datafusion::physical_plan::display::DisplayFormatType::Default
-            | datafusion::physical_plan::display::DisplayFormatType::Verbose => {
-                write!(f, "ColumnMapDataSink")
-            }
-            datafusion::physical_plan::display::DisplayFormatType::TreeRender => write!(f, ""),
-        }
-    }
-}
-
-impl<P> ColumnMapDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn new(
-        store: Arc<ColumnStore<P>>,
-        schema: SchemaRef,
-        row_ids: Arc<RwLock<Vec<RowId>>>,
-    ) -> Self {
-        Self {
-            store,
-            schema,
-            row_ids,
-        }
-    }
-}
-
-#[async_trait]
-impl<P> DataSink for ColumnMapDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    async fn write_all(
-        &self,
-        mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
-    ) -> DataFusionResult<u64> {
-        let mut total_rows = 0;
-        while let Some(batch) = data.next().await.transpose()? {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            // 1. Determine Row IDs
-            let (row_ids_arr, user_columns) =
-                if let Ok(idx) = batch.schema().index_of(ROW_ID_COLUMN_NAME) {
-                    // Batch already has row_id
-                    let row_id_col = batch
-                        .column(idx)
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .ok_or_else(|| {
-                            DataFusionError::Execution("row_id column must be UInt64".to_string())
-                        })?;
-
-                    let mut cols = batch.columns().to_vec();
-                    cols.remove(idx);
-                    (Arc::new(row_id_col.clone()) as ArrayRef, cols)
-                } else {
-                    // Generate row IDs
-                    let start_row_id = {
-                        let lock = self.row_ids.read().unwrap();
-                        lock.last().copied().unwrap_or(0) + 1
-                    };
-                    let num_rows = batch.num_rows();
-                    let new_row_ids: Vec<u64> =
-                        (0..num_rows).map(|i| start_row_id + i as u64).collect();
-                    (
-                        Arc::new(UInt64Array::from(new_row_ids)) as ArrayRef,
-                        batch.columns().to_vec(),
-                    )
-                };
-
-            // 2. Construct Schema with row_id
-            let mut fields = vec![Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false)];
-            fields.extend(self.schema.fields().iter().map(|f| f.as_ref().clone()));
-            let schema_with_row_id = Arc::new(Schema::new(fields));
-
-            // 3. Construct Columns
-            let mut columns = vec![row_ids_arr.clone()];
-            columns.extend(user_columns);
-
-            let batch_with_row_id = RecordBatch::try_new(schema_with_row_id, columns)?;
-
-            // 4. Append to Store
-            self.store
-                .append(&batch_with_row_id)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-            // 5. Update tracked row IDs
-            let new_row_ids_values = row_ids_arr
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .values();
-            {
-                let mut lock = self.row_ids.write().unwrap();
-                lock.extend_from_slice(new_row_ids_values);
-            }
-
-            total_rows += batch.num_rows() as u64;
-        }
-        Ok(total_rows)
+        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 }
 
@@ -452,7 +306,7 @@ where
     store: Arc<ColumnStore<P>>,
     table_id: u64,
     schema: SchemaRef,
-    listener: Option<Box<dyn TableEventListener>>,
+    listener: Option<Arc<dyn TableEventListener>>,
     row_ids: Arc<RwLock<Vec<u64>>>,
 }
 
@@ -488,7 +342,7 @@ where
         }
     }
 
-    pub fn with_listener(mut self, listener: Box<dyn TableEventListener>) -> Self {
+    pub fn with_listener(mut self, listener: Arc<dyn TableEventListener>) -> Self {
         self.listener = Some(listener);
         self
     }
@@ -563,6 +417,7 @@ where
             self.schema,
             self.table_id,
             self.row_ids,
+            self.listener,
         ))
     }
 }

@@ -67,10 +67,10 @@ where
 
     fn create_table_builder(
         &self,
-        _table_id: u64,
+        table_id: u64,
         name: &str,
         schema: SchemaRef,
-        _listener: Option<Box<dyn TableEventListener>>,
+        _listener: Option<Arc<dyn TableEventListener>>,
     ) -> LlkvResult<Box<dyn TableBuilder>> {
         // Note: We ignore the passed table_id because ParquetStore assigns its own IDs.
         // This might cause a mismatch if TableCatalog expects to control IDs.
@@ -84,6 +84,7 @@ where
         table_id: u64,
         schema: SchemaRef,
         _row_ids: &[u64],
+        _listener: Option<Arc<dyn TableEventListener>>,
     ) -> LlkvResult<Arc<dyn TableProvider>> {
         // We ignore row_ids because ParquetStore manages them internally.
         let provider = LlkvTableProvider::new(

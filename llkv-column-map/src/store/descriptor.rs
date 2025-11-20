@@ -396,7 +396,13 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
                             self.current_blob = Some(bytes);
                             self.cursor_in_page = 0;
                         }
-                        Some(GetResult::Missing { .. }) => return Some(Err(Error::NotFound)),
+                        Some(GetResult::Missing { .. }) => {
+                            eprintln!(
+                                "DescriptorIterator: page missing page_pk={}",
+                                self.current_page_pk
+                            );
+                            return Some(Err(Error::NotFound));
+                        }
                         None => return Some(Err(Error::Internal("batch_get empty result".into()))),
                     },
                     Err(e) => return Some(Err(e)),

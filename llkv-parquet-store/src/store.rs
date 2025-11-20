@@ -126,6 +126,18 @@ where
         Ok(table_id)
     }
 
+    /// Allocate a range of row IDs for a table.
+    ///
+    /// This is used by the DataSink to generate row IDs for new INSERTs.
+    pub fn allocate_row_ids(&self, table_id: TableId, count: usize) -> Result<u64> {
+        let start_id = {
+            let mut catalog = self.catalog.write().unwrap();
+            catalog.allocate_row_ids(table_id, count)?
+        };
+        self.save_catalog()?;
+        Ok(start_id)
+    }
+
     /// Append multiple RecordBatches to a table in a single transaction.
     ///
     /// This is more efficient than calling `append()` multiple times because

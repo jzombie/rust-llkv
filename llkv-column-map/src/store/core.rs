@@ -771,6 +771,7 @@ where
             num_rows = batch.num_rows(),
             "ColumnStore::append BEGIN"
         );
+
         // --- PHASE 1: PRE-PROCESSING THE INCOMING BATCH ---
         // The `append` logic relies on row IDs being processed in ascending order to handle
         // metadata updates efficiently and to ensure the shadow row_id chunks are naturally sorted.
@@ -1052,6 +1053,10 @@ where
 
             // After processing all slices, stage the final writes for the updated tail pages
             // and the root descriptor objects themselves.
+            eprintln!(
+                "append: writing tail page field_id={:?} tail_page_pk={}",
+                field_id, data_descriptor.tail_page_pk
+            );
             all_puts.push(BatchPut::Raw {
                 key: data_descriptor.tail_page_pk,
                 bytes: data_tail_page,
@@ -1975,7 +1980,7 @@ where
                 let rid_bytes = serialize_array(rid_norm.as_ref())?;
 
                 let data_pk = self.pager.alloc_many(1)?[0];
-                let s_norm = zero_offset(&s);
+                               let s_norm = zero_offset(&s);
                 let data_bytes = serialize_array(s_norm.as_ref())?;
                 puts.push(BatchPut::Raw {
                     key: data_pk,

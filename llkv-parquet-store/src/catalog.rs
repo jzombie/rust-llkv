@@ -169,6 +169,14 @@ impl ParquetCatalog {
             .ok_or_else(|| Error::NotFound)
     }
 
+    /// Allocate a range of row IDs for a table.
+    pub fn allocate_row_ids(&mut self, table_id: TableId, count: usize) -> Result<u64> {
+        let (_, metadata) = self.get_table_by_id_mut(table_id)?;
+        let start_id = metadata.next_row_id;
+        metadata.next_row_id += count as u64;
+        Ok(start_id)
+    }
+
     /// Add a Parquet file to a table.
     pub fn add_file_to_table(&mut self, table_id: TableId, file_ref: ParquetFileRef) -> Result<()> {
         let (_, metadata) = self.get_table_by_id_mut(table_id)?;
