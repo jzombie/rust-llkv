@@ -553,12 +553,12 @@ mod flat_baseline {
 
 criterion_group!(
     benches,
-    flat_baseline::run_baseline_benchmark,
+    // -- flat_baseline::run_baseline_benchmark,
     // parquet_based::run_write_benchmark,
-    parquet_based::run_read_benchmark,
+    // -- parquet_based::run_read_benchmark,
     parquet_based::run_read_benchmark_external,
     // parquet_based::run_similarity_benchmark,
     // parquet_based::run_similarity_benchmark_external,
-    parquet_based::run_compression_analysis
+    // -- parquet_based::run_compression_analysis
 );
 criterion_main!(benches);

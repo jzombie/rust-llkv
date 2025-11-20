@@ -64,7 +64,11 @@ pub fn is_external_field(field: &Field) -> bool {
         .unwrap_or(false)
 }
 
-/// Transform a schema by replacing external fields with FixedSizeBinary(8) key columns.
+/// Transform a schema by replacing external fields with FixedSizeBinary(12) key columns.
+///
+/// The 12 bytes encode:
+/// - Bytes 0-7: Physical key pointing to the column blob
+/// - Bytes 8-11: Row count (u32) - number of rows in the blob
 ///
 /// The transformed schema is what gets written to Parquet files.
 pub fn transform_schema_for_storage(schema: &Schema) -> SchemaRef {
@@ -73,7 +77,7 @@ pub fn transform_schema_for_storage(schema: &Schema) -> SchemaRef {
         .iter()
         .map(|field| {
             if is_external_field(field) {
-                // Replace with FixedSizeBinary(8) to hold PhysicalKey (u64)
+                // Replace with FixedSizeBinary(12) to hold PhysicalKey (u64) + row count (u32)
                 let mut metadata = field.metadata().clone();
                 metadata.insert(
                     "llkv:original_type".to_string(),
@@ -83,7 +87,7 @@ pub fn transform_schema_for_storage(schema: &Schema) -> SchemaRef {
                 Arc::new(
                     Field::new(
                         field.name(),
-                        DataType::FixedSizeBinary(8),
+                        DataType::FixedSizeBinary(12),
                         field.is_nullable(),
                     )
                     .with_metadata(metadata),
@@ -192,43 +196,106 @@ where
         .map_err(|e| Error::Internal(format!("failed to create externalized batch: {}", e)))
 }
 
-/// Store an array's data externally and return a FixedSizeBinary(8) array of keys.
+/// Store an array's data externally and return a FixedSizeBinary(12) array of encoded keys.
+///
+/// For efficiency, stores the entire column as a single contiguous blob rather than
+/// one blob per row. This dramatically reduces pager overhead and munmap storms.
+///
+/// Each row gets a 12-byte encoded key containing:
+/// - Bytes 0-7: Physical key pointing to the column blob
+/// - Bytes 8-11: Row count (u32) - number of rows in the blob
 fn store_array_externally<P>(array: &ArrayRef, pager: &P) -> Result<ArrayRef>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let num_rows = array.len();
 
-    // Get the raw buffer data for each row
-    // For FixedSizeList, we need to extract each element's buffer
-    let buffers = extract_row_buffers(array)?;
+    // Serialize the entire column into a single contiguous buffer
+    let column_buffer = serialize_entire_column(array)?;
 
-    // Allocate pager keys
-    let keys = pager.alloc_many(num_rows)?;
+    // Allocate a single key for the entire column
+    let keys = pager.alloc_many(1)?;
+    let column_key = keys[0];
 
-    // Store each buffer
-    let puts: Vec<BatchPut> = buffers
-        .into_iter()
-        .zip(keys.iter())
-        .map(|(buffer, key)| BatchPut::Raw {
-            key: *key,
-            bytes: buffer.to_vec(),
-        })
-        .collect();
+    // Store as a single blob
+    pager.batch_put(&[BatchPut::Raw {
+        key: column_key,
+        bytes: column_buffer,
+    }])?;
 
-    pager.batch_put(&puts)?;
-
-    // Create FixedSizeBinary array containing the keys using builder
+    // Create FixedSizeBinary(12) array with encoded key + row count
     use arrow::array::FixedSizeBinaryBuilder;
-    let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 8);
+    let mut builder = FixedSizeBinaryBuilder::with_capacity(num_rows, 12);
 
-    for key in keys.iter() {
-        builder.append_value(&key.to_le_bytes())?;
+    // Encode: [physical_key (8 bytes), row_count (4 bytes)]
+    let mut encoded = Vec::with_capacity(12);
+    encoded.extend_from_slice(&column_key.to_le_bytes());
+    encoded.extend_from_slice(&(num_rows as u32).to_le_bytes());
+
+    for _ in 0..num_rows {
+        builder.append_value(&encoded)?;
     }
 
     let key_array = builder.finish();
 
     Ok(Arc::new(key_array))
+}
+
+/// Serialize an entire column into a single contiguous buffer.
+fn serialize_entire_column(array: &ArrayRef) -> Result<Vec<u8>> {
+    use arrow::array::{BinaryArray, FixedSizeListArray, LargeBinaryArray};
+
+    match array.data_type() {
+        DataType::FixedSizeList(_, size) => {
+            let list_array = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    Error::Internal("failed to downcast to FixedSizeListArray".into())
+                })?;
+
+            let values = list_array.values();
+            let array_data = values.to_data();
+            let buffers = array_data.buffers();
+
+            if buffers.is_empty() {
+                return Err(Error::Internal("array has no buffers".into()));
+            }
+
+            // The entire column's data is in the first buffer
+            Ok(buffers[0].as_slice().to_vec())
+        }
+        DataType::Binary => {
+            let binary_array = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::Internal("failed to downcast to BinaryArray".into()))?;
+
+            // Concatenate all binary values
+            let mut buffer = Vec::new();
+            for i in 0..array.len() {
+                buffer.extend_from_slice(binary_array.value(i));
+            }
+            Ok(buffer)
+        }
+        DataType::LargeBinary => {
+            let binary_array = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| Error::Internal("failed to downcast to LargeBinaryArray".into()))?;
+
+            // Concatenate all binary values
+            let mut buffer = Vec::new();
+            for i in 0..array.len() {
+                buffer.extend_from_slice(binary_array.value(i));
+            }
+            Ok(buffer)
+        }
+        _ => Err(Error::Internal(format!(
+            "unsupported external storage type: {:?}",
+            array.data_type()
+        ))),
+    }
 }
 
 /// Extract individual row buffers from an array.
@@ -350,7 +417,7 @@ fn fetch_and_reconstruct_array<P>(
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    // Extract keys from FixedSizeBinary array
+    // Extract keys from FixedSizeBinary(12) array
     let key_array = key_array
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
@@ -358,6 +425,111 @@ where
             Error::Internal("expected FixedSizeBinary array for external column".into())
         })?;
 
+    if key_array.is_empty() {
+        return Err(Error::Internal("empty key array".into()));
+    }
+
+    // Decode key + row count from first entry (all rows have same metadata)
+    let first_key_bytes = key_array.value(0);
+    let physical_key = u64::from_le_bytes(first_key_bytes[0..8].try_into().unwrap());
+    let blob_row_count = u32::from_le_bytes(first_key_bytes[8..12].try_into().unwrap()) as usize;
+
+    fetch_column_blob_and_reconstruct(
+        physical_key,
+        blob_row_count,
+        key_array.len(),
+        original_field,
+        pager,
+    )
+}
+
+/// Fetch a single column blob and reconstruct the array.
+fn fetch_column_blob_and_reconstruct<P>(
+    column_key: PhysicalKey,
+    blob_row_count: usize,
+    num_rows_needed: usize,
+    original_field: &Field,
+    pager: &P,
+) -> Result<ArrayRef>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    // Fetch the single column blob
+    let results = pager.batch_get(&[BatchGet::Raw { key: column_key }])?;
+
+    let column_bytes = match results.into_iter().next() {
+        Some(GetResult::Raw { bytes, .. }) => bytes.into_bytes(),
+        _ => {
+            return Err(Error::Internal(
+                "expected raw blob for external column".into(),
+            ))
+        }
+    };
+
+    // Reconstruct the array from the single blob, using blob_row_count and num_rows_needed
+    reconstruct_array_from_column_blob(
+        &column_bytes,
+        blob_row_count,
+        num_rows_needed,
+        original_field,
+    )
+}
+
+/// Reconstruct an Arrow array from a single column blob.
+fn reconstruct_array_from_column_blob(
+    column_bytes: &bytes::Bytes,
+    blob_row_count: usize,
+    num_rows_needed: usize,
+    field: &Field,
+) -> Result<ArrayRef> {
+    use arrow::array::{FixedSizeListArray, Float32Array};
+
+    match field.data_type() {
+        DataType::FixedSizeList(inner_field, size) => {
+            // Reconstruct FixedSizeListArray from contiguous data
+            match inner_field.data_type() {
+                DataType::Float32 => {
+                    let floats: &[f32] = bytemuck::cast_slice(column_bytes.as_ref());
+
+                    // Take only the rows we need from the blob
+                    let total_floats_needed = num_rows_needed * (*size as usize);
+                    let floats_slice = &floats[..total_floats_needed];
+
+                    let values_array = Float32Array::from(floats_slice.to_vec());
+                    let field = Arc::new(Field::new("item", DataType::Float32, false));
+                    let list_array =
+                        FixedSizeListArray::new(field, *size, Arc::new(values_array), None);
+                    Ok(Arc::new(list_array))
+                }
+                _ => Err(Error::Internal(format!(
+                    "unsupported FixedSizeList inner type: {:?}",
+                    inner_field.data_type()
+                ))),
+            }
+        }
+        DataType::Binary | DataType::LargeBinary => {
+            // For variable-length types, we need length information
+            // This would require storing lengths separately or using a different format
+            Err(Error::Internal(
+                "Binary/LargeBinary not yet supported for column-level storage".into(),
+            ))
+        }
+        _ => Err(Error::Internal(format!(
+            "unsupported external storage type: {:?}",
+            field.data_type()
+        ))),
+    }
+}
+
+/// Fetch individual row blobs and reconstruct the array (legacy path).
+fn fetch_row_blobs_and_reconstruct<P>(
+    key_array: &FixedSizeBinaryArray,
+    original_field: &Field,
+    pager: &P,
+) -> Result<ArrayRef>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
     let keys: Vec<PhysicalKey> = (0..key_array.len())
         .map(|i| {
             let key_bytes = key_array.value(i);
@@ -370,11 +542,12 @@ where
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Batch fetch all buffers
+    // Batch fetch all buffers for this column
     let gets: Vec<BatchGet> = keys.iter().map(|&key| BatchGet::Raw { key }).collect();
     let results = pager.batch_get(&gets)?;
 
-    let buffers: Result<Vec<bytes::Bytes>> = results
+    // Convert EntryHandles to bytes immediately
+    let buffers: Vec<bytes::Bytes> = results
         .into_iter()
         .map(|result| match result {
             GetResult::Raw { bytes, .. } => Ok(bytes.into_bytes()),
@@ -382,9 +555,7 @@ where
                 "expected raw blob for external column".into(),
             )),
         })
-        .collect();
-
-    let buffers = buffers?;
+        .collect::<Result<Vec<_>>>()?;
 
     // Reconstruct the array based on the original type
     reconstruct_array_from_buffers(&buffers, original_field)

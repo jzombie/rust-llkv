@@ -92,14 +92,35 @@ where
         for projected_col_idx in 0..batch.num_columns() {
             let array = batch.column(projected_col_idx);
 
-            // The column should be FixedSizeBinary(8) containing u64 keys
+            // The column should be FixedSizeBinary containing physical keys
+            // For column-level storage: FixedSizeBinary(12) = [physical_key(8), row_count(4)]
+            // For legacy row-level storage: FixedSizeBinary(8) = [physical_key(8)]
             if let Some(fsb_array) = array
                 .as_any()
                 .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
             {
-                for row_idx in 0..array.len() {
-                    let key_bytes = fsb_array.value(row_idx);
-                    if key_bytes.len() == 8 {
+                let key_size = fsb_array.value_length();
+
+                if key_size == 12 {
+                    // Column-level storage: extract physical_key from first row (all rows identical)
+                    if !fsb_array.is_empty() {
+                        let key_bytes = fsb_array.value(0);
+                        let key = u64::from_le_bytes([
+                            key_bytes[0],
+                            key_bytes[1],
+                            key_bytes[2],
+                            key_bytes[3],
+                            key_bytes[4],
+                            key_bytes[5],
+                            key_bytes[6],
+                            key_bytes[7],
+                        ]);
+                        blob_keys.push(key);
+                    }
+                } else if key_size == 8 {
+                    // Legacy row-level storage: extract key from each row
+                    for row_idx in 0..array.len() {
+                        let key_bytes = fsb_array.value(row_idx);
                         let key = u64::from_le_bytes([
                             key_bytes[0],
                             key_bytes[1],
