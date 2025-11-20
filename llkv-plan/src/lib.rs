@@ -1,37 +1,152 @@
-//! Planner data structures shared between SQL parsing and execution.
-//!
-//! The crate exposes:
-//! - [`plan_graph`] for the serialized DAG representation exchanged with tooling.
-//! - [`plans`] for high-level logical plan structures emitted by the SQL layer.
-//! - [`validation`] helpers that enforce naming and schema invariants while plans
-//!   are being assembled.
-//! - [`conversion`] utilities for converting SQL AST nodes to Plan types.
-//! - [`traversal`] generic iterative traversal utilities for deeply nested ASTs.
-//!
-//! Modules are re-exported so downstream crates can `use llkv_plan::*` when they
-//! only need a subset of the functionality.
-#![forbid(unsafe_code)]
+use std::fmt;
+use std::sync::Arc;
 
-pub mod canonical;
-pub mod conversion;
-pub mod date;
-pub mod interval;
-pub mod plan_graph;
-pub mod plans;
-pub mod subquery_correlation;
-pub mod traversal;
-pub mod validation;
+use async_trait::async_trait;
+use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use datafusion::datasource::TableProvider;
+use datafusion::execution::context::QueryPlanner;
+use datafusion::logical_expr::{DmlStatement, LogicalPlan, WriteOp};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{Column, Literal};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use datafusion::scalar::ScalarValue;
+use datafusion_datasource::sink::DataSinkExec;
+use llkv_storage::pager::BoxedPager;
+use llkv_table::catalog::TableCatalog;
+use llkv_table::common::ROW_ID_COLUMN_NAME;
+use llkv_table::providers::column_map::ColumnMapTableProvider;
 
-pub use canonical::{CanonicalRow, CanonicalScalar};
-pub use conversion::{
-    RangeSelectRows, extract_rows_from_range, plan_value_from_sql_expr, plan_value_from_sql_value,
-};
-pub use date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
-pub use interval::parse_interval_literal;
-pub use plan_graph::*;
-pub use plans::*;
-pub use subquery_correlation::{
-    SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,
-    SubqueryCorrelatedTracker, subquery_correlated_placeholder,
-};
-pub use traversal::{TransformFrame, Traversable, traverse_postorder};
+/// Custom physical planner that intercepts DDL and DML operations.
+pub struct LlkvQueryPlanner {
+    catalog: Arc<TableCatalog>,
+    fallback: Arc<dyn PhysicalPlanner>,
+}
+
+impl fmt::Debug for LlkvQueryPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LlkvQueryPlanner")
+            .field("catalog", &"<TableCatalog>")
+            .finish()
+    }
+}
+
+impl LlkvQueryPlanner {
+    /// Construct a new planner with a catalog reference.
+    pub fn new(catalog: Arc<TableCatalog>) -> Self {
+        Self {
+            catalog,
+            fallback: Arc::new(DefaultPhysicalPlanner::default()),
+        }
+    }
+}
+
+#[async_trait]
+impl QueryPlanner for LlkvQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &datafusion::execution::context::SessionState,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        match logical_plan {
+            LogicalPlan::Dml(DmlStatement {
+                table_name,
+                op: WriteOp::Update,
+                input,
+                ..
+            }) => {
+                let name = table_name.table();
+                let provider = self
+                    .catalog
+                    .get_table(name)
+                    .map_err(|e| DataFusionError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!("Table {} not found", name))
+                    })?;
+
+                if let Some(cmp) = provider
+                    .as_any()
+                    .downcast_ref::<ColumnMapTableProvider<BoxedPager>>()
+                {
+                    let input_exec = self
+                        .fallback
+                        .create_physical_plan(input, session_state)
+                        .await?;
+                    let sink = cmp.create_sink();
+                    return Ok(Arc::new(DataSinkExec::new(input_exec, sink, None)));
+                }
+            }
+            LogicalPlan::Dml(DmlStatement {
+                table_name,
+                op: WriteOp::Delete,
+                input,
+                ..
+            }) => {
+                let name = table_name.table();
+                let provider = self
+                    .catalog
+                    .get_table(name)
+                    .map_err(|e| DataFusionError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!("Table {} not found", name))
+                    })?;
+
+                if let Some(cmp) = provider
+                    .as_any()
+                    .downcast_ref::<ColumnMapTableProvider<BoxedPager>>()
+                {
+                    // 1. Create physical plan for the input
+                    let input_exec = self
+                        .fallback
+                        .create_physical_plan(input, session_state)
+                        .await?;
+
+                    // 2. Create a projection that maps:
+                    //    row_id -> row_id
+                    //    other_col -> NULL
+                    let schema = cmp.schema();
+                    let input_schema = input_exec.schema();
+
+                    // Find row_id index in input
+                    let row_id_idx = input_schema.index_of(ROW_ID_COLUMN_NAME).map_err(|_| {
+                        DataFusionError::Execution(format!(
+                            "DELETE requires {} column to be present in the plan. \
+                             This might require an optimizer rule to force its selection.",
+                            ROW_ID_COLUMN_NAME
+                        ))
+                    })?;
+
+                    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+                        Vec::with_capacity(schema.fields().len());
+
+                    for field in schema.fields() {
+                        if field.name() == ROW_ID_COLUMN_NAME {
+                            exprs.push((
+                                Arc::new(Column::new(ROW_ID_COLUMN_NAME, row_id_idx)),
+                                ROW_ID_COLUMN_NAME.to_string(),
+                            ));
+                        } else {
+                            let null_value = ScalarValue::try_from(field.data_type())?;
+                            exprs.push((
+                                Arc::new(Literal::new(null_value)),
+                                field.name().to_string(),
+                            ));
+                        }
+                    }
+
+                    let projection_plan = Arc::new(ProjectionExec::try_new(exprs, input_exec)?);
+                    let sink = cmp.create_sink();
+
+                    // 3. Sink the projected NULLs (which triggers LWW delete)
+                    return Ok(Arc::new(DataSinkExec::new(projection_plan, sink, None)));
+                }
+            }
+            _ => {}
+        }
+
+        self.fallback
+            .create_physical_plan(logical_plan, session_state)
+            .await
+    }
+}

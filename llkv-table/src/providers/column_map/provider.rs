@@ -7,14 +7,18 @@ use std::sync::{Arc, RwLock};
 
 use arrow::array::{ArrayRef, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::{TableProvider, TableType};
+use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::sink::DataSinkExec;
 
@@ -308,7 +312,12 @@ where
                 }
             }
 
-            let batch_with_schema = RecordBatch::try_new(output_schema.clone(), final_columns)?;
+            let batch_with_schema = if output_schema.fields().is_empty() {
+                let options = RecordBatchOptions::new().with_row_count(Some(chunk.len()));
+                RecordBatch::try_new_with_options(output_schema.clone(), final_columns, &options)?
+            } else {
+                RecordBatch::try_new(output_schema.clone(), final_columns)?
+            };
             batches.push(batch_with_schema);
         }
 

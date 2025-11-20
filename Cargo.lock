@@ -2193,6 +2193,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-plan"
+version = "0.8.2-alpha"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-datasource",
+ "llkv-column-map",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-table",
+ "llkv-test-utils",
+]
+
+[[package]]
 name = "llkv-result"
 version = "0.8.2-alpha"
 dependencies = [
@@ -2210,6 +2224,7 @@ dependencies = [
  "datafusion-catalog",
  "llkv-column-map",
  "llkv-fusion",
+ "llkv-plan",
  "llkv-result",
  "llkv-storage",
  "llkv-table",

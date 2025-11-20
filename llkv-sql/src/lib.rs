@@ -18,7 +18,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_catalog::CatalogProvider;
 use datafusion_catalog::memory::MemorySchemaProvider;
 use llkv_column_map::store::ColumnStore;
-use llkv_fusion::LlkvQueryPlanner;
+use llkv_plan::LlkvQueryPlanner;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;

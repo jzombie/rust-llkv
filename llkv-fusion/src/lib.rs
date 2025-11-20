@@ -23,11 +23,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
-use datafusion::execution::context::QueryPlanner;
-use datafusion::logical_expr::{DmlStatement, LogicalPlan};
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use datafusion_datasource::sink::DataSinkExec;
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
 
@@ -297,122 +292,6 @@ mod tests {
         .join("\n");
 
         assert_eq!(formatted2.trim(), expected2.trim());
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "DELETE FROM llkv_demo not yet implemented")]
-    async fn datafusion_delete_statement_is_rejected() {
-        use datafusion::execution::session_state::SessionStateBuilder;
-        use llkv_storage::pager::BoxedPager;
-        use llkv_table::catalog::TableCatalog;
-        use llkv_table::providers::column_map::ColumnStoreBackend;
-
-        let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
-        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
-        let backend = Box::new(ColumnStoreBackend::new(Arc::clone(&store)));
-        let catalog = TableCatalog::new(backend).expect("catalog");
-
-        let schema = build_demo_batch().schema();
-        let mut builder = ColumnMapTableBuilder::new(Arc::clone(&store), 1, schema);
-        builder.append_batch(&build_demo_batch()).expect("append");
-        let provider = builder.finish().expect("provider");
-
-        // Create context with custom query planner that intercepts DELETE
-        let session_state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_query_planner(Arc::new(LlkvQueryPlanner::new(catalog)))
-            .build();
-        let ctx = SessionContext::new_with_state(session_state);
-        ctx.register_table("llkv_demo", Arc::new(provider))
-            .expect("register");
-
-        let delete_df = ctx
-            .sql("DELETE FROM llkv_demo WHERE user_id = 2")
-            .await
-            .expect("DELETE planning");
-
-        // This will panic with todo!() - demonstrating interception works
-        let _results = delete_df.collect().await.unwrap();
-    }
-}
-
-/// Custom physical planner that intercepts DDL and DML operations.
-pub struct LlkvQueryPlanner {
-    catalog: Arc<TableCatalog>,
-    fallback: Arc<dyn PhysicalPlanner>,
-}
-
-impl fmt::Debug for LlkvQueryPlanner {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LlkvQueryPlanner")
-            .field("catalog", &"<TableCatalog>")
-            .finish()
-    }
-}
-
-impl LlkvQueryPlanner {
-    /// Construct a new planner with a catalog reference.
-    pub fn new(catalog: Arc<TableCatalog>) -> Self {
-        Self {
-            catalog,
-            fallback: Arc::new(DefaultPhysicalPlanner::default()),
-        }
-    }
-}
-
-#[async_trait]
-impl QueryPlanner for LlkvQueryPlanner {
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session_state: &datafusion::execution::context::SessionState,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Intercept UPDATE
-        if let LogicalPlan::Dml(DmlStatement {
-            table_name,
-            op: datafusion::logical_expr::WriteOp::Update,
-            input,
-            ..
-        }) = logical_plan
-        {
-            let name = table_name.table();
-            let provider = self
-                .catalog
-                .get_table(name)
-                .map_err(|e| DataFusionError::Internal(e.to_string()))?
-                .ok_or_else(|| DataFusionError::Execution(format!("Table {} not found", name)))?;
-
-            // Check if it's ColumnMapTableProvider
-            if let Some(cmp) = provider
-                .as_any()
-                .downcast_ref::<ColumnMapTableProvider<BoxedPager>>()
-            {
-                let input_exec = self
-                    .fallback
-                    .create_physical_plan(input, session_state)
-                    .await?;
-                let sink = cmp.create_sink();
-                return Ok(Arc::new(DataSinkExec::new(input_exec, sink, None)));
-            }
-        }
-
-        // Intercept DELETE
-        if let LogicalPlan::Dml(DmlStatement {
-            table_name,
-            op: datafusion::logical_expr::WriteOp::Delete,
-            ..
-        }) = logical_plan
-        {
-            return Err(DataFusionError::NotImplemented(format!(
-                "DELETE FROM {} not yet implemented",
-                table_name
-            )));
-        }
-
-        // Delegate everything else to the default planner
-        self.fallback
-            .create_physical_plan(logical_plan, session_state)
-            .await
     }
 }
 
