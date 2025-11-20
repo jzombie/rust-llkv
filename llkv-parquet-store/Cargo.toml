@@ -32,3 +32,7 @@ simd-r-drive-entry-handle = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 criterion = { workspace = true }
+
+[[bench]]
+name = "compression_bench"
+harness = false
