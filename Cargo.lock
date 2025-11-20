@@ -2368,6 +2368,8 @@ dependencies = [
  "bitcode",
  "bytes",
  "criterion",
+ "datafusion-common",
+ "datafusion-expr",
  "llkv-result",
  "llkv-storage",
  "parquet",

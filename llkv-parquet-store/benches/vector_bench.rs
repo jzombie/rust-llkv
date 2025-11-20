@@ -8,6 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llkv_parquet_store::{add_mvcc_columns, ParquetStore, WriterConfig};
+use llkv_result::Result;
 use llkv_storage::pager::{BatchGet, GetResult, MemPager, Pager};
 use llkv_storage::types::PhysicalKey;
 use parquet::basic::Compression;
@@ -129,7 +130,11 @@ fn bench_read_vectors(compression: Compression) -> usize {
     store.append_many(table_id, batches).unwrap();
 
     // Read back and count rows
-    let batches = store.read_table_files(table_id, None).unwrap();
+    let batches: Vec<_> = store
+        .scan(table_id, &[], None, None)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
@@ -160,7 +165,11 @@ fn bench_vector_similarity_search(compression: Compression) -> (usize, f64) {
     let query_vector: Vec<f32> = (0..VECTOR_DIM).map(|_| rng.random::<f32>()).collect();
 
     // Read all vectors and compute cosine similarity
-    let batches = store.read_table_files(table_id, None).unwrap();
+    let batches: Vec<_> = store
+        .scan(table_id, &[], None, None)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
     let mut best_similarity = f64::NEG_INFINITY;
     let mut vectors_searched = 0;
 

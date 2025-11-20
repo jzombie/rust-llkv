@@ -16,7 +16,13 @@ llkv-storage = { path = "../llkv-storage" }
 
 # Parquet support
 parquet = { workspace = true, default-features = false, features = ["arrow", "async", "snap"] }
+# TODO: Use workspace crate
 bytes = "1.9"
+
+# DataFusion integration for predicate pushdown
+# TODO: Use workspace crates
+datafusion-expr = "50.3.0"
+datafusion-common = "50.3.0"
 
 # Serialization
 bitcode = { workspace = true }
@@ -33,6 +39,7 @@ rayon = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 criterion = { workspace = true }
+# TODO: Use workspace crate
 simsimd = "6.5.5"
 rand = { workspace = true }
 

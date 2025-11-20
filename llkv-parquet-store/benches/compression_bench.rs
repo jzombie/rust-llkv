@@ -8,6 +8,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llkv_parquet_store::{add_mvcc_columns, ParquetStore, WriterConfig};
+use llkv_result::Result;
 use llkv_storage::pager::{MemPager, Pager};
 use parquet::basic::Compression;
 use std::hint::black_box;
@@ -174,7 +175,11 @@ fn bench_read(compression: Compression) -> usize {
     }
 
     // Read all data back
-    let batches = store.read_table_files(table_id, None).unwrap();
+    let batches: Vec<_> = store
+        .scan(table_id, &[], None, None)
+        .unwrap()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     total_rows
