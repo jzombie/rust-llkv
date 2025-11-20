@@ -3,6 +3,7 @@
 use crate::types::{ColumnStats, FileId, TableId};
 use arrow::datatypes::SchemaRef;
 use llkv_result::{Error, Result};
+use llkv_storage::types::PhysicalKey;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
@@ -174,6 +175,53 @@ impl ParquetCatalog {
         metadata.total_row_count += file_ref.row_count;
         metadata.parquet_files.push(file_ref);
         Ok(())
+    }
+
+    /// Update a Parquet file in a table (used during write-time deduplication).
+    pub fn update_file_in_table(
+        &mut self,
+        table_id: TableId,
+        updated_file: ParquetFileRef,
+    ) -> Result<()> {
+        let (_, metadata) = self.get_table_by_id_mut(table_id)?;
+
+        // Find the file by physical_key
+        if let Some(file) = metadata
+            .parquet_files
+            .iter_mut()
+            .find(|f| f.physical_key == updated_file.physical_key)
+        {
+            let old_row_count = file.row_count;
+            *file = updated_file;
+            // Adjust total row count
+            metadata.total_row_count =
+                metadata.total_row_count.saturating_sub(old_row_count) + file.row_count;
+            Ok(())
+        } else {
+            Err(Error::Internal("file not found in table".into()))
+        }
+    }
+
+    /// Remove a Parquet file from a table (used during write-time deduplication).
+    pub fn remove_file_from_table(
+        &mut self,
+        table_id: TableId,
+        physical_key: PhysicalKey,
+    ) -> Result<()> {
+        let (_, metadata) = self.get_table_by_id_mut(table_id)?;
+
+        // Find and remove the file
+        if let Some(pos) = metadata
+            .parquet_files
+            .iter()
+            .position(|f| f.physical_key == physical_key)
+        {
+            let removed = metadata.parquet_files.remove(pos);
+            metadata.total_row_count = metadata.total_row_count.saturating_sub(removed.row_count);
+            Ok(())
+        } else {
+            Err(Error::Internal("file not found in table".into()))
+        }
     }
 
     /// Replace all Parquet files for a table (used during compaction).

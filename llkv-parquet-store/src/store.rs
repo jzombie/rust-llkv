@@ -136,12 +136,170 @@ where
     /// Fields marked with `llkv:storage = "external"` metadata are stored directly
     /// in the pager as raw buffers, with only their pager keys written to Parquet.
     /// This bypasses Parquet decode overhead for large blob columns like embeddings.
+    ///
+    /// # Deduplication
+    ///
+    /// Before writing new batches, scans existing files to find rows with matching
+    /// row_ids. Any old versions are physically rewritten without duplicate rows,
+    /// ensuring no duplicates ever exist on disk.
     pub fn append_many(&self, table_id: TableId, batches: Vec<RecordBatch>) -> Result<()> {
         if batches.is_empty() {
             return Ok(());
         }
 
-        // Allocate all keys upfront
+        // Extract all row_ids from incoming batches
+        let mut new_row_ids = rustc_hash::FxHashSet::default();
+        for batch in &batches {
+            let row_id_col = batch
+                .column_by_name("row_id")
+                .ok_or_else(|| Error::InvalidArgumentError("missing row_id column".into()))?
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .ok_or_else(|| Error::InvalidArgumentError("row_id must be UInt64".into()))?;
+
+            for i in 0..row_id_col.len() {
+                new_row_ids.insert(row_id_col.value(i));
+            }
+        }
+
+        // Scan existing files and remove rows that match new_row_ids
+        let (files_to_rewrite, files_to_delete) = {
+            let catalog = self.catalog.read().unwrap();
+            let (_, metadata) = catalog.get_table_by_id(table_id)?;
+            let schema = metadata.schema()?;
+
+            let mut files_to_rewrite = Vec::new();
+            let mut files_to_delete = Vec::new();
+
+            for file_ref in &metadata.parquet_files {
+                // Check if this file might contain any of the new row_ids
+                if new_row_ids
+                    .iter()
+                    .any(|&rid| rid >= file_ref.min_row_id && rid <= file_ref.max_row_id)
+                {
+                    // Read this file and filter out duplicates
+                    let bytes = match self.pager.batch_get(&[BatchGet::Raw {
+                        key: file_ref.physical_key,
+                    }]) {
+                        Ok(mut results) => match results.pop() {
+                            Some(GetResult::Raw { bytes, .. }) => bytes,
+                            _ => continue,
+                        },
+                        Err(_) => continue,
+                    };
+
+                    match crate::reader::read_parquet_from_memory(bytes.into_bytes(), None) {
+                        Ok(batches) => {
+                            let mut filtered_batches = Vec::new();
+                            let mut has_surviving_rows = false;
+
+                            for batch in batches {
+                                // Restore the full schema (including MVCC columns) from storage schema
+                                let batch_schema = crate::external::restore_schema_from_storage(
+                                    batch.schema().as_ref(),
+                                )
+                                .unwrap_or_else(|_| batch.schema());
+
+                                // Internalize external columns using the batch's schema (with MVCC)
+                                let batch = match crate::external::internalize_columns(
+                                    &batch,
+                                    &batch_schema,
+                                    &*self.pager,
+                                ) {
+                                    Ok(b) => b,
+                                    Err(_) => continue,
+                                };
+
+                                let row_id_col = batch
+                                    .column_by_name("row_id")
+                                    .unwrap()
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::UInt64Array>()
+                                    .unwrap();
+
+                                // Build filter: keep rows NOT in new_row_ids
+                                let keep_mask: Vec<bool> = (0..batch.num_rows())
+                                    .map(|i| !new_row_ids.contains(&row_id_col.value(i)))
+                                    .collect();
+
+                                if keep_mask.iter().any(|&k| k) {
+                                    has_surviving_rows = true;
+                                    let filter = arrow::array::BooleanArray::from(keep_mask);
+                                    if let Ok(filtered) =
+                                        arrow::compute::filter_record_batch(&batch, &filter)
+                                    {
+                                        if filtered.num_rows() > 0 {
+                                            filtered_batches.push(filtered);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if has_surviving_rows && !filtered_batches.is_empty() {
+                                files_to_rewrite.push((file_ref.physical_key, filtered_batches));
+                            } else {
+                                files_to_delete.push(file_ref.physical_key);
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+
+            (files_to_rewrite, files_to_delete)
+        };
+
+        // Rewrite files that have surviving rows
+        for (old_key, filtered_batches) in files_to_rewrite {
+            if filtered_batches.is_empty() {
+                continue;
+            }
+
+            let combined_batch = if filtered_batches.len() == 1 {
+                filtered_batches.into_iter().next().unwrap()
+            } else {
+                match arrow::compute::concat_batches(
+                    &filtered_batches[0].schema(),
+                    &filtered_batches,
+                ) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                }
+            };
+
+            // Re-externalize and overwrite
+            let transformed = crate::external::externalize_columns(&combined_batch, &*self.pager)?;
+            let parquet_bytes = crate::writer::write_parquet_to_memory_with_config(
+                &transformed,
+                &self.writer_config,
+            )?;
+            let (min_row_id, max_row_id) = extract_row_id_range(&combined_batch)?;
+            let column_stats = if self.writer_config.enable_statistics {
+                let bytes = bytes::Bytes::from(parquet_bytes.clone());
+                crate::statistics::extract_statistics(bytes).ok()
+            } else {
+                None
+            };
+
+            self.pager.batch_put(&[BatchPut::Raw {
+                key: old_key,
+                bytes: parquet_bytes.into(),
+            }])?;
+
+            let mut catalog = self.catalog.write().unwrap();
+            catalog.update_file_in_table(
+                table_id,
+                ParquetFileRef {
+                    physical_key: old_key,
+                    row_count: combined_batch.num_rows() as u64,
+                    min_row_id,
+                    max_row_id,
+                    column_stats,
+                },
+            )?;
+        }
+
+        // Allocate keys for new batches
         let file_ids = self.pager.alloc_many(batches.len())?;
 
         // Parallelize Parquet encoding across all batches using Rayon
@@ -201,12 +359,24 @@ where
             });
         }
 
-        // Batch write all Parquet files
+        // Batch write all NEW Parquet files
         self.pager.batch_put(&puts)?;
 
-        // Update catalog with all file refs
+        // Delete files that had no surviving rows
+        if !files_to_delete.is_empty() {
+            self.pager.free_many(&files_to_delete)?;
+        }
+
+        // Update catalog: remove deleted files and add new ones
         {
             let mut catalog = self.catalog.write().unwrap();
+
+            // Remove deleted files from catalog
+            for old_key in &files_to_delete {
+                catalog.remove_file_from_table(table_id, *old_key)?;
+            }
+
+            // Add new files
             for file_ref in file_refs {
                 catalog.add_file_to_table(table_id, file_ref)?;
             }

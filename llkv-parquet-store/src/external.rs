@@ -39,7 +39,9 @@
 //! ).with_metadata(metadata);
 //! ```
 
-use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, RecordBatch,
+};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BatchGet, BatchPut, GetResult, Pager};
@@ -420,6 +422,19 @@ fn reconstruct_array_from_buffers(buffers: &[bytes::Bytes], field: &Field) -> Re
                     inner_field.data_type()
                 ))),
             }
+        }
+        DataType::Binary => {
+            let values: Vec<Vec<u8>> = buffers.iter().map(|b| b.to_vec()).collect();
+            Ok(Arc::new(BinaryArray::from_vec(
+                values.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+            )))
+        }
+        DataType::LargeBinary => {
+            use arrow::array::LargeBinaryArray;
+            let values: Vec<Vec<u8>> = buffers.iter().map(|b| b.to_vec()).collect();
+            Ok(Arc::new(LargeBinaryArray::from_vec(
+                values.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+            )))
         }
         _ => Err(Error::Internal(format!(
             "unsupported external storage reconstruction for type: {:?}",
