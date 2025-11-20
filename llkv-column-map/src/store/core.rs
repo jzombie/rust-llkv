@@ -828,10 +828,11 @@ where
 
         tracing::trace!("ColumnStore::append PHASE 1 complete - batch preprocessed");
 
-        // --- PHASE 2: LAST-WRITER-WINS (LWW) REWRITE ---
-        // This phase handles updates. It identifies any rows in the incoming batch that
-        // already exist in the store and rewrites them in-place. This is a separate
-        // transaction that happens before the main append of new rows.
+        // --- PHASE 2: LWW REWRITE AND APPEND PER COLUMN ---
+        // We iterate through each column to perform rewrites and appends.
+        // This handles sparse updates correctly: if a row is rewritten in one column
+        // but not another, it will be appended to the column where it was missing.
+
         let schema = batch_ref.schema();
         let row_id_idx = schema
             .index_of(ROW_ID_COLUMN_NAME)
@@ -849,138 +850,90 @@ where
             incoming_ids_map.insert(row_id_arr.value(i), i);
         }
 
-        // These variables will track the state of the LWW transaction.
         let mut catalog_dirty = false;
-        let mut puts_rewrites: Vec<BatchPut> = Vec::new();
-        let mut all_rewritten_ids = FxHashSet::default();
+        let mut all_puts: Vec<BatchPut> = Vec::new();
 
-        // Iterate through each column in the batch (except row_id) to perform rewrites.
-        let mut catalog_lock = self.catalog.write().unwrap();
+        // Iterate through each column in the batch (except row_id).
         for i in 0..batch_ref.num_columns() {
             if i == row_id_idx {
                 continue;
             }
             let field = schema.field(i);
-            if let Some(field_id_str) = field.metadata().get(crate::store::FIELD_ID_META_KEY) {
-                let field_id = field_id_str
-                    .parse::<u64>()
-                    .map(LogicalFieldId::from)
-                    .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
+            let field_id =
+                if let Some(field_id_str) = field.metadata().get(crate::store::FIELD_ID_META_KEY) {
+                    field_id_str
+                        .parse::<u64>()
+                        .map(LogicalFieldId::from)
+                        .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?
+                } else {
+                    continue;
+                };
 
-                // `lww_rewrite_for_field` finds overlapping row IDs and rewrites the data chunks.
-                // It returns the set of row IDs that were updated.
-                let rewritten = self.lww_rewrite_for_field(
-                    &mut catalog_lock,
-                    field_id,
-                    &incoming_ids_map,
-                    batch_ref.column(i),
-                    batch_ref.column(row_id_idx),
-                    &mut puts_rewrites,
-                )?;
-                all_rewritten_ids.extend(rewritten);
-            }
-        }
-        drop(catalog_lock);
+            // 1. LWW Rewrite
+            let mut catalog_lock = self.catalog.write().unwrap();
+            let rewritten_ids = self.lww_rewrite_for_field(
+                &mut catalog_lock,
+                field_id,
+                &incoming_ids_map,
+                batch_ref.column(i),
+                batch_ref.column(row_id_idx),
+                &mut all_puts,
+            )?;
 
-        // Commit the LWW changes to the pager immediately.
-        if !puts_rewrites.is_empty() {
-            self.pager.batch_put(&puts_rewrites)?;
-        }
+            // Ensure catalog entries exist for append
+            let (descriptor_pk, rid_descriptor_pk, rid_fid) = {
+                let pk1 = *catalog_lock.map.entry(field_id).or_insert_with(|| {
+                    catalog_dirty = true;
+                    self.pager.alloc_many(1).unwrap()[0]
+                });
+                let r_fid = rowid_fid(field_id);
+                let pk2 = *catalog_lock.map.entry(r_fid).or_insert_with(|| {
+                    catalog_dirty = true;
+                    self.pager.alloc_many(1).unwrap()[0]
+                });
+                (pk1, pk2, r_fid)
+            };
+            drop(catalog_lock);
 
-        tracing::trace!("ColumnStore::append PHASE 2 complete - LWW rewrites done");
-
-        // --- PHASE 3: FILTERING FOR NEW ROWS ---
-        // After handling updates, we filter the incoming batch to remove the rows that were
-        // just rewritten. The remaining rows are guaranteed to be new additions to the store.
-        let batch_to_append = if !all_rewritten_ids.is_empty() {
-            let keep_mask: Vec<bool> = (0..row_id_arr.len())
-                .map(|i| !all_rewritten_ids.contains(&row_id_arr.value(i)))
-                .collect();
-            let keep_array = BooleanArray::from(keep_mask);
-            compute::filter_record_batch(batch_ref, &keep_array)?
-        } else {
-            batch_ref.clone()
-        };
-
-        // If no new rows are left, we are done.
-        if batch_to_append.num_rows() == 0 {
-            tracing::trace!("ColumnStore::append early exit - no new rows to append");
-            return Ok(());
-        }
-
-        tracing::trace!("ColumnStore::append PHASE 3 complete - filtered for new rows");
-
-        // --- PHASE 4: APPENDING NEW DATA ---
-        // This is the main append transaction. All writes generated in this phase will be
-        // collected and committed atomically at the very end.
-        let append_schema = batch_to_append.schema();
-        let append_row_id_idx = append_schema.index_of(ROW_ID_COLUMN_NAME)?;
-        let append_row_id_any: ArrayRef = Arc::clone(batch_to_append.column(append_row_id_idx));
-        let mut puts_appends: Vec<BatchPut> = Vec::new();
-
-        // Loop through each column of the filtered batch to append its data.
-        for (i, array) in batch_to_append.columns().iter().enumerate() {
-            if i == append_row_id_idx {
-                continue;
-            }
-
-            let field = append_schema.field(i);
-
-            let field_id = field
-                .metadata()
-                .get(crate::store::FIELD_ID_META_KEY)
-                .ok_or_else(|| Error::Internal("Missing field_id".into()))?
-                .parse::<u64>()
-                .map(LogicalFieldId::from)
-                .map_err(|e| Error::Internal(format!("Invalid field_id: {}", e)))?;
-
-            // Populate the data type cache for this column. This is a performance optimization
-            // to avoid reading a chunk from storage later just to determine its type.
-            self.dtype_cache.insert(field_id, field.data_type().clone());
-
-            // Null values are treated as deletions, so we filter them out. The `rids_clean`
-            // array contains the row IDs corresponding to the non-null values.
-            let (array_clean, rids_clean) = if array.null_count() == 0 {
-                (array.clone(), append_row_id_any.clone())
+            // 2. Filter for Append
+            let array = batch_ref.column(i);
+            let (array_clean, rids_clean) = if rewritten_ids.is_empty() {
+                // No rewrites, append everything (filtering nulls)
+                if array.null_count() == 0 {
+                    (array.clone(), batch_ref.column(row_id_idx).clone())
+                } else {
+                    let keep =
+                        BooleanArray::from_iter((0..array.len()).map(|j| Some(!array.is_null(j))));
+                    (
+                        compute::filter(array, &keep)?,
+                        compute::filter(batch_ref.column(row_id_idx), &keep)?,
+                    )
+                }
             } else {
-                let keep =
-                    BooleanArray::from_iter((0..array.len()).map(|j| Some(!array.is_null(j))));
-                let a = compute::filter(array, &keep)?;
-                let r = compute::filter(&append_row_id_any, &keep)?;
-                (a, r)
+                // Filter out rewritten rows AND nulls
+                let keep = BooleanArray::from_iter((0..array.len()).map(|j| {
+                    let rid = row_id_arr.value(j);
+                    Some(!rewritten_ids.contains(&rid) && !array.is_null(j))
+                }));
+                (
+                    compute::filter(array, &keep)?,
+                    compute::filter(batch_ref.column(row_id_idx), &keep)?,
+                )
             };
 
             if array_clean.is_empty() {
                 continue;
             }
 
-            // Get or create the physical keys for the column's data descriptor and its
-            // shadow row_id descriptor from the catalog.
-            let (descriptor_pk, rid_descriptor_pk, rid_fid) = {
-                let mut catalog = self.catalog.write().unwrap();
-                let pk1 = *catalog.map.entry(field_id).or_insert_with(|| {
-                    catalog_dirty = true;
-                    self.pager.alloc_many(1).unwrap()[0]
-                });
-                let r_fid = rowid_fid(field_id);
-                let pk2 = *catalog.map.entry(r_fid).or_insert_with(|| {
-                    catalog_dirty = true;
-                    self.pager.alloc_many(1).unwrap()[0]
-                });
-                (pk1, pk2, r_fid)
-            };
+            // 3. Append (Phase 4 logic)
+            self.dtype_cache.insert(field_id, field.data_type().clone());
 
             // Load the descriptors and their tail metadata pages into memory.
             // If they don't exist, `load_or_create` will initialize new ones.
             let (mut data_descriptor, mut data_tail_page) =
                 ColumnDescriptor::load_or_create(Arc::clone(&self.pager), descriptor_pk, field_id)
                     .map_err(|e| {
-                        tracing::error!(
-                            ?field_id,
-                            descriptor_pk,
-                            error = ?e,
-                            "append: load_or_create failed for data descriptor"
-                        );
+                        tracing::error!(?field_id, descriptor_pk, error = ?e, "append: load_or_create failed for data descriptor");
                         e
                     })?;
             let (mut rid_descriptor, mut rid_tail_page) = ColumnDescriptor::load_or_create(
@@ -989,12 +942,7 @@ where
                 rid_fid,
             )
             .map_err(|e| {
-                tracing::error!(
-                    ?rid_fid,
-                    rid_descriptor_pk,
-                    error = ?e,
-                    "append: load_or_create failed for rid descriptor"
-                );
+                tracing::error!(?rid_fid, rid_descriptor_pk, error = ?e, "append: load_or_create failed for rid descriptor");
                 e
             })?;
 
@@ -1019,7 +967,7 @@ where
                 let data_pk = self.pager.alloc_many(1)?[0];
                 let s_norm = zero_offset(&s);
                 let data_bytes = serialize_array(s_norm.as_ref())?;
-                puts_appends.push(BatchPut::Raw {
+                all_puts.push(BatchPut::Raw {
                     key: data_pk,
                     bytes: data_bytes,
                 });
@@ -1029,7 +977,7 @@ where
                 let rid_norm = zero_offset(&rid_slice);
                 let rid_pk = self.pager.alloc_many(1)?[0];
                 let rid_bytes = serialize_array(rid_norm.as_ref())?;
-                puts_appends.push(BatchPut::Raw {
+                all_puts.push(BatchPut::Raw {
                     key: rid_pk,
                     bytes: rid_bytes,
                 });
@@ -1083,7 +1031,7 @@ where
                     &rid_norm,
                     &mut data_meta,
                     &mut rid_meta,
-                    &mut puts_appends,
+                    &mut all_puts,
                 )?;
 
                 // Append the (potentially modified) metadata to their respective descriptor chains.
@@ -1091,42 +1039,41 @@ where
                     &mut data_descriptor,
                     &mut data_tail_page,
                     data_meta,
-                    &mut puts_appends,
+                    &mut all_puts,
                 )?;
                 self.append_meta_in_loop(
                     &mut rid_descriptor,
                     &mut rid_tail_page,
                     rid_meta,
-                    &mut puts_appends,
+                    &mut all_puts,
                 )?;
                 row_off += rows;
             }
 
             // After processing all slices, stage the final writes for the updated tail pages
             // and the root descriptor objects themselves.
-            puts_appends.push(BatchPut::Raw {
+            all_puts.push(BatchPut::Raw {
                 key: data_descriptor.tail_page_pk,
                 bytes: data_tail_page,
             });
-            puts_appends.push(BatchPut::Raw {
+            all_puts.push(BatchPut::Raw {
                 key: descriptor_pk,
                 bytes: data_descriptor.to_le_bytes(),
             });
-            puts_appends.push(BatchPut::Raw {
+            all_puts.push(BatchPut::Raw {
                 key: rid_descriptor.tail_page_pk,
                 bytes: rid_tail_page,
             });
-            puts_appends.push(BatchPut::Raw {
+            all_puts.push(BatchPut::Raw {
                 key: rid_descriptor_pk,
                 bytes: rid_descriptor.to_le_bytes(),
             });
         }
 
-        // --- PHASE 5: FINAL ATOMIC COMMIT ---
-        // If the catalog was modified (e.g., new columns were created), stage its write.
+        // --- PHASE 3: FINAL ATOMIC COMMIT ---
         if catalog_dirty {
             let catalog = self.catalog.read().unwrap();
-            puts_appends.push(BatchPut::Raw {
+            all_puts.push(BatchPut::Raw {
                 key: CATALOG_ROOT_PKEY,
                 bytes: catalog.to_bytes(),
             });
@@ -1135,8 +1082,8 @@ where
         // Commit all staged puts (new data chunks, new row_id chunks, new index permutations,
         // updated descriptor pages, updated root descriptors, and the updated catalog)
         // in a single atomic operation.
-        if !puts_appends.is_empty() {
-            self.pager.batch_put(&puts_appends)?;
+        if !all_puts.is_empty() {
+            self.pager.batch_put(&all_puts)?;
         }
         tracing::trace!("ColumnStore::append END - success");
         Ok(())

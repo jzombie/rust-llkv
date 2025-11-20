@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::fmt;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::UInt64Array;
@@ -20,6 +21,9 @@ use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
 
+use datafusion::logical_expr::{BinaryExpr, Operator};
+use datafusion::scalar::ScalarValue;
+
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder,
@@ -33,7 +37,7 @@ use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::common::{DEFAULT_SCAN_BATCH_SIZE, FIELD_ID_META_KEY};
+use crate::common::FIELD_ID_META_KEY;
 
 /// Custom [`TableProvider`] that surfaces LLKV Column Map data to DataFusion.
 pub struct ColumnMapTableProvider<P>
@@ -91,8 +95,8 @@ where
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // 1. Identify the first column to scan for row IDs.
         // We assume at least one column exists.
@@ -104,13 +108,84 @@ where
             )?);
         }
 
-        // Use the first column (index 0) to find all row IDs.
-        // In a real implementation, we would pick the best column or use the row_id column if available.
-        let first_field_id = LogicalFieldId::for_user(self.table_id as u16, 1); // 1-based field index
+        // Default: Use the first column (index 0) to find all row IDs.
+        let mut driving_field_id = LogicalFieldId::for_user(self.table_id as u16, 1);
+        let mut builder_setup: Box<dyn for<'a> FnOnce(ScanBuilder<'a, P>) -> ScanBuilder<'a, P>> =
+            Box::new(|b| b);
+
+        // Try to find a filter to drive the scan
+        for expr in filters {
+            if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr {
+                let (col_idx, val) = if let Expr::Column(c) = left.as_ref() {
+                    if let Expr::Literal(v, ..) = right.as_ref() {
+                        if let Ok(idx) = self.schema.index_of(&c.name) {
+                            (idx, v)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+
+                let field = self.schema.field(col_idx);
+                let field_id =
+                    LogicalFieldId::for_user(self.table_id as u16, (col_idx + 1) as u64 as u32);
+
+                // Helper to create range bounds
+                fn make_range<T: Copy>(op: Operator, val: T) -> Option<(Bound<T>, Bound<T>)> {
+                    match op {
+                        Operator::Eq => Some((Bound::Included(val), Bound::Included(val))),
+                        Operator::Gt => Some((Bound::Excluded(val), Bound::Unbounded)),
+                        Operator::GtEq => Some((Bound::Included(val), Bound::Unbounded)),
+                        Operator::Lt => Some((Bound::Unbounded, Bound::Excluded(val))),
+                        Operator::LtEq => Some((Bound::Unbounded, Bound::Included(val))),
+                        _ => None,
+                    }
+                }
+
+                // Apply range based on type
+                match field.data_type() {
+                    arrow::datatypes::DataType::Int32 => {
+                        if let ScalarValue::Int32(Some(v)) = val {
+                            if let Some(range) = make_range(*op, *v) {
+                                driving_field_id = field_id;
+                                builder_setup = Box::new(move |b| b.with_range(range));
+                                break;
+                            }
+                        }
+                    }
+                    arrow::datatypes::DataType::Int64 => {
+                        if let ScalarValue::Int64(Some(v)) = val {
+                            if let Some(range) = make_range(*op, *v) {
+                                driving_field_id = field_id;
+                                builder_setup = Box::new(move |b| b.with_range(range));
+                                break;
+                            }
+                        }
+                    }
+                    arrow::datatypes::DataType::UInt64 => {
+                        if let ScalarValue::UInt64(Some(v)) = val {
+                            if let Some(range) = make_range(*op, *v) {
+                                driving_field_id = field_id;
+                                builder_setup = Box::new(move |b| b.with_range(range));
+                                break;
+                            }
+                        }
+                    }
+                    // Add other types as needed
+                    _ => {}
+                }
+            }
+        }
 
         // 2. Scan to collect row IDs.
-        let mut collector = RowIdCollector::default();
-        let builder = ScanBuilder::new(&self.store, first_field_id).with_row_ids(first_field_id);
+        let mut collector = RowIdCollector::new(limit);
+        let builder =
+            ScanBuilder::new(&self.store, driving_field_id).with_row_ids(driving_field_id);
+        let builder = builder_setup(builder);
 
         // We need to run the visitor. ScanBuilder::run is synchronous.
         // In an async context, we should probably spawn_blocking, but for now we run it directly.
@@ -127,53 +202,50 @@ where
             )?);
         }
 
-        // 3. Gather rows.
-        // We need to map projection indices to LogicalFieldIds.
-        let projected_indices = if let Some(proj) = projection {
+        // 3. Gather columns for the collected row IDs.
+        // We need to map the projection to the actual columns.
+        let projected_indices: Vec<usize> = if let Some(proj) = projection {
             proj.clone()
         } else {
             (0..self.schema.fields().len()).collect()
         };
 
-        let projected_field_ids: Vec<LogicalFieldId> = projected_indices
-            .iter()
-            .map(|&i| LogicalFieldId::for_user(self.table_id as u16, (i + 1) as u64 as u32))
-            .collect();
+        let mut field_ids = Vec::new();
+        let mut output_schema_fields = Vec::new();
 
-        // Gather in chunks to avoid huge allocations (though MemorySourceConfig will hold them all anyway).
+        for &idx in &projected_indices {
+            let field = self.schema.field(idx);
+            output_schema_fields.push(field.clone());
+
+            // Calculate the logical field ID.
+            // Note: This assumes the schema passed to the provider matches the user schema
+            // used to create the table, where indices map 1-to-1 to field IDs (offset by 1).
+            let field_id = LogicalFieldId::for_user(self.table_id as u16, (idx + 1) as u64 as u32);
+            field_ids.push(field_id);
+        }
+
+        // Debug: Print row IDs being gathered
+        // println!("Gathering rows: {:?}", row_ids);
+
+        // Gather in chunks to avoid huge allocations
         let chunk_size = 1024;
         let mut batches = Vec::new();
+        let output_schema = Arc::new(Schema::new(output_schema_fields));
 
         for chunk in row_ids.chunks(chunk_size) {
             let batch = self
                 .store
-                .gather_rows(&projected_field_ids, chunk, GatherNullPolicy::IncludeNulls)
+                .gather_rows(&field_ids, chunk, GatherNullPolicy::IncludeNulls)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 
-            // The batch returned by gather_rows has columns in order of projected_field_ids.
-            // We need to ensure the schema matches what DataFusion expects (names, types).
-            // gather_rows returns a RecordBatch with a schema derived from the store.
-            // We should cast/rename if necessary, but for now assume types match.
-
-            // Construct the projected schema for this batch
-            let projected_fields: Vec<_> = projected_indices
-                .iter()
-                .map(|&i| self.schema.field(i).clone())
-                .collect();
-            let projected_schema = Arc::new(Schema::new(projected_fields));
-
+            // The batch returned by gather_rows has columns in order of field_ids.
+            // We need to ensure the schema matches what DataFusion expects.
             let batch_with_schema =
-                RecordBatch::try_new(projected_schema, batch.columns().to_vec())?;
+                RecordBatch::try_new(output_schema.clone(), batch.columns().to_vec())?;
             batches.push(batch_with_schema);
         }
 
         let partitions = vec![batches];
-        let output_schema = if let Some(proj) = projection {
-            let fields: Vec<_> = proj.iter().map(|&i| self.schema.field(i).clone()).collect();
-            Arc::new(Schema::new(fields))
-        } else {
-            self.schema.clone()
-        };
 
         Ok(MemorySourceConfig::try_new_exec(
             &partitions,
@@ -334,12 +406,34 @@ where
 #[derive(Default)]
 struct RowIdCollector {
     row_ids: Vec<u64>,
+    limit: Option<usize>,
+}
+
+impl RowIdCollector {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            row_ids: Vec::new(),
+            limit,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.limit.map_or(false, |l| self.row_ids.len() >= l)
+    }
 }
 
 macro_rules! impl_primitive_with_rids {
     ($base:ident, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype:expr, $native_ty:ty, $cast_expr:expr) => {
         fn $chunk_with_rids_fn(&mut self, _v: &$array_ty, r: &UInt64Array) {
-            self.row_ids.extend(r.values());
+            if self.is_full() {
+                return;
+            }
+            let remaining = self
+                .limit
+                .map(|l| l - self.row_ids.len())
+                .unwrap_or(usize::MAX);
+            let len = r.len().min(remaining);
+            self.row_ids.extend(r.values().iter().take(len));
         }
     };
 }
@@ -347,7 +441,15 @@ macro_rules! impl_primitive_with_rids {
 macro_rules! impl_sorted_with_rids {
     ($base:ident, $chunk_fn:ident, $chunk_with_rids_fn:ident, $run_fn:ident, $run_with_rids_fn:ident, $array_ty:ty, $physical_ty:ty, $dtype:expr, $native_ty:ty, $cast_expr:expr) => {
         fn $run_with_rids_fn(&mut self, _v: &$array_ty, r: &UInt64Array, start: usize, len: usize) {
-            self.row_ids.extend(&r.values()[start..start + len]);
+            if self.is_full() {
+                return;
+            }
+            let remaining = self
+                .limit
+                .map(|l| l - self.row_ids.len())
+                .unwrap_or(usize::MAX);
+            let take = len.min(remaining);
+            self.row_ids.extend(&r.values()[start..start + take]);
         }
     };
 }
