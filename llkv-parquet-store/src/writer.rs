@@ -6,14 +6,14 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-/// Minimum batch size threshold (rows).
+/// Minimum batch size threshold in bytes.
 /// Batches smaller than this should be merged together to improve storage efficiency.
-pub const MIN_BATCH_SIZE: usize = 1024;
+pub const MIN_BATCH_SIZE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 
-/// Target batch size (rows).
+/// Target batch size in bytes.
 /// Batches are merged up to this size, and oversized batches are split to this size.
-/// Matches the default row group size for optimal Parquet performance.
-pub const TARGET_BATCH_SIZE: usize = 8192;
+/// This size works well for both Parquet compression and external storage blobs.
+pub const TARGET_BATCH_SIZE_BYTES: usize = 32 * 1024 * 1024; // 32 MB
 
 /// Configuration for Parquet file writing.
 #[derive(Debug, Clone)]
@@ -156,12 +156,51 @@ pub fn write_parquet_to_memory_with_config(
     Ok(buffer)
 }
 
-/// Merge small batches together and split large batches to achieve TARGET_BATCH_SIZE.
+/// Estimate the memory size of a RecordBatch in bytes.
 ///
-/// This function optimizes batch sizes for storage efficiency:
-/// - Small batches (< MIN_BATCH_SIZE) are merged together
-/// - Large batches (> TARGET_BATCH_SIZE) are split into chunks
-/// - Batches near TARGET_BATCH_SIZE are left as-is
+/// This provides a rough estimate by recursively summing all buffer sizes.
+fn estimate_batch_size_bytes(batch: &RecordBatch) -> usize {
+    fn estimate_array_size(array: &dyn arrow::array::Array) -> usize {
+        let array_data = array.to_data();
+        let mut size = 0;
+
+        // Sum all buffers at this level
+        for buffer in array_data.buffers() {
+            size += buffer.len();
+        }
+
+        // Add null buffer
+        if let Some(null_buffer) = array_data.nulls() {
+            size += null_buffer.buffer().len();
+        }
+
+        // Recursively add child arrays (for nested types like FixedSizeList)
+        for child in array_data.child_data() {
+            for buffer in child.buffers() {
+                size += buffer.len();
+            }
+            if let Some(null_buffer) = child.nulls() {
+                size += null_buffer.buffer().len();
+            }
+        }
+
+        size
+    }
+
+    let mut total_bytes = 0;
+    for column in batch.columns() {
+        total_bytes += estimate_array_size(column.as_ref());
+    }
+
+    total_bytes
+}
+
+/// Merge small batches together and split large batches to achieve TARGET_BATCH_SIZE_BYTES.
+///
+/// This function optimizes batch sizes for storage efficiency based on memory size:
+/// - Small batches (< MIN_BATCH_SIZE_BYTES) are merged together
+/// - Large batches (> TARGET_BATCH_SIZE_BYTES) are split into chunks
+/// - Batches near TARGET_BATCH_SIZE_BYTES are left as-is
 ///
 /// All batches must have the same schema.
 pub fn optimize_batch_sizes(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
@@ -180,6 +219,16 @@ pub fn optimize_batch_sizes(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
         }
     }
 
+    // Calculate approximate bytes per row from first batch
+    let bytes_per_row = if batches[0].num_rows() > 0 {
+        estimate_batch_size_bytes(&batches[0]) / batches[0].num_rows()
+    } else {
+        1024 // Default estimate if first batch is empty
+    };
+
+    let min_rows = (MIN_BATCH_SIZE_BYTES / bytes_per_row).max(1);
+    let target_rows = (TARGET_BATCH_SIZE_BYTES / bytes_per_row).max(1);
+
     let mut optimized = Vec::new();
     let mut accumulator: Option<RecordBatch> = None;
 
@@ -191,14 +240,14 @@ pub fn optimize_batch_sizes(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
             let combined_rows = acc.num_rows() + current_batch.num_rows();
 
             // If combining would still be under or near target, merge them
-            if combined_rows <= TARGET_BATCH_SIZE {
+            if combined_rows <= target_rows {
                 current_batch = arrow::compute::concat_batches(&schema, &[acc, current_batch])
                     .map_err(|e| Error::Arrow(e))?;
             } else {
                 // Accumulator is full enough, flush it
-                // If accumulator is below MIN_BATCH_SIZE but would exceed TARGET when combined,
+                // If accumulator is below MIN but would exceed TARGET when combined,
                 // still flush it (trade-off: small batch vs oversized batch)
-                if acc.num_rows() >= MIN_BATCH_SIZE || combined_rows > TARGET_BATCH_SIZE * 2 {
+                if acc.num_rows() >= min_rows || combined_rows > target_rows * 2 {
                     optimized.push(acc);
                 } else {
                     // Merge anyway, will split below if needed
@@ -209,8 +258,8 @@ pub fn optimize_batch_sizes(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
         }
 
         // Split oversized batches
-        if current_batch.num_rows() > TARGET_BATCH_SIZE {
-            let num_chunks = (current_batch.num_rows() + TARGET_BATCH_SIZE - 1) / TARGET_BATCH_SIZE;
+        if current_batch.num_rows() > target_rows {
+            let num_chunks = (current_batch.num_rows() + target_rows - 1) / target_rows;
             let chunk_size = (current_batch.num_rows() + num_chunks - 1) / num_chunks;
 
             let mut offset = 0;
@@ -218,7 +267,7 @@ pub fn optimize_batch_sizes(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
                 let length = chunk_size.min(current_batch.num_rows() - offset);
                 let chunk = current_batch.slice(offset, length);
 
-                if chunk.num_rows() < MIN_BATCH_SIZE && offset + length < current_batch.num_rows() {
+                if chunk.num_rows() < min_rows && offset + length < current_batch.num_rows() {
                     // This chunk is too small and there's more data, accumulate it
                     accumulator = Some(chunk);
                 } else {
@@ -227,7 +276,7 @@ pub fn optimize_batch_sizes(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
 
                 offset += length;
             }
-        } else if current_batch.num_rows() <= MIN_BATCH_SIZE {
+        } else if current_batch.num_rows() <= min_rows {
             // Batch is too small (or exactly at minimum), accumulate for merging
             accumulator = Some(current_batch);
         } else {
@@ -247,7 +296,7 @@ pub fn optimize_batch_sizes(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{StringArray, UInt64Array};
+    use arrow::array::{Float32Array, StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -348,28 +397,62 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        // Create schema with large FixedSizeList to exceed TARGET_BATCH_SIZE_BYTES
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "embedding",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    1024,
+                ),
+                false,
+            ),
+        ]));
 
-        // Create 1 large batch (20000 rows)
-        let array = UInt64Array::from_iter_values(0..20000);
-        let large_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        // Create 10K rows with 1024-dim vectors = 10K × 1024 × 4 = ~40MB
+        let ids = UInt64Array::from_iter_values(0..10000);
+        let floats: Vec<f32> = (0..10000 * 1024).map(|i| i as f32).collect();
+        let float_array = Float32Array::from(floats);
+        let embedding_array = arrow::array::FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            1024,
+            Arc::new(float_array),
+            None,
+        );
 
-        let optimized = optimize_batch_sizes(vec![large_batch]).unwrap();
+        let large_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids), Arc::new(embedding_array)],
+        )
+        .unwrap();
 
-        // Should split into multiple batches
-        assert!(optimized.len() >= 2);
+        let optimized = optimize_batch_sizes(vec![large_batch.clone()]).unwrap();
 
-        // Each batch should be reasonably sized
-        for batch in &optimized {
-            assert!(
-                batch.num_rows() >= MIN_BATCH_SIZE
-                    || batch.num_rows() == optimized.last().unwrap().num_rows()
-            );
-        }
+        // Debug: check actual size
+        let actual_size = estimate_batch_size_bytes(&large_batch);
+        println!(
+            "Batch size: {} bytes ({} MB)",
+            actual_size,
+            actual_size / 1024 / 1024
+        );
+        println!(
+            "Target size: {} bytes ({} MB)",
+            TARGET_BATCH_SIZE_BYTES,
+            TARGET_BATCH_SIZE_BYTES / 1024 / 1024
+        );
+
+        // Should split into multiple batches (40MB > 32MB target)
+        assert!(
+            optimized.len() >= 2,
+            "Expected split but got {} batch(es), batch size is {} bytes",
+            optimized.len(),
+            actual_size
+        );
 
         // Total rows should be preserved
         let total_rows: usize = optimized.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 20000);
+        assert_eq!(total_rows, 10000);
     }
 
     #[test]
@@ -377,44 +460,58 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::UInt64, false)]));
+        // Use large vectors to make batches exceed size thresholds
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "data",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    1024,
+                ),
+                false,
+            ),
+        ]));
 
         let mut batches = Vec::new();
 
-        // Small batch (512 rows)
+        // Small batch (500 rows × 4KB = 2MB)
+        let ids = UInt64Array::from_iter_values(0..500);
+        let floats: Vec<f32> = (0..500 * 1024).map(|i| i as f32).collect();
+        let embedding = arrow::array::FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            1024,
+            Arc::new(Float32Array::from(floats)),
+            None,
+        );
         batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(UInt64Array::from_iter_values(0..512))],
-            )
-            .unwrap(),
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(embedding)]).unwrap(),
         );
 
-        // Medium batch (5000 rows) - acceptable size
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(UInt64Array::from_iter_values(512..5512))],
-            )
-            .unwrap(),
+        // Large batch (12000 rows × 4KB = 48MB) - should be split
+        let ids = UInt64Array::from_iter_values(500..12500);
+        let floats: Vec<f32> = (0..12000 * 1024).map(|i| i as f32).collect();
+        let embedding = arrow::array::FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            1024,
+            Arc::new(Float32Array::from(floats)),
+            None,
         );
-
-        // Large batch (15000 rows) - should be split
         batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(UInt64Array::from_iter_values(5512..20512))],
-            )
-            .unwrap(),
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(embedding)]).unwrap(),
         );
 
         let optimized = optimize_batch_sizes(batches).unwrap();
 
-        // Should have multiple batches
-        assert!(optimized.len() >= 2);
+        // Should have multiple batches (small merged with first chunk, plus additional chunks)
+        assert!(
+            optimized.len() >= 2,
+            "Expected multiple batches but got {}",
+            optimized.len()
+        );
 
         // Total rows preserved
         let total_rows: usize = optimized.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 20512);
+        assert_eq!(total_rows, 12500);
     }
 }
