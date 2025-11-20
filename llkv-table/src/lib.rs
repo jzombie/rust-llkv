@@ -2,33 +2,15 @@
 
 //! DataFusion integration helpers for LLKV storage.
 //!
-//! This crate wires [`llkv-column-map`] and [`llkv-storage`] into a
-//! [`datafusion`] [`TableProvider`] so DataFusion's query engine can operate
-//! directly on LLKV's persisted columnar data. The integration is intentionally
-//! minimal—writes flow through [`ColumnStore::append`], while reads rely on the
-//! store's projection utilities to materialize [`RecordBatch`]es for DataFusion.
-//!
-//! The primary entry points are:
-//! - [`LlkvTableBuilder`]: registers logical columns inside a [`ColumnStore`],
-//!   appends Arrow batches (with automatic `rowid` management), and tracks the
-//!   row IDs that back each insert.
-//! - [`LlkvTableProvider`]: implements DataFusion's [`TableProvider`] by
-//!   gathering LLKV rows in scan-sized chunks and surfacing them through a
-//!   [`MemorySourceConfig`].
-//! - [`LlkvQueryPlanner`]: intercepts `DELETE` statements during physical
-//!   planning and executes them through LLKV's storage layer.
-//! - [`catalog::TableCatalog`]: persistent catalog for table metadata, allowing
-//!   tables to be discovered and reconstructed across process restarts.
-
-pub mod catalog;
+//! This crate wires [`llkv-parquet-store`] into a [`datafusion`] [`TableProvider`]
+//! so DataFusion's query engine can operate directly on LLKV's persisted Parquet data.
 
 use std::any::Any;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
 
-use crate::catalog::TableCatalog;
-use arrow::array::{ArrayRef, UInt64Builder};
+use arrow::array::{ArrayRef, UInt64Array, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use async_trait::async_trait;
@@ -44,69 +26,26 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
-use llkv_column_map::store::{
-    ColumnStore, FIELD_ID_META_KEY, GatherNullPolicy, ROW_ID_COLUMN_NAME,
-};
-use llkv_column_map::types::{LogicalFieldId, RowId, TableId};
+
+use llkv_parquet_store::ParquetStore;
+use llkv_parquet_store::TableId;
 use llkv_result::{Error as LlkvError, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
+const ROW_ID_COLUMN_NAME: &str = "row_id";
 const DEFAULT_SCAN_BATCH_SIZE: usize = 1024;
 
-pub(crate) struct CatalogHook<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    table_name: String,
-    catalog: Weak<TableCatalog<P>>,
-}
-
-impl<P> Clone for CatalogHook<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn clone(&self) -> Self {
-        Self {
-            table_name: self.table_name.clone(),
-            catalog: self.catalog.clone(),
-        }
-    }
-}
-
-impl<P> CatalogHook<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn new(table_name: String, catalog: Weak<TableCatalog<P>>) -> Self {
-        Self {
-            table_name,
-            catalog,
-        }
-    }
-
-    fn update(&self, new_row_ids: &[RowId]) -> LlkvResult<()> {
-        if let Some(catalog) = self.catalog.upgrade() {
-            catalog.update_table_rows(&self.table_name, new_row_ids.to_vec())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-/// Custom [`TableProvider`] that surfaces LLKV column-map data to DataFusion.
+/// Custom [`TableProvider`] that surfaces LLKV Parquet data to DataFusion.
 pub struct LlkvTableProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    store: Arc<ColumnStore<P>>,
+    store: Arc<ParquetStore<P>>,
+    table_id: TableId,
     schema: SchemaRef,
     ingest_schema: SchemaRef,
-    logical_fields: Vec<LogicalFieldId>,
-    row_ids: Arc<RwLock<Vec<RowId>>>,
-    next_row_id: Arc<AtomicU64>,
     scan_batch_size: usize,
-    catalog_hook: Option<CatalogHook<P>>,
 }
 
 impl<P> fmt::Debug for LlkvTableProvider<P>
@@ -114,10 +53,9 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let row_count = self.row_ids.read().unwrap().len();
         f.debug_struct("LlkvTableProvider")
+            .field("table_id", &self.table_id)
             .field("schema", &self.schema)
-            .field("row_count", &row_count)
             .field("scan_batch_size", &self.scan_batch_size)
             .finish()
     }
@@ -127,374 +65,40 @@ impl<P> LlkvTableProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    /// Get the ingest schema which includes rowid and field_id metadata
-    pub fn ingest_schema(&self) -> SchemaRef {
-        Arc::clone(&self.ingest_schema)
-    }
-
-    /// Get all row IDs currently in the table
-    pub fn get_row_ids(&self) -> Vec<RowId> {
-        self.row_ids.read().unwrap().clone()
-    }
-
-    /// Construct a table provider with the default scan batch size.
+    /// Construct a table provider.
     pub fn new(
-        store: Arc<ColumnStore<P>>,
+        store: Arc<ParquetStore<P>>,
+        table_id: TableId,
         schema: SchemaRef,
-        logical_fields: Vec<LogicalFieldId>,
-        row_ids: Arc<RwLock<Vec<RowId>>>,
     ) -> LlkvResult<Self> {
-        Self::with_options(
-            store,
-            schema,
-            logical_fields,
-            row_ids,
-            DEFAULT_SCAN_BATCH_SIZE,
-            None,
-        )
+        Self::with_batch_size(store, table_id, schema, DEFAULT_SCAN_BATCH_SIZE)
     }
 
     /// Construct a table provider with an explicit scan batch size.
     pub fn with_batch_size(
-        store: Arc<ColumnStore<P>>,
+        store: Arc<ParquetStore<P>>,
+        table_id: TableId,
         schema: SchemaRef,
-        logical_fields: Vec<LogicalFieldId>,
-        row_ids: Arc<RwLock<Vec<RowId>>>,
         scan_batch_size: usize,
     ) -> LlkvResult<Self> {
-        Self::with_options(
-            store,
-            schema,
-            logical_fields,
-            row_ids,
-            scan_batch_size,
-            None,
-        )
-    }
-
-    pub(crate) fn with_catalog_hook(
-        store: Arc<ColumnStore<P>>,
-        schema: SchemaRef,
-        logical_fields: Vec<LogicalFieldId>,
-        row_ids: Arc<RwLock<Vec<RowId>>>,
-        scan_batch_size: usize,
-        catalog_hook: CatalogHook<P>,
-    ) -> LlkvResult<Self> {
-        Self::with_options(
-            store,
-            schema,
-            logical_fields,
-            row_ids,
-            scan_batch_size,
-            Some(catalog_hook),
-        )
-    }
-
-    fn with_options(
-        store: Arc<ColumnStore<P>>,
-        schema: SchemaRef,
-        logical_fields: Vec<LogicalFieldId>,
-        row_ids: Arc<RwLock<Vec<RowId>>>,
-        scan_batch_size: usize,
-        catalog_hook: Option<CatalogHook<P>>,
-    ) -> LlkvResult<Self> {
-        if schema.fields().len() != logical_fields.len() {
-            return Err(LlkvError::InvalidArgumentError(
-                "schema field count must match logical field bindings".into(),
-            ));
-        }
-
-        for fid in &logical_fields {
-            if !store.has_field(*fid) {
-                return Err(LlkvError::InvalidArgumentError(format!(
-                    "logical field {fid:?} is not registered in the column store"
-                )));
-            }
-        }
-
-        let ingest_schema = build_ingest_schema(&schema, &logical_fields)?;
-        let next_row_id = {
-            let rows = row_ids.read().unwrap();
-            rows.last().copied().unwrap_or(0).saturating_add(1)
-        };
-
+        let ingest_schema = build_ingest_schema(&schema)?;
         Ok(Self {
             store,
+            table_id,
             schema,
             ingest_schema,
-            logical_fields,
-            row_ids,
-            next_row_id: Arc::new(AtomicU64::new(next_row_id)),
             scan_batch_size: scan_batch_size.max(1),
-            catalog_hook,
         })
+    }
+
+    /// Get the ingest schema which includes rowid.
+    pub fn ingest_schema(&self) -> SchemaRef {
+        Arc::clone(&self.ingest_schema)
     }
 
     /// Total number of rows currently visible to DataFusion.
     pub fn row_count(&self) -> usize {
-        self.row_ids.read().unwrap().len()
-    }
-
-    fn slice_row_ids(&self, limit: Option<usize>) -> Vec<RowId> {
-        let rows = self.row_ids.read().unwrap();
-        match limit {
-            Some(requested) => rows[..requested.min(rows.len())].to_vec(),
-            None => rows.clone(),
-        }
-    }
-
-    fn build_projection(
-        &self,
-        projection: Option<&Vec<usize>>,
-    ) -> DataFusionResult<(SchemaRef, Vec<LogicalFieldId>)> {
-        if let Some(indices) = projection {
-            let mut fields = Vec::with_capacity(indices.len());
-            let mut logical = Vec::with_capacity(indices.len());
-            for &idx in indices {
-                if idx >= self.logical_fields.len() {
-                    return Err(DataFusionError::Plan(format!(
-                        "projection index {idx} is out of bounds for schema with {} columns",
-                        self.logical_fields.len()
-                    )));
-                }
-                fields.push(self.schema.field(idx).clone());
-                logical.push(self.logical_fields[idx]);
-            }
-            Ok((Arc::new(Schema::new(fields)), logical))
-        } else {
-            Ok((self.schema.clone(), self.logical_fields.clone()))
-        }
-    }
-
-    fn gather_batches(
-        &self,
-        field_ids: &[LogicalFieldId],
-        schema: SchemaRef,
-        row_ids: &[RowId],
-    ) -> LlkvResult<Vec<RecordBatch>> {
-        if row_ids.is_empty() {
-            return Ok(vec![RecordBatch::new_empty(schema)]);
-        }
-
-        // Handle empty projection (no columns requested, but rows are needed for cardinality)
-        if field_ids.is_empty() {
-            let mut batches = Vec::new();
-            for chunk in row_ids.chunks(self.scan_batch_size) {
-                // Create a RecordBatch with no columns but with row_count set
-                let options = RecordBatchOptions::new().with_row_count(Some(chunk.len()));
-                let batch = RecordBatch::try_new_with_options(schema.clone(), vec![], &options)?;
-                batches.push(batch);
-            }
-            return Ok(batches);
-        }
-
-        let mut batches = Vec::new();
-        for chunk in row_ids.chunks(self.scan_batch_size) {
-            let llkv_batch =
-                self.store
-                    .gather_rows(field_ids, chunk, GatherNullPolicy::IncludeNulls)?;
-            let columns: Vec<ArrayRef> = llkv_batch
-                .columns()
-                .iter()
-                .map(|array| Arc::clone(array))
-                .collect();
-            let batch = RecordBatch::try_new(schema.clone(), columns)?;
-            batches.push(batch);
-        }
-
-        Ok(batches)
-    }
-}
-
-fn map_storage_error(err: LlkvError) -> DataFusionError {
-    DataFusionError::Execution(format!("llkv storage error: {err}"))
-}
-
-fn build_ingest_schema(
-    user_schema: &SchemaRef,
-    logical_fields: &[LogicalFieldId],
-) -> LlkvResult<SchemaRef> {
-    let mut ingest_fields = Vec::with_capacity(user_schema.fields().len() + 1);
-    ingest_fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-
-    for (field, fid) in user_schema.fields().iter().zip(logical_fields.iter()) {
-        let mut metadata = field.metadata().clone();
-        metadata.insert(FIELD_ID_META_KEY.to_string(), u64::from(*fid).to_string());
-        ingest_fields.push(
-            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                .with_metadata(metadata),
-        );
-    }
-
-    Ok(Arc::new(Schema::new(ingest_fields)))
-}
-
-struct LlkvDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    store: Arc<ColumnStore<P>>,
-    schema: SchemaRef,
-    ingest_schema: SchemaRef,
-    row_ids: Arc<RwLock<Vec<RowId>>>,
-    next_row_id: Arc<AtomicU64>,
-    catalog_hook: Option<CatalogHook<P>>,
-}
-
-impl<P> fmt::Debug for LlkvDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LlkvDataSink")
-            .field("schema", &self.schema)
-            .finish()
-    }
-}
-
-impl<P> DisplayAs for LlkvDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LlkvDataSink")
-            }
-            DisplayFormatType::TreeRender => write!(f, ""),
-        }
-    }
-}
-
-impl<P> LlkvDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn new(
-        store: Arc<ColumnStore<P>>,
-        schema: SchemaRef,
-        ingest_schema: SchemaRef,
-        row_ids: Arc<RwLock<Vec<RowId>>>,
-        next_row_id: Arc<AtomicU64>,
-        catalog_hook: Option<CatalogHook<P>>,
-    ) -> DataFusionResult<Self> {
-        Ok(Self {
-            store,
-            schema,
-            ingest_schema,
-            row_ids,
-            next_row_id,
-            catalog_hook,
-        })
-    }
-
-    fn validate_batch_schema(&self, batch: &RecordBatch) -> LlkvResult<()> {
-        if batch.schema().fields().len() != self.schema.fields().len() {
-            return Err(LlkvError::InvalidArgumentError(format!(
-                "expected {} columns but received {}",
-                self.schema.fields().len(),
-                batch.schema().fields().len()
-            )));
-        }
-
-        for (expected, actual) in self
-            .schema
-            .fields()
-            .iter()
-            .zip(batch.schema().fields().iter())
-        {
-            if expected != actual {
-                return Err(LlkvError::InvalidArgumentError(format!(
-                    "column mismatch: expected {expected:?}, received {actual:?}"
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn prepare_ingest_batch(&self, batch: &RecordBatch) -> LlkvResult<(RecordBatch, Vec<RowId>)> {
-        self.validate_batch_schema(batch)?;
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            return Ok((RecordBatch::new_empty(self.ingest_schema()), Vec::new()));
-        }
-
-        let start = self
-            .next_row_id
-            .fetch_add(num_rows as u64, Ordering::SeqCst);
-        let mut row_id_builder = UInt64Builder::with_capacity(num_rows);
-        let mut new_row_ids = Vec::with_capacity(num_rows);
-        for offset in 0..num_rows {
-            let row_id = start + offset as u64;
-            row_id_builder.append_value(row_id);
-            new_row_ids.push(row_id);
-        }
-        let row_id_array = Arc::new(row_id_builder.finish()) as ArrayRef;
-
-        let mut columns = Vec::with_capacity(batch.num_columns() + 1);
-        columns.push(row_id_array);
-        columns.extend(batch.columns().iter().cloned());
-
-        let ingest_batch = RecordBatch::try_new_with_options(
-            self.ingest_schema(),
-            columns,
-            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
-        )?;
-
-        Ok((ingest_batch, new_row_ids))
-    }
-
-    fn ingest_schema(&self) -> SchemaRef {
-        Arc::clone(&self.ingest_schema)
-    }
-}
-
-#[async_trait]
-impl<P> DataSink for LlkvDataSink<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
-{
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    async fn write_all(
-        &self,
-        mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
-    ) -> DataFusionResult<u64> {
-        let mut appended = Vec::new();
-        let mut total_rows = 0usize;
-        while let Some(batch) = data.next().await.transpose()? {
-            let (ingest_batch, row_ids) = self
-                .prepare_ingest_batch(&batch)
-                .map_err(map_storage_error)?;
-            if ingest_batch.num_rows() == 0 {
-                continue;
-            }
-            self.store
-                .append(&ingest_batch)
-                .map_err(map_storage_error)?;
-            total_rows += batch.num_rows();
-            appended.extend(row_ids);
-        }
-
-        if !appended.is_empty() {
-            {
-                let mut rows = self.row_ids.write().unwrap();
-                rows.extend(&appended);
-            }
-            if let Some(hook) = &self.catalog_hook {
-                hook.update(&appended).map_err(map_storage_error)?;
-            }
-        }
-
-        Ok(total_rows as u64)
+        self.store.get_row_count(self.table_id).unwrap_or(0) as usize
     }
 }
 
@@ -519,16 +123,55 @@ where
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let (projected_schema, field_ids) = self.build_projection(projection)?;
-        let rows = self.slice_row_ids(limit);
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Map user projection to store projection (shift by 3 for row_id, created_by, deleted_by)
+        // and ensure row_id (0) and created_by (1) are included for deduplication.
+        let (store_projection, output_schema) = if let Some(indices) = projection {
+            let mut store_indices = vec![0, 1]; // Always need row_id and created_by
+            store_indices.extend(indices.iter().map(|&i| i + 3));
+
+            let fields: Vec<Field> = indices
+                .iter()
+                .map(|&i| self.schema.field(i).clone())
+                .collect();
+            (Some(store_indices), Arc::new(Schema::new(fields)))
+        } else {
+            // If no projection, we want all user columns.
+            // Store has: row_id, created_by, deleted_by, UserCols...
+            // We need row_id, created_by for dedup, and then all UserCols.
+            // UserCols start at index 3.
+            let num_user_cols = self.schema.fields().len();
+            let mut store_indices = vec![0, 1];
+            store_indices.extend(3..(3 + num_user_cols));
+
+            (Some(store_indices), self.schema.clone())
+        };
+
         let batches = self
-            .gather_batches(&field_ids, projected_schema.clone(), rows.as_slice())
+            .store
+            .scan_parallel(self.table_id, filters, store_projection.clone(), limit)
             .map_err(map_storage_error)?;
-        let partitions = vec![batches];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, projected_schema, None)?;
+
+        // Remove the extra columns (row_id, created_by) from the result batches
+        // and ensure they match output_schema.
+        let projected_batches = batches.into_iter().map(|batch| {
+            // The batch has [row_id, created_by, requested_user_cols...]
+            // We want [requested_user_cols...]
+            // So we just slice off the first 2 columns.
+            if batch.num_columns() < 2 {
+                 return Err(DataFusionError::Internal(format!(
+                    "Expected at least 2 columns (row_id, created_by) from store, got {}. Projection: {:?}",
+                    batch.num_columns(), store_projection
+                )));
+            }
+            let columns = batch.columns()[2..].to_vec();
+            RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        }).collect::<Result<Vec<_>, _>>()?;
+
+        let partitions = vec![projected_batches];
+        let exec = MemorySourceConfig::try_new_exec(&partitions, output_schema, None)?;
         Ok(exec)
     }
 
@@ -536,10 +179,7 @@ where
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     fn statistics(&self) -> Option<Statistics> {
@@ -563,16 +203,161 @@ where
         self.schema()
             .logically_equivalent_names_and_types(&input.schema())?;
 
+        let next_row_id = self
+            .store
+            .get_next_row_id(self.table_id)
+            .map_err(map_storage_error)?;
+
         let sink = LlkvDataSink::new(
             Arc::clone(&self.store),
+            self.table_id,
             self.schema.clone(),
             self.ingest_schema(),
-            Arc::clone(&self.row_ids),
-            Arc::clone(&self.next_row_id),
-            self.catalog_hook.clone(),
-        )?;
+            next_row_id,
+        );
 
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+    }
+}
+
+fn map_storage_error(err: LlkvError) -> DataFusionError {
+    DataFusionError::Execution(format!("llkv storage error: {err}"))
+}
+
+fn build_ingest_schema(user_schema: &SchemaRef) -> LlkvResult<SchemaRef> {
+    let mut ingest_fields = Vec::with_capacity(user_schema.fields().len() + 3);
+    ingest_fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
+    ingest_fields.push(Field::new("created_by_txn", DataType::UInt64, false));
+    ingest_fields.push(Field::new("deleted_by_txn", DataType::UInt64, true));
+    ingest_fields.extend(user_schema.fields().iter().map(|f| f.as_ref().clone()));
+    Ok(Arc::new(Schema::new(ingest_fields)))
+}
+
+struct LlkvDataSink<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    store: Arc<ParquetStore<P>>,
+    table_id: TableId,
+    schema: SchemaRef,
+    ingest_schema: SchemaRef,
+    next_row_id: AtomicU64,
+}
+
+impl<P> fmt::Debug for LlkvDataSink<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LlkvDataSink")
+            .field("table_id", &self.table_id)
+            .finish()
+    }
+}
+
+impl<P> DisplayAs for LlkvDataSink<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "LlkvDataSink")
+            }
+            DisplayFormatType::TreeRender => write!(f, ""),
+        }
+    }
+}
+
+impl<P> LlkvDataSink<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn new(
+        store: Arc<ParquetStore<P>>,
+        table_id: TableId,
+        schema: SchemaRef,
+        ingest_schema: SchemaRef,
+        next_row_id: u64,
+    ) -> Self {
+        Self {
+            store,
+            table_id,
+            schema,
+            ingest_schema,
+            next_row_id: AtomicU64::new(next_row_id),
+        }
+    }
+
+    fn prepare_ingest_batch(&self, batch: &RecordBatch) -> LlkvResult<RecordBatch> {
+        if batch.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(self.ingest_schema.clone()));
+        }
+
+        let num_rows = batch.num_rows();
+        let start = self
+            .next_row_id
+            .fetch_add(num_rows as u64, Ordering::SeqCst);
+
+        let mut row_id_builder = UInt64Builder::with_capacity(num_rows);
+        for offset in 0..num_rows {
+            row_id_builder.append_value(start + offset as u64);
+        }
+        let row_id_array = Arc::new(row_id_builder.finish()) as ArrayRef;
+
+        let mut columns = Vec::with_capacity(batch.num_columns() + 3);
+        columns.push(row_id_array);
+
+        // Add MVCC columns (txn_id=1, deleted=null)
+        let created_by = Arc::new(UInt64Array::from(vec![1; num_rows]));
+        let deleted_by = Arc::new(UInt64Array::from(vec![None; num_rows]));
+        columns.push(created_by);
+        columns.push(deleted_by);
+
+        columns.extend(batch.columns().iter().cloned());
+
+        let ingest_batch = RecordBatch::try_new_with_options(
+            self.ingest_schema.clone(),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )?;
+
+        Ok(ingest_batch)
+    }
+}
+
+#[async_trait]
+impl<P> DataSink for LlkvDataSink<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> DataFusionResult<u64> {
+        let mut total_rows = 0;
+        while let Some(batch) = data.next().await.transpose()? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let ingest_batch = self
+                .prepare_ingest_batch(&batch)
+                .map_err(map_storage_error)?;
+            self.store
+                .append_many(self.table_id, vec![ingest_batch])
+                .map_err(map_storage_error)?;
+            total_rows += batch.num_rows() as u64;
+        }
+        Ok(total_rows)
     }
 }
 
@@ -582,127 +367,70 @@ pub struct LlkvTableBuilder<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    store: Arc<ColumnStore<P>>,
-    _table_id: TableId,
+    store: Arc<ParquetStore<P>>,
+    table_id: TableId,
     user_schema: SchemaRef,
     ingest_schema: SchemaRef,
-    logical_fields: Vec<LogicalFieldId>,
-    row_ids: Vec<RowId>,
-    next_row_id: RowId,
-    scan_batch_size: usize,
-    catalog_hook: Option<CatalogHook<P>>,
+    next_row_id: u64,
 }
 
 impl<P> LlkvTableBuilder<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    /// Create a builder for the provided schema. Field IDs are assigned in
-    /// declaration order starting at `1`.
+    /// Create a builder for the provided schema.
+    /// This creates a new table in the store.
     pub fn new(
-        store: Arc<ColumnStore<P>>,
-        table_id: TableId,
+        store: Arc<ParquetStore<P>>,
+        table_name: &str,
         schema: SchemaRef,
     ) -> LlkvResult<Self> {
-        if table_id == 0 {
-            return Err(LlkvError::reserved_table_id(table_id));
-        }
-
-        let fields: Vec<Field> = schema
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect();
-        let mut logical_fields = Vec::with_capacity(fields.len());
-        let mut ingest_fields = Vec::with_capacity(fields.len() + 1);
-        ingest_fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-
-        for (idx, field) in fields.iter().enumerate() {
-            let fid = LogicalFieldId::for_user(table_id, (idx as u32) + 1);
-            store.ensure_column_registered(fid, field.data_type())?;
-
-            let mut metadata = field.metadata().clone();
-            metadata.insert(FIELD_ID_META_KEY.to_string(), u64::from(fid).to_string());
-            let field_with_meta =
-                Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                    .with_metadata(metadata);
-
-            ingest_fields.push(field_with_meta);
-            logical_fields.push(fid);
-        }
+        let ingest_schema = build_ingest_schema(&schema)?;
+        let table_id = store.create_table(table_name, ingest_schema.clone())?;
 
         Ok(Self {
             store,
-            _table_id: table_id,
+            table_id,
             user_schema: schema,
-            ingest_schema: Arc::new(Schema::new(ingest_fields)),
-            logical_fields,
-            row_ids: Vec::new(),
+            ingest_schema,
             next_row_id: 1,
-            scan_batch_size: DEFAULT_SCAN_BATCH_SIZE,
-            catalog_hook: None,
         })
-    }
-
-    /// Tune the chunk size used when scanning through the resulting provider.
-    pub fn with_scan_batch_size(mut self, batch_size: usize) -> Self {
-        self.scan_batch_size = batch_size.max(1);
-        self
-    }
-
-    pub(crate) fn attach_catalog_hook(&mut self, hook: CatalogHook<P>) {
-        self.catalog_hook = Some(hook);
     }
 
     /// Append a [`RecordBatch`] whose schema matches the user-facing schema.
     pub fn append_batch(&mut self, batch: &RecordBatch) -> LlkvResult<()> {
-        self.validate_batch_schema(batch)?;
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
+        if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        let mut builder = UInt64Builder::with_capacity(num_rows);
-        self.row_ids.reserve(num_rows);
-        for _ in 0..num_rows {
-            let row_id = self.next_row_id;
-            builder.append_value(row_id);
-            self.row_ids.push(row_id);
-            self.next_row_id = self
-                .next_row_id
-                .checked_add(1)
-                .ok_or_else(|| LlkvError::Internal("row id space exhausted".into()))?;
-        }
-        let row_id_array = Arc::new(builder.finish()) as ArrayRef;
+        self.validate_batch_schema(batch)?;
 
-        let mut columns = Vec::with_capacity(batch.num_columns() + 1);
+        let num_rows = batch.num_rows();
+        let mut row_id_builder = UInt64Builder::with_capacity(num_rows);
+        for _ in 0..num_rows {
+            row_id_builder.append_value(self.next_row_id);
+            self.next_row_id += 1;
+        }
+        let row_id_array = Arc::new(row_id_builder.finish()) as ArrayRef;
+
+        let mut columns = Vec::with_capacity(batch.num_columns() + 3);
         columns.push(row_id_array);
+
+        // Add MVCC columns (txn_id=1, deleted=null)
+        let created_by = Arc::new(UInt64Array::from(vec![1; num_rows]));
+        let deleted_by = Arc::new(UInt64Array::from(vec![None; num_rows]));
+        columns.push(created_by);
+        columns.push(deleted_by);
+
         columns.extend(batch.columns().iter().cloned());
 
         let ingest_batch = RecordBatch::try_new(self.ingest_schema.clone(), columns)?;
-        self.store.append(&ingest_batch)
+        self.store.append_many(self.table_id, vec![ingest_batch])
     }
 
     /// Finish ingestion and build a [`LlkvTableProvider`].
     pub fn finish(self) -> LlkvResult<LlkvTableProvider<P>> {
-        let row_ids = Arc::new(RwLock::new(self.row_ids));
-        match self.catalog_hook {
-            Some(hook) => LlkvTableProvider::with_catalog_hook(
-                self.store,
-                self.user_schema,
-                self.logical_fields,
-                row_ids,
-                self.scan_batch_size,
-                hook,
-            ),
-            None => LlkvTableProvider::with_batch_size(
-                self.store,
-                self.user_schema,
-                self.logical_fields,
-                row_ids,
-                self.scan_batch_size,
-            ),
-        }
+        LlkvTableProvider::new(self.store, self.table_id, self.user_schema)
     }
 
     fn validate_batch_schema(&self, batch: &RecordBatch) -> LlkvResult<()> {
@@ -756,10 +484,11 @@ mod tests {
     #[tokio::test]
     async fn datafusion_scans_llkv_provider() {
         let pager = Arc::new(MemPager::default());
-        let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
+        let store = Arc::new(ParquetStore::open(Arc::clone(&pager)).expect("store"));
 
         let schema = build_demo_batch().schema();
-        let mut builder = LlkvTableBuilder::new(Arc::clone(&store), 1, schema).expect("builder");
+        let mut builder =
+            LlkvTableBuilder::new(Arc::clone(&store), "llkv_demo", schema).expect("builder");
         builder.append_batch(&build_demo_batch()).expect("append");
         let provider = builder.finish().expect("provider");
 

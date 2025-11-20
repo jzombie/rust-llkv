@@ -1,6 +1,6 @@
 [package]
 name = "llkv-parquet-store"
-version = "0.1.0"
+version = "0.8.2-alpha"
 edition = "2021"
 license = "Apache-2.0"
 description = "Parquet-based storage layer for LLKV, managing collections of Parquet files as pager blobs"

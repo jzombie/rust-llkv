@@ -3,7 +3,7 @@
 use crate::catalog::{ParquetCatalog, ParquetFileRef};
 use crate::types::TableId;
 use crate::writer::WriterConfig;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BatchGet, BatchPut, GetResult, Pager};
@@ -574,15 +574,25 @@ where
         };
 
         // Decode Parquet file with projection
-        let file_batches = crate::reader::read_parquet_from_memory(bytes, projection)?;
+        let file_batches = crate::reader::read_parquet_from_memory(bytes, projection.clone())?;
 
         // Apply LWW deduplication within this file
         let deduped_batches = crate::mvcc::deduplicate_by_row_id(file_batches)?;
 
+        // Project the schema if needed to match the projected batch
+        let processing_schema = if let Some(indices) = projection {
+            let fields: Vec<Field> = indices.iter().map(|&i| schema.field(i).clone()).collect();
+            Arc::new(Schema::new(fields))
+        } else {
+            schema.clone()
+        };
+
         // Internalize external columns for all batches in this file
         deduped_batches
             .into_iter()
-            .map(|batch| crate::external::internalize_columns(&batch, schema, &*self.pager))
+            .map(|batch| {
+                crate::external::internalize_columns(&batch, &processing_schema, &*self.pager)
+            })
             .collect()
     }
 
@@ -660,14 +670,19 @@ where
         crate::gc::garbage_collect(self.pager.as_ref(), &catalog)
     }
 
-    // Note on garbage collection:
-    //
-    // The garbage_collect() method above performs automatic GC using the
-    // pager's enumerate_keys() capability. For manual inspection, you can:
-    //   1. Get all keys: pager.enumerate_keys()?
-    //   2. Get reachable keys: store.collect_reachable_keys()
-    //   3. Find difference: all_keys.difference(&reachable)
-    //   4. Free: pager.free_many(&unreferenced)?
+    /// Get the next row ID to assign for a table.
+    pub fn get_next_row_id(&self, table_id: TableId) -> Result<u64> {
+        let catalog = self.catalog.read().unwrap();
+        let (_, metadata) = catalog.get_table_by_id(table_id)?;
+        Ok(metadata.next_row_id)
+    }
+
+    /// Get the total row count for a table.
+    pub fn get_row_count(&self, table_id: TableId) -> Result<u64> {
+        let catalog = self.catalog.read().unwrap();
+        let (_, metadata) = catalog.get_table_by_id(table_id)?;
+        Ok(metadata.total_row_count)
+    }
 }
 
 /// Streaming iterator for scanning Parquet files one at a time.

@@ -20,7 +20,7 @@ llkv-result = { path = "./llkv-result", version = "0.8.2-alpha" }
 # llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.2-alpha" }
 # llkv-sql = { path = "./llkv-sql", version = "0.8.2-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.8.2-alpha" }
-# llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
+llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.2-alpha" }
 # llkv-transaction = { path = "./llkv-transaction", version = "0.8.2-alpha" }
 simd-r-drive = "0.16.0-alpha"
@@ -86,7 +86,7 @@ members = [
     # "llkv-slt-tester",
     # "llkv-sql",
     "llkv-storage",
-    # "llkv-table",
+    "llkv-table",
     "llkv-test-utils",
     # "llkv-tpch",
     # "llkv-transaction",
