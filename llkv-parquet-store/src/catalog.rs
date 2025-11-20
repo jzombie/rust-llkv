@@ -248,6 +248,22 @@ impl ParquetCatalog {
     pub fn drop_table(&mut self, name: &str) -> Result<TableMetadata> {
         self.tables.remove(name).ok_or_else(|| Error::NotFound)
     }
+
+    /// Drop a table by its ID.
+    ///
+    /// Returns the metadata of the dropped table if it existed.
+    pub fn drop_table_by_id(&mut self, table_id: TableId) -> Result<TableMetadata> {
+        let name = self
+            .tables
+            .iter()
+            .find(|(_, meta)| meta.table_id == table_id)
+            .map(|(name, _)| name.clone())
+            .ok_or_else(|| Error::NotFound)?;
+
+        self.tables
+            .remove(&name)
+            .ok_or_else(|| Error::Internal("table found but failed to remove".into()))
+    }
 }
 
 #[cfg(test)]

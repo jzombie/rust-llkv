@@ -162,12 +162,9 @@ impl TableCatalog {
         let schema = Arc::new(Self::deserialize_schema(&metadata.schema_bytes)?);
 
         // We need to pass row_ids to the backend so it can construct the provider
-        let provider = self.backend.get_table_provider(
-            metadata.table_id as u64,
-            name,
-            schema,
-            &metadata.row_ids,
-        )?;
+        let provider =
+            self.backend
+                .get_table_provider(metadata.table_id as u64, schema, &metadata.row_ids)?;
 
         Ok(Some(provider))
     }

@@ -145,7 +145,6 @@ where
     fn get_table_provider(
         &self,
         table_id: u64,
-        _name: &str,
         schema: SchemaRef,
         row_ids: &[u64],
     ) -> LlkvResult<Arc<dyn TableProvider>> {

@@ -37,7 +37,6 @@ pub trait CatalogBackend: Send + Sync {
     fn get_table_provider(
         &self,
         table_id: u64,
-        name: &str,
         schema: SchemaRef,
         row_ids: &[u64],
     ) -> Result<Arc<dyn TableProvider>>;

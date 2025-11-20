@@ -32,6 +32,7 @@ use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::common::{DEFAULT_SCAN_BATCH_SIZE, ROW_ID_COLUMN_NAME};
+use crate::traits::TableBuilder;
 
 /// Custom [`TableProvider`] that surfaces LLKV Parquet data to DataFusion.
 pub struct LlkvTableProvider<P>
@@ -453,6 +454,19 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl<P> TableBuilder for LlkvTableBuilder<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn append_batch(&mut self, batch: &RecordBatch) -> LlkvResult<()> {
+        self.append_batch(batch)
+    }
+
+    fn finish(self: Box<Self>) -> LlkvResult<Arc<dyn TableProvider>> {
+        Ok(Arc::new((*self).finish()?))
     }
 }
 

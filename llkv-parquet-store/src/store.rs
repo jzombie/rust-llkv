@@ -601,6 +601,26 @@ where
             .collect()
     }
 
+    /// Get the ID of a table by name.
+    pub fn get_table_id(&self, name: &str) -> Result<Option<TableId>> {
+        let catalog = self.catalog.read().unwrap();
+        match catalog.get_table(name) {
+            Ok(meta) => Ok(Some(meta.table_id)),
+            Err(Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get the schema of a table by name.
+    pub fn get_table_schema(&self, name: &str) -> Result<Option<SchemaRef>> {
+        let catalog = self.catalog.read().unwrap();
+        match catalog.get_table(name) {
+            Ok(meta) => Ok(Some(meta.schema()?)),
+            Err(Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List all tables in the catalog.
     pub fn list_tables(&self) -> Vec<String> {
         let catalog = self.catalog.read().unwrap();
@@ -630,6 +650,18 @@ where
 
         self.save_catalog()?;
         Ok(())
+    }
+
+    /// Drop a table by its ID.
+    ///
+    /// This removes the table from the catalog but does not immediately delete
+    /// the underlying Parquet files (they will be cleaned up by GC).
+    pub fn drop_table_by_id(&self, table_id: TableId) -> Result<()> {
+        {
+            let mut catalog = self.catalog.write().unwrap();
+            catalog.drop_table_by_id(table_id)?;
+        }
+        self.save_catalog()
     }
 
     /// Collect all physical keys currently referenced by the catalog.
