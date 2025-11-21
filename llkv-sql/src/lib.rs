@@ -41,6 +41,11 @@ pub struct SqlEngine {
 impl SqlEngine {
     /// Create a new SQL engine backed by the provided pager.
     pub fn new(pager: Arc<BoxedPager>) -> Result<Self> {
+        Self::new_with_backend(pager, "parquet")
+    }
+
+    /// Create a new SQL engine with a specific default backend.
+    pub fn new_with_backend(pager: Arc<BoxedPager>, default_backend: &str) -> Result<Self> {
         let store = Arc::new(ColumnStore::open(Arc::clone(&pager))?);
         let metadata_backend = Box::new(ColumnStoreBackend::new(Arc::clone(&store)));
 
@@ -54,8 +59,14 @@ impl SqlEngine {
         );
         data_backends.insert("parquet".to_string(), parquet_backend);
 
-        let catalog = TableCatalog::new(metadata_backend, data_backends, "parquet".to_string())?;
+        let catalog =
+            TableCatalog::new(metadata_backend, data_backends, default_backend.to_string())?;
 
+        Self::new_with_catalog(catalog)
+    }
+
+    /// Create a new SQL engine with an existing catalog.
+    pub fn new_with_catalog(catalog: Arc<TableCatalog>) -> Result<Self> {
         let session_state = SessionStateBuilder::new()
             .with_default_features()
             .with_query_planner(Arc::new(LlkvQueryPlanner::new(Arc::clone(&catalog))))

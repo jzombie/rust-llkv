@@ -17,7 +17,7 @@ fn test_delete_via_datafusion() {
             .expect("create table");
 
         engine
-            .execute("INSERT INTO t1(id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+            .execute("INSERT INTO t1(id, val) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
             .await
             .expect("insert");
 
