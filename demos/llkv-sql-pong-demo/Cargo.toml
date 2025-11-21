@@ -20,6 +20,7 @@ llkv-sql.workspace = true
 llkv-storage.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
 
 [lints]
 workspace = true

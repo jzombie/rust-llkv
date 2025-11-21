@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use std::{cmp, thread};
 
-use arrow::array::{Array, Int64Array};
+use arrow::array::{Array, Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
 use arrow::record_batch::RecordBatch;
 use crossterm::QueueableCommand;
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -19,7 +19,7 @@ use crossterm::terminal::{
 };
 use indoc::indoc;
 use llkv_sql::SqlEngine;
-use llkv_storage::pager::MemPager;
+use llkv_storage::pager::{BoxedPager, MemPager};
 use rustc_hash::FxHashMap;
 
 #[derive(thiserror::Error, Debug)]
@@ -44,29 +44,29 @@ const APP_TITLE: &str = env!("CARGO_PKG_NAME");
 
 const SETUP_SQL: &str = indoc! {"
     CREATE TABLE params (
-      w INT,
-      h INT,
-      paddle_h INT,
-      paddle_speed INT
-    );
+      w BIGINT,
+      h BIGINT,
+      paddle_h BIGINT,
+      paddle_speed BIGINT
+    ) WITH (backend = 'columnstore');
     INSERT INTO params (w, h, paddle_h, paddle_speed) VALUES (80, 25, 5, 2);
     CREATE TABLE state (
-        id INT PRIMARY KEY,
-      tick INT,
-      ax INT,
-      bx INT,
-      ball_x INT,
-      ball_y INT,
-      vx INT,
-      vy INT,
-      score_a INT,
-      score_b INT
-    );
+        id BIGINT PRIMARY KEY,
+      tick BIGINT,
+      ax BIGINT,
+      bx BIGINT,
+      ball_x BIGINT,
+      ball_y BIGINT,
+      vx BIGINT,
+      vy BIGINT,
+      score_a BIGINT,
+      score_b BIGINT
+    ) WITH (backend = 'columnstore');
     CREATE TABLE digits (
-      digit INT,
-      row INT,
+      digit BIGINT,
+      row BIGINT,
       pattern TEXT
-    );
+    ) WITH (backend = 'columnstore');
     INSERT INTO digits (digit, row, pattern) VALUES
       (0, 0, 'FFF'), (0, 1, 'F F'), (0, 2, 'F F'), (0, 3, 'F F'), (0, 4, 'FFF'),
       (1, 0, ' F '), (1, 1, 'FF '), (1, 2, ' F '), (1, 3, ' F '), (1, 4, 'FFF'),
@@ -383,14 +383,15 @@ fn build_tick_sql_template() -> String {
     "}.to_string()
 }
 
-fn main() -> Result<()> {
-    let pager = Arc::new(MemPager::default());
-    let engine = SqlEngine::new(pager);
+#[tokio::main]
+async fn main() -> Result<()> {
+    let pager = Arc::new(BoxedPager::from_arc(Arc::new(MemPager::default())));
+    let engine = SqlEngine::new(pager)?;
 
-    engine.execute(SETUP_SQL)?;
-    let params = fetch_params(&engine)?;
-    insert_initial_state(&engine, &params)?;
-    let mut state = fetch_state(&engine)?;
+    engine.execute(SETUP_SQL).await?;
+    let params = fetch_params(&engine).await?;
+    insert_initial_state(&engine, &params).await?;
+    let mut state = fetch_state(&engine).await?;
 
     enable_raw_mode()?;
     let mut out = stdout();
@@ -405,6 +406,8 @@ fn main() -> Result<()> {
     let mut last_paddle_beep = Instant::now();
     let min_beep_interval = Duration::from_secs_f64(1.0 / 120.0);
     let mut perf = PerfStats::default();
+
+    let tick_stmt = engine.prepare(tick_sql_template()).await?;
 
     loop {
         let frame_start = Instant::now();
@@ -445,8 +448,8 @@ fn main() -> Result<()> {
 
         let update_start = Instant::now();
         let previous_state = state;
-        engine.execute(tick_sql_template())?;
-        let updated_state = fetch_state(&engine)?;
+        tick_stmt.execute().await?;
+        let updated_state = fetch_state(&engine).await?;
         let update_time = update_start.elapsed();
 
         let point_to = if updated_state.score_a > previous_state.score_a {
@@ -469,7 +472,8 @@ fn main() -> Result<()> {
             sound_enabled,
             max_mode,
             &perf,
-        )?;
+        )
+        .await?;
         let render_time = render_start.elapsed();
 
         if sound_enabled && !max_mode {
@@ -496,8 +500,11 @@ fn main() -> Result<()> {
     }
 }
 
-fn fetch_params(engine: &SqlEngine) -> Result<Params> {
-    let batches = engine.sql("SELECT w, h, paddle_h FROM params LIMIT 1;")?;
+async fn fetch_params(engine: &SqlEngine) -> Result<Params> {
+    let results = engine
+        .execute("SELECT w, h, paddle_h FROM params LIMIT 1;")
+        .await?;
+    let batches = extract_batches(results)?;
     let batch = first_batch(&batches)?;
     ensure_single_row(&batch)?;
     Ok(Params {
@@ -509,39 +516,44 @@ fn fetch_params(engine: &SqlEngine) -> Result<Params> {
 
 /// Initialize the game state using SQL with RANDOM() for randomization.
 /// This offloads all randomization to the SQL engine instead of using Rust RNG.
-fn insert_initial_state(engine: &SqlEngine, _params: &Params) -> Result<()> {
+async fn insert_initial_state(engine: &SqlEngine, _params: &Params) -> Result<()> {
     // Use INSERT...SELECT directly from params table with all randomization in SQL
-    engine.execute(&indoc::formatdoc! {"
+    engine
+        .execute(&indoc::formatdoc! {"
         INSERT INTO state (id, tick, ax, bx, ball_x, ball_y, vx, vy, score_a, score_b)
         SELECT 
             {STATE_ROW_ID},
-            0,
-            (h - paddle_h) / 2,
-            (h - paddle_h) / 2,
+            0 AS tick_init,
+            (h - paddle_h) / 2 AS ax_init,
+            (h - paddle_h) / 2 AS bx_init,
             w / 2,
             CASE
-                WHEN (h / 2) + (CAST(FLOOR(RANDOM() * 7) AS INTEGER) - 3) < 1 THEN 1
-                WHEN (h / 2) + (CAST(FLOOR(RANDOM() * 7) AS INTEGER) - 3) > h - 2 THEN h - 2
-                ELSE (h / 2) + (CAST(FLOOR(RANDOM() * 7) AS INTEGER) - 3)
+                WHEN (h / 2) + (CAST(FLOOR(RANDOM() * 7) AS BIGINT) - 3) < 1 THEN 1
+                WHEN (h / 2) + (CAST(FLOOR(RANDOM() * 7) AS BIGINT) - 3) > h - 2 THEN h - 2
+                ELSE (h / 2) + (CAST(FLOOR(RANDOM() * 7) AS BIGINT) - 3)
             END,
             CASE WHEN RANDOM() < 0.5 THEN 1 ELSE -1 END,
-            CAST(FLOOR(RANDOM() * 5) AS INTEGER) - 2,
-            0,
-            0
+            CAST(FLOOR(RANDOM() * 5) AS BIGINT) - 2,
+            0 AS score_a_init,
+            0 AS score_b_init
         FROM params
         LIMIT 1;
-    "})?;
+    "})
+        .await?;
 
     Ok(())
 }
 
-fn fetch_state(engine: &SqlEngine) -> Result<State> {
-    let batches = engine.sql(&indoc::formatdoc! {"
+async fn fetch_state(engine: &SqlEngine) -> Result<State> {
+    let results = engine
+        .execute(&indoc::formatdoc! {"
         SELECT tick, ax, bx, ball_x, ball_y, vx, vy, score_a, score_b 
         FROM state 
         WHERE id = {STATE_ROW_ID} 
         LIMIT 1;
-    "})?;
+    "})
+        .await?;
+    let batches = extract_batches(results)?;
     let batch = first_batch(&batches)?;
     ensure_single_row(&batch)?;
     Ok(State {
@@ -553,6 +565,16 @@ fn fetch_state(engine: &SqlEngine) -> Result<State> {
         score_a: value_at(&batch, 7),
         score_b: value_at(&batch, 8),
     })
+}
+
+fn extract_batches(results: Vec<llkv_sql::SqlStatementResult>) -> Result<Vec<RecordBatch>> {
+    let mut batches = Vec::new();
+    for result in results {
+        if let llkv_sql::SqlStatementResult::Query { batches: b } = result {
+            batches.extend(b);
+        }
+    }
+    Ok(batches)
 }
 
 fn first_batch(batches: &[RecordBatch]) -> Result<RecordBatch> {
@@ -571,11 +593,17 @@ fn ensure_single_row(batch: &RecordBatch) -> Result<()> {
 
 fn value_at(batch: &RecordBatch, index: usize) -> i64 {
     let column = batch.column(index);
-    let array = column
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("expected Int64Array");
-    array.value(0)
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        return array.value(0);
+    }
+    if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
+        return array.value(0) as i64;
+    }
+    panic!(
+        "expected Int64Array or Int32Array at index {}, got {:?}",
+        index,
+        column.data_type()
+    );
 }
 
 fn build_field_lines(params: &Params, state: &State) -> Vec<String> {
@@ -601,34 +629,53 @@ fn build_field_lines(params: &Params, state: &State) -> Vec<String> {
     lines
 }
 
-fn fetch_digit_patterns(engine: &SqlEngine, digit: usize) -> Result<Vec<String>> {
+async fn fetch_digit_patterns(engine: &SqlEngine, digit: usize) -> Result<Vec<String>> {
     if digit > 9 {
         return Ok(vec![]);
     }
-    let batches = engine.sql(&indoc::formatdoc! {"
+    let results = engine
+        .execute(&indoc::formatdoc! {"
         SELECT pattern 
         FROM digits 
         WHERE digit = {digit} 
         ORDER BY row;
-    "})?;
+    "})
+        .await?;
+    let batches = extract_batches(results)?;
     let batch = first_batch(&batches)?;
 
     let mut patterns = Vec::new();
     let column = batch.column(0);
-    let array = column
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .expect("expected StringArray");
 
-    for i in 0..batch.num_rows() {
-        if !array.is_null(i) {
-            patterns.push(array.value(i).to_string());
+    if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+        for i in 0..batch.num_rows() {
+            if !array.is_null(i) {
+                patterns.push(array.value(i).to_string());
+            }
         }
+    } else if let Some(array) = column.as_any().downcast_ref::<LargeStringArray>() {
+        for i in 0..batch.num_rows() {
+            if !array.is_null(i) {
+                patterns.push(array.value(i).to_string());
+            }
+        }
+    } else if let Some(array) = column.as_any().downcast_ref::<StringViewArray>() {
+        for i in 0..batch.num_rows() {
+            if !array.is_null(i) {
+                patterns.push(array.value(i).to_string());
+            }
+        }
+    } else {
+        panic!(
+            "expected StringArray, LargeStringArray or StringViewArray, got {:?}",
+            column.data_type()
+        );
     }
+
     Ok(patterns)
 }
 
-fn draw_digit(
+async fn draw_digit(
     engine: &SqlEngine,
     buf: &mut Vec<HudCell>,
     digit: usize,
@@ -636,7 +683,7 @@ fn draw_digit(
     x: u16,
     color: Color,
 ) -> Result<()> {
-    let patterns = fetch_digit_patterns(engine, digit)?;
+    let patterns = fetch_digit_patterns(engine, digit).await?;
     for (i, pattern) in patterns.iter().enumerate() {
         let text = pattern.replace('F', &FULL_BLOCK.to_string());
         buf.push(HudCell {
@@ -651,7 +698,7 @@ fn draw_digit(
     Ok(())
 }
 
-fn render_frame(
+async fn render_frame(
     engine: &SqlEngine,
     params: &Params,
     state: &State,
@@ -676,22 +723,25 @@ fn render_frame(
             engine,
             &mut hud,
             digit,
-            1,
-            (start_a + (idx as i32 * 4)) as u16,
-            Color::DarkGrey,
-        )?;
+            2,
+            (start_a + idx as i32 * 4) as u16,
+            Color::Cyan,
+        )
+        .await?;
     }
 
+    let start_b = 42i32;
     for (idx, ch) in score_b_str.chars().enumerate() {
         let digit = ch.to_digit(10).unwrap() as usize;
         draw_digit(
             engine,
             &mut hud,
             digit,
-            1,
-            43 + (idx as u16 * 4),
-            Color::DarkGrey,
-        )?;
+            2,
+            (start_b + idx as i32 * 4) as u16,
+            Color::Magenta,
+        )
+        .await?;
     }
 
     hud.push(HudCell {

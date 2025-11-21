@@ -90,7 +90,7 @@ members = [
     "llkv-test-utils",
     # "llkv-tpch",
     # "llkv-transaction",
-    # "demos/llkv-sql-pong-demo"
+    "demos/llkv-sql-pong-demo"
 ]
 resolver = "2"
 

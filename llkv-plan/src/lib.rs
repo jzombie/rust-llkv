@@ -102,7 +102,58 @@ impl QueryPlanner for LlkvQueryPlanner {
                         ))
                     })?;
 
-                if let Some(ptp) = provider
+                if let Some(cmp) = provider
+                    .as_any()
+                    .downcast_ref::<ColumnMapTableProvider<BoxedPager>>()
+                {
+                    // 1. Create physical plan for the input
+                    let input_exec = self
+                        .fallback
+                        .create_physical_plan(input, session_state)
+                        .await?;
+
+                    // 2. Ensure row_id is present
+                    let input_schema = input_exec.schema();
+                    if input_schema.index_of(ROW_ID_COLUMN_NAME).is_err() {
+                        return Err(DataFusionError::Execution(format!(
+                            "UPDATE requires {} column to be present in the plan.",
+                            ROW_ID_COLUMN_NAME
+                        )));
+                    }
+
+                    // 3. Create a projection to match table schema
+                    let schema = cmp.schema();
+                    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+                        Vec::with_capacity(schema.fields().len());
+
+                    for field in schema.fields() {
+                        if field.name() == ROW_ID_COLUMN_NAME {
+                            let idx = input_schema.index_of(ROW_ID_COLUMN_NAME).unwrap();
+                            exprs.push((
+                                Arc::new(Column::new(ROW_ID_COLUMN_NAME, idx)),
+                                ROW_ID_COLUMN_NAME.to_string(),
+                            ));
+                        } else {
+                            // User column
+                            if let Ok(idx) = input_schema.index_of(field.name()) {
+                                exprs.push((
+                                    Arc::new(Column::new(field.name(), idx)),
+                                    field.name().to_string(),
+                                ));
+                            } else {
+                                return Err(DataFusionError::Execution(format!(
+                                    "Column {} not found in UPDATE input plan",
+                                    field.name()
+                                )));
+                            }
+                        }
+                    }
+
+                    let projection_plan = Arc::new(ProjectionExec::try_new(exprs, input_exec)?);
+                    let sink = cmp.create_sink();
+
+                    return Ok(Arc::new(DataSinkExec::new(projection_plan, sink, None)));
+                } else if let Some(ptp) = provider
                     .as_any()
                     .downcast_ref::<LlkvTableProvider<BoxedPager>>()
                 {

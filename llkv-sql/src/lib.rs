@@ -40,6 +40,30 @@ pub enum SqlStatementResult {
     Statement { rows_affected: usize },
 }
 
+/// A prepared SQL statement that can be executed multiple times.
+pub struct PreparedStatement {
+    plan: LogicalPlan,
+    ctx: SessionContext,
+}
+
+impl PreparedStatement {
+    /// Execute the prepared statement.
+    pub async fn execute(&self) -> Result<Vec<RecordBatch>> {
+        let df = self
+            .ctx
+            .execute_logical_plan(self.plan.clone())
+            .await
+            .map_err(|e| map_datafusion_error("Execution failed", e))?;
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| map_datafusion_error("DataFusion execution failed", e))?;
+
+        Ok(batches)
+    }
+}
+
 /// SQL engine that intercepts DDL before delegating to DataFusion.
 pub struct SqlEngine {
     ctx: SessionContext,
@@ -91,6 +115,34 @@ impl SqlEngine {
     /// Get the underlying table catalog
     pub fn catalog(&self) -> &Arc<TableCatalog> {
         &self.catalog
+    }
+
+    /// Prepare a SQL statement for execution.
+    pub async fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        let statements = DFParser::parse_sql(sql).map_err(|e| {
+            map_datafusion_error("Parser error", DataFusionError::Execution(e.to_string()))
+        })?;
+
+        if statements.len() != 1 {
+            return Err(Error::Internal(
+                "Prepare only supports single statement".to_string(),
+            ));
+        }
+
+        let statement = statements.into_iter().next().unwrap();
+
+        // Convert to LogicalPlan
+        let plan = self
+            .ctx
+            .state()
+            .statement_to_plan(statement)
+            .await
+            .map_err(|e| map_datafusion_error("Planning failed", e))?;
+
+        Ok(PreparedStatement {
+            plan,
+            ctx: self.ctx.clone(),
+        })
     }
 
     /// Execute raw SQL text.
