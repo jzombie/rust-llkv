@@ -7,7 +7,7 @@ use llkv::{
     Error as LlkvError, SqlEngine, SqlStatementResult,
     storage::{BoxedPager, MemPager},
 };
-use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
+// use llkv_slt_tester::{LlkvSltRunner, RuntimeKind};
 use tokio::runtime::Runtime;
 
 #[allow(clippy::print_stdout)]
@@ -29,8 +29,8 @@ fn print_help() {
     println!("Any other line is executed as SQL against the in-memory pager");
     println!();
     println!("Command-line options:");
-    println!("  --slt PATH            Run a single SLT file or directory");
-    println!("  --slt-runtime MODE    Override runtime (current|multi). Defaults to current");
+    // println!("  --slt PATH            Run a single SLT file or directory");
+    // println!("  --slt-runtime MODE    Override runtime (current|multi). Defaults to current");
     println!("  --help                Show this usage information");
 }
 
@@ -71,10 +71,7 @@ impl SqlRunner {
                 } else {
                     match pretty_format_batches(&batches) {
                         Ok(table) => println!("{}", table),
-                        Err(e) => eprintln!(
-                            "Query executed but failed to format batches: {:?}",
-                            e
-                        ),
+                        Err(e) => eprintln!("Query executed but failed to format batches: {:?}", e),
                     }
                 }
             }
@@ -148,32 +145,32 @@ fn process_stream<R: std::io::Read>(runner: &SqlRunner, reader: R) -> io::Result
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
     let mut slt_target: Option<String> = None;
-    let mut runtime_kind = RuntimeKind::CurrentThread;
+    // let mut runtime_kind = RuntimeKind::CurrentThread;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--slt" => {
-                slt_target = args.next();
-                if slt_target.is_none() {
-                    eprintln!("--slt requires a path to a file or directory");
-                    std::process::exit(1);
-                }
-            }
-            "--slt-runtime" => {
-                if let Some(mode) = args.next() {
-                    runtime_kind = match mode.as_str() {
-                        "current" => RuntimeKind::CurrentThread,
-                        "multi" | "multi-thread" => RuntimeKind::MultiThread,
-                        other => {
-                            eprintln!("Unknown runtime mode: {}", other);
-                            std::process::exit(1);
-                        }
-                    };
-                } else {
-                    eprintln!("--slt-runtime requires a mode (current|multi)");
-                    std::process::exit(1);
-                }
-            }
+            // "--slt" => {
+            //     slt_target = args.next();
+            //     if slt_target.is_none() {
+            //         eprintln!("--slt requires a path to a file or directory");
+            //         std::process::exit(1);
+            //     }
+            // }
+            // "--slt-runtime" => {
+            //     if let Some(mode) = args.next() {
+            //         runtime_kind = match mode.as_str() {
+            //             "current" => RuntimeKind::CurrentThread,
+            //             "multi" | "multi-thread" => RuntimeKind::MultiThread,
+            //             other => {
+            //                 eprintln!("Unknown runtime mode: {}", other);
+            //                 std::process::exit(1);
+            //             }
+            //         };
+            //     } else {
+            //         eprintln!("--slt-runtime requires a mode (current|multi)");
+            //         std::process::exit(1);
+            //     }
+            // }
             "--help" | "-h" => {
                 print_banner();
                 print_help();
@@ -189,13 +186,13 @@ fn main() {
         }
     }
 
-    if let Some(target) = slt_target {
-        if let Err(e) = run_slt_command(&target, runtime_kind) {
-            eprintln!("SLT execution failed: {}", e);
-            std::process::exit(1);
-        }
-        return;
-    }
+    // if let Some(target) = slt_target {
+    //     if let Err(e) = run_slt_command(&target, runtime_kind) {
+    //         eprintln!("SLT execution failed: {}", e);
+    //         std::process::exit(1);
+    //     }
+    //     return;
+    // }
 
     let sql_runner = match SqlRunner::in_memory() {
         Ok(runner) => runner,
@@ -221,18 +218,18 @@ fn main() {
     }
 }
 
-fn run_slt_command(path: &str, runtime_kind: RuntimeKind) -> Result<(), LlkvError> {
-    let runner = LlkvSltRunner::in_memory().with_runtime_kind(runtime_kind);
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| LlkvError::Internal(format!("failed to access {}: {}", path, e)))?;
-    if metadata.is_dir() {
-        runner.run_directory(path)
-    } else if metadata.is_file() {
-        runner.run_file(Path::new(path))
-    } else {
-        Err(LlkvError::Internal(format!(
-            "path is neither file nor directory: {}",
-            path
-        )))
-    }
-}
+// fn run_slt_command(path: &str, runtime_kind: RuntimeKind) -> Result<(), LlkvError> {
+//     let runner = LlkvSltRunner::in_memory().with_runtime_kind(runtime_kind);
+//     let metadata = std::fs::metadata(path)
+//         .map_err(|e| LlkvError::Internal(format!("failed to access {}: {}", path, e)))?;
+//     if metadata.is_dir() {
+//         runner.run_directory(path)
+//     } else if metadata.is_file() {
+//         runner.run_file(Path::new(path))
+//     } else {
+//         Err(LlkvError::Internal(format!(
+//             "path is neither file nor directory: {}",
+//             path
+//         )))
+//     }
+// }

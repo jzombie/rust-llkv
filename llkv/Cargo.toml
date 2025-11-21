@@ -18,7 +18,7 @@ simd-r-drive-support = ["llkv-storage/simd-r-drive-support"]
 llkv-sql = { workspace = true }
 llkv-storage = { workspace = true }
 arrow = { workspace = true }
-llkv-slt-tester = { workspace = true }
+# llkv-slt-tester = { workspace = true }
 llkv-result = { workspace = true }
 tokio = { workspace = true }
 
