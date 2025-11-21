@@ -1,4 +1,4 @@
-use arrow::array::{Int32Array, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, Int32Array, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
@@ -190,18 +190,32 @@ async fn assert_parity(
     let results_cm_clean: Vec<RecordBatch> = results_cm
         .iter()
         .map(|batch| {
+            // The ColumnMap provider currently leaks the system `row_id` column
+            // and attaches internal metadata (like field IDs) to the schema.
+            // We strip these out here to ensure a clean comparison with the Parquet
+            // results, which match the user's logical schema.
             let fields: Vec<Field> = batch
                 .schema()
                 .fields()
                 .iter()
+                .filter(|f| f.name() != ROW_ID_COLUMN_NAME)
                 .map(|f| {
                     let mut f = f.as_ref().clone();
                     f.set_metadata(std::collections::HashMap::new());
                     f
                 })
                 .collect();
+
+            let columns: Vec<ArrayRef> = batch
+                .columns()
+                .iter()
+                .zip(batch.schema().fields())
+                .filter(|(_, f)| f.name() != ROW_ID_COLUMN_NAME)
+                .map(|(c, _)| c.clone())
+                .collect();
+
             let schema = Arc::new(Schema::new(fields));
-            RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap()
+            RecordBatch::try_new(schema, columns).unwrap()
         })
         .collect();
 

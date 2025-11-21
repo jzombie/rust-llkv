@@ -17,6 +17,7 @@
 //! The catalog uses table ID `0` (otherwise reserved) for the system metadata
 //! table that indexes all user tables.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -25,7 +26,10 @@ use arrow::ipc::{
     convert::try_schema_from_flatbuffer_bytes,
     writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
 };
+use async_trait::async_trait;
 use bitcode::{Decode, Encode};
+use datafusion::common::{DataFusionError, Result as DataFusionResult};
+use datafusion_catalog::SchemaProvider;
 use llkv_column_map::types::{LogicalFieldId, RowId, TableId};
 use llkv_result::{Error as LlkvError, Result as LlkvResult};
 
@@ -308,6 +312,75 @@ impl TableCatalog {
     pub fn snapshot(&self) -> TableCatalogSnapshot {
         let tables = self.tables.read().unwrap();
         TableCatalogSnapshot::new(tables.clone())
+    }
+}
+
+use std::fmt;
+
+pub struct LlkvSchemaProvider {
+    catalog: Arc<TableCatalog>,
+}
+
+impl fmt::Debug for LlkvSchemaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LlkvSchemaProvider").finish_non_exhaustive()
+    }
+}
+
+impl LlkvSchemaProvider {
+    pub fn new(catalog: Arc<TableCatalog>) -> Self {
+        Self { catalog }
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for LlkvSchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.catalog.list_tables()
+    }
+
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        self.catalog
+            .get_table(name)
+            .map_err(|e| DataFusionError::Internal(e.to_string()))
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        match self.catalog.get_table(name) {
+            Ok(Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        // We intercept registration to create the table in our catalog instead of letting DataFusion use MemTable.
+        // Note: This only works for empty tables (CREATE TABLE). 
+        // CTAS (CREATE TABLE AS SELECT) would require copying data, which we can't do easily here synchronously.
+        // Ideally, we should intercept the logical plan, but DataFusion seems to bypass the planner for DDL.
+        
+        let schema = table.schema();
+        
+        let mut builder = self.catalog.create_table(&name, schema)
+            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+            
+        let provider = builder.finish()
+            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+            
+        Ok(Some(provider))
+    }
+
+    fn deregister_table(&self, _name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
+        Err(DataFusionError::NotImplemented(
+            "Deregistering tables not supported".into(),
+        ))
     }
 }
 

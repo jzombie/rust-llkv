@@ -2196,9 +2196,11 @@ dependencies = [
 name = "llkv-plan"
 version = "0.8.2-alpha"
 dependencies = [
+ "arrow",
  "async-trait",
  "datafusion",
  "datafusion-datasource",
+ "futures",
  "llkv-column-map",
  "llkv-result",
  "llkv-storage",

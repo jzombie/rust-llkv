@@ -4,8 +4,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::datasource::TableProvider;
-use datafusion::execution::context::QueryPlanner;
-use datafusion::logical_expr::{DmlStatement, LogicalPlan, WriteOp};
+use datafusion::execution::context::{QueryPlanner, SessionState};
+use datafusion::logical_expr::{DdlStatement, DmlStatement, LogicalPlan, WriteOp};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{Column, Literal};
 use datafusion::physical_plan::ExecutionPlan;
@@ -47,8 +47,12 @@ impl QueryPlanner for LlkvQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &datafusion::execution::context::SessionState,
+        session_state: &SessionState,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        println!("LlkvQueryPlanner received plan: {:?}", logical_plan);
+        if let LogicalPlan::Ddl(_) = logical_plan {
+             println!("LlkvQueryPlanner DDL: {:?}", logical_plan);
+        }
         match logical_plan {
             LogicalPlan::Dml(DmlStatement {
                 table_name,
@@ -142,6 +146,27 @@ impl QueryPlanner for LlkvQueryPlanner {
                     return Ok(Arc::new(DataSinkExec::new(projection_plan, sink, None)));
                 }
             }
+            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(cmd)) => {
+                println!("Intercepted CreateMemoryTable for {}", cmd.name);
+                let table_name = cmd.name.table();
+
+                let input = &cmd.input;
+
+                let schema = Arc::new(input.schema().inner().clone());
+
+                let input_plan = self
+                    .fallback
+                    .create_physical_plan(input, session_state)
+                    .await?;
+
+                return Ok(Arc::new(CreateTableExec::new(
+                    Arc::clone(&self.catalog),
+                    table_name.to_string(),
+                    Arc::clone(&schema),
+                    Some(input_plan),
+                    cmd.if_not_exists,
+                )));
+            }
             _ => {}
         }
 
@@ -150,3 +175,6 @@ impl QueryPlanner for LlkvQueryPlanner {
             .await
     }
 }
+
+pub mod ddl;
+use ddl::CreateTableExec;
