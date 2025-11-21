@@ -50,8 +50,41 @@ impl QueryPlanner for LlkvQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &datafusion::execution::context::SessionState,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        println!("LlkvQueryPlanner: {:?}", logical_plan);
         match logical_plan {
+            LogicalPlan::Extension(extension) => {
+                let maybe_node = match extension.node.as_any() {
+                    node if node.is::<LlkvCreateTable>() => {
+                        Some(node.downcast_ref::<LlkvCreateTable>().unwrap().clone())
+                    }
+                    _ => None,
+                };
+
+                match maybe_node {
+                    Some(node) => {
+                        let input_plan = if let Some(input) = &node.input {
+                            Some(
+                                self.fallback
+                                    .create_physical_plan(input, session_state)
+                                    .await?,
+                            )
+                        } else {
+                            None
+                        };
+
+                        let schema = node.schema.inner().clone();
+
+                        return Ok(Arc::new(CreateTableExec::new(
+                            Arc::clone(&self.catalog),
+                            node.name.clone(),
+                            schema,
+                            input_plan,
+                            node.if_not_exists,
+                            node.backend.clone(),
+                        )));
+                    }
+                    _ => {}
+                }
+            }
             LogicalPlan::Dml(DmlStatement {
                 table_name,
                 op: WriteOp::Update,
@@ -262,55 +295,6 @@ impl QueryPlanner for LlkvQueryPlanner {
                     return Ok(Arc::new(DataSinkExec::new(projection_plan, sink, None)));
                 }
             }
-            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(cmd)) => {
-                let table_name = cmd.name.table();
-
-                let input = &cmd.input;
-
-                let schema = Arc::new(input.schema().inner().clone());
-
-                let input_plan = self
-                    .fallback
-                    .create_physical_plan(input, session_state)
-                    .await?;
-
-                return Ok(Arc::new(CreateTableExec::new(
-                    Arc::clone(&self.catalog),
-                    table_name.to_string(),
-                    Arc::clone(&schema),
-                    Some(input_plan),
-                    cmd.if_not_exists,
-                    None, // TODO: Extract backend from options if available
-                )));
-            }
-            LogicalPlan::Ddl(DdlStatement::CreateExternalTable(cmd)) => {
-                let table_name = cmd.name.table();
-                let schema = Arc::new(cmd.schema.as_ref().inner().clone());
-                let if_not_exists = cmd.if_not_exists;
-
-                // Determine backend from file_type or options or location
-                let backend_name = if let Some(backend) = cmd.options.get("backend") {
-                    Some(backend.clone())
-                } else if cmd.location.contains("backend=columnstore") {
-                    Some("columnstore".to_string())
-                } else if cmd.location.contains("backend=parquet") {
-                    Some("parquet".to_string())
-                } else if cmd.file_type == "PARQUET" {
-                    Some("parquet".to_string())
-                } else {
-                    // Default or infer from other options
-                    None
-                };
-
-                return Ok(Arc::new(CreateTableExec::new(
-                    Arc::clone(&self.catalog),
-                    table_name.to_string(),
-                    Arc::clone(&schema),
-                    None, // External tables usually don't have input plan in this context?
-                    if_not_exists,
-                    backend_name,
-                )));
-            }
             _ => {}
         }
 
@@ -321,4 +305,64 @@ impl QueryPlanner for LlkvQueryPlanner {
 }
 
 pub mod ddl;
+use datafusion::common::DFSchemaRef;
+use datafusion::logical_expr::UserDefinedLogicalNodeCore;
 use ddl::CreateTableExec;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LlkvCreateTable {
+    pub name: String,
+    pub schema: DFSchemaRef,
+    pub input: Option<LogicalPlan>,
+    pub if_not_exists: bool,
+    pub backend: Option<String>,
+}
+
+impl PartialOrd for LlkvCreateTable {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.name.partial_cmp(&other.name)
+    }
+}
+
+impl UserDefinedLogicalNodeCore for LlkvCreateTable {
+    fn name(&self) -> &str {
+        "LlkvCreateTable"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        match &self.input {
+            Some(input) => vec![input],
+            None => vec![],
+        }
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema
+    }
+
+    fn expressions(&self) -> Vec<datafusion::logical_expr::Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "LlkvCreateTable: name={}, backend={:?}",
+            self.name, self.backend
+        )
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<datafusion::logical_expr::Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> DataFusionResult<Self> {
+        Ok(LlkvCreateTable {
+            name: self.name.clone(),
+            schema: self.schema.clone(),
+            input: inputs.into_iter().next(),
+            if_not_exists: self.if_not_exists,
+            backend: self.backend.clone(),
+        })
+    }
+}

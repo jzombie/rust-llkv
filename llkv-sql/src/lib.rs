@@ -7,7 +7,7 @@
 //! planning, keeping LLKV storage as the backing store.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+// use std::sync::Arc; // Removed duplicate import
 
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
@@ -22,6 +22,14 @@ use llkv_table::catalog::{LlkvSchemaProvider, TableCatalog};
 use llkv_table::providers::column_map::ColumnStoreBackend;
 use llkv_table::providers::parquet::ParquetStoreBackend;
 use llkv_table::traits::CatalogBackend;
+
+use datafusion::logical_expr::{DdlStatement, LogicalPlan};
+use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use llkv_plan::LlkvCreateTable;
+use sqlparser::ast::{
+    CreateTableOptions, Expr, SqlOption, Statement as SQLStatement, Value, ValueWithSpan,
+};
+use std::sync::Arc;
 
 /// Result of executing a SQL statement.
 #[derive(Debug)]
@@ -41,11 +49,6 @@ pub struct SqlEngine {
 impl SqlEngine {
     /// Create a new SQL engine backed by the provided pager.
     pub fn new(pager: Arc<BoxedPager>) -> Result<Self> {
-        Self::new_with_backend(pager, "parquet")
-    }
-
-    /// Create a new SQL engine with a specific default backend.
-    pub fn new_with_backend(pager: Arc<BoxedPager>, default_backend: &str) -> Result<Self> {
         let store = Arc::new(ColumnStore::open(Arc::clone(&pager))?);
         let metadata_backend = Box::new(ColumnStoreBackend::new(Arc::clone(&store)));
 
@@ -59,14 +62,8 @@ impl SqlEngine {
         );
         data_backends.insert("parquet".to_string(), parquet_backend);
 
-        let catalog =
-            TableCatalog::new(metadata_backend, data_backends, default_backend.to_string())?;
+        let catalog = TableCatalog::new(metadata_backend, data_backends, "parquet".to_string())?;
 
-        Self::new_with_catalog(catalog)
-    }
-
-    /// Create a new SQL engine with an existing catalog.
-    pub fn new_with_catalog(catalog: Arc<TableCatalog>) -> Result<Self> {
         let session_state = SessionStateBuilder::new()
             .with_default_features()
             .with_query_planner(Arc::new(LlkvQueryPlanner::new(Arc::clone(&catalog))))
@@ -98,31 +95,106 @@ impl SqlEngine {
 
     /// Execute raw SQL text.
     pub async fn execute(&self, sql: &str) -> Result<Vec<SqlStatementResult>> {
-        let result = self.execute_via_datafusion(sql).await?;
-        Ok(vec![result])
-    }
+        let statements = DFParser::parse_sql(sql).map_err(|e| {
+            map_datafusion_error("Parser error", DataFusionError::Execution(e.to_string()))
+        })?;
 
-    async fn execute_via_datafusion(&self, sql: &str) -> Result<SqlStatementResult> {
-        let df = self
-            .ctx
-            .sql(sql)
-            .await
-            .map_err(|e| map_datafusion_error("DataFusion planning failed", e))?;
+        let mut results = Vec::new();
 
-        println!("Logical Plan: {:?}", df.logical_plan());
+        for mut statement in statements {
+            let mut backend_option = None;
 
-        let schema_is_empty = df.schema().fields().is_empty();
+            if let DFStatement::Statement(inner_stmt) = &mut statement {
+                if let SQLStatement::CreateTable(create_table) = &mut **inner_stmt {
+                    let options_vec = match &mut create_table.table_options {
+                        CreateTableOptions::With(opts) => Some(opts),
+                        CreateTableOptions::Options(opts) => Some(opts),
+                        CreateTableOptions::TableProperties(opts) => Some(opts),
+                        CreateTableOptions::Plain(opts) => Some(opts),
+                        CreateTableOptions::None => None,
+                    };
 
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| map_datafusion_error("DataFusion execution failed", e))?;
+                    if let Some(options) = options_vec {
+                        if let Some(idx) = options.iter().position(|o| {
+                            if let SqlOption::KeyValue { key, .. } = o {
+                                key.value.eq_ignore_ascii_case("backend")
+                            } else {
+                                false
+                            }
+                        }) {
+                            if let SqlOption::KeyValue { value, .. } = &options[idx] {
+                                match value {
+                                    Expr::Value(ValueWithSpan {
+                                        value: Value::SingleQuotedString(s),
+                                        ..
+                                    })
+                                    | Expr::Value(ValueWithSpan {
+                                        value: Value::DoubleQuotedString(s),
+                                        ..
+                                    }) => {
+                                        backend_option = Some(s.clone());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            options.remove(idx);
+                            if options.is_empty() {
+                                create_table.table_options = CreateTableOptions::None;
+                            }
+                        }
+                    }
+                }
+            }
 
-        if schema_is_empty {
-            Ok(SqlStatementResult::Statement { rows_affected: 0 })
-        } else {
-            Ok(SqlStatementResult::Query { batches })
+            // Convert to LogicalPlan
+            let plan = self
+                .ctx
+                .state()
+                .statement_to_plan(statement)
+                .await
+                .map_err(|e| map_datafusion_error("Planning failed", e))?;
+
+            let final_plan = if let Some(backend) = backend_option {
+                if let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(cmd)) = plan {
+                    // Wrap in LlkvCreateTable
+                    let schema = cmd.input.schema().clone();
+                    LogicalPlan::Extension(datafusion::logical_expr::Extension {
+                        node: Arc::new(LlkvCreateTable {
+                            name: cmd.name.table().to_string(),
+                            schema,
+                            input: Some((*cmd.input).clone()),
+                            if_not_exists: cmd.if_not_exists,
+                            backend: Some(backend),
+                        }),
+                    })
+                } else {
+                    plan
+                }
+            } else {
+                plan
+            };
+
+            let df = self
+                .ctx
+                .execute_logical_plan(final_plan)
+                .await
+                .map_err(|e| map_datafusion_error("Execution failed", e))?;
+
+            let schema_is_empty = df.schema().fields().is_empty();
+
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| map_datafusion_error("DataFusion execution failed", e))?;
+
+            if schema_is_empty {
+                results.push(SqlStatementResult::Statement { rows_affected: 0 });
+            } else {
+                results.push(SqlStatementResult::Query { batches });
+            }
         }
+
+        Ok(results)
     }
 }
 
