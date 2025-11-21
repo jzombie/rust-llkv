@@ -12426,8 +12426,13 @@ fn normalize_join_column(array: &ArrayRef) -> ExecutorResult<ArrayRef> {
             .map_err(|e| Error::Internal(format!("failed to cast integer/boolean to Int64: {e}"))),
         DataType::Float32 => cast(array, &DataType::Float64)
             .map_err(|e| Error::Internal(format!("failed to cast Float32 to Float64: {e}"))),
-        DataType::Utf8 => cast(array, &DataType::LargeUtf8)
+        DataType::Utf8 | DataType::LargeUtf8 => cast(array, &DataType::LargeUtf8)
             .map_err(|e| Error::Internal(format!("failed to cast Utf8 to LargeUtf8: {e}"))),
+        DataType::Dictionary(_, value_type) => {
+            let unpacked = cast(array, value_type)
+                .map_err(|e| Error::Internal(format!("failed to unpack dictionary: {e}")))?;
+            normalize_join_column(&unpacked)
+        }
         _ => Ok(array.clone()),
     }
 }

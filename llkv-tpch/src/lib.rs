@@ -231,6 +231,7 @@ impl TpchToolkit {
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {};", self.schema_name);
         run_sql(engine, &create_schema_sql)?;
         let ddl_batch_sql = self.render_create_tables();
+        println!("Executing DDL:\n{}", ddl_batch_sql);
         run_sql(engine, &ddl_batch_sql)?;
 
         Ok(TpchSchema {
@@ -1064,7 +1065,7 @@ fn build_table_info(name: &str, raw_tables: &HashMap<String, RawTableDef>) -> Tp
 
 fn parse_column_value(column: &TableColumn, raw: &str) -> Result<PlanValue> {
     match column.value_kind {
-        ColumnValueKind::String => Ok(PlanValue::String(raw.to_string())),
+        ColumnValueKind::String => Ok(PlanValue::String(raw.trim_end().to_string())),
         ColumnValueKind::Integer => {
             if raw.is_empty() {
                 return Err(TpchError::Parse(format!(

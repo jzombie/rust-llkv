@@ -312,7 +312,70 @@ fn normalize_expr<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
             Expr::Or(normalized)
         }
         Expr::Not(inner) => normalize_negated(*inner),
+        Expr::Compare { left, op, right } => normalize_compare(left, op, right),
         other => other,
+    }
+}
+
+fn normalize_compare<'expr>(
+    left: ScalarExpr<FieldId>,
+    op: CompareOp,
+    right: ScalarExpr<FieldId>,
+) -> Expr<'expr, FieldId> {
+    match (left, right) {
+        (ScalarExpr::Column(field_id), ScalarExpr::Literal(lit)) => match op {
+            CompareOp::Eq => Expr::Pred(Filter {
+                field_id,
+                op: Operator::Equals(lit),
+            }),
+            CompareOp::Gt => Expr::Pred(Filter {
+                field_id,
+                op: Operator::GreaterThan(lit),
+            }),
+            CompareOp::GtEq => Expr::Pred(Filter {
+                field_id,
+                op: Operator::GreaterThanOrEquals(lit),
+            }),
+            CompareOp::Lt => Expr::Pred(Filter {
+                field_id,
+                op: Operator::LessThan(lit),
+            }),
+            CompareOp::LtEq => Expr::Pred(Filter {
+                field_id,
+                op: Operator::LessThanOrEquals(lit),
+            }),
+            CompareOp::NotEq => Expr::Not(Box::new(Expr::Pred(Filter {
+                field_id,
+                op: Operator::Equals(lit),
+            }))),
+        },
+        (ScalarExpr::Literal(lit), ScalarExpr::Column(field_id)) => match op {
+            CompareOp::Eq => Expr::Pred(Filter {
+                field_id,
+                op: Operator::Equals(lit),
+            }),
+            CompareOp::Gt => Expr::Pred(Filter {
+                field_id,
+                op: Operator::LessThan(lit),
+            }),
+            CompareOp::GtEq => Expr::Pred(Filter {
+                field_id,
+                op: Operator::LessThanOrEquals(lit),
+            }),
+            CompareOp::Lt => Expr::Pred(Filter {
+                field_id,
+                op: Operator::GreaterThan(lit),
+            }),
+            CompareOp::LtEq => Expr::Pred(Filter {
+                field_id,
+                op: Operator::GreaterThanOrEquals(lit),
+            }),
+            CompareOp::NotEq => Expr::Not(Box::new(Expr::Pred(Filter {
+                field_id,
+                op: Operator::Equals(lit),
+            }))),
+        },
+        (left, right) => Expr::Compare { left, op, right },
     }
 }
 
