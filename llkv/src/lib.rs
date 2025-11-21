@@ -160,8 +160,7 @@ pub mod storage {
     //! for both in-memory and persistent storage backends.
 
     pub use llkv_storage::pager::{
-        BoxedPager, InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, Pager,
-        PagerDiagnostics,
+        BoxedPager, InstrumentedPager, IoStats, IoStatsSnapshot, MemPager, Pager, PagerDiagnostics,
     };
 
     // SimdRDrivePager is only available when llkv-storage is built with simd-r-drive-support
