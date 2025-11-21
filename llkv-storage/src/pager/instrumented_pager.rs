@@ -291,4 +291,8 @@ where
         }
         self.inner.free_many(keys)
     }
+
+    fn enumerate_keys(&self) -> Result<Vec<PhysicalKey>> {
+        self.inner.enumerate_keys()
+    }
 }

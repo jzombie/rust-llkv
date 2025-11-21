@@ -3,11 +3,11 @@
 //! This module avoids deserialization by defining fixed-layout structs that
 //! can be interpreted directly from byte buffers provided by the pager.
 
+use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::store::indexing::IndexKind;
 use crate::types::LogicalFieldId;
 use llkv_result::{Error, Result};
 use llkv_storage::{
-    codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le},
     pager::{BatchGet, BatchPut, GetResult, Pager},
     types::PhysicalKey,
 };
@@ -396,7 +396,9 @@ impl<'a, P: Pager> Iterator for DescriptorIterator<'a, P> {
                             self.current_blob = Some(bytes);
                             self.cursor_in_page = 0;
                         }
-                        Some(GetResult::Missing { .. }) => return Some(Err(Error::NotFound)),
+                        Some(GetResult::Missing { .. }) => {
+                            return Some(Err(Error::NotFound));
+                        }
                         None => return Some(Err(Error::Internal("batch_get empty result".into()))),
                     },
                     Err(e) => return Some(Err(e)),

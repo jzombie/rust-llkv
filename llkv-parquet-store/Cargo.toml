@@ -1,0 +1,53 @@
+[package]
+name = "llkv-parquet-store"
+version = "0.8.2-alpha"
+edition = "2021"
+license = "Apache-2.0"
+description = "Parquet-based storage layer for LLKV, managing collections of Parquet files as pager blobs"
+repository = "https://github.com/jzombie/rust-llkv"
+
+[dependencies]
+# Workspace dependencies
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+llkv-result = { path = "../llkv-result" }
+llkv-storage = { path = "../llkv-storage" }
+
+# Parquet support
+parquet = { workspace = true, default-features = false, features = ["arrow", "async", "snap"] }
+# TODO: Use workspace crate
+bytes = "1.11"
+
+# DataFusion integration for predicate pushdown
+# TODO: Use workspace crates
+datafusion-expr = "50.3.0"
+datafusion-common = "50.3.0"
+
+# Serialization
+bitcode = { workspace = true }
+serde = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["rt"] }
+
+# Utilities
+bytemuck = { workspace = true }
+rustc-hash = { workspace = true }
+simd-r-drive-entry-handle = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+criterion = { workspace = true }
+# TODO: Use workspace crate
+simsimd = "6.5.5"
+rand = { workspace = true }
+
+[[bench]]
+name = "compression_bench"
+harness = false
+
+[[bench]]
+name = "vector_bench"
+harness = false

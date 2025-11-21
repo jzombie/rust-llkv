@@ -121,6 +121,16 @@ cargo test --test slturl_test -- --ignored
 
 - The harness supports collection of query statistics via `LLKV_SLT_STATS=1` if you want timings and per-query metrics.
 
+### Fail-fast vs. run-all modes
+
+By default the harness aborts after the first failing SLT record. This shortens the feedback loop when iterating locally. To instead run *all* suites (the previous behavior), set `LLKV_SLT_RUN_ALL=1` before invoking the harness:
+
+```bash
+LLKV_SLT_RUN_ALL=1 cargo test -p llkv-slt-tester --test slt_harness
+```
+
+In fail-fast mode the runner executes files sequentially and stops as soon as an error is encountered, reporting the failure immediately while still persisting `target/last_failed_slt.tmp`.
+
 ## Internals / Implementation notes (for maintainers)
 
 - Entry point: `tests/slt_harness.rs` builds the harness binary and delegates to `run_slt_harness_with_args` for discovery and execution.

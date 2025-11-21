@@ -442,12 +442,16 @@ pub fn ensure_supported_arrow_type(dtype: &arrow::datatypes::DataType) -> Result
     )))
 }
 
+pub mod codecs;
 pub mod gather;
 pub mod parallel;
+pub mod predicate;
+pub mod serialization;
 pub mod store;
 pub mod types;
 
 pub use llkv_result::{Error, Result};
+pub use predicate::{Predicate, PredicateValue};
 pub use store::{
     ColumnStore, IndexKind, ROW_ID_COLUMN_NAME,
     scan::{self, ScanBuilder},
