@@ -24,6 +24,7 @@ use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, IntervalUnit, Schema};
+use arrow::row::{RowConverter, SortField};
 use arrow_buffer::IntervalMonthDayNano;
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::gather::gather_indices_from_batches;
@@ -40,9 +41,9 @@ use llkv_expr::typed_predicate::{
 };
 use llkv_join::cross_join_pair;
 use llkv_plan::{
-    plan_value_from_literal, AggregateExpr, AggregateFunction, CanonicalRow, CompoundOperator,
-    CompoundQuantifier, CompoundSelectComponent, CompoundSelectPlan, OrderByPlan, OrderSortType,
-    OrderTarget, PlanValue, SelectPlan, SelectProjection,
+    AggregateExpr, AggregateFunction, CanonicalRow, CompoundOperator, CompoundQuantifier,
+    CompoundSelectComponent, CompoundSelectPlan, OrderByPlan, OrderSortType, OrderTarget,
+    PlanValue, SelectPlan, SelectProjection, plan_value_from_literal,
 };
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -834,9 +835,8 @@ where
         if rows_seen == 0 {
             Ok(Literal::Null)
         } else {
-            result.ok_or_else(|| {
-                Error::Internal("scalar subquery evaluation missing result".into())
-            })
+            result
+                .ok_or_else(|| Error::Internal("scalar subquery evaluation missing result".into()))
         }
     }
 
@@ -880,16 +880,13 @@ where
         }
 
         // Execute each unique correlated subquery in parallel on the shared Rayon pool.
-        let job_results: Vec<ExecutorResult<Literal>> = llkv_column_map::parallel::with_thread_pool(
-            || {
+        let job_results: Vec<ExecutorResult<Literal>> =
+            llkv_column_map::parallel::with_thread_pool(|| {
                 unique_bindings
                     .par_iter()
-                    .map(|bindings| {
-                        self.evaluate_scalar_subquery_with_bindings(subquery, bindings)
-                    })
+                    .map(|bindings| self.evaluate_scalar_subquery_with_bindings(subquery, bindings))
                     .collect()
-            },
-        );
+            });
 
         let mut job_literals: Vec<Literal> = Vec::with_capacity(job_results.len());
         for result in job_results {
@@ -11429,6 +11426,21 @@ struct TableCrossProductData {
     table_indices: Vec<usize>,
 }
 
+fn plan_value_to_literal(value: &PlanValue) -> ExecutorResult<Literal> {
+    match value {
+        PlanValue::String(s) => Ok(Literal::String(s.clone())),
+        PlanValue::Integer(i) => Ok(Literal::Integer(*i as i128)),
+        PlanValue::Float(f) => Ok(Literal::Float(*f)),
+        PlanValue::Null => Ok(Literal::Null),
+        PlanValue::Date32(d) => Ok(Literal::Date32(*d)),
+        PlanValue::Decimal(d) => Ok(Literal::Decimal(*d)),
+        _ => Err(Error::Internal(format!(
+            "unsupported plan value for literal conversion: {:?}",
+            value
+        ))),
+    }
+}
+
 fn collect_table_data<P>(
     table_index: usize,
     table_ref: &llkv_plan::TableRef,
@@ -11468,7 +11480,55 @@ where
     let schema = Arc::new(Schema::new(fields));
 
     let filter_field_id = table.schema.first_field_id().unwrap_or(ROW_ID_FIELD_ID);
-    let filter_expr = crate::translation::expression::full_table_scan_filter(filter_field_id);
+
+    // Build filter expression from constraints to push down to scan
+    let mut filter_exprs = Vec::new();
+    for constraint in constraints {
+        match constraint {
+            ColumnConstraint::Equality(lit) => {
+                let col_idx = lit.column.column;
+                if col_idx < table.schema.columns.len() {
+                    let field_id = table.schema.columns[col_idx].field_id;
+                    if let Ok(literal) = plan_value_to_literal(&lit.value) {
+                        filter_exprs.push(LlkvExpr::Compare {
+                            left: ScalarExpr::Column(field_id),
+                            op: CompareOp::Eq,
+                            right: ScalarExpr::Literal(literal),
+                        });
+                    }
+                }
+            }
+            ColumnConstraint::InList(in_list) => {
+                let col_idx = in_list.column.column;
+                if col_idx < table.schema.columns.len() {
+                    let field_id = table.schema.columns[col_idx].field_id;
+                    let literals: Vec<Literal> = in_list
+                        .values
+                        .iter()
+                        .filter_map(|v| plan_value_to_literal(v).ok())
+                        .collect();
+
+                    if !literals.is_empty() {
+                        filter_exprs.push(LlkvExpr::InList {
+                            expr: ScalarExpr::Column(field_id),
+                            list: literals.into_iter().map(ScalarExpr::Literal).collect(),
+                            negated: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let filter_expr = if filter_exprs.is_empty() {
+        crate::translation::expression::full_table_scan_filter(filter_field_id)
+    } else {
+        if filter_exprs.len() == 1 {
+            filter_exprs.pop().unwrap()
+        } else {
+            LlkvExpr::And(filter_exprs)
+        }
+    };
 
     let mut raw_batches = Vec::new();
     table.table.scan_stream(
@@ -12353,6 +12413,25 @@ type OptionalJoinMatches = Vec<Option<(usize, usize)>>;
 /// Type alias for LEFT join match outputs
 type LeftJoinMatchPairs = (JoinMatchIndices, OptionalJoinMatches);
 
+fn normalize_join_column(array: &ArrayRef) -> ExecutorResult<ArrayRef> {
+    match array.data_type() {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => cast(array, &DataType::Int64)
+            .map_err(|e| Error::Internal(format!("failed to cast integer/boolean to Int64: {e}"))),
+        DataType::Float32 => cast(array, &DataType::Float64)
+            .map_err(|e| Error::Internal(format!("failed to cast Float32 to Float64: {e}"))),
+        DataType::Utf8 => cast(array, &DataType::LargeUtf8)
+            .map_err(|e| Error::Internal(format!("failed to cast Utf8 to LargeUtf8: {e}"))),
+        _ => Ok(array.clone()),
+    }
+}
+
 /// Build hash join match indices using parallel hash table construction and probing.
 ///
 /// Constructs a hash table from the right batches (build phase), then probes it with
@@ -12392,36 +12471,53 @@ fn build_join_match_indices(
     // Parallelize hash table build phase across batches
     // Each thread builds a local hash table for its batch(es), then we merge them
     let hash_table: JoinHashTable = llkv_column_map::parallel::with_thread_pool(|| {
-        let local_tables: Vec<JoinHashTable> = right_batches
+        let local_tables: Vec<ExecutorResult<JoinHashTable>> = right_batches
             .par_iter()
             .enumerate()
             .map(|(batch_idx, batch)| {
                 let mut local_table: JoinHashTable = FxHashMap::default();
-                let mut key_buffer: Vec<u8> = Vec::new();
 
-                for row_idx in 0..batch.num_rows() {
-                    key_buffer.clear();
-                    match build_join_key(batch, &right_key_indices, row_idx, &mut key_buffer) {
-                        Ok(true) => {
-                            local_table
-                                .entry(key_buffer.clone())
-                                .or_default()
-                                .push((batch_idx, row_idx));
-                        }
-                        Ok(false) => continue,
-                        Err(_) => continue, // Skip rows with errors during parallel build
+                let columns: Vec<ArrayRef> = right_key_indices
+                    .iter()
+                    .map(|&idx| normalize_join_column(batch.column(idx)))
+                    .collect::<ExecutorResult<Vec<_>>>()?;
+
+                let sort_fields: Vec<SortField> = columns
+                    .iter()
+                    .map(|c| SortField::new(c.data_type().clone()))
+                    .collect();
+
+                let converter = RowConverter::new(sort_fields)
+                    .map_err(|e| Error::Internal(format!("failed to create RowConverter: {e}")))?;
+                let rows = converter.convert_columns(&columns).map_err(|e| {
+                    Error::Internal(format!("failed to convert columns to rows: {e}"))
+                })?;
+
+                for (row_idx, row) in rows.iter().enumerate() {
+                    // Skip rows with NULLs in join keys (standard SQL behavior)
+                    if columns.iter().any(|c| c.is_null(row_idx)) {
+                        continue;
                     }
+
+                    local_table
+                        .entry(row.as_ref().to_vec())
+                        .or_default()
+                        .push((batch_idx, row_idx));
                 }
 
-                local_table
+                Ok(local_table)
             })
             .collect();
 
         // Merge all local hash tables into one
         let mut merged_table: JoinHashTable = FxHashMap::default();
-        for local_table in local_tables {
-            for (key, mut positions) in local_table {
-                merged_table.entry(key).or_default().append(&mut positions);
+        for local_table_res in local_tables {
+            if let Ok(local_table) = local_table_res {
+                for (key, mut positions) in local_table {
+                    merged_table.entry(key).or_default().append(&mut positions);
+                }
+            } else {
+                tracing::error!("failed to build hash table for batch");
             }
         }
 
@@ -12436,40 +12532,55 @@ fn build_join_match_indices(
 
     // Parallelize probe phase across left batches
     // Each thread probes its batch(es) against the shared hash table
-    let matches: Vec<JoinMatchPairs> = llkv_column_map::parallel::with_thread_pool(|| {
-        left_batches
-            .par_iter()
-            .enumerate()
-            .map(|(batch_idx, batch)| {
-                let mut local_left_matches: JoinMatchIndices = Vec::new();
-                let mut local_right_matches: JoinMatchIndices = Vec::new();
-                let mut key_buffer: Vec<u8> = Vec::new();
+    let matches: Vec<ExecutorResult<JoinMatchPairs>> =
+        llkv_column_map::parallel::with_thread_pool(|| {
+            left_batches
+                .par_iter()
+                .enumerate()
+                .map(|(batch_idx, batch)| {
+                    let mut local_left_matches: JoinMatchIndices = Vec::new();
+                    let mut local_right_matches: JoinMatchIndices = Vec::new();
 
-                for row_idx in 0..batch.num_rows() {
-                    key_buffer.clear();
-                    match build_join_key(batch, &left_key_indices, row_idx, &mut key_buffer) {
-                        Ok(true) => {
-                            if let Some(entries) = hash_table.get(&key_buffer) {
-                                for &(r_batch, r_row) in entries {
-                                    local_left_matches.push((batch_idx, row_idx));
-                                    local_right_matches.push((r_batch, r_row));
-                                }
+                    let columns: Vec<ArrayRef> = left_key_indices
+                        .iter()
+                        .map(|&idx| normalize_join_column(batch.column(idx)))
+                        .collect::<ExecutorResult<Vec<_>>>()?;
+
+                    let sort_fields: Vec<SortField> = columns
+                        .iter()
+                        .map(|c| SortField::new(c.data_type().clone()))
+                        .collect();
+
+                    let converter = RowConverter::new(sort_fields).map_err(|e| {
+                        Error::Internal(format!("failed to create RowConverter: {e}"))
+                    })?;
+                    let rows = converter.convert_columns(&columns).map_err(|e| {
+                        Error::Internal(format!("failed to convert columns to rows: {e}"))
+                    })?;
+
+                    for (row_idx, row) in rows.iter().enumerate() {
+                        if columns.iter().any(|c| c.is_null(row_idx)) {
+                            continue;
+                        }
+
+                        if let Some(positions) = hash_table.get(row.as_ref()) {
+                            for &(r_batch_idx, r_row_idx) in positions {
+                                local_left_matches.push((batch_idx, row_idx));
+                                local_right_matches.push((r_batch_idx, r_row_idx));
                             }
                         }
-                        Ok(false) => continue,
-                        Err(_) => continue, // Skip rows with errors during parallel probe
                     }
-                }
 
-                (local_left_matches, local_right_matches)
-            })
-            .collect()
-    });
+                    Ok((local_left_matches, local_right_matches))
+                })
+                .collect()
+        });
 
     // Merge all match results
     let mut left_matches: JoinMatchIndices = Vec::new();
     let mut right_matches: JoinMatchIndices = Vec::new();
-    for (mut left, mut right) in matches {
+    for match_res in matches {
+        let (mut left, mut right) = match_res?;
         left_matches.append(&mut left);
         right_matches.append(&mut right);
     }
