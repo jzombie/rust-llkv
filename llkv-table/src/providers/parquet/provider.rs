@@ -75,6 +75,19 @@ where
         schema: SchemaRef,
         scan_batch_size: usize,
     ) -> LlkvResult<Self> {
+        // Ensure schema has row_id column
+        let schema = if schema.field_with_name(ROW_ID_COLUMN_NAME).is_ok() {
+            schema
+        } else {
+            let mut fields = schema.fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                ROW_ID_COLUMN_NAME,
+                DataType::UInt64,
+                true,
+            )));
+            Arc::new(Schema::new(fields))
+        };
+
         let ingest_schema = build_ingest_schema(&schema)?;
         Ok(Self {
             store,
@@ -93,6 +106,27 @@ where
     /// Total number of rows currently visible to DataFusion.
     pub fn row_count(&self) -> usize {
         self.store.get_row_count(self.table_id).unwrap_or(0) as usize
+    }
+
+    /// Create a data sink for writing to this table.
+    pub fn create_sink(&self) -> Arc<dyn datafusion_datasource::sink::DataSink> {
+        Arc::new(crate::providers::parquet::sink::ParquetDataSink::new(
+            self.store.clone(),
+            self.table_id,
+            self.schema.clone(),
+        ))
+    }
+
+    /// Create a data sink with a specific schema.
+    pub fn create_sink_from_schema(
+        &self,
+        schema: SchemaRef,
+    ) -> Arc<dyn datafusion_datasource::sink::DataSink> {
+        Arc::new(crate::providers::parquet::sink::ParquetDataSink::new(
+            self.store.clone(),
+            self.table_id,
+            schema,
+        ))
     }
 }
 
@@ -120,49 +154,89 @@ where
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Map user projection to store projection (shift by 3 for row_id, created_by, deleted_by)
-        // and ensure row_id (0) and created_by (1) are included for deduplication.
-        let (store_projection, output_schema) = if let Some(indices) = projection {
-            let mut store_indices = vec![0, 1]; // Always need row_id and created_by
-            store_indices.extend(indices.iter().map(|&i| i + 3));
+        let row_id_idx = self.schema.index_of(ROW_ID_COLUMN_NAME).ok();
+        let num_fields = self.schema.fields().len();
 
-            let fields: Vec<Field> = indices
-                .iter()
-                .map(|&i| self.schema.field(i).clone())
-                .collect();
-            (Some(store_indices), Arc::new(Schema::new(fields)))
-        } else {
-            // If no projection, we want all user columns.
-            // Store has: row_id, created_by, deleted_by, UserCols...
-            // We need row_id, created_by for dedup, and then all UserCols.
-            // UserCols start at index 3.
-            let num_user_cols = self.schema.fields().len();
-            let mut store_indices = vec![0, 1];
-            store_indices.extend(3..(3 + num_user_cols));
-
-            (Some(store_indices), self.schema.clone())
+        let projection_indices = match projection {
+            Some(indices) => indices.clone(),
+            None => (0..num_fields).collect(),
         };
+
+        let output_schema = Arc::new(self.schema.project(&projection_indices)?);
+
+        let mut store_indices = Vec::new();
+        let mut output_to_store_map = Vec::new();
+
+        for &idx in &projection_indices {
+            let store_idx = if Some(idx) == row_id_idx {
+                0
+            } else {
+                let user_col_idx = if let Some(ridx) = row_id_idx {
+                    if idx > ridx { idx - 1 } else { idx }
+                } else {
+                    idx
+                };
+                3 + user_col_idx
+            };
+            store_indices.push(store_idx);
+            output_to_store_map.push(store_idx);
+        }
+
+        let mut fetch_indices = store_indices.clone();
+        if !fetch_indices.contains(&0) {
+            fetch_indices.push(0);
+        }
+        if !fetch_indices.contains(&1) {
+            fetch_indices.push(1);
+        }
+        if !fetch_indices.contains(&2) {
+            fetch_indices.push(2);
+        }
+
+        fetch_indices.sort();
+        fetch_indices.dedup();
+
+        let mut store_to_batch_map = std::collections::HashMap::new();
+        for (i, &store_idx) in fetch_indices.iter().enumerate() {
+            store_to_batch_map.insert(store_idx, i);
+        }
 
         let batches = self
             .store
-            .scan_parallel(self.table_id, filters, store_projection.clone(), limit)
+            .scan_parallel(self.table_id, filters, Some(fetch_indices), limit)
             .map_err(map_storage_error)?;
 
-        // Remove the extra columns (row_id, created_by) from the result batches
-        // and ensure they match output_schema.
-        let projected_batches = batches.into_iter().map(|batch| {
-            // The batch has [row_id, created_by, requested_user_cols...]
-            // We want [requested_user_cols...]
-            // So we just slice off the first 2 columns.
-            if batch.num_columns() < 2 {
-                 return Err(DataFusionError::Internal(format!(
-                    "Expected at least 2 columns (row_id, created_by) from store, got {}. Projection: {:?}",
-                    batch.num_columns(), store_projection
-                )));
-            }
-            let columns = batch.columns()[2..].to_vec();
-            RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-        }).collect::<Result<Vec<_>, _>>()?;
+        let projected_batches = batches
+            .into_iter()
+            .map(|batch| {
+                // Filter deleted rows
+                let deleted_by_idx = store_to_batch_map[&2];
+                let deleted_by_col = batch
+                    .column(deleted_by_idx)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .expect("deleted_by should be UInt64Array");
+
+                let mut filter_builder =
+                    arrow::array::BooleanBuilder::with_capacity(batch.num_rows());
+                for val in deleted_by_col.iter() {
+                    let is_active = val.unwrap_or(0) == 0;
+                    filter_builder.append_value(is_active);
+                }
+                let filter_array = filter_builder.finish();
+
+                let filtered_batch = arrow::compute::filter_record_batch(&batch, &filter_array)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+                let mut columns = Vec::with_capacity(output_to_store_map.len());
+                for &store_idx in &output_to_store_map {
+                    let batch_idx = store_to_batch_map[&store_idx];
+                    columns.push(filtered_batch.column(batch_idx).clone());
+                }
+                RecordBatch::try_new(output_schema.clone(), columns)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let partitions = vec![projected_batches];
         let exec = MemorySourceConfig::try_new_exec(&partitions, output_schema, None)?;
@@ -216,10 +290,28 @@ fn map_storage_error(err: LlkvError) -> DataFusionError {
 
 fn build_ingest_schema(user_schema: &SchemaRef) -> LlkvResult<SchemaRef> {
     let mut ingest_fields = Vec::with_capacity(user_schema.fields().len() + 3);
-    ingest_fields.push(Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false));
-    ingest_fields.push(Field::new("created_by_txn", DataType::UInt64, false));
-    ingest_fields.push(Field::new("deleted_by_txn", DataType::UInt64, true));
-    ingest_fields.extend(user_schema.fields().iter().map(|f| f.as_ref().clone()));
+    ingest_fields.push(Arc::new(Field::new(
+        ROW_ID_COLUMN_NAME,
+        DataType::UInt64,
+        false,
+    )));
+    ingest_fields.push(Arc::new(Field::new(
+        "created_by_txn",
+        DataType::UInt64,
+        false,
+    )));
+    ingest_fields.push(Arc::new(Field::new(
+        "deleted_by_txn",
+        DataType::UInt64,
+        true,
+    )));
+
+    for field in user_schema.fields() {
+        if field.name() != ROW_ID_COLUMN_NAME {
+            ingest_fields.push(field.clone());
+        }
+    }
+
     Ok(Arc::new(Schema::new(ingest_fields)))
 }
 

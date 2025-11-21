@@ -2206,6 +2206,7 @@ dependencies = [
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",
+ "simd-r-drive-entry-handle",
 ]
 
 [[package]]
@@ -2226,6 +2227,7 @@ dependencies = [
  "datafusion-catalog",
  "llkv-column-map",
  "llkv-fusion",
+ "llkv-parquet-store",
  "llkv-plan",
  "llkv-result",
  "llkv-storage",

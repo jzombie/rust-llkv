@@ -15,7 +15,7 @@ use llkv_parquet_store::{ParquetStore, TableId};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::common::ROW_ID_COLUMN_NAME;
+use crate::common::{CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, ROW_ID_COLUMN_NAME};
 
 /// DataSink implementation for LLKV ParquetStore.
 pub struct ParquetDataSink<P>
@@ -120,8 +120,81 @@ where
             let batch_rows = batch.num_rows();
             total_rows += batch_rows as u64;
 
-            if batch.column_by_name(ROW_ID_COLUMN_NAME).is_some() {
-                batches_to_write.push(batch);
+            let row_id_col_opt = batch.column_by_name(ROW_ID_COLUMN_NAME);
+            let has_valid_row_ids = if let Some(col) = row_id_col_opt {
+                col.null_count() != col.len()
+            } else {
+                false
+            };
+
+            if has_valid_row_ids {
+                let row_id_col = row_id_col_opt.unwrap();
+                // Reconstruct batch to ensure correct order: [row_id, created_by, deleted_by, UserCols...]
+                let row_id_array = row_id_col.clone();
+
+                let created_by_array =
+                    if let Some(col) = batch.column_by_name(CREATED_BY_COLUMN_NAME) {
+                        col.clone()
+                    } else {
+                        let mut builder = UInt64Builder::with_capacity(batch_rows);
+                        for _ in 0..batch_rows {
+                            builder.append_value(0);
+                        }
+                        Arc::new(builder.finish()) as ArrayRef
+                    };
+
+                let deleted_by_array =
+                    if let Some(col) = batch.column_by_name(DELETED_BY_COLUMN_NAME) {
+                        col.clone()
+                    } else {
+                        let mut builder = UInt64Builder::with_capacity(batch_rows);
+                        for _ in 0..batch_rows {
+                            builder.append_value(0);
+                        }
+                        Arc::new(builder.finish()) as ArrayRef
+                    };
+
+                let mut user_columns = Vec::new();
+                let mut user_fields = Vec::new();
+
+                for (i, field) in batch.schema().fields().iter().enumerate() {
+                    let name = field.name();
+                    if name != ROW_ID_COLUMN_NAME
+                        && name != CREATED_BY_COLUMN_NAME
+                        && name != DELETED_BY_COLUMN_NAME
+                    {
+                        user_columns.push(batch.column(i).clone());
+                        user_fields.push(field.clone());
+                    }
+                }
+
+                let mut new_columns = Vec::with_capacity(3 + user_columns.len());
+                new_columns.push(row_id_array);
+                new_columns.push(created_by_array);
+                new_columns.push(deleted_by_array);
+                new_columns.extend(user_columns);
+
+                let mut new_fields = Vec::with_capacity(3 + user_fields.len());
+                new_fields.push(Arc::new(arrow::datatypes::Field::new(
+                    ROW_ID_COLUMN_NAME,
+                    arrow::datatypes::DataType::UInt64,
+                    false,
+                )));
+                new_fields.push(Arc::new(arrow::datatypes::Field::new(
+                    CREATED_BY_COLUMN_NAME,
+                    arrow::datatypes::DataType::UInt64,
+                    false,
+                )));
+                new_fields.push(Arc::new(arrow::datatypes::Field::new(
+                    DELETED_BY_COLUMN_NAME,
+                    arrow::datatypes::DataType::UInt64,
+                    true,
+                )));
+                new_fields.extend(user_fields);
+
+                let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
+                let new_batch = RecordBatch::try_new(new_schema, new_columns)?;
+                batches_to_write.push(new_batch);
             } else {
                 // Generate row_ids
                 let mut builder = UInt64Builder::with_capacity(batch_rows);
@@ -131,16 +204,57 @@ where
                 }
                 let row_id_array = Arc::new(builder.finish()) as ArrayRef;
 
-                // Add row_id column to batch
-                let mut new_columns = batch.columns().to_vec();
-                let mut new_fields = batch.schema().fields().to_vec();
+                // Generate created_by (0)
+                let mut created_by_builder = UInt64Builder::with_capacity(batch_rows);
+                for _ in 0..batch_rows {
+                    created_by_builder.append_value(0);
+                }
+                let created_by_array = Arc::new(created_by_builder.finish()) as ArrayRef;
 
+                // Generate deleted_by (0)
+                let mut deleted_by_builder = UInt64Builder::with_capacity(batch_rows);
+                for _ in 0..batch_rows {
+                    deleted_by_builder.append_value(0);
+                }
+                let deleted_by_array = Arc::new(deleted_by_builder.finish()) as ArrayRef;
+
+                // Extract user columns
+                let mut user_columns = Vec::new();
+                let mut user_fields = Vec::new();
+                for (i, field) in batch.schema().fields().iter().enumerate() {
+                    let name = field.name();
+                    if name != ROW_ID_COLUMN_NAME
+                        && name != CREATED_BY_COLUMN_NAME
+                        && name != DELETED_BY_COLUMN_NAME
+                    {
+                        user_columns.push(batch.column(i).clone());
+                        user_fields.push(field.clone());
+                    }
+                }
+
+                let mut new_columns = Vec::with_capacity(3 + user_columns.len());
+                new_columns.push(row_id_array);
+                new_columns.push(created_by_array);
+                new_columns.push(deleted_by_array);
+                new_columns.extend(user_columns);
+
+                let mut new_fields = Vec::with_capacity(3 + user_fields.len());
                 new_fields.push(Arc::new(arrow::datatypes::Field::new(
                     ROW_ID_COLUMN_NAME,
                     arrow::datatypes::DataType::UInt64,
                     false,
                 )));
-                new_columns.push(row_id_array);
+                new_fields.push(Arc::new(arrow::datatypes::Field::new(
+                    CREATED_BY_COLUMN_NAME,
+                    arrow::datatypes::DataType::UInt64,
+                    false,
+                )));
+                new_fields.push(Arc::new(arrow::datatypes::Field::new(
+                    DELETED_BY_COLUMN_NAME,
+                    arrow::datatypes::DataType::UInt64,
+                    true,
+                )));
+                new_fields.extend(user_fields);
 
                 let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
                 let new_batch = RecordBatch::try_new(new_schema, new_columns)?;

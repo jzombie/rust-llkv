@@ -78,6 +78,16 @@ where
                                 bitcode::decode(bytes).map_err(|e| {
                                     LlkvError::Internal(format!("failed to decode catalog: {}", e))
                                 })?;
+                            // Ensure backend field is populated for legacy metadata
+                            let all_metadata = all_metadata
+                                .into_iter()
+                                .map(|mut m| {
+                                    if m.backend.is_empty() {
+                                        m.backend = "columnstore".to_string();
+                                    }
+                                    m
+                                })
+                                .collect();
                             return Ok(all_metadata);
                         }
                     }

@@ -14,6 +14,7 @@ datafusion = { workspace = true }
 datafusion-catalog = { workspace = true }
 llkv-column-map.workspace = true
 llkv-fusion = { workspace = true }
+llkv-parquet-store = { workspace = true }
 llkv-plan = { workspace = true }
 llkv-result = { workspace = true }
 llkv-storage = { workspace = true }

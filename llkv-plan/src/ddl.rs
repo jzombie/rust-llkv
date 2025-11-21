@@ -21,6 +21,7 @@ pub struct CreateTableExec {
     schema: SchemaRef,
     input: Option<Arc<dyn ExecutionPlan>>,
     if_not_exists: bool,
+    backend_name: Option<String>,
     properties: PlanProperties,
 }
 
@@ -29,6 +30,7 @@ impl fmt::Debug for CreateTableExec {
         f.debug_struct("CreateTableExec")
             .field("table_name", &self.table_name)
             .field("if_not_exists", &self.if_not_exists)
+            .field("backend_name", &self.backend_name)
             .finish_non_exhaustive()
     }
 }
@@ -40,6 +42,7 @@ impl CreateTableExec {
         schema: SchemaRef,
         input: Option<Arc<dyn ExecutionPlan>>,
         if_not_exists: bool,
+        backend_name: Option<String>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -53,6 +56,7 @@ impl CreateTableExec {
             schema,
             input,
             if_not_exists,
+            backend_name,
             properties,
         }
     }
@@ -108,6 +112,7 @@ impl ExecutionPlan for CreateTableExec {
             Arc::clone(&self.schema),
             input,
             self.if_not_exists,
+            self.backend_name.clone(),
         )))
     }
 
@@ -119,10 +124,13 @@ impl ExecutionPlan for CreateTableExec {
         let catalog = Arc::clone(&self.catalog);
         let table_name = self.table_name.clone();
         let schema = Arc::clone(&self.schema);
+        let schema_adapter = Arc::clone(&self.schema);
         let input = self.input.clone();
         let if_not_exists = self.if_not_exists;
+        let backend_name = self.backend_name.clone();
 
         let stream = futures::stream::once(async move {
+            println!("CreateTableExec: executing for table {}", table_name);
             // 1. Check if table exists
             if if_not_exists
                 && catalog
@@ -135,7 +143,7 @@ impl ExecutionPlan for CreateTableExec {
 
             // 2. Create table
             let mut builder = catalog
-                .create_table(&table_name, Arc::clone(&schema))
+                .create_table(&table_name, Arc::clone(&schema), backend_name.as_deref())
                 .map_err(|e| datafusion::error::DataFusionError::Internal(e.to_string()))?;
 
             // 3. If CTAS, execute input and append
@@ -159,7 +167,7 @@ impl ExecutionPlan for CreateTableExec {
 
         Ok(Box::pin(
             datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                Arc::clone(&self.schema),
+                schema_adapter,
                 Box::pin(stream),
             ),
         ))

@@ -21,6 +21,7 @@ llkv-column-map = { workspace = true }
 llkv-storage = { workspace = true }
 llkv-table = { workspace = true }
 llkv-result = { workspace = true }
+simd-r-drive-entry-handle = { workspace = true }
 
 
 [dev-dependencies]

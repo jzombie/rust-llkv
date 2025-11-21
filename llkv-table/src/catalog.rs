@@ -48,6 +48,8 @@ pub struct TableMetadata {
     pub logical_fields: Vec<u64>,
     /// Row IDs that exist in this table.
     pub row_ids: Vec<RowId>,
+    /// The storage backend used for this table (e.g., "columnstore", "parquet").
+    pub backend: String,
 }
 
 struct CatalogHook {
@@ -79,7 +81,9 @@ impl TableEventListener for CatalogHook {
 /// allowing tables to be discovered and reconstructed across process restarts.
 /// All operations are thread-safe via interior mutability.
 pub struct TableCatalog {
-    backend: Box<dyn CatalogBackend>,
+    metadata_backend: Box<dyn CatalogBackend>,
+    data_backends: HashMap<String, Box<dyn CatalogBackend>>,
+    default_backend: String,
     /// In-memory cache of table metadata, indexed by table name.
     tables: RwLock<HashMap<String, TableMetadata>>,
     /// Counter for assigning new table IDs (starts at 1, 0 is reserved).
@@ -87,10 +91,23 @@ pub struct TableCatalog {
 }
 
 impl TableCatalog {
-    /// Create a new table catalog with the given backend.
-    pub fn new(backend: Box<dyn CatalogBackend>) -> LlkvResult<Arc<Self>> {
+    /// Create a new table catalog with the given backends.
+    pub fn new(
+        metadata_backend: Box<dyn CatalogBackend>,
+        data_backends: HashMap<String, Box<dyn CatalogBackend>>,
+        default_backend: String,
+    ) -> LlkvResult<Arc<Self>> {
+        if !data_backends.contains_key(&default_backend) {
+            return Err(LlkvError::InvalidArgumentError(format!(
+                "default backend '{}' not found in data backends",
+                default_backend
+            )));
+        }
+
         let mut catalog = Self {
-            backend,
+            metadata_backend,
+            data_backends,
+            default_backend,
             tables: RwLock::new(HashMap::new()),
             next_table_id: RwLock::new(1),
         };
@@ -103,6 +120,7 @@ impl TableCatalog {
         self: &Arc<Self>,
         name: &str,
         schema: SchemaRef,
+        backend_name: Option<&str>,
     ) -> LlkvResult<Box<dyn TableBuilder>> {
         // Check if table already exists
         {
@@ -114,6 +132,11 @@ impl TableCatalog {
                 )));
             }
         }
+
+        let backend_key = backend_name.unwrap_or(&self.default_backend);
+        let backend = self.data_backends.get(backend_key).ok_or_else(|| {
+            LlkvError::InvalidArgumentError(format!("backend '{}' not found", backend_key))
+        })?;
 
         // Allocate a new table ID
         let table_id = {
@@ -127,12 +150,8 @@ impl TableCatalog {
 
         // Create the builder via backend
         let listener = Arc::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
-        let builder = self.backend.create_table_builder(
-            table_id as u64,
-            name,
-            schema.clone(),
-            Some(listener),
-        )?;
+        let builder =
+            backend.create_table_builder(table_id as u64, name, schema.clone(), Some(listener))?;
 
         // Store initial metadata (empty row_ids)
         let schema_bytes = Self::serialize_schema(schema.as_ref())?;
@@ -144,6 +163,7 @@ impl TableCatalog {
                 .map(|fid| LogicalFieldId::for_user(table_id, fid).into())
                 .collect(),
             row_ids: Vec::new(),
+            backend: backend_key.to_string(),
         };
 
         {
@@ -167,8 +187,21 @@ impl TableCatalog {
 
         let listener = Arc::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
 
+        let backend_key = if metadata.backend.is_empty() {
+            &self.default_backend
+        } else {
+            &metadata.backend
+        };
+
+        let backend = self.data_backends.get(backend_key).ok_or_else(|| {
+            LlkvError::Internal(format!(
+                "backend '{}' not found for table '{}'",
+                backend_key, name
+            ))
+        })?;
+
         // We need to pass row_ids to the backend so it can construct the provider
-        let provider = self.backend.get_table_provider(
+        let provider = backend.get_table_provider(
             metadata.table_id as u64,
             schema,
             &metadata.row_ids,
@@ -191,8 +224,20 @@ impl TableCatalog {
         // We attach the listener to ensure row counts are updated
         let listener = Arc::new(CatalogHook::new(name.to_string(), Arc::downgrade(self)));
 
-        self.backend
-            .create_table_builder(metadata.table_id as u64, name, schema, Some(listener))
+        let backend_key = if metadata.backend.is_empty() {
+            &self.default_backend
+        } else {
+            &metadata.backend
+        };
+
+        let backend = self.data_backends.get(backend_key).ok_or_else(|| {
+            LlkvError::Internal(format!(
+                "backend '{}' not found for table '{}'",
+                backend_key, name
+            ))
+        })?;
+
+        backend.create_table_builder(metadata.table_id as u64, name, schema, Some(listener))
     }
 
     /// List all table names in the catalog.
@@ -212,8 +257,20 @@ impl TableCatalog {
             return Ok(false);
         };
 
-        self.backend
-            .drop_table(metadata.table_id as u64, &metadata.logical_fields)?;
+        let backend_key = if metadata.backend.is_empty() {
+            &self.default_backend
+        } else {
+            &metadata.backend
+        };
+
+        let backend = self.data_backends.get(backend_key).ok_or_else(|| {
+            LlkvError::Internal(format!(
+                "backend '{}' not found for table '{}'",
+                backend_key, name
+            ))
+        })?;
+
+        backend.drop_table(metadata.table_id as u64, &metadata.logical_fields)?;
 
         let mut tables = self.tables.write().unwrap();
         tables.remove(name);
@@ -225,30 +282,16 @@ impl TableCatalog {
     /// Update table metadata after rows have been appended.
     pub fn update_table_rows(&self, name: &str, new_row_ids: Vec<RowId>) -> LlkvResult<()> {
         let mut tables = self.tables.write().unwrap();
-        let metadata = tables.get_mut(name).ok_or_else(|| {
-            LlkvError::InvalidArgumentError(format!("table '{}' not found", name))
-        })?;
-
-        metadata.row_ids.extend(new_row_ids);
+        if let Some(metadata) = tables.get_mut(name) {
+            metadata.row_ids.extend(new_row_ids);
+        } else {
+            return Err(LlkvError::Internal(format!(
+                "cannot update rows for unknown table '{}'",
+                name
+            )));
+        }
         drop(tables);
-
         self.persist_metadata()
-    }
-
-    /// Create a sort index on a column.
-    pub fn create_index(
-        &self,
-        _table_name: &str,
-        _column_name: &str,
-        _index_name: Option<&str>,
-        _unique: bool,
-        _if_not_exists: bool,
-    ) -> LlkvResult<()> {
-        // TODO: Add index support to CatalogBackend trait
-        // For now, this is a no-op or returns error
-        Err(LlkvError::Internal(
-            "Index creation not yet supported in decoupled catalog".into(),
-        ))
     }
 
     /// Create a multi-column index (metadata only).
@@ -265,7 +308,7 @@ impl TableCatalog {
 
     /// Load catalog metadata from the backend.
     fn load_metadata(&mut self) -> LlkvResult<()> {
-        let all_metadata = self.backend.load_metadata()?;
+        let all_metadata = self.metadata_backend.load_metadata()?;
 
         let mut tables = self.tables.write().unwrap();
         let mut max_table_id: TableId = 0;
@@ -289,7 +332,7 @@ impl TableCatalog {
         let all_metadata: Vec<TableMetadata> = tables.values().cloned().collect();
         drop(tables);
 
-        self.backend.persist_metadata(&all_metadata)
+        self.metadata_backend.persist_metadata(&all_metadata)
     }
 
     fn serialize_schema(schema: &Schema) -> LlkvResult<Vec<u8>> {
@@ -361,20 +404,13 @@ impl SchemaProvider for LlkvSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        // We intercept registration to create the table in our catalog instead of letting DataFusion use MemTable.
-        // Note: This only works for empty tables (CREATE TABLE). 
-        // CTAS (CREATE TABLE AS SELECT) would require copying data, which we can't do easily here synchronously.
-        // Ideally, we should intercept the logical plan, but DataFusion seems to bypass the planner for DDL.
-        
+        // Handle CREATE TABLE (default backend)
         let schema = table.schema();
-        
-        let mut builder = self.catalog.create_table(&name, schema)
+        let _ = self
+            .catalog
+            .create_table(&name, schema, None)
             .map_err(|e| DataFusionError::Internal(e.to_string()))?;
-            
-        let provider = builder.finish()
-            .map_err(|e| DataFusionError::Internal(e.to_string()))?;
-            
-        Ok(Some(provider))
+        Ok(None)
     }
 
     fn deregister_table(&self, _name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {

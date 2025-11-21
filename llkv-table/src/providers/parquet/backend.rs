@@ -51,6 +51,7 @@ where
                         schema_bytes,
                         logical_fields: Vec::new(),
                         row_ids: Vec::new(),
+                        backend: "parquet".to_string(),
                     });
                 }
             }

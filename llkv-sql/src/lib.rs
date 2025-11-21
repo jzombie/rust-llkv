@@ -6,6 +6,7 @@
 //! are delegated to a `SessionContext` that uses [`LlkvQueryPlanner`] for scan
 //! planning, keeping LLKV storage as the backing store.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
@@ -13,11 +14,14 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use llkv_column_map::store::ColumnStore;
+use llkv_parquet_store::ParquetStore;
 use llkv_plan::LlkvQueryPlanner;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::{LlkvSchemaProvider, TableCatalog};
 use llkv_table::providers::column_map::ColumnStoreBackend;
+use llkv_table::providers::parquet::ParquetStoreBackend;
+use llkv_table::traits::CatalogBackend;
 
 /// Result of executing a SQL statement.
 #[derive(Debug)]
@@ -37,9 +41,20 @@ pub struct SqlEngine {
 impl SqlEngine {
     /// Create a new SQL engine backed by the provided pager.
     pub fn new(pager: Arc<BoxedPager>) -> Result<Self> {
-        let store = Arc::new(ColumnStore::open(pager)?);
-        let backend = Box::new(ColumnStoreBackend::new(store));
-        let catalog = TableCatalog::new(backend)?;
+        let store = Arc::new(ColumnStore::open(Arc::clone(&pager))?);
+        let metadata_backend = Box::new(ColumnStoreBackend::new(Arc::clone(&store)));
+
+        let parquet_store = Arc::new(ParquetStore::open(Arc::clone(&pager))?);
+        let parquet_backend = Box::new(ParquetStoreBackend::new(parquet_store));
+
+        let mut data_backends: HashMap<String, Box<dyn CatalogBackend>> = HashMap::new();
+        data_backends.insert(
+            "columnstore".to_string(),
+            Box::new(ColumnStoreBackend::new(Arc::clone(&store))),
+        );
+        data_backends.insert("parquet".to_string(), parquet_backend);
+
+        let catalog = TableCatalog::new(metadata_backend, data_backends, "parquet".to_string())?;
 
         let session_state = SessionStateBuilder::new()
             .with_default_features()
@@ -82,6 +97,9 @@ impl SqlEngine {
             .sql(sql)
             .await
             .map_err(|e| map_datafusion_error("DataFusion planning failed", e))?;
+
+        println!("Logical Plan: {:?}", df.logical_plan());
+
         let schema_is_empty = df.schema().fields().is_empty();
 
         let batches = df
