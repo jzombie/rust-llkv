@@ -18,7 +18,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use indoc::indoc;
-use llkv_sql::SqlEngine;
+use llkv_sql::{PreparedStatement, SqlEngine};
 use llkv_storage::pager::{BoxedPager, MemPager};
 use rustc_hash::FxHashMap;
 
@@ -391,7 +391,16 @@ async fn main() -> Result<()> {
     engine.execute(SETUP_SQL).await?;
     let params = fetch_params(&engine).await?;
     insert_initial_state(&engine, &params).await?;
-    let mut state = fetch_state(&engine).await?;
+
+    let fetch_state_sql = indoc::formatdoc! {"
+        SELECT tick, ax, bx, ball_x, ball_y, vx, vy, score_a, score_b 
+        FROM state 
+        WHERE id = {STATE_ROW_ID} 
+        LIMIT 1;
+    "};
+    let fetch_state_stmt = engine.prepare(&fetch_state_sql).await?;
+
+    let mut state = fetch_state(&fetch_state_stmt).await?;
 
     enable_raw_mode()?;
     let mut out = stdout();
@@ -408,6 +417,9 @@ async fn main() -> Result<()> {
     let mut perf = PerfStats::default();
 
     let tick_stmt = engine.prepare(tick_sql_template()).await?;
+
+    // Pre-load digit patterns
+    let digit_patterns = load_digit_patterns(&engine).await?;
 
     loop {
         let frame_start = Instant::now();
@@ -449,7 +461,7 @@ async fn main() -> Result<()> {
         let update_start = Instant::now();
         let previous_state = state;
         tick_stmt.execute().await?;
-        let updated_state = fetch_state(&engine).await?;
+        let updated_state = fetch_state(&fetch_state_stmt).await?;
         let update_time = update_start.elapsed();
 
         let point_to = if updated_state.score_a > previous_state.score_a {
@@ -468,6 +480,7 @@ async fn main() -> Result<()> {
             &engine,
             &params,
             &state,
+            &digit_patterns,
             fps,
             sound_enabled,
             max_mode,
@@ -544,16 +557,9 @@ async fn insert_initial_state(engine: &SqlEngine, _params: &Params) -> Result<()
     Ok(())
 }
 
-async fn fetch_state(engine: &SqlEngine) -> Result<State> {
-    let results = engine
-        .execute(&indoc::formatdoc! {"
-        SELECT tick, ax, bx, ball_x, ball_y, vx, vy, score_a, score_b 
-        FROM state 
-        WHERE id = {STATE_ROW_ID} 
-        LIMIT 1;
-    "})
-        .await?;
-    let batches = extract_batches(results)?;
+async fn fetch_state(stmt: &PreparedStatement) -> Result<State> {
+    let batches = stmt.execute().await?;
+    let batches = extract_batches_from_batches(batches)?;
     let batch = first_batch(&batches)?;
     ensure_single_row(&batch)?;
     Ok(State {
@@ -565,6 +571,10 @@ async fn fetch_state(engine: &SqlEngine) -> Result<State> {
         score_a: value_at(&batch, 7),
         score_b: value_at(&batch, 8),
     })
+}
+
+fn extract_batches_from_batches(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    Ok(batches)
 }
 
 fn extract_batches(results: Vec<llkv_sql::SqlStatementResult>) -> Result<Vec<RecordBatch>> {
@@ -629,6 +639,14 @@ fn build_field_lines(params: &Params, state: &State) -> Vec<String> {
     lines
 }
 
+async fn load_digit_patterns(engine: &SqlEngine) -> Result<Vec<Vec<String>>> {
+    let mut patterns = Vec::with_capacity(10);
+    for i in 0..10 {
+        patterns.push(fetch_digit_patterns(engine, i).await?);
+    }
+    Ok(patterns)
+}
+
 async fn fetch_digit_patterns(engine: &SqlEngine, digit: usize) -> Result<Vec<String>> {
     if digit > 9 {
         return Ok(vec![]);
@@ -676,14 +694,17 @@ async fn fetch_digit_patterns(engine: &SqlEngine, digit: usize) -> Result<Vec<St
 }
 
 async fn draw_digit(
-    engine: &SqlEngine,
+    digit_patterns: &[Vec<String>],
     buf: &mut Vec<HudCell>,
     digit: usize,
     y: u16,
     x: u16,
     color: Color,
 ) -> Result<()> {
-    let patterns = fetch_digit_patterns(engine, digit).await?;
+    if digit >= digit_patterns.len() {
+        return Ok(());
+    }
+    let patterns = &digit_patterns[digit];
     for (i, pattern) in patterns.iter().enumerate() {
         let text = pattern.replace('F', &FULL_BLOCK.to_string());
         buf.push(HudCell {
@@ -702,6 +723,7 @@ async fn render_frame(
     engine: &SqlEngine,
     params: &Params,
     state: &State,
+    digit_patterns: &[Vec<String>],
     fps: u32,
     sound_enabled: bool,
     max_mode: bool,
@@ -720,7 +742,7 @@ async fn render_frame(
     for (idx, ch) in score_a_str.chars().enumerate() {
         let digit = ch.to_digit(10).unwrap() as usize;
         draw_digit(
-            engine,
+            digit_patterns,
             &mut hud,
             digit,
             2,
@@ -734,7 +756,7 @@ async fn render_frame(
     for (idx, ch) in score_b_str.chars().enumerate() {
         let digit = ch.to_digit(10).unwrap() as usize;
         draw_digit(
-            engine,
+            digit_patterns,
             &mut hud,
             digit,
             2,
