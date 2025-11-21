@@ -186,41 +186,45 @@ async fn assert_parity(
         arrow::util::pretty::print_batches(&[batch.clone()]).unwrap();
     }
 
-    // Strip metadata from ColumnMap results for comparison
-    let results_cm_clean: Vec<RecordBatch> = results_cm
-        .iter()
-        .map(|batch| {
-            // The ColumnMap provider currently leaks the system `row_id` column
-            // and attaches internal metadata (like field IDs) to the schema.
-            // We strip these out here to ensure a clean comparison with the Parquet
-            // results, which match the user's logical schema.
-            let fields: Vec<Field> = batch
-                .schema()
-                .fields()
-                .iter()
-                .filter(|f| f.name() != ROW_ID_COLUMN_NAME)
-                .map(|f| {
-                    let mut f = f.as_ref().clone();
-                    f.set_metadata(std::collections::HashMap::new());
-                    f
-                })
-                .collect();
+    // Strip metadata and system columns from results for comparison
+    let clean_batches = |batches: Vec<RecordBatch>| -> Vec<RecordBatch> {
+        batches
+            .iter()
+            .map(|batch| {
+                // The providers might leak the system `row_id` column
+                // and attach internal metadata (like field IDs) to the schema.
+                // We strip these out here to ensure a clean comparison.
+                let fields: Vec<Field> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .filter(|f| f.name() != ROW_ID_COLUMN_NAME)
+                    .map(|f| {
+                        let mut f = f.as_ref().clone();
+                        f.set_metadata(std::collections::HashMap::new());
+                        f
+                    })
+                    .collect();
 
-            let columns: Vec<ArrayRef> = batch
-                .columns()
-                .iter()
-                .zip(batch.schema().fields())
-                .filter(|(_, f)| f.name() != ROW_ID_COLUMN_NAME)
-                .map(|(c, _)| c.clone())
-                .collect();
+                let columns: Vec<ArrayRef> = batch
+                    .columns()
+                    .iter()
+                    .zip(batch.schema().fields())
+                    .filter(|(_, f)| f.name() != ROW_ID_COLUMN_NAME)
+                    .map(|(c, _)| c.clone())
+                    .collect();
 
-            let schema = Arc::new(Schema::new(fields));
-            RecordBatch::try_new(schema, columns).unwrap()
-        })
-        .collect();
+                let schema = Arc::new(Schema::new(fields));
+                RecordBatch::try_new(schema, columns).unwrap()
+            })
+            .collect()
+    };
+
+    let results_cm_clean = clean_batches(results_cm);
+    let results_pq_clean = clean_batches(results_pq);
 
     assert_eq!(
-        results_cm_clean, results_pq,
+        results_cm_clean, results_pq_clean,
         "Mismatch for query: {}",
         query_suffix
     );

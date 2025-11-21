@@ -18,6 +18,7 @@
 //!   scan-sized chunks and surfacing them through a
 //!   [`datafusion_datasource::memory::MemorySourceConfig`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ use async_trait::async_trait;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use llkv_storage::pager::BoxedPager;
 use llkv_table::catalog::TableCatalog;
+use llkv_table::traits::CatalogBackend;
 
 pub use llkv_table::{
     ColumnMapTableBuilder, ColumnMapTableProvider, LlkvTableBuilder, LlkvTableProvider,
@@ -303,6 +305,8 @@ mod persistence_tests {
     use arrow::util::pretty::pretty_format_batches;
     use datafusion::prelude::SessionContext;
     use llkv_storage::pager::MemPager;
+    use llkv_table::traits::CatalogBackend;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -317,8 +321,14 @@ mod persistence_tests {
         // Inner scope 1: Create table schema, insert data, then drop everything except pager
         {
             let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("store"));
-            let backend = Box::new(ColumnStoreBackend::new(store));
-            let catalog = TableCatalog::new(backend).expect("open catalog");
+            let backend = Box::new(ColumnStoreBackend::new(store.clone()));
+            let mut data_backends = HashMap::new();
+            data_backends.insert(
+                "default".to_string(),
+                Box::new(ColumnStoreBackend::new(store)) as Box<dyn CatalogBackend>,
+            );
+            let catalog = TableCatalog::new(backend, data_backends, "default".to_string())
+                .expect("open catalog");
 
             let users_schema = Arc::new(Schema::new(vec![
                 Field::new("user_id", DataType::UInt64, false),
@@ -337,7 +347,7 @@ mod persistence_tests {
             .expect("users batch");
 
             let mut users_builder = catalog
-                .create_table("users", users_schema)
+                .create_table("users", users_schema, None)
                 .expect("create users table");
 
             users_builder
@@ -372,8 +382,14 @@ mod persistence_tests {
         // Inner scope 2: Reopen the catalog with the same pager and verify data persists
         {
             let store = Arc::new(ColumnStore::open(Arc::clone(&pager)).expect("reopen store"));
-            let backend = Box::new(ColumnStoreBackend::new(store));
-            let catalog = TableCatalog::new(backend).expect("reopen catalog");
+            let backend = Box::new(ColumnStoreBackend::new(store.clone()));
+            let mut data_backends = HashMap::new();
+            data_backends.insert(
+                "default".to_string(),
+                Box::new(ColumnStoreBackend::new(store)) as Box<dyn CatalogBackend>,
+            );
+            let catalog = TableCatalog::new(backend, data_backends, "default".to_string())
+                .expect("reopen catalog");
 
             // List tables to verify it was persisted
             let tables = catalog.list_tables();
@@ -433,8 +449,15 @@ mod persistence_tests {
         let sales_pager = Arc::new(SimdRDrivePager::open(&sales_path).expect("open sales pager"));
         let sales_store =
             Arc::new(ColumnStore::open(Arc::clone(&sales_pager)).expect("open sales store"));
-        let sales_backend = Box::new(ColumnStoreBackend::new(sales_store));
-        let sales_catalog = TableCatalog::new(sales_backend).expect("open sales catalog");
+        let sales_backend = Box::new(ColumnStoreBackend::new(sales_store.clone()));
+        let mut sales_data_backends = HashMap::new();
+        sales_data_backends.insert(
+            "default".to_string(),
+            Box::new(ColumnStoreBackend::new(sales_store)) as Box<dyn CatalogBackend>,
+        );
+        let sales_catalog =
+            TableCatalog::new(sales_backend, sales_data_backends, "default".to_string())
+                .expect("open sales catalog");
 
         let orders_schema = Arc::new(Schema::new(vec![
             Field::new("order_id", DataType::UInt64, false),
@@ -455,7 +478,7 @@ mod persistence_tests {
         .expect("orders batch");
 
         let mut orders_builder = sales_catalog
-            .create_table("orders", orders_schema)
+            .create_table("orders", orders_schema, None)
             .expect("create orders table");
 
         orders_builder
@@ -475,9 +498,18 @@ mod persistence_tests {
         let inventory_store = Arc::new(
             ColumnStore::open(Arc::clone(&inventory_pager)).expect("open inventory store"),
         );
-        let inventory_backend = Box::new(ColumnStoreBackend::new(inventory_store));
-        let inventory_catalog =
-            TableCatalog::new(inventory_backend).expect("open inventory catalog");
+        let inventory_backend = Box::new(ColumnStoreBackend::new(inventory_store.clone()));
+        let mut inventory_data_backends = HashMap::new();
+        inventory_data_backends.insert(
+            "default".to_string(),
+            Box::new(ColumnStoreBackend::new(inventory_store)) as Box<dyn CatalogBackend>,
+        );
+        let inventory_catalog = TableCatalog::new(
+            inventory_backend,
+            inventory_data_backends,
+            "default".to_string(),
+        )
+        .expect("open inventory catalog");
 
         let products_schema = Arc::new(Schema::new(vec![
             Field::new("product_id", DataType::UInt64, false),
@@ -496,7 +528,7 @@ mod persistence_tests {
         .expect("products batch");
 
         let mut products_builder = inventory_catalog
-            .create_table("products", products_schema)
+            .create_table("products", products_schema, None)
             .expect("create products table");
 
         products_builder
@@ -611,15 +643,30 @@ mod persistence_tests {
         drop(inventory_catalog);
 
         let sales_store = Arc::new(ColumnStore::open(sales_pager).expect("reopen sales store"));
-        let sales_backend = Box::new(ColumnStoreBackend::new(sales_store));
+        let sales_backend = Box::new(ColumnStoreBackend::new(sales_store.clone()));
+        let mut sales_data_backends = HashMap::new();
+        sales_data_backends.insert(
+            "default".to_string(),
+            Box::new(ColumnStoreBackend::new(sales_store)) as Box<dyn CatalogBackend>,
+        );
         let sales_catalog_reopened =
-            TableCatalog::new(sales_backend).expect("reopen sales catalog");
+            TableCatalog::new(sales_backend, sales_data_backends, "default".to_string())
+                .expect("reopen sales catalog");
 
         let inventory_store =
             Arc::new(ColumnStore::open(inventory_pager).expect("reopen inventory store"));
-        let inventory_backend = Box::new(ColumnStoreBackend::new(inventory_store));
-        let inventory_catalog_reopened =
-            TableCatalog::new(inventory_backend).expect("reopen inventory catalog");
+        let inventory_backend = Box::new(ColumnStoreBackend::new(inventory_store.clone()));
+        let mut inventory_data_backends = HashMap::new();
+        inventory_data_backends.insert(
+            "default".to_string(),
+            Box::new(ColumnStoreBackend::new(inventory_store)) as Box<dyn CatalogBackend>,
+        );
+        let inventory_catalog_reopened = TableCatalog::new(
+            inventory_backend,
+            inventory_data_backends,
+            "default".to_string(),
+        )
+        .expect("reopen inventory catalog");
 
         // Verify tables are still in the catalogs
         let sales_tables = sales_catalog_reopened.list_tables();
