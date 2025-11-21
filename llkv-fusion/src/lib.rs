@@ -34,20 +34,6 @@ mod tests {
     use llkv_storage::pager::MemPager;
     use std::sync::Arc;
 
-    fn build_demo_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::UInt64, false),
-            Field::new("score", DataType::Int32, false),
-            Field::new("status", DataType::Utf8, true),
-        ]));
-
-        let user_ids = Arc::new(UInt64Array::from(vec![1_u64, 2, 3]));
-        let scores = Arc::new(Int32Array::from(vec![42, 7, 99]));
-        let statuses = Arc::new(StringArray::from(vec![Some("active"), None, Some("vip")]));
-
-        RecordBatch::try_new(schema, vec![user_ids, scores, statuses]).expect("batch")
-    }
-
     #[tokio::test]
     async fn datafusion_joins_llkv_tables() {
         let pager = Arc::new(MemPager::default());
