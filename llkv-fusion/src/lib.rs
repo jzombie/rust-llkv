@@ -18,16 +18,6 @@
 //!   scan-sized chunks and surfacing them through a
 //!   [`datafusion_datasource::memory::MemorySourceConfig`].
 
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use datafusion::common::{DataFusionError, Result as DataFusionResult};
-use llkv_storage::pager::BoxedPager;
-use llkv_table::catalog::TableCatalog;
-use llkv_table::traits::CatalogBackend;
-
 pub use llkv_table::{
     ColumnMapTableBuilder, ColumnMapTableProvider, LlkvTableBuilder, LlkvTableProvider,
 };
@@ -42,6 +32,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use llkv_column_map::store::ColumnStore;
     use llkv_storage::pager::MemPager;
+    use std::sync::Arc;
 
     fn build_demo_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
