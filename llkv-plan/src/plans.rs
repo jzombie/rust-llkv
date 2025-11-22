@@ -822,6 +822,10 @@ pub struct SelectPlan {
     pub group_by: Vec<String>,
     /// Optional value table output mode (BigQuery style).
     pub value_table_mode: Option<ValueTableMode>,
+    /// Optional LIMIT count.
+    pub limit: Option<usize>,
+    /// Optional OFFSET count.
+    pub offset: Option<usize>,
 }
 
 impl SelectPlan {
@@ -854,6 +858,8 @@ impl SelectPlan {
             compound: None,
             group_by: Vec::new(),
             value_table_mode: None,
+            limit: None,
+            offset: None,
         }
     }
 
@@ -876,6 +882,8 @@ impl SelectPlan {
             compound: None,
             group_by: Vec::new(),
             value_table_mode: None,
+            limit: None,
+            offset: None,
         }
     }
 

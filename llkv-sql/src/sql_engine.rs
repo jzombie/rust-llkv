@@ -132,6 +132,66 @@ impl ParameterState {
     }
 }
 
+fn extract_limit_offset(
+    limit_clause: &sqlparser::ast::LimitClause,
+) -> SqlResult<(Option<usize>, Option<usize>)> {
+    use sqlparser::ast::LimitClause;
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if !limit_by.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "LIMIT BY is not supported".into(),
+                ));
+            }
+            let limit_val = if let Some(expr) = limit {
+                extract_usize_from_expr(expr, "LIMIT")?
+            } else {
+                None
+            };
+            let offset_val = if let Some(offset_struct) = offset {
+                extract_usize_from_expr(&offset_struct.value, "OFFSET")?
+            } else {
+                None
+            };
+            Ok((limit_val, offset_val))
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            let offset_val = extract_usize_from_expr(offset, "OFFSET")?;
+            let limit_val = extract_usize_from_expr(limit, "LIMIT")?;
+            Ok((limit_val, offset_val))
+        }
+    }
+}
+
+fn extract_usize_from_expr(expr: &sqlparser::ast::Expr, context: &str) -> SqlResult<Option<usize>> {
+    use sqlparser::ast::{Expr, Value};
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(text, _) => {
+                let parsed = text.parse::<i64>().map_err(|_| {
+                    Error::InvalidArgumentError(format!("{} must be an integer", context).into())
+                })?;
+                if parsed < 0 {
+                    return Err(Error::InvalidArgumentError(
+                        format!("{} must be non-negative", context).into(),
+                    ));
+                }
+                Ok(Some(parsed as usize))
+            }
+            _ => Err(Error::InvalidArgumentError(
+                format!("{} must be a constant integer", context).into(),
+            )),
+        },
+        _ => Err(Error::InvalidArgumentError(
+            format!("{} must be a constant integer", context).into(),
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SubqueryMaterializationMode {
     ExecuteScalarSubqueries,
@@ -5876,6 +5936,13 @@ impl SqlEngine {
             let order_plan = self.translate_order_by(&resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(order_plan);
         }
+
+        if let Some(limit_clause) = &query.limit_clause {
+            let (limit, offset) = extract_limit_offset(limit_clause)?;
+            select_plan.limit = limit;
+            select_plan.offset = offset;
+        }
+
         Ok(select_plan)
     }
 
@@ -5919,6 +5986,13 @@ impl SqlEngine {
             let order_plan = self.translate_order_by(resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(order_plan);
         }
+
+        if let Some(limit_clause) = &query.limit_clause {
+            let (limit, offset) = extract_limit_offset(limit_clause)?;
+            select_plan.limit = limit;
+            select_plan.offset = offset;
+        }
+
         Ok(select_plan)
     }
 

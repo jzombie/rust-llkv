@@ -530,43 +530,41 @@ where
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
-        if plan.compound.is_some() {
-            return self.execute_compound_select(plan, row_filter);
-        }
+        let limit = plan.limit;
+        let offset = plan.offset;
 
-        // Handle SELECT without FROM clause (e.g., SELECT 42, SELECT {'a': 1})
-        if plan.tables.is_empty() {
-            return self.execute_select_without_table(plan);
-        }
-
-        if !plan.group_by.is_empty() {
+        let execution = if plan.compound.is_some() {
+            self.execute_compound_select(plan, row_filter)?
+        } else if plan.tables.is_empty() {
+            self.execute_select_without_table(plan)?
+        } else if !plan.group_by.is_empty() {
             if plan.tables.len() > 1 {
-                return self.execute_cross_product(plan);
+                self.execute_cross_product(plan)?
+            } else {
+                let table_ref = &plan.tables[0];
+                let table = self.provider.get_table(&table_ref.qualified_name())?;
+                let display_name = table_ref.qualified_name();
+                self.execute_group_by_single_table(table, display_name, plan, row_filter)?
             }
+        } else if plan.tables.len() > 1 {
+            self.execute_cross_product(plan)?
+        } else {
+            // Single table query
             let table_ref = &plan.tables[0];
             let table = self.provider.get_table(&table_ref.qualified_name())?;
             let display_name = table_ref.qualified_name();
-            return self.execute_group_by_single_table(table, display_name, plan, row_filter);
-        }
 
-        // Handle multi-table queries (cross products/joins)
-        if plan.tables.len() > 1 {
-            return self.execute_cross_product(plan);
-        }
+            if !plan.aggregates.is_empty() {
+                self.execute_aggregates(table, display_name, plan, row_filter)?
+            } else if self.has_computed_aggregates(&plan) {
+                // Handle computed projections that contain embedded aggregates
+                self.execute_computed_aggregates(table, display_name, plan, row_filter)?
+            } else {
+                self.execute_projection(table, display_name, plan, row_filter)?
+            }
+        };
 
-        // Single table query
-        let table_ref = &plan.tables[0];
-        let table = self.provider.get_table(&table_ref.qualified_name())?;
-        let display_name = table_ref.qualified_name();
-
-        if !plan.aggregates.is_empty() {
-            self.execute_aggregates(table, display_name, plan, row_filter)
-        } else if self.has_computed_aggregates(&plan) {
-            // Handle computed projections that contain embedded aggregates
-            self.execute_computed_aggregates(table, display_name, plan, row_filter)
-        } else {
-            self.execute_projection(table, display_name, plan, row_filter)
-        }
+        Ok(execution.with_limit(limit).with_offset(offset))
     }
 
     /// Execute a compound SELECT query (UNION, EXCEPT, INTERSECT).
@@ -1631,9 +1629,18 @@ where
                         let exclude_lower: Vec<String> =
                             exclude.iter().map(|e| e.to_ascii_lowercase()).collect();
 
+                        let mut excluded_indices = FxHashSet::default();
+                        for excluded_name in &exclude_lower {
+                            if let Some(&idx) = column_lookup_map.get(excluded_name) {
+                                excluded_indices.insert(idx);
+                            }
+                        }
+
                         for (idx, field) in combined_schema.fields().iter().enumerate() {
                             let field_name_lower = field.name().to_ascii_lowercase();
-                            if !exclude_lower.contains(&field_name_lower) {
+                            if !exclude_lower.contains(&field_name_lower)
+                                && !excluded_indices.contains(&idx)
+                            {
                                 selected_fields.push(field.clone());
                                 selected_columns.push(combined_batch.column(idx).clone());
                             }
@@ -3630,6 +3637,22 @@ where
         // Note: We now allow subqueries in filters. Join predicates will be extracted
         // and used for hash join, while subquery predicates will be handled post-join.
 
+        // Check if we can optimize despite explicit joins.
+        // We can optimize if all joins are INNER joins, as they are commutative/associative.
+        // For comma-joins (implicit joins), the parser/planner creates Inner joins with no ON condition,
+        // and all filters are in the WHERE clause (plan.filter).
+        let all_inner_joins = plan
+            .joins
+            .iter()
+            .all(|j| j.join_type == llkv_plan::JoinPlan::Inner);
+
+        if !plan.joins.is_empty() && !all_inner_joins {
+            tracing::debug!(
+                "join_opt[{query_label}]: skipping optimization – explicit non-INNER JOINs present"
+            );
+            return Ok(None);
+        }
+
         if tables_with_handles.len() < 2 {
             tracing::debug!(
                 "join_opt[{query_label}]: skipping optimization – requires at least 2 tables"
@@ -4757,8 +4780,18 @@ where
                         .iter()
                         .map(|name| name.to_ascii_lowercase())
                         .collect();
+
+                    let mut excluded_indices = FxHashSet::default();
+                    for excluded_name in &exclude_lower {
+                        if let Some(&idx) = column_lookup_map.get(excluded_name) {
+                            excluded_indices.insert(idx);
+                        }
+                    }
+
                     for (index, field) in base_schema.fields().iter().enumerate() {
-                        if !exclude_lower.contains(&field.name().to_ascii_lowercase()) {
+                        if !exclude_lower.contains(&field.name().to_ascii_lowercase())
+                            && !excluded_indices.contains(&index)
+                        {
                             columns.push(OutputColumn {
                                 field: (**field).clone(),
                                 source: OutputSource::TableColumn { index },
@@ -4847,9 +4880,18 @@ where
                         .iter()
                         .map(|name| name.to_ascii_lowercase())
                         .collect();
+
+                    let mut excluded_indices = FxHashSet::default();
+                    for excluded_name in &exclude_lower {
+                        if let Some(&idx) = lookup.get(excluded_name) {
+                            excluded_indices.insert(idx);
+                        }
+                    }
+
                     for (idx, field) in schema.fields().iter().enumerate() {
                         let column_name = field.name().to_ascii_lowercase();
-                        if !exclude_lower.contains(&column_name) {
+                        if !exclude_lower.contains(&column_name) && !excluded_indices.contains(&idx)
+                        {
                             selected_fields.push(Arc::clone(field));
                             selected_columns.push(batch.column(idx).clone());
                         }
@@ -9236,6 +9278,8 @@ fn bind_select_plan(
             compound: Some(bound_compound),
             group_by: Vec::new(),
             value_table_mode: None,
+            limit: plan.limit,
+            offset: plan.offset,
         });
     }
 
@@ -9252,6 +9296,8 @@ fn bind_select_plan(
         compound: None,
         group_by: plan.group_by.clone(),
         value_table_mode: plan.value_table_mode.clone(),
+        limit: plan.limit,
+        offset: plan.offset,
     })
 }
 
@@ -10996,6 +11042,8 @@ where
     table_name: String,
     schema: Arc<Schema>,
     stream: SelectStream<P>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -11045,6 +11093,8 @@ where
                 order_by,
                 distinct,
             },
+            limit: None,
+            offset: None,
         }
     }
 
@@ -11053,6 +11103,8 @@ where
             table_name,
             schema,
             stream: SelectStream::Aggregation { batch },
+            limit: None,
+            offset: None,
         }
     }
 
@@ -11068,10 +11120,56 @@ where
         Arc::clone(&self.schema)
     }
 
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    pub fn with_offset(mut self, offset: Option<usize>) -> Self {
+        self.offset = offset;
+        self
+    }
+
     pub fn stream(
         self,
         mut on_batch: impl FnMut(RecordBatch) -> ExecutorResult<()>,
     ) -> ExecutorResult<()> {
+        let limit = self.limit;
+        let mut offset = self.offset.unwrap_or(0);
+        let mut rows_emitted = 0;
+
+        let mut on_batch = |batch: RecordBatch| -> ExecutorResult<()> {
+            let rows = batch.num_rows();
+            let mut batch_to_emit = batch;
+
+            // Handle offset
+            if offset > 0 {
+                if rows == 0 {
+                    // Pass through empty batches to preserve schema
+                } else if rows <= offset {
+                    offset -= rows;
+                    return Ok(());
+                } else {
+                    batch_to_emit = batch_to_emit.slice(offset, rows - offset);
+                    offset = 0;
+                }
+            }
+
+            // Handle limit
+            if let Some(limit_val) = limit {
+                if rows_emitted >= limit_val {
+                    return Ok(());
+                }
+                let remaining = limit_val - rows_emitted;
+                if batch_to_emit.num_rows() > remaining {
+                    batch_to_emit = batch_to_emit.slice(0, remaining);
+                }
+                rows_emitted += batch_to_emit.num_rows();
+            }
+
+            on_batch(batch_to_emit)
+        };
+
         let schema = Arc::clone(&self.schema);
         match self.stream {
             SelectStream::Projection {
