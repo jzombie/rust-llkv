@@ -1065,7 +1065,7 @@ fn build_table_info(name: &str, raw_tables: &HashMap<String, RawTableDef>) -> Tp
 
 fn parse_column_value(column: &TableColumn, raw: &str) -> Result<PlanValue> {
     match column.value_kind {
-        ColumnValueKind::String => Ok(PlanValue::String(raw.trim_end().to_string())),
+        ColumnValueKind::String => Ok(PlanValue::String(raw.trim().to_string())),
         ColumnValueKind::Integer => {
             if raw.is_empty() {
                 return Err(TpchError::Parse(format!(

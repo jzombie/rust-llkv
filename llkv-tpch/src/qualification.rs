@@ -58,7 +58,7 @@ impl QualificationOptions {
         Self {
             answers_dir: dataset_dir.clone(),
             dataset_dir,
-            stream_number: 1,
+            stream_number: 0,
             queries: (1..=QUALIFICATION_QUERY_COUNT).collect(),
         }
     }
@@ -154,7 +154,11 @@ pub fn run_qualification(
     validate_query_range(options.queries())?;
 
     let column_kinds = column_kinds(paths)?;
-    let stream_parameters = load_stream_parameters(options.dataset_dir(), options.stream_number())?;
+    let stream_parameters = if options.stream_number() == 0 {
+        HashMap::new()
+    } else {
+        load_stream_parameters(options.dataset_dir(), options.stream_number())?
+    };
 
     let mut reports = Vec::with_capacity(options.queries().len());
 
@@ -216,12 +220,14 @@ pub fn verify_qualification_assets(options: &QualificationOptions) -> Result<()>
             dir.display()
         )));
     }
-    let subparam_path = dir.join(format!("subparam_{}", options.stream_number()));
-    if !subparam_path.is_file() {
-        return Err(TpchError::Parse(format!(
-            "qualification dataset missing stream parameters file '{}'",
-            subparam_path.display()
-        )));
+    if options.stream_number() != 0 {
+        let subparam_path = dir.join(format!("subparam_{}", options.stream_number()));
+        if !subparam_path.is_file() {
+            return Err(TpchError::Parse(format!(
+                "qualification dataset missing stream parameters file '{}'",
+                subparam_path.display()
+            )));
+        }
     }
     for &query in options.queries() {
         let answer_path = options.answers_dir().join(format!("q{query}.out"));

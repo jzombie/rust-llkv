@@ -880,10 +880,11 @@ where
         // Execute each unique correlated subquery in parallel on the shared Rayon pool.
         let job_results: Vec<ExecutorResult<Literal>> =
             llkv_column_map::parallel::with_thread_pool(|| {
-                unique_bindings
+                let results: Vec<ExecutorResult<Literal>> = unique_bindings
                     .par_iter()
                     .map(|bindings| self.evaluate_scalar_subquery_with_bindings(subquery, bindings))
-                    .collect()
+                    .collect();
+                results
             });
 
         let mut job_literals: Vec<Literal> = Vec::with_capacity(job_results.len());
@@ -1709,6 +1710,11 @@ where
         }
 
         let schema = combined_batch.schema();
+
+        if !plan.order_by.is_empty() {
+            combined_batch =
+                sort_record_batch_with_order(&schema, &combined_batch, &plan.order_by)?;
+        }
 
         Ok(SelectExecution::new_single_batch(
             display_name,

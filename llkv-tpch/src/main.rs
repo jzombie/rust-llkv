@@ -278,7 +278,7 @@ struct QualifyArgs {
     #[arg(long, default_value_t = 1.0)]
     scale: f64,
     /// TPC-H stream number used when rendering parameterized templates.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 0)]
     stream: u32,
     /// One or more TPC-H query numbers (1-22) to validate.
     #[arg(

@@ -389,6 +389,7 @@ fn default_parameter_values(paths: &SchemaPaths, query: u8) -> Result<Option<&'s
     let defaults = ensure_query_parameter_defaults(paths)?;
     let idx = (query - 1) as usize;
     let entry = defaults.get(idx).filter(|values| !values.is_empty());
+
     Ok(entry.map(|values| values.as_slice()))
 }
 
