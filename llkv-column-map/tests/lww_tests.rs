@@ -160,7 +160,11 @@ fn test_sequential_lww() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nAfter INSERT, gathering all 3 rows:");
     let batch = store.gather_rows(&[field_id], &[1, 2, 3], GatherNullPolicy::IncludeNulls)?;
     println!("  Result: {:?}", batch.column(0));
-    let arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(arr.value(0), 1);
     assert_eq!(arr.value(1), 0);
     assert!(arr.is_null(2));
@@ -183,7 +187,11 @@ fn test_sequential_lww() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nAfter UPDATE row 1, gathering all 3 rows:");
     let batch = store.gather_rows(&[field_id], &[1, 2, 3], GatherNullPolicy::IncludeNulls)?;
     println!("  Result: {:?}", batch.column(0));
-    let arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(arr.value(0), 2);
     assert_eq!(arr.value(1), 0);
     assert!(arr.is_null(2));
@@ -207,7 +215,11 @@ fn test_sequential_lww() -> Result<(), Box<dyn std::error::Error>> {
     println!("After UPDATE all rows, gathering all 3 rows:");
     let batch = store.gather_rows(&[field_id], &[1, 2, 3], GatherNullPolicy::IncludeNulls)?;
     println!("  Result: {:?}", batch.column(0));
-    let arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert_eq!(arr.value(0), 99);
     assert_eq!(arr.value(1), 99);
     assert_eq!(arr.value(2), 99);
@@ -217,7 +229,11 @@ fn test_sequential_lww() -> Result<(), Box<dyn std::error::Error>> {
     for rid in [1, 2, 3] {
         let batch = store.gather_rows(&[field_id], &[rid], GatherNullPolicy::IncludeNulls)?;
         println!("  Row {}: {:?}", rid, batch.column(0));
-        let arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(arr.value(0), 99);
     }
 
@@ -294,8 +310,16 @@ fn test_null_to_value_multicolumn() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("  x={:?}", batch.column(0));
     println!("  y={:?}", batch.column(1));
-    let x_arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let y_arr = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let x_arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let y_arr = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(x_arr.value(0), 2);
     assert_eq!(y_arr.value(0), "unknown");
 
@@ -325,13 +349,21 @@ fn test_null_to_value_multicolumn() -> Result<(), Box<dyn std::error::Error>> {
         &[1, 2, 3],
         GatherNullPolicy::IncludeNulls,
     )?;
-    let x_arr = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let y_arr = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    
+    let x_arr = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let y_arr = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
     assert_eq!(x_arr.value(0), 99);
     assert_eq!(x_arr.value(1), 99);
     assert_eq!(x_arr.value(2), 99);
-    
+
     assert_eq!(y_arr.value(0), "unknown");
     assert_eq!(y_arr.value(1), "false");
     assert_eq!(y_arr.value(2), "NULL");
