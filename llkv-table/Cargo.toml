@@ -18,6 +18,7 @@ arrow-schema.workspace = true
 bitcode.workspace = true
 crossbeam-channel.workspace = true
 llkv-column-map.workspace = true
+llkv-compute.workspace = true
 llkv-expr.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true

@@ -1587,6 +1587,7 @@ version = "0.8.2-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
+ "llkv-compute",
  "llkv-plan",
  "llkv-result",
  "rustc-hash",
@@ -1613,6 +1614,15 @@ dependencies = [
  "simd-r-drive-entry-handle",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "llkv-compute"
+version = "0.8.2-alpha"
+dependencies = [
+ "arrow",
+ "llkv-expr",
+ "llkv-result",
 ]
 
 [[package]]
@@ -1813,6 +1823,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "llkv-column-map",
+ "llkv-compute",
  "llkv-expr",
  "llkv-plan",
  "llkv-result",

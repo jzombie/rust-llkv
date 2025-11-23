@@ -23,6 +23,7 @@ llkv-storage = { path = "./llkv-storage", version = "0.8.2-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.2-alpha" }
 llkv-transaction = { path = "./llkv-transaction", version = "0.8.2-alpha" }
+llkv-compute = { path = "./llkv-compute", version = "0.8.2-alpha" }
 simd-r-drive = "0.15.5-alpha"
 simd-r-drive-entry-handle = "0.15.5-alpha"
 
@@ -70,6 +71,7 @@ members = [
     "llkv",
     "llkv-aggregate",
     "llkv-column-map",
+    "llkv-compute",
     "llkv-csv",
     "llkv-runtime",
     "llkv-executor",

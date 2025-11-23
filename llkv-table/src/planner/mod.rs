@@ -1945,7 +1945,7 @@ where
             if has_row_id {
                 let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
                 let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
+                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::new_float(Arc::new(array)));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
@@ -2193,7 +2193,7 @@ where
             if has_row_id {
                 let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
                 let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
+                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::new_float(Arc::new(array)));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
@@ -2348,7 +2348,7 @@ where
             if has_row_id {
                 let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
                 let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
+                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::new_float(Arc::new(array)));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
@@ -5157,7 +5157,7 @@ fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Opti
 
     let arrays = NumericArrayMap::default();
     match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
-        Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
+        Some(NumericValue::Int(v)) => Ok(Some(Literal::Integer(v as i128))),
         Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
         Some(NumericValue::Decimal(d)) => Ok(Some(Literal::Decimal(d))),
         None => Ok(None),
