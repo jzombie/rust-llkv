@@ -47,6 +47,22 @@ jobs:
           rustc -Vv
           echo "hash=$(rustc -Vv | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
 
+      # Workaround for macOS error when using `hashFiles`
+      # `Error: The template is not valid....Fail to hash files under directory `
+      - name: Calculate lockfile hash
+        id: lockfile
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            HASH=$(sha256sum Cargo.lock | awk '{print $1}')
+          elif command -v shasum >/dev/null 2>&1; then
+            HASH=$(shasum -a 256 Cargo.lock | awk '{print $1}')
+          else
+            echo "No hashing utility found"
+            exit 1
+          fi
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
       # Added caching step to speed up dependency builds.
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
@@ -57,9 +73,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
+          key: ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ steps.lockfile.outputs.hash }}-${{ matrix.flags }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ steps.lockfile.outputs.hash }}-
 
       - name: Test
         run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
