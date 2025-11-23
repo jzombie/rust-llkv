@@ -25,5 +25,8 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 llkv-compute.workspace = true
 
+[dev-dependencies]
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
+
 [lints]
 workspace = true

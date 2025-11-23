@@ -1624,6 +1624,7 @@ dependencies = [
  "arrow-buffer",
  "llkv-expr",
  "llkv-result",
+ "llkv-test-utils",
 ]
 
 [[package]]
@@ -1862,6 +1863,7 @@ dependencies = [
  "llkv-plan",
  "llkv-sql",
  "llkv-table",
+ "llkv-test-utils",
  "regex",
  "rust_decimal",
  "sqlparser",
