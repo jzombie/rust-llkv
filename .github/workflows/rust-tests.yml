@@ -47,8 +47,8 @@ jobs:
           rustc -Vv
           echo "hash=$(rustc -Vv | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
 
-      # Workaround for macOS error when using `hashFiles`
-      # `Error: The template is not valid....Fail to hash files under directory `
+      # Workaround for macOS error when using `hashFiles`:
+      # "Error: The template is not valid....Fail to hash files under directory"
       - name: Calculate lockfile hash
         id: lockfile
         shell: bash
