@@ -17,12 +17,12 @@ use arrow::array::*;
 use arrow::compute;
 
 use super::ColumnStore;
+use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::types::{LogicalFieldId, Namespace};
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, GetResult, Pager},
-    serialization::deserialize_array,
     types::PhysicalKey,
 };
 use simd_r_drive_entry_handle::EntryHandle;
@@ -104,8 +104,7 @@ where
             return Ok(());
         }
         let buffers = sorted::load_sorted_buffers(self.pager.as_ref(), &metas)?;
-        let first_any =
-            llkv_storage::serialization::deserialize_array(buffers.value_handle(0).clone())?;
+        let first_any = deserialize_array(buffers.value_handle(0).clone())?;
         with_integer_arrow_type!(
             first_any.data_type().clone(),
             |ArrowTy| {
@@ -165,8 +164,7 @@ where
             });
         }
         let buffers = sorted::load_sorted_buffers(self.pager.as_ref(), &metas)?;
-        let first_any =
-            llkv_storage::serialization::deserialize_array(buffers.value_handle(0).clone())?;
+        let first_any = deserialize_array(buffers.value_handle(0).clone())?;
         with_integer_arrow_type!(
             first_any.data_type().clone(),
             |ArrowTy| {
@@ -321,9 +319,7 @@ where
 
             let buffers =
                 sorted::load_sorted_buffers_with_rids(self.pager.as_ref(), &metas_val, &metas_rid)?;
-            let first_any = llkv_storage::serialization::deserialize_array(
-                buffers.base().value_handle(0).clone(),
-            )?;
+            let first_any = deserialize_array(buffers.base().value_handle(0).clone())?;
             if opts.reverse {
                 if paginate {
                     let mut pv = crate::store::scan::PaginateVisitor::new_with_reverse(

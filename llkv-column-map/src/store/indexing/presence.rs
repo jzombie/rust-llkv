@@ -1,6 +1,7 @@
 //! Presence index: type and ops live here.
 
 use super::{Index, IndexKind, IndexManager, IndexOps};
+use crate::serialization::{deserialize_array, serialize_array};
 use crate::store::{
     ColumnStore,
     catalog::ColumnCatalog,
@@ -13,7 +14,6 @@ use arrow::compute::{SortColumn, lexsort_to_indices};
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, BatchPut, GetResult, Pager},
-    serialization::{deserialize_array, serialize_array},
     types::PhysicalKey,
 };
 use simd_r_drive_entry_handle::EntryHandle;

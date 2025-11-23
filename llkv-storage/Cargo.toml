@@ -14,7 +14,6 @@ readme = "README.md"
 [dependencies]
 arrow.workspace = true
 llkv-result.workspace = true
-num_enum = { workspace = true }
 rustc-hash.workspace = true
 simd-r-drive = { workspace = true, optional = true }
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }

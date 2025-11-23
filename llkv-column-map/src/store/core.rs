@@ -1,4 +1,5 @@
 use super::*;
+use crate::serialization::{deserialize_array, serialize_array};
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{
     ChunkMetadata, ColumnDescriptor, DescriptorIterator, DescriptorPageHeader,
@@ -15,7 +16,6 @@ use llkv_result::{Error, Result};
 use llkv_storage::{
     constants::CATALOG_ROOT_PKEY,
     pager::{BatchGet, BatchPut, GetResult, Pager},
-    serialization::{deserialize_array, serialize_array},
     types::PhysicalKey,
 };
 

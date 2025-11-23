@@ -19,6 +19,7 @@ llkv-result = { workspace = true }
 llkv-storage = { workspace = true }
 llkv-expr = { workspace = true }
 modular-bitfield = { workspace = true }
+num_enum = { workspace = true }
 roaring = { workspace = true }
 rustc-hash = { workspace = true }
 rayon = { workspace = true }
