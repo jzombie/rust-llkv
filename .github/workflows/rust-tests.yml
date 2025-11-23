@@ -57,9 +57,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.flags }}
+          key: ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}-${{ matrix.flags }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}-
 
       - name: Test
         run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
