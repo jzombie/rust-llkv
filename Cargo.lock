@@ -3878,11 +3878,3 @@ dependencies = [
  "quote",
  "syn 2.0.106",
 ]
-
-[[patch.unused]]
-name = "simd-r-drive"
-version = "0.16.0-alpha"
-
-[[patch.unused]]
-name = "simd-r-drive-entry-handle"
-version = "0.16.0-alpha"
