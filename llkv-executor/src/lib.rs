@@ -155,8 +155,7 @@ impl AggregateValue {
 }
 
 fn decimal_exact_i64(decimal: DecimalValue) -> Option<i64> {
-    decimal
-        .rescale(0)
+    llkv_compute::scalar::decimal::rescale(decimal, 0)
         .ok()
         .and_then(|integral| i64::try_from(integral.raw_value()).ok())
 }
@@ -7227,27 +7226,32 @@ where
 
                             // Perform exact decimal arithmetic
                             let result_dec = match op {
-                                BinaryOp::Add => left_dec.checked_add(right_dec).map_err(|e| {
-                                    Error::InvalidArgumentError(format!(
-                                        "Decimal addition overflow: {}",
-                                        e
-                                    ))
-                                })?,
+                                BinaryOp::Add => {
+                                    llkv_compute::scalar::decimal::add(left_dec, right_dec)
+                                        .map_err(|e| {
+                                            Error::InvalidArgumentError(format!(
+                                                "Decimal addition overflow: {}",
+                                                e
+                                            ))
+                                        })?
+                                }
                                 BinaryOp::Subtract => {
-                                    left_dec.checked_sub(right_dec).map_err(|e| {
-                                        Error::InvalidArgumentError(format!(
-                                            "Decimal subtraction overflow: {}",
-                                            e
-                                        ))
-                                    })?
+                                    llkv_compute::scalar::decimal::sub(left_dec, right_dec)
+                                        .map_err(|e| {
+                                            Error::InvalidArgumentError(format!(
+                                                "Decimal subtraction overflow: {}",
+                                                e
+                                            ))
+                                        })?
                                 }
                                 BinaryOp::Multiply => {
-                                    left_dec.checked_mul(right_dec).map_err(|e| {
-                                        Error::InvalidArgumentError(format!(
-                                            "Decimal multiplication overflow: {}",
-                                            e
-                                        ))
-                                    })?
+                                    llkv_compute::scalar::decimal::mul(left_dec, right_dec)
+                                        .map_err(|e| {
+                                            Error::InvalidArgumentError(format!(
+                                                "Decimal multiplication overflow: {}",
+                                                e
+                                            ))
+                                        })?
                                 }
                                 BinaryOp::Divide => {
                                     // Check for division by zero first
@@ -7256,7 +7260,12 @@ where
                                     }
                                     // For division, preserve scale of left operand
                                     let target_scale = left_dec.scale();
-                                    left_dec.checked_div(right_dec, target_scale).map_err(|e| {
+                                    llkv_compute::scalar::decimal::div(
+                                        left_dec,
+                                        right_dec,
+                                        target_scale,
+                                    )
+                                    .map_err(|e| {
                                         Error::InvalidArgumentError(format!(
                                             "Decimal division error: {}",
                                             e
@@ -8275,11 +8284,13 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
                     Literal::Null => aligned.push(None),
                     Literal::Decimal(value) => {
                         let adjusted = if value.scale() != target_scale {
-                            value.rescale(target_scale).map_err(|err| {
-                                Error::InvalidArgumentError(format!(
-                                    "failed to align decimal scale: {err}"
-                                ))
-                            })?
+                            llkv_compute::scalar::decimal::rescale(*value, target_scale).map_err(
+                                |err| {
+                                    Error::InvalidArgumentError(format!(
+                                        "failed to align decimal scale: {err}"
+                                    ))
+                                },
+                            )?
                         } else {
                             *value
                         };
@@ -8287,13 +8298,12 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
                         aligned.push(Some(adjusted));
                     }
                     Literal::Integer(value) => {
-                        let decimal = DecimalValue::new(*value, 0)
-                            .map_err(|err| {
-                                Error::InvalidArgumentError(format!(
-                                    "failed to build decimal from integer: {err}"
-                                ))
-                            })?
-                            .rescale(target_scale)
+                        let decimal = DecimalValue::new(*value, 0).map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "failed to build decimal from integer: {err}"
+                            ))
+                        })?;
+                        let decimal = llkv_compute::scalar::decimal::rescale(decimal, target_scale)
                             .map_err(|err| {
                                 Error::InvalidArgumentError(format!(
                                     "failed to align integer decimal scale: {err}"
@@ -10105,7 +10115,9 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     fn literal_to_i128_from_integer_like(literal: &Literal) -> Option<i128> {
         match literal {
             Literal::Integer(value) => Some(*value),
-            Literal::Decimal(value) => value.rescale(0).ok().map(|integral| integral.raw_value()),
+            Literal::Decimal(value) => llkv_compute::scalar::decimal::rescale(*value, 0)
+                .ok()
+                .map(|integral| integral.raw_value()),
             Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
             Literal::Date32(value) => Some(*value as i128),
             _ => None,
@@ -10159,7 +10171,9 @@ fn literal_to_i128(literal: &Literal) -> Option<i128> {
     match literal {
         Literal::Integer(value) => Some(*value),
         Literal::Float(value) => Some(*value as i128),
-        Literal::Decimal(value) => value.rescale(0).ok().map(|integral| integral.raw_value()),
+        Literal::Decimal(value) => llkv_compute::scalar::decimal::rescale(*value, 0)
+            .ok()
+            .map(|integral| integral.raw_value()),
         Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
         Literal::Date32(value) => Some(*value as i128),
         _ => None,

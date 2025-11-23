@@ -1621,6 +1621,7 @@ name = "llkv-compute"
 version = "0.8.2-alpha"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "llkv-expr",
  "llkv-result",
 ]
@@ -1649,6 +1650,7 @@ dependencies = [
  "arrow-buffer",
  "llkv-aggregate",
  "llkv-column-map",
+ "llkv-compute",
  "llkv-expr",
  "llkv-join",
  "llkv-plan",
@@ -1855,6 +1857,7 @@ dependencies = [
  "arrow",
  "clap",
  "llkv",
+ "llkv-compute",
  "llkv-expr",
  "llkv-plan",
  "llkv-sql",

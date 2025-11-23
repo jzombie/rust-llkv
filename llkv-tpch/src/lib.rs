@@ -1141,7 +1141,7 @@ fn parse_decimal_literal(raw: &str, target_scale: i8, column_name: &str) -> Resu
     if scale == target_scale {
         Ok(decimal)
     } else {
-        decimal.rescale(target_scale).map_err(|err| {
+        llkv_compute::scalar::decimal::rescale(decimal, target_scale).map_err(|err| {
             TpchError::Parse(format!(
                 "unable to rescale decimal literal '{}' for column {}: {}",
                 raw, column_name, err

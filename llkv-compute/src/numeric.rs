@@ -46,21 +46,21 @@ impl NumericValue {
                     .ok_or_else(|| Error::Internal("Integer overflow in sum".to_string()))
             }
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a + b)),
-            (NumericValue::Decimal(a), NumericValue::Decimal(b)) => a
-                .checked_add(*b)
-                .map(NumericValue::Decimal)
-                .map_err(|e| Error::Internal(format!("Decimal error: {}", e))),
+            (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+                crate::scalar::decimal::add(*a, *b)
+                    .map(NumericValue::Decimal)
+                    .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
+            }
             // Mixed types - promote to Decimal if one is Decimal and other is Int
             (NumericValue::Int(a), NumericValue::Decimal(b)) => {
                 let a_dec = DecimalValue::from_i64(*a);
-                a_dec
-                    .checked_add(*b)
+                crate::scalar::decimal::add(a_dec, *b)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
             (NumericValue::Decimal(a), NumericValue::Int(b)) => {
                 let b_dec = DecimalValue::from_i64(*b);
-                a.checked_add(b_dec)
+                crate::scalar::decimal::add(*a, b_dec)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
@@ -76,20 +76,20 @@ impl NumericValue {
                 .map(NumericValue::Int)
                 .ok_or_else(|| Error::Internal("Integer overflow in sub".to_string())),
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a - b)),
-            (NumericValue::Decimal(a), NumericValue::Decimal(b)) => a
-                .checked_sub(*b)
-                .map(NumericValue::Decimal)
-                .map_err(|e| Error::Internal(format!("Decimal error: {}", e))),
+            (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+                crate::scalar::decimal::sub(*a, *b)
+                    .map(NumericValue::Decimal)
+                    .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
+            }
             (NumericValue::Int(a), NumericValue::Decimal(b)) => {
                 let a_dec = DecimalValue::from_i64(*a);
-                a_dec
-                    .checked_sub(*b)
+                crate::scalar::decimal::sub(a_dec, *b)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
             (NumericValue::Decimal(a), NumericValue::Int(b)) => {
                 let b_dec = DecimalValue::from_i64(*b);
-                a.checked_sub(b_dec)
+                crate::scalar::decimal::sub(*a, b_dec)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
@@ -104,20 +104,20 @@ impl NumericValue {
                 .map(NumericValue::Int)
                 .ok_or_else(|| Error::Internal("Integer overflow in mul".to_string())),
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a * b)),
-            (NumericValue::Decimal(a), NumericValue::Decimal(b)) => a
-                .checked_mul(*b)
-                .map(NumericValue::Decimal)
-                .map_err(|e| Error::Internal(format!("Decimal error: {}", e))),
+            (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+                crate::scalar::decimal::mul(*a, *b)
+                    .map(NumericValue::Decimal)
+                    .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
+            }
             (NumericValue::Int(a), NumericValue::Decimal(b)) => {
                 let a_dec = DecimalValue::from_i64(*a);
-                a_dec
-                    .checked_mul(*b)
+                crate::scalar::decimal::mul(a_dec, *b)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
             (NumericValue::Decimal(a), NumericValue::Int(b)) => {
                 let b_dec = DecimalValue::from_i64(*b);
-                a.checked_mul(b_dec)
+                crate::scalar::decimal::mul(*a, b_dec)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
@@ -144,22 +144,21 @@ impl NumericValue {
                 // Or just use a fixed high scale?
                 // Let's use max(a.scale, b.scale) + 4 for now.
                 let target_scale = (a.scale().max(b.scale()) + 4).min(38); // Assuming 38 is max
-                a.checked_div(*b, target_scale)
+                crate::scalar::decimal::div(*a, *b, target_scale)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
             (NumericValue::Int(a), NumericValue::Decimal(b)) => {
                 let a_dec = DecimalValue::from_i64(*a);
                 let target_scale = (b.scale() + 4).min(38);
-                a_dec
-                    .checked_div(*b, target_scale)
+                crate::scalar::decimal::div(a_dec, *b, target_scale)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }
             (NumericValue::Decimal(a), NumericValue::Int(b)) => {
                 let b_dec = DecimalValue::from_i64(*b);
                 let target_scale = (a.scale() + 4).min(38);
-                a.checked_div(b_dec, target_scale)
+                crate::scalar::decimal::div(*a, b_dec, target_scale)
                     .map(NumericValue::Decimal)
                     .map_err(|e| Error::Internal(format!("Decimal error: {}", e)))
             }

@@ -1598,7 +1598,8 @@ impl NumericKernels {
             | DataType::UInt16
             | DataType::UInt32
             | DataType::UInt64
-            | DataType::Float32 => Some(NumericKind::Float),
+            | DataType::Float32
+            | DataType::Float64 => Some(NumericKind::Float),
             DataType::Decimal128(_, scale) => {
                 if *scale == 0 {
                     Some(NumericKind::Integer)

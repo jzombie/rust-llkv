@@ -1663,13 +1663,15 @@ where
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
                 (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
                 (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
-                (Literal::Decimal(l), Literal::Decimal(r)) => (*l).compare(*r).ok(),
+                (Literal::Decimal(l), Literal::Decimal(r)) => {
+                    llkv_compute::scalar::decimal::compare(*l, *r).ok()
+                }
                 (Literal::Decimal(l), Literal::Integer(r)) => DecimalValue::new(*r, 0)
                     .ok()
-                    .and_then(|int| (*l).compare(int).ok()),
+                    .and_then(|int| llkv_compute::scalar::decimal::compare(*l, int).ok()),
                 (Literal::Integer(l), Literal::Decimal(r)) => DecimalValue::new(*l, 0)
                     .ok()
-                    .and_then(|int| int.compare(*r).ok()),
+                    .and_then(|int| llkv_compute::scalar::decimal::compare(int, *r).ok()),
                 (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
                 (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),

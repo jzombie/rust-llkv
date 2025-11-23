@@ -243,7 +243,7 @@ impl NumericArray {
                 for val in values {
                     match val {
                         Some(NumericValue::Decimal(d)) => {
-                            if let Ok(rescaled) = d.rescale(max_scale) {
+                            if let Ok(rescaled) = crate::scalar::decimal::rescale(d, max_scale) {
                                 builder.append_value(rescaled.raw_value());
                             } else {
                                 builder.append_null();
@@ -251,7 +251,7 @@ impl NumericArray {
                         }
                         Some(NumericValue::Int(i)) => {
                             let d = DecimalValue::from_i64(i);
-                            if let Ok(rescaled) = d.rescale(max_scale) {
+                            if let Ok(rescaled) = crate::scalar::decimal::rescale(d, max_scale) {
                                 builder.append_value(rescaled.raw_value());
                             } else {
                                 builder.append_null();
