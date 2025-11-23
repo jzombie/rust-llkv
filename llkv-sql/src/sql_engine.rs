@@ -173,22 +173,25 @@ fn extract_usize_from_expr(expr: &sqlparser::ast::Expr, context: &str) -> SqlRes
         Expr::Value(value) => match &value.value {
             Value::Number(text, _) => {
                 let parsed = text.parse::<i64>().map_err(|_| {
-                    Error::InvalidArgumentError(format!("{} must be an integer", context).into())
+                    Error::InvalidArgumentError(format!("{} must be an integer", context))
                 })?;
                 if parsed < 0 {
-                    return Err(Error::InvalidArgumentError(
-                        format!("{} must be non-negative", context).into(),
-                    ));
+                    return Err(Error::InvalidArgumentError(format!(
+                        "{} must be non-negative",
+                        context
+                    )));
                 }
                 Ok(Some(parsed as usize))
             }
-            _ => Err(Error::InvalidArgumentError(
-                format!("{} must be a constant integer", context).into(),
-            )),
+            _ => Err(Error::InvalidArgumentError(format!(
+                "{} must be a constant integer",
+                context
+            ))),
         },
-        _ => Err(Error::InvalidArgumentError(
-            format!("{} must be a constant integer", context).into(),
-        )),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "{} must be a constant integer",
+            context
+        ))),
     }
 }
 
@@ -6311,14 +6314,12 @@ impl SqlEngine {
             if let Some(join_meta) = plan.joins.get_mut(idx) {
                 let expr_for_join = translated
                     .clone()
-                    .unwrap_or_else(|| llkv_expr::expr::Expr::Literal(true));
+                    .unwrap_or(llkv_expr::expr::Expr::Literal(true));
                 join_meta.on_condition = Some(expr_for_join);
             }
 
-            if let Some(actual_expr) = translated {
-                if !is_left_join {
-                    filter_components.push(actual_expr);
-                }
+            if let (Some(actual_expr), false) = (translated, is_left_join) {
+                filter_components.push(actual_expr);
             }
         }
 

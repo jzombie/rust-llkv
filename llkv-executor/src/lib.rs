@@ -861,7 +861,7 @@ where
                     .get(&column.placeholder)
                     .cloned()
                     .unwrap_or(Literal::Null);
-                let plan_value = plan_value_from_literal(&literal).map_err(Error::from)?;
+                let plan_value = plan_value_from_literal(&literal)?;
                 plan_values.push(plan_value);
             }
             let key = encode_row(&plan_values);
@@ -1295,13 +1295,14 @@ where
 
                 // Start with the first table
                 let (first_ref, first_table) = &tables_with_handles[0];
-                let first_constraints = constraint_map.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
+                let first_constraints = constraint_map.first().map(|v| v.as_slice()).unwrap_or(&[]);
                 let mut accumulated =
                     collect_table_data(0, first_ref, first_table.as_ref(), first_constraints)?;
 
                 // Join each subsequent table
-                for idx in 1..tables_with_handles.len() {
-                    let (right_ref, right_table) = &tables_with_handles[idx];
+                for (idx, (right_ref, right_table)) in
+                    tables_with_handles.iter().enumerate().skip(1)
+                {
                     let right_constraints =
                         constraint_map.get(idx).map(|v| v.as_slice()).unwrap_or(&[]);
 
@@ -1331,7 +1332,7 @@ where
                     let condition_expr = join_metadata
                         .on_condition
                         .clone()
-                        .unwrap_or_else(|| LlkvExpr::Literal(true));
+                        .unwrap_or(LlkvExpr::Literal(true));
 
                     // For now, materialize accumulated result and perform join via llkv-join hash join
                     // This avoids full cartesian product while using our existing join implementation
@@ -2455,7 +2456,7 @@ fn execute_hash_join_batches(
 
             hash_table
                 .entry(key_values)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((batch_idx, row_idx));
         }
     }
@@ -2489,7 +2490,7 @@ fn execute_hash_join_batches(
         let mut left_indices = Vec::new();
         let mut right_refs = Vec::new();
 
-        for left_row_idx in 0..num_rows {
+        for (left_row_idx, matched) in left_matched.iter_mut().enumerate() {
             // Extract key for this left row
             let mut key_values = Vec::with_capacity(left_key_columns.len());
             let mut has_null = false;
@@ -2510,7 +2511,7 @@ fn execute_hash_join_batches(
 
             // Look up matches in hash table
             if let Some(right_rows) = hash_table.get(&key_values) {
-                left_matched[left_row_idx] = true;
+                *matched = true;
                 for &(right_batch_idx, right_row_idx) in right_rows {
                     left_indices.push(left_row_idx as u32);
                     right_refs.push((right_batch_idx, right_row_idx));
@@ -2730,7 +2731,7 @@ fn gather_from_multiple_batches(
     let mut array_map: FxHashMap<*const dyn Array, usize> = FxHashMap::default();
 
     for (arr, row_idx) in values {
-        let ptr = Arc::as_ptr(arr) as *const dyn Array;
+        let ptr = Arc::as_ptr(arr);
         if let Some(&idx) = array_map.get(&ptr) {
             unique_arrays[idx].1.push(*row_idx);
         } else {
@@ -11659,12 +11660,10 @@ where
 
     let filter_expr = if filter_exprs.is_empty() {
         crate::translation::expression::full_table_scan_filter(filter_field_id)
+    } else if filter_exprs.len() == 1 {
+        filter_exprs.pop().unwrap()
     } else {
-        if filter_exprs.len() == 1 {
-            filter_exprs.pop().unwrap()
-        } else {
-            LlkvExpr::And(filter_exprs)
-        }
+        LlkvExpr::And(filter_exprs)
     };
 
     let mut raw_batches = Vec::new();

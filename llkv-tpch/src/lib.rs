@@ -231,7 +231,7 @@ impl TpchToolkit {
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {};", self.schema_name);
         run_sql(engine, &create_schema_sql)?;
         let ddl_batch_sql = self.render_create_tables();
-        println!("Executing DDL:\n{}", ddl_batch_sql);
+        tracing::info!("Executing DDL:\n{}", ddl_batch_sql);
         run_sql(engine, &ddl_batch_sql)?;
 
         Ok(TpchSchema {
