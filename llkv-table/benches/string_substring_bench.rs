@@ -68,7 +68,7 @@ fn bench_substring_scan(table: &Table, case_sensitive: bool) -> usize {
     let projections = vec![Projection::from(logical_field_id)];
     let filter = Expr::Pred(Filter {
         field_id: FIELD_ID,
-        op: Operator::contains("needle", case_sensitive),
+        op: Operator::contains("needle".to_string(), case_sensitive),
     });
 
     let mut found = 0usize;

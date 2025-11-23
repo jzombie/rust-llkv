@@ -117,21 +117,21 @@ impl OwnedOperator {
                 pattern,
                 case_sensitive,
             } => Operator::StartsWith {
-                pattern: pattern.as_str(),
+                pattern: pattern.clone(),
                 case_sensitive: *case_sensitive,
             },
             Self::EndsWith {
                 pattern,
                 case_sensitive,
             } => Operator::EndsWith {
-                pattern: pattern.as_str(),
+                pattern: pattern.clone(),
                 case_sensitive: *case_sensitive,
             },
             Self::Contains {
                 pattern,
                 case_sensitive,
             } => Operator::Contains {
-                pattern: pattern.as_str(),
+                pattern: pattern.clone(),
                 case_sensitive: *case_sensitive,
             },
             Self::IsNull => Operator::IsNull,
@@ -312,7 +312,78 @@ fn normalize_expr<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
             Expr::Or(normalized)
         }
         Expr::Not(inner) => normalize_negated(*inner),
+        Expr::Compare { left, op, right } => normalize_compare(left, op, right),
         other => other,
+    }
+}
+
+fn normalize_compare<'expr>(
+    left: ScalarExpr<FieldId>,
+    op: CompareOp,
+    right: ScalarExpr<FieldId>,
+) -> Expr<'expr, FieldId> {
+    match (left, right) {
+        (ScalarExpr::Column(field_id), ScalarExpr::Literal(lit))
+            if !matches!(lit, Literal::Null) =>
+        {
+            match op {
+                CompareOp::Eq => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::Equals(lit),
+                }),
+                CompareOp::Gt => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::GreaterThan(lit),
+                }),
+                CompareOp::GtEq => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::GreaterThanOrEquals(lit),
+                }),
+                CompareOp::Lt => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::LessThan(lit),
+                }),
+                CompareOp::LtEq => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::LessThanOrEquals(lit),
+                }),
+                CompareOp::NotEq => Expr::Not(Box::new(Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::Equals(lit),
+                }))),
+            }
+        }
+        (ScalarExpr::Literal(lit), ScalarExpr::Column(field_id))
+            if !matches!(lit, Literal::Null) =>
+        {
+            match op {
+                CompareOp::Eq => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::Equals(lit),
+                }),
+                CompareOp::Gt => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::LessThan(lit),
+                }),
+                CompareOp::GtEq => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::LessThanOrEquals(lit),
+                }),
+                CompareOp::Lt => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::GreaterThan(lit),
+                }),
+                CompareOp::LtEq => Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::GreaterThanOrEquals(lit),
+                }),
+                CompareOp::NotEq => Expr::Not(Box::new(Expr::Pred(Filter {
+                    field_id,
+                    op: Operator::Equals(lit),
+                }))),
+            }
+        }
+        (left, right) => Expr::Compare { left, op, right },
     }
 }
 
@@ -376,13 +447,13 @@ mod tests {
 
         match &children[0] {
             Expr::Not(inner) => match inner.as_ref() {
-                Expr::Compare {
-                    op: CompareOp::GtEq,
+                Expr::Pred(Filter {
+                    op: Operator::GreaterThanOrEquals(_),
                     ..
-                } => {}
+                }) => {}
                 other => panic!("unexpected left branch: {other:?}"),
             },
-            other => panic!("left branch should be NOT(compare), got {other:?}"),
+            other => panic!("left branch should be NOT(pred), got {other:?}"),
         }
 
         match &children[1] {

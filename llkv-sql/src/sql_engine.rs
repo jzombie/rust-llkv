@@ -132,6 +132,69 @@ impl ParameterState {
     }
 }
 
+fn extract_limit_offset(
+    limit_clause: &sqlparser::ast::LimitClause,
+) -> SqlResult<(Option<usize>, Option<usize>)> {
+    use sqlparser::ast::LimitClause;
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if !limit_by.is_empty() {
+                return Err(Error::InvalidArgumentError(
+                    "LIMIT BY is not supported".into(),
+                ));
+            }
+            let limit_val = if let Some(expr) = limit {
+                extract_usize_from_expr(expr, "LIMIT")?
+            } else {
+                None
+            };
+            let offset_val = if let Some(offset_struct) = offset {
+                extract_usize_from_expr(&offset_struct.value, "OFFSET")?
+            } else {
+                None
+            };
+            Ok((limit_val, offset_val))
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            let offset_val = extract_usize_from_expr(offset, "OFFSET")?;
+            let limit_val = extract_usize_from_expr(limit, "LIMIT")?;
+            Ok((limit_val, offset_val))
+        }
+    }
+}
+
+fn extract_usize_from_expr(expr: &sqlparser::ast::Expr, context: &str) -> SqlResult<Option<usize>> {
+    use sqlparser::ast::{Expr, Value};
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(text, _) => {
+                let parsed = text.parse::<i64>().map_err(|_| {
+                    Error::InvalidArgumentError(format!("{} must be an integer", context))
+                })?;
+                if parsed < 0 {
+                    return Err(Error::InvalidArgumentError(format!(
+                        "{} must be non-negative",
+                        context
+                    )));
+                }
+                Ok(Some(parsed as usize))
+            }
+            _ => Err(Error::InvalidArgumentError(format!(
+                "{} must be a constant integer",
+                context
+            ))),
+        },
+        _ => Err(Error::InvalidArgumentError(format!(
+            "{} must be a constant integer",
+            context
+        ))),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SubqueryMaterializationMode {
     ExecuteScalarSubqueries,
@@ -5876,6 +5939,13 @@ impl SqlEngine {
             let order_plan = self.translate_order_by(&resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(order_plan);
         }
+
+        if let Some(limit_clause) = &query.limit_clause {
+            let (limit, offset) = extract_limit_offset(limit_clause)?;
+            select_plan.limit = limit;
+            select_plan.offset = offset;
+        }
+
         Ok(select_plan)
     }
 
@@ -5919,6 +5989,13 @@ impl SqlEngine {
             let order_plan = self.translate_order_by(resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(order_plan);
         }
+
+        if let Some(limit_clause) = &query.limit_clause {
+            let (limit, offset) = extract_limit_offset(limit_clause)?;
+            select_plan.limit = limit;
+            select_plan.offset = offset;
+        }
+
         Ok(select_plan)
     }
 
@@ -6209,24 +6286,24 @@ impl SqlEngine {
         // safely push these predicates into the WHERE clause, while LEFT joins must retain
         // them on the join so that unmatched left rows are preserved.
         for (idx, join_expr_opt) in join_conditions.iter().enumerate() {
-            let Some(join_expr) = join_expr_opt else {
-                continue;
+            let translated = if let Some(join_expr) = join_expr_opt {
+                let materialized_expr = self.materialize_in_subquery(
+                    join_expr.clone(),
+                    SubqueryMaterializationMode::PreserveScalarSubqueries,
+                )?;
+                Some(translate_condition_with_context(
+                    self,
+                    resolver,
+                    id_context.clone(),
+                    &materialized_expr,
+                    outer_scopes,
+                    &mut all_subqueries,
+                    &mut scalar_subqueries,
+                    correlated_tracker.reborrow(),
+                )?)
+            } else {
+                None
             };
-
-            let materialized_expr = self.materialize_in_subquery(
-                join_expr.clone(),
-                SubqueryMaterializationMode::PreserveScalarSubqueries,
-            )?;
-            let translated = translate_condition_with_context(
-                self,
-                resolver,
-                id_context.clone(),
-                &materialized_expr,
-                outer_scopes,
-                &mut all_subqueries,
-                &mut scalar_subqueries,
-                correlated_tracker.reborrow(),
-            )?;
 
             let is_left_join = plan
                 .joins
@@ -6235,11 +6312,14 @@ impl SqlEngine {
                 .unwrap_or(false);
 
             if let Some(join_meta) = plan.joins.get_mut(idx) {
-                join_meta.on_condition = Some(translated.clone());
+                let expr_for_join = translated
+                    .clone()
+                    .unwrap_or(llkv_expr::expr::Expr::Literal(true));
+                join_meta.on_condition = Some(expr_for_join);
             }
 
-            if !is_left_join {
-                filter_components.push(translated);
+            if let (Some(actual_expr), false) = (translated, is_left_join) {
+                filter_components.push(actual_expr);
             }
         }
 
@@ -7069,10 +7149,7 @@ impl SqlEngine {
             let plan = ReindexPlan::new(display_name.clone()).with_canonical(canonical_name);
 
             let statement = PlanStatement::Reindex(plan);
-            self.engine.execute_statement(statement).map_err(|err| {
-                tracing::error!("REINDEX failed for '{}': {}", display_name, err);
-                err
-            })
+            self.engine.execute_statement(statement)
         } else {
             // Other VACUUM variants are not supported
             Err(Error::InvalidArgumentError(
@@ -8726,6 +8803,140 @@ fn translate_between_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Refactor args list
+fn translate_like_expr(
+    engine: &SqlEngine,
+    resolver: &IdentifierResolver<'_>,
+    context: IdentifierContext,
+    like_expr: &SqlExpr,
+    pattern_expr: &SqlExpr,
+    negated: bool,
+    outer_scopes: &[IdentifierContext],
+    scalar_subqueries: &mut Vec<llkv_plan::ScalarSubquery>,
+    mut correlated_tracker: Option<&mut SubqueryCorrelatedColumnTracker>,
+) -> SqlResult<llkv_expr::expr::Expr<'static, String>> {
+    // Translate the target expression (must be a column reference)
+    let target_scalar = translate_scalar_with_context_scoped(
+        engine,
+        resolver,
+        context,
+        like_expr,
+        outer_scopes,
+        correlated_tracker.reborrow(),
+        Some(&mut *scalar_subqueries),
+    )?;
+
+    let llkv_expr::expr::ScalarExpr::Column(column) = target_scalar else {
+        return Err(Error::InvalidArgumentError(
+            "LIKE expression target must be a column reference".into(),
+        ));
+    };
+
+    // Extract the pattern string literal
+    let SqlExpr::Value(pattern_value) = pattern_expr else {
+        return Err(Error::InvalidArgumentError(
+            "LIKE pattern must be a string literal".into(),
+        ));
+    };
+
+    let (Value::SingleQuotedString(pattern_str) | Value::DoubleQuotedString(pattern_str)) =
+        &pattern_value.value
+    else {
+        return Err(Error::InvalidArgumentError(
+            "LIKE pattern must be a quoted string".into(),
+        ));
+    };
+
+    // Optimize common LIKE patterns to use specialized operators
+    let operator = if let Some(optimized_op) = try_optimize_like_pattern(pattern_str) {
+        optimized_op
+    } else {
+        // TODO: Implement full pattern matching with % and _ wildcards
+        return Err(Error::InvalidArgumentError(format!(
+            "LIKE pattern '{}' requires full wildcard support (not yet implemented)",
+            pattern_str
+        )));
+    };
+
+    let filter = llkv_expr::expr::Filter {
+        field_id: column,
+        op: operator,
+    };
+
+    let result = llkv_expr::expr::Expr::Pred(filter);
+
+    if negated {
+        Ok(llkv_expr::expr::Expr::not(result))
+    } else {
+        Ok(result)
+    }
+}
+
+/// Try to optimize SQL LIKE patterns to specialized operators.
+///
+/// Returns `Some(operator)` if the pattern can be optimized, `None` otherwise.
+///
+/// Supported optimizations:
+/// - `pattern%` → `StartsWith(pattern)`
+/// - `%pattern` → `EndsWith(pattern)`
+/// - `%pattern%` → `Contains(pattern)`
+/// - Exact match (no wildcards) → `Equals(pattern)`
+fn try_optimize_like_pattern(pattern: &str) -> Option<llkv_expr::expr::Operator<'static>> {
+    let bytes = pattern.as_bytes();
+
+    // Check if pattern has any underscore wildcards (can't optimize those)
+    if pattern.contains('_') {
+        return None;
+    }
+
+    // Count percent signs
+    let percent_count = pattern.chars().filter(|&c| c == '%').count();
+
+    match percent_count {
+        0 => {
+            // No wildcards - exact match
+            Some(llkv_expr::expr::Operator::Equals(Literal::from(pattern)))
+        }
+        1 => {
+            if bytes.first() == Some(&b'%') {
+                // %pattern - ends with
+                let suffix = pattern[1..].to_string();
+                Some(llkv_expr::expr::Operator::EndsWith {
+                    pattern: suffix,
+                    case_sensitive: true,
+                })
+            } else if bytes.last() == Some(&b'%') {
+                // pattern% - starts with
+                let prefix = pattern[..pattern.len() - 1].to_string();
+                Some(llkv_expr::expr::Operator::StartsWith {
+                    pattern: prefix,
+                    case_sensitive: true,
+                })
+            } else {
+                // % in the middle - can't optimize
+                None
+            }
+        }
+        2 => {
+            if bytes.first() == Some(&b'%') && bytes.last() == Some(&b'%') {
+                // %pattern% - contains
+                let substring = pattern[1..pattern.len() - 1].to_string();
+                Some(llkv_expr::expr::Operator::Contains {
+                    pattern: substring,
+                    case_sensitive: true,
+                })
+            } else {
+                // Multiple % in other positions - can't optimize
+                None
+            }
+        }
+        _ => {
+            // Multiple % signs in complex positions - can't optimize
+            None
+        }
+    }
+}
+
 fn correlated_scalar_from_resolution(
     placeholder: String,
     resolution: &ColumnResolution,
@@ -9079,6 +9290,32 @@ fn translate_condition_with_context(
                             negated: *negated,
                         },
                     )));
+                }
+                SqlExpr::Like {
+                    negated,
+                    expr: like_expr,
+                    pattern,
+                    escape_char,
+                    any: _,
+                } => {
+                    if escape_char.is_some() {
+                        return Err(Error::InvalidArgumentError(
+                            "LIKE with ESCAPE clause is not supported".into(),
+                        ));
+                    }
+
+                    let result = translate_like_expr(
+                        engine,
+                        resolver,
+                        context.clone(),
+                        like_expr,
+                        pattern,
+                        *negated,
+                        outer_scopes,
+                        scalar_subqueries,
+                        correlated_tracker.reborrow(),
+                    )?;
+                    work_stack.push(ConditionFrame::Leaf(result));
                 }
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
@@ -11072,7 +11309,23 @@ fn extract_tables(from: &[TableWithJoins]) -> SqlResult<ExtractedJoinData> {
     let mut join_filters = Vec::new();
 
     for item in from {
+        let prior_table_len = tables.len();
+        let prior_join_len = join_metadata.len();
+
         flatten_table_with_joins(item, &mut tables, &mut join_metadata, &mut join_filters)?;
+
+        let new_table_len = tables.len();
+        if prior_table_len > 0 && new_table_len > prior_table_len {
+            join_metadata.insert(
+                prior_join_len,
+                llkv_plan::JoinMetadata {
+                    left_table_index: prior_table_len - 1,
+                    join_type: llkv_plan::JoinPlan::Inner,
+                    on_condition: None,
+                },
+            );
+            join_filters.insert(prior_join_len, None);
+        }
     }
 
     Ok((tables, join_metadata, join_filters))
@@ -11707,6 +11960,70 @@ mod tests {
     }
 
     #[test]
+    fn extract_tables_inserts_cross_join_metadata_for_comma_lists() {
+        use sqlparser::ast::{SetExpr, Statement};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = GenericDialect {};
+        let sql = "SELECT * FROM tab0, tab1 AS cor0 CROSS JOIN tab2";
+        let statements = Parser::parse_sql(&dialect, sql).expect("parse sql");
+        let Statement::Query(query) = &statements[0] else {
+            panic!("expected SELECT query");
+        };
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select.as_ref(),
+            other => panic!("unexpected query body: {other:?}"),
+        };
+
+        let (tables, join_metadata, join_filters) =
+            extract_tables(&select.from).expect("extract tables");
+
+        assert_eq!(tables.len(), 3, "expected three table refs");
+        assert_eq!(join_metadata.len(), 2, "expected two join edges");
+        assert_eq!(join_filters.len(), 2, "join filters mirror metadata len");
+
+        assert_eq!(join_metadata[0].left_table_index, 0, "implicit comma join");
+        assert_eq!(join_metadata[1].left_table_index, 1, "explicit cross join");
+    }
+
+    #[test]
+    fn implicit_cross_join_populates_literal_true_on_condition() {
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute(
+                "CREATE TABLE tab0(col0 INTEGER);
+                 CREATE TABLE tab1(col0 INTEGER);",
+            )
+            .expect("create tables");
+
+        let dialect = SQLiteDialect {};
+        let mut statements =
+            Parser::parse_sql(&dialect, "SELECT * FROM tab0, tab1").expect("parse sql");
+        let Statement::Query(query) = statements.pop().expect("statement") else {
+            unreachable!();
+        };
+        let plan = engine.build_select_plan(*query).expect("build select plan");
+
+        assert_eq!(plan.tables.len(), 2, "expected two tables");
+        assert_eq!(plan.joins.len(), 1, "expected implicit join edge");
+
+        let join_meta = &plan.joins[0];
+        match join_meta.on_condition.as_ref() {
+            Some(llkv_expr::expr::Expr::Literal(value)) => {
+                assert!(*value, "implicit join should be ON TRUE");
+            }
+            other => panic!("unexpected join predicate: {other:?}"),
+        }
+    }
+
+    #[test]
     fn not_between_null_bounds_matches_sqlite_behavior() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
@@ -11988,9 +12305,11 @@ mod tests {
 
         let plan = engine.build_select_plan(*query).expect("build select plan");
 
-        assert_eq!(plan.joins.len(), 1, "expected single explicit join entry");
-
-        let left_join = &plan.joins[0];
+        let left_join = plan
+            .joins
+            .iter()
+            .find(|join| join.join_type == llkv_plan::JoinPlan::Left)
+            .expect("expected explicit LEFT JOIN entry");
         let on_condition = left_join
             .on_condition
             .as_ref()

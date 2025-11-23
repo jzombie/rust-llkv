@@ -4,6 +4,7 @@
 //! memory and persisting lightweight fingerprints alongside column descriptors.
 //! This keeps hot scan and planning paths from re-reading descriptor chains.
 
+use crate::serialization::deserialize_array;
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{ColumnDescriptor, DescriptorIterator};
 use crate::types::{LogicalFieldId, ROW_ID_FIELD_ID};
@@ -11,7 +12,6 @@ use arrow::datatypes::DataType;
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, BatchPut, GetResult, Pager},
-    serialization::deserialize_array,
     types::PhysicalKey,
 };
 use rustc_hash::FxHashMap;

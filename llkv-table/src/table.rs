@@ -978,7 +978,7 @@ mod tests {
 
         let expr = pred_expr(Filter {
             field_id: COL_STR,
-            op: Operator::starts_with("al", true),
+            op: Operator::starts_with("al".to_string(), true),
         });
 
         let mut collected: Vec<Option<String>> = Vec::new();

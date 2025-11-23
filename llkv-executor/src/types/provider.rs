@@ -10,7 +10,7 @@ use std::sync::Arc;
 ///
 /// Implementations of this trait are responsible for resolving canonical table names
 /// to `ExecutorTable` instances that can be used for query execution.
-pub trait ExecutorTableProvider<P>
+pub trait ExecutorTableProvider<P>: Send + Sync
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {

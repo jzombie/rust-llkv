@@ -316,15 +316,15 @@ pub enum Operator<'a> {
     LessThanOrEquals(Literal),
     In(&'a [Literal]),
     StartsWith {
-        pattern: &'a str,
+        pattern: String,
         case_sensitive: bool,
     },
     EndsWith {
-        pattern: &'a str,
+        pattern: String,
         case_sensitive: bool,
     },
     Contains {
-        pattern: &'a str,
+        pattern: String,
         case_sensitive: bool,
     },
     IsNull,
@@ -333,7 +333,7 @@ pub enum Operator<'a> {
 
 impl<'a> Operator<'a> {
     #[inline]
-    pub fn starts_with(pattern: &'a str, case_sensitive: bool) -> Self {
+    pub fn starts_with(pattern: String, case_sensitive: bool) -> Self {
         Operator::StartsWith {
             pattern,
             case_sensitive,
@@ -341,7 +341,7 @@ impl<'a> Operator<'a> {
     }
 
     #[inline]
-    pub fn ends_with(pattern: &'a str, case_sensitive: bool) -> Self {
+    pub fn ends_with(pattern: String, case_sensitive: bool) -> Self {
         Operator::EndsWith {
             pattern,
             case_sensitive,
@@ -349,7 +349,7 @@ impl<'a> Operator<'a> {
     }
 
     #[inline]
-    pub fn contains(pattern: &'a str, case_sensitive: bool) -> Self {
+    pub fn contains(pattern: String, case_sensitive: bool) -> Self {
         Operator::Contains {
             pattern,
             case_sensitive,
@@ -408,7 +408,7 @@ mod tests {
         };
         let f4 = Filter {
             field_id: 4u32,
-            op: Operator::starts_with("pre", true),
+            op: Operator::starts_with("pre".to_string(), true),
         };
 
         // ( f1 AND ( f2 OR NOT f3 ) )  OR  ( NOT f1 AND f4 )
@@ -606,20 +606,20 @@ mod tests {
             _ => panic!("expected In"),
         }
 
-        let f_sw = Filter {
-            field_id: 10u32,
-            op: Operator::starts_with("pre", true),
+        let f4 = Filter {
+            field_id: 4u32,
+            op: Operator::starts_with("pre".to_string(), true),
         };
-        let f_ew = Filter {
-            field_id: 11u32,
-            op: Operator::ends_with("suf", true),
+        let f5 = Filter {
+            field_id: 5u32,
+            op: Operator::ends_with("suf".to_string(), true),
         };
-        let f_ct = Filter {
-            field_id: 12u32,
-            op: Operator::contains("mid", true),
+        let f6 = Filter {
+            field_id: 6u32,
+            op: Operator::contains("mid".to_string(), true),
         };
 
-        match f_sw.op {
+        match f4.op {
             Operator::StartsWith {
                 pattern: b,
                 case_sensitive,
@@ -629,7 +629,7 @@ mod tests {
             }
             _ => panic!(),
         }
-        match f_ew.op {
+        match f5.op {
             Operator::EndsWith {
                 pattern: b,
                 case_sensitive,
@@ -639,7 +639,7 @@ mod tests {
             }
             _ => panic!(),
         }
-        match f_ct.op {
+        match f6.op {
             Operator::Contains {
                 pattern: b,
                 case_sensitive,

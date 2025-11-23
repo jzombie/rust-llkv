@@ -278,7 +278,7 @@ struct QualifyArgs {
     #[arg(long, default_value_t = 1.0)]
     scale: f64,
     /// TPC-H stream number used when rendering parameterized templates.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 0)]
     stream: u32,
     /// One or more TPC-H query numbers (1-22) to validate.
     #[arg(
@@ -591,15 +591,21 @@ fn run_qualify_command(args: QualifyArgs) -> Result<(), TpchError> {
         );
         if report.status == QualificationStatus::Fail {
             if !report.missing_rows.is_empty() {
-                println!("    missing rows:");
-                for row in &report.missing_rows {
+                println!("    missing rows ({}):", report.missing_rows.len());
+                for row in report.missing_rows.iter().take(20) {
                     println!("      {}", row.join(" | "));
+                }
+                if report.missing_rows.len() > 20 {
+                    println!("      ... ({} more)", report.missing_rows.len() - 20);
                 }
             }
             if !report.extra_rows.is_empty() {
-                println!("    extra rows:");
-                for row in &report.extra_rows {
+                println!("    extra rows ({}):", report.extra_rows.len());
+                for row in report.extra_rows.iter().take(20) {
                     println!("      {}", row.join(" | "));
+                }
+                if report.extra_rows.len() > 20 {
+                    println!("      ... ({} more)", report.extra_rows.len() - 20);
                 }
             }
         }

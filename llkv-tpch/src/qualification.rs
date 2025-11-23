@@ -46,6 +46,7 @@ static COLUMN_KINDS: OnceLock<Vec<Vec<ValueKind>>> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct QualificationOptions {
     dataset_dir: PathBuf,
+    answers_dir: PathBuf,
     stream_number: u32,
     queries: Vec<u8>,
 }
@@ -53,16 +54,18 @@ pub struct QualificationOptions {
 impl QualificationOptions {
     /// Create a qualification configuration rooted at the provided answer-set directory.
     pub fn new(dataset_dir: impl Into<PathBuf>) -> Self {
+        let dataset_dir = dataset_dir.into();
         Self {
-            dataset_dir: dataset_dir.into(),
-            stream_number: 1,
+            answers_dir: dataset_dir.clone(),
+            dataset_dir,
+            stream_number: 0,
             queries: (1..=QUALIFICATION_QUERY_COUNT).collect(),
         }
     }
 
     /// Build options targeting the bundled `ref_data/<scale>` folder.
     pub fn from_scale(paths: &SchemaPaths, scale: impl AsRef<Path>) -> Self {
-        Self::new(paths.ref_data_dir(scale))
+        Self::new(paths.ref_data_dir(scale)).with_answers(paths.answers_dir())
     }
 
     /// Override the stream number used for substitution parameters (defaults to 1).
@@ -86,8 +89,18 @@ impl QualificationOptions {
         self
     }
 
+    /// Override the directory containing the expected answer sets.
+    pub fn with_answers(mut self, answers_dir: impl Into<PathBuf>) -> Self {
+        self.answers_dir = answers_dir.into();
+        self
+    }
+
     pub fn dataset_dir(&self) -> &Path {
         &self.dataset_dir
+    }
+
+    pub fn answers_dir(&self) -> &Path {
+        &self.answers_dir
     }
 
     pub fn queries(&self) -> &[u8] {
@@ -141,7 +154,11 @@ pub fn run_qualification(
     validate_query_range(options.queries())?;
 
     let column_kinds = column_kinds(paths)?;
-    let stream_parameters = load_stream_parameters(options.dataset_dir(), options.stream_number())?;
+    let stream_parameters = if options.stream_number() == 0 {
+        HashMap::new()
+    } else {
+        load_stream_parameters(options.dataset_dir(), options.stream_number())?
+    };
 
     let mut reports = Vec::with_capacity(options.queries().len());
 
@@ -153,7 +170,7 @@ pub fn run_qualification(
             .get((query - 1) as usize)
             .ok_or_else(|| TpchError::Parse(format!("no column metadata for query {query}")))?;
 
-        let answer_path = options.dataset_dir().join(format!("q{query}.out"));
+        let answer_path = options.answers_dir().join(format!("q{query}.out"));
         let expected_rows = load_answer_set(&answer_path, kinds)?;
         let rendered = render_query(
             paths,
@@ -203,15 +220,17 @@ pub fn verify_qualification_assets(options: &QualificationOptions) -> Result<()>
             dir.display()
         )));
     }
-    let subparam_path = dir.join(format!("subparam_{}", options.stream_number()));
-    if !subparam_path.is_file() {
-        return Err(TpchError::Parse(format!(
-            "qualification dataset missing stream parameters file '{}'",
-            subparam_path.display()
-        )));
+    if options.stream_number() != 0 {
+        let subparam_path = dir.join(format!("subparam_{}", options.stream_number()));
+        if !subparam_path.is_file() {
+            return Err(TpchError::Parse(format!(
+                "qualification dataset missing stream parameters file '{}'",
+                subparam_path.display()
+            )));
+        }
     }
     for &query in options.queries() {
-        let answer_path = dir.join(format!("q{query}.out"));
+        let answer_path = options.answers_dir().join(format!("q{query}.out"));
         if !answer_path.is_file() {
             return Err(TpchError::Parse(format!(
                 "qualification dataset missing answer set '{}'",

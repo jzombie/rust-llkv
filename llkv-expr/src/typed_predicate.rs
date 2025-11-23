@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn unsupported_operator_errors() {
-        let op = Operator::starts_with("foo", true);
+        let op = Operator::starts_with("foo".to_string(), true);
         let err = build_fixed_width_predicate::<arrow::datatypes::UInt32Type>(&op).unwrap_err();
         assert!(matches!(err, PredicateBuildError::UnsupportedOperator(_)));
     }
@@ -553,33 +553,37 @@ mod tests {
         assert!(predicate.matches("x"));
         assert!(!predicate.matches("z"));
 
-        let sw_sensitive = build_var_width_predicate(&Operator::starts_with("pre", true))
-            .expect("starts with predicate");
+        let sw_sensitive =
+            build_var_width_predicate(&Operator::starts_with("pre".to_string(), true))
+                .expect("starts with predicate");
         assert!(sw_sensitive.matches("prefix"));
         assert!(!sw_sensitive.matches("Prefix"));
 
-        let sw_insensitive = build_var_width_predicate(&Operator::starts_with("Pre", false))
-            .expect("starts with predicate");
+        let sw_insensitive =
+            build_var_width_predicate(&Operator::starts_with("Pre".to_string(), false))
+                .expect("starts with predicate");
         assert!(sw_insensitive.matches("prefix"));
         assert!(sw_insensitive.matches("Prefix"));
 
-        let ew_sensitive = build_var_width_predicate(&Operator::ends_with("suf", true))
+        let ew_sensitive = build_var_width_predicate(&Operator::ends_with("suf".to_string(), true))
             .expect("ends with predicate");
         assert!(ew_sensitive.matches("datsuf"));
         assert!(!ew_sensitive.matches("datSuf"));
 
-        let ew_insensitive = build_var_width_predicate(&Operator::ends_with("SUF", false))
-            .expect("ends with predicate");
+        let ew_insensitive =
+            build_var_width_predicate(&Operator::ends_with("SUF".to_string(), false))
+                .expect("ends with predicate");
         assert!(ew_insensitive.matches("datsuf"));
         assert!(ew_insensitive.matches("datSuf"));
 
-        let ct_sensitive = build_var_width_predicate(&Operator::contains("mid", true))
+        let ct_sensitive = build_var_width_predicate(&Operator::contains("mid".to_string(), true))
             .expect("contains predicate");
         assert!(ct_sensitive.matches("amidst"));
         assert!(!ct_sensitive.matches("aMidst"));
 
-        let ct_insensitive = build_var_width_predicate(&Operator::contains("MiD", false))
-            .expect("contains predicate");
+        let ct_insensitive =
+            build_var_width_predicate(&Operator::contains("MiD".to_string(), false))
+                .expect("contains predicate");
         assert!(ct_insensitive.matches("amidst"));
         assert!(ct_insensitive.matches("aMidst"));
     }

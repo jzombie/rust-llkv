@@ -114,11 +114,11 @@ fn fused_equals_sequential_string_contains() {
     // Two contains predicates on same field
     let pred1 = Expr::Pred(Filter {
         field_id: FIELD,
-        op: Operator::contains("needle", true),
+        op: Operator::contains("needle".to_string(), true),
     });
     let pred2 = Expr::Pred(Filter {
         field_id: FIELD,
-        op: Operator::starts_with("row-1", true),
+        op: Operator::starts_with("row-1".to_string(), true),
     });
 
     // Fused: planner should detect AND of same-field preds
@@ -141,11 +141,14 @@ fn fused_equals_sequential_string_contains() {
     // Sequential: run two single-predicate scans and intersect row ids
     use llkv_column_map::store::scan::filter::Utf8Filter;
     let lf = LogicalFieldId::for_user(table.table_id(), FIELD);
-    let p1 =
-        llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains("needle", true))
-            .unwrap();
+    let p1 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::contains(
+        "needle".to_string(),
+        true,
+    ))
+    .unwrap();
     let p2 = llkv_expr::typed_predicate::build_var_width_predicate(&Operator::starts_with(
-        "row-1", true,
+        "row-1".to_string(),
+        true,
     ))
     .unwrap();
     let ids1 = table
@@ -185,7 +188,7 @@ fn scan_string_predicates_case_sensitivity() {
         FIELD,
         &Expr::Pred(Filter {
             field_id: FIELD,
-            op: Operator::contains("needle", true),
+            op: Operator::contains("needle".to_string(), true),
         }),
     );
     sensitive.sort();
@@ -196,7 +199,7 @@ fn scan_string_predicates_case_sensitivity() {
         FIELD,
         &Expr::Pred(Filter {
             field_id: FIELD,
-            op: Operator::contains("needle", false),
+            op: Operator::contains("needle".to_string(), false),
         }),
     );
     insensitive.sort();
@@ -211,7 +214,7 @@ fn scan_string_predicates_case_sensitivity() {
         FIELD,
         &Expr::Pred(Filter {
             field_id: FIELD,
-            op: Operator::starts_with("row-", true),
+            op: Operator::starts_with("row-".to_string(), true),
         }),
     );
     starts_sensitive.sort();
@@ -222,7 +225,7 @@ fn scan_string_predicates_case_sensitivity() {
         FIELD,
         &Expr::Pred(Filter {
             field_id: FIELD,
-            op: Operator::starts_with("row-", false),
+            op: Operator::starts_with("row-".to_string(), false),
         }),
     );
     starts_insensitive.sort();
@@ -237,7 +240,7 @@ fn scan_string_predicates_case_sensitivity() {
         FIELD,
         &Expr::Pred(Filter {
             field_id: FIELD,
-            op: Operator::ends_with("tail", true),
+            op: Operator::ends_with("tail".to_string(), true),
         }),
     );
     ends_sensitive.sort();
@@ -248,7 +251,7 @@ fn scan_string_predicates_case_sensitivity() {
         FIELD,
         &Expr::Pred(Filter {
             field_id: FIELD,
-            op: Operator::ends_with("tail", false),
+            op: Operator::ends_with("tail".to_string(), false),
         }),
     );
     ends_insensitive.sort();
@@ -290,11 +293,11 @@ fn fused_case_sensitivity_combinations() {
         let expr = Expr::And(vec![
             Expr::Pred(Filter {
                 field_id: FIELD,
-                op: Operator::contains("needle", contains_case_sensitive),
+                op: Operator::contains("needle".to_string(), contains_case_sensitive),
             }),
             Expr::Pred(Filter {
                 field_id: FIELD,
-                op: Operator::starts_with("row-", starts_case_sensitive),
+                op: Operator::starts_with("row-".to_string(), starts_case_sensitive),
             }),
         ]);
 
