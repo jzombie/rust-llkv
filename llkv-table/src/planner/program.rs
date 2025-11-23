@@ -447,13 +447,13 @@ mod tests {
 
         match &children[0] {
             Expr::Not(inner) => match inner.as_ref() {
-                Expr::Compare {
-                    op: CompareOp::GtEq,
+                Expr::Pred(Filter {
+                    op: Operator::GreaterThanOrEquals(_),
                     ..
-                } => {}
+                }) => {}
                 other => panic!("unexpected left branch: {other:?}"),
             },
-            other => panic!("left branch should be NOT(compare), got {other:?}"),
+            other => panic!("left branch should be NOT(pred), got {other:?}"),
         }
 
         match &children[1] {

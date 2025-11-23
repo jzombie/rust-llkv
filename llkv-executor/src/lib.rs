@@ -1611,6 +1611,44 @@ where
             })?
         };
 
+        // Sort if needed (before projection, so we have access to all columns and the lookup map)
+        if !plan.order_by.is_empty() {
+            let mut resolved_order_by = Vec::with_capacity(plan.order_by.len());
+            for order in &plan.order_by {
+                let resolved_target = match &order.target {
+                    OrderTarget::Column(name) => {
+                        let col_name = name.to_ascii_lowercase();
+                        if let Some(&idx) = column_lookup_map.get(&col_name) {
+                            OrderTarget::Index(idx)
+                        } else {
+                            // Fallback: try to find in schema directly (for unqualified names)
+                            if let Ok(idx) = combined_schema.index_of(name) {
+                                OrderTarget::Index(idx)
+                            } else {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "ORDER BY references unknown column '{}'",
+                                    name
+                                )));
+                            }
+                        }
+                    }
+                    other => other.clone(),
+                };
+                resolved_order_by.push(llkv_plan::OrderByPlan {
+                    target: resolved_target,
+                    sort_type: order.sort_type.clone(),
+                    ascending: order.ascending,
+                    nulls_first: order.nulls_first,
+                });
+            }
+
+            combined_batch = sort_record_batch_with_order(
+                &combined_schema,
+                &combined_batch,
+                &resolved_order_by,
+            )?;
+        }
+
         // Apply SELECT projections if specified
         if !plan.projections.is_empty() {
             let mut selected_fields = Vec::new();
@@ -1710,11 +1748,6 @@ where
         }
 
         let schema = combined_batch.schema();
-
-        if !plan.order_by.is_empty() {
-            combined_batch =
-                sort_record_batch_with_order(&schema, &combined_batch, &plan.order_by)?;
-        }
 
         Ok(SelectExecution::new_single_batch(
             display_name,
