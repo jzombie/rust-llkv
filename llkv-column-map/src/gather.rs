@@ -10,8 +10,8 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Decimal128Builder, GenericBinaryArray,
     GenericBinaryBuilder, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
-    PrimitiveArray, PrimitiveBuilder, RecordBatch, StructArray, UInt32Array, UInt64Array,
-    new_empty_array,
+    PrimitiveArray, PrimitiveBuilder, RecordBatch, StringViewArray, StringViewBuilder, StructArray,
+    UInt32Array, UInt64Array, new_empty_array,
 };
 use arrow::compute::{self, take};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
@@ -363,6 +363,87 @@ where
         }
     }
 
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+pub(crate) fn gather_rows_single_shot_string_view(
+    row_index: &FxHashMap<u64, usize>,
+    len: usize,
+    value_metas: &[ChunkMetadata],
+    row_metas: &[ChunkMetadata],
+    candidate_indices: &[usize],
+    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+    allow_missing: bool,
+) -> Result<ArrayRef> {
+    if len == 0 {
+        let mut builder = StringViewBuilder::new();
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
+
+    let mut values: Vec<Option<String>> = vec![None; len];
+    let mut found: Vec<bool> = vec![false; len];
+
+    for &idx in candidate_indices {
+        let value_chunk = chunk_blobs
+            .remove(&value_metas[idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+        let row_chunk = chunk_blobs
+            .remove(&row_metas[idx].chunk_pk)
+            .ok_or(Error::NotFound)?;
+
+        let value_any = deserialize_array(value_chunk)?;
+        let value_arr = value_any
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .ok_or_else(|| {
+                Error::Internal(
+                    "gather_rows_multi: dtype mismatch (expected StringViewArray)".into(),
+                )
+            })?;
+        let row_any = deserialize_array(row_chunk)?;
+        let row_arr = row_any
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
+
+        for i in 0..row_arr.len() {
+            if !row_arr.is_valid(i) {
+                continue;
+            }
+            let row_id = row_arr.value(i);
+            if let Some(&out_idx) = row_index.get(&row_id) {
+                found[out_idx] = true;
+                if value_arr.is_null(i) {
+                    values[out_idx] = None;
+                } else {
+                    values[out_idx] = Some(value_arr.value(i).to_string());
+                }
+            }
+        }
+    }
+
+    if !allow_missing {
+        if found.iter().any(|f| !*f) {
+            return Err(Error::Internal(
+                "gather_rows_multi: one or more requested row IDs were not found".into(),
+            ));
+        }
+    } else {
+        for (idx, was_found) in found.iter().enumerate() {
+            if !*was_found {
+                values[idx] = None;
+            }
+        }
+    }
+
+    let mut builder = StringViewBuilder::with_capacity(len);
+    for v in values {
+        if let Some(s) = v {
+            builder.append_value(s);
+        } else {
+            builder.append_null();
+        }
+    }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 

@@ -18,6 +18,7 @@ use crate::gather::{
     gather_rows_single_shot_bool as shared_gather_rows_single_shot_bool,
     gather_rows_single_shot_decimal128 as shared_gather_rows_single_shot_decimal128,
     gather_rows_single_shot_string as shared_gather_rows_single_shot_string,
+    gather_rows_single_shot_string_view as shared_gather_rows_single_shot_string_view,
     gather_rows_single_shot_struct as shared_gather_rows_single_shot_struct,
 };
 use crate::serialization::deserialize_array;
@@ -374,6 +375,13 @@ where
                     allow_missing,
                 ),
                 DataType::LargeBinary => Self::gather_rows_single_shot_binary::<i64>(
+                    &row_index,
+                    row_ids.len(),
+                    plan,
+                    &mut chunk_map,
+                    allow_missing,
+                ),
+                DataType::Utf8View => Self::gather_rows_single_shot_string_view(
                     &row_index,
                     row_ids.len(),
                     plan,
@@ -885,6 +893,24 @@ where
         T: ArrowPrimitiveType,
     {
         shared_gather_rows_single_shot::<T>(
+            row_index,
+            len,
+            &plan.value_metas,
+            &plan.row_metas,
+            &plan.candidate_indices,
+            chunk_blobs,
+            allow_missing,
+        )
+    }
+
+    fn gather_rows_single_shot_string_view(
+        row_index: &FxHashMap<u64, usize>,
+        len: usize,
+        plan: &FieldPlan,
+        chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
+        allow_missing: bool,
+    ) -> Result<ArrayRef> {
+        shared_gather_rows_single_shot_string_view(
             row_index,
             len,
             &plan.value_metas,

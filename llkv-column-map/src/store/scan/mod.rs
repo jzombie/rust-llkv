@@ -164,7 +164,7 @@ where
             });
         }
         let buffers = sorted::load_sorted_buffers(self.pager.as_ref(), &metas)?;
-        let first_any = deserialize_array(buffers.value_handle(0).clone())?;
+        let first_any = crate::serialization::deserialize_array(buffers.value_handle(0).clone())?;
         with_integer_arrow_type!(
             first_any.data_type().clone(),
             |ArrowTy| {
@@ -319,7 +319,8 @@ where
 
             let buffers =
                 sorted::load_sorted_buffers_with_rids(self.pager.as_ref(), &metas_val, &metas_rid)?;
-            let first_any = deserialize_array(buffers.base().value_handle(0).clone())?;
+            let first_any =
+                crate::serialization::deserialize_array(buffers.base().value_handle(0).clone())?;
             if opts.reverse {
                 if paginate {
                     let mut pv = crate::store::scan::PaginateVisitor::new_with_reverse(

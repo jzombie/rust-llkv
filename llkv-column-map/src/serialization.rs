@@ -162,6 +162,7 @@ enum PrimType {
     Date32 = 16,
     Date64 = 17,
     Decimal128 = 18,
+    Utf8View = 19,
 }
 
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
@@ -184,6 +185,7 @@ fn prim_from_datatype(dt: &DataType) -> Result<PrimType> {
         Float64 => PrimType::Float64,
         Binary => PrimType::Binary,
         Utf8 => PrimType::Utf8,
+        Utf8View => PrimType::Utf8View,
         LargeBinary => PrimType::LargeBinary,
         LargeUtf8 => PrimType::LargeUtf8,
         Boolean => PrimType::Boolean,
@@ -213,6 +215,7 @@ fn datatype_from_prim(p: PrimType, precision: u8, scale: u8) -> Result<DataType>
         PrimType::Float64 => Float64,
         PrimType::Binary => Binary,
         PrimType::Utf8 => Utf8,
+        PrimType::Utf8View => Utf8View,
         PrimType::LargeBinary => LargeBinary,
         PrimType::LargeUtf8 => LargeUtf8,
         PrimType::Boolean => Boolean,
@@ -231,6 +234,11 @@ pub fn serialize_array(arr: &dyn Array) -> Result<Vec<u8>> {
         &DataType::Utf8 => serialize_varlen(arr, PrimType::Utf8),
         &DataType::LargeBinary => serialize_varlen(arr, PrimType::LargeBinary),
         &DataType::LargeUtf8 => serialize_varlen(arr, PrimType::LargeUtf8),
+        &DataType::Utf8View => {
+            let casted = arrow::compute::cast(arr, &DataType::Utf8)
+                .map_err(|e| Error::Internal(format!("failed to cast Utf8View to Utf8: {}", e)))?;
+            serialize_varlen(&casted, PrimType::Utf8View)
+        }
 
         // Special-case fixed-size list of f32 as before.
         &DataType::FixedSizeList(ref child, list_size) => {
@@ -515,6 +523,24 @@ pub fn deserialize_array(blob: EntryHandle) -> Result<ArrayRef> {
 
             let p = PrimType::try_from(type_code)
                 .map_err(|_| Error::Internal("unsupported varlen code".into()))?;
+
+            // Special handling for Utf8View stored as Utf8
+            if p == PrimType::Utf8View {
+                let data_type = DataType::Utf8;
+                let data = ArrayData::builder(data_type)
+                    .len(len)
+                    .add_buffer(offsets)
+                    .add_buffer(values)
+                    .build()?;
+                let utf8_array = make_array(data);
+                // Cast to Utf8View
+                let view_array =
+                    arrow::compute::cast(&utf8_array, &DataType::Utf8View).map_err(|e| {
+                        Error::Internal(format!("failed to cast Utf8 to Utf8View: {}", e))
+                    })?;
+                return Ok(view_array);
+            }
+
             // Varlen types (Binary, Utf8, etc.) don't use precision/scale
             let data_type = datatype_from_prim(p, 0, 0)?;
 
@@ -582,4 +608,5 @@ const _: () = {
     ["code changed"][!(PrimType::Boolean as u8 == 15) as usize];
     ["code changed"][!(PrimType::Date32 as u8 == 16) as usize];
     ["code changed"][!(PrimType::Date64 as u8 == 17) as usize];
+    ["code changed"][!(PrimType::Utf8View as u8 == 19) as usize];
 };
