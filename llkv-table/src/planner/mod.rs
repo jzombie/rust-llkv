@@ -1203,6 +1203,7 @@ where
                                     NumericKind::Integer => DataType::Int64,
                                     NumericKind::Float => DataType::Float64,
                                     NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
+                                    NumericKind::String => DataType::Utf8,
                                 }
                             }
                             ScalarExpr::Column(fid) => {
@@ -1478,6 +1479,7 @@ where
                     NumericKind::Integer => DataType::Int64,
                     NumericKind::Float => DataType::Float64,
                     NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
+                    NumericKind::String => DataType::Utf8,
                 };
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
@@ -1818,7 +1820,7 @@ where
             let value = NumericKernels::evaluate_value(value_expr, 0, &arrays)?;
             match value {
                 Some(v) => {
-                    if NumericKernels::compare(CompareOp::Eq, v, target_val) {
+                    if NumericKernels::compare(CompareOp::Eq, v, target_val.clone()) {
                         matched = true;
                         break;
                     }
@@ -1963,7 +1965,7 @@ where
                         NumericKernels::evaluate_value(value_expr, offset, &numeric_arrays)?;
                     match value {
                         Some(v) => {
-                            if NumericKernels::compare(CompareOp::Eq, v, target_val) {
+                            if NumericKernels::compare(CompareOp::Eq, v, target_val.clone()) {
                                 matched = true;
                                 break;
                             }
@@ -5162,6 +5164,7 @@ fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Opti
         Some(NumericValue::Int(v)) => Ok(Some(Literal::Integer(v as i128))),
         Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
         Some(NumericValue::Decimal(d)) => Ok(Some(Literal::Decimal(d))),
+        Some(NumericValue::String(s)) => Ok(Some(Literal::String(s))),
         None => Ok(None),
     }
 }

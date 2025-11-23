@@ -1,4 +1,4 @@
-use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array};
+use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use llkv_expr::DecimalValue;
 use llkv_result::Error;
@@ -14,6 +14,7 @@ pub struct NumericArray {
     int_data: Option<Arc<Int64Array>>,
     float_data: Option<Arc<Float64Array>>,
     decimal_data: Option<Arc<Decimal128Array>>,
+    string_data: Option<Arc<StringArray>>,
 }
 
 impl NumericArray {
@@ -25,6 +26,7 @@ impl NumericArray {
             int_data: Some(array),
             float_data: None,
             decimal_data: None,
+            string_data: None,
         }
     }
 
@@ -36,6 +38,7 @@ impl NumericArray {
             int_data: None,
             float_data: Some(array),
             decimal_data: None,
+            string_data: None,
         }
     }
 
@@ -47,11 +50,32 @@ impl NumericArray {
             int_data: None,
             float_data: None,
             decimal_data: Some(array),
+            string_data: None,
+        }
+    }
+
+    pub fn new_string(array: Arc<StringArray>) -> Self {
+        let len = array.len();
+        Self {
+            kind: NumericKind::String,
+            len,
+            int_data: None,
+            float_data: None,
+            decimal_data: None,
+            string_data: Some(array),
         }
     }
 
     pub fn try_from_arrow(array: &ArrayRef) -> Result<Self, Error> {
         match array.data_type() {
+            DataType::Utf8 => {
+                let typed = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| Error::Internal("expected String array".into()))?
+                    .clone();
+                Ok(Self::new_string(Arc::new(typed)))
+            }
             DataType::Int64 => {
                 let typed = array
                     .as_any()
@@ -129,6 +153,7 @@ impl NumericArray {
             NumericKind::Integer => Arc::new(self.int_data.as_ref().unwrap().as_ref().clone()),
             NumericKind::Float => Arc::new(self.float_data.as_ref().unwrap().as_ref().clone()),
             NumericKind::Decimal => Arc::new(self.decimal_data.as_ref().unwrap().as_ref().clone()),
+            NumericKind::String => Arc::new(self.string_data.as_ref().unwrap().as_ref().clone()),
         }
     }
 
@@ -154,6 +179,10 @@ impl NumericArray {
 
     pub fn decimal_data(&self) -> Option<&Arc<Decimal128Array>> {
         self.decimal_data.as_ref()
+    }
+
+    pub fn string_data(&self) -> Option<&Arc<StringArray>> {
+        self.string_data.as_ref()
     }
 
     pub fn value(&self, idx: usize) -> Option<NumericValue> {
@@ -188,18 +217,44 @@ impl NumericArray {
                 if array.is_null(idx) {
                     None
                 } else {
-                    let value_i128 = array.value(idx);
-                    let scale = array.scale();
                     Some(NumericValue::Decimal(
-                        DecimalValue::new(value_i128, scale)
-                            .expect("valid decimal from Decimal128Array"),
+                        DecimalValue::new(array.value(idx), array.scale())
+                            .expect("invalid decimal in array"),
                     ))
+                }
+            }
+            NumericKind::String => {
+                let array = self
+                    .string_data
+                    .as_ref()
+                    .expect("string array missing backing data");
+                if array.is_null(idx) {
+                    None
+                } else {
+                    Some(NumericValue::String(array.value(idx).to_string()))
                 }
             }
         }
     }
 
     pub fn from_numeric_values(values: Vec<Option<NumericValue>>, preferred: NumericKind) -> Self {
+        let contains_string = values
+            .iter()
+            .any(|opt| matches!(opt, Some(NumericValue::String(_))));
+
+        if contains_string || preferred == NumericKind::String {
+            let iter = values.into_iter().map(|opt| {
+                opt.map(|v| match v {
+                    NumericValue::String(s) => s,
+                    NumericValue::Int(i) => i.to_string(),
+                    NumericValue::Float(f) => f.to_string(),
+                    NumericValue::Decimal(d) => d.to_string(),
+                })
+            });
+            let array = StringArray::from_iter(iter);
+            return NumericArray::new_string(Arc::new(array));
+        }
+
         let contains_float = values
             .iter()
             .any(|opt| matches!(opt, Some(NumericValue::Float(_))));
@@ -306,6 +361,13 @@ impl NumericArray {
                     .unwrap();
                 NumericArray::new_decimal(Arc::new(array))
             }
+            // Fallback for unexpected cases (shouldn't happen with current logic)
+            _ => {
+                // Default to float if we can't decide
+                let iter = values.into_iter().map(|opt| opt.map(|v| v.to_f64()));
+                let array = Float64Array::from_iter(iter);
+                NumericArray::new_float(Arc::new(array))
+            }
         }
     }
 
@@ -341,6 +403,21 @@ impl NumericArray {
                         let decimal = DecimalValue::new(value_i128, scale)
                             .expect("valid decimal from Decimal128Array");
                         Some(decimal.to_f64())
+                    }
+                });
+                let float_array = Float64Array::from_iter(iter);
+                NumericArray::new_float(Arc::new(float_array))
+            }
+            NumericKind::String => {
+                let array = self
+                    .string_data
+                    .as_ref()
+                    .expect("string array missing backing data");
+                let iter = (0..self.len).map(|idx| {
+                    if array.is_null(idx) {
+                        None
+                    } else {
+                        array.value(idx).parse::<f64>().ok()
                     }
                 });
                 let float_array = Float64Array::from_iter(iter);

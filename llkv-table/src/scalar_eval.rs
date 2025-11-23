@@ -4,7 +4,7 @@
 //! into a minimal numeric representation and apply lightweight kernels without
 //! duplicating logic throughout the scan pipeline.
 
-use std::{convert::TryFrom, sync::Arc};
+use std::{convert::TryFrom, str::FromStr, sync::Arc};
 
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
@@ -36,6 +36,8 @@ impl VectorizedExpr {
             VectorizedExpr::Array(array) => array.to_aligned_array_ref(kind),
             VectorizedExpr::Scalar(Some(value)) => {
                 let target_kind = match (value.kind(), kind) {
+                    (_, NumericKind::String) => NumericKind::String,
+                    (NumericKind::String, _) => NumericKind::String,
                     (NumericKind::Float, _) => NumericKind::Float,
                     (NumericKind::Decimal, _) => NumericKind::Decimal,
                     (NumericKind::Integer, NumericKind::Float) => NumericKind::Float,
@@ -275,7 +277,7 @@ impl NumericKernels {
                         let when_val = Self::evaluate_value(when_expr, idx, arrays)?;
                         match (op_val_opt, &when_val) {
                             (Some(op_val), Some(branch_val)) => {
-                                Self::numeric_equals(*op_val, *branch_val)
+                                Self::numeric_equals(op_val.clone(), branch_val.clone())
                             }
                             _ => false,
                         }
@@ -498,39 +500,22 @@ impl NumericKernels {
     }
 
     fn literal_numeric_value(expr: &ScalarExpr<FieldId>) -> Option<NumericValue> {
-        if let ScalarExpr::Literal(lit) = expr {
-            match lit {
-                llkv_expr::literal::Literal::Float(f) => Some(NumericValue::Float(*f)),
-                llkv_expr::literal::Literal::Integer(i) => {
-                    if let Ok(value) = i64::try_from(*i) {
-                        Some(NumericValue::Int(value))
-                    } else {
-                        Some(NumericValue::Float(*i as f64))
-                    }
-                }
-                llkv_expr::literal::Literal::Decimal(decimal) => {
-                    // Preserve decimal values instead of converting to float
-                    Some(NumericValue::Decimal(*decimal))
-                }
-                llkv_expr::literal::Literal::Boolean(b) => {
-                    Some(NumericValue::Int(if *b { 1 } else { 0 }))
-                }
-                llkv_expr::literal::Literal::String(_) => None,
-                llkv_expr::literal::Literal::Date32(_) => None,
-                llkv_expr::literal::Literal::Struct(_) => None,
-                llkv_expr::literal::Literal::Interval(_) => None,
-                llkv_expr::literal::Literal::Null => None,
-            }
-        } else if let ScalarExpr::IsNull { expr, negated } = expr {
-            if let ScalarExpr::Literal(lit) = expr.as_ref() {
-                let is_null = matches!(lit, Literal::Null);
-                let condition = if is_null { !negated } else { *negated };
-                Some(NumericValue::Int(if condition { 1 } else { 0 }))
-            } else {
-                None
-            }
-        } else {
-            None
+        let value = match expr {
+            ScalarExpr::Literal(lit) => match lit {
+                Literal::Integer(i) => Some(NumericValue::Int(*i as i64)),
+                Literal::Float(f) => Some(NumericValue::Float(*f)),
+                Literal::Decimal(d) => Some(NumericValue::Decimal(*d)),
+                Literal::String(s) => Some(NumericValue::String(s.clone())),
+                _ => None,
+            },
+            _ => None,
+        };
+        match value {
+            Some(NumericValue::Int(_)) => value,
+            Some(NumericValue::Float(_)) => value,
+            Some(NumericValue::Decimal(_)) => value,
+            Some(NumericValue::String(_)) => value,
+            None => None,
         }
     }
 
@@ -550,8 +535,9 @@ impl NumericKernels {
 
     #[inline]
     fn numeric_equals(lhs: NumericValue, rhs: NumericValue) -> bool {
-        match (lhs, rhs) {
+        match (&lhs, &rhs) {
             (NumericValue::Int(a), NumericValue::Int(b)) => a == b,
+            (NumericValue::String(a), NumericValue::String(b)) => a == b,
             _ => lhs.as_f64() == rhs.as_f64(),
         }
     }
@@ -559,9 +545,10 @@ impl NumericKernels {
     #[inline]
     fn truthy_numeric(value: NumericValue) -> bool {
         match value {
-            NumericValue::Int(v) => v != 0,
-            NumericValue::Float(v) => v != 0.0,
+            NumericValue::Int(i) => i != 0,
+            NumericValue::Float(f) => f != 0.0,
             NumericValue::Decimal(d) => d.raw_value() != 0,
+            NumericValue::String(s) => !s.is_empty(),
         }
     }
 
@@ -669,6 +656,9 @@ impl NumericKernels {
                 }
                 Ok(Some(truncated as i32))
             }
+            Some(NumericValue::String(_)) => Err(Error::InvalidArgumentError(
+                "cannot cast string to DATE".into(),
+            )),
         }
     }
 
@@ -1205,11 +1195,13 @@ impl NumericKernels {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
                 Some(ScalarExpr::literal(result))
@@ -1219,11 +1211,13 @@ impl NumericKernels {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
                 Some(ScalarExpr::literal(result))
@@ -1236,6 +1230,7 @@ impl NumericKernels {
             NumericValue::Int(i) => ScalarExpr::literal(i),
             NumericValue::Float(f) => ScalarExpr::literal(f),
             NumericValue::Decimal(d) => ScalarExpr::Literal(Literal::Decimal(d)),
+            NumericValue::String(s) => ScalarExpr::Literal(Literal::String(s)),
         }
     }
 
@@ -1285,11 +1280,13 @@ impl NumericKernels {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
                 Some(NumericValue::Int(result))
@@ -1299,11 +1296,13 @@ impl NumericKernels {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
+                    NumericValue::String(_) => return None,
                 };
                 let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
                 Some(NumericValue::Int(result))
@@ -1346,6 +1345,7 @@ impl NumericKernels {
                 NumericKind::Integer => NumericValue::Int(v),
                 NumericKind::Float => NumericValue::Float(v as f64),
                 NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(v)),
+                NumericKind::String => NumericValue::String(v.to_string()),
             })),
             Some(NumericValue::Float(v)) => {
                 if !v.is_finite() {
@@ -1366,6 +1366,7 @@ impl NumericKernels {
                         }
                         Ok(Some(NumericValue::Int(truncated as i64)))
                     }
+                    NumericKind::String => Ok(Some(NumericValue::String(v.to_string()))),
                 }
             }
             Some(NumericValue::Decimal(d)) => match target {
@@ -1381,6 +1382,29 @@ impl NumericKernels {
                     }
                     Ok(Some(NumericValue::Int(truncated as i64)))
                 }
+                NumericKind::String => Ok(Some(NumericValue::String(d.to_string()))),
+            },
+            Some(NumericValue::String(s)) => match target {
+                NumericKind::String => Ok(Some(NumericValue::String(s))),
+                NumericKind::Integer => {
+                    s.parse::<i64>()
+                        .map(NumericValue::Int)
+                        .map(Some)
+                        .map_err(|_| {
+                            Error::InvalidArgumentError("cannot cast string to integer".into())
+                        })
+                }
+                NumericKind::Float => s
+                    .parse::<f64>()
+                    .map(NumericValue::Float)
+                    .map(Some)
+                    .map_err(|_| Error::InvalidArgumentError("cannot cast string to float".into())),
+                NumericKind::Decimal => DecimalValue::from_str(&s)
+                    .map(NumericValue::Decimal)
+                    .map(Some)
+                    .map_err(|_| {
+                        Error::InvalidArgumentError("cannot cast string to decimal".into())
+                    }),
             },
         }
     }
@@ -1418,6 +1442,21 @@ impl NumericKernels {
                     Ok(NumericArray::from_numeric_values(
                         values,
                         NumericKind::Integer,
+                    ))
+                }
+            }
+            NumericKind::String => {
+                if array.kind() == NumericKind::String {
+                    Ok(array.clone())
+                } else {
+                    let mut values = Vec::with_capacity(array.len());
+                    for idx in 0..array.len() {
+                        let value = array.value(idx);
+                        values.push(Self::cast_numeric_value_to_kind(value, target)?);
+                    }
+                    Ok(NumericArray::from_numeric_values(
+                        values,
+                        NumericKind::String,
                     ))
                 }
             }
@@ -1620,11 +1659,13 @@ impl NumericKernels {
             NumericKind::Integer => NumericValue::Int(1),
             NumericKind::Float => NumericValue::Float(1.0),
             NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(1)),
+            NumericKind::String => NumericValue::String("".to_string()),
         };
         let rhs_value = match rhs_kind {
             NumericKind::Integer => NumericValue::Int(1),
             NumericKind::Float => NumericValue::Float(1.0),
             NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(1)),
+            NumericKind::String => NumericValue::String("".to_string()),
         };
 
         Self::apply_binary_values(op, lhs_value, rhs_value)
@@ -1642,6 +1683,14 @@ impl NumericKernels {
                 CompareOp::LtEq => li <= ri,
                 CompareOp::Gt => li > ri,
                 CompareOp::GtEq => li >= ri,
+            },
+            (NumericValue::String(ls), NumericValue::String(rs)) => match op {
+                CompareOp::Eq => ls == rs,
+                CompareOp::NotEq => ls != rs,
+                CompareOp::Lt => ls < rs,
+                CompareOp::LtEq => ls <= rs,
+                CompareOp::Gt => ls > rs,
+                CompareOp::GtEq => ls >= rs,
             },
             (lv, rv) => {
                 let lf = lv.as_f64();
@@ -1823,6 +1872,7 @@ mod tests {
                 NumericValue::Int(v) => v,
                 NumericValue::Float(v) => v as i64,
                 NumericValue::Decimal(d) => d.to_f64() as i64,
+                NumericValue::String(_) => panic!("unexpected string"),
             });
             assert_eq!(actual, *expected, "row {idx} did not match");
         }
@@ -1837,6 +1887,7 @@ mod tests {
                 NumericValue::Int(v) => v,
                 NumericValue::Float(v) => v as i64,
                 NumericValue::Decimal(d) => d.to_f64() as i64,
+                NumericValue::String(_) => panic!("unexpected string"),
             });
             assert_eq!(actual, *expected, "comparison row {idx} mismatch");
         }
@@ -2139,5 +2190,56 @@ mod tests {
             ScalarExpr::literal(2),
         );
         assert_eq!(NumericKernels::passthrough_column(&expr_add_two), None);
+    }
+
+    #[test]
+    fn coalesce_mixed_types() {
+        const A: FieldId = 1;
+        const B: FieldId = 2;
+        const C: FieldId = 3;
+        const D: FieldId = 4;
+        const E: FieldId = 5;
+
+        let mut arrays: NumericArrayMap = NumericArrayMap::default();
+        arrays.insert(A, int_array(&[Some(1), None, None, None, None, None]));
+        arrays.insert(B, float_array(&[None, Some(2.0), None, None, None, None]));
+        arrays.insert(C, int_array(&[None, None, Some(3), None, None, None]));
+        arrays.insert(D, float_array(&[None, None, None, Some(4.0), None, None]));
+        arrays.insert(E, int_array(&[None, None, None, None, Some(5), None]));
+
+        let coalesce_expr = ScalarExpr::Coalesce(vec![
+            ScalarExpr::column(A),
+            ScalarExpr::column(B),
+            ScalarExpr::column(C),
+            ScalarExpr::column(D),
+            ScalarExpr::column(E),
+        ]);
+
+        let expected_values = [Some(1), Some(2), Some(3), Some(4), Some(5), None];
+        for (idx, expected) in expected_values.iter().enumerate() {
+            let value = NumericKernels::evaluate_value(&coalesce_expr, idx, &arrays).unwrap();
+            let actual = value.map(|num| match num {
+                NumericValue::Int(v) => v,
+                NumericValue::Float(v) => v as i64,
+                NumericValue::Decimal(d) => d.to_f64() as i64,
+                NumericValue::String(_) => panic!("unexpected string"),
+            });
+            assert_eq!(actual, *expected, "row {idx} did not match");
+        }
+
+        let compare_expr =
+            ScalarExpr::compare(coalesce_expr, CompareOp::NotEq, ScalarExpr::literal(0));
+
+        let expected_flags = [Some(1), Some(1), Some(1), Some(1), Some(1), None];
+        for (idx, expected) in expected_flags.iter().enumerate() {
+            let value = NumericKernels::evaluate_value(&compare_expr, idx, &arrays).unwrap();
+            let actual = value.map(|num| match num {
+                NumericValue::Int(v) => v,
+                NumericValue::Float(v) => v as i64,
+                NumericValue::Decimal(d) => d.to_f64() as i64,
+                NumericValue::String(_) => panic!("unexpected string"),
+            });
+            assert_eq!(actual, *expected, "comparison row {idx} mismatch");
+        }
     }
 }

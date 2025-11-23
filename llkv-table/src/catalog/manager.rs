@@ -389,7 +389,8 @@ where
                 | DataType::Utf8
                 | DataType::Date32
                 | DataType::Boolean
-                | DataType::Struct(_) => field.data_type().clone(),
+                | DataType::Struct(_)
+                | DataType::Decimal128(_, _) => field.data_type().clone(),
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
                         "unsupported column type in CTAS result: {other:?}"

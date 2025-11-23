@@ -7,13 +7,15 @@ pub enum NumericKind {
     Integer,
     Float,
     Decimal,
+    String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NumericValue {
     Int(i64),
     Float(f64),
     Decimal(DecimalValue),
+    String(String),
 }
 
 impl NumericValue {
@@ -22,6 +24,7 @@ impl NumericValue {
             NumericValue::Int(_) => NumericKind::Integer,
             NumericValue::Float(_) => NumericKind::Float,
             NumericValue::Decimal(_) => NumericKind::Decimal,
+            NumericValue::String(_) => NumericKind::String,
         }
     }
 
@@ -34,10 +37,14 @@ impl NumericValue {
             NumericValue::Int(v) => *v as f64,
             NumericValue::Float(v) => *v,
             NumericValue::Decimal(v) => v.to_f64(),
+            NumericValue::String(_) => f64::NAN,
         }
     }
 
     pub fn add(&self, other: &NumericValue) -> Result<NumericValue, Error> {
+        if let (NumericValue::String(_), _) | (_, NumericValue::String(_)) = (self, other) {
+            return Err(Error::Internal("Cannot add string values".to_string()));
+        }
         match (self, other) {
             (NumericValue::Int(a), NumericValue::Int(b)) => {
                 // Check for overflow?
@@ -70,6 +77,9 @@ impl NumericValue {
     }
 
     pub fn sub(&self, other: &NumericValue) -> Result<NumericValue, Error> {
+        if let (NumericValue::String(_), _) | (_, NumericValue::String(_)) = (self, other) {
+            return Err(Error::Internal("Cannot subtract string values".to_string()));
+        }
         match (self, other) {
             (NumericValue::Int(a), NumericValue::Int(b)) => a
                 .checked_sub(*b)
@@ -98,6 +108,9 @@ impl NumericValue {
     }
 
     pub fn mul(&self, other: &NumericValue) -> Result<NumericValue, Error> {
+        if let (NumericValue::String(_), _) | (_, NumericValue::String(_)) = (self, other) {
+            return Err(Error::Internal("Cannot multiply string values".to_string()));
+        }
         match (self, other) {
             (NumericValue::Int(a), NumericValue::Int(b)) => a
                 .checked_mul(*b)
@@ -126,6 +139,9 @@ impl NumericValue {
     }
 
     pub fn div(&self, other: &NumericValue) -> Result<NumericValue, Error> {
+        if let (NumericValue::String(_), _) | (_, NumericValue::String(_)) = (self, other) {
+            return Err(Error::Internal("Cannot divide string values".to_string()));
+        }
         match (self, other) {
             (NumericValue::Int(a), NumericValue::Int(b)) => {
                 if *b == 0 {
@@ -167,6 +183,11 @@ impl NumericValue {
     }
 
     pub fn rem(&self, other: &NumericValue) -> Result<NumericValue, Error> {
+        if let (NumericValue::String(_), _) | (_, NumericValue::String(_)) = (self, other) {
+            return Err(Error::Internal(
+                "Cannot compute remainder of string values".to_string(),
+            ));
+        }
         match (self, other) {
             (NumericValue::Int(a), NumericValue::Int(b)) => {
                 if *b == 0 {

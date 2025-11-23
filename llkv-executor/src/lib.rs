@@ -8842,7 +8842,11 @@ impl CrossProductExpressionContext {
                         match candidate {
                             ValueArray::Numeric(array) => match array.value(idx) {
                                 Some(value) => {
-                                    if NumericKernels::compare(CompareOp::Eq, target_value, value) {
+                                    if NumericKernels::compare(
+                                        CompareOp::Eq,
+                                        target_value.clone(),
+                                        value,
+                                    ) {
                                         has_match = true;
                                         break;
                                     }

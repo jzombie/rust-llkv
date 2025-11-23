@@ -1,5 +1,7 @@
-use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, make_array};
-use arrow::compute::{cast, kernels::numeric};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, Scalar, make_array,
+};
+use arrow::compute::{cast, kernels::cmp, kernels::numeric, nullif};
 use arrow::datatypes::DataType;
 use llkv_expr::expr::BinaryOp;
 use llkv_result::Error;
@@ -18,6 +20,11 @@ pub fn compute_binary(
         (NumericKind::Float, _) | (_, NumericKind::Float) => NumericKind::Float,
         (NumericKind::Decimal, _) | (_, NumericKind::Decimal) => NumericKind::Decimal,
         (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
+        (NumericKind::String, _) | (_, NumericKind::String) => {
+            return Err(Error::Internal(
+                "Cannot perform binary arithmetic on string arrays".to_string(),
+            ));
+        }
     };
 
     // Cast inputs to result type (or compatible type)
@@ -50,8 +57,36 @@ pub fn compute_binary(
                 res
             }
         }
-        BinaryOp::Divide => numeric::div(&lhs_arr, &rhs_arr)?,
-        BinaryOp::Modulo => numeric::rem(&lhs_arr, &rhs_arr)?,
+        BinaryOp::Divide | BinaryOp::Modulo => {
+            // Handle divide by zero by nulling out zeros in rhs
+            let is_zero = match result_kind {
+                NumericKind::Integer => {
+                    let zero_scalar = Scalar::new(Int64Array::from(vec![0]));
+                    cmp::eq(&rhs_arr, &zero_scalar)?
+                }
+                NumericKind::Float => {
+                    let zero_scalar = Scalar::new(Float64Array::from(vec![0.0]));
+                    cmp::eq(&rhs_arr, &zero_scalar)?
+                }
+                NumericKind::Decimal => {
+                    // Cast to Float64 to check for zero.
+                    // This is safe because 10^-38 (min decimal) is > 10^-308 (min float).
+                    // So any non-zero decimal will be non-zero float.
+                    let rhs_float_arr = cast(&rhs_arr, &DataType::Float64)?;
+                    let zero_scalar = Scalar::new(Float64Array::from(vec![0.0]));
+                    cmp::eq(&rhs_float_arr, &zero_scalar)?
+                }
+                _ => return Err(Error::Internal("Unsupported type for division".into())),
+            };
+
+            let safe_rhs = nullif(&rhs_arr, &is_zero)?;
+
+            if matches!(op, BinaryOp::Divide) {
+                numeric::div(&lhs_arr, &safe_rhs)?
+            } else {
+                numeric::rem(&lhs_arr, &safe_rhs)?
+            }
+        }
         _ => return Err(Error::Internal(format!("Unsupported binary op {:?}", op))),
     };
 
@@ -92,5 +127,8 @@ fn cast_to_common_type(
             let rhs_cast = cast(&rhs.to_array_ref(), &target_type)?;
             Ok((lhs_cast, rhs_cast))
         }
+        NumericKind::String => Err(Error::Internal(
+            "Cannot cast to String for arithmetic".to_string(),
+        )),
     }
 }
