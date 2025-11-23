@@ -18,6 +18,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Workaround for macOS error when using `hashFiles`:
+      # "Error: The template is not valid....Fail to hash files under directory"
+      - name: Calculate lockfile hash
+        id: lockfile
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            HASH=$(sha256sum Cargo.lock | awk '{print $1}')
+          elif command -v shasum >/dev/null 2>&1; then
+            HASH=$(shasum -a 256 Cargo.lock | awk '{print $1}')
+          else
+            echo "No hashing utility found"
+            exit 1
+          fi
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
@@ -27,7 +43,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-lint-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-lint-${{ steps.lockfile.outputs.hash }}
           restore-keys: |
             ${{ runner.os }}-lint-
 

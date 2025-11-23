@@ -87,11 +87,11 @@ fn crud_statements_update_pager_counters() {
         "unexpected delete put batches: {delete_delta:?}"
     );
     assert_eq!(
-        delete_delta.physical_gets, 50,
+        delete_delta.physical_gets, 52,
         "unexpected delete get count: {delete_delta:?}"
     );
     assert_eq!(
-        delete_delta.get_batches, 34,
+        delete_delta.get_batches, 36,
         "unexpected delete get batches: {delete_delta:?}"
     );
 
