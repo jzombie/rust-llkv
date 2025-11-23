@@ -60,6 +60,8 @@ pub struct SubqueryExpr {
 pub struct ScalarSubqueryExpr {
     /// Identifier referencing the subquery definition attached to the parent projection.
     pub id: SubqueryId,
+    /// The data type of the single column returned by the subquery.
+    pub data_type: DataType,
 }
 
 impl<'a, F> Expr<'a, F> {
@@ -244,8 +246,8 @@ impl<F> ScalarExpr<F> {
     }
 
     #[inline]
-    pub fn scalar_subquery(id: SubqueryId) -> Self {
-        Self::ScalarSubquery(ScalarSubqueryExpr { id })
+    pub fn scalar_subquery(id: SubqueryId, data_type: DataType) -> Self {
+        Self::ScalarSubquery(ScalarSubqueryExpr { id, data_type })
     }
 
     #[inline]

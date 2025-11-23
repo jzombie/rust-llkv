@@ -10680,6 +10680,105 @@ fn translate_scalar_internal(
         .ok_or_else(|| Error::Internal("translate_scalar: empty result stack".into()))
 }
 
+fn infer_query_output_type(
+    engine: &SqlEngine,
+    plan: &llkv_plan::SelectPlan,
+) -> SqlResult<DataType> {
+    if plan.projections.len() != 1 {
+        return Err(Error::InvalidArgumentError(
+            "Scalar subquery must return exactly one column".into(),
+        ));
+    }
+    match &plan.projections[0] {
+        llkv_plan::SelectProjection::Computed { expr, .. } => infer_expr_type(engine, expr, plan),
+        llkv_plan::SelectProjection::Column { name, .. } => {
+            resolve_column_type_in_plan(engine, name, plan)
+        }
+        _ => Ok(DataType::Int64),
+    }
+}
+
+fn infer_expr_type(
+    engine: &SqlEngine,
+    expr: &llkv_expr::expr::ScalarExpr<String>,
+    plan: &llkv_plan::SelectPlan,
+) -> SqlResult<DataType> {
+    use llkv_expr::expr::ScalarExpr;
+    match expr {
+        ScalarExpr::Literal(lit) => Ok(match lit {
+            Literal::Integer(_) => DataType::Int64,
+            Literal::Float(_) => DataType::Float64,
+            Literal::Decimal(v) => DataType::Decimal128(v.precision(), v.scale()),
+            Literal::Boolean(_) => DataType::Boolean,
+            Literal::String(_) => DataType::Utf8,
+            Literal::Date32(_) => DataType::Date32,
+            Literal::Null => DataType::Null,
+            Literal::Struct(_) => DataType::Utf8,
+            Literal::Interval(_) => {
+                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+            }
+        }),
+        ScalarExpr::Column(name) => resolve_column_type_in_plan(engine, name, plan),
+        ScalarExpr::Binary { left, right, .. } => {
+            let l = infer_expr_type(engine, left, plan)?;
+            let r = infer_expr_type(engine, right, plan)?;
+            if matches!(l, DataType::Float64) || matches!(r, DataType::Float64) {
+                Ok(DataType::Float64)
+            } else if let DataType::Decimal128(_, s1) = l {
+                if let DataType::Decimal128(_, s2) = r {
+                    Ok(DataType::Decimal128(38, s1.max(s2)))
+                } else {
+                    Ok(DataType::Decimal128(38, s1))
+                }
+            } else if let DataType::Decimal128(_, s2) = r {
+                Ok(DataType::Decimal128(38, s2))
+            } else {
+                Ok(l)
+            }
+        }
+        ScalarExpr::Cast { data_type, .. } => Ok(data_type.clone()),
+        ScalarExpr::ScalarSubquery(sub) => Ok(sub.data_type.clone()),
+        ScalarExpr::Aggregate(_) => Ok(DataType::Float64),
+        _ => Ok(DataType::Int64),
+    }
+}
+
+fn resolve_column_type_in_plan(
+    engine: &SqlEngine,
+    col_name: &str,
+    plan: &llkv_plan::SelectPlan,
+) -> SqlResult<DataType> {
+    for table_ref in &plan.tables {
+        if let Ok((_, canonical)) = llkv_table::resolvers::canonical_table_name(&table_ref.table) {
+            if let Ok(table) = engine.engine.context().lookup_table(&canonical) {
+                let (target_col, matches_alias) = if let Some(alias) = &table_ref.alias {
+                    if col_name.starts_with(alias) && col_name.chars().nth(alias.len()) == Some('.')
+                    {
+                        (&col_name[alias.len() + 1..], true)
+                    } else {
+                        (col_name, false)
+                    }
+                } else {
+                    (col_name, false)
+                };
+
+                let target_col = if !matches_alias
+                    && col_name.starts_with(&table_ref.table)
+                    && col_name.chars().nth(table_ref.table.len()) == Some('.')
+                {
+                    &col_name[table_ref.table.len() + 1..]
+                } else {
+                    target_col
+                };
+
+                if let Some(field) = table.schema.resolve(target_col) {
+                    return Ok(field.data_type.clone());
+                }
+            }
+        }
+    }
+    Ok(DataType::Int64)
+}
 struct ScalarSubqueryPlanner<'engine, 'vec> {
     engine: &'engine SqlEngine,
     scalar_subqueries: &'vec mut Vec<llkv_plan::ScalarSubquery>,
@@ -10716,11 +10815,15 @@ impl<'engine, 'vec> ScalarSubqueryResolver for ScalarSubqueryPlanner<'engine, 'v
         let subquery_id = llkv_expr::SubqueryId(id);
         self.scalar_subqueries.push(llkv_plan::ScalarSubquery {
             id: subquery_id,
-            plan: Box::new(plan),
+            plan: Box::new(plan.clone()),
             correlated_columns: tracker.into_columns(),
         });
 
-        Ok(llkv_expr::expr::ScalarExpr::scalar_subquery(subquery_id))
+        let data_type = infer_query_output_type(self.engine, &plan)?;
+        Ok(llkv_expr::expr::ScalarExpr::scalar_subquery(
+            subquery_id,
+            data_type,
+        ))
     }
 }
 
@@ -10746,10 +10849,17 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::Scala
         }
         Value::Number(text, _) => {
             if text.contains(['.', 'e', 'E']) {
-                let parsed = text.parse::<f64>().map_err(|err| {
-                    Error::InvalidArgumentError(format!("invalid float literal: {err}"))
-                })?;
-                Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float(parsed)))
+                // Try parsing as Decimal first to preserve precision
+                if let Ok(decimal) = text.parse::<DecimalValue>() {
+                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Decimal(
+                        decimal,
+                    )))
+                } else {
+                    let parsed = text.parse::<f64>().map_err(|err| {
+                        Error::InvalidArgumentError(format!("invalid float literal: {err}"))
+                    })?;
+                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float(parsed)))
+                }
             } else {
                 let parsed = text.parse::<i128>().map_err(|err| {
                     Error::InvalidArgumentError(format!("invalid integer literal: {err}"))

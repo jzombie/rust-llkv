@@ -42,7 +42,7 @@ pub fn align_decimal_to_scale(
     precision: u8,
     scale: i8,
 ) -> Result<DecimalValue, DecimalError> {
-    let rescaled = value.rescale(scale)?;
+    let rescaled = value.rescale_with_rounding(scale)?;
     if rescaled.precision() > precision {
         return Err(DecimalError::PrecisionOverflow {
             value: rescaled.raw_value(),
@@ -94,4 +94,32 @@ pub fn decimal_from_f64(
     }
 
     Ok(decimal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llkv_expr::decimal::DecimalValue;
+
+    #[test]
+    fn test_align_decimal_rounding() {
+        // 10.515 (scale 3) -> 10.52 (scale 2)
+        let val = DecimalValue::new(10515, 3).unwrap();
+        let aligned = align_decimal_to_scale(val, 38, 2).unwrap();
+        assert_eq!(aligned.raw_value(), 1052);
+        assert_eq!(aligned.scale(), 2);
+
+        // 10.514 (scale 3) -> 10.51 (scale 2)
+        let val = DecimalValue::new(10514, 3).unwrap();
+        let aligned = align_decimal_to_scale(val, 38, 2).unwrap();
+        assert_eq!(aligned.raw_value(), 1051);
+        assert_eq!(aligned.scale(), 2);
+
+        // Negative rounding
+        // -10.515 (scale 3) -> -10.52 (scale 2)
+        let val = DecimalValue::new(-10515, 3).unwrap();
+        let aligned = align_decimal_to_scale(val, 38, 2).unwrap();
+        assert_eq!(aligned.raw_value(), -1052);
+        assert_eq!(aligned.scale(), 2);
+    }
 }

@@ -5,6 +5,7 @@
 //! values without pulling in heavier dependencies.
 
 use std::fmt;
+use std::str::FromStr;
 
 use arrow::datatypes::DECIMAL128_MAX_PRECISION;
 use arrow_buffer::i256;
@@ -143,6 +144,63 @@ impl DecimalValue {
         Self::new(new_value, target_scale)
     }
 
+    /// Rescale to a different exponent, rounding half-up if necessary.
+    pub fn rescale_with_rounding(self, target_scale: i8) -> Result<Self, DecimalError> {
+        if !scale_within_bounds(target_scale as i16) {
+            return Err(DecimalError::ScaleOutOfRange {
+                scale: target_scale,
+            });
+        }
+        if target_scale == self.scale {
+            return Ok(self);
+        }
+
+        if target_scale > self.scale {
+            return self.rescale(target_scale);
+        }
+
+        // target_scale < self.scale -> divide and round
+        let diff = (self.scale - target_scale) as u32;
+        let factor = pow10(diff)?;
+        let value = i256::from_i128(self.value);
+
+        let quotient = value.checked_div(factor).ok_or(DecimalError::Overflow)?;
+        let remainder = value.checked_rem(factor).ok_or(DecimalError::Overflow)?;
+
+        let mut new_value = quotient;
+
+        if remainder != i256::ZERO {
+            let abs_rem = if remainder < i256::ZERO {
+                remainder.wrapping_neg()
+            } else {
+                remainder
+            };
+            let abs_factor = if factor < i256::ZERO {
+                factor.wrapping_neg()
+            } else {
+                factor
+            };
+
+            // Round half up: if abs(remainder) * 2 >= abs(factor)
+            let double_rem = abs_rem
+                .checked_mul(i256::from_i128(2))
+                .ok_or(DecimalError::Overflow)?;
+            if double_rem >= abs_factor {
+                if value > i256::ZERO {
+                    new_value = new_value
+                        .checked_add(i256::ONE)
+                        .ok_or(DecimalError::Overflow)?;
+                } else {
+                    new_value = new_value
+                        .checked_sub(i256::ONE)
+                        .ok_or(DecimalError::Overflow)?;
+                }
+            }
+        }
+
+        let final_value = new_value.to_i128().ok_or(DecimalError::Overflow)?;
+        Self::new(final_value, target_scale)
+    }
     /// Add two decimals, aligning scales as needed.
     pub fn checked_add(self, other: Self) -> Result<Self, DecimalError> {
         let target_scale = self.scale.max(other.scale);
@@ -287,6 +345,30 @@ impl fmt::Display for DecimalValue {
         f.write_str(&digits[..split])?;
         f.write_str(".")?;
         f.write_str(&digits[split..])
+    }
+}
+
+impl FromStr for DecimalValue {
+    type Err = DecimalError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let (int_part, frac_part) = match s.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (s, ""),
+        };
+
+        let scale = frac_part.len();
+        if scale > MAX_DECIMAL_PRECISION as usize {
+            return Err(DecimalError::ScaleOutOfRange { scale: scale as i8 });
+        }
+
+        let combined = format!("{}{}", int_part, frac_part);
+        let value = combined
+            .parse::<i128>()
+            .map_err(|_| DecimalError::Overflow)?;
+
+        Self::new(value, scale as i8)
     }
 }
 

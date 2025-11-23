@@ -2,7 +2,7 @@ use crate::ExecutorResult;
 use crate::types::{ExecutorSchema, ExecutorTable};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema};
 use llkv_expr::decimal::DecimalValue;
-use llkv_expr::expr::ScalarExpr;
+use llkv_expr::expr::{BinaryOp, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
@@ -77,48 +77,128 @@ pub fn infer_computed_data_type(
             })?;
             Ok(normalized_numeric_type(&column.data_type))
         }
-        ScalarExpr::Binary { .. } => {
-            if expression_uses_float(schema, expr)? {
-                Ok(DataType::Float64)
-            } else {
-                Ok(DataType::Int64)
+        ScalarExpr::Binary { left, op, right } => {
+            let left_type = infer_computed_data_type(schema, left)?;
+            let right_type = infer_computed_data_type(schema, right)?;
+
+            if matches!(left_type, DataType::Float64) || matches!(right_type, DataType::Float64) {
+                return Ok(DataType::Float64);
+            }
+
+            match (left_type, right_type) {
+                (DataType::Decimal128(_, s1), DataType::Decimal128(_, s2)) => {
+                    let scale = match op {
+                        BinaryOp::Add | BinaryOp::Subtract => s1.max(s2),
+                        BinaryOp::Multiply => (s1 + s2).min(38),
+                        BinaryOp::Divide => (s1.max(s2) + 4).min(38),
+                        BinaryOp::Modulo => s1.max(s2),
+                        _ => s1.max(s2),
+                    };
+                    Ok(DataType::Decimal128(38, scale))
+                }
+                (DataType::Decimal128(_, s), _) | (_, DataType::Decimal128(_, s)) => {
+                    let scale = match op {
+                        BinaryOp::Multiply => s,
+                        BinaryOp::Divide => (s + 4).min(38),
+                        _ => s,
+                    };
+                    Ok(DataType::Decimal128(38, scale))
+                }
+                _ => Ok(DataType::Int64),
             }
         }
         ScalarExpr::Not(_) => Ok(DataType::Int64),
         ScalarExpr::IsNull { .. } => Ok(DataType::Int64),
         ScalarExpr::Compare { .. } => Ok(DataType::Int64),
-        ScalarExpr::Aggregate(_) => Ok(DataType::Int64),
+        ScalarExpr::Aggregate(agg) => match agg {
+            llkv_expr::AggregateCall::Count { .. }
+            | llkv_expr::AggregateCall::CountStar
+            | llkv_expr::AggregateCall::CountNulls(_) => Ok(DataType::Int64),
+            llkv_expr::AggregateCall::Sum { expr, .. }
+            | llkv_expr::AggregateCall::Min(expr)
+            | llkv_expr::AggregateCall::Max(expr) => infer_computed_data_type(schema, expr),
+            llkv_expr::AggregateCall::Avg { expr, .. } => {
+                let input_type = infer_computed_data_type(schema, expr)?;
+                match input_type {
+                    DataType::Decimal128(_, s) => Ok(DataType::Decimal128(38, s)),
+                    _ => Ok(DataType::Float64),
+                }
+            }
+            llkv_expr::AggregateCall::Total { expr, .. } => infer_computed_data_type(schema, expr),
+            llkv_expr::AggregateCall::GroupConcat { .. } => Ok(DataType::Utf8),
+        },
         ScalarExpr::GetField { base, field_name } => {
             let field_type = resolve_struct_field_type(schema, base, field_name)?;
             Ok(field_type)
         }
         ScalarExpr::Cast { data_type, .. } => Ok(data_type.clone()),
-        ScalarExpr::Case { .. } => {
-            if expression_uses_float(schema, expr)? {
+        ScalarExpr::Case {
+            branches,
+            else_expr,
+            ..
+        } => {
+            let mut is_float = false;
+            let mut is_decimal = false;
+            let mut max_scale = 0;
+
+            for (_, then_expr) in branches {
+                let dtype = infer_computed_data_type(schema, then_expr)?;
+                match dtype {
+                    DataType::Float64 => is_float = true,
+                    DataType::Decimal128(_, s) => {
+                        is_decimal = true;
+                        max_scale = max_scale.max(s);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(inner) = else_expr.as_deref() {
+                let dtype = infer_computed_data_type(schema, inner)?;
+                match dtype {
+                    DataType::Float64 => is_float = true,
+                    DataType::Decimal128(_, s) => {
+                        is_decimal = true;
+                        max_scale = max_scale.max(s);
+                    }
+                    _ => {}
+                }
+            }
+
+            if is_float {
                 Ok(DataType::Float64)
+            } else if is_decimal {
+                Ok(DataType::Decimal128(38, max_scale))
             } else {
                 Ok(DataType::Int64)
             }
         }
         ScalarExpr::Coalesce(items) => {
-            let mut uses_float = false;
+            let mut is_float = false;
+            let mut is_decimal = false;
+            let mut max_scale = 0;
+
             for item in items {
-                if expression_uses_float(schema, item)? {
-                    uses_float = true;
-                    break;
+                let dtype = infer_computed_data_type(schema, item)?;
+                match dtype {
+                    DataType::Float64 => is_float = true,
+                    DataType::Decimal128(_, s) => {
+                        is_decimal = true;
+                        max_scale = max_scale.max(s);
+                    }
+                    _ => {}
                 }
             }
-            if uses_float {
+
+            if is_float {
                 Ok(DataType::Float64)
+            } else if is_decimal {
+                Ok(DataType::Decimal128(38, max_scale))
             } else {
                 Ok(DataType::Int64)
             }
         }
         ScalarExpr::Random => Ok(DataType::Float64),
-        ScalarExpr::ScalarSubquery(_) => {
-            // TODO: Infer type from subquery result
-            Ok(DataType::Utf8)
-        }
+        ScalarExpr::ScalarSubquery(sub) => Ok(sub.data_type.clone()),
     }
 }
 
@@ -135,13 +215,7 @@ fn normalized_numeric_type(dtype: &DataType) -> DataType {
         | DataType::UInt64
         | DataType::Float32
         | DataType::Float64 => DataType::Float64,
-        DataType::Decimal128(precision, scale) => {
-            if *scale == 0 && *precision <= 18 {
-                DataType::Int64
-            } else {
-                DataType::Float64
-            }
-        }
+        DataType::Decimal128(precision, scale) => DataType::Decimal128(*precision, *scale),
         other => other.clone(),
     }
 }

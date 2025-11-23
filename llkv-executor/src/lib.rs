@@ -4741,6 +4741,13 @@ where
                 | AggregateCall::Avg { expr: agg_expr, .. }
                 | AggregateCall::Min(agg_expr)
                 | AggregateCall::Max(agg_expr) => {
+                    // Try recursive inference first to handle complex expressions without sample data
+                    if let Some(dtype) =
+                        infer_type_recursive(agg_expr, base_schema, column_lookup_map)
+                    {
+                        return Some(dtype);
+                    }
+
                     // For aggregate functions, infer the type from the expression
                     if let Some(col_name) = try_extract_simple_column(agg_expr) {
                         let idx = resolve_column_name_to_index(col_name, column_lookup_map)?;
@@ -11391,6 +11398,53 @@ where
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Recursively infer the data type of a scalar expression from the schema.
+fn infer_type_recursive(
+    expr: &ScalarExpr<String>,
+    base_schema: &Schema,
+    column_lookup_map: &FxHashMap<String, usize>,
+) -> Option<DataType> {
+    use arrow::datatypes::IntervalUnit;
+    use llkv_expr::literal::Literal;
+
+    match expr {
+        ScalarExpr::Column(name) => resolve_column_name_to_index(name, column_lookup_map)
+            .map(|idx| base_schema.field(idx).data_type().clone()),
+        ScalarExpr::Literal(lit) => match lit {
+            Literal::Decimal(v) => Some(DataType::Decimal128(v.precision(), v.scale())),
+            Literal::Float(_) => Some(DataType::Float64),
+            Literal::Integer(_) => Some(DataType::Int64),
+            Literal::Boolean(_) => Some(DataType::Boolean),
+            Literal::String(_) => Some(DataType::Utf8),
+            Literal::Date32(_) => Some(DataType::Date32),
+            Literal::Null => Some(DataType::Null),
+            Literal::Interval(_) => Some(DataType::Interval(IntervalUnit::MonthDayNano)),
+            _ => None,
+        },
+        ScalarExpr::Binary { left, op: _, right } => {
+            let l = infer_type_recursive(left, base_schema, column_lookup_map)?;
+            let r = infer_type_recursive(right, base_schema, column_lookup_map)?;
+
+            if matches!(l, DataType::Float64) || matches!(r, DataType::Float64) {
+                return Some(DataType::Float64);
+            }
+
+            match (l, r) {
+                (DataType::Decimal128(_, s1), DataType::Decimal128(_, s2)) => {
+                    // Propagate decimal type with max scale
+                    Some(DataType::Decimal128(38, s1.max(s2)))
+                }
+                (DataType::Decimal128(p, s), _) => Some(DataType::Decimal128(p, s)),
+                (_, DataType::Decimal128(p, s)) => Some(DataType::Decimal128(p, s)),
+                (l, _) => Some(l),
+            }
+        }
+        ScalarExpr::Cast { data_type, .. } => Some(data_type.clone()),
+        // For other types, return None to fall back to sample evaluation
+        _ => None,
+    }
+}
 
 fn expand_order_targets(
     order_items: &[OrderByPlan],

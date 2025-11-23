@@ -337,8 +337,21 @@ impl NumericKernels {
         }
 
         let preferred = Self::infer_result_kind(expr, arrays);
+        if std::env::var("LLKV_DEBUG_SCALAR").is_ok() {
+            eprintln!(
+                "DEBUG evaluate_batch_simplified: preferred={:?} expr={:?}",
+                preferred, expr
+            );
+        }
         if let Some(vectorized) = Self::try_evaluate_vectorized(expr, len, arrays, preferred)? {
-            return Ok(vectorized.materialize(len, preferred));
+            let result = vectorized.materialize(len, preferred);
+            if std::env::var("LLKV_DEBUG_SCALAR").is_ok() {
+                eprintln!(
+                    "DEBUG evaluate_batch_simplified: vectorized result type={:?}",
+                    result.data_type()
+                );
+            }
+            return Ok(result);
         }
 
         let mut values: Vec<Option<NumericValue>> = Vec::with_capacity(len);
