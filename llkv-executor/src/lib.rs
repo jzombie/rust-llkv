@@ -812,6 +812,11 @@ where
         let mut result: Option<Literal> = None;
         execution.stream(|inner_batch| {
             if inner_batch.num_columns() != 1 {
+                eprintln!(
+                    "DEBUG: scalar subquery returned {} columns: {:?}",
+                    inner_batch.num_columns(),
+                    inner_batch.schema()
+                );
                 return Err(Error::InvalidArgumentError(
                     "scalar subquery must return exactly one column".into(),
                 ));
@@ -1070,15 +1075,16 @@ where
             )),
             Literal::Decimal(value) => {
                 let iter = std::iter::once(value.raw_value());
+                let precision = std::cmp::max(value.precision(), value.scale() as u8);
                 let array = Decimal128Array::from_iter_values(iter)
-                    .with_precision_and_scale(value.precision(), value.scale())
+                    .with_precision_and_scale(precision, value.scale())
                     .map_err(|err| {
                         Error::InvalidArgumentError(format!(
                             "failed to build Decimal128 literal array: {err}"
                         ))
                     })?;
                 Ok((
-                    DataType::Decimal128(value.precision(), value.scale()),
+                    DataType::Decimal128(precision, value.scale()),
                     Arc::new(array) as ArrayRef,
                 ))
             }

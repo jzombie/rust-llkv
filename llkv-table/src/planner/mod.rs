@@ -3553,8 +3553,9 @@ fn synthesize_computed_literal_array(
         }
         ScalarExpr::Literal(Literal::Decimal(value)) => {
             let iter = std::iter::repeat_n(value.raw_value(), row_count);
+            let precision = std::cmp::max(value.precision(), value.scale() as u8);
             let array = Decimal128Array::from_iter_values(iter)
-                .with_precision_and_scale(value.precision(), value.scale())
+                .with_precision_and_scale(precision, value.scale())
                 .map_err(|err| {
                     Error::InvalidArgumentError(format!(
                         "failed to build Decimal128 literal array: {err}"
@@ -3600,8 +3601,9 @@ fn synthesize_computed_literal_array(
                     }
                     Literal::Decimal(v) => {
                         let iter = std::iter::repeat_n(v.raw_value(), row_count);
+                        let precision = std::cmp::max(v.precision(), v.scale() as u8);
                         let array = Decimal128Array::from_iter_values(iter)
-                            .with_precision_and_scale(v.precision(), v.scale())
+                            .with_precision_and_scale(precision, v.scale())
                             .map_err(|err| {
                                 Error::InvalidArgumentError(format!(
                                     "failed to build Decimal128 literal array: {err}"

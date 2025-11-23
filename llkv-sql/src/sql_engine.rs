@@ -10684,7 +10684,35 @@ fn infer_query_output_type(
     engine: &SqlEngine,
     plan: &llkv_plan::SelectPlan,
 ) -> SqlResult<DataType> {
+    if !plan.aggregates.is_empty() {
+        if plan.aggregates.len() != 1 {
+            return Err(Error::InvalidArgumentError(
+                "Scalar subquery must return exactly one column".into(),
+            ));
+        }
+        let agg = &plan.aggregates[0];
+        return match agg {
+            llkv_plan::AggregateExpr::CountStar { .. } => Ok(DataType::Int64),
+            llkv_plan::AggregateExpr::Column { function, .. } => match function {
+                llkv_plan::AggregateFunction::Count
+                | llkv_plan::AggregateFunction::SumInt64
+                | llkv_plan::AggregateFunction::TotalInt64
+                | llkv_plan::AggregateFunction::MinInt64
+                | llkv_plan::AggregateFunction::MaxInt64
+                | llkv_plan::AggregateFunction::CountNulls => Ok(DataType::Int64),
+                llkv_plan::AggregateFunction::GroupConcat => Ok(DataType::Utf8),
+            },
+        };
+    }
+
     if plan.projections.len() != 1 {
+        eprintln!(
+            "[DEBUG] infer_query_output_type: projections.len() = {}",
+            plan.projections.len()
+        );
+        for (i, proj) in plan.projections.iter().enumerate() {
+            eprintln!("[DEBUG] proj[{}]: {:?}", i, proj);
+        }
         return Err(Error::InvalidArgumentError(
             "Scalar subquery must return exactly one column".into(),
         ));
