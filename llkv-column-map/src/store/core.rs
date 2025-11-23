@@ -923,6 +923,9 @@ where
             };
 
             if array_clean.is_empty() {
+                // Even if we have no data to append, we must ensure the column exists
+                // so that subsequent schema queries (e.g. data_type()) succeed.
+                self.ensure_column_registered(field_id, field.data_type())?;
                 continue;
             }
 
