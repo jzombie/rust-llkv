@@ -1,11 +1,8 @@
-use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, Scalar, make_array,
-};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, Scalar, make_array};
 use arrow::compute::{cast, kernels::cmp, kernels::numeric, nullif};
 use arrow::datatypes::DataType;
 use llkv_expr::expr::BinaryOp;
 use llkv_result::Error;
-use std::sync::Arc;
 
 use crate::NumericKind;
 use crate::array::NumericArray;

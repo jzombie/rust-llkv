@@ -4,12 +4,9 @@
 //! into a minimal numeric representation and apply lightweight kernels without
 //! duplicating logic throughout the scan pipeline.
 
-use std::{convert::TryFrom, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
-use arrow::array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
-};
-use arrow::compute::cast;
+use arrow::array::{ArrayRef, Date32Array, Float64Array};
 use arrow::datatypes::DataType;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::literal::{IntervalValue, Literal};
@@ -339,20 +336,8 @@ impl NumericKernels {
         }
 
         let preferred = Self::infer_result_kind(expr, arrays);
-        if std::env::var("LLKV_DEBUG_SCALAR").is_ok() {
-            eprintln!(
-                "DEBUG evaluate_batch_simplified: preferred={:?} expr={:?}",
-                preferred, expr
-            );
-        }
         if let Some(vectorized) = Self::try_evaluate_vectorized(expr, len, arrays, preferred)? {
             let result = vectorized.materialize(len, preferred);
-            if std::env::var("LLKV_DEBUG_SCALAR").is_ok() {
-                eprintln!(
-                    "DEBUG evaluate_batch_simplified: vectorized result type={:?}",
-                    result.data_type()
-                );
-            }
             return Ok(result);
         }
 
@@ -464,9 +449,9 @@ impl NumericKernels {
     fn compute_binary_array_array(
         left: &NumericArray,
         right: &NumericArray,
-        len: usize,
+        _len: usize,
         op: BinaryOp,
-        preferred: NumericKind,
+        _preferred: NumericKind,
     ) -> LlkvResult<NumericArray> {
         // Delegate to vectorized kernel
         compute_binary(left, right, op).map_err(|e| Error::Internal(e.to_string()))
@@ -1522,13 +1507,13 @@ impl NumericKernels {
                         _ => {}
                     }
                 }
-                if result_kind != NumericKind::Float {
-                    if let Some(inner) = else_expr.as_deref() {
-                        match Self::infer_result_kind(inner, arrays) {
-                            NumericKind::Float => result_kind = NumericKind::Float,
-                            NumericKind::Decimal => has_decimal = true,
-                            _ => {}
-                        }
+                if result_kind != NumericKind::Float
+                    && let Some(inner) = else_expr.as_deref()
+                {
+                    match Self::infer_result_kind(inner, arrays) {
+                        NumericKind::Float => result_kind = NumericKind::Float,
+                        NumericKind::Decimal => has_decimal = true,
+                        _ => {}
                     }
                 }
                 if result_kind != NumericKind::Float && has_decimal {
@@ -1715,7 +1700,7 @@ impl NumericKernels {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Array, Int64Array};
+    use arrow::array::{Array, Float64Array, Int64Array};
     use llkv_expr::Literal;
 
     fn float_array(values: &[Option<f64>]) -> NumericArray {

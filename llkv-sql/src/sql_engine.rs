@@ -10706,13 +10706,6 @@ fn infer_query_output_type(
     }
 
     if plan.projections.len() != 1 {
-        eprintln!(
-            "[DEBUG] infer_query_output_type: projections.len() = {}",
-            plan.projections.len()
-        );
-        for (i, proj) in plan.projections.iter().enumerate() {
-            eprintln!("[DEBUG] proj[{}]: {:?}", i, proj);
-        }
         return Err(Error::InvalidArgumentError(
             "Scalar subquery must return exactly one column".into(),
         ));
@@ -10777,31 +10770,30 @@ fn resolve_column_type_in_plan(
     plan: &llkv_plan::SelectPlan,
 ) -> SqlResult<DataType> {
     for table_ref in &plan.tables {
-        if let Ok((_, canonical)) = llkv_table::resolvers::canonical_table_name(&table_ref.table) {
-            if let Ok(table) = engine.engine.context().lookup_table(&canonical) {
-                let (target_col, matches_alias) = if let Some(alias) = &table_ref.alias {
-                    if col_name.starts_with(alias) && col_name.chars().nth(alias.len()) == Some('.')
-                    {
-                        (&col_name[alias.len() + 1..], true)
-                    } else {
-                        (col_name, false)
-                    }
+        if let Ok((_, canonical)) = llkv_table::resolvers::canonical_table_name(&table_ref.table)
+            && let Ok(table) = engine.engine.context().lookup_table(&canonical)
+        {
+            let (target_col, matches_alias) = if let Some(alias) = &table_ref.alias {
+                if col_name.starts_with(alias) && col_name.chars().nth(alias.len()) == Some('.') {
+                    (&col_name[alias.len() + 1..], true)
                 } else {
                     (col_name, false)
-                };
-
-                let target_col = if !matches_alias
-                    && col_name.starts_with(&table_ref.table)
-                    && col_name.chars().nth(table_ref.table.len()) == Some('.')
-                {
-                    &col_name[table_ref.table.len() + 1..]
-                } else {
-                    target_col
-                };
-
-                if let Some(field) = table.schema.resolve(target_col) {
-                    return Ok(field.data_type.clone());
                 }
+            } else {
+                (col_name, false)
+            };
+
+            let target_col = if !matches_alias
+                && col_name.starts_with(&table_ref.table)
+                && col_name.chars().nth(table_ref.table.len()) == Some('.')
+            {
+                &col_name[table_ref.table.len() + 1..]
+            } else {
+                target_col
+            };
+
+            if let Some(field) = table.schema.resolve(target_col) {
+                return Ok(field.data_type.clone());
             }
         }
     }

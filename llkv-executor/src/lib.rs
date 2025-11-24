@@ -812,11 +812,6 @@ where
         let mut result: Option<Literal> = None;
         execution.stream(|inner_batch| {
             if inner_batch.num_columns() != 1 {
-                eprintln!(
-                    "DEBUG: scalar subquery returned {} columns: {:?}",
-                    inner_batch.num_columns(),
-                    inner_batch.schema()
-                );
                 return Err(Error::InvalidArgumentError(
                     "scalar subquery must return exactly one column".into(),
                 ));
@@ -8887,12 +8882,6 @@ impl CrossProductExpressionContext {
                                 ));
                             }
                         }
-                    }
-                    if idx == 0 {
-                        println!(
-                            "DEBUG: InList check. Target: {:?}, Negated: {}, HasMatch: {}, SawNull: {}",
-                            target_value, negated, has_match, saw_null
-                        );
                     }
                     out.push(finalize_in_list_result(has_match, saw_null, negated));
                 }

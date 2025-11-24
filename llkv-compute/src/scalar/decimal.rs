@@ -1,4 +1,3 @@
-use arrow::datatypes::DECIMAL128_MAX_PRECISION;
 use arrow_buffer::i256;
 use llkv_expr::decimal::{DecimalError, DecimalValue, MAX_DECIMAL_PRECISION};
 
@@ -66,7 +65,10 @@ pub fn rescale(value: DecimalValue, target_scale: i8) -> Result<DecimalValue, De
 }
 
 /// Rescale to a different exponent, rounding half-up if necessary.
-pub fn rescale_with_rounding(value: DecimalValue, target_scale: i8) -> Result<DecimalValue, DecimalError> {
+pub fn rescale_with_rounding(
+    value: DecimalValue,
+    target_scale: i8,
+) -> Result<DecimalValue, DecimalError> {
     if !scale_within_bounds(target_scale as i16) {
         return Err(DecimalError::ScaleOutOfRange {
             scale: target_scale,
@@ -162,7 +164,11 @@ pub fn mul(lhs: DecimalValue, rhs: DecimalValue) -> Result<DecimalValue, Decimal
 }
 
 /// Divide `lhs` by `rhs`, producing a value with the requested scale.
-pub fn div(lhs: DecimalValue, rhs: DecimalValue, target_scale: i8) -> Result<DecimalValue, DecimalError> {
+pub fn div(
+    lhs: DecimalValue,
+    rhs: DecimalValue,
+    target_scale: i8,
+) -> Result<DecimalValue, DecimalError> {
     if rhs.raw_value() == 0 {
         return Err(DecimalError::DivisionByZero);
     }

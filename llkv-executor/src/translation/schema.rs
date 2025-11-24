@@ -220,6 +220,7 @@ fn normalized_numeric_type(dtype: &DataType) -> DataType {
     }
 }
 
+#[allow(dead_code)]
 fn expression_uses_float(
     schema: &ExecutorSchema,
     expr: &ScalarExpr<FieldId>,
@@ -337,6 +338,7 @@ fn resolve_struct_field_type(
     }
 }
 
+#[allow(dead_code)]
 fn decimal_literal_behaves_like_integer(value: &DecimalValue) -> bool {
     value.scale() == 0
         && value.raw_value() >= i128::from(i64::MIN)
