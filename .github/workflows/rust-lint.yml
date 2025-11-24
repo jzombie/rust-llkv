@@ -49,7 +49,7 @@ jobs:
         run: cargo install cargo-udeps --locked
 
       - name: Check unused dependencies
-        run: cargo udeps --workspace
+        run: cargo udeps --workspace --all-targets --all-features
 
   lint:
     name: lint
