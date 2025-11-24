@@ -235,6 +235,7 @@ impl From<SqlValue> for PlanValue {
     }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn add_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     match (lhs, rhs) {
         (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
@@ -256,6 +257,7 @@ fn add_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn subtract_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     match (lhs, rhs) {
         (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
@@ -282,6 +284,7 @@ fn subtract_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     if matches!(lhs, SqlValue::Null) || matches!(rhs, SqlValue::Null) {
         return Ok(SqlValue::Null);

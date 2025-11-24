@@ -1,3 +1,5 @@
+// TODO: Move portions of this to llkv-compute?
+
 //! Parse SQL `INTERVAL` literals into [`IntervalValue`] instances.
 //!
 //! The planner and SQL layers share this module so literal handling stays

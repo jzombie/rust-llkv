@@ -1,3 +1,5 @@
+// TODO: Move portions of this to llkv-table?
+
 use sqlparser::ast::{CreateTable, ObjectName, ObjectNamePart, TableConstraint};
 use std::collections::HashSet;
 
