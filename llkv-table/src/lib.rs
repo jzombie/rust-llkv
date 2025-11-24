@@ -41,7 +41,7 @@ pub mod metadata;
 mod planner;
 pub mod reserved;
 pub mod resolvers;
-mod scalar_eval;
+pub mod scalar_eval;
 pub mod schema_ext;
 mod sys_catalog;
 pub mod view;

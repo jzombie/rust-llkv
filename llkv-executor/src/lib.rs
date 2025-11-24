@@ -1959,6 +1959,27 @@ fn compare_literals_with_mode(
         (Literal::Float(lhs), Literal::Integer(rhs)) => Some(compare_f64(*lhs, *rhs as f64, op)),
         (Literal::Boolean(lhs), Literal::Boolean(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
         (Literal::String(lhs), Literal::String(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::Decimal(lhs), Literal::Decimal(rhs)) => {
+            llkv_compute::scalar::decimal::compare(*lhs, *rhs)
+                .ok()
+                .map(|ord| ordering_result(ord, op))
+        }
+        (Literal::Decimal(lhs), Literal::Integer(rhs)) => {
+            DecimalValue::new(*rhs, 0).ok().and_then(|rhs_dec| {
+                llkv_compute::scalar::decimal::compare(*lhs, rhs_dec)
+                    .ok()
+                    .map(|ord| ordering_result(ord, op))
+            })
+        }
+        (Literal::Integer(lhs), Literal::Decimal(rhs)) => {
+            DecimalValue::new(*lhs, 0).ok().and_then(|lhs_dec| {
+                llkv_compute::scalar::decimal::compare(lhs_dec, *rhs)
+                    .ok()
+                    .map(|ord| ordering_result(ord, op))
+            })
+        }
+        (Literal::Decimal(lhs), Literal::Float(rhs)) => Some(compare_f64(lhs.to_f64(), *rhs, op)),
+        (Literal::Float(lhs), Literal::Decimal(rhs)) => Some(compare_f64(*lhs, rhs.to_f64(), op)),
         (Literal::Struct(_), _) | (_, Literal::Struct(_)) => None,
         _ => None,
     }
@@ -8866,6 +8887,12 @@ impl CrossProductExpressionContext {
                                 ));
                             }
                         }
+                    }
+                    if idx == 0 {
+                        println!(
+                            "DEBUG: InList check. Target: {:?}, Negated: {}, HasMatch: {}, SawNull: {}",
+                            target_value, negated, has_match, saw_null
+                        );
                     }
                     out.push(finalize_in_list_result(has_match, saw_null, negated));
                 }
