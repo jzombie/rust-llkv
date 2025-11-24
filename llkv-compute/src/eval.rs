@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Datum, Float64Array, UInt32Array, new_null_array};
 use arrow::compute::kernels::cast;
-use arrow::compute::{concat, take};
+use arrow::compute::kernels::zip::zip;
+use arrow::compute::{concat, is_not_null, take};
 use arrow::datatypes::{DataType, IntervalMonthDayNanoType};
 use llkv_expr::literal::Literal;
 use llkv_expr::{AggregateCall, BinaryOp, CompareOp, DecimalValue, ScalarExpr};
@@ -441,7 +442,14 @@ impl ScalarEvaluator {
 
         let mut values = Vec::with_capacity(len);
         for idx in 0..len {
-            values.push(Self::evaluate_value(expr, idx, arrays)?);
+            let val = Self::evaluate_value(expr, idx, arrays)?;
+            if val.data_type() != &preferred {
+                let casted =
+                    cast::cast(&val, &preferred).map_err(|e| Error::Internal(e.to_string()))?;
+                values.push(casted);
+            } else {
+                values.push(val);
+            }
         }
         // Concat all single-value arrays
         let refs: Vec<&dyn arrow::array::Array> = values.iter().map(|a| a.as_ref()).collect();
@@ -516,6 +524,64 @@ impl ScalarEvaluator {
                     }
                     None => Ok(None),
                 }
+            }
+            ScalarExpr::Coalesce(items) => {
+                let mut evaluated_items = Vec::with_capacity(items.len());
+                let mut types = Vec::with_capacity(items.len());
+
+                for item in items {
+                    let item_type = Self::infer_result_type_from_arrays(item, arrays);
+                    // If any item cannot be vectorized, we cannot vectorize the whole Coalesce
+                    let vec_expr = match Self::try_evaluate_vectorized(
+                        item,
+                        len,
+                        arrays,
+                        item_type.clone(),
+                    )? {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    };
+
+                    let array = vec_expr.materialize(len, item_type.clone());
+                    types.push(array.data_type().clone());
+                    evaluated_items.push(array);
+                }
+
+                if evaluated_items.is_empty() {
+                    return Ok(Some(VectorizedExpr::Array(new_null_array(
+                        &DataType::Null,
+                        len,
+                    ))));
+                }
+
+                // Determine common type
+                let mut common_type = types[0].clone();
+                for t in &types[1..] {
+                    common_type = get_common_type(&common_type, t);
+                }
+
+                // Cast all arrays to common type
+                let mut casted_arrays = Vec::with_capacity(evaluated_items.len());
+                for array in evaluated_items {
+                    if array.data_type() != &common_type {
+                        let casted = cast::cast(&array, &common_type)
+                            .map_err(|e| Error::Internal(e.to_string()))?;
+                        casted_arrays.push(casted);
+                    } else {
+                        casted_arrays.push(array);
+                    }
+                }
+
+                let mut result = casted_arrays[0].clone();
+                for next_array in &casted_arrays[1..] {
+                    let mask = is_not_null(&result).map_err(|e| Error::Internal(e.to_string()))?;
+                    // result = zip(mask, result, next_array)
+                    // if mask is true (result is not null), keep result.
+                    // if mask is false (result is null), take next_array.
+                    result = zip(&mask, &result, next_array)
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                }
+                Ok(Some(VectorizedExpr::Array(result)))
             }
             ScalarExpr::Random => {
                 let values: Vec<f64> = (0..len).map(|_| rand::random::<f64>()).collect();
