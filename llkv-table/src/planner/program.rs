@@ -287,6 +287,7 @@ pub(crate) fn normalize_predicate<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'ex
     normalize_expr(expr)
 }
 
+// TODO: Move to llkv-compute or llkv-expr?
 fn normalize_expr<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
     match expr {
         Expr::And(children) => {
@@ -317,6 +318,7 @@ fn normalize_expr<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
     }
 }
 
+// TODO: Move to llkv-compute?
 fn normalize_compare<'expr>(
     left: ScalarExpr<FieldId>,
     op: CompareOp,
@@ -387,6 +389,7 @@ fn normalize_compare<'expr>(
     }
 }
 
+// TODO: Move to llkv-compute?
 fn normalize_negated<'expr>(inner: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
     match inner {
         Expr::Not(nested) => normalize_expr(*nested),
@@ -403,6 +406,21 @@ fn normalize_negated<'expr>(inner: Expr<'expr, FieldId>) -> Expr<'expr, FieldId>
                 .map(|child| normalize_expr(Expr::Not(Box::new(child))))
                 .collect();
             Expr::And(mapped)
+        }
+        Expr::Compare { left, op, right } => {
+            let negated_op = match op {
+                CompareOp::Eq => CompareOp::NotEq,
+                CompareOp::NotEq => CompareOp::Eq,
+                CompareOp::Gt => CompareOp::LtEq,
+                CompareOp::GtEq => CompareOp::Lt,
+                CompareOp::Lt => CompareOp::GtEq,
+                CompareOp::LtEq => CompareOp::Gt,
+            };
+            Expr::Compare {
+                left,
+                op: negated_op,
+                right,
+            }
         }
         Expr::Literal(value) => Expr::Literal(!value),
         Expr::IsNull { expr, negated } => Expr::IsNull {

@@ -11,7 +11,7 @@ use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
-use crate::kernels::compute_binary;
+use crate::kernels::{compute_binary, get_common_type};
 
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap<F> = FxHashMap<F, ArrayRef>;
@@ -285,16 +285,8 @@ impl ScalarEvaluator {
     }
 
     fn binary_result_type(op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
-        // Simplified logic
         match op {
-            BinaryOp::Divide => DataType::Float64,
-            _ => {
-                if lhs == DataType::Float64 || rhs == DataType::Float64 {
-                    DataType::Float64
-                } else {
-                    lhs
-                }
-            }
+            _ => get_common_type(&lhs, &rhs),
         }
     }
 

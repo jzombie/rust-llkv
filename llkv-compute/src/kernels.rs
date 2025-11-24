@@ -1,6 +1,6 @@
-use arrow::array::{Array, ArrayRef};
+use arrow::array::{Array, ArrayRef, Scalar};
 use arrow::compute::kernels::cmp;
-use arrow::compute::{cast, kernels::numeric};
+use arrow::compute::{cast, kernels::numeric, nullif};
 use arrow::datatypes::DataType;
 use llkv_expr::expr::{BinaryOp, CompareOp};
 use llkv_result::Error;
@@ -21,7 +21,19 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
             numeric::mul(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?
         }
         BinaryOp::Divide => {
-            numeric::div(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?
+            // Handle division by zero by treating 0s as NULLs
+            let zero = arrow::array::Int64Array::from(vec![0]);
+            let zero = cast(&zero, rhs_arr.data_type())
+                .map_err(|e| Error::Internal(format!("Failed to cast 0: {}", e)))?;
+            let zero_scalar = Scalar::new(zero);
+
+            let is_zero = cmp::eq(&rhs_arr, &zero_scalar)
+                .map_err(|e| Error::Internal(format!("Failed to compare with 0: {}", e)))?;
+
+            let safe_rhs = nullif(&rhs_arr, &is_zero)
+                .map_err(|e| Error::Internal(format!("Failed to nullif zeros: {}", e)))?;
+
+            numeric::div(&lhs_arr, &safe_rhs).map_err(|e| Error::Internal(e.to_string()))?
         }
         BinaryOp::Modulo => {
             numeric::rem(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?
@@ -32,21 +44,12 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
     Ok(result_arr)
 }
 
-pub fn coerce_types(
-    lhs: &ArrayRef,
-    rhs: &ArrayRef,
-    _op: BinaryOp,
-) -> Result<(ArrayRef, ArrayRef), Error> {
-    let lhs_type = lhs.data_type();
-    let rhs_type = rhs.data_type();
-
+pub fn get_common_type(lhs_type: &DataType, rhs_type: &DataType) -> DataType {
     if lhs_type == rhs_type {
-        return Ok((lhs.clone(), rhs.clone()));
+        return lhs_type.clone();
     }
 
-    // Simple coercion rules
-    // TODO: Implement full type coercion matrix (like DataFusion)
-    let target_type = match (lhs_type, rhs_type) {
+    match (lhs_type, rhs_type) {
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64, // Promote to f64
 
@@ -69,7 +72,24 @@ pub fn coerce_types(
         (DataType::UInt64, DataType::UInt64) => DataType::UInt64,
         // ... handle other types
         _ => DataType::Float64, // Fallback
-    };
+    }
+}
+
+pub fn coerce_types(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    op: BinaryOp,
+) -> Result<(ArrayRef, ArrayRef), Error> {
+    let lhs_type = lhs.data_type();
+    let rhs_type = rhs.data_type();
+
+    if lhs_type == rhs_type {
+        return Ok((lhs.clone(), rhs.clone()));
+    }
+
+    // Simple coercion rules
+    // TODO: Implement full type coercion matrix (like DataFusion)
+    let target_type = get_common_type(lhs_type, rhs_type);
 
     let lhs_casted = cast(lhs, &target_type).map_err(|e| Error::Internal(e.to_string()))?;
     let rhs_casted = cast(rhs, &target_type).map_err(|e| Error::Internal(e.to_string()))?;

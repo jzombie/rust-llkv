@@ -1789,7 +1789,8 @@ where
         let arrays: NumericArrayMap = FxHashMap::default();
         let target_array = NumericKernels::evaluate_value(expr, 0, &arrays)?;
 
-        if target_array.is_null(0) {
+        if target_array.data_type() == &arrow::datatypes::DataType::Null || target_array.is_null(0)
+        {
             return Ok((Vec::new(), Vec::new()));
         }
 
@@ -1797,7 +1798,9 @@ where
         let mut saw_null = false;
         for value_expr in list {
             let value_array = NumericKernels::evaluate_value(value_expr, 0, &arrays)?;
-            if value_array.is_null(0) {
+            if value_array.data_type() == &arrow::datatypes::DataType::Null
+                || value_array.is_null(0)
+            {
                 saw_null = true;
             } else {
                 let cmp_array =
@@ -1841,7 +1844,7 @@ where
     ) -> LlkvResult<bool> {
         let arrays: NumericArrayMap = FxHashMap::default();
         let value = NumericKernels::evaluate_value(expr, 0, &arrays)?;
-        let is_null = value.is_null(0);
+        let is_null = value.data_type() == &arrow::datatypes::DataType::Null || value.is_null(0);
         Ok(if negated { !is_null } else { is_null })
     }
 
@@ -2244,6 +2247,11 @@ where
             left,
             right,
             |row_id, left_val, right_val| {
+                if left_val.data_type() == &arrow::datatypes::DataType::Null
+                    || right_val.data_type() == &arrow::datatypes::DataType::Null
+                {
+                    return;
+                }
                 if !left_val.is_null(0) && !right_val.is_null(0) {
                     if let Ok(cmp_array) = llkv_compute::compute_compare(&left_val, op, &right_val)
                     {
