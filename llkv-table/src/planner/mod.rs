@@ -4691,6 +4691,7 @@ where
     }
 }
 
+// TODO: Move to llkv-compute
 fn normalize_row_ids(mut row_ids: Vec<RowId>) -> Vec<RowId> {
     row_ids.sort_unstable();
     row_ids.dedup();
@@ -4870,6 +4871,7 @@ where
     Ok(Some(batch))
 }
 
+// TODO: Move to llkv-compute
 fn emit_synthetic_null_batch<F>(
     projection_evals: &[ProjectionEval],
     out_schema: &Arc<Schema>,
@@ -4901,11 +4903,13 @@ where
     Ok(())
 }
 
+// TODO: Move to llkv-compute
 fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
     u64::from_literal(lit)
         .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
 }
 
+// TODO: Move to llkv-compute
 fn lower_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
     Ok(match bound {
         Bound::Unbounded => 0,
@@ -4920,6 +4924,7 @@ fn lower_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<us
     })
 }
 
+// TODO: Move to llkv-compute
 fn upper_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
     Ok(match bound {
         Bound::Unbounded => row_ids.len(),
@@ -4934,6 +4939,7 @@ fn upper_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<us
     })
 }
 
+// TODO: Move to llkv-compute (and vectorize, if possible)
 fn filter_row_ids_by_operator(row_ids: &[RowId], op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
     use Operator::*;
 
@@ -5005,6 +5011,7 @@ fn filter_row_ids_by_operator(row_ids: &[RowId], op: &Operator<'_>) -> LlkvResul
     }
 }
 
+// TODO: Move to llkv-compute (and vectorize, if possible)
 fn intersect_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     let mut result = Vec::with_capacity(left.len().min(right.len()));
     let mut i = 0;
@@ -5025,6 +5032,7 @@ fn intersect_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     result
 }
 
+// TODO: Move to llkv-compute (and vectorize, if possible)
 fn union_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     if left.is_empty() {
         return right;
@@ -5065,6 +5073,7 @@ fn union_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
     result
 }
 
+// TODO: Move to llkv-compute (and vectorize, if possible)
 fn difference_sorted(base: Vec<RowId>, subtract: Vec<RowId>) -> Vec<RowId> {
     if base.is_empty() || subtract.is_empty() {
         return base;
@@ -5093,6 +5102,7 @@ fn difference_sorted(base: Vec<RowId>, subtract: Vec<RowId>) -> Vec<RowId> {
     result
 }
 
+// TODO: Move to llkv-compute (and vectorize, if possible)
 fn difference_sorted_slice(base: &[RowId], subtract: &[RowId]) -> Vec<RowId> {
     if base.is_empty() {
         return Vec::new();
@@ -5137,6 +5147,7 @@ fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
     row_ids
 }
 
+// TODO: Move to llkv-compute
 fn array_value_to_literal(array: &ArrayRef, index: usize) -> LlkvResult<Literal> {
     use arrow::datatypes::*;
     if array.is_null(index) {
@@ -5258,6 +5269,7 @@ fn array_value_to_literal(array: &ArrayRef, index: usize) -> LlkvResult<Literal>
     }
 }
 
+// TODO: Move to llkv-compute?
 fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
     let simplified = NumericKernels::simplify(expr);
 
@@ -5277,6 +5289,7 @@ fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Opti
     Ok(Some(array_value_to_literal(&array, 0)?))
 }
 
+// TODO: Move to llkv-compute?
 fn evaluate_constant_literal_non_numeric(
     expr: &ScalarExpr<FieldId>,
 ) -> LlkvResult<Option<Literal>> {
@@ -5368,6 +5381,7 @@ fn evaluate_constant_literal_non_numeric(
     }
 }
 
+// TODO: Move to llkv-compute?
 fn literal_type_name(literal: &Literal) -> &'static str {
     match literal {
         Literal::Null => "NULL",
@@ -5382,6 +5396,7 @@ fn literal_type_name(literal: &Literal) -> &'static str {
     }
 }
 
+// TODO: Move to llkv-compute
 fn is_supported_numeric(dtype: &DataType) -> bool {
     matches!(
         dtype,

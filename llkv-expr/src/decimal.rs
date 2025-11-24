@@ -1,3 +1,5 @@
+// TODO: Move this entire thing to llkv-compute?
+
 //! Decimal utilities shared across LLKV crates.
 //!
 //! The runtime stores decimal values using Arrow's `Decimal128` semantics.
