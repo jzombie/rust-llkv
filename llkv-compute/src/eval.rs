@@ -1,56 +1,43 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, Datum, Float64Array, UInt32Array, new_null_array};
+use arrow::compute::kernels::cast;
+use arrow::compute::{concat, take};
+use arrow::datatypes::{DataType, IntervalMonthDayNanoType};
 use llkv_expr::literal::Literal;
 use llkv_expr::{AggregateCall, BinaryOp, CompareOp, DecimalValue, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::array::NumericArray;
 use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
-use crate::kernels::{compute_binary, compute_binary_scalar};
-use crate::numeric::{NumericKind, NumericValue};
+use crate::kernels::compute_binary;
 
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
-pub type NumericArrayMap<F> = FxHashMap<F, NumericArray>;
+pub type NumericArrayMap<F> = FxHashMap<F, ArrayRef>;
 
 /// Intermediate representation for vectorized evaluators.
 enum VectorizedExpr {
-    Array(NumericArray),
-    Scalar(Option<NumericValue>),
+    Array(ArrayRef),
+    Scalar(ArrayRef),
 }
 
 impl VectorizedExpr {
-    fn materialize(self, len: usize, kind: NumericKind) -> ArrayRef {
+    fn materialize(self, len: usize, _target_type: DataType) -> ArrayRef {
         match self {
-            VectorizedExpr::Array(array) => array.to_aligned_array_ref(kind),
-            VectorizedExpr::Scalar(Some(value)) => {
-                let target_kind = match (value.kind(), kind) {
-                    (_, NumericKind::String) => NumericKind::String,
-                    (NumericKind::String, _) => NumericKind::String,
-                    (NumericKind::Float, _) => NumericKind::Float,
-                    (NumericKind::Decimal, _) => NumericKind::Decimal,
-                    (NumericKind::Integer, NumericKind::Float) => NumericKind::Float,
-                    (NumericKind::Integer, NumericKind::Decimal) => NumericKind::Decimal,
-                    (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
-                    (NumericKind::UnsignedInteger, NumericKind::Float) => NumericKind::Float,
-                    (NumericKind::UnsignedInteger, NumericKind::Decimal) => NumericKind::Decimal,
-                    (NumericKind::UnsignedInteger, NumericKind::UnsignedInteger) => {
-                        NumericKind::UnsignedInteger
-                    }
-                    (NumericKind::UnsignedInteger, NumericKind::Integer) => NumericKind::Float,
-                    (NumericKind::Integer, NumericKind::UnsignedInteger) => NumericKind::Float,
-                };
-                let values = vec![Some(value); len];
-                let array = NumericArray::from_numeric_values(values, target_kind);
-                array.to_aligned_array_ref(kind)
-            }
-            VectorizedExpr::Scalar(None) => {
-                let values = vec![None; len];
-                let array = NumericArray::from_numeric_values(values, kind);
-                array.to_aligned_array_ref(kind)
+            VectorizedExpr::Array(array) => array, // TODO: Cast to target_type if needed
+            VectorizedExpr::Scalar(scalar_array) => {
+                if scalar_array.len() == 0 {
+                    return new_null_array(&_target_type, len);
+                }
+                if scalar_array.is_null(0) {
+                    return new_null_array(scalar_array.data_type(), len);
+                }
+
+                // Expand scalar to array of length len
+                let indices = UInt32Array::from(vec![0; len]);
+                take(&scalar_array, &indices, None)
+                    .unwrap_or_else(|_| new_null_array(scalar_array.data_type(), len))
             }
         }
     }
@@ -174,13 +161,7 @@ impl ScalarEvaluator {
         arrays: &FxHashMap<F, ArrayRef>,
         _row_count: usize,
     ) -> NumericArrayMap<F> {
-        let mut result = FxHashMap::default();
-        for (field, array) in arrays {
-            if let Ok(numeric) = NumericArray::try_from_arrow(array) {
-                result.insert(*field, numeric);
-            }
-        }
-        result
+        arrays.clone()
     }
 
     /// Attempts to represent the expression as `scale * column + offset`.
@@ -210,12 +191,17 @@ impl ScalarEvaluator {
                 scale: 1.0,
                 offset: 0.0,
             }),
-            ScalarExpr::Literal(_) => {
-                let value = Self::literal_numeric_value(expr)?.as_f64();
+            ScalarExpr::Literal(lit) => {
+                let arr = Self::literal_to_array(lit);
+                let val = cast::cast(&arr, &DataType::Float64).ok()?;
+                let val = val.as_any().downcast_ref::<Float64Array>()?;
+                if val.is_null(0) {
+                    return None;
+                }
                 Some(AffineState {
                     field: None,
                     scale: 0.0,
-                    offset: value,
+                    offset: val.value(0),
                 })
             }
             ScalarExpr::Aggregate(_) => None,
@@ -237,92 +223,79 @@ impl ScalarEvaluator {
     }
 
     /// Infer the numeric kind of an expression using only the kinds of its referenced columns.
-    pub fn infer_result_kind_from_types<F, R>(
-        expr: &ScalarExpr<F>,
-        resolve_kind: &mut R,
-    ) -> Option<NumericKind>
+    pub fn infer_result_type<F, R>(expr: &ScalarExpr<F>, resolve_type: &mut R) -> Option<DataType>
     where
         F: Hash + Eq + Copy,
-        R: FnMut(F) -> Option<NumericKind>,
+        R: FnMut(F) -> Option<DataType>,
     {
         match expr {
-            ScalarExpr::Literal(_) => Self::literal_numeric_value(expr).map(|v| v.kind()),
-            ScalarExpr::Column(fid) => resolve_kind(*fid),
+            ScalarExpr::Literal(lit) => Some(Self::literal_type(lit)),
+            ScalarExpr::Column(fid) => resolve_type(*fid),
             ScalarExpr::Binary { left, op, right } => {
-                let left_kind = Self::infer_result_kind_from_types(left, resolve_kind)?;
-                let right_kind = Self::infer_result_kind_from_types(right, resolve_kind)?;
-                Some(Self::binary_result_kind(*op, left_kind, right_kind))
+                let left_type = Self::infer_result_type(left, resolve_type)?;
+                let right_type = Self::infer_result_type(right, resolve_type)?;
+                Some(Self::binary_result_type(*op, left_type, right_type))
             }
-            ScalarExpr::Compare { .. } => Some(NumericKind::Integer),
-            ScalarExpr::Not(_) => Some(NumericKind::Integer),
-            ScalarExpr::IsNull { .. } => Some(NumericKind::Integer),
-            ScalarExpr::Aggregate(_) => Some(NumericKind::Float),
+            ScalarExpr::Compare { .. } => Some(DataType::Boolean),
+            ScalarExpr::Not(_) => Some(DataType::Boolean),
+            ScalarExpr::IsNull { .. } => Some(DataType::Boolean),
+            ScalarExpr::Aggregate(_) => Some(DataType::Float64), // TODO: Fix aggregate types
             ScalarExpr::GetField { .. } => None,
-            ScalarExpr::Cast { expr, data_type } => {
-                let target_kind = Self::kind_for_data_type(data_type);
-                target_kind.or_else(|| Self::infer_result_kind_from_types(expr, resolve_kind))
-            }
+            ScalarExpr::Cast { data_type, .. } => Some(data_type.clone()),
             ScalarExpr::Case {
                 branches,
                 else_expr,
                 ..
             } => {
-                let mut result_kind = NumericKind::Integer;
-                for (_, then_expr) in branches {
-                    let kind = Self::infer_result_kind_from_types(then_expr, resolve_kind)?;
-                    if matches!(kind, NumericKind::Float) {
-                        result_kind = NumericKind::Float;
-                        break;
-                    }
+                // Simplified: take first branch type
+                if let Some((_, then_expr)) = branches.first() {
+                    Self::infer_result_type(then_expr, resolve_type)
+                } else if let Some(else_expr) = else_expr {
+                    Self::infer_result_type(else_expr, resolve_type)
+                } else {
+                    None
                 }
-                if result_kind != NumericKind::Float
-                    && let Some(inner) = else_expr.as_deref()
-                    && let Some(kind) = Self::infer_result_kind_from_types(inner, resolve_kind)
-                    && matches!(kind, NumericKind::Float)
-                {
-                    result_kind = NumericKind::Float;
-                }
-                Some(result_kind)
             }
             ScalarExpr::Coalesce(items) => {
-                let mut result_kind = NumericKind::Integer;
-                for item in items {
-                    let kind = Self::infer_result_kind_from_types(item, resolve_kind)?;
-                    if matches!(kind, NumericKind::Float) {
-                        result_kind = NumericKind::Float;
-                        break;
-                    }
+                if let Some(first) = items.first() {
+                    Self::infer_result_type(first, resolve_type)
+                } else {
+                    None
                 }
-                Some(result_kind)
             }
-            ScalarExpr::Random => Some(NumericKind::Float),
-            ScalarExpr::ScalarSubquery(_) => Some(NumericKind::Float),
+            ScalarExpr::Random => Some(DataType::Float64),
+            ScalarExpr::ScalarSubquery(sub) => Some(sub.data_type.clone()),
         }
     }
 
-    fn binary_result_kind(
-        op: BinaryOp,
-        lhs_kind: NumericKind,
-        rhs_kind: NumericKind,
-    ) -> NumericKind {
-        let lhs_value = match lhs_kind {
-            NumericKind::Integer => NumericValue::Int(1),
-            NumericKind::UnsignedInteger => NumericValue::UInt(1),
-            NumericKind::Float => NumericValue::Float(1.0),
-            NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(1)),
-            NumericKind::String => NumericValue::String("".to_string()),
-        };
-        let rhs_value = match rhs_kind {
-            NumericKind::Integer => NumericValue::Int(1),
-            NumericKind::UnsignedInteger => NumericValue::UInt(1),
-            NumericKind::Float => NumericValue::Float(1.0),
-            NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(1)),
-            NumericKind::String => NumericValue::String("".to_string()),
-        };
+    fn literal_type(lit: &Literal) -> DataType {
+        match lit {
+            Literal::Null => DataType::Null,
+            Literal::Boolean(_) => DataType::Boolean,
+            Literal::Integer(_) => DataType::Int64, // Default to Int64 for literals
+            Literal::Float(_) => DataType::Float64,
+            Literal::Decimal(d) => DataType::Decimal128(d.precision(), d.scale()),
+            Literal::String(_) => DataType::Utf8,
+            Literal::Date32(_) => DataType::Date32,
+            Literal::Interval(_) => {
+                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+            }
+            Literal::Struct(_) => DataType::Struct(arrow::datatypes::Fields::empty()), // TODO: Infer struct fields
+        }
+    }
 
-        Self::apply_binary_values(op, lhs_value, rhs_value)
-            .unwrap_or(NumericValue::Float(0.0))
-            .kind()
+    fn binary_result_type(op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
+        // Simplified logic
+        match op {
+            BinaryOp::Divide => DataType::Float64,
+            _ => {
+                if lhs == DataType::Float64 || rhs == DataType::Float64 {
+                    DataType::Float64
+                } else {
+                    lhs
+                }
+            }
+        }
     }
 
     /// Evaluate a scalar expression for the row at `idx` using the provided numeric arrays.
@@ -330,121 +303,123 @@ impl ScalarEvaluator {
         expr: &ScalarExpr<F>,
         idx: usize,
         arrays: &NumericArrayMap<F>,
-    ) -> LlkvResult<Option<NumericValue>> {
+    ) -> LlkvResult<ArrayRef> {
         match expr {
             ScalarExpr::Column(fid) => {
                 let array = arrays
                     .get(fid)
                     .ok_or_else(|| Error::Internal("missing column for field".into()))?;
-                Ok(array.value(idx))
+                Ok(array.slice(idx, 1))
             }
-            ScalarExpr::Literal(_) => Ok(Self::literal_numeric_value(expr)),
+            ScalarExpr::Literal(lit) => Ok(Self::literal_to_array(lit)),
             ScalarExpr::Binary { left, op, right } => {
-                if let Some(result) =
-                    Self::try_evaluate_date_interval_binary(left, *op, right, idx, arrays)?
-                {
-                    return Ok(result);
-                }
                 let l = Self::evaluate_value(left, idx, arrays)?;
                 let r = Self::evaluate_value(right, idx, arrays)?;
-                Ok(Self::apply_binary(*op, l, r))
+                Self::evaluate_binary_scalar(&l, *op, &r)
             }
             ScalarExpr::Compare { left, op, right } => {
                 let l = Self::evaluate_value(left, idx, arrays)?;
                 let r = Self::evaluate_value(right, idx, arrays)?;
-                match (l, r) {
-                    (Some(lhs), Some(rhs)) => {
-                        let result = Self::compare(*op, lhs, rhs);
-                        Ok(Some(NumericValue::Int(result as i64)))
-                    }
-                    _ => Ok(None),
-                }
+                crate::kernels::compute_compare(&l, *op, &r)
             }
-            ScalarExpr::Not(inner) => {
-                let value = Self::evaluate_value(inner, idx, arrays)?;
-                match value {
-                    Some(v) => {
-                        let is_truthy = Self::truthy_numeric(v);
-                        Ok(Some(NumericValue::Int(if is_truthy { 0 } else { 1 })))
-                    }
-                    None => Ok(None),
-                }
+            ScalarExpr::Not(expr) => {
+                let val = Self::evaluate_value(expr, idx, arrays)?;
+                let bool_arr = cast::cast(&val, &DataType::Boolean)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                let bool_arr = bool_arr
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .unwrap();
+                let result = arrow::compute::kernels::boolean::not(bool_arr)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                Ok(Arc::new(result))
             }
             ScalarExpr::IsNull { expr, negated } => {
-                let value = Self::evaluate_value(expr, idx, arrays)?;
-                let is_null = value.is_none();
-                // XOR-style comparison keeps negated IS NULL readable.
-                let condition_holds = is_null != *negated;
-                Ok(Some(NumericValue::Int(if condition_holds { 1 } else { 0 })))
+                let val = Self::evaluate_value(expr, idx, arrays)?;
+                let is_null = val.is_null(0);
+                let result = if *negated { !is_null } else { is_null };
+                Ok(Arc::new(arrow::array::BooleanArray::from(vec![result])))
             }
-            ScalarExpr::Aggregate(_) => Err(Error::Internal(
-                "Aggregate expressions should not appear in row-level evaluation".into(),
-            )),
-            ScalarExpr::GetField { .. } => Err(Error::Internal(
-                "GetField expressions should not be evaluated in numeric kernels".into(),
-            )),
             ScalarExpr::Cast { expr, data_type } => {
-                if matches!(data_type, DataType::Date32) {
-                    return Self::evaluate_cast_date32_value(expr, idx, arrays);
-                }
-
-                let value = Self::evaluate_value(expr, idx, arrays)?;
-                let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "unsupported cast target type {:?}",
-                        data_type
-                    ))
-                })?;
-                Self::cast_numeric_value_to_kind(value, target_kind)
+                let val = Self::evaluate_value(expr, idx, arrays)?;
+                cast::cast(&val, data_type).map_err(|e| Error::Internal(e.to_string()))
             }
             ScalarExpr::Case {
-                operand,
                 branches,
                 else_expr,
+                ..
             } => {
-                let operand_value = match operand.as_deref() {
-                    Some(op) => Some(Self::evaluate_value(op, idx, arrays)?),
-                    None => None,
-                };
-
                 for (when_expr, then_expr) in branches {
-                    let matched = if let Some(op_val_opt) = &operand_value {
-                        let when_val = Self::evaluate_value(when_expr, idx, arrays)?;
-                        match (op_val_opt, &when_val) {
-                            (Some(op_val), Some(branch_val)) => {
-                                Self::numeric_equals(op_val.clone(), branch_val.clone())
-                            }
-                            _ => false,
-                        }
+                    let when_val = Self::evaluate_value(when_expr, idx, arrays)?;
+                    let is_true = if when_val.is_null(0) {
+                        false
                     } else {
-                        let cond_val = Self::evaluate_value(when_expr, idx, arrays)?;
-                        cond_val.is_some_and(Self::truthy_numeric)
+                        let bool_arr = cast::cast(&when_val, &DataType::Boolean)
+                            .map_err(|e| Error::Internal(e.to_string()))?;
+                        let bool_arr = bool_arr
+                            .as_any()
+                            .downcast_ref::<arrow::array::BooleanArray>()
+                            .unwrap();
+                        bool_arr.value(0)
                     };
 
-                    if matched {
+                    if is_true {
                         return Self::evaluate_value(then_expr, idx, arrays);
                     }
                 }
-
-                if let Some(else_expr) = else_expr.as_deref() {
+                if let Some(else_expr) = else_expr {
                     Self::evaluate_value(else_expr, idx, arrays)
                 } else {
-                    Ok(None)
+                    Ok(new_null_array(&DataType::Null, 1))
                 }
             }
             ScalarExpr::Coalesce(items) => {
                 for item in items {
-                    if let Some(value) = Self::evaluate_value(item, idx, arrays)? {
-                        return Ok(Some(value));
+                    let val = Self::evaluate_value(item, idx, arrays)?;
+                    if !val.is_null(0) {
+                        return Ok(val);
                     }
                 }
-                Ok(None)
+                Ok(new_null_array(&DataType::Null, 1))
             }
-            ScalarExpr::Random => Ok(Some(NumericValue::Float(rand::random::<f64>()))),
-            ScalarExpr::ScalarSubquery(_) => Err(Error::Internal(
-                "Scalar subquery evaluation requires a separate execution context".into(),
-            )),
+            ScalarExpr::Random => {
+                let val = rand::random::<f64>();
+                Ok(Arc::new(Float64Array::from(vec![val])))
+            }
+            _ => Err(Error::Internal("Unsupported scalar expression".into())),
         }
+    }
+
+    fn literal_to_array(lit: &Literal) -> ArrayRef {
+        match lit {
+            Literal::Null => new_null_array(&DataType::Null, 1),
+            Literal::Boolean(b) => Arc::new(arrow::array::BooleanArray::from(vec![*b])),
+            Literal::Integer(i) => Arc::new(arrow::array::Int64Array::from(vec![*i as i64])),
+            Literal::Float(f) => Arc::new(Float64Array::from(vec![*f])),
+            Literal::Decimal(d) => {
+                let array = arrow::array::Decimal128Array::from(vec![Some(d.raw_value())])
+                    .with_precision_and_scale(d.precision(), d.scale())
+                    .unwrap();
+                Arc::new(array)
+            }
+            Literal::String(s) => Arc::new(arrow::array::StringArray::from(vec![s.clone()])),
+            Literal::Date32(d) => Arc::new(arrow::array::Date32Array::from(vec![*d])),
+            Literal::Interval(i) => {
+                let val = IntervalMonthDayNanoType::make_value(i.months, i.days, i.nanos);
+                Arc::new(arrow::array::IntervalMonthDayNanoArray::from(vec![val]))
+            }
+            Literal::Struct(_) => {
+                new_null_array(&DataType::Struct(arrow::datatypes::Fields::empty()), 1)
+            }
+        }
+    }
+
+    fn evaluate_binary_scalar(
+        lhs: &ArrayRef,
+        op: BinaryOp,
+        rhs: &ArrayRef,
+    ) -> LlkvResult<ArrayRef> {
+        compute_binary(lhs, rhs, op)
     }
 
     /// Evaluate a scalar expression for every row in the batch.
@@ -464,34 +439,28 @@ impl ScalarEvaluator {
         len: usize,
         arrays: &NumericArrayMap<F>,
     ) -> LlkvResult<ArrayRef> {
-        if let ScalarExpr::Cast {
-            expr: inner,
-            data_type,
-        } = expr
-            && matches!(data_type, DataType::Date32)
+        let preferred = Self::infer_result_type_from_arrays(expr, arrays);
+        if let Some(vectorized) =
+            Self::try_evaluate_vectorized(expr, len, arrays, preferred.clone())?
         {
-            return Self::evaluate_cast_date32_batch(inner, len, arrays);
-        }
-
-        let preferred = Self::infer_result_kind(expr, arrays);
-        if let Some(vectorized) = Self::try_evaluate_vectorized(expr, len, arrays, preferred)? {
             let result = vectorized.materialize(len, preferred);
             return Ok(result);
         }
 
-        let mut values: Vec<Option<NumericValue>> = Vec::with_capacity(len);
+        let mut values = Vec::with_capacity(len);
         for idx in 0..len {
             values.push(Self::evaluate_value(expr, idx, arrays)?);
         }
-        let array = NumericArray::from_numeric_values(values, preferred);
-        Ok(array.to_aligned_array_ref(preferred))
+        // Concat all single-value arrays
+        let refs: Vec<&dyn arrow::array::Array> = values.iter().map(|a| a.as_ref()).collect();
+        concat(&refs).map_err(|e| Error::Internal(e.to_string()))
     }
 
     fn try_evaluate_vectorized<F: Hash + Eq + Copy>(
         expr: &ScalarExpr<F>,
         len: usize,
         arrays: &NumericArrayMap<F>,
-        _preferred: NumericKind,
+        _preferred: DataType,
     ) -> LlkvResult<Option<VectorizedExpr>> {
         if Self::expr_contains_interval(expr) {
             return Ok(None);
@@ -503,79 +472,65 @@ impl ScalarEvaluator {
                     .ok_or_else(|| Error::Internal("missing column for field".into()))?;
                 Ok(Some(VectorizedExpr::Array(array.clone())))
             }
-            ScalarExpr::Literal(_) => Ok(Some(VectorizedExpr::Scalar(
-                Self::literal_numeric_value(expr),
-            ))),
+            ScalarExpr::Literal(lit) => {
+                let array = Self::literal_to_array(lit);
+                Ok(Some(VectorizedExpr::Scalar(array)))
+            }
             ScalarExpr::Binary { left, op, right } => {
-                let left_kind = Self::infer_result_kind(left, arrays);
-                let right_kind = Self::infer_result_kind(right, arrays);
+                let left_type = Self::infer_result_type_from_arrays(left, arrays);
+                let right_type = Self::infer_result_type_from_arrays(right, arrays);
 
-                let left_vec = Self::try_evaluate_vectorized(left, len, arrays, left_kind)?;
-                let right_vec = Self::try_evaluate_vectorized(right, len, arrays, right_kind)?;
+                let left_vec = Self::try_evaluate_vectorized(left, len, arrays, left_type)?;
+                let right_vec = Self::try_evaluate_vectorized(right, len, arrays, right_type)?;
 
                 match (left_vec, right_vec) {
-                    (Some(VectorizedExpr::Scalar(lhs)), Some(VectorizedExpr::Scalar(rhs))) => Ok(
-                        Some(VectorizedExpr::Scalar(Self::apply_binary(*op, lhs, rhs))),
-                    ),
+                    (Some(VectorizedExpr::Scalar(lhs)), Some(VectorizedExpr::Scalar(rhs))) => {
+                        let result = compute_binary(&lhs, &rhs, *op)?;
+                        Ok(Some(VectorizedExpr::Scalar(result)))
+                    }
                     (Some(VectorizedExpr::Array(lhs)), Some(VectorizedExpr::Array(rhs))) => {
                         let array = compute_binary(&lhs, &rhs, *op)?;
                         Ok(Some(VectorizedExpr::Array(array)))
                     }
                     (Some(VectorizedExpr::Array(lhs)), Some(VectorizedExpr::Scalar(rhs))) => {
-                        let array = compute_binary_scalar(&lhs, rhs, *op, true)?;
+                        let rhs_expanded = VectorizedExpr::Scalar(rhs)
+                            .materialize(lhs.len(), lhs.data_type().clone());
+                        let array = compute_binary(&lhs, &rhs_expanded, *op)?;
                         Ok(Some(VectorizedExpr::Array(array)))
                     }
                     (Some(VectorizedExpr::Scalar(lhs)), Some(VectorizedExpr::Array(rhs))) => {
-                        let array = compute_binary_scalar(&rhs, lhs, *op, false)?;
+                        let lhs_expanded = VectorizedExpr::Scalar(lhs)
+                            .materialize(rhs.len(), rhs.data_type().clone());
+                        let array = compute_binary(&lhs_expanded, &rhs, *op)?;
                         Ok(Some(VectorizedExpr::Array(array)))
                     }
                     _ => Ok(None),
                 }
             }
-            ScalarExpr::Compare { .. } => Ok(None),
-            ScalarExpr::Not(_) => Ok(None),
-            ScalarExpr::IsNull { .. } => Ok(None),
-            ScalarExpr::Aggregate(_) => Err(Error::Internal(
-                "Aggregate expressions should not appear in row-level evaluation".into(),
-            )),
-            ScalarExpr::GetField { .. } => Err(Error::Internal(
-                "GetField expressions should not be evaluated in numeric kernels".into(),
-            )),
             ScalarExpr::Cast { expr, data_type } => {
-                if matches!(data_type, DataType::Date32) {
-                    return Ok(None);
-                }
-
-                let inner_kind = Self::infer_result_kind(expr, arrays);
-                let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays, inner_kind)?;
-                let target_kind = Self::kind_for_data_type(data_type).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "unsupported cast target type {:?}",
-                        data_type
-                    ))
-                })?;
+                let inner_type = Self::infer_result_type_from_arrays(expr, arrays);
+                let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays, inner_type)?;
 
                 match inner_vec {
-                    Some(VectorizedExpr::Scalar(value)) => Ok(Some(VectorizedExpr::Scalar(
-                        Self::cast_numeric_value_to_kind(value, target_kind)?,
-                    ))),
-                    Some(VectorizedExpr::Array(array)) => Ok(Some(VectorizedExpr::Array(
-                        Self::cast_numeric_array_to_kind(&array, target_kind)?,
-                    ))),
+                    Some(VectorizedExpr::Scalar(array)) => {
+                        let casted = cast::cast(&array, data_type)
+                            .map_err(|e| Error::Internal(e.to_string()))?;
+                        Ok(Some(VectorizedExpr::Scalar(casted)))
+                    }
+                    Some(VectorizedExpr::Array(array)) => {
+                        let casted = cast::cast(&array, data_type)
+                            .map_err(|e| Error::Internal(e.to_string()))?;
+                        Ok(Some(VectorizedExpr::Array(casted)))
+                    }
                     None => Ok(None),
                 }
             }
-            ScalarExpr::Case { .. } => Ok(None),
-            ScalarExpr::Coalesce(_) => Ok(None),
             ScalarExpr::Random => {
-                // Generate array of random float values
                 let values: Vec<f64> = (0..len).map(|_| rand::random::<f64>()).collect();
                 let array = Float64Array::from(values);
-                Ok(Some(VectorizedExpr::Array(NumericArray::new_float(
-                    Arc::new(array),
-                ))))
+                Ok(Some(VectorizedExpr::Array(Arc::new(array))))
             }
-            ScalarExpr::ScalarSubquery(_) => Ok(None),
+            _ => Ok(None),
         }
     }
 
@@ -593,42 +548,7 @@ impl ScalarEvaluator {
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
-
-                // Constant folding
-                if let (ScalarExpr::Literal(_lv), ScalarExpr::Literal(_rv)) = (&l, &r) {
-                    let ln = Self::literal_numeric_value(&l);
-                    let rn = Self::literal_numeric_value(&r);
-                    if let (Some(ln_val), Some(rn_val)) = (ln, rn) {
-                        if let Some(res) = Self::apply_binary_literal(*op, ln_val, rn_val) {
-                            return res;
-                        }
-                    }
-                }
-
-                // Identity removal (e.g. x + 0 = x)
-                if *op == BinaryOp::Add {
-                    if let ScalarExpr::Literal(_lit) = &r {
-                        if let Some(NumericValue::Int(0)) = Self::literal_numeric_value(&r) {
-                            return l;
-                        }
-                        if let Some(NumericValue::Float(f)) = Self::literal_numeric_value(&r) {
-                            if f == 0.0 {
-                                return l;
-                            }
-                        }
-                    }
-                    if let ScalarExpr::Literal(_lit) = &l {
-                        if let Some(NumericValue::Int(0)) = Self::literal_numeric_value(&l) {
-                            return r;
-                        }
-                        if let Some(NumericValue::Float(f)) = Self::literal_numeric_value(&l) {
-                            if f == 0.0 {
-                                return r;
-                            }
-                        }
-                    }
-                }
-
+                // TODO: Restore constant folding using ScalarValue
                 ScalarExpr::Binary {
                     left: Box::new(l),
                     op: *op,
@@ -637,7 +557,6 @@ impl ScalarEvaluator {
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
-                // Remove redundant casts?
                 ScalarExpr::Cast {
                     expr: Box::new(inner),
                     data_type: data_type.clone(),
@@ -647,107 +566,12 @@ impl ScalarEvaluator {
         }
     }
 
-    fn infer_result_kind<F: Hash + Eq + Copy>(
+    fn infer_result_type_from_arrays<F: Hash + Eq + Copy>(
         expr: &ScalarExpr<F>,
         arrays: &NumericArrayMap<F>,
-    ) -> NumericKind {
-        match expr {
-            ScalarExpr::Column(fid) => arrays
-                .get(fid)
-                .map(|a| a.kind())
-                .unwrap_or(NumericKind::Float),
-            ScalarExpr::Literal(lit) => match lit {
-                Literal::Integer(_) => NumericKind::Integer,
-                Literal::Float(_) => NumericKind::Float,
-                Literal::Decimal(_) => NumericKind::Decimal,
-                Literal::String(_) => NumericKind::String,
-                _ => NumericKind::Float,
-            },
-            ScalarExpr::Binary { left, op, right } => {
-                if *op == BinaryOp::Divide {
-                    return NumericKind::Float;
-                }
-                let l = Self::infer_result_kind(left, arrays);
-                let r = Self::infer_result_kind(right, arrays);
-                match (l, r) {
-                    (NumericKind::String, _) | (_, NumericKind::String) => NumericKind::String,
-                    (NumericKind::Float, _) | (_, NumericKind::Float) => NumericKind::Float,
-                    (NumericKind::Decimal, _) | (_, NumericKind::Decimal) => NumericKind::Decimal,
-                    (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
-                    (NumericKind::UnsignedInteger, NumericKind::UnsignedInteger) => {
-                        NumericKind::UnsignedInteger
-                    }
-                    (NumericKind::Integer, NumericKind::UnsignedInteger)
-                    | (NumericKind::UnsignedInteger, NumericKind::Integer) => NumericKind::Float,
-                }
-            }
-            ScalarExpr::Compare { .. } => NumericKind::Integer, // Boolean 0/1
-            ScalarExpr::Not(_) => NumericKind::Integer,         // Boolean 0/1
-            ScalarExpr::IsNull { .. } => NumericKind::Integer,  // Boolean 0/1
-            ScalarExpr::Aggregate(_) => NumericKind::Float,
-            ScalarExpr::GetField { .. } => NumericKind::Float,
-            ScalarExpr::Cast { expr, data_type } => {
-                let target_kind = Self::kind_for_data_type(data_type);
-                target_kind.unwrap_or_else(|| Self::infer_result_kind(expr, arrays))
-            }
-            ScalarExpr::Case {
-                branches,
-                else_expr,
-                ..
-            } => {
-                let mut result_kind = NumericKind::Integer;
-                let mut has_decimal = false;
-                for (_, then_expr) in branches {
-                    match Self::infer_result_kind(then_expr, arrays) {
-                        NumericKind::Float => {
-                            result_kind = NumericKind::Float;
-                            break;
-                        }
-                        NumericKind::Decimal => {
-                            has_decimal = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if result_kind != NumericKind::Float
-                    && let Some(inner) = else_expr.as_deref()
-                {
-                    match Self::infer_result_kind(inner, arrays) {
-                        NumericKind::Float => result_kind = NumericKind::Float,
-                        NumericKind::Decimal => has_decimal = true,
-                        _ => {}
-                    }
-                }
-                if result_kind != NumericKind::Float && has_decimal {
-                    result_kind = NumericKind::Decimal;
-                }
-                result_kind
-            }
-            ScalarExpr::Coalesce(items) => {
-                let mut result_kind = NumericKind::Integer;
-                let mut has_decimal = false;
-                for item in items {
-                    match Self::infer_result_kind(item, arrays) {
-                        NumericKind::Float => {
-                            result_kind = NumericKind::Float;
-                            break;
-                        }
-                        NumericKind::Decimal => {
-                            has_decimal = true;
-                        }
-                        _ => {}
-                    }
-                }
-                if result_kind != NumericKind::Float && has_decimal {
-                    result_kind = NumericKind::Decimal;
-                }
-                result_kind
-            }
-            ScalarExpr::Random => NumericKind::Float,
-            ScalarExpr::ScalarSubquery(sub) => {
-                Self::kind_for_data_type(&sub.data_type).unwrap_or(NumericKind::Float)
-            }
-        }
+    ) -> DataType {
+        let mut resolver = |fid| arrays.get(&fid).map(|a| a.data_type().clone());
+        Self::infer_result_type(expr, &mut resolver).unwrap_or(DataType::Float64)
     }
 
     fn expr_contains_interval<F: Hash + Eq + Copy>(expr: &ScalarExpr<F>) -> bool {
@@ -757,199 +581,6 @@ impl ScalarEvaluator {
                 Self::expr_contains_interval(left) || Self::expr_contains_interval(right)
             }
             _ => false,
-        }
-    }
-
-    fn try_evaluate_date_interval_binary<F: Hash + Eq + Copy>(
-        left: &ScalarExpr<F>,
-        op: BinaryOp,
-        right: &ScalarExpr<F>,
-        idx: usize,
-        arrays: &NumericArrayMap<F>,
-    ) -> LlkvResult<Option<Option<NumericValue>>> {
-        // Check for DATE +/- INTERVAL
-        if let ScalarExpr::Literal(Literal::Interval(interval)) = right {
-            if op == BinaryOp::Add || op == BinaryOp::Subtract {
-                // Left must be a date
-                let left_val = Self::evaluate_value(left, idx, arrays)?;
-                if let Some(NumericValue::Int(days)) = left_val {
-                    // Treat int as days since epoch (Date32)
-                    let result_days = if op == BinaryOp::Add {
-                        add_interval_to_date32(days as i32, *interval)?
-                    } else {
-                        subtract_interval_from_date32(days as i32, *interval)?
-                    };
-                    return Ok(Some(Some(NumericValue::Int(result_days as i64))));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn evaluate_option_numeric_and(
-        lhs: Option<NumericValue>,
-        rhs: Option<NumericValue>,
-    ) -> Option<NumericValue> {
-        // SQL AND logic with NULLs:
-        // TRUE AND TRUE = TRUE
-        // TRUE AND FALSE = FALSE
-        // TRUE AND NULL = NULL
-        // FALSE AND ... = FALSE
-        // NULL AND FALSE = FALSE
-        // NULL AND NULL = NULL
-
-        let l_truthy = lhs.as_ref().map(|v| Self::truthy_numeric(v.clone()));
-        let r_truthy = rhs.as_ref().map(|v| Self::truthy_numeric(v.clone()));
-
-        match (l_truthy, r_truthy) {
-            (Some(false), _) => Some(NumericValue::Int(0)),
-            (_, Some(false)) => Some(NumericValue::Int(0)),
-            (Some(true), Some(true)) => Some(NumericValue::Int(1)),
-            _ => None,
-        }
-    }
-
-    fn evaluate_option_numeric_or(
-        lhs: Option<NumericValue>,
-        rhs: Option<NumericValue>,
-    ) -> Option<NumericValue> {
-        // SQL OR logic with NULLs:
-        // TRUE OR ... = TRUE
-        // FALSE OR TRUE = TRUE
-        // FALSE OR FALSE = FALSE
-        // FALSE OR NULL = NULL
-        // NULL OR TRUE = TRUE
-        // NULL OR NULL = NULL
-
-        let l_truthy = lhs.as_ref().map(|v| Self::truthy_numeric(v.clone()));
-        let r_truthy = rhs.as_ref().map(|v| Self::truthy_numeric(v.clone()));
-
-        match (l_truthy, r_truthy) {
-            (Some(true), _) => Some(NumericValue::Int(1)),
-            (_, Some(true)) => Some(NumericValue::Int(1)),
-            (Some(false), Some(false)) => Some(NumericValue::Int(0)),
-            _ => None,
-        }
-    }
-
-    fn evaluate_cast_date32_value<F: Hash + Eq + Copy>(
-        expr: &ScalarExpr<F>,
-        idx: usize,
-        arrays: &NumericArrayMap<F>,
-    ) -> LlkvResult<Option<NumericValue>> {
-        let val = Self::evaluate_value(expr, idx, arrays)?;
-        match val {
-            Some(NumericValue::String(s)) => {
-                let days = parse_date32_literal(&s)?;
-                Ok(Some(NumericValue::Int(days as i64)))
-            }
-            Some(NumericValue::Int(i)) => Ok(Some(NumericValue::Int(i))),
-            _ => Err(Error::InvalidArgumentError(
-                "Cannot cast non-string/int to Date32".into(),
-            )),
-        }
-    }
-
-    fn evaluate_cast_date32_batch<F: Hash + Eq + Copy>(
-        expr: &ScalarExpr<F>,
-        len: usize,
-        arrays: &NumericArrayMap<F>,
-    ) -> LlkvResult<ArrayRef> {
-        // Fallback to row-by-row for now
-        let mut builder = arrow::array::Date32Builder::with_capacity(len);
-        for idx in 0..len {
-            let val = Self::evaluate_cast_date32_value(expr, idx, arrays)?;
-            match val {
-                Some(NumericValue::Int(i)) => builder.append_value(i as i32),
-                _ => builder.append_null(),
-            }
-        }
-        Ok(Arc::new(builder.finish()))
-    }
-
-    pub fn kind_for_data_type(dt: &DataType) -> Option<NumericKind> {
-        match dt {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _) => Some(NumericKind::Integer),
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(NumericKind::Float),
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => Some(NumericKind::Decimal),
-            DataType::Utf8 | DataType::LargeUtf8 => Some(NumericKind::String),
-            _ => None,
-        }
-    }
-
-    fn cast_numeric_array_to_kind(
-        array: &NumericArray,
-        target: NumericKind,
-    ) -> LlkvResult<NumericArray> {
-        // TODO: Implement vectorized cast
-        // For now, just rebuild
-        let len = array.len();
-        let mut values = Vec::with_capacity(len);
-        for i in 0..len {
-            let val = array.value(i);
-            values.push(Self::cast_numeric_value_to_kind(val, target)?);
-        }
-        Ok(NumericArray::from_numeric_values(values, target))
-    }
-
-    fn literal_numeric_value<F>(expr: &ScalarExpr<F>) -> Option<NumericValue> {
-        match expr {
-            ScalarExpr::Literal(lit) => match lit {
-                Literal::Integer(i) => Some(NumericValue::Int((*i).try_into().unwrap_or(0))),
-                Literal::Float(f) => Some(NumericValue::Float(*f)),
-                Literal::Decimal(d) => Some(NumericValue::Decimal(*d)),
-                Literal::String(s) => Some(NumericValue::String(s.clone())),
-                Literal::Boolean(b) => Some(NumericValue::Int(if *b { 1 } else { 0 })),
-                Literal::Null => None,
-                Literal::Date32(d) => Some(NumericValue::Int(*d as i64)),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    fn truthy_numeric(val: NumericValue) -> bool {
-        match val {
-            NumericValue::Int(i) => i != 0,
-            NumericValue::UInt(u) => u != 0,
-            NumericValue::Float(f) => f != 0.0,
-            NumericValue::Decimal(d) => d.raw_value() != 0,
-            NumericValue::String(s) => !s.is_empty(),
-        }
-    }
-
-    fn numeric_equals(lhs: NumericValue, rhs: NumericValue) -> bool {
-        match (lhs, rhs) {
-            (NumericValue::Int(a), NumericValue::Int(b)) => a == b,
-            (NumericValue::Float(a), NumericValue::Float(b)) => (a - b).abs() < f64::EPSILON,
-            (NumericValue::Decimal(a), NumericValue::Decimal(b)) => a == b,
-            (NumericValue::String(a), NumericValue::String(b)) => a == b,
-            (NumericValue::Int(a), NumericValue::Float(b)) => (a as f64 - b).abs() < f64::EPSILON,
-            (NumericValue::Float(a), NumericValue::Int(b)) => (a - b as f64).abs() < f64::EPSILON,
-            _ => false,
-        }
-    }
-
-    pub fn compare(op: CompareOp, lhs: NumericValue, rhs: NumericValue) -> bool {
-        match op {
-            CompareOp::Eq => Self::numeric_equals(lhs, rhs),
-            CompareOp::NotEq => !Self::numeric_equals(lhs, rhs),
-            CompareOp::Lt => lhs.to_f64() < rhs.to_f64(),
-            CompareOp::LtEq => lhs.to_f64() <= rhs.to_f64(),
-            CompareOp::Gt => lhs.to_f64() > rhs.to_f64(),
-            CompareOp::GtEq => lhs.to_f64() >= rhs.to_f64(),
         }
     }
 
@@ -1038,222 +669,5 @@ impl ScalarEvaluator {
             scale: lhs.scale / denom,
             offset: lhs.offset / denom,
         })
-    }
-
-    fn apply_binary_literal<F>(
-        op: BinaryOp,
-        lhs: NumericValue,
-        rhs: NumericValue,
-    ) -> Option<ScalarExpr<F>> {
-        match op {
-            BinaryOp::Add => Some(Self::literal_from_numeric(Self::add_values(lhs, rhs))),
-            BinaryOp::Subtract => Some(Self::literal_from_numeric(Self::sub_values(lhs, rhs))),
-            BinaryOp::Multiply => Some(Self::literal_from_numeric(Self::mul_values(lhs, rhs))),
-            BinaryOp::Divide => Self::div_values(lhs, rhs).map(Self::literal_from_numeric),
-            BinaryOp::Modulo => Self::mod_values(lhs, rhs).map(Self::literal_from_numeric),
-            BinaryOp::And => {
-                let truthy = Self::truthy_numeric(lhs) && Self::truthy_numeric(rhs);
-                Some(ScalarExpr::literal(if truthy { 1 } else { 0 }))
-            }
-            BinaryOp::Or => {
-                let truthy = Self::truthy_numeric(lhs) || Self::truthy_numeric(rhs);
-                Some(ScalarExpr::literal(if truthy { 1 } else { 0 }))
-            }
-            BinaryOp::BitwiseShiftLeft => {
-                let lhs_i64 = match lhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let rhs_i64 = match rhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
-                Some(ScalarExpr::literal(result))
-            }
-            BinaryOp::BitwiseShiftRight => {
-                let lhs_i64 = match lhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let rhs_i64 = match rhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
-                Some(ScalarExpr::literal(result))
-            }
-        }
-    }
-
-    fn literal_from_numeric<F>(value: NumericValue) -> ScalarExpr<F> {
-        match value {
-            NumericValue::Int(i) => ScalarExpr::literal(i),
-            NumericValue::UInt(u) => ScalarExpr::literal(u as i128),
-            NumericValue::Float(f) => ScalarExpr::literal(f),
-            NumericValue::Decimal(d) => ScalarExpr::Literal(Literal::Decimal(d)),
-            NumericValue::String(s) => ScalarExpr::Literal(Literal::String(s)),
-        }
-    }
-
-    /// Apply an arithmetic kernel. Returns `None` when the computation results in a null (e.g. divide by zero).
-    pub fn apply_binary(
-        op: BinaryOp,
-        lhs: Option<NumericValue>,
-        rhs: Option<NumericValue>,
-    ) -> Option<NumericValue> {
-        match op {
-            BinaryOp::And => Self::evaluate_option_numeric_and(lhs, rhs),
-            BinaryOp::Or => Self::evaluate_option_numeric_or(lhs, rhs),
-            _ => match (lhs, rhs) {
-                (Some(lv), Some(rv)) => Self::apply_binary_values(op, lv, rv),
-                _ => None,
-            },
-        }
-    }
-
-    fn apply_binary_values(
-        op: BinaryOp,
-        lhs: NumericValue,
-        rhs: NumericValue,
-    ) -> Option<NumericValue> {
-        match op {
-            BinaryOp::Add => Some(Self::add_values(lhs, rhs)),
-            BinaryOp::Subtract => Some(Self::sub_values(lhs, rhs)),
-            BinaryOp::Multiply => Some(Self::mul_values(lhs, rhs)),
-            BinaryOp::Divide => Self::div_values(lhs, rhs),
-            BinaryOp::Modulo => Self::mod_values(lhs, rhs),
-            BinaryOp::And => Some(NumericValue::Int(
-                if Self::truthy_numeric(lhs) && Self::truthy_numeric(rhs) {
-                    1
-                } else {
-                    0
-                },
-            )),
-            BinaryOp::Or => Some(NumericValue::Int(
-                if Self::truthy_numeric(lhs) || Self::truthy_numeric(rhs) {
-                    1
-                } else {
-                    0
-                },
-            )),
-            BinaryOp::BitwiseShiftLeft => {
-                let lhs_i64 = match lhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let rhs_i64 = match rhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let result = lhs_i64.wrapping_shl(rhs_i64 as u32);
-                Some(NumericValue::Int(result))
-            }
-            BinaryOp::BitwiseShiftRight => {
-                let lhs_i64 = match lhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let rhs_i64 = match rhs {
-                    NumericValue::Int(i) => i,
-                    NumericValue::UInt(u) => u as i64,
-                    NumericValue::Float(f) => f as i64,
-                    NumericValue::Decimal(d) => d.to_f64() as i64,
-                    NumericValue::String(_) => return None,
-                };
-                let result = lhs_i64.wrapping_shr(rhs_i64 as u32);
-                Some(NumericValue::Int(result))
-            }
-        }
-    }
-
-    fn add_values(lhs: NumericValue, rhs: NumericValue) -> NumericValue {
-        lhs.add(&rhs).unwrap_or_else(|_| {
-            // Fallback to float on error (e.g. overflow)
-            NumericValue::Float(lhs.as_f64() + rhs.as_f64())
-        })
-    }
-
-    fn sub_values(lhs: NumericValue, rhs: NumericValue) -> NumericValue {
-        lhs.sub(&rhs)
-            .unwrap_or_else(|_| NumericValue::Float(lhs.as_f64() - rhs.as_f64()))
-    }
-
-    fn mul_values(lhs: NumericValue, rhs: NumericValue) -> NumericValue {
-        lhs.mul(&rhs)
-            .unwrap_or_else(|_| NumericValue::Float(lhs.as_f64() * rhs.as_f64()))
-    }
-
-    fn div_values(lhs: NumericValue, rhs: NumericValue) -> Option<NumericValue> {
-        lhs.div(&rhs).ok()
-    }
-
-    fn mod_values(lhs: NumericValue, rhs: NumericValue) -> Option<NumericValue> {
-        lhs.rem(&rhs).ok()
-    }
-
-    fn cast_numeric_value_to_kind(
-        value: Option<NumericValue>,
-        target: NumericKind,
-    ) -> LlkvResult<Option<NumericValue>> {
-        match value {
-            None => Ok(None),
-            Some(NumericValue::Int(v)) => Ok(Some(match target {
-                NumericKind::Integer => NumericValue::Int(v),
-                NumericKind::UnsignedInteger => NumericValue::UInt(v as u64),
-                NumericKind::Float => NumericValue::Float(v as f64),
-                NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(v)),
-                NumericKind::String => NumericValue::String(v.to_string()),
-            })),
-            Some(NumericValue::UInt(v)) => Ok(Some(match target {
-                NumericKind::Integer => NumericValue::Int(v as i64),
-                NumericKind::UnsignedInteger => NumericValue::UInt(v),
-                NumericKind::Float => NumericValue::Float(v as f64),
-                NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(v as i64)),
-                NumericKind::String => NumericValue::String(v.to_string()),
-            })),
-            Some(NumericValue::Float(v)) => Ok(Some(match target {
-                NumericKind::Integer => NumericValue::Int(v as i64),
-                NumericKind::UnsignedInteger => NumericValue::UInt(v as u64),
-                NumericKind::Float => NumericValue::Float(v),
-                NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(v as i64)),
-                NumericKind::String => NumericValue::String(v.to_string()),
-            })),
-            Some(NumericValue::Decimal(v)) => Ok(Some(match target {
-                NumericKind::Integer => NumericValue::Int(v.to_f64() as i64),
-                NumericKind::UnsignedInteger => NumericValue::UInt(v.to_f64() as u64),
-                NumericKind::Float => NumericValue::Float(v.to_f64()),
-                NumericKind::Decimal => NumericValue::Decimal(v),
-                NumericKind::String => NumericValue::String(v.to_string()),
-            })),
-            Some(NumericValue::String(v)) => Ok(Some(match target {
-                NumericKind::Integer => NumericValue::Int(v.parse().unwrap_or(0)),
-                NumericKind::UnsignedInteger => NumericValue::UInt(v.parse().unwrap_or(0)),
-                NumericKind::Float => NumericValue::Float(v.parse().unwrap_or(0.0)),
-                NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(0)),
-                NumericKind::String => NumericValue::String(v),
-            })),
-        }
     }
 }

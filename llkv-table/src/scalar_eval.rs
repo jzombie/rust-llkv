@@ -13,10 +13,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::types::FieldId;
 
 // Re-export types used by consumers of this module
+pub use llkv_compute::compute_binary;
 pub use llkv_compute::eval::{AffineExpr, ScalarEvaluator};
-pub use llkv_compute::{
-    NumericArray, NumericKind, NumericValue, compute_binary, compute_binary_scalar,
-};
 
 pub type NumericArrayMap = llkv_compute::eval::NumericArrayMap<FieldId>;
 
@@ -35,7 +33,7 @@ impl NumericKernels {
         expr: &ScalarExpr<FieldId>,
         idx: usize,
         arrays: &NumericArrayMap,
-    ) -> LlkvResult<Option<NumericValue>> {
+    ) -> LlkvResult<ArrayRef> {
         ScalarEvaluator::evaluate_value(expr, idx, arrays)
     }
 
@@ -72,45 +70,14 @@ impl NumericKernels {
         ScalarEvaluator::extract_affine(expr)
     }
 
-    /// Infer the numeric kind of an expression using only the kinds of its referenced columns.
-    pub fn infer_result_kind_from_types<F>(
+    /// Infer the result type of an expression using the types of its referenced columns.
+    pub fn infer_result_type<F>(
         expr: &ScalarExpr<FieldId>,
-        resolve_kind: &mut F,
-    ) -> Option<NumericKind>
+        resolve_type: &mut F,
+    ) -> Option<DataType>
     where
-        F: FnMut(FieldId) -> Option<NumericKind>,
+        F: FnMut(FieldId) -> Option<DataType>,
     {
-        ScalarEvaluator::infer_result_kind_from_types(expr, resolve_kind)
-    }
-
-    /// Map an Arrow `DataType` to the corresponding numeric kind when supported.
-    pub fn kind_for_data_type(dtype: &DataType) -> Option<NumericKind> {
-        ScalarEvaluator::kind_for_data_type(dtype)
-    }
-
-    /// Compare two numeric values using the provided operator.
-    pub fn compare(op: CompareOp, lhs: NumericValue, rhs: NumericValue) -> bool {
-        ScalarEvaluator::compare(op, lhs, rhs)
-    }
-
-    /// Ensure each referenced column is materialized as a `NumericArray`, casting as needed.
-    pub fn prepare_numeric_arrays(
-        lfids: &[LogicalFieldId],
-        arrays: &[ArrayRef],
-        needed_fields: &FxHashSet<FieldId>,
-    ) -> LlkvResult<NumericArrayMap> {
-        let mut out: NumericArrayMap = FxHashMap::default();
-        if needed_fields.is_empty() {
-            return Ok(out);
-        }
-        for (lfid, array) in lfids.iter().zip(arrays.iter()) {
-            let fid = lfid.field_id();
-            if !needed_fields.contains(&fid) {
-                continue;
-            }
-            let numeric = NumericArray::try_from_arrow(array)?;
-            out.insert(fid, numeric);
-        }
-        Ok(out)
+        ScalarEvaluator::infer_result_type(expr, resolve_type)
     }
 }

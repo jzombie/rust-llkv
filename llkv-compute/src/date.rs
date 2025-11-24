@@ -164,3 +164,16 @@ fn month_from_number(raw: u8) -> Result<Month> {
     }
     Ok(Month::January.nth_next(raw - 1))
 }
+
+/// Format an Arrow `Date32` day count into `YYYY-MM-DD` text.
+pub fn format_date32_literal(days: i32) -> Result<String> {
+    let julian = epoch_julian_day()
+        .checked_add(days)
+        .ok_or_else(|| Error::InvalidArgumentError("date literal out of range".into()))?;
+
+    let date = Date::from_julian_day(julian)
+        .map_err(|err| Error::InvalidArgumentError(format!("invalid DATE value: {err}")))?;
+    let (year, month, day) = date.to_calendar_date();
+    let month_number = month as u8;
+    Ok(format!("{:04}-{:02}-{:02}", year, month_number, day))
+}

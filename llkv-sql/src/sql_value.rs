@@ -2,7 +2,7 @@ use crate::{
     SqlResult, interval::parse_interval_literal, sql_engine::placeholder_marker,
     sql_engine::register_placeholder,
 };
-use llkv_executor::utils::parse_date32_literal;
+use llkv_compute::date::parse_date32_literal;
 use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::IntervalValue;
 use llkv_plan::plans::PlanValue;

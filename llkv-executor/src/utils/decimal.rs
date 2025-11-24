@@ -42,7 +42,7 @@ pub fn align_decimal_to_scale(
     precision: u8,
     scale: i8,
 ) -> Result<DecimalValue, DecimalError> {
-    let rescaled = llkv_compute::scalar::decimal::rescale_with_rounding(value, scale)?;
+    let rescaled = value.rescale_with_rounding(scale)?;
     if rescaled.precision() > precision {
         return Err(DecimalError::PrecisionOverflow {
             value: rescaled.raw_value(),

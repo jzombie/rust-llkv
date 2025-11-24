@@ -56,9 +56,8 @@ use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::reserved::is_information_schema_table;
-use crate::scalar_eval::{
-    NumericArray, NumericArrayMap, NumericKernels, NumericKind, NumericValue,
-};
+use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+
 use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
@@ -1177,34 +1176,22 @@ where
                             | ScalarExpr::Coalesce(_) => {
                                 let mut resolver = |fid: FieldId| {
                                     let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                                    lfid_dtypes
-                                        .get(&lfid)
-                                        .and_then(NumericKernels::kind_for_data_type)
+                                    lfid_dtypes.get(&lfid).cloned()
                                 };
 
-                                let inferred_kind = NumericKernels::infer_result_kind_from_types(
-                                    &info.expr,
-                                    &mut resolver,
-                                );
+                                let inferred_type =
+                                    NumericKernels::infer_result_type(&info.expr, &mut resolver);
 
-                                let result_kind = if let Some(kind) = inferred_kind {
-                                    kind
+                                if let Some(dtype) = inferred_type {
+                                    dtype
                                 } else if computed_expr_prefers_float(
                                     &info.expr,
                                     self.table.table_id(),
                                     &lfid_dtypes,
                                 )? {
-                                    NumericKind::Float
+                                    DataType::Float64
                                 } else {
-                                    NumericKind::Integer
-                                };
-
-                                match result_kind {
-                                    NumericKind::Integer => DataType::Int64,
-                                    NumericKind::UnsignedInteger => DataType::UInt64,
-                                    NumericKind::Float => DataType::Float64,
-                                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
-                                    NumericKind::String => DataType::Utf8,
+                                    DataType::Int64
                                 }
                             }
                             ScalarExpr::Column(fid) => {
@@ -1463,26 +1450,15 @@ where
                 let field_alias = alias.clone();
                 let dtype = self.table.store().data_type(lfid)?;
 
-                let column_kind =
-                    NumericKernels::kind_for_data_type(&dtype).unwrap_or(NumericKind::Float);
                 let mut resolver = |fid: FieldId| {
                     if fid == field_id {
-                        Some(column_kind)
+                        Some(dtype.clone())
                     } else {
                         None
                     }
                 };
-                let result_kind =
-                    NumericKernels::infer_result_kind_from_types(&simplified, &mut resolver)
-                        .unwrap_or(NumericKind::Float);
-
-                let output_dtype = match result_kind {
-                    NumericKind::Integer => DataType::Int64,
-                    NumericKind::UnsignedInteger => DataType::UInt64,
-                    NumericKind::Float => DataType::Float64,
-                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
-                    NumericKind::String => DataType::Utf8,
-                };
+                let output_dtype = NumericKernels::infer_result_type(&simplified, &mut resolver)
+                    .unwrap_or(DataType::Float64);
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
                     if passthrough_fid != field_id {
@@ -1512,7 +1488,10 @@ where
                     if !is_supported_numeric(&dtype) {
                         return Ok(StreamOutcome::Fallback);
                     }
-                    if matches!(result_kind, NumericKind::Float) {
+                    if matches!(
+                        output_dtype,
+                        DataType::Float16 | DataType::Float32 | DataType::Float64
+                    ) {
                         let schema = Arc::new(Schema::new(vec![Field::new(
                             field_alias.clone(),
                             output_dtype.clone(),
@@ -1667,15 +1646,13 @@ where
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
                 (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
                 (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
-                (Literal::Decimal(l), Literal::Decimal(r)) => {
-                    llkv_compute::scalar::decimal::compare(*l, *r).ok()
+                (Literal::Decimal(l), Literal::Decimal(r)) => Some(l.cmp(r)),
+                (Literal::Decimal(l), Literal::Integer(r)) => {
+                    DecimalValue::new(*r, 0).ok().map(|int| l.cmp(&int))
                 }
-                (Literal::Decimal(l), Literal::Integer(r)) => DecimalValue::new(*r, 0)
-                    .ok()
-                    .and_then(|int| llkv_compute::scalar::decimal::compare(*l, int).ok()),
-                (Literal::Integer(l), Literal::Decimal(r)) => DecimalValue::new(*l, 0)
-                    .ok()
-                    .and_then(|int| llkv_compute::scalar::decimal::compare(int, *r).ok()),
+                (Literal::Integer(l), Literal::Decimal(r)) => {
+                    DecimalValue::new(*l, 0).ok().map(|int| int.cmp(r))
+                }
                 (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
                 (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
@@ -1810,24 +1787,26 @@ where
         all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
     ) -> LlkvResult<(Vec<RowId>, Vec<RowId>)> {
         let arrays: NumericArrayMap = FxHashMap::default();
-        let target = NumericKernels::evaluate_value(expr, 0, &arrays)?;
+        let target_array = NumericKernels::evaluate_value(expr, 0, &arrays)?;
 
-        let Some(target_val) = target else {
+        if target_array.is_null(0) {
             return Ok((Vec::new(), Vec::new()));
-        };
+        }
 
         let mut matched = false;
         let mut saw_null = false;
         for value_expr in list {
-            let value = NumericKernels::evaluate_value(value_expr, 0, &arrays)?;
-            match value {
-                Some(v) => {
-                    if NumericKernels::compare(CompareOp::Eq, v, target_val.clone()) {
-                        matched = true;
-                        break;
-                    }
+            let value_array = NumericKernels::evaluate_value(value_expr, 0, &arrays)?;
+            if value_array.is_null(0) {
+                saw_null = true;
+            } else {
+                let cmp_array =
+                    llkv_compute::compute_compare(&value_array, CompareOp::Eq, &target_array)?;
+                let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                if cmp.value(0) {
+                    matched = true;
+                    break;
                 }
-                None => saw_null = true,
             }
         }
 
@@ -1862,7 +1841,7 @@ where
     ) -> LlkvResult<bool> {
         let arrays: NumericArrayMap = FxHashMap::default();
         let value = NumericKernels::evaluate_value(expr, 0, &arrays)?;
-        let is_null = value.is_none();
+        let is_null = value.is_null(0);
         Ok(if negated { !is_null } else { is_null })
     }
 
@@ -1938,41 +1917,46 @@ where
                 return Ok(());
             }
 
-            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
-                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
-            } else {
-                NumericKernels::prepare_numeric_arrays(
-                    &logical_fields_for_arrays,
-                    columns,
-                    numeric_fields_arc.as_ref(),
-                )?
-            };
+            let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+            if !columns.is_empty() {
+                for (lfid, array) in logical_fields_for_arrays.iter().zip(columns.iter()) {
+                    let fid = lfid.field_id();
+                    if numeric_fields_arc.contains(&fid) {
+                        numeric_arrays.insert(fid, array.clone());
+                    }
+                }
+            }
 
             if has_row_id {
-                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::new_float(Arc::new(array)));
+                let rid_values: Vec<i64> = window.iter().map(|rid| *rid as i64).collect();
+                let array = Int64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
-                let target = NumericKernels::evaluate_value(expr, offset, &numeric_arrays)?;
-                let Some(target_val) = target else {
+                let target_array = NumericKernels::evaluate_value(expr, offset, &numeric_arrays)?;
+                if target_array.is_null(0) {
                     continue;
-                };
+                }
 
                 let mut matched = false;
                 let mut saw_null = false;
                 for value_expr in list {
-                    let value =
+                    let value_array =
                         NumericKernels::evaluate_value(value_expr, offset, &numeric_arrays)?;
-                    match value {
-                        Some(v) => {
-                            if NumericKernels::compare(CompareOp::Eq, v, target_val.clone()) {
-                                matched = true;
-                                break;
-                            }
+                    if value_array.is_null(0) {
+                        saw_null = true;
+                    } else {
+                        let cmp_array = llkv_compute::compute_compare(
+                            &value_array,
+                            CompareOp::Eq,
+                            &target_array,
+                        )?;
+                        let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        if cmp.value(0) {
+                            matched = true;
+                            break;
                         }
-                        None => saw_null = true,
                     }
                 }
 
@@ -2186,25 +2170,25 @@ where
                 return Ok(());
             }
 
-            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
-                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
-            } else {
-                NumericKernels::prepare_numeric_arrays(
-                    &logical_fields_for_arrays,
-                    columns,
-                    numeric_fields_arc.as_ref(),
-                )?
-            };
+            let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+            if !columns.is_empty() {
+                for (lfid, array) in logical_fields_for_arrays.iter().zip(columns.iter()) {
+                    let fid = lfid.field_id();
+                    if numeric_fields_arc.contains(&fid) {
+                        numeric_arrays.insert(fid, array.clone());
+                    }
+                }
+            }
 
             if has_row_id {
-                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::new_float(Arc::new(array)));
+                let rid_values: Vec<i64> = window.iter().map(|rid| *rid as i64).collect();
+                let array = Int64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
                 let value = NumericKernels::evaluate_value(expr, offset, &numeric_arrays)?;
-                let is_null = value.is_none();
+                let is_null = value.is_null(0);
                 let matches = if negated { !is_null } else { is_null };
                 if matches {
                     matched_rows.push(row_id);
@@ -2257,10 +2241,14 @@ where
             left,
             right,
             |row_id, left_val, right_val| {
-                if let (Some(lv), Some(rv)) = (left_val, right_val)
-                    && NumericKernels::compare(op, lv, rv)
-                {
-                    result.push(row_id);
+                if !left_val.is_null(0) && !right_val.is_null(0) {
+                    if let Ok(cmp_array) = llkv_compute::compute_compare(&left_val, op, &right_val)
+                    {
+                        let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        if cmp.value(0) {
+                            result.push(row_id);
+                        }
+                    }
                 }
             },
         )?;
@@ -2277,7 +2265,7 @@ where
         mut on_row: F,
     ) -> LlkvResult<()>
     where
-        F: FnMut(RowId, Option<NumericValue>, Option<NumericValue>),
+        F: FnMut(RowId, ArrayRef, ArrayRef),
     {
         if row_ids.is_empty() {
             return Ok(());
@@ -2341,20 +2329,20 @@ where
                 return Ok(());
             }
 
-            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
-                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
-            } else {
-                NumericKernels::prepare_numeric_arrays(
-                    &logical_fields_for_arrays,
-                    columns,
-                    numeric_fields_arc.as_ref(),
-                )?
-            };
+            let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+            if !columns.is_empty() {
+                for (lfid, array) in logical_fields_for_arrays.iter().zip(columns.iter()) {
+                    let fid = lfid.field_id();
+                    if numeric_fields_arc.contains(&fid) {
+                        numeric_arrays.insert(fid, array.clone());
+                    }
+                }
+            }
 
             if has_row_id {
-                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::new_float(Arc::new(array)));
+                let rid_values: Vec<i64> = window.iter().map(|rid| *rid as i64).collect();
+                let array = Int64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
@@ -2757,7 +2745,7 @@ where
             left,
             right,
             |row_id, left_val, right_val| {
-                if left_val.is_some() && right_val.is_some() {
+                if !left_val.is_null(0) && !right_val.is_null(0) {
                     usable_rows.push(row_id);
                 }
             },
@@ -3332,8 +3320,8 @@ fn computed_expr_prefers_float(
                 .get(&lfid)
                 .ok_or_else(|| Error::Internal("missing dtype for computed column".into()))?;
             Ok(matches!(
-                NumericKernels::kind_for_data_type(dtype),
-                Some(NumericKind::Float)
+                dtype,
+                DataType::Float16 | DataType::Float32 | DataType::Float64
             ))
         }
         ScalarExpr::Binary { left, right, .. } => {
@@ -3347,18 +3335,22 @@ fn computed_expr_prefers_float(
         ScalarExpr::GetField { base, field_name } => {
             let dtype = get_field_dtype(base.as_ref(), field_name, table_id, lfid_dtypes)?;
             Ok(matches!(
-                NumericKernels::kind_for_data_type(&dtype),
-                Some(NumericKind::Float)
+                dtype,
+                DataType::Float16 | DataType::Float32 | DataType::Float64
             ))
         }
         ScalarExpr::Cast { expr, data_type } => {
-            if let Some(kind) = NumericKernels::kind_for_data_type(data_type) {
-                Ok(matches!(kind, NumericKind::Float))
+            if matches!(
+                data_type,
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) {
+                Ok(true)
             } else {
                 computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)
             }
         }
         ScalarExpr::Not(expr) => computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes),
+
         ScalarExpr::IsNull { expr, .. } => {
             let _ = computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)?;
             Ok(false)
@@ -4303,16 +4295,10 @@ where
             return;
         }
 
-        let lfids = [self.lfid];
-        let arrays = vec![array.clone()];
-        let numeric_arrays =
-            match NumericKernels::prepare_numeric_arrays(&lfids, &arrays, &self.numeric_fields) {
-                Ok(map) => map,
-                Err(err) => {
-                    self.error = Some(err);
-                    return;
-                }
-            };
+        let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+        if self.numeric_fields.contains(&self.lfid.field_id()) {
+            numeric_arrays.insert(self.lfid.field_id(), array.clone());
+        }
 
         let len = array.len();
         let evaluated = match NumericKernels::evaluate_batch(&self.expr, len, &numeric_arrays) {
@@ -4736,11 +4722,7 @@ where
     let mut gathered_batch: Option<RecordBatch> = None;
     let (batch_len, numeric_arrays) = if unique_lfids.is_empty() {
         let numeric_arrays = if requires_numeric {
-            Some(NumericKernels::prepare_numeric_arrays(
-                &[],
-                &[],
-                numeric_fields,
-            )?)
+            Some(FxHashMap::default())
         } else {
             None
         };
@@ -4760,11 +4742,14 @@ where
         }
         let batch_len = batch.num_rows();
         let numeric_arrays = if requires_numeric {
-            Some(NumericKernels::prepare_numeric_arrays(
-                unique_lfids,
-                batch.columns(),
-                numeric_fields,
-            )?)
+            let mut map: NumericArrayMap = FxHashMap::default();
+            for (lfid, array) in unique_lfids.iter().zip(batch.columns().iter()) {
+                let fid = lfid.field_id();
+                if numeric_fields.contains(&fid) {
+                    map.insert(fid, array.clone());
+                }
+            }
+            Some(map)
         } else {
             None
         };
@@ -5152,6 +5137,127 @@ fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
     row_ids
 }
 
+fn array_value_to_literal(array: &ArrayRef, index: usize) -> LlkvResult<Literal> {
+    use arrow::datatypes::*;
+    if array.is_null(index) {
+        return Ok(Literal::Null);
+    }
+    match array.data_type() {
+        DataType::Int8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::Int16 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int16Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::UInt8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt8Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::UInt16 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt16Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::UInt32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::UInt64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
+            Ok(Literal::Integer(arr.value(index) as i128))
+        }
+        DataType::Float32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .unwrap();
+            Ok(Literal::Float(arr.value(index) as f64))
+        }
+        DataType::Float64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            Ok(Literal::Float(arr.value(index)))
+        }
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            Ok(Literal::String(arr.value(index).to_string()))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .unwrap();
+            Ok(Literal::String(arr.value(index).to_string()))
+        }
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap();
+            Ok(Literal::Boolean(arr.value(index)))
+        }
+        DataType::Date32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Date32Array>()
+                .unwrap();
+            Ok(Literal::Date32(arr.value(index)))
+        }
+        DataType::Decimal128(_, scale) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Decimal128Array>()
+                .unwrap();
+            let val = arr.value(index);
+            Ok(Literal::Decimal(
+                DecimalValue::new(val, *scale as i8).unwrap(),
+            ))
+        }
+        _ => Err(Error::Internal(format!(
+            "Unsupported type for literal conversion: {:?}",
+            array.data_type()
+        ))),
+    }
+}
+
 fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
     let simplified = NumericKernels::simplify(expr);
 
@@ -5164,14 +5270,11 @@ fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Opti
     }
 
     let arrays = NumericArrayMap::default();
-    match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
-        Some(NumericValue::Int(v)) => Ok(Some(Literal::Integer(v as i128))),
-        Some(NumericValue::UInt(v)) => Ok(Some(Literal::Integer(v as i128))),
-        Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
-        Some(NumericValue::Decimal(d)) => Ok(Some(Literal::Decimal(d))),
-        Some(NumericValue::String(s)) => Ok(Some(Literal::String(s))),
-        None => Ok(None),
+    let array = NumericKernels::evaluate_value(&simplified, 0, &arrays)?;
+    if array.is_null(0) {
+        return Ok(None);
     }
+    Ok(Some(array_value_to_literal(&array, 0)?))
 }
 
 fn evaluate_constant_literal_non_numeric(

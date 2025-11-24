@@ -162,6 +162,34 @@ impl FromStr for DecimalValue {
     }
 }
 
+impl PartialOrd for DecimalValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DecimalValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.scale == other.scale {
+            return self.value.cmp(&other.value);
+        }
+
+        let max_scale = std::cmp::max(self.scale, other.scale);
+        let scale_diff_self = (max_scale - self.scale) as u32;
+        let scale_diff_other = (max_scale - other.scale) as u32;
+
+        let l_i256 = i256::from_i128(self.value);
+        let r_i256 = i256::from_i128(other.value);
+
+        // Use wrapping_pow/mul because i256 handles the overflow of i128 range
+        // and we are just comparing.
+        let l_scaled = l_i256.wrapping_mul(POW10_BASE.wrapping_pow(scale_diff_self));
+        let r_scaled = r_i256.wrapping_mul(POW10_BASE.wrapping_pow(scale_diff_other));
+
+        l_scaled.cmp(&r_scaled)
+    }
+}
+
 fn digit_count_i256(mut value: i256) -> u8 {
     if value == i256::ZERO {
         return 1;

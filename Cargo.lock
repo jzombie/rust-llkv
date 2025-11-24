@@ -1731,6 +1731,7 @@ version = "0.8.2-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
+ "llkv-compute",
  "llkv-executor",
  "llkv-expr",
  "llkv-plan",
@@ -1775,6 +1776,7 @@ version = "0.8.2-alpha"
 dependencies = [
  "arrow",
  "llkv-column-map",
+ "llkv-compute",
  "llkv-executor",
  "llkv-expr",
  "llkv-plan",
