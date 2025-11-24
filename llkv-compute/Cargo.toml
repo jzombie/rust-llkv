@@ -13,6 +13,9 @@ arrow = { workspace = true }
 arrow-buffer = { workspace = true }
 llkv-result = { workspace = true }
 llkv-expr = { workspace = true }
+time = { workspace = true }
+rand = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }

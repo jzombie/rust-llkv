@@ -15,6 +15,7 @@ readme = "README.md"
 arrow = { workspace = true, default-features = false }
 llkv-expr.workspace = true
 llkv-result.workspace = true
+llkv-compute.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlparser.workspace = true

@@ -13,7 +13,8 @@ use sqlparser::ast::{
     TypedString, UnaryOperator, Value, ValueWithSpan,
 };
 
-use crate::{PlanValue, date::parse_date32_literal, interval::parse_interval_literal};
+use crate::{PlanValue, interval::parse_interval_literal};
+use llkv_compute::date::parse_date32_literal;
 
 /// Convert a SQL expression to a PlanValue literal.
 ///

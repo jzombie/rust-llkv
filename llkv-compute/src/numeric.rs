@@ -47,10 +47,11 @@ impl NumericValue {
         }
         match (self, other) {
             (NumericValue::Int(a), NumericValue::Int(b)) => {
-                // Check for overflow?
-                a.checked_add(*b)
-                    .map(NumericValue::Int)
-                    .ok_or_else(|| Error::Internal("Integer overflow in sum".to_string()))
+                // Check for overflow
+                match a.checked_add(*b) {
+                    Some(val) => Ok(NumericValue::Int(val)),
+                    None => Ok(NumericValue::Float(*a as f64 + *b as f64)),
+                }
             }
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a + b)),
             (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
@@ -81,10 +82,10 @@ impl NumericValue {
             return Err(Error::Internal("Cannot subtract string values".to_string()));
         }
         match (self, other) {
-            (NumericValue::Int(a), NumericValue::Int(b)) => a
-                .checked_sub(*b)
-                .map(NumericValue::Int)
-                .ok_or_else(|| Error::Internal("Integer overflow in sub".to_string())),
+            (NumericValue::Int(a), NumericValue::Int(b)) => match a.checked_sub(*b) {
+                Some(val) => Ok(NumericValue::Int(val)),
+                None => Ok(NumericValue::Float(*a as f64 - *b as f64)),
+            },
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a - b)),
             (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
                 crate::scalar::decimal::sub(*a, *b)
@@ -112,10 +113,10 @@ impl NumericValue {
             return Err(Error::Internal("Cannot multiply string values".to_string()));
         }
         match (self, other) {
-            (NumericValue::Int(a), NumericValue::Int(b)) => a
-                .checked_mul(*b)
-                .map(NumericValue::Int)
-                .ok_or_else(|| Error::Internal("Integer overflow in mul".to_string())),
+            (NumericValue::Int(a), NumericValue::Int(b)) => match a.checked_mul(*b) {
+                Some(val) => Ok(NumericValue::Int(val)),
+                None => Ok(NumericValue::Float(*a as f64 * *b as f64)),
+            },
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a * b)),
             (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
                 crate::scalar::decimal::mul(*a, *b)
@@ -147,7 +148,7 @@ impl NumericValue {
                 if *b == 0 {
                     return Err(Error::Internal("Division by zero".to_string()));
                 }
-                Ok(NumericValue::Int(a / b))
+                Ok(NumericValue::Float(*a as f64 / *b as f64))
             }
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a / b)),
             // For Decimal division, we need a target scale.

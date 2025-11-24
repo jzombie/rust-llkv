@@ -4,8 +4,8 @@ use arrow::datatypes::DataType;
 use llkv_expr::expr::BinaryOp;
 use llkv_result::Error;
 
-use crate::NumericKind;
 use crate::array::NumericArray;
+use crate::{NumericKind, NumericValue};
 
 pub fn compute_binary(
     lhs: &NumericArray,
@@ -13,15 +13,21 @@ pub fn compute_binary(
     op: BinaryOp,
 ) -> Result<NumericArray, Error> {
     // Determine result type
-    let result_kind = match (lhs.kind(), rhs.kind()) {
-        (NumericKind::Float, _) | (_, NumericKind::Float) => NumericKind::Float,
-        (NumericKind::Decimal, _) | (_, NumericKind::Decimal) => NumericKind::Decimal,
-        (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
-        (NumericKind::String, _) | (_, NumericKind::String) => {
-            return Err(Error::Internal(
-                "Cannot perform binary arithmetic on string arrays".to_string(),
-            ));
-        }
+    let result_kind = match op {
+        BinaryOp::Divide => match (lhs.kind(), rhs.kind()) {
+            (NumericKind::Decimal, _) | (_, NumericKind::Decimal) => NumericKind::Decimal,
+            _ => NumericKind::Float,
+        },
+        _ => match (lhs.kind(), rhs.kind()) {
+            (NumericKind::Float, _) | (_, NumericKind::Float) => NumericKind::Float,
+            (NumericKind::Decimal, _) | (_, NumericKind::Decimal) => NumericKind::Decimal,
+            (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
+            (NumericKind::String, _) | (_, NumericKind::String) => {
+                return Err(Error::Internal(
+                    "Cannot perform binary arithmetic on string arrays".to_string(),
+                ));
+            }
+        },
     };
 
     // Cast inputs to result type (or compatible type)
@@ -119,6 +125,30 @@ pub fn compute_binary(
     };
 
     NumericArray::try_from_arrow(&result_arr)
+}
+
+pub fn compute_binary_scalar(
+    array: &NumericArray,
+    scalar: Option<NumericValue>,
+    op: BinaryOp,
+    array_is_left: bool,
+) -> Result<NumericArray, Error> {
+    let len = array.len();
+    let scalar_values = vec![scalar.clone(); len];
+
+    // Infer preferred kind from scalar
+    let scalar_kind = scalar
+        .as_ref()
+        .map(|v| v.kind())
+        .unwrap_or(NumericKind::Integer);
+
+    let scalar_array = NumericArray::from_numeric_values(scalar_values, scalar_kind);
+
+    if array_is_left {
+        compute_binary(array, &scalar_array, op)
+    } else {
+        compute_binary(&scalar_array, array, op)
+    }
 }
 
 fn cast_to_common_type(
