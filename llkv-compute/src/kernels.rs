@@ -1,4 +1,4 @@
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, Scalar, make_array};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, Scalar, UInt64Array, make_array};
 use arrow::compute::{cast, kernels::cmp, kernels::numeric, nullif};
 use arrow::datatypes::DataType;
 use llkv_expr::expr::BinaryOp;
@@ -22,6 +22,11 @@ pub fn compute_binary(
             (NumericKind::Float, _) | (_, NumericKind::Float) => NumericKind::Float,
             (NumericKind::Decimal, _) | (_, NumericKind::Decimal) => NumericKind::Decimal,
             (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
+            (NumericKind::UnsignedInteger, NumericKind::UnsignedInteger) => {
+                NumericKind::UnsignedInteger
+            }
+            (NumericKind::Integer, NumericKind::UnsignedInteger)
+            | (NumericKind::UnsignedInteger, NumericKind::Integer) => NumericKind::Float,
             (NumericKind::String, _) | (_, NumericKind::String) => {
                 return Err(Error::Internal(
                     "Cannot perform binary arithmetic on string arrays".to_string(),
@@ -98,6 +103,10 @@ pub fn compute_binary(
                     let zero_scalar = Scalar::new(Int64Array::from(vec![0]));
                     cmp::eq(&rhs_arr, &zero_scalar)?
                 }
+                NumericKind::UnsignedInteger => {
+                    let zero_scalar = Scalar::new(UInt64Array::from(vec![0]));
+                    cmp::eq(&rhs_arr, &zero_scalar)?
+                }
                 NumericKind::Float => {
                     let zero_scalar = Scalar::new(Float64Array::from(vec![0.0]));
                     cmp::eq(&rhs_arr, &zero_scalar)?
@@ -159,6 +168,10 @@ fn cast_to_common_type(
     match target_kind {
         NumericKind::Integer => {
             // Both should be Integer
+            Ok((lhs.to_array_ref(), rhs.to_array_ref()))
+        }
+        NumericKind::UnsignedInteger => {
+            // Both should be UnsignedInteger
             Ok((lhs.to_array_ref(), rhs.to_array_ref()))
         }
         NumericKind::Float => {

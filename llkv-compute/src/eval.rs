@@ -35,6 +35,13 @@ impl VectorizedExpr {
                     (NumericKind::Integer, NumericKind::Float) => NumericKind::Float,
                     (NumericKind::Integer, NumericKind::Decimal) => NumericKind::Decimal,
                     (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
+                    (NumericKind::UnsignedInteger, NumericKind::Float) => NumericKind::Float,
+                    (NumericKind::UnsignedInteger, NumericKind::Decimal) => NumericKind::Decimal,
+                    (NumericKind::UnsignedInteger, NumericKind::UnsignedInteger) => {
+                        NumericKind::UnsignedInteger
+                    }
+                    (NumericKind::UnsignedInteger, NumericKind::Integer) => NumericKind::Float,
+                    (NumericKind::Integer, NumericKind::UnsignedInteger) => NumericKind::Float,
                 };
                 let values = vec![Some(value); len];
                 let array = NumericArray::from_numeric_values(values, target_kind);
@@ -300,12 +307,14 @@ impl ScalarEvaluator {
     ) -> NumericKind {
         let lhs_value = match lhs_kind {
             NumericKind::Integer => NumericValue::Int(1),
+            NumericKind::UnsignedInteger => NumericValue::UInt(1),
             NumericKind::Float => NumericValue::Float(1.0),
             NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(1)),
             NumericKind::String => NumericValue::String("".to_string()),
         };
         let rhs_value = match rhs_kind {
             NumericKind::Integer => NumericValue::Int(1),
+            NumericKind::UnsignedInteger => NumericValue::UInt(1),
             NumericKind::Float => NumericValue::Float(1.0),
             NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(1)),
             NumericKind::String => NumericValue::String("".to_string()),
@@ -665,6 +674,11 @@ impl ScalarEvaluator {
                     (NumericKind::Float, _) | (_, NumericKind::Float) => NumericKind::Float,
                     (NumericKind::Decimal, _) | (_, NumericKind::Decimal) => NumericKind::Decimal,
                     (NumericKind::Integer, NumericKind::Integer) => NumericKind::Integer,
+                    (NumericKind::UnsignedInteger, NumericKind::UnsignedInteger) => {
+                        NumericKind::UnsignedInteger
+                    }
+                    (NumericKind::Integer, NumericKind::UnsignedInteger)
+                    | (NumericKind::UnsignedInteger, NumericKind::Integer) => NumericKind::Float,
                 }
             }
             ScalarExpr::Compare { .. } => NumericKind::Integer, // Boolean 0/1
@@ -859,18 +873,16 @@ impl ScalarEvaluator {
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
             | DataType::Date32
             | DataType::Date64
             | DataType::Time32(_)
             | DataType::Time64(_)
             | DataType::Timestamp(_, _) => Some(NumericKind::Integer),
-            DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64 => Some(NumericKind::Float),
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(NumericKind::Float),
             DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => Some(NumericKind::Decimal),
             DataType::Utf8 | DataType::LargeUtf8 => Some(NumericKind::String),
             _ => None,
@@ -911,6 +923,7 @@ impl ScalarEvaluator {
     fn truthy_numeric(val: NumericValue) -> bool {
         match val {
             NumericValue::Int(i) => i != 0,
+            NumericValue::UInt(u) => u != 0,
             NumericValue::Float(f) => f != 0.0,
             NumericValue::Decimal(d) => d.raw_value() != 0,
             NumericValue::String(s) => !s.is_empty(),
@@ -1049,12 +1062,14 @@ impl ScalarEvaluator {
             BinaryOp::BitwiseShiftLeft => {
                 let lhs_i64 = match lhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
@@ -1065,12 +1080,14 @@ impl ScalarEvaluator {
             BinaryOp::BitwiseShiftRight => {
                 let lhs_i64 = match lhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
@@ -1084,6 +1101,7 @@ impl ScalarEvaluator {
     fn literal_from_numeric<F>(value: NumericValue) -> ScalarExpr<F> {
         match value {
             NumericValue::Int(i) => ScalarExpr::literal(i),
+            NumericValue::UInt(u) => ScalarExpr::literal(u as i128),
             NumericValue::Float(f) => ScalarExpr::literal(f),
             NumericValue::Decimal(d) => ScalarExpr::Literal(Literal::Decimal(d)),
             NumericValue::String(s) => ScalarExpr::Literal(Literal::String(s)),
@@ -1134,12 +1152,14 @@ impl ScalarEvaluator {
             BinaryOp::BitwiseShiftLeft => {
                 let lhs_i64 = match lhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
@@ -1150,12 +1170,14 @@ impl ScalarEvaluator {
             BinaryOp::BitwiseShiftRight => {
                 let lhs_i64 = match lhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
                 };
                 let rhs_i64 = match rhs {
                     NumericValue::Int(i) => i,
+                    NumericValue::UInt(u) => u as i64,
                     NumericValue::Float(f) => f as i64,
                     NumericValue::Decimal(d) => d.to_f64() as i64,
                     NumericValue::String(_) => return None,
@@ -1199,24 +1221,35 @@ impl ScalarEvaluator {
             None => Ok(None),
             Some(NumericValue::Int(v)) => Ok(Some(match target {
                 NumericKind::Integer => NumericValue::Int(v),
+                NumericKind::UnsignedInteger => NumericValue::UInt(v as u64),
                 NumericKind::Float => NumericValue::Float(v as f64),
                 NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(v)),
                 NumericKind::String => NumericValue::String(v.to_string()),
             })),
+            Some(NumericValue::UInt(v)) => Ok(Some(match target {
+                NumericKind::Integer => NumericValue::Int(v as i64),
+                NumericKind::UnsignedInteger => NumericValue::UInt(v),
+                NumericKind::Float => NumericValue::Float(v as f64),
+                NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(v as i64)),
+                NumericKind::String => NumericValue::String(v.to_string()),
+            })),
             Some(NumericValue::Float(v)) => Ok(Some(match target {
                 NumericKind::Integer => NumericValue::Int(v as i64),
+                NumericKind::UnsignedInteger => NumericValue::UInt(v as u64),
                 NumericKind::Float => NumericValue::Float(v),
                 NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(v as i64)),
                 NumericKind::String => NumericValue::String(v.to_string()),
             })),
             Some(NumericValue::Decimal(v)) => Ok(Some(match target {
                 NumericKind::Integer => NumericValue::Int(v.to_f64() as i64),
+                NumericKind::UnsignedInteger => NumericValue::UInt(v.to_f64() as u64),
                 NumericKind::Float => NumericValue::Float(v.to_f64()),
                 NumericKind::Decimal => NumericValue::Decimal(v),
                 NumericKind::String => NumericValue::String(v.to_string()),
             })),
             Some(NumericValue::String(v)) => Ok(Some(match target {
                 NumericKind::Integer => NumericValue::Int(v.parse().unwrap_or(0)),
+                NumericKind::UnsignedInteger => NumericValue::UInt(v.parse().unwrap_or(0)),
                 NumericKind::Float => NumericValue::Float(v.parse().unwrap_or(0.0)),
                 NumericKind::Decimal => NumericValue::Decimal(DecimalValue::from_i64(0)),
                 NumericKind::String => NumericValue::String(v),

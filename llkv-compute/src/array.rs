@@ -1,4 +1,6 @@
-use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, StringArray, UInt64Array,
+};
 use arrow::datatypes::DataType;
 use llkv_expr::DecimalValue;
 use llkv_result::Error;
@@ -12,6 +14,7 @@ pub struct NumericArray {
     kind: NumericKind,
     len: usize,
     int_data: Option<Arc<Int64Array>>,
+    uint_data: Option<Arc<UInt64Array>>,
     float_data: Option<Arc<Float64Array>>,
     decimal_data: Option<Arc<Decimal128Array>>,
     string_data: Option<Arc<StringArray>>,
@@ -24,6 +27,20 @@ impl NumericArray {
             kind: NumericKind::Integer,
             len,
             int_data: Some(array),
+            uint_data: None,
+            float_data: None,
+            decimal_data: None,
+            string_data: None,
+        }
+    }
+
+    pub fn new_uint(array: Arc<UInt64Array>) -> Self {
+        let len = array.len();
+        Self {
+            kind: NumericKind::UnsignedInteger,
+            len,
+            int_data: None,
+            uint_data: Some(array),
             float_data: None,
             decimal_data: None,
             string_data: None,
@@ -36,6 +53,7 @@ impl NumericArray {
             kind: NumericKind::Float,
             len,
             int_data: None,
+            uint_data: None,
             float_data: Some(array),
             decimal_data: None,
             string_data: None,
@@ -48,6 +66,7 @@ impl NumericArray {
             kind: NumericKind::Decimal,
             len,
             int_data: None,
+            uint_data: None,
             float_data: None,
             decimal_data: Some(array),
             string_data: None,
@@ -60,6 +79,7 @@ impl NumericArray {
             kind: NumericKind::String,
             len,
             int_data: None,
+            uint_data: None,
             float_data: None,
             decimal_data: None,
             string_data: Some(array),
@@ -95,26 +115,22 @@ impl NumericArray {
                 Ok(Self::new_int(Arc::new(typed)))
             }
             DataType::UInt64 => {
-                // UInt64 doesn't fit in Int64, so we promote to Float64 to avoid overflow/wrapping
-                // and to support operations that might result in floats.
-                let casted = arrow::compute::cast(array, &DataType::Float64)
-                    .map_err(|e| Error::Internal(e.to_string()))?;
-                let typed = casted
+                let typed = array
                     .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| Error::Internal("expected Float64 array after cast".into()))?
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("expected UInt64 array".into()))?
                     .clone();
-                Ok(Self::new_float(Arc::new(typed)))
+                Ok(Self::new_uint(Arc::new(typed)))
             }
             DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
-                let casted = arrow::compute::cast(array, &DataType::Int64)
+                let casted = arrow::compute::cast(array, &DataType::UInt64)
                     .map_err(|e| Error::Internal(e.to_string()))?;
                 let typed = casted
                     .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| Error::Internal("expected Int64 array after cast".into()))?
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| Error::Internal("expected UInt64 array after cast".into()))?
                     .clone();
-                Ok(Self::new_int(Arc::new(typed)))
+                Ok(Self::new_uint(Arc::new(typed)))
             }
             DataType::Float64 => {
                 let typed = array
@@ -167,6 +183,9 @@ impl NumericArray {
     pub fn to_array_ref(&self) -> ArrayRef {
         match self.kind {
             NumericKind::Integer => Arc::new(self.int_data.as_ref().unwrap().as_ref().clone()),
+            NumericKind::UnsignedInteger => {
+                Arc::new(self.uint_data.as_ref().unwrap().as_ref().clone())
+            }
             NumericKind::Float => Arc::new(self.float_data.as_ref().unwrap().as_ref().clone()),
             NumericKind::Decimal => Arc::new(self.decimal_data.as_ref().unwrap().as_ref().clone()),
             NumericKind::String => Arc::new(self.string_data.as_ref().unwrap().as_ref().clone()),
@@ -187,6 +206,10 @@ impl NumericArray {
 
     pub fn int_data(&self) -> Option<&Arc<Int64Array>> {
         self.int_data.as_ref()
+    }
+
+    pub fn uint_data(&self) -> Option<&Arc<UInt64Array>> {
+        self.uint_data.as_ref()
     }
 
     pub fn float_data(&self) -> Option<&Arc<Float64Array>> {
@@ -212,6 +235,17 @@ impl NumericArray {
                     None
                 } else {
                     Some(NumericValue::Int(array.value(idx)))
+                }
+            }
+            NumericKind::UnsignedInteger => {
+                let array = self
+                    .uint_data
+                    .as_ref()
+                    .expect("uint array missing backing data");
+                if array.is_null(idx) {
+                    None
+                } else {
+                    Some(NumericValue::UInt(array.value(idx)))
                 }
             }
             NumericKind::Float => {
@@ -263,6 +297,7 @@ impl NumericArray {
                 opt.map(|v| match v {
                     NumericValue::String(s) => s,
                     NumericValue::Int(i) => i.to_string(),
+                    NumericValue::UInt(u) => u.to_string(),
                     NumericValue::Float(f) => f.to_string(),
                     NumericValue::Decimal(d) => d.to_string(),
                 })
@@ -328,6 +363,16 @@ impl NumericArray {
                                 builder.append_null();
                             }
                         }
+                        Some(NumericValue::UInt(u)) => {
+                            // u64 might not fit in i64, but Decimal128 can hold it.
+                            // We can convert u64 to i128 directly.
+                            let d = DecimalValue::new(u as i128, 0).unwrap();
+                            if let Ok(rescaled) = crate::scalar::decimal::rescale(d, max_scale) {
+                                builder.append_value(rescaled.raw_value());
+                            } else {
+                                builder.append_null();
+                            }
+                        }
                         None => builder.append_null(),
                         _ => builder.append_null(),
                     }
@@ -347,11 +392,32 @@ impl NumericArray {
                 let iter = values.into_iter().map(|opt| {
                     opt.map(|v| match v {
                         NumericValue::Int(i) => i,
+                        NumericValue::UInt(u) => {
+                            // Try to fit in i64, else panic? Or promote?
+                            // The preferred kind is Integer (i64).
+                            // If we have UInts that fit in i64, great.
+                            // If not, we should have probably chosen a different preferred kind.
+                            // But here we are forced to Integer.
+                            // Let's cast and hope.
+                            u as i64
+                        }
                         _ => panic!("expected integer"),
                     })
                 });
                 let array = Int64Array::from_iter(iter);
                 NumericArray::new_int(Arc::new(array))
+            }
+            // Pure unsigned integers
+            (false, false, NumericKind::UnsignedInteger) => {
+                let iter = values.into_iter().map(|opt| {
+                    opt.map(|v| match v {
+                        NumericValue::UInt(u) => u,
+                        NumericValue::Int(i) => i as u64, // Cast i64 to u64
+                        _ => panic!("expected unsigned integer"),
+                    })
+                });
+                let array = UInt64Array::from_iter(iter);
+                NumericArray::new_uint(Arc::new(array))
             }
             // Pure integers but preferred float
             (false, false, NumericKind::Float) => {
@@ -362,11 +428,12 @@ impl NumericArray {
             // Pure integers but preferred decimal
             (false, false, NumericKind::Decimal) => {
                 let max_scale = 0;
-                let max_precision = 19; // i64 max digits
+                let max_precision = 20; // u64 max digits
                 let mut builder = arrow::array::Decimal128Builder::with_capacity(values.len());
                 for val in values {
                     match val {
                         Some(NumericValue::Int(i)) => builder.append_value(i as i128),
+                        Some(NumericValue::UInt(u)) => builder.append_value(u as i128),
                         None => builder.append_null(),
                         _ => builder.append_null(),
                     }
@@ -395,6 +462,21 @@ impl NumericArray {
                     .int_data
                     .as_ref()
                     .expect("integer array missing backing data");
+                let iter = (0..self.len).map(|idx| {
+                    if array.is_null(idx) {
+                        None
+                    } else {
+                        Some(array.value(idx) as f64)
+                    }
+                });
+                let float_array = Float64Array::from_iter(iter);
+                NumericArray::new_float(Arc::new(float_array))
+            }
+            NumericKind::UnsignedInteger => {
+                let array = self
+                    .uint_data
+                    .as_ref()
+                    .expect("uint array missing backing data");
                 let iter = (0..self.len).map(|idx| {
                     if array.is_null(idx) {
                         None
@@ -445,6 +527,9 @@ impl NumericArray {
     pub fn to_aligned_array_ref(&self, preferred: NumericKind) -> ArrayRef {
         match (preferred, self.kind) {
             (NumericKind::Float, NumericKind::Integer) => self.promote_to_float().to_array_ref(),
+            (NumericKind::Float, NumericKind::UnsignedInteger) => {
+                self.promote_to_float().to_array_ref()
+            }
             (NumericKind::Float, NumericKind::Decimal) => self.promote_to_float().to_array_ref(),
             _ => self.to_array_ref(),
         }

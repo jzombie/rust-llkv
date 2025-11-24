@@ -5,6 +5,7 @@ use llkv_result::Error;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericKind {
     Integer,
+    UnsignedInteger,
     Float,
     Decimal,
     String,
@@ -13,6 +14,7 @@ pub enum NumericKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NumericValue {
     Int(i64),
+    UInt(u64),
     Float(f64),
     Decimal(DecimalValue),
     String(String),
@@ -22,6 +24,7 @@ impl NumericValue {
     pub fn kind(&self) -> NumericKind {
         match self {
             NumericValue::Int(_) => NumericKind::Integer,
+            NumericValue::UInt(_) => NumericKind::UnsignedInteger,
             NumericValue::Float(_) => NumericKind::Float,
             NumericValue::Decimal(_) => NumericKind::Decimal,
             NumericValue::String(_) => NumericKind::String,
@@ -35,6 +38,7 @@ impl NumericValue {
     pub fn to_f64(&self) -> f64 {
         match self {
             NumericValue::Int(v) => *v as f64,
+            NumericValue::UInt(v) => *v as f64,
             NumericValue::Float(v) => *v,
             NumericValue::Decimal(v) => v.to_f64(),
             NumericValue::String(_) => f64::NAN,
@@ -52,6 +56,17 @@ impl NumericValue {
                     Some(val) => Ok(NumericValue::Int(val)),
                     None => Ok(NumericValue::Float(*a as f64 + *b as f64)),
                 }
+            }
+            (NumericValue::UInt(a), NumericValue::UInt(b)) => match a.checked_add(*b) {
+                Some(val) => Ok(NumericValue::UInt(val)),
+                None => Ok(NumericValue::Float(*a as f64 + *b as f64)),
+            },
+            (NumericValue::Int(a), NumericValue::UInt(b)) => {
+                // Promote to Float to avoid overflow/sign issues
+                Ok(NumericValue::Float(*a as f64 + *b as f64))
+            }
+            (NumericValue::UInt(a), NumericValue::Int(b)) => {
+                Ok(NumericValue::Float(*a as f64 + *b as f64))
             }
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a + b)),
             (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
@@ -86,6 +101,16 @@ impl NumericValue {
                 Some(val) => Ok(NumericValue::Int(val)),
                 None => Ok(NumericValue::Float(*a as f64 - *b as f64)),
             },
+            (NumericValue::UInt(a), NumericValue::UInt(b)) => match a.checked_sub(*b) {
+                Some(val) => Ok(NumericValue::UInt(val)),
+                None => Ok(NumericValue::Float(*a as f64 - *b as f64)),
+            },
+            (NumericValue::Int(a), NumericValue::UInt(b)) => {
+                Ok(NumericValue::Float(*a as f64 - *b as f64))
+            }
+            (NumericValue::UInt(a), NumericValue::Int(b)) => {
+                Ok(NumericValue::Float(*a as f64 - *b as f64))
+            }
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a - b)),
             (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
                 crate::scalar::decimal::sub(*a, *b)
@@ -117,6 +142,16 @@ impl NumericValue {
                 Some(val) => Ok(NumericValue::Int(val)),
                 None => Ok(NumericValue::Float(*a as f64 * *b as f64)),
             },
+            (NumericValue::UInt(a), NumericValue::UInt(b)) => match a.checked_mul(*b) {
+                Some(val) => Ok(NumericValue::UInt(val)),
+                None => Ok(NumericValue::Float(*a as f64 * *b as f64)),
+            },
+            (NumericValue::Int(a), NumericValue::UInt(b)) => {
+                Ok(NumericValue::Float(*a as f64 * *b as f64))
+            }
+            (NumericValue::UInt(a), NumericValue::Int(b)) => {
+                Ok(NumericValue::Float(*a as f64 * *b as f64))
+            }
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a * b)),
             (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
                 crate::scalar::decimal::mul(*a, *b)
@@ -145,6 +180,12 @@ impl NumericValue {
         }
         match (self, other) {
             (NumericValue::Int(a), NumericValue::Int(b)) => {
+                if *b == 0 {
+                    return Err(Error::Internal("Division by zero".to_string()));
+                }
+                Ok(NumericValue::Float(*a as f64 / *b as f64))
+            }
+            (NumericValue::UInt(a), NumericValue::UInt(b)) => {
                 if *b == 0 {
                     return Err(Error::Internal("Division by zero".to_string()));
                 }
@@ -196,6 +237,12 @@ impl NumericValue {
                 }
                 Ok(NumericValue::Int(a % b))
             }
+            (NumericValue::UInt(a), NumericValue::UInt(b)) => {
+                if *b == 0 {
+                    return Err(Error::Internal("Division by zero".to_string()));
+                }
+                Ok(NumericValue::UInt(a % b))
+            }
             (NumericValue::Float(a), NumericValue::Float(b)) => Ok(NumericValue::Float(a % b)),
             // Decimal rem not explicitly in snippet, but maybe available?
             // If not, fallback to float.
@@ -207,6 +254,12 @@ impl NumericValue {
 impl From<i64> for NumericValue {
     fn from(v: i64) -> Self {
         NumericValue::Int(v)
+    }
+}
+
+impl From<u64> for NumericValue {
+    fn from(v: u64) -> Self {
+        NumericValue::UInt(v)
     }
 }
 

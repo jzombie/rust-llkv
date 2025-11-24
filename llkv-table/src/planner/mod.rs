@@ -1201,6 +1201,7 @@ where
 
                                 match result_kind {
                                     NumericKind::Integer => DataType::Int64,
+                                    NumericKind::UnsignedInteger => DataType::UInt64,
                                     NumericKind::Float => DataType::Float64,
                                     NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
                                     NumericKind::String => DataType::Utf8,
@@ -1477,6 +1478,7 @@ where
 
                 let output_dtype = match result_kind {
                     NumericKind::Integer => DataType::Int64,
+                    NumericKind::UnsignedInteger => DataType::UInt64,
                     NumericKind::Float => DataType::Float64,
                     NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
                     NumericKind::String => DataType::Utf8,
@@ -5164,6 +5166,7 @@ fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Opti
     let arrays = NumericArrayMap::default();
     match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
         Some(NumericValue::Int(v)) => Ok(Some(Literal::Integer(v as i128))),
+        Some(NumericValue::UInt(v)) => Ok(Some(Literal::Integer(v as i128))),
         Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
         Some(NumericValue::Decimal(d)) => Ok(Some(Literal::Decimal(d))),
         Some(NumericValue::String(s)) => Ok(Some(Literal::String(s))),
