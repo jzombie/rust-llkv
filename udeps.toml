@@ -1,0 +1,3 @@
+[package]
+# Per-package config; `*` applies to all
+"*" = { skip = ["llkv-test-utils"] }
