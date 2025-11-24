@@ -1845,6 +1845,7 @@ where
         Ok(if negated { !is_null } else { is_null })
     }
 
+    // TODO: Can Rayon be used internally?
     fn evaluate_in_list_over_rows(
         &self,
         row_ids: &[RowId],
