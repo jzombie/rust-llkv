@@ -8668,14 +8668,7 @@ impl CrossProductExpressionContext {
             .downcast_ref::<BooleanArray>()
             .expect("compute_compare must return BooleanArray");
 
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            if bool_array.is_null(i) {
-                out.push(None);
-            } else {
-                out.push(Some(bool_array.value(i)));
-            }
-        }
+        let out: Vec<Option<bool>> = bool_array.iter().collect();
         Ok(out)
     }
 
@@ -8782,14 +8775,7 @@ impl CrossProductExpressionContext {
             final_bool
         };
 
-        let mut out = Vec::with_capacity(len);
-        for i in 0..len {
-            if final_bool.is_null(i) {
-                out.push(None);
-            } else {
-                out.push(Some(final_bool.value(i)));
-            }
-        }
+        let out: Vec<Option<bool>> = final_bool.iter().collect();
         Ok(out)
     }
 

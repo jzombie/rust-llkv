@@ -1933,52 +1933,47 @@ where
                 numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
             }
 
-            for (offset, &row_id) in window.iter().enumerate() {
-                let target_array = NumericKernels::evaluate_value(expr, offset, &numeric_arrays)?;
-                if target_array.is_null(0) {
+            let len = window.len();
+            let target_array = NumericKernels::evaluate_batch(expr, len, &numeric_arrays)?;
+
+            let mut acc: Option<BooleanArray> = None;
+
+            for value_expr in list {
+                let value_array = NumericKernels::evaluate_batch(value_expr, len, &numeric_arrays)?;
+                let cmp_array =
+                    llkv_compute::compute_compare(&value_array, CompareOp::Eq, &target_array)?;
+                let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+                match acc {
+                    None => acc = Some(cmp.clone()),
+                    Some(prev) => acc = Some(compute::or_kleene(&prev, cmp)?),
+                }
+            }
+
+            let mut final_bool = match acc {
+                Some(a) => a,
+                None => {
+                    let mut builder = arrow::array::BooleanBuilder::with_capacity(len);
+                    for _ in 0..len {
+                        builder.append_value(false);
+                    }
+                    builder.finish()
+                }
+            };
+
+            if negated {
+                final_bool = compute::not(&final_bool)?;
+            }
+
+            for (i, &row_id) in window.iter().enumerate() {
+                if final_bool.is_null(i) {
                     continue;
                 }
-
-                let mut matched = false;
-                let mut saw_null = false;
-                for value_expr in list {
-                    let value_array =
-                        NumericKernels::evaluate_value(value_expr, offset, &numeric_arrays)?;
-                    if value_array.is_null(0) {
-                        saw_null = true;
-                    } else {
-                        let cmp_array = llkv_compute::compute_compare(
-                            &value_array,
-                            CompareOp::Eq,
-                            &target_array,
-                        )?;
-                        let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
-                        if cmp.value(0) {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-
-                let outcome = if matched {
-                    Some(!negated)
-                } else if saw_null {
-                    None
-                } else if negated {
-                    Some(true)
+                if final_bool.value(i) {
+                    matched_rows.push(row_id);
+                    determined_rows.push(row_id);
                 } else {
-                    Some(false)
-                };
-
-                match outcome {
-                    Some(true) => {
-                        matched_rows.push(row_id);
-                        determined_rows.push(row_id);
-                    }
-                    Some(false) => {
-                        determined_rows.push(row_id);
-                    }
-                    None => {}
+                    determined_rows.push(row_id);
                 }
             }
 

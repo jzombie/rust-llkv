@@ -49,7 +49,21 @@ fn coerce_types(
     let target_type = match (lhs_type, rhs_type) {
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64, // Promote to f64
+
         (DataType::Int64, DataType::Int64) => DataType::Int64,
+        (DataType::Int32, DataType::Int32) => DataType::Int32,
+        (DataType::Int16, DataType::Int16) => DataType::Int16,
+        (DataType::Int8, DataType::Int8) => DataType::Int8,
+
+        (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => DataType::Int64,
+        (DataType::Int16, DataType::Int64) | (DataType::Int64, DataType::Int16) => DataType::Int64,
+        (DataType::Int8, DataType::Int64) | (DataType::Int64, DataType::Int8) => DataType::Int64,
+
+        (DataType::Int16, DataType::Int32) | (DataType::Int32, DataType::Int16) => DataType::Int32,
+        (DataType::Int8, DataType::Int32) | (DataType::Int32, DataType::Int8) => DataType::Int32,
+
+        (DataType::Int8, DataType::Int16) | (DataType::Int16, DataType::Int8) => DataType::Int16,
+
         (DataType::Int64, DataType::UInt64) => DataType::Float64, // Avoid overflow
         (DataType::UInt64, DataType::Int64) => DataType::Float64,
         (DataType::UInt64, DataType::UInt64) => DataType::UInt64,
