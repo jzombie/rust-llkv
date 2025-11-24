@@ -248,21 +248,46 @@ impl ScalarEvaluator {
                 else_expr,
                 ..
             } => {
-                // Simplified: take first branch type
-                if let Some((_, then_expr)) = branches.first() {
-                    Self::infer_result_type(then_expr, resolve_type)
-                } else if let Some(else_expr) = else_expr {
-                    Self::infer_result_type(else_expr, resolve_type)
-                } else {
-                    None
+                let mut types = Vec::new();
+                for (_, then_expr) in branches {
+                    if let Some(t) = Self::infer_result_type(then_expr, resolve_type) {
+                        types.push(t);
+                    }
                 }
+                if let Some(else_expr) = else_expr {
+                    if let Some(t) = Self::infer_result_type(else_expr, resolve_type) {
+                        types.push(t);
+                    }
+                } else {
+                    // Implicit ELSE NULL
+                    types.push(DataType::Null);
+                }
+
+                if types.is_empty() {
+                    return None;
+                }
+
+                let mut common = types[0].clone();
+                for t in &types[1..] {
+                    common = get_common_type(&common, t);
+                }
+                Some(common)
             }
             ScalarExpr::Coalesce(items) => {
-                if let Some(first) = items.first() {
-                    Self::infer_result_type(first, resolve_type)
-                } else {
-                    None
+                let mut types = Vec::new();
+                for item in items {
+                    if let Some(t) = Self::infer_result_type(item, resolve_type) {
+                        types.push(t);
+                    }
                 }
+                if types.is_empty() {
+                    return None;
+                }
+                let mut common = types[0].clone();
+                for t in &types[1..] {
+                    common = get_common_type(&common, t);
+                }
+                Some(common)
             }
             ScalarExpr::Random => Some(DataType::Float64),
             ScalarExpr::ScalarSubquery(sub) => Some(sub.data_type.clone()),

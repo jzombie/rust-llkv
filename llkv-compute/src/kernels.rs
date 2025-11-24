@@ -50,6 +50,7 @@ pub fn get_common_type(lhs_type: &DataType, rhs_type: &DataType) -> DataType {
     }
 
     match (lhs_type, rhs_type) {
+        (DataType::Null, other) | (other, DataType::Null) => other.clone(),
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64, // Promote to f64
 
