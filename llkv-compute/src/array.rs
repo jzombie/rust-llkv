@@ -84,11 +84,53 @@ impl NumericArray {
                     .clone();
                 Ok(Self::new_int(Arc::new(typed)))
             }
+            DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                let casted = arrow::compute::cast(array, &DataType::Int64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                let typed = casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::Internal("expected Int64 array after cast".into()))?
+                    .clone();
+                Ok(Self::new_int(Arc::new(typed)))
+            }
+            DataType::UInt64 => {
+                // UInt64 doesn't fit in Int64, so we promote to Float64 to avoid overflow/wrapping
+                // and to support operations that might result in floats.
+                let casted = arrow::compute::cast(array, &DataType::Float64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                let typed = casted
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| Error::Internal("expected Float64 array after cast".into()))?
+                    .clone();
+                Ok(Self::new_float(Arc::new(typed)))
+            }
+            DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
+                let casted = arrow::compute::cast(array, &DataType::Int64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                let typed = casted
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::Internal("expected Int64 array after cast".into()))?
+                    .clone();
+                Ok(Self::new_int(Arc::new(typed)))
+            }
             DataType::Float64 => {
                 let typed = array
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| Error::Internal("expected Float64 array".into()))?
+                    .clone();
+                Ok(Self::new_float(Arc::new(typed)))
+            }
+            DataType::Float32 => {
+                let casted = arrow::compute::cast(array, &DataType::Float64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                let typed = casted
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| Error::Internal("expected Float64 array after cast".into()))?
                     .clone();
                 Ok(Self::new_float(Arc::new(typed)))
             }
@@ -101,32 +143,6 @@ impl NumericArray {
                 Ok(Self::new_decimal(Arc::new(typed)))
             }
             // Coercions
-            DataType::Int32 => {
-                let typed = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .ok_or_else(|| Error::Internal("expected Int32 array".into()))?;
-                let casted = arrow::compute::cast(typed, &DataType::Int64)?;
-                let int_array = casted
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| Error::Internal("cast failed".into()))?
-                    .clone();
-                Ok(Self::new_int(Arc::new(int_array)))
-            }
-            DataType::Float32 => {
-                let typed = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float32Array>()
-                    .ok_or_else(|| Error::Internal("expected Float32 array".into()))?;
-                let casted = arrow::compute::cast(typed, &DataType::Float64)?;
-                let float_array = casted
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| Error::Internal("cast failed".into()))?
-                    .clone();
-                Ok(Self::new_float(Arc::new(float_array)))
-            }
             DataType::Date32 => {
                 let typed = array
                     .as_any()

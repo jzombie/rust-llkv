@@ -31,10 +31,41 @@ pub fn compute_binary(
     let (lhs_arr, rhs_arr) = cast_to_common_type(lhs, rhs, result_kind)?;
 
     let result_arr: ArrayRef = match op {
-        BinaryOp::Add => numeric::add(&lhs_arr, &rhs_arr)?,
-        BinaryOp::Subtract => numeric::sub(&lhs_arr, &rhs_arr)?,
+        BinaryOp::Add => match numeric::add(&lhs_arr, &rhs_arr) {
+            Ok(res) => res,
+            Err(e) if e.to_string().contains("overflow") => {
+                let lhs_f = cast(&lhs_arr, &DataType::Float64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                let rhs_f = cast(&rhs_arr, &DataType::Float64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                numeric::add(&lhs_f, &rhs_f).map_err(|e| Error::Internal(e.to_string()))?
+            }
+            Err(e) => return Err(Error::Internal(e.to_string())),
+        },
+        BinaryOp::Subtract => match numeric::sub(&lhs_arr, &rhs_arr) {
+            Ok(res) => res,
+            Err(e) if e.to_string().contains("overflow") => {
+                let lhs_f = cast(&lhs_arr, &DataType::Float64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                let rhs_f = cast(&rhs_arr, &DataType::Float64)
+                    .map_err(|e| Error::Internal(e.to_string()))?;
+                numeric::sub(&lhs_f, &rhs_f).map_err(|e| Error::Internal(e.to_string()))?
+            }
+            Err(e) => return Err(Error::Internal(e.to_string())),
+        },
         BinaryOp::Multiply => {
-            let res = numeric::mul(&lhs_arr, &rhs_arr)?;
+            let res = match numeric::mul(&lhs_arr, &rhs_arr) {
+                Ok(res) => res,
+                Err(e) if e.to_string().contains("overflow") => {
+                    let lhs_f = cast(&lhs_arr, &DataType::Float64)
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                    let rhs_f = cast(&rhs_arr, &DataType::Float64)
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                    numeric::mul(&lhs_f, &rhs_f).map_err(|e| Error::Internal(e.to_string()))?
+                }
+                Err(e) => return Err(Error::Internal(e.to_string())),
+            };
+
             if result_kind == NumericKind::Decimal {
                 if let DataType::Decimal128(p, s) = res.data_type() {
                     // Result of mul has scale 's' (same as inputs).
