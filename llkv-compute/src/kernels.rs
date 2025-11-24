@@ -32,7 +32,7 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
     Ok(result_arr)
 }
 
-fn coerce_types(
+pub fn coerce_types(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
     _op: BinaryOp,

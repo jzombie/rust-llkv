@@ -1934,19 +1934,26 @@ where
             }
 
             let len = window.len();
-            let target_array = NumericKernels::evaluate_batch(expr, len, &numeric_arrays)?;
+            let mut target_array = NumericKernels::evaluate_batch(expr, len, &numeric_arrays)?;
 
             let mut acc: Option<BooleanArray> = None;
 
             for value_expr in list {
                 let value_array = NumericKernels::evaluate_batch(value_expr, len, &numeric_arrays)?;
-                let cmp_array =
-                    llkv_compute::compute_compare(&value_array, CompareOp::Eq, &target_array)?;
-                let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+                // Coerce types and update target_array if promoted.
+                let (new_target, new_value) = llkv_compute::kernels::coerce_types(
+                    &target_array,
+                    &value_array,
+                    BinaryOp::Add,
+                )?;
+                target_array = new_target;
+
+                let cmp_array = compute::kernels::cmp::eq(&new_value, &target_array)?;
 
                 match acc {
-                    None => acc = Some(cmp.clone()),
-                    Some(prev) => acc = Some(compute::or_kleene(&prev, cmp)?),
+                    None => acc = Some(cmp_array),
+                    Some(prev) => acc = Some(compute::or_kleene(&prev, &cmp_array)?),
                 }
             }
 
