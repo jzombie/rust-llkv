@@ -5,10 +5,9 @@
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
-use llkv_column_map::types::LogicalFieldId;
-use llkv_expr::{CompareOp, ScalarExpr};
+use llkv_expr::ScalarExpr;
 use llkv_result::Result as LlkvResult;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use crate::types::FieldId;
 

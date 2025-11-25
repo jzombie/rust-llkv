@@ -1,17 +1,16 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Datum, Float64Array, UInt32Array, new_null_array};
+use arrow::array::{Array, ArrayRef, Float64Array, UInt32Array, new_null_array};
 use arrow::compute::kernels::cast;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{concat, is_not_null, take};
 use arrow::datatypes::{DataType, IntervalMonthDayNanoType};
 use llkv_expr::literal::Literal;
-use llkv_expr::{AggregateCall, BinaryOp, CompareOp, DecimalValue, ScalarExpr};
+use llkv_expr::{AggregateCall, BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
 use crate::kernels::{compute_binary, get_common_type};
 
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
@@ -28,7 +27,7 @@ impl VectorizedExpr {
         match self {
             VectorizedExpr::Array(array) => array, // TODO: Cast to target_type if needed
             VectorizedExpr::Scalar(scalar_array) => {
-                if scalar_array.len() == 0 {
+                if scalar_array.is_empty() {
                     return new_null_array(&_target_type, len);
                 }
                 if scalar_array.is_null(0) {
@@ -311,10 +310,8 @@ impl ScalarEvaluator {
         }
     }
 
-    fn binary_result_type(op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
-        match op {
-            _ => get_common_type(&lhs, &rhs),
-        }
+    fn binary_result_type(_op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
+        get_common_type(&lhs, &rhs)
     }
 
     /// Evaluate a scalar expression for the row at `idx` using the provided numeric arrays.
@@ -521,7 +518,7 @@ impl ScalarEvaluator {
         expr: &ScalarExpr<F>,
         len: usize,
         arrays: &NumericArrayMap<F>,
-        target_type: DataType,
+        _target_type: DataType,
     ) -> LlkvResult<Option<VectorizedExpr>> {
         if Self::expr_contains_interval(expr) {
             return Ok(None);

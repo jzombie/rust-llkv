@@ -8,7 +8,6 @@
 //! - [`translation`]: Expression and projection translation utilities
 //! - [`types`]: Core type definitions (tables, schemas, columns)  
 //! - [`insert`]: INSERT operation support (value coercion)
-//! - [`utils`]: Utility functions (time)
 //!
 //! The [`QueryExecutor`] and [`SelectExecution`] implementations are defined inline
 //! in this module for now, but should be extracted to a dedicated `query` module
@@ -16,9 +15,9 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal128Builder,
-    Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int64Array,
-    Int64Builder, IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray,
-    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
+    IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute::{
     SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, not,

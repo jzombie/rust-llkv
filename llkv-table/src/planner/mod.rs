@@ -2252,6 +2252,7 @@ where
                 {
                     return;
                 }
+                #[allow(clippy::collapsible_if)]
                 if !left_val.is_null(0) && !right_val.is_null(0) {
                     if let Ok(cmp_array) = llkv_compute::compute_compare(&left_val, op, &right_val)
                     {
@@ -5269,9 +5270,7 @@ fn array_value_to_literal(array: &ArrayRef, index: usize) -> LlkvResult<Literal>
                 .downcast_ref::<arrow::array::Decimal128Array>()
                 .unwrap();
             let val = arr.value(index);
-            Ok(Literal::Decimal(
-                DecimalValue::new(val, *scale as i8).unwrap(),
-            ))
+            Ok(Literal::Decimal(DecimalValue::new(val, *scale).unwrap()))
         }
         _ => Err(Error::Internal(format!(
             "Unsupported type for literal conversion: {:?}",

@@ -117,7 +117,7 @@ pub fn get_common_type(lhs_type: &DataType, rhs_type: &DataType) -> DataType {
 pub fn coerce_types(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
-    op: BinaryOp,
+    _op: BinaryOp,
 ) -> Result<(ArrayRef, ArrayRef), Error> {
     let lhs_type = lhs.data_type();
     let rhs_type = rhs.data_type();
@@ -162,7 +162,6 @@ pub fn compute_compare(lhs: &ArrayRef, op: CompareOp, rhs: &ArrayRef) -> Result<
         CompareOp::GtEq => {
             Arc::new(cmp::gt_eq(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?)
         }
-        _ => return Err(Error::Internal(format!("Unsupported compare op: {:?}", op))),
     };
     Ok(result_arr)
 }
