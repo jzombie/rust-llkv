@@ -461,7 +461,7 @@ where
 
         let row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            row_ids,
+            row_ids.iter().collect(),
             &self.txn_manager,
             snapshot,
         )?;

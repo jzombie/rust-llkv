@@ -303,7 +303,7 @@ where
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
-            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
+            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids.iter().collect(), &self.txn_manager, snapshot)?
         };
 
         self.constraint_service.validate_insert_constraints(
@@ -647,7 +647,7 @@ where
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
-            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
+            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids.iter().collect(), &self.txn_manager, snapshot)?
         };
 
         self.constraint_service.validate_insert_constraints(

@@ -1,3 +1,4 @@
+use roaring::RoaringTreemap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -631,7 +632,7 @@ where
         TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
     }
 
-    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<RowId>> {
+    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<RoaringTreemap> {
         collect_row_ids_for_table(self, filter_expr)
     }
 

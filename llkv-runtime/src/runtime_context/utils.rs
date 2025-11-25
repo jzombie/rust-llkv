@@ -9,6 +9,7 @@
 //! - Transaction state tracking
 //! - Table cache management
 
+use roaring::RoaringTreemap;
 use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, IntervalUnit};
 use llkv_column_map::store::GatherNullPolicy;
@@ -226,7 +227,7 @@ where
         // Apply MVCC filtering manually using filter_row_ids_for_snapshot
         let row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            row_ids,
+            row_ids.iter().collect(),
             &self.txn_manager,
             snapshot,
         )?;
@@ -306,7 +307,7 @@ where
 
         let row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            row_ids,
+            row_ids.iter().collect(),
             &self.txn_manager,
             snapshot,
         )?;
@@ -398,7 +399,7 @@ where
         // Use FK-specific filtering that treats deleted rows as still visible
         let row_ids = llkv_transaction::filter_row_ids_for_fk_check(
             table.table.as_ref(),
-            row_ids,
+            row_ids.iter().collect(),
             &self.txn_manager,
             snapshot,
         )?;
@@ -508,10 +509,11 @@ where
     pub(super) fn filter_visible_row_ids(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: Vec<RowId>,
+        row_ids: RoaringTreemap,
         snapshot: TransactionSnapshot,
     ) -> Result<Vec<RowId>> {
-        filter_row_ids_for_snapshot(table.table.as_ref(), row_ids, &self.txn_manager, snapshot)
+        let row_ids_vec: Vec<RowId> = row_ids.iter().collect();
+        filter_row_ids_for_snapshot(table.table.as_ref(), row_ids_vec, &self.txn_manager, snapshot)
     }
 
     /// Record that a transaction has inserted rows into a table.
@@ -564,7 +566,7 @@ where
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
         let mut stream = table.table.stream_columns(
             Arc::clone(&logical_fields),
-            row_ids,
+            row_ids.iter().collect(),
             GatherNullPolicy::IncludeNulls,
         )?;
 

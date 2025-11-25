@@ -136,7 +136,7 @@ where
 
         let visible_row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            raw_row_ids,
+            raw_row_ids.iter().collect(),
             &self.txn_manager,
             snapshot,
         )?;

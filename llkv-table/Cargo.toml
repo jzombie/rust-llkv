@@ -26,6 +26,7 @@ llkv-storage.workspace = true
 llkv-types.workspace = true
 rand.workspace = true
 rayon.workspace = true
+roaring.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 sqlparser.workspace = true
