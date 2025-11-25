@@ -416,11 +416,7 @@ fn normalize_negated<'expr>(inner: Expr<'expr, FieldId>) -> Expr<'expr, FieldId>
                 CompareOp::Lt => CompareOp::GtEq,
                 CompareOp::LtEq => CompareOp::Gt,
             };
-            Expr::Compare {
-                left,
-                op: negated_op,
-                right,
-            }
+            normalize_compare(left, negated_op, right)
         }
         Expr::Literal(value) => Expr::Literal(!value),
         Expr::IsNull { expr, negated } => Expr::IsNull {
@@ -464,25 +460,20 @@ mod tests {
         assert_eq!(children.len(), 2);
 
         match &children[0] {
-            Expr::Not(inner) => match inner.as_ref() {
-                Expr::Pred(Filter {
-                    op: Operator::GreaterThanOrEquals(_),
-                    ..
-                }) => {}
-                other => panic!("unexpected left branch: {other:?}"),
-            },
-            other => panic!("left branch should be NOT(pred), got {other:?}"),
+            Expr::Pred(Filter {
+                op: Operator::LessThan(_),
+                ..
+            }) => {}
+            other => panic!("left branch should be Pred(LessThan), got {other:?}"),
         }
 
         match &children[1] {
-            Expr::Not(inner) => match inner.as_ref() {
-                Expr::Compare {
-                    op: CompareOp::LtEq,
-                    ..
-                } => {}
-                other => panic!("unexpected right branch: {other:?}"),
-            },
-            other => panic!("right branch should be NOT(compare), got {other:?}"),
+            Expr::Compare {
+                op: CompareOp::Gt,
+                right: ScalarExpr::Literal(Literal::Null),
+                ..
+            } => {}
+            other => panic!("right branch should be Compare(Gt, Null), got {other:?}"),
         }
     }
 
