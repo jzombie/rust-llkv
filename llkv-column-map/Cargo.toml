@@ -13,25 +13,25 @@ categories = ["database-implementations", "data-structures"]
 readme = "README.md"
 
 [dependencies]
-arrow = { workspace = true }
-arrow-ord = { workspace = true }
-llkv-expr = { workspace = true }
-llkv-result = { workspace = true }
-llkv-storage = { workspace = true }
-modular-bitfield = { workspace = true }
-num_enum = { workspace = true }
-roaring = { workspace = true }
-rustc-hash = { workspace = true }
-rayon = { workspace = true }
+arrow.workspace = true
+arrow-ord.workspace = true
+llkv-expr.workspace = true
+llkv-result.workspace = true
+llkv-storage.workspace = true
+modular-bitfield.workspace = true
+num_enum.workspace = true
+roaring.workspace = true
+rustc-hash.workspace = true
+rayon.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
-thiserror = { workspace = true }
+thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-criterion = { workspace = true }
-line-ending = { workspace = true }
+criterion.workspace = true
+line-ending.workspace = true
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
-rand = { workspace = true }
+rand.workspace = true
 
 [[bench]]
 name = "column_sum_bench"

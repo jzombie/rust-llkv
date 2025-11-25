@@ -42,13 +42,13 @@ use llkv_column_map::{
 use llkv_compute::date::{
     add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
 };
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::{FromLiteral, IntervalValue, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::decimal::DecimalValue;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 

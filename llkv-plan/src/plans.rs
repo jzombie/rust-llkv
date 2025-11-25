@@ -11,10 +11,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::SubqueryId;
 use llkv_expr::literal::IntervalValue;
 use llkv_result::Error;
+use llkv_types::decimal::DecimalValue;
 use rustc_hash::FxHashMap;
 
 /// Result type for plan operations.

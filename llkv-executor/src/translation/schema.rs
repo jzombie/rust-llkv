@@ -1,13 +1,13 @@
 use crate::ExecutorResult;
 use crate::types::{ExecutorSchema, ExecutorTable};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema};
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::{BinaryOp, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::types::FieldId;
+use llkv_types::decimal::DecimalValue;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::collections::HashMap;
 use std::sync::Arc;

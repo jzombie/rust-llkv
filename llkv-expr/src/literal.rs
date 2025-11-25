@@ -1,3 +1,5 @@
+// TODO: Move entirely to llkv-types?
+
 //! Untyped literal values plus helpers for converting them into native types.
 //!
 //! Literals capture query parameters before a table knows the concrete Arrow

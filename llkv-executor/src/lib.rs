@@ -31,7 +31,6 @@ use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::SubqueryId;
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
 };
@@ -53,6 +52,7 @@ use llkv_table::table::{
 };
 use llkv_table::types::FieldId;
 use llkv_table::{NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
+use llkv_types::decimal::DecimalValue;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -7207,7 +7207,7 @@ where
                             || matches!(&right_val, PlanValue::Decimal(_));
 
                         if has_decimal {
-                            use llkv_expr::decimal::DecimalValue;
+                            use llkv_types::decimal::DecimalValue;
 
                             // Convert both operands to Decimal
                             let left_dec = match &left_val {

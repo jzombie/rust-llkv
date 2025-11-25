@@ -13,12 +13,13 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, IntervalUnit};
 use arrow::record_batch::RecordBatch;
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::IntervalValue;
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::decimal::DecimalValue;
 
 use crate::plans::PlanValue;
 
+// TODO: Move to llkv-types?
 /// Canonical scalar value with stable hashing semantics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CanonicalScalar {
@@ -167,6 +168,7 @@ impl CanonicalScalar {
     }
 }
 
+// TODO: Move to llkv-types?
 /// Canonical row representation used for hashing and equality checks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CanonicalRow(pub Vec<CanonicalScalar>);

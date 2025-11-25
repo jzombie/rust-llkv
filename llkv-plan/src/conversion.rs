@@ -4,8 +4,8 @@
 //! llkv-plan data structures, particularly for literal value conversion
 //! and range SELECT parsing.
 
-use llkv_expr::decimal::DecimalValue;
 use llkv_result::{Error, Result};
+use llkv_types::decimal::DecimalValue;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     DataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName,

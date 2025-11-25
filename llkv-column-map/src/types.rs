@@ -13,6 +13,7 @@
 
 use modular_bitfield::prelude::*;
 
+// TODO: Rename to something more specific
 /// Category of data a column contains.
 ///
 /// The `Namespace` enum prevents ID collisions by segregating different types of
@@ -59,6 +60,7 @@ pub enum Namespace {
     Reserved = 0xFFFF,
 }
 
+// TODO: Move to llkv-types?
 /// Unique identifier for a table.
 ///
 /// Table IDs are 16-bit unsigned integers, allowing up to 65,535 tables per database.
@@ -70,6 +72,7 @@ pub enum Namespace {
 /// - User tables receive IDs starting from `1`
 pub type TableId = u16;
 
+// TODO: Move to llkv-types?
 /// Unique identifier for a column within a table.
 ///
 /// Field IDs are 32-bit unsigned integers, allowing up to ~4.3 billion columns per table.
@@ -83,12 +86,14 @@ pub type TableId = u16;
 /// - User columns receive IDs starting from `1`
 pub type FieldId = u32;
 
+// TODO: Move to llkv-types?
 /// Reserved field ID for row ID columns.
 ///
 /// This constant is used for the synthetic row ID column that exists in all tables.
 /// Row IDs are globally unique `u64` values that never change once assigned.
 pub const ROW_ID_FIELD_ID: FieldId = 0;
 
+// TODO: Move to llkv-types?
 /// Unique identifier for a row within a table.
 ///
 /// Row IDs are 64-bit unsigned integers assigned sequentially on insert. They are:
@@ -98,6 +103,7 @@ pub const ROW_ID_FIELD_ID: FieldId = 0;
 /// - Used for joins, filters, and row-level operations
 pub type RowId = u64;
 
+// TODO: Move to llkv-types?
 /// Globally unique identifier for a column in the storage engine.
 ///
 /// A `LogicalFieldId` combines three components into a single 64-bit value:

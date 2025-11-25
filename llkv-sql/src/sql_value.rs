@@ -3,11 +3,11 @@ use crate::{
     sql_engine::register_placeholder,
 };
 use llkv_compute::date::parse_date32_literal;
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::IntervalValue;
 use llkv_plan::plans::PlanValue;
 use llkv_plan::{add_interval_to_date32, subtract_interval_from_date32};
 use llkv_result::Error;
+use llkv_types::decimal::DecimalValue;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr as SqlExpr, TypedString, UnaryOperator, Value, ValueWithSpan,
