@@ -9,13 +9,12 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-    IntervalMonthDayNanoArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    StringArray, UInt64Array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
-use arrow_array::types::{Int32Type, Int64Type, IntervalMonthDayNanoType};
+use arrow_array::types::{Int32Type, Int64Type};
 use time::{Date, Month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,10 +38,16 @@ use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
-use llkv_compute::date::{
-    add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
+use llkv_compute::projection::{
+    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
+    synthesize_computed_literal_array,
 };
-use llkv_expr::literal::{FromLiteral, IntervalValue, Literal};
+use llkv_compute::rowids::{
+    difference_sorted, difference_sorted_slice, filter_row_ids_by_operator, intersect_sorted,
+    normalize_row_ids, union_sorted,
+};
+use llkv_compute::scalar::interval::compare_interval_values;
+use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
@@ -486,11 +491,7 @@ pub(crate) struct ColumnProjectionInfo {
     output_name: String,
 }
 
-#[derive(Clone)]
-pub(crate) struct ComputedProjectionInfo {
-    expr: ScalarExpr<FieldId>,
-    alias: String,
-}
+pub(crate) type ComputedProjectionInfo = ComputedLiteralInfo<FieldId>;
 
 #[derive(Clone)]
 pub(crate) enum ProjectionEval {
@@ -993,7 +994,12 @@ where
             let row_count = usize::try_from(total_rows).map_err(|_| {
                 Error::InvalidArgumentError("table row count exceeds supported range".into())
             })?;
-            emit_synthetic_null_batch(projection_evals, out_schema, row_count, on_batch)?;
+            let projection_literals = build_projection_literals(projection_evals, out_schema);
+            if let Some(batch) =
+                emit_synthetic_null_batch(&projection_literals, out_schema, row_count)?
+            {
+                on_batch(batch);
+            }
         }
 
         Ok(StreamOutcome::Handled)
@@ -1323,12 +1329,12 @@ where
                 let row_count = usize::try_from(total_rows).map_err(|_| {
                     Error::InvalidArgumentError("table row count exceeds supported range".into())
                 })?;
-                emit_synthetic_null_batch(
-                    &projection_evals,
-                    &out_schema,
-                    row_count,
-                    &mut on_batch,
-                )?;
+                let projection_literals = build_projection_literals(&projection_evals, &out_schema);
+                if let Some(batch) =
+                    emit_synthetic_null_batch(&projection_literals, &out_schema, row_count)?
+                {
+                    on_batch(batch);
+                }
             }
             return Ok(());
         }
@@ -1485,7 +1491,7 @@ where
                             "affine extraction resolved to unexpected field".into(),
                         ));
                     }
-                    if !is_supported_numeric(&dtype) {
+                    if !NumericKernels::is_supported_numeric(&dtype) {
                         return Ok(StreamOutcome::Fallback);
                     }
                     if matches!(
@@ -1628,8 +1634,8 @@ where
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
     ) -> LlkvResult<Option<bool>> {
-        let left_lit_opt = evaluate_constant_literal_expr(left)?;
-        let right_lit_opt = evaluate_constant_literal_expr(right)?;
+        let left_lit_opt = NumericKernels::evaluate_constant_literal_expr(left)?;
+        let right_lit_opt = NumericKernels::evaluate_constant_literal_expr(right)?;
 
         let left_lit = match left_lit_opt {
             Some(Literal::Null) | None => return Ok(None),
@@ -3497,195 +3503,6 @@ fn get_field_dtype(
     }
 }
 
-fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
-    match literal {
-        Literal::Integer(_) => Ok(DataType::Int64),
-        Literal::Float(_) => Ok(DataType::Float64),
-        Literal::Decimal(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
-        Literal::Boolean(_) => Ok(DataType::Boolean),
-        Literal::String(_) => Ok(DataType::Utf8),
-        Literal::Date32(_) => Ok(DataType::Date32),
-        Literal::Interval(_) => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
-        Literal::Null => Ok(DataType::Null),
-        Literal::Struct(fields) => {
-            let inferred_fields = fields
-                .iter()
-                .map(|(name, nested)| {
-                    let dtype = infer_literal_datatype(nested.as_ref())?;
-                    Ok(Field::new(name.clone(), dtype, true))
-                })
-                .collect::<LlkvResult<Vec<_>>>()?;
-            Ok(DataType::Struct(inferred_fields.into()))
-        }
-    }
-}
-
-#[inline]
-fn interval_value_to_arrow(
-    value: IntervalValue,
-) -> <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native {
-    <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native::new(
-        value.months,
-        value.days,
-        value.nanos,
-    )
-}
-
-#[inline]
-fn compare_interval_values(lhs: IntervalValue, rhs: IntervalValue) -> Ordering {
-    (lhs.months, lhs.days, lhs.nanos).cmp(&(rhs.months, rhs.days, rhs.nanos))
-}
-
-fn synthesize_computed_literal_array(
-    info: &ComputedProjectionInfo,
-    data_type: &DataType,
-    row_count: usize,
-) -> LlkvResult<ArrayRef> {
-    if row_count == 0 {
-        return Ok(new_null_array(data_type, 0));
-    }
-
-    match &info.expr {
-        ScalarExpr::Literal(Literal::Integer(value)) => {
-            let v = i64::try_from(*value).map_err(|_| {
-                Error::InvalidArgumentError(
-                    "integer literal exceeds supported range for INT64 column".into(),
-                )
-            })?;
-            Ok(Arc::new(Int64Array::from(vec![v; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Float(value)) => {
-            Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Decimal(value)) => {
-            let iter = std::iter::repeat_n(value.raw_value(), row_count);
-            let precision = std::cmp::max(value.precision(), value.scale() as u8);
-            let array = Decimal128Array::from_iter_values(iter)
-                .with_precision_and_scale(precision, value.scale())
-                .map_err(|err| {
-                    Error::InvalidArgumentError(format!(
-                        "failed to build Decimal128 literal array: {err}"
-                    ))
-                })?;
-            Ok(Arc::new(array) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Boolean(value)) => {
-            Ok(Arc::new(BooleanArray::from(vec![*value; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::String(value)) => {
-            Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Date32(value)) => {
-            Ok(Arc::new(Date32Array::from(vec![*value; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Interval(value)) => {
-            let native = interval_value_to_arrow(*value);
-            Ok(Arc::new(IntervalMonthDayNanoArray::from(vec![native; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Null) => Ok(new_null_array(data_type, row_count)),
-        ScalarExpr::Literal(Literal::Struct(fields)) => {
-            // Build a struct array from the literal fields
-            use arrow::array::StructArray;
-
-            // Convert each field to an array
-            let mut field_arrays = Vec::new();
-            let mut arrow_fields = Vec::new();
-
-            for (field_name, field_literal) in fields {
-                // Infer the proper data type from the literal
-                let field_dtype = infer_literal_datatype(field_literal.as_ref())?;
-                arrow_fields.push(Field::new(field_name.clone(), field_dtype.clone(), true));
-
-                // Create the array for this field
-                let field_array = match field_literal.as_ref() {
-                    Literal::Integer(v) => {
-                        let int_val = i64::try_from(*v).unwrap_or(0);
-                        Arc::new(Int64Array::from(vec![int_val; row_count])) as ArrayRef
-                    }
-                    Literal::Float(v) => {
-                        Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
-                    }
-                    Literal::Decimal(v) => {
-                        let iter = std::iter::repeat_n(v.raw_value(), row_count);
-                        let precision = std::cmp::max(v.precision(), v.scale() as u8);
-                        let array = Decimal128Array::from_iter_values(iter)
-                            .with_precision_and_scale(precision, v.scale())
-                            .map_err(|err| {
-                                Error::InvalidArgumentError(format!(
-                                    "failed to build Decimal128 literal array: {err}"
-                                ))
-                            })?;
-                        Arc::new(array) as ArrayRef
-                    }
-                    Literal::Boolean(v) => {
-                        Arc::new(BooleanArray::from(vec![*v; row_count])) as ArrayRef
-                    }
-                    Literal::String(v) => {
-                        Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
-                    }
-                    Literal::Date32(v) => {
-                        Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
-                    }
-                    Literal::Interval(v) => Arc::new(IntervalMonthDayNanoArray::from(vec![
-                        interval_value_to_arrow(*v);
-                        row_count
-                    ])) as ArrayRef,
-                    Literal::Null => new_null_array(&field_dtype, row_count),
-                    Literal::Struct(nested_fields) => {
-                        // Recursively build nested struct
-                        // Create a temporary ComputedProjectionInfo for nested struct
-                        let nested_info = ComputedProjectionInfo {
-                            expr: ScalarExpr::Literal(Literal::Struct(nested_fields.clone())),
-                            alias: field_name.clone(),
-                        };
-                        synthesize_computed_literal_array(&nested_info, &field_dtype, row_count)?
-                    }
-                };
-
-                field_arrays.push(field_array);
-            }
-
-            let struct_array = StructArray::try_new(
-                arrow_fields.into(),
-                field_arrays,
-                None, // No null buffer
-            )
-            .map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
-
-            Ok(Arc::new(struct_array) as ArrayRef)
-        }
-        ScalarExpr::Cast {
-            expr,
-            data_type: target_type,
-        } => {
-            let inner_dtype = match expr.as_ref() {
-                ScalarExpr::Literal(lit) => infer_literal_datatype(lit)?,
-                ScalarExpr::Cast { data_type, .. } => data_type.clone(),
-                _ => return Ok(new_null_array(data_type, row_count)),
-            };
-
-            let inner_info = ComputedProjectionInfo {
-                expr: expr.as_ref().clone(),
-                alias: info.alias.clone(),
-            };
-            let inner = synthesize_computed_literal_array(&inner_info, &inner_dtype, row_count)?;
-            compute::cast(&inner, target_type)
-                .map_err(|e| Error::InvalidArgumentError(format!("failed to cast literal: {e}")))
-        }
-        ScalarExpr::Column(_)
-        | ScalarExpr::Binary { .. }
-        | ScalarExpr::Compare { .. }
-        | ScalarExpr::Aggregate(_)
-        | ScalarExpr::GetField { .. }
-        | ScalarExpr::Not(_)
-        | ScalarExpr::IsNull { .. }
-        | ScalarExpr::Case { .. }
-        | ScalarExpr::Coalesce(_)
-        | ScalarExpr::Random => Ok(new_null_array(data_type, row_count)),
-        ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
-    }
-}
-
 fn plan_graph_err(err: PlanGraphError) -> Error {
     Error::Internal(format!("plan graph construction failed: {err}"))
 }
@@ -4703,13 +4520,6 @@ where
     }
 }
 
-// TODO: Move to llkv-compute
-fn normalize_row_ids(mut row_ids: Vec<RowId>) -> Vec<RowId> {
-    row_ids.sort_unstable();
-    row_ids.dedup();
-    row_ids
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_row_window<P>(
     store: &llkv_column_map::store::ColumnStore<P>,
@@ -4883,267 +4693,23 @@ where
     Ok(Some(batch))
 }
 
-// TODO: Move to llkv-compute
-fn emit_synthetic_null_batch<F>(
+fn build_projection_literals(
     projection_evals: &[ProjectionEval],
     out_schema: &Arc<Schema>,
-    row_count: usize,
-    on_batch: &mut F,
-) -> LlkvResult<()>
-where
-    F: FnMut(RecordBatch),
-{
-    if row_count == 0 {
-        return Ok(());
-    }
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-    for (idx, eval) in projection_evals.iter().enumerate() {
-        let array = match eval {
-            ProjectionEval::Column(info) => new_null_array(&info.data_type, row_count),
-            ProjectionEval::Computed(info) => synthesize_computed_literal_array(
-                info,
-                out_schema.field(idx).data_type(),
-                row_count,
-            )?,
-        };
-        columns.push(array);
-    }
-
-    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns)?;
-    on_batch(batch);
-    Ok(())
-}
-
-// TODO: Move to llkv-compute
-fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
-    u64::from_literal(lit)
-        .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
-}
-
-// TODO: Move to llkv-compute
-fn lower_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
-    Ok(match bound {
-        Bound::Unbounded => 0,
-        Bound::Included(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid < value)
-        }
-        Bound::Excluded(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid <= value)
-        }
-    })
-}
-
-// TODO: Move to llkv-compute
-fn upper_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
-    Ok(match bound {
-        Bound::Unbounded => row_ids.len(),
-        Bound::Included(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid <= value)
-        }
-        Bound::Excluded(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid < value)
-        }
-    })
-}
-
-// TODO: Move to llkv-compute (and vectorize, if possible)
-fn filter_row_ids_by_operator(row_ids: &[RowId], op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
-    use Operator::*;
-
-    match op {
-        Equals(lit) => {
-            let value = literal_to_u64(lit)?;
-            match row_ids.binary_search(&value) {
-                Ok(idx) => Ok(vec![row_ids[idx]]),
-                Err(_) => Ok(Vec::new()),
-            }
-        }
-        GreaterThan(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid <= value);
-            Ok(row_ids[idx..].to_vec())
-        }
-        GreaterThanOrEquals(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid < value);
-            Ok(row_ids[idx..].to_vec())
-        }
-        LessThan(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid < value);
-            Ok(row_ids[..idx].to_vec())
-        }
-        LessThanOrEquals(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid <= value);
-            Ok(row_ids[..idx].to_vec())
-        }
-        Range { lower, upper } => {
-            let start = lower_bound_index(row_ids, lower)?;
-            let end = upper_bound_index(row_ids, upper)?;
-            if start >= end {
-                Ok(Vec::new())
-            } else {
-                Ok(row_ids[start..end].to_vec())
-            }
-        }
-        In(literals) => {
-            if literals.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut targets = FxHashSet::default();
-            for lit in *literals {
-                targets.insert(literal_to_u64(lit)?);
-            }
-            if targets.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut matches = Vec::with_capacity(targets.len());
-            for &rid in row_ids {
-                if targets.remove(&rid) {
-                    matches.push(rid);
-                    if targets.is_empty() {
-                        break;
-                    }
-                }
-            }
-            Ok(matches)
-        }
-        StartsWith { .. } | EndsWith { .. } | Contains { .. } => Err(Error::InvalidArgumentError(
-            "rowid predicates do not support string pattern matching".into(),
-        )),
-        IsNull | IsNotNull => Err(Error::InvalidArgumentError(
-            "rowid predicates do not support null checks".into(),
-        )),
-    }
-}
-
-// TODO: Move to llkv-compute (and vectorize, if possible)
-fn intersect_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
-    let mut result = Vec::with_capacity(left.len().min(right.len()));
-    let mut i = 0;
-    let mut j = 0;
-    while i < left.len() && j < right.len() {
-        let lv = left[i];
-        let rv = right[j];
-        if lv == rv {
-            result.push(lv);
-            i += 1;
-            j += 1;
-        } else if lv < rv {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    result
-}
-
-// TODO: Move to llkv-compute (and vectorize, if possible)
-fn union_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
-    if left.is_empty() {
-        return right;
-    }
-    if right.is_empty() {
-        return left;
-    }
-
-    let mut result = Vec::with_capacity(left.len() + right.len());
-    let mut i = 0;
-    let mut j = 0;
-    while i < left.len() && j < right.len() {
-        let lv = left[i];
-        let rv = right[j];
-        if lv == rv {
-            result.push(lv);
-            i += 1;
-            j += 1;
-        } else if lv < rv {
-            result.push(lv);
-            i += 1;
-        } else {
-            result.push(rv);
-            j += 1;
-        }
-    }
-
-    while i < left.len() {
-        result.push(left[i]);
-        i += 1;
-    }
-    while j < right.len() {
-        result.push(right[j]);
-        j += 1;
-    }
-
-    result.dedup();
-    result
-}
-
-// TODO: Move to llkv-compute (and vectorize, if possible)
-fn difference_sorted(base: Vec<RowId>, subtract: Vec<RowId>) -> Vec<RowId> {
-    if base.is_empty() || subtract.is_empty() {
-        return base;
-    }
-
-    let mut result = Vec::with_capacity(base.len());
-    let mut i = 0;
-    let mut j = 0;
-    while i < base.len() && j < subtract.len() {
-        let bv = base[i];
-        let sv = subtract[j];
-        if bv == sv {
-            i += 1;
-            j += 1;
-        } else if bv < sv {
-            result.push(bv);
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    while i < base.len() {
-        result.push(base[i]);
-        i += 1;
-    }
-    result
-}
-
-// TODO: Move to llkv-compute (and vectorize, if possible)
-fn difference_sorted_slice(base: &[RowId], subtract: &[RowId]) -> Vec<RowId> {
-    if base.is_empty() {
-        return Vec::new();
-    }
-    if subtract.is_empty() {
-        return base.to_vec();
-    }
-
-    let mut result = Vec::with_capacity(base.len());
-    let mut i = 0;
-    let mut j = 0;
-    while i < base.len() && j < subtract.len() {
-        let bv = base[i];
-        let sv = subtract[j];
-        if bv == sv {
-            i += 1;
-            j += 1;
-        } else if bv < sv {
-            result.push(bv);
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    while i < base.len() {
-        result.push(base[i]);
-        i += 1;
-    }
-    result
+) -> Vec<ProjectionLiteral<FieldId>> {
+    projection_evals
+        .iter()
+        .enumerate()
+        .map(|(idx, eval)| match eval {
+            ProjectionEval::Column(_) => ProjectionLiteral::Column {
+                data_type: out_schema.field(idx).data_type().clone(),
+            },
+            ProjectionEval::Computed(info) => ProjectionLiteral::Computed {
+                info: info.clone(),
+                data_type: out_schema.field(idx).data_type().clone(),
+            },
+        })
+        .collect()
 }
 
 fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
@@ -5157,270 +4723,6 @@ fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
         }
     }
     row_ids
-}
-
-// TODO: Move to llkv-compute
-fn array_value_to_literal(array: &ArrayRef, index: usize) -> LlkvResult<Literal> {
-    use arrow::datatypes::*;
-    if array.is_null(index) {
-        return Ok(Literal::Null);
-    }
-    match array.data_type() {
-        DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int8Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int16Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int32Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::UInt8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::UInt8Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::UInt16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::UInt16Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::UInt32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::UInt32Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::UInt64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-                .unwrap();
-            Ok(Literal::Integer(arr.value(index) as i128))
-        }
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Float32Array>()
-                .unwrap();
-            Ok(Literal::Float(arr.value(index) as f64))
-        }
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .unwrap();
-            Ok(Literal::Float(arr.value(index)))
-        }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .unwrap();
-            Ok(Literal::String(arr.value(index).to_string()))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
-                .unwrap();
-            Ok(Literal::String(arr.value(index).to_string()))
-        }
-        DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .unwrap();
-            Ok(Literal::Boolean(arr.value(index)))
-        }
-        DataType::Date32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Date32Array>()
-                .unwrap();
-            Ok(Literal::Date32(arr.value(index)))
-        }
-        DataType::Decimal128(_, scale) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::Decimal128Array>()
-                .unwrap();
-            let val = arr.value(index);
-            Ok(Literal::Decimal(DecimalValue::new(val, *scale).unwrap()))
-        }
-        _ => Err(Error::Internal(format!(
-            "Unsupported type for literal conversion: {:?}",
-            array.data_type()
-        ))),
-    }
-}
-
-// TODO: Move to llkv-compute?
-fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
-    let simplified = NumericKernels::simplify(expr);
-
-    if let Some(literal) = evaluate_constant_literal_non_numeric(&simplified)? {
-        return Ok(Some(literal));
-    }
-
-    if let ScalarExpr::Literal(lit) = &simplified {
-        return Ok(Some(lit.clone()));
-    }
-
-    let arrays = NumericArrayMap::default();
-    let array = NumericKernels::evaluate_value(&simplified, 0, &arrays)?;
-    if array.is_null(0) {
-        return Ok(None);
-    }
-    Ok(Some(array_value_to_literal(&array, 0)?))
-}
-
-// TODO: Move to llkv-compute?
-fn evaluate_constant_literal_non_numeric(
-    expr: &ScalarExpr<FieldId>,
-) -> LlkvResult<Option<Literal>> {
-    match expr {
-        ScalarExpr::Literal(lit) => Ok(Some(lit.clone())),
-        ScalarExpr::Cast {
-            expr,
-            data_type: DataType::Date32,
-        } => {
-            let inner = evaluate_constant_literal_non_numeric(expr)?;
-            match inner {
-                Some(Literal::Null) => Ok(Some(Literal::Null)),
-                Some(Literal::String(text)) => {
-                    let days = parse_date32_literal(&text)?;
-                    Ok(Some(Literal::Date32(days)))
-                }
-                Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
-                Some(other) => Err(Error::InvalidArgumentError(format!(
-                    "cannot cast literal of type {} to DATE",
-                    literal_type_name(&other)
-                ))),
-                None => Ok(None),
-            }
-        }
-        ScalarExpr::Cast { .. } => Ok(None),
-        ScalarExpr::Binary { left, op, right } => {
-            let left_lit = match evaluate_constant_literal_non_numeric(left)? {
-                Some(lit) => lit,
-                None => return Ok(None),
-            };
-            let right_lit = match evaluate_constant_literal_non_numeric(right)? {
-                Some(lit) => lit,
-                None => return Ok(None),
-            };
-
-            if matches!(left_lit, Literal::Null) || matches!(right_lit, Literal::Null) {
-                return Ok(Some(Literal::Null));
-            }
-
-            match op {
-                BinaryOp::Add => match (&left_lit, &right_lit) {
-                    (Literal::Date32(days), Literal::Interval(interval))
-                    | (Literal::Interval(interval), Literal::Date32(days)) => {
-                        let adjusted = add_interval_to_date32(*days, *interval)?;
-                        Ok(Some(Literal::Date32(adjusted)))
-                    }
-                    (Literal::Interval(left), Literal::Interval(right)) => {
-                        let sum = left.checked_add(*right).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "interval addition overflow during constant folding".into(),
-                            )
-                        })?;
-                        Ok(Some(Literal::Interval(sum)))
-                    }
-                    _ => Ok(None),
-                },
-                BinaryOp::Subtract => match (&left_lit, &right_lit) {
-                    (Literal::Date32(days), Literal::Interval(interval)) => {
-                        let adjusted = subtract_interval_from_date32(*days, *interval)?;
-                        Ok(Some(Literal::Date32(adjusted)))
-                    }
-                    (Literal::Interval(left), Literal::Interval(right)) => {
-                        let diff = left.checked_sub(*right).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "interval subtraction overflow during constant folding".into(),
-                            )
-                        })?;
-                        Ok(Some(Literal::Interval(diff)))
-                    }
-                    (Literal::Date32(lhs), Literal::Date32(rhs)) => {
-                        let delta = i64::from(*lhs) - i64::from(*rhs);
-                        if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
-                            return Err(Error::InvalidArgumentError(
-                                "DATE subtraction overflowed day precision".into(),
-                            ));
-                        }
-                        Ok(Some(Literal::Interval(IntervalValue::new(
-                            0,
-                            delta as i32,
-                            0,
-                        ))))
-                    }
-                    _ => Ok(None),
-                },
-                _ => Ok(None),
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
-// TODO: Move to llkv-compute?
-fn literal_type_name(literal: &Literal) -> &'static str {
-    match literal {
-        Literal::Null => "NULL",
-        Literal::Integer(_) => "INTEGER",
-        Literal::Float(_) => "FLOAT",
-        Literal::Decimal(_) => "DECIMAL",
-        Literal::String(_) => "STRING",
-        Literal::Boolean(_) => "BOOLEAN",
-        Literal::Date32(_) => "DATE",
-        Literal::Struct(_) => "STRUCT",
-        Literal::Interval(_) => "INTERVAL",
-    }
-}
-
-// TODO: Move to llkv-compute
-fn is_supported_numeric(dtype: &DataType) -> bool {
-    matches!(
-        dtype,
-        DataType::UInt64
-            | DataType::UInt32
-            | DataType::UInt16
-            | DataType::UInt8
-            | DataType::Int64
-            | DataType::Int32
-            | DataType::Int16
-            | DataType::Int8
-            | DataType::Float64
-            | DataType::Float32
-    )
 }
 
 // Ensure macro_rules! definitions above are considered used by the compiler.

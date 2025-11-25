@@ -10576,6 +10576,7 @@ fn extract_struct_field(literal: &Literal, field_name: &str) -> Option<Literal> 
     None
 }
 
+// TODO: Dedupe with version in llkv-compute
 fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Literal> {
     if array.is_null(idx) {
         return Ok(Literal::Null);
