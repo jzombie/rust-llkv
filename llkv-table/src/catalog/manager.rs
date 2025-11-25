@@ -1460,8 +1460,6 @@ fn field_id_for_index(idx: usize) -> LlkvResult<FieldId> {
     })
 }
 
-
-
 /// Parse a SQL type string (e.g., "INTEGER") back into a DataType.
 fn parse_data_type_from_sql(sql: &str) -> LlkvResult<sqlparser::ast::DataType> {
     use sqlparser::dialect::GenericDialect;
