@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use arrow_buffer::IntervalMonthDayNano;
-use llkv_expr::literal::IntervalValue;
+use llkv_types::interval::IntervalValue;
 
 #[inline]
 pub fn interval_value_to_arrow(value: IntervalValue) -> IntervalMonthDayNano {

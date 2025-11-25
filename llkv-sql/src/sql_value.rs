@@ -2,12 +2,12 @@ use crate::{
     SqlResult, interval::parse_interval_literal, sql_engine::placeholder_marker,
     sql_engine::register_placeholder,
 };
-use llkv_executor::utils::parse_date32_literal;
-use llkv_expr::decimal::DecimalValue;
+use llkv_compute::date::parse_date32_literal;
 use llkv_expr::literal::IntervalValue;
 use llkv_plan::plans::PlanValue;
 use llkv_plan::{add_interval_to_date32, subtract_interval_from_date32};
 use llkv_result::Error;
+use llkv_types::decimal::DecimalValue;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr as SqlExpr, TypedString, UnaryOperator, Value, ValueWithSpan,
@@ -235,6 +235,7 @@ impl From<SqlValue> for PlanValue {
     }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn add_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     match (lhs, rhs) {
         (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
@@ -256,6 +257,7 @@ fn add_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn subtract_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     match (lhs, rhs) {
         (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
@@ -282,6 +284,7 @@ fn subtract_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     if matches!(lhs, SqlValue::Null) || matches!(rhs, SqlValue::Null) {
         return Ok(SqlValue::Null);

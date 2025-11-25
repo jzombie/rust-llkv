@@ -1,124 +1,16 @@
+// TODO: Move entirely to llkv-types?
+
 //! Untyped literal values plus helpers for converting them into native types.
 //!
 //! Literals capture query parameters before a table knows the concrete Arrow
 //! type of each column. Conversion helpers here defer type checking until the
 //! caller can perform schema-aware coercion.
-use crate::decimal::DecimalValue;
+
 use arrow::datatypes::ArrowPrimitiveType;
 use std::ops::Bound;
 
-/// Interval value stored as a combination of calendar months, whole days, and nanoseconds.
-///
-/// Months capture both month and year components (12 months == 1 year). Days represent
-/// whole 24-hour periods and nanoseconds account for sub-day precision. This mirrors the
-/// semantics of Arrow's `IntervalMonthDayNano` while keeping arithmetic manageable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct IntervalValue {
-    pub months: i32,
-    pub days: i32,
-    pub nanos: i64,
-}
-
-impl IntervalValue {
-    pub const fn new(months: i32, days: i32, nanos: i64) -> Self {
-        Self {
-            months,
-            days,
-            nanos,
-        }
-    }
-
-    pub const fn zero() -> Self {
-        Self::new(0, 0, 0)
-    }
-
-    pub fn checked_add(self, other: Self) -> Option<Self> {
-        Some(Self {
-            months: self.months.checked_add(other.months)?,
-            days: self.days.checked_add(other.days)?,
-            nanos: self.nanos.checked_add(other.nanos)?,
-        })
-    }
-
-    pub fn checked_sub(self, other: Self) -> Option<Self> {
-        Some(Self {
-            months: self.months.checked_sub(other.months)?,
-            days: self.days.checked_sub(other.days)?,
-            nanos: self.nanos.checked_sub(other.nanos)?,
-        })
-    }
-
-    pub fn checked_neg(self) -> Option<Self> {
-        Some(Self {
-            months: self.months.checked_neg()?,
-            days: self.days.checked_neg()?,
-            nanos: self.nanos.checked_neg()?,
-        })
-    }
-
-    pub fn checked_scale(self, factor: i64) -> Option<Self> {
-        let months = i64::from(self.months).checked_mul(factor)?;
-        let days = i64::from(self.days).checked_mul(factor)?;
-        let nanos = self.nanos.checked_mul(factor)?;
-        Some(Self {
-            months: months.try_into().ok()?,
-            days: days.try_into().ok()?,
-            nanos,
-        })
-    }
-
-    pub const fn is_zero(self) -> bool {
-        self.months == 0 && self.days == 0 && self.nanos == 0
-    }
-}
-
-/// A literal value that has not yet been coerced into a specific native
-/// type. This allows for type inference to be deferred until the column
-/// type is known.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
-    Null,
-    Integer(i128),
-    Float(f64),
-    /// Decimal literal stored as scaled integer with fixed precision.
-    Decimal(DecimalValue),
-    String(String),
-    Boolean(bool),
-    /// Date literal stored as days since the Unix epoch (1970-01-01).
-    Date32(i32),
-    /// Struct literal with field names and nested literals
-    Struct(Vec<(String, Box<Literal>)>),
-    /// Interval literal with mixed calendar and sub-day precision.
-    Interval(IntervalValue),
-    // Other types like Bytes, etc. can be added here.
-}
-
-macro_rules! impl_from_for_literal {
-    ($variant:ident, $($t:ty),*) => {
-        $(
-            impl From<$t> for Literal {
-                fn from(v: $t) -> Self {
-                    Literal::$variant(v.into())
-                }
-            }
-        )*
-    };
-}
-
-impl_from_for_literal!(Integer, i8, i16, i32, i64, i128, u8, u16, u32, u64);
-impl_from_for_literal!(Float, f32, f64);
-
-impl From<&str> for Literal {
-    fn from(v: &str) -> Self {
-        Literal::String(v.to_string())
-    }
-}
-
-impl From<bool> for Literal {
-    fn from(v: bool) -> Self {
-        Literal::Boolean(v)
-    }
-}
+pub use llkv_types::interval::IntervalValue;
+pub use llkv_types::literal::Literal;
 
 /// Error converting a `Literal` into a concrete native type.
 #[derive(Debug, Clone, PartialEq)]

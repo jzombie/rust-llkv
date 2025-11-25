@@ -1,16 +1,16 @@
 //! Helper functions for value coercion and data preparation used during inserts.
 
-use crate::utils::date::parse_date32_literal;
-use crate::utils::interval::interval_value_to_arrow;
-use crate::utils::{
-    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
-    truncate_decimal_to_i64,
-};
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Decimal128Array, Float64Builder, Int64Builder,
     IntervalMonthDayNanoArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, FieldRef, IntervalUnit};
+use llkv_compute::date::parse_date32_literal;
+use llkv_compute::scalar::decimal::{
+    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
+    truncate_decimal_to_i64,
+};
+use llkv_compute::scalar::interval::interval_value_to_arrow;
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use std::sync::Arc;

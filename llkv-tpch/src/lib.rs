@@ -6,7 +6,6 @@
 //! unmodified while still producing a structured manifest the caller can inspect.
 
 use llkv::Error as LlkvError;
-use llkv_expr::decimal::DecimalValue;
 use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue, parse_date32_literal};
 use llkv_sql::{
     SqlEngine, SqlTypeFamily, canonical_table_ident, classify_sql_data_type,
@@ -14,6 +13,7 @@ use llkv_sql::{
     tpch::strip_tpch_connect_statements,
 };
 use llkv_table::ConstraintEnforcementMode;
+use llkv_types::decimal::DecimalValue;
 use regex::Regex;
 use sqlparser::ast::{
     AlterTableOperation, CreateTable, Ident, ObjectNamePart, Statement, TableConstraint,

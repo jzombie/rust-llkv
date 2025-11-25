@@ -20,14 +20,15 @@ crossbeam-channel.workspace = true
 llkv-column-map.workspace = true
 llkv-compute.workspace = true
 llkv-expr.workspace = true
+llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
-llkv-plan.workspace = true
-sqlparser.workspace = true
+llkv-types.workspace = true
 rand.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
+sqlparser.workspace = true
 tracing.workspace = true
 time.workspace = true
 

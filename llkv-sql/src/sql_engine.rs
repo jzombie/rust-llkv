@@ -17,7 +17,6 @@ use arrow::row::{RowConverter, SortField};
 
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_executor::{SelectExecution, push_query_label};
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::literal::Literal;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
@@ -37,6 +36,7 @@ use llkv_runtime::{
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use llkv_table::{CatalogDdl, ConstraintEnforcementMode, TriggerEventMeta, TriggerTimingMeta};
+use llkv_types::decimal::DecimalValue;
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{

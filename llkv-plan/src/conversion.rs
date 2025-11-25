@@ -4,8 +4,8 @@
 //! llkv-plan data structures, particularly for literal value conversion
 //! and range SELECT parsing.
 
-use llkv_expr::decimal::DecimalValue;
 use llkv_result::{Error, Result};
+use llkv_types::decimal::DecimalValue;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     DataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName,
@@ -13,8 +13,10 @@ use sqlparser::ast::{
     TypedString, UnaryOperator, Value, ValueWithSpan,
 };
 
-use crate::{PlanValue, date::parse_date32_literal, interval::parse_interval_literal};
+use crate::{PlanValue, interval::parse_interval_literal};
+use llkv_compute::date::parse_date32_literal;
 
+// TODO: Move to llkv-sql?
 /// Convert a SQL expression to a PlanValue literal.
 ///
 /// Supports:
@@ -92,6 +94,7 @@ pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
     }
 }
 
+// TODO: Move to PlanValue as impl method?
 fn plan_value_from_typed_string(typed: &TypedString) -> Result<PlanValue> {
     let text = typed.value.value.clone().into_string().ok_or_else(|| {
         Error::InvalidArgumentError("typed string literal must be a quoted string".into())
@@ -106,6 +109,7 @@ fn plan_value_from_typed_string(typed: &TypedString) -> Result<PlanValue> {
     }
 }
 
+// TODO: Move to llkv-sql?
 /// Convert a SQL value literal to a PlanValue.
 ///
 /// Handles:

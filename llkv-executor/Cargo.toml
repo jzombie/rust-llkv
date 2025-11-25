@@ -23,6 +23,7 @@ llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
+llkv-types.workspace = true
 rand.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true

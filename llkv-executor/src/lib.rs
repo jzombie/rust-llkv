@@ -8,7 +8,6 @@
 //! - [`translation`]: Expression and projection translation utilities
 //! - [`types`]: Core type definitions (tables, schemas, columns)  
 //! - [`insert`]: INSERT operation support (value coercion)
-//! - [`utils`]: Utility functions (time)
 //!
 //! The [`QueryExecutor`] and [`SelectExecution`] implementations are defined inline
 //! in this module for now, but should be extracted to a dedicated `query` module
@@ -16,12 +15,13 @@
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal128Builder,
-    Float32Array, Float64Array, Float64Builder, Int8Array, Int16Array, Int32Array, Int64Array,
-    Int64Builder, IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray,
-    StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_null_array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Int64Builder,
+    IntervalMonthDayNanoArray, LargeStringArray, RecordBatch, StringArray, StructArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow::compute::{
-    SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, take,
+    SortColumn, SortOptions, cast, concat_batches, filter_record_batch, lexsort_to_indices, not,
+    or_kleene, take,
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, IntervalUnit, Schema};
 use arrow::row::{RowConverter, SortField};
@@ -31,7 +31,6 @@ use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_expr::SubqueryId;
-use llkv_expr::decimal::DecimalValue;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
 };
@@ -52,7 +51,8 @@ use llkv_table::table::{
     ScanStreamOptions,
 };
 use llkv_table::types::FieldId;
-use llkv_table::{NumericArray, NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
+use llkv_table::{NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
+use llkv_types::decimal::DecimalValue;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -71,7 +71,6 @@ use std::cell::RefCell;
 pub mod insert;
 pub mod translation;
 pub mod types;
-pub mod utils;
 
 // ============================================================================
 // Type Aliases and Re-exports
@@ -81,16 +80,17 @@ pub mod utils;
 pub type ExecutorResult<T> = Result<T, Error>;
 
 use crate::translation::schema::infer_computed_data_type;
-use crate::utils::interval::{
-    compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
-};
-use crate::utils::{
-    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
-    format_date32_literal, parse_date32_literal,
-};
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
+use llkv_compute::date::{format_date32_literal, parse_date32_literal};
+use llkv_compute::scalar::decimal::{
+    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
+};
+use llkv_compute::scalar::interval::{
+    compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
+};
+pub use llkv_compute::time::current_time_micros;
 pub use translation::{
     build_projected_columns, build_wildcard_projections, full_table_scan_filter,
     resolve_field_id_from_schema, schema_for_projections, translate_predicate,
@@ -100,7 +100,6 @@ pub use types::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
     ExecutorTableProvider,
 };
-pub use utils::current_time_micros;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum GroupKeyValue {
@@ -842,7 +841,7 @@ where
         context: &mut CrossProductExpressionContext,
         subquery: &llkv_plan::ScalarSubquery,
         batch: &RecordBatch,
-    ) -> ExecutorResult<NumericArray> {
+    ) -> ExecutorResult<ArrayRef> {
         let row_count = batch.num_rows();
         let mut row_job_indices: Vec<usize> = Vec::with_capacity(row_count);
         let mut unique_bindings: Vec<FxHashMap<String, Literal>> = Vec::new();
@@ -936,10 +935,10 @@ where
         if all_integer {
             let iter = values.into_iter().map(|opt| opt.map(|v| v as i64));
             let array = Int64Array::from_iter(iter);
-            NumericArray::try_from_arrow(&(Arc::new(array) as ArrayRef))
+            Ok(Arc::new(array) as ArrayRef)
         } else {
             let array = Float64Array::from_iter(values);
-            NumericArray::try_from_arrow(&(Arc::new(array) as ArrayRef))
+            Ok(Arc::new(array) as ArrayRef)
         }
     }
 
@@ -1044,12 +1043,12 @@ where
 
     /// Convert a Literal to an Arrow array (recursive for nested structs)
     fn literal_to_array(lit: &llkv_expr::literal::Literal) -> ExecutorResult<(DataType, ArrayRef)> {
-        use crate::utils::interval::interval_value_to_arrow;
         use arrow::array::{
             ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
             IntervalMonthDayNanoArray, StringArray, StructArray, new_null_array,
         };
         use arrow::datatypes::{DataType, Field, IntervalUnit};
+        use llkv_compute::scalar::interval::interval_value_to_arrow;
         use llkv_expr::literal::Literal;
 
         match lit {
@@ -7208,7 +7207,7 @@ where
                             || matches!(&right_val, PlanValue::Decimal(_));
 
                         if has_decimal {
-                            use llkv_expr::decimal::DecimalValue;
+                            use llkv_types::decimal::DecimalValue;
 
                             // Convert both operands to Decimal
                             let left_dec = match &left_val {
@@ -7788,7 +7787,7 @@ where
 struct CrossProductExpressionContext {
     schema: Arc<ExecutorSchema>,
     field_id_to_index: FxHashMap<FieldId, usize>,
-    numeric_cache: FxHashMap<FieldId, NumericArray>,
+    numeric_cache: FxHashMap<FieldId, ArrayRef>,
     column_cache: FxHashMap<FieldId, ColumnAccessor>,
     scalar_subquery_columns: FxHashMap<SubqueryId, ColumnAccessor>,
     next_field_id: FieldId,
@@ -7879,16 +7878,14 @@ impl ColumnAccessor {
         }
     }
 
-    fn from_numeric_array(numeric: &NumericArray) -> ExecutorResult<Self> {
-        // Convert all numeric values to Float64 for compatibility with filter evaluation
-        let mut float_builder = Float64Builder::with_capacity(numeric.len());
-        for idx in 0..numeric.len() {
-            match numeric.value(idx) {
-                None => float_builder.append_null(),
-                Some(value) => float_builder.append_value(value.as_f64()),
-            }
-        }
-        Ok(Self::Float64(Arc::new(float_builder.finish())))
+    fn from_numeric_array(numeric: &ArrayRef) -> ExecutorResult<Self> {
+        let casted = cast(numeric, &DataType::Float64)?;
+        let float_array = casted
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("cast to Float64 failed")
+            .clone();
+        Ok(Self::Float64(Arc::new(float_array)))
     }
 
     fn len(&self) -> usize {
@@ -7951,7 +7948,7 @@ impl ColumnAccessor {
 
 #[derive(Clone)]
 enum ValueArray {
-    Numeric(NumericArray),
+    Numeric(ArrayRef),
     Boolean(Arc<BooleanArray>),
     Utf8(Arc<StringArray>),
     Interval(Arc<IntervalMonthDayNanoArray>),
@@ -7997,10 +7994,7 @@ impl ValueArray {
             | DataType::Date32
             | DataType::Float32
             | DataType::Float64
-            | DataType::Decimal128(_, _) => {
-                let numeric = NumericArray::try_from_arrow(&array)?;
-                Ok(Self::Numeric(numeric))
-            }
+            | DataType::Decimal128(_, _) => Ok(Self::Numeric(array)),
             other => Err(Error::InvalidArgumentError(format!(
                 "unsupported data type {:?} in cross product expression",
                 other
@@ -8015,6 +8009,16 @@ impl ValueArray {
             ValueArray::Utf8(array) => array.len(),
             ValueArray::Interval(array) => array.len(),
             ValueArray::Null(len) => *len,
+        }
+    }
+
+    fn as_array_ref(&self) -> ArrayRef {
+        match self {
+            ValueArray::Numeric(arr) => arr.clone(),
+            ValueArray::Boolean(arr) => arr.clone() as ArrayRef,
+            ValueArray::Utf8(arr) => arr.clone() as ArrayRef,
+            ValueArray::Interval(arr) => arr.clone() as ArrayRef,
+            ValueArray::Null(len) => new_null_array(&DataType::Null, *len),
         }
     }
 }
@@ -8040,42 +8044,6 @@ fn truth_not(value: Option<bool>) -> Option<bool> {
         Some(true) => Some(false),
         Some(false) => Some(true),
         None => None,
-    }
-}
-
-fn compare_bool(op: CompareOp, lhs: bool, rhs: bool) -> bool {
-    let l = lhs as u8;
-    let r = rhs as u8;
-    match op {
-        CompareOp::Eq => lhs == rhs,
-        CompareOp::NotEq => lhs != rhs,
-        CompareOp::Lt => l < r,
-        CompareOp::LtEq => l <= r,
-        CompareOp::Gt => l > r,
-        CompareOp::GtEq => l >= r,
-    }
-}
-
-fn compare_str(op: CompareOp, lhs: &str, rhs: &str) -> bool {
-    match op {
-        CompareOp::Eq => lhs == rhs,
-        CompareOp::NotEq => lhs != rhs,
-        CompareOp::Lt => lhs < rhs,
-        CompareOp::LtEq => lhs <= rhs,
-        CompareOp::Gt => lhs > rhs,
-        CompareOp::GtEq => lhs >= rhs,
-    }
-}
-
-fn finalize_in_list_result(has_match: bool, saw_null: bool, negated: bool) -> Option<bool> {
-    if has_match {
-        Some(!negated)
-    } else if saw_null {
-        None
-    } else if negated {
-        Some(true)
-    } else {
-        Some(false)
     }
 }
 
@@ -8684,82 +8652,23 @@ impl CrossProductExpressionContext {
         }
 
         let len = left_values.len();
-        match (&left_values, &right_values) {
-            (ValueArray::Null(_), _) | (_, ValueArray::Null(_)) => Ok(vec![None; len]),
-            (ValueArray::Numeric(lhs), ValueArray::Numeric(rhs)) => {
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    match (lhs.value(idx), rhs.value(idx)) {
-                        (Some(lv), Some(rv)) => out.push(Some(NumericKernels::compare(op, lv, rv))),
-                        _ => out.push(None),
-                    }
-                }
-                Ok(out)
-            }
-            (ValueArray::Boolean(lhs), ValueArray::Boolean(rhs)) => {
-                let lhs = lhs.as_ref();
-                let rhs = rhs.as_ref();
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    if lhs.is_null(idx) || rhs.is_null(idx) {
-                        out.push(None);
-                    } else {
-                        out.push(Some(compare_bool(op, lhs.value(idx), rhs.value(idx))));
-                    }
-                }
-                Ok(out)
-            }
-            (ValueArray::Utf8(lhs), ValueArray::Utf8(rhs)) => {
-                let lhs = lhs.as_ref();
-                let rhs = rhs.as_ref();
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    if lhs.is_null(idx) || rhs.is_null(idx) {
-                        out.push(None);
-                    } else {
-                        out.push(Some(compare_str(op, lhs.value(idx), rhs.value(idx))));
-                    }
-                }
-                Ok(out)
-            }
-            (ValueArray::Interval(lhs), ValueArray::Interval(rhs)) => {
-                let lhs = lhs.as_ref();
-                let rhs = rhs.as_ref();
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    if lhs.is_null(idx) || rhs.is_null(idx) {
-                        out.push(None);
-                    } else {
-                        let lhs_val = interval_value_from_arrow(lhs.value(idx));
-                        let rhs_val = interval_value_from_arrow(rhs.value(idx));
-                        let ordering = compare_interval_values(lhs_val, rhs_val);
-                        let result = match op {
-                            CompareOp::Eq => ordering == std::cmp::Ordering::Equal,
-                            CompareOp::NotEq => ordering != std::cmp::Ordering::Equal,
-                            CompareOp::Lt => ordering == std::cmp::Ordering::Less,
-                            CompareOp::LtEq => {
-                                matches!(
-                                    ordering,
-                                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
-                                )
-                            }
-                            CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
-                            CompareOp::GtEq => {
-                                matches!(
-                                    ordering,
-                                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
-                                )
-                            }
-                        };
-                        out.push(Some(result));
-                    }
-                }
-                Ok(out)
-            }
-            _ => Err(Error::InvalidArgumentError(
-                "unsupported comparison between mismatched types in cross product filter".into(),
-            )),
+
+        if matches!(left_values, ValueArray::Null(_)) || matches!(right_values, ValueArray::Null(_))
+        {
+            return Ok(vec![None; len]);
         }
+
+        let lhs_arr = left_values.as_array_ref();
+        let rhs_arr = right_values.as_array_ref();
+
+        let result_array = llkv_compute::kernels::compute_compare(&lhs_arr, op, &rhs_arr)?;
+        let bool_array = result_array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("compute_compare must return BooleanArray");
+
+        let out: Vec<Option<bool>> = bool_array.iter().collect();
+        Ok(out)
     }
 
     fn evaluate_is_null_truths(
@@ -8771,58 +8680,19 @@ impl CrossProductExpressionContext {
         let values = self.materialize_value_array(expr, batch)?;
         let len = values.len();
 
-        match &values {
-            ValueArray::Null(len) => {
-                // All values are NULL
-                let result = if negated {
-                    Some(false) // IS NOT NULL on NULL column
-                } else {
-                    Some(true) // IS NULL on NULL column
-                };
-                Ok(vec![result; *len])
-            }
-            ValueArray::Numeric(arr) => {
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    let is_null = arr.value(idx).is_none();
-                    let result = if negated {
-                        !is_null // IS NOT NULL
-                    } else {
-                        is_null // IS NULL
-                    };
-                    out.push(Some(result));
-                }
-                Ok(out)
-            }
-            ValueArray::Boolean(arr) => {
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    let is_null = arr.is_null(idx);
-                    let result = if negated { !is_null } else { is_null };
-                    out.push(Some(result));
-                }
-                Ok(out)
-            }
-            ValueArray::Utf8(arr) => {
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    let is_null = arr.is_null(idx);
-                    let result = if negated { !is_null } else { is_null };
-                    out.push(Some(result));
-                }
-                Ok(out)
-            }
-            ValueArray::Interval(arr) => {
-                let arr = arr.as_ref();
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    let is_null = arr.is_null(idx);
-                    let result = if negated { !is_null } else { is_null };
-                    out.push(Some(result));
-                }
-                Ok(out)
-            }
+        if let ValueArray::Null(len) = values {
+            let result = if negated { Some(false) } else { Some(true) };
+            return Ok(vec![result; len]);
         }
+
+        let arr = values.as_array_ref();
+        let mut out = Vec::with_capacity(len);
+        for idx in 0..len {
+            let is_null = arr.is_null(idx);
+            let result = if negated { !is_null } else { is_null };
+            out.push(Some(result));
+        }
+        Ok(out)
     }
 
     fn evaluate_in_list_truths(
@@ -8847,152 +8717,65 @@ impl CrossProductExpressionContext {
             }
         }
 
-        match &target_values {
-            ValueArray::Numeric(target_numeric) => {
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    let target_value = match target_numeric.value(idx) {
-                        Some(value) => value,
-                        None => {
-                            out.push(None);
-                            continue;
-                        }
-                    };
-                    let mut has_match = false;
-                    let mut saw_null = false;
-                    for candidate in &list_values {
-                        match candidate {
-                            ValueArray::Numeric(array) => match array.value(idx) {
-                                Some(value) => {
-                                    if NumericKernels::compare(
-                                        CompareOp::Eq,
-                                        target_value.clone(),
-                                        value,
-                                    ) {
-                                        has_match = true;
-                                        break;
-                                    }
-                                }
-                                None => saw_null = true,
-                            },
-                            ValueArray::Null(_) => saw_null = true,
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "type mismatch in IN list evaluation".into(),
-                                ));
-                            }
-                        }
-                    }
-                    out.push(finalize_in_list_result(has_match, saw_null, negated));
-                }
-                Ok(out)
-            }
-            ValueArray::Boolean(target_bool) => {
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    if target_bool.is_null(idx) {
-                        out.push(None);
-                        continue;
-                    }
-                    let target_value = target_bool.value(idx);
-                    let mut has_match = false;
-                    let mut saw_null = false;
-                    for candidate in &list_values {
-                        match candidate {
-                            ValueArray::Boolean(array) => {
-                                if array.is_null(idx) {
-                                    saw_null = true;
-                                } else if array.value(idx) == target_value {
-                                    has_match = true;
-                                    break;
-                                }
-                            }
-                            ValueArray::Null(_) => saw_null = true,
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "type mismatch in IN list evaluation".into(),
-                                ));
-                            }
-                        }
-                    }
-                    out.push(finalize_in_list_result(has_match, saw_null, negated));
-                }
-                Ok(out)
-            }
-            ValueArray::Utf8(target_utf8) => {
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    if target_utf8.is_null(idx) {
-                        out.push(None);
-                        continue;
-                    }
-                    let target_value = target_utf8.value(idx);
-                    let mut has_match = false;
-                    let mut saw_null = false;
-                    for candidate in &list_values {
-                        match candidate {
-                            ValueArray::Utf8(array) => {
-                                if array.is_null(idx) {
-                                    saw_null = true;
-                                } else if array.value(idx) == target_value {
-                                    has_match = true;
-                                    break;
-                                }
-                            }
-                            ValueArray::Null(_) => saw_null = true,
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "type mismatch in IN list evaluation".into(),
-                                ));
-                            }
-                        }
-                    }
-                    out.push(finalize_in_list_result(has_match, saw_null, negated));
-                }
-                Ok(out)
-            }
-            ValueArray::Interval(target_interval) => {
-                let target_interval = target_interval.as_ref();
-                let mut out = Vec::with_capacity(len);
-                for idx in 0..len {
-                    if target_interval.is_null(idx) {
-                        out.push(None);
-                        continue;
-                    }
-                    let target_value = interval_value_from_arrow(target_interval.value(idx));
-                    let mut has_match = false;
-                    let mut saw_null = false;
-                    for candidate in &list_values {
-                        match candidate {
-                            ValueArray::Interval(array) => {
-                                let array = array.as_ref();
-                                if array.is_null(idx) {
-                                    saw_null = true;
-                                } else {
-                                    let candidate_value =
-                                        interval_value_from_arrow(array.value(idx));
-                                    if compare_interval_values(target_value, candidate_value)
-                                        == std::cmp::Ordering::Equal
-                                    {
-                                        has_match = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            ValueArray::Null(_) => saw_null = true,
-                            _ => {
-                                return Err(Error::InvalidArgumentError(
-                                    "type mismatch in IN list evaluation".into(),
-                                ));
-                            }
-                        }
-                    }
-                    out.push(finalize_in_list_result(has_match, saw_null, negated));
-                }
-                Ok(out)
-            }
-            ValueArray::Null(len) => Ok(vec![None; *len]),
+        if matches!(target_values, ValueArray::Null(_)) {
+            return Ok(vec![None; len]);
         }
+
+        let target_arr = target_values.as_array_ref();
+        let mut combined_result: Option<BooleanArray> = None;
+
+        for candidate in &list_values {
+            if matches!(candidate, ValueArray::Null(_)) {
+                let nulls = new_null_array(&DataType::Boolean, len);
+                let bool_nulls = nulls
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .unwrap()
+                    .clone();
+
+                match combined_result {
+                    None => combined_result = Some(bool_nulls),
+                    Some(prev) => {
+                        combined_result = Some(or_kleene(&prev, &bool_nulls)?);
+                    }
+                }
+                continue;
+            }
+
+            let candidate_arr = candidate.as_array_ref();
+
+            let cmp =
+                llkv_compute::kernels::compute_compare(&target_arr, CompareOp::Eq, &candidate_arr)?;
+            let bool_cmp = cmp
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("compute_compare returns BooleanArray")
+                .clone();
+
+            match combined_result {
+                None => combined_result = Some(bool_cmp),
+                Some(prev) => {
+                    combined_result = Some(or_kleene(&prev, &bool_cmp)?);
+                }
+            }
+        }
+
+        let final_bool = combined_result.unwrap_or_else(|| {
+            let mut builder = BooleanBuilder::new();
+            for _ in 0..len {
+                builder.append_value(false);
+            }
+            builder.finish()
+        });
+
+        let final_bool = if negated {
+            not(&final_bool)?
+        } else {
+            final_bool
+        };
+
+        let out: Vec<Option<bool>> = final_bool.iter().collect();
+        Ok(out)
     }
 
     fn evaluate_numeric(
@@ -9016,7 +8799,7 @@ impl CrossProductExpressionContext {
         &mut self,
         field_id: FieldId,
         batch: &RecordBatch,
-    ) -> ExecutorResult<NumericArray> {
+    ) -> ExecutorResult<ArrayRef> {
         if let Some(existing) = self.numeric_cache.get(&field_id) {
             return Ok(existing.clone());
         }
@@ -9026,9 +8809,8 @@ impl CrossProductExpressionContext {
         })?;
 
         let array_ref = batch.column(column_index).clone();
-        let numeric = NumericArray::try_from_arrow(&array_ref)?;
-        self.numeric_cache.insert(field_id, numeric.clone());
-        Ok(numeric)
+        self.numeric_cache.insert(field_id, array_ref.clone());
+        Ok(array_ref)
     }
 
     fn column_accessor(
