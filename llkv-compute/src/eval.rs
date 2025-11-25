@@ -271,6 +271,7 @@ impl ScalarEvaluator {
                 for t in &types[1..] {
                     common = get_common_type(&common, t);
                 }
+
                 Some(common)
             }
             ScalarExpr::Coalesce(items) => {
@@ -363,25 +364,49 @@ impl ScalarEvaluator {
                 cast::cast(&val, data_type).map_err(|e| Error::Internal(e.to_string()))
             }
             ScalarExpr::Case {
+                operand,
                 branches,
                 else_expr,
-                ..
             } => {
+                let operand_val = if let Some(op) = operand {
+                    Some(Self::evaluate_value(op, idx, arrays)?)
+                } else {
+                    None
+                };
+
                 for (when_expr, then_expr) in branches {
                     let when_val = Self::evaluate_value(when_expr, idx, arrays)?;
-                    let is_true = if when_val.is_null(0) {
-                        false
+
+                    let is_match = if let Some(op_val) = &operand_val {
+                        // Simple CASE: operand = when_val
+                        // If either is null, result is null (false for condition)
+                        if op_val.is_null(0) || when_val.is_null(0) {
+                            false
+                        } else {
+                            let eq =
+                                crate::kernels::compute_compare(op_val, CompareOp::Eq, &when_val)?;
+                            let bool_arr = eq
+                                .as_any()
+                                .downcast_ref::<arrow::array::BooleanArray>()
+                                .unwrap();
+                            bool_arr.value(0)
+                        }
                     } else {
-                        let bool_arr = cast::cast(&when_val, &DataType::Boolean)
-                            .map_err(|e| Error::Internal(e.to_string()))?;
-                        let bool_arr = bool_arr
-                            .as_any()
-                            .downcast_ref::<arrow::array::BooleanArray>()
-                            .unwrap();
-                        bool_arr.value(0)
+                        // Searched CASE: when_val is boolean condition
+                        if when_val.is_null(0) {
+                            false
+                        } else {
+                            let bool_arr = cast::cast(&when_val, &DataType::Boolean)
+                                .map_err(|e| Error::Internal(e.to_string()))?;
+                            let bool_arr = bool_arr
+                                .as_any()
+                                .downcast_ref::<arrow::array::BooleanArray>()
+                                .unwrap();
+                            bool_arr.value(0)
+                        }
                     };
 
-                    if is_true {
+                    if is_match {
                         return Self::evaluate_value(then_expr, idx, arrays);
                     }
                 }
@@ -442,7 +467,7 @@ impl ScalarEvaluator {
 
     /// Evaluate a scalar expression for every row in the batch.
     #[allow(dead_code)]
-    pub fn evaluate_batch<F: Hash + Eq + Copy>(
+    pub fn evaluate_batch<F: Hash + Eq + Copy + std::fmt::Debug>(
         expr: &ScalarExpr<F>,
         len: usize,
         arrays: &NumericArrayMap<F>,
@@ -458,6 +483,7 @@ impl ScalarEvaluator {
         arrays: &NumericArrayMap<F>,
     ) -> LlkvResult<ArrayRef> {
         let preferred = Self::infer_result_type_from_arrays(expr, arrays);
+
         if let Some(vectorized) =
             Self::try_evaluate_vectorized(expr, len, arrays, preferred.clone())?
         {
@@ -469,23 +495,29 @@ impl ScalarEvaluator {
         for idx in 0..len {
             let val = Self::evaluate_value(expr, idx, arrays)?;
             if val.data_type() != &preferred {
-                let casted =
-                    cast::cast(&val, &preferred).map_err(|e| Error::Internal(e.to_string()))?;
+                let casted = cast::cast(&val, &preferred).map_err(|e| {
+                    Error::Internal(format!(
+                        "Failed to cast row {}: {} (Val type: {:?}, Preferred: {:?})",
+                        idx,
+                        e,
+                        val.data_type(),
+                        preferred
+                    ))
+                })?;
                 values.push(casted);
             } else {
                 values.push(val);
             }
         }
-        // Concat all single-value arrays
-        let refs: Vec<&dyn arrow::array::Array> = values.iter().map(|a| a.as_ref()).collect();
-        concat(&refs).map_err(|e| Error::Internal(e.to_string()))
+        concat(&values.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
+            .map_err(|e| Error::Internal(e.to_string()))
     }
 
     fn try_evaluate_vectorized<F: Hash + Eq + Copy>(
         expr: &ScalarExpr<F>,
         len: usize,
         arrays: &NumericArrayMap<F>,
-        _preferred: DataType,
+        target_type: DataType,
     ) -> LlkvResult<Option<VectorizedExpr>> {
         if Self::expr_contains_interval(expr) {
             return Ok(None);

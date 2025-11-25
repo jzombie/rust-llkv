@@ -1,4 +1,4 @@
-use arrow::array::{Array, ArrayRef, Scalar};
+use arrow::array::{Array, ArrayRef, Scalar, new_null_array};
 use arrow::compute::kernels::cmp;
 use arrow::compute::{cast, kernels::numeric, nullif};
 use arrow::datatypes::DataType;
@@ -9,6 +9,10 @@ use std::sync::Arc;
 pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<ArrayRef, Error> {
     // Coerce inputs to common type
     let (lhs_arr, rhs_arr) = coerce_types(lhs, rhs, op)?;
+
+    if lhs_arr.data_type() == &DataType::Null {
+        return Ok(new_null_array(&DataType::Null, lhs_arr.len()));
+    }
 
     let result_arr: ArrayRef = match op {
         BinaryOp::Add => {
