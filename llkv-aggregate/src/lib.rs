@@ -1,3 +1,5 @@
+// TODO: Can portions of this be offloaded to llkv-compute as vectorized ops?
+
 //! Runtime aggregation utilities used by the planner and executor.
 //!
 //! The crate evaluates logical aggregates described by [`llkv_plan::AggregateExpr`] against Arrow
