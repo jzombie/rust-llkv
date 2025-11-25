@@ -32,7 +32,7 @@ jobs:
       CARGO_TARGET_DIR: /tmp/llkv-bench-target
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Setup rust toolchain and cache
         uses: moonrepo/setup-rust@v1
