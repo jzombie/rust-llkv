@@ -30,7 +30,6 @@
 
 pub mod error;
 pub mod result;
-pub mod table_error;
 
 pub use error::Error;
 pub use result::Result;
