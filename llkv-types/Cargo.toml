@@ -1,6 +1,6 @@
 [package]
-name = "llkv-compute"
-description = "Compute kernels and math operations for LLKV."
+name = "llkv-types"
+description = "Common data types for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -12,11 +12,7 @@ publish.workspace = true
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
 llkv-result = { workspace = true }
-llkv-expr = { workspace = true }
-llkv-types = { workspace = true }
-time = { workspace = true }
-rand = { workspace = true }
-rustc-hash = { workspace = true }
+serde = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }

@@ -6,6 +6,30 @@ license = "Apache-2.0"
 repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
+[workspace]
+members = [
+    "llkv",
+    "llkv-aggregate",
+    "llkv-column-map",
+    "llkv-compute",
+    "llkv-csv",
+    "llkv-runtime",
+    "llkv-executor",
+    "llkv-expr",
+    "llkv-join",
+    "llkv-plan",
+    "llkv-result",
+    "llkv-slt-tester",
+    "llkv-sql",
+    "llkv-storage",
+    "llkv-table",
+    "llkv-test-utils",
+    "llkv-tpch",
+    "llkv-transaction",
+    "llkv-types",
+    "demos/llkv-sql-pong-demo",
+]
+
 [workspace.dependencies]
 llkv = { path = "./llkv", version = "0.8.2-alpha" }
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.2-alpha" }
@@ -23,13 +47,14 @@ llkv-storage = { path = "./llkv-storage", version = "0.8.2-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.2-alpha" }
 llkv-transaction = { path = "./llkv-transaction", version = "0.8.2-alpha" }
+llkv-types = { path = "./llkv-types", version = "0.8.2-alpha" }
 llkv-compute = { path = "./llkv-compute", version = "0.8.2-alpha" }
 simd-r-drive = "0.15.5-alpha"
 simd-r-drive-entry-handle = "0.15.5-alpha"
 
 # Vendor crates
-# Note: A subset of these crates are used only for debug builds or examples;
-# they're listed here to keep workspace versions consistent.
+# Note: A subset of these crates are used only for debug builds or examples.
+# They're listed here to keep workspace versions consistent.
 arrow = { version = "57.0.0", default-features = false, features = ["prettyprint", "ipc"] }
 arrow-array = { version = "57.0.0", default-features = false }
 arrow-ord = { version = "57.0.0", default-features = false }
@@ -66,28 +91,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 walkdir = "2.5"
 
-[workspace]
-members = [
-    "llkv",
-    "llkv-aggregate",
-    "llkv-column-map",
-    "llkv-compute",
-    "llkv-csv",
-    "llkv-runtime",
-    "llkv-executor",
-    "llkv-expr",
-    "llkv-join",
-    "llkv-plan",
-    "llkv-result",
-    "llkv-slt-tester",
-    "llkv-sql",
-    "llkv-storage",
-    "llkv-table",
-    "llkv-test-utils",
-    "llkv-tpch",
-    "llkv-transaction",
-    "demos/llkv-sql-pong-demo"
-]
 resolver = "2"
 
 [workspace.lints.clippy]

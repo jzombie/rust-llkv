@@ -28,8 +28,9 @@
 //! - **Catalog errors** ([`Error::CatalogError`]): Metadata corruption or inconsistency
 //! - **Internal errors** ([`Error::Internal`]): Bugs or unexpected states
 
-pub mod result;
-pub use result::*;
-
 pub mod error;
-pub use error::*;
+pub mod result;
+pub mod table_error;
+
+pub use error::Error;
+pub use result::Result;

@@ -1,5 +1,5 @@
 use arrow_buffer::i256;
-use llkv_expr::decimal::{DecimalError, DecimalValue, MAX_DECIMAL_PRECISION};
+use llkv_types::decimal::{DecimalError, DecimalValue, MAX_DECIMAL_PRECISION, scale_within_bounds};
 
 const POW10_BASE: i256 = i256::from_i128(10);
 
@@ -21,18 +21,9 @@ fn pow10_i128(exp: u32) -> Result<i128, DecimalError> {
     Ok(value)
 }
 
-fn scale_within_bounds(scale: i16) -> bool {
-    let max = MAX_DECIMAL_PRECISION as i16;
-    (-max..=max).contains(&scale)
-}
-
 /// Convert the decimal into an `f64` (lossy for high precision inputs).
 pub fn to_f64(value: DecimalValue) -> f64 {
-    if value.raw_value() == 0 {
-        return 0.0;
-    }
-    let denominator = 10_f64.powi(value.scale() as i32);
-    (value.raw_value() as f64) / denominator
+    value.to_f64()
 }
 
 /// Rescale to a different exponent, preserving the numeric value when possible.
