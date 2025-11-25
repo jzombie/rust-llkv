@@ -29,6 +29,7 @@ members = [
     "llkv-types",
     "demos/llkv-sql-pong-demo",
 ]
+resolver = "2"
 
 [workspace.dependencies]
 llkv = { path = "./llkv", version = "0.8.2-alpha" }
@@ -90,8 +91,6 @@ tpchgen = "2.0.1"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 walkdir = "2.5"
-
-resolver = "2"
 
 [workspace.lints.clippy]
 print_stderr = "deny"
