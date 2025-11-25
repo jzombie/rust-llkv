@@ -42,10 +42,7 @@ use llkv_compute::projection::{
     ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
     synthesize_computed_literal_array,
 };
-use llkv_compute::rowids::{
-    difference_sorted, difference_sorted_slice, filter_row_ids_by_operator, intersect_sorted,
-    normalize_row_ids, union_sorted,
-};
+use llkv_compute::rowids::{RowIdSliceExt, SortedSliceOps, normalize_row_ids};
 use llkv_compute::scalar::interval::compare_interval_values;
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
@@ -1010,7 +1007,7 @@ where
         if all_row_ids.is_empty() {
             return Ok(Vec::new());
         }
-        filter_row_ids_by_operator(&all_row_ids, op)
+        all_row_ids.filter_by_operator(op)
     }
 
     fn execute<'expr, F>(&self, plan: PlannedScan<'expr, P>, mut on_batch: F) -> LlkvResult<()>
@@ -1573,7 +1570,7 @@ where
                 }
                 let mut cache = FxHashMap::default();
                 let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
-                let null_ids = difference_sorted(all_row_ids, non_null);
+                let null_ids = all_row_ids.difference_sorted(&non_null);
                 tracing::debug!(
                     field = ?filter_lfid,
                     row_count = null_ids.len(),
@@ -1752,7 +1749,7 @@ where
             for fid in &ordered_fields {
                 let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
                 domain = Some(match domain {
-                    Some(existing) => intersect_sorted(existing, rows),
+                    Some(existing) => existing.intersect_sorted(&rows),
                     None => rows,
                 });
                 if let Some(ref d) = domain
@@ -2047,7 +2044,7 @@ where
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing.intersect_sorted(&rows),
                 None => rows,
             });
             if let Some(ref d) = domain
@@ -2092,7 +2089,7 @@ where
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing.intersect_sorted(&rows),
                 None => rows,
             });
             if let Some(ref d) = domain
@@ -2475,7 +2472,7 @@ where
                             acc.clear();
                             continue;
                         }
-                        acc = intersect_sorted(acc, next);
+                        acc = acc.intersect_sorted(&next);
                     }
                     stack.push(acc);
                 }
@@ -2493,7 +2490,7 @@ where
                         if acc.is_empty() {
                             acc = next;
                         } else if !next.is_empty() {
-                            acc = union_sorted(acc, next);
+                            acc = acc.union_sorted(&next);
                         }
                     }
                     stack.push(acc);
@@ -2513,7 +2510,7 @@ where
                     } else if domain_rows.is_empty() {
                         stack.push(Vec::new());
                     } else {
-                        stack.push(difference_sorted_slice(domain_rows.as_ref(), &matched));
+                        stack.push(domain_rows.difference_sorted(&matched));
                     }
                 }
             }
@@ -2590,7 +2587,7 @@ where
                 acc.clear();
                 break;
             }
-            acc = intersect_sorted(acc, rows);
+            acc = acc.intersect_sorted(&rows);
         }
         Ok(acc)
     }
@@ -2673,7 +2670,7 @@ where
                         if acc.is_empty() {
                             acc = next;
                         } else if !next.is_empty() {
-                            acc = union_sorted(acc, next);
+                            acc = acc.union_sorted(&next);
                         }
                     }
                     stack.push(acc);
@@ -2697,7 +2694,7 @@ where
                             acc.clear();
                             continue;
                         }
-                        acc = intersect_sorted(acc, next);
+                        acc = acc.intersect_sorted(&next);
                     }
                     stack.push(acc);
                 }
@@ -2741,7 +2738,7 @@ where
         for &fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing.intersect_sorted(&rows),
                 None => rows,
             });
             if let Some(ref d) = domain
@@ -2794,7 +2791,7 @@ where
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing.intersect_sorted(&rows),
                 None => rows,
             });
             if let Some(ref d) = domain
@@ -2839,7 +2836,7 @@ where
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing.intersect_sorted(&rows),
                 None => rows,
             });
             if let Some(ref d) = domain

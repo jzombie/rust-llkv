@@ -34,7 +34,7 @@ use llkv_expr::SubqueryId;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
 };
-use llkv_expr::literal::Literal;
+use llkv_expr::literal::{Literal, LiteralExt};
 use llkv_expr::typed_predicate::{
     build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
@@ -823,7 +823,7 @@ where
                     ));
                 }
                 rows_seen = rows_seen.saturating_add(1);
-                result = Some(array_value_to_literal(&column, idx)?);
+                result = Some(Literal::from_array_ref(&column, idx)?);
             }
             Ok(())
         })?;
@@ -10574,150 +10574,6 @@ fn extract_struct_field(literal: &Literal, field_name: &str) -> Option<Literal> 
         }
     }
     None
-}
-
-// TODO: Dedupe with version in llkv-compute
-fn array_value_to_literal(array: &ArrayRef, idx: usize) -> ExecutorResult<Literal> {
-    if array.is_null(idx) {
-        return Ok(Literal::Null);
-    }
-
-    match array.data_type() {
-        DataType::Boolean => {
-            let array = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| Error::Internal("failed to downcast boolean array".into()))?;
-            Ok(Literal::Boolean(array.value(idx)))
-        }
-        DataType::Int8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast int8 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::Int16 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast int16 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::Int32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast int32 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::Int64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast int64 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::UInt8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast uint8 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::UInt16 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast uint16 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::UInt32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast uint32 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::UInt64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast uint64 array".into()))?;
-            Ok(Literal::Integer(array.value(idx) as i128))
-        }
-        DataType::Decimal128(_, scale) => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast decimal128 array".into()))?;
-            let raw = array.value(idx);
-            let decimal = DecimalValue::new(raw, *scale).map_err(|err| {
-                Error::InvalidArgumentError(format!("invalid decimal value: {err}"))
-            })?;
-            Ok(Literal::Decimal(decimal))
-        }
-        DataType::Float32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast float32 array".into()))?;
-            Ok(Literal::Float(array.value(idx) as f64))
-        }
-        DataType::Float64 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast float64 array".into()))?;
-            Ok(Literal::Float(array.value(idx)))
-        }
-        DataType::Date32 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| Error::Internal("failed to downcast date32 array".into()))?;
-            Ok(Literal::Date32(array.value(idx)))
-        }
-        DataType::Utf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| Error::Internal("failed to downcast utf8 array".into()))?;
-            Ok(Literal::String(array.value(idx).to_string()))
-        }
-        DataType::LargeUtf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| Error::Internal("failed to downcast large utf8 array".into()))?;
-            Ok(Literal::String(array.value(idx).to_string()))
-        }
-        DataType::Interval(IntervalUnit::MonthDayNano) => {
-            let array = array
-                .as_any()
-                .downcast_ref::<IntervalMonthDayNanoArray>()
-                .ok_or_else(|| Error::Internal("failed to downcast interval array".into()))?;
-            Ok(Literal::Interval(interval_value_from_arrow(
-                array.value(idx),
-            )))
-        }
-        DataType::Struct(fields) => {
-            let struct_array = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| Error::Internal("failed to downcast struct array".into()))?;
-            let mut members = Vec::with_capacity(fields.len());
-            for (field_idx, field) in fields.iter().enumerate() {
-                let child = struct_array.column(field_idx);
-                let literal = array_value_to_literal(child, idx)?;
-                members.push((field.name().clone(), Box::new(literal)));
-            }
-            Ok(Literal::Struct(members))
-        }
-        other => Err(Error::InvalidArgumentError(format!(
-            "unsupported scalar subquery result type: {other:?}"
-        ))),
-    }
 }
 
 fn collect_scalar_subquery_ids(expr: &ScalarExpr<FieldId>, ids: &mut FxHashSet<SubqueryId>) {

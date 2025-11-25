@@ -6,9 +6,16 @@
 //! type of each column. Conversion helpers here defer type checking until the
 //! caller can perform schema-aware coercion.
 
-use arrow::datatypes::ArrowPrimitiveType;
+use arrow::array::{
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, StructArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::{ArrowPrimitiveType, DataType};
 use std::ops::Bound;
 
+use llkv_result::Error;
+use llkv_types::decimal::DecimalValue;
 pub use llkv_types::interval::IntervalValue;
 pub use llkv_types::literal::Literal;
 
@@ -43,6 +50,167 @@ impl std::fmt::Display for LiteralCastError {
 }
 
 impl std::error::Error for LiteralCastError {}
+
+/// Extension methods for working with `Literal`.
+pub trait LiteralExt {
+    fn type_name(&self) -> &'static str;
+    fn to_string_owned(&self) -> Result<String, LiteralCastError>;
+    fn to_native<T>(&self) -> Result<T, LiteralCastError>
+    where
+        T: FromLiteral + Copy + 'static;
+    fn from_array_ref(array: &ArrayRef, index: usize) -> llkv_result::Result<Literal>;
+    fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, LiteralCastError>
+    where
+        T: ArrowPrimitiveType,
+        T::Native: FromLiteral + Copy;
+}
+
+impl LiteralExt for Literal {
+    fn type_name(&self) -> &'static str {
+        match self {
+            Literal::Integer(_) => "integer",
+            Literal::Float(_) => "float",
+            Literal::Decimal(_) => "decimal",
+            Literal::String(_) => "string",
+            Literal::Boolean(_) => "boolean",
+            Literal::Date32(_) => "date",
+            Literal::Null => "null",
+            Literal::Struct(_) => "struct",
+            Literal::Interval(_) => "interval",
+        }
+    }
+
+    fn to_string_owned(&self) -> Result<String, LiteralCastError> {
+        match self {
+            Literal::String(s) => Ok(s.clone()),
+            Literal::Null => Err(LiteralCastError::TypeMismatch {
+                expected: "string",
+                got: "null",
+            }),
+            Literal::Date32(_) => Err(LiteralCastError::TypeMismatch {
+                expected: "string",
+                got: "date",
+            }),
+            other => Err(LiteralCastError::TypeMismatch {
+                expected: "string",
+                got: other.type_name(),
+            }),
+        }
+    }
+
+    fn to_native<T>(&self) -> Result<T, LiteralCastError>
+    where
+        T: FromLiteral + Copy + 'static,
+    {
+        T::from_literal(self)
+    }
+
+    fn from_array_ref(array: &ArrayRef, index: usize) -> llkv_result::Result<Literal> {
+        if array.is_null(index) {
+            return Ok(Literal::Null);
+        }
+
+        match array.data_type() {
+            DataType::Int8 => {
+                let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::Int16 => {
+                let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::Int32 => {
+                let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::Int64 => {
+                let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::UInt8 => {
+                let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::UInt16 => {
+                let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::UInt32 => {
+                let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::UInt64 => {
+                let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                Ok(Literal::Integer(arr.value(index) as i128))
+            }
+            DataType::Float32 => {
+                let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+                Ok(Literal::Float(arr.value(index) as f64))
+            }
+            DataType::Float64 => {
+                let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                Ok(Literal::Float(arr.value(index)))
+            }
+            DataType::Utf8 => {
+                let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+                Ok(Literal::String(arr.value(index).to_string()))
+            }
+            DataType::LargeUtf8 => {
+                let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                Ok(Literal::String(arr.value(index).to_string()))
+            }
+            DataType::Boolean => {
+                let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                Ok(Literal::Boolean(arr.value(index)))
+            }
+            DataType::Date32 => {
+                let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+                Ok(Literal::Date32(arr.value(index)))
+            }
+            DataType::Decimal128(_, scale) => {
+                let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let val = arr.value(index);
+                let decimal = DecimalValue::new(val, *scale).map_err(|err| {
+                    Error::InvalidArgumentError(format!(
+                        "invalid decimal value for literal conversion: {err}"
+                    ))
+                })?;
+                Ok(Literal::Decimal(decimal))
+            }
+            DataType::Struct(fields) => {
+                let struct_array =
+                    array
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .ok_or_else(|| {
+                            Error::InvalidArgumentError("failed to downcast struct array".into())
+                        })?;
+                let mut members = Vec::with_capacity(fields.len());
+                for (idx, field) in fields.iter().enumerate() {
+                    let child = struct_array.column(idx);
+                    let literal = Literal::from_array_ref(child, index)?;
+                    members.push((field.name().clone(), Box::new(literal)));
+                }
+                Ok(Literal::Struct(members))
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported type for literal conversion: {other:?}"
+            ))),
+        }
+    }
+
+    fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, LiteralCastError>
+    where
+        T: ArrowPrimitiveType,
+        T::Native: FromLiteral + Copy,
+    {
+        Ok(match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(l) => Bound::Included(T::Native::from_literal(l)?),
+            Bound::Excluded(l) => Bound::Excluded(T::Native::from_literal(l)?),
+        })
+    }
+}
 
 /// Helper trait implemented for primitive types that can be produced from a `Literal`.
 pub trait FromLiteral: Sized {
@@ -251,65 +419,6 @@ impl FromLiteral for f64 {
     }
 }
 
-fn literal_type_name(lit: &Literal) -> &'static str {
-    match lit {
-        Literal::Integer(_) => "integer",
-        Literal::Float(_) => "float",
-        Literal::Decimal(_) => "decimal",
-        Literal::String(_) => "string",
-        Literal::Boolean(_) => "boolean",
-        Literal::Date32(_) => "date",
-        Literal::Null => "null",
-        Literal::Struct(_) => "struct",
-        Literal::Interval(_) => "interval",
-    }
-}
-
-/// Convert a `Literal` into an owned `String`.
-pub fn literal_to_string(lit: &Literal) -> Result<String, LiteralCastError> {
-    match lit {
-        Literal::String(s) => Ok(s.clone()),
-        Literal::Null => Err(LiteralCastError::TypeMismatch {
-            expected: "string",
-            got: "null",
-        }),
-        Literal::Date32(_) => Err(LiteralCastError::TypeMismatch {
-            expected: "string",
-            got: "date",
-        }),
-        _ => Err(LiteralCastError::TypeMismatch {
-            expected: "string",
-            got: literal_type_name(lit),
-        }),
-    }
-}
-
-/// Convert a `Literal` into a concrete native type `T`.
-pub fn literal_to_native<T>(lit: &Literal) -> Result<T, LiteralCastError>
-where
-    T: FromLiteral + Copy + 'static,
-{
-    T::from_literal(lit)
-}
-
-/// Convert a bound of `Literal` into a bound of `T::Native`.
-///
-/// Kept generic over `T: ArrowPrimitiveType` so callers (like the table
-/// crate) can use `bound_to_native::<T>()` with `T::Native` inferred.
-/// Error type is `LiteralCastError` since this crate is independent of
-/// table-layer errors.
-pub fn bound_to_native<T>(bound: &Bound<Literal>) -> Result<Bound<T::Native>, LiteralCastError>
-where
-    T: ArrowPrimitiveType,
-    T::Native: FromLiteral + Copy,
-{
-    Ok(match bound {
-        Bound::Unbounded => Bound::Unbounded,
-        Bound::Included(l) => Bound::Included(literal_to_native::<T::Native>(l)?),
-        Bound::Excluded(l) => Bound::Excluded(literal_to_native::<T::Native>(l)?),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,14 +427,14 @@ mod tests {
     fn boolean_literal_roundtrip() {
         let lit = Literal::from(true);
         assert_eq!(lit, Literal::Boolean(true));
-        assert!(literal_to_native::<bool>(&lit).unwrap());
-        assert!(!literal_to_native::<bool>(&Literal::Boolean(false)).unwrap());
+        assert!(lit.to_native::<bool>().unwrap());
+        assert!(!Literal::Boolean(false).to_native::<bool>().unwrap());
     }
 
     #[test]
     fn boolean_literal_rejects_integer_cast() {
         let lit = Literal::Boolean(true);
-        let err = literal_to_native::<i32>(&lit).unwrap_err();
+        let err = lit.to_native::<i32>().unwrap_err();
         assert!(matches!(
             err,
             LiteralCastError::TypeMismatch {

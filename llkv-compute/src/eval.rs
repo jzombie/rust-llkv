@@ -6,10 +6,9 @@ use arrow::compute::kernels::cast;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{concat, is_not_null, take};
 use arrow::datatypes::{DataType, IntervalMonthDayNanoType};
-use llkv_expr::literal::{IntervalValue, Literal};
+use llkv_expr::literal::{IntervalValue, Literal, LiteralExt};
 use llkv_expr::{AggregateCall, BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
-use llkv_types::decimal::DecimalValue;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
@@ -684,133 +683,6 @@ impl ScalarEvaluator {
         }
     }
 
-    // TODO: Dedupe workspace versions and move to Literal as `from_array_ref`
-    pub fn array_value_to_literal(array: &ArrayRef, index: usize) -> LlkvResult<Literal> {
-        use arrow::datatypes::*;
-
-        if array.is_null(index) {
-            return Ok(Literal::Null);
-        }
-
-        match array.data_type() {
-            DataType::Int8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int8Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::Int16 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int16Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::Int32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int32Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::Int64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::UInt8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt8Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::UInt16 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt16Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::UInt32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt32Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::UInt64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt64Array>()
-                    .unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
-            }
-            DataType::Float32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float32Array>()
-                    .unwrap();
-                Ok(Literal::Float(arr.value(index) as f64))
-            }
-            DataType::Float64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
-                    .unwrap();
-                Ok(Literal::Float(arr.value(index)))
-            }
-            DataType::Utf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                Ok(Literal::String(arr.value(index).to_string()))
-            }
-            DataType::LargeUtf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::LargeStringArray>()
-                    .unwrap();
-                Ok(Literal::String(arr.value(index).to_string()))
-            }
-            DataType::Boolean => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
-                    .unwrap();
-                Ok(Literal::Boolean(arr.value(index)))
-            }
-            DataType::Date32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Date32Array>()
-                    .unwrap();
-                Ok(Literal::Date32(arr.value(index)))
-            }
-            DataType::Decimal128(_, scale) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<arrow::array::Decimal128Array>()
-                    .unwrap();
-                let val = arr.value(index);
-                let decimal = DecimalValue::new(val, *scale).map_err(|err| {
-                    Error::InvalidArgumentError(format!(
-                        "invalid decimal value for literal conversion: {err}"
-                    ))
-                })?;
-                Ok(Literal::Decimal(decimal))
-            }
-            _ => Err(Error::Internal(format!(
-                "Unsupported type for literal conversion: {:?}",
-                array.data_type()
-            ))),
-        }
-    }
-
     pub fn evaluate_constant_literal_expr<F: Hash + Eq + Copy>(
         expr: &ScalarExpr<F>,
     ) -> LlkvResult<Option<Literal>> {
@@ -829,7 +701,7 @@ impl ScalarEvaluator {
         if array.is_null(0) {
             return Ok(None);
         }
-        Ok(Some(Self::array_value_to_literal(&array, 0)?))
+        Ok(Some(Literal::from_array_ref(&array, 0)?))
     }
 
     pub fn evaluate_constant_literal_non_numeric<F: Hash + Eq + Copy>(
@@ -851,7 +723,7 @@ impl ScalarEvaluator {
                     Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
                     Some(other) => Err(Error::InvalidArgumentError(format!(
                         "cannot cast literal of type {} to DATE",
-                        Self::literal_type_name(&other)
+                        other.type_name()
                     ))),
                     None => Ok(None),
                 }
@@ -920,21 +792,6 @@ impl ScalarEvaluator {
                 }
             }
             _ => Ok(None),
-        }
-    }
-
-    // TODO: Move to Literal impl
-    pub fn literal_type_name(literal: &Literal) -> &'static str {
-        match literal {
-            Literal::Null => "NULL",
-            Literal::Integer(_) => "INTEGER",
-            Literal::Float(_) => "FLOAT",
-            Literal::Decimal(_) => "DECIMAL",
-            Literal::String(_) => "STRING",
-            Literal::Boolean(_) => "BOOLEAN",
-            Literal::Date32(_) => "DATE",
-            Literal::Struct(_) => "STRUCT",
-            Literal::Interval(_) => "INTERVAL",
         }
     }
 
