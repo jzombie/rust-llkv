@@ -419,7 +419,7 @@ impl ScalarEvaluator {
             ScalarExpr::Coalesce(items) => {
                 for item in items {
                     let val = Self::evaluate_value(item, idx, arrays)?;
-                    if !val.is_null(0) {
+                    if !val.is_null(0) && val.data_type() != &DataType::Null {
                         return Ok(val);
                     }
                 }
@@ -483,6 +483,10 @@ impl ScalarEvaluator {
         arrays: &NumericArrayMap<F>,
     ) -> LlkvResult<ArrayRef> {
         let preferred = Self::infer_result_type_from_arrays(expr, arrays);
+
+        if len == 0 {
+            return Ok(new_null_array(&preferred, 0));
+        }
 
         if let Some(vectorized) =
             Self::try_evaluate_vectorized(expr, len, arrays, preferred.clone())?

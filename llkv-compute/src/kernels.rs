@@ -42,6 +42,40 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
         BinaryOp::Modulo => {
             numeric::rem(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?
         }
+        BinaryOp::And => {
+            let lhs_bool =
+                cast(&lhs_arr, &DataType::Boolean).map_err(|e| Error::Internal(e.to_string()))?;
+            let rhs_bool =
+                cast(&rhs_arr, &DataType::Boolean).map_err(|e| Error::Internal(e.to_string()))?;
+            let lhs_bool = lhs_bool
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap();
+            let rhs_bool = rhs_bool
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap();
+            let result = arrow::compute::kernels::boolean::and(lhs_bool, rhs_bool)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            Arc::new(result)
+        }
+        BinaryOp::Or => {
+            let lhs_bool =
+                cast(&lhs_arr, &DataType::Boolean).map_err(|e| Error::Internal(e.to_string()))?;
+            let rhs_bool =
+                cast(&rhs_arr, &DataType::Boolean).map_err(|e| Error::Internal(e.to_string()))?;
+            let lhs_bool = lhs_bool
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap();
+            let rhs_bool = rhs_bool
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .unwrap();
+            let result = arrow::compute::kernels::boolean::or(lhs_bool, rhs_bool)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+            Arc::new(result)
+        }
         _ => return Err(Error::Internal(format!("Unsupported binary op: {:?}", op))),
     };
 
