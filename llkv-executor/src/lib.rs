@@ -29,7 +29,6 @@ use arrow_buffer::IntervalMonthDayNano;
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
-use llkv_types::LogicalFieldId;
 use llkv_expr::SubqueryId;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,
@@ -52,6 +51,7 @@ use llkv_table::table::{
 };
 use llkv_table::types::FieldId;
 use llkv_table::{NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
+use llkv_types::LogicalFieldId;
 use llkv_types::decimal::DecimalValue;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};

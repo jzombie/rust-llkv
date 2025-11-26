@@ -3,7 +3,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use llkv_column_map::store::Projection;
-use llkv_types::LogicalFieldId;
 use llkv_csv::CsvReadOptions;
 use llkv_csv::csv_export::{
     CsvExportColumn, CsvWriteOptions, export_csv_from_table, export_csv_from_table_with_filter,
@@ -16,6 +15,7 @@ use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::expr::{BinaryOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_table::table::ScanProjection;
+use llkv_types::LogicalFieldId;
 use tempfile::NamedTempFile;
 
 fn write_sample_csv() -> NamedTempFile {

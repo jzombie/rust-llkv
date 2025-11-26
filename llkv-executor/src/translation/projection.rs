@@ -1,11 +1,11 @@
 use crate::ExecutorResult;
 use crate::types::ExecutorTable;
 use llkv_column_map::store::Projection as StoreProjection;
-use llkv_types::LogicalFieldId;
 use llkv_plan::SelectProjection;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
+use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 
 pub fn build_wildcard_projections<P>(table: &ExecutorTable<P>) -> Vec<ScanProjection>

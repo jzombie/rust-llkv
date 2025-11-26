@@ -1,9 +1,9 @@
 //! The top-level directory for all columns in the store.
 
 use crate::codecs::{read_u64_le, write_u64_le};
-use crate::types::LogicalFieldId;
 use llkv_result::{Error, Result};
 use llkv_storage::types::PhysicalKey;
+use llkv_types::ids::LogicalFieldId;
 use rustc_hash::FxHashMap;
 
 /// An in-memory mapping from logical field IDs to the physical key of the

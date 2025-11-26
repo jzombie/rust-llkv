@@ -19,12 +19,12 @@ use arrow::compute;
 use super::ColumnStore;
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, Namespace};
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, GetResult, Pager},
     types::PhysicalKey,
 };
+use llkv_types::ids::{LogicalFieldId, Namespace};
 use simd_r_drive_entry_handle::EntryHandle;
 
 pub mod builder;

@@ -6,16 +6,16 @@ use std::sync::RwLock;
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::stream::ColumnStream;
 use crate::stream::RowIdSource;
-use crate::types::TableId;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
+use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{GatherNullPolicy, IndexKind, Projection, ROW_ID_COLUMN_NAME};
-use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
+use llkv_types::ids::{LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::reserved::is_reserved_table_id;

@@ -14,12 +14,12 @@ use llkv_column_map::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
-use llkv_types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::types::{FieldId, RowId, TableId};
+use llkv_types::LogicalFieldId;
 use std::ops::Bound;
 
 /// Attach required `field_id` metadata to a data column field.

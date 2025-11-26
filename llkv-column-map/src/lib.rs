@@ -447,7 +447,6 @@ pub mod gather;
 pub mod parallel;
 pub mod serialization;
 pub mod store;
-pub mod types;
 
 pub use llkv_result::{Error, Result};
 pub use store::{

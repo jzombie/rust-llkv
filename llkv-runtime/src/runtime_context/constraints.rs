@@ -9,7 +9,6 @@
 use arrow::array::{Array, UInt64Array};
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_types::LogicalFieldId;
 use llkv_executor::{ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
@@ -19,6 +18,7 @@ use llkv_table::{
     InsertUniqueColumn, RowId,
 };
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
+use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 

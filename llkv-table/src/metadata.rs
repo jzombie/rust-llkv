@@ -23,10 +23,10 @@ use crate::{ColMeta, TableMeta, TableMultiColumnIndexMeta};
 use arrow::datatypes::DataType;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
-use llkv_types::LogicalFieldId;
 use llkv_plan::ForeignKeySpec;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
+use llkv_types::LogicalFieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
@@ -1454,8 +1454,7 @@ mod tests {
             .set_column_meta(table_id, column_meta.clone())
             .unwrap();
 
-        let logical_field_id =
-            llkv_types::LogicalFieldId::for_user(table_id, column_meta.col_id);
+        let logical_field_id = llkv_types::LogicalFieldId::for_user(table_id, column_meta.col_id);
         store
             .ensure_column_registered(logical_field_id, &arrow::datatypes::DataType::Utf8)
             .unwrap();

@@ -10,8 +10,8 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
-use llkv_types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 #[test]
 fn unsorted_scan_works_without_index_u64() {

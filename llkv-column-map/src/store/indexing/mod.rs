@@ -7,10 +7,10 @@ use crate::store::{
     catalog::ColumnCatalog,
     descriptor::{ChunkMetadata, ColumnDescriptor},
 };
-use crate::types::LogicalFieldId;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::{BatchGet, BatchPut, GetResult, Pager};
 use llkv_storage::types::PhysicalKey;
+use llkv_types::ids::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::RwLockReadGuard;

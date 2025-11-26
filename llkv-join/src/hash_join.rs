@@ -38,13 +38,13 @@ use llkv_column_map::gather::{
     gather_indices, gather_indices_from_batches, gather_optional_indices_from_batches,
 };
 use llkv_column_map::store::Projection;
-use llkv_types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::schema_ext::CachedSchema;
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::FieldId;
+use llkv_types::LogicalFieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::hash::{Hash, Hasher};

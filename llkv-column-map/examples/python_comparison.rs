@@ -13,8 +13,8 @@ use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
-use llkv_types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 fn schema_with_row_id(field: Field) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);

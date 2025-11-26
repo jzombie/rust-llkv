@@ -35,7 +35,6 @@ use llkv_column_map::ScanBuilder;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
-use llkv_types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
@@ -56,6 +55,7 @@ use llkv_expr::typed_predicate::{
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::decimal::DecimalValue;
+use llkv_types::{LogicalFieldId, Namespace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 

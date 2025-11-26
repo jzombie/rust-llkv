@@ -11,7 +11,6 @@ use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_types::LogicalFieldId;
 use llkv_executor::{
     ExecutorColumn, ExecutorTable, build_array_for_column, resolve_insert_columns, translation,
 };
@@ -23,6 +22,7 @@ use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::{ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
+use llkv_types::LogicalFieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;

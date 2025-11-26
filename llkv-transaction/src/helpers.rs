@@ -6,12 +6,12 @@
 use arrow::array::{Array, ArrayRef, UInt64Array};
 use arrow::datatypes::{DataType, Field};
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_types::LogicalFieldId;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::MvccColumnBuilder;
 use llkv_table::table::RowIdFilter;
 use llkv_table::{FieldId, RowId, Table};
+use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::marker::PhantomData;
 use std::sync::Arc;

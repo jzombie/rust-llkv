@@ -11,12 +11,12 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::Projection;
-use llkv_types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::types::FieldId;
+use llkv_types::LogicalFieldId;
 
 const NUM_ROWS: usize = 1_000_000;
 const EXPECTED_MATCHES: usize = NUM_ROWS / 1000;

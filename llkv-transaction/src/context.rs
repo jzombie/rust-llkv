@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
-use llkv_types::TableId;
 use llkv_executor::{ExecutorRowBatch, SelectExecution};
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
@@ -22,6 +21,7 @@ use llkv_plan::plans::{
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;
+use llkv_types::TableId;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::mvcc::{TXN_ID_AUTO_COMMIT, TransactionSnapshot, TxnId, TxnIdManager};

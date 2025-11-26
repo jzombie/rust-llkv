@@ -1,6 +1,6 @@
 use crate::reserved::FIRST_USER_FIELD_ID;
-use llkv_types::FieldId;
 use llkv_result::{Error, Result};
+use llkv_types::FieldId;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 

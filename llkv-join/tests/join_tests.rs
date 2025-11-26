@@ -4,13 +4,13 @@ use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::Projection;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_types::LogicalFieldId;
 use llkv_expr::{CompareOp, Expr, ScalarExpr};
 use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::table::{ScanProjection, ScanStreamOptions};
 use llkv_table::types::TableId;
+use llkv_types::LogicalFieldId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

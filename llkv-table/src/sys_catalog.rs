@@ -42,13 +42,13 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 
-use llkv_types::LogicalFieldId;
 use llkv_column_map::{
     ColumnStore,
     store::{GatherNullPolicy, ROW_ID_COLUMN_NAME, rowid_fid},
 };
 use llkv_result::{self, Result as LlkvResult};
 use llkv_storage::pager::{MemPager, Pager};
+use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 
 // Import all reserved constants and validation functions

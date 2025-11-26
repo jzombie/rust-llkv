@@ -11,7 +11,6 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_types::{LogicalFieldId, RowId};
 use llkv_executor::{
     ExecutorTable, build_array_for_column, normalize_insert_value_for_column,
     resolve_insert_columns,
@@ -21,6 +20,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::ConstraintEnforcementMode;
 use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
+use llkv_types::{LogicalFieldId, RowId};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

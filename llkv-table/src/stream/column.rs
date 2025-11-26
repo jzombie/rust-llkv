@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 
-use crate::types::RowId;
+use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
-use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::{MemPager, Pager};
+use llkv_types::ids::{LogicalFieldId, RowId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use croaring::Treemap;

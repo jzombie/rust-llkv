@@ -11,8 +11,8 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
+use llkv_types::{LogicalFieldId, Namespace};
 
 // Minimal visitor that records that callbacks occurred (to ensure scan executed).
 struct TouchVisitor {

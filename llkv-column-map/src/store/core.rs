@@ -6,7 +6,6 @@ use crate::store::descriptor::{
 };
 use crate::store::scan::filter::FilterDispatch;
 use crate::store::scan::{FilterPrimitive, FilterResult};
-use crate::types::{LogicalFieldId, RowId, TableId};
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, UInt64Array};
 use arrow::compute::{self, SortColumn, lexsort_to_indices};
 use arrow::datatypes::DataType;
@@ -18,6 +17,7 @@ use llkv_storage::{
     pager::{BatchGet, BatchPut, GetResult, Pager},
     types::PhysicalKey,
 };
+use llkv_types::ids::{LogicalFieldId, RowId, TableId};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -447,8 +447,8 @@ where
     /// # Errors
     ///
     /// Returns an error if column descriptors cannot be loaded.
-    pub fn total_rows_for_table(&self, table_id: crate::types::TableId) -> Result<u64> {
-        use crate::types::Namespace;
+    pub fn total_rows_for_table(&self, table_id: llkv_types::ids::TableId) -> Result<u64> {
+        use llkv_types::ids::Namespace;
         // Acquire read lock on catalog and find any matching user-data field
         let catalog = self.catalog.read().unwrap();
         // Collect all user-data logical field ids for this table.
@@ -480,8 +480,11 @@ where
     /// This returns the [`LogicalFieldId`]s of all persisted user columns (namespace
     /// `UserData`) belonging to the specified table. MVCC and row ID columns are not
     /// included.
-    pub fn user_field_ids_for_table(&self, table_id: crate::types::TableId) -> Vec<LogicalFieldId> {
-        use crate::types::Namespace;
+    pub fn user_field_ids_for_table(
+        &self,
+        table_id: llkv_types::ids::TableId,
+    ) -> Vec<LogicalFieldId> {
+        use llkv_types::ids::Namespace;
 
         let catalog = self.catalog.read().unwrap();
         catalog

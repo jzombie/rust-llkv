@@ -8,8 +8,8 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::scan::{PrimitiveSortedVisitor, PrimitiveVisitor, ScanOptions};
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 fn make_schema_u64(field_id: LogicalFieldId) -> Arc<Schema> {
     let rid = Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false);

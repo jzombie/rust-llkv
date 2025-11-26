@@ -1,8 +1,8 @@
 use arrow::datatypes::DataType;
-use llkv_types::{FieldId, LogicalFieldId, TableId};
 use llkv_expr::ScalarExpr;
 use llkv_expr::literal::Literal;
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::{FieldId, LogicalFieldId, TableId};
 use rustc_hash::FxHashMap;
 
 pub fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {

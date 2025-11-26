@@ -1,6 +1,6 @@
 use super::*;
-use crate::types::Namespace;
 use arrow::datatypes::DataType;
+use llkv_types::ids::Namespace;
 use rustc_hash::FxHashMap;
 
 /// Owned handles to sorted value chunks and their permutation arrays.

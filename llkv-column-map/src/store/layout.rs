@@ -1,5 +1,5 @@
-use crate::types::LogicalFieldId;
 use llkv_storage::types::PhysicalKey;
+use llkv_types::ids::LogicalFieldId;
 
 /// Statistics for a single descriptor page.
 #[derive(Debug, Clone)]

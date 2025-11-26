@@ -7,13 +7,13 @@
 use crate::serialization::deserialize_array;
 use crate::store::catalog::ColumnCatalog;
 use crate::store::descriptor::{ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, ROW_ID_FIELD_ID};
 use arrow::datatypes::DataType;
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, BatchPut, GetResult, Pager},
     types::PhysicalKey,
 };
+use llkv_types::ids::{LogicalFieldId, ROW_ID_FIELD_ID};
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};

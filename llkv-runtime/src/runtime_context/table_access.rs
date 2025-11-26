@@ -9,7 +9,6 @@ use crate::{RuntimeContext, RuntimeTableHandle, canonical_table_name};
 use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_types::LogicalFieldId;
 use llkv_executor::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
     translation,
@@ -21,6 +20,7 @@ use llkv_table::{
     ConstraintKind, FieldId, MultiColumnIndexEntryMeta, RowId, Table, TableConstraintSummaryView,
 };
 use llkv_transaction::{TransactionSnapshot, mvcc};
+use llkv_types::LogicalFieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{
