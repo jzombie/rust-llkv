@@ -14,6 +14,7 @@ use arrow::array::{
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
 
 use llkv_result::Error;
+use time::{Date, Month};
 
 use crate::decimal::DecimalValue;
 use crate::interval::IntervalValue;
@@ -72,6 +73,58 @@ impl From<Vec<(String, Literal)>> for Literal {
             .collect();
         Literal::Struct(boxed_fields)
     }
+}
+
+impl Literal {
+    /// Human-friendly rendering used in plan/debug output.
+    pub fn format_display(&self) -> String {
+        match self {
+            Literal::Integer(i) => i.to_string(),
+            Literal::Float(f) => f.to_string(),
+            Literal::Decimal(d) => d.to_string(),
+            Literal::Boolean(b) => b.to_string(),
+            Literal::String(s) => format!("\"{}\"", escape_string(s)),
+            Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
+            Literal::Interval(interval) => format!(
+                "INTERVAL {{ months: {}, days: {}, nanos: {} }}",
+                interval.months, interval.days, interval.nanos
+            ),
+            Literal::Null => "NULL".to_string(),
+            Literal::Struct(fields) => {
+                let field_strs: Vec<_> = fields
+                    .iter()
+                    .map(|(name, lit)| format!("{}: {}", name, lit.format_display()))
+                    .collect();
+                format!("{{{}}}", field_strs.join(", "))
+            }
+        }
+    }
+}
+
+fn format_date32(days: i32) -> String {
+    let julian = match epoch_julian_day().checked_add(days) {
+        Some(value) => value,
+        None => return days.to_string(),
+    };
+
+    match Date::from_julian_day(julian) {
+        Ok(date) => {
+            let (year, month, day) = date.to_calendar_date();
+            let month_number = month as u8;
+            format!("{:04}-{:02}-{:02}", year, month_number, day)
+        }
+        Err(_) => days.to_string(),
+    }
+}
+
+fn epoch_julian_day() -> i32 {
+    Date::from_calendar_date(1970, Month::January, 1)
+        .expect("1970-01-01 is a valid date")
+        .to_julian_day()
+}
+
+fn escape_string(value: &str) -> String {
+    value.chars().flat_map(|c| c.escape_default()).collect()
 }
 
 /// Error converting a `Literal` into a concrete native type.

@@ -1946,6 +1946,7 @@ dependencies = [
  "llkv-test-utils",
  "modular-bitfield",
  "serde",
+ "time",
 ]
 
 [[package]]

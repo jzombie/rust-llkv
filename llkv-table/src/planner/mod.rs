@@ -16,7 +16,6 @@ use arrow::array::{
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
 use arrow_array::types::{Int32Type, Int64Type};
-use time::{Date, Month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
@@ -3541,18 +3540,18 @@ fn format_filter(filter: &Filter<'_, FieldId>) -> String {
 // TODO: Move to llkv-expr?
 fn format_operator(op: &Operator<'_>) -> String {
     match op {
-        Operator::Equals(lit) => format!("= {}", format_literal(lit)),
+        Operator::Equals(lit) => format!("= {}", lit.format_display()),
         Operator::Range { lower, upper } => format!(
             "IN {} .. {}",
             format_range_bound_lower(lower),
             format_range_bound_upper(upper)
         ),
-        Operator::GreaterThan(lit) => format!("> {}", format_literal(lit)),
-        Operator::GreaterThanOrEquals(lit) => format!(">= {}", format_literal(lit)),
-        Operator::LessThan(lit) => format!("< {}", format_literal(lit)),
-        Operator::LessThanOrEquals(lit) => format!("<= {}", format_literal(lit)),
+        Operator::GreaterThan(lit) => format!("> {}", lit.format_display()),
+        Operator::GreaterThanOrEquals(lit) => format!(">= {}", lit.format_display()),
+        Operator::LessThan(lit) => format!("< {}", lit.format_display()),
+        Operator::LessThanOrEquals(lit) => format!("<= {}", lit.format_display()),
         Operator::In(values) => {
-            let rendered: Vec<String> = values.iter().map(format_literal).collect();
+            let rendered: Vec<String> = values.iter().map(|lit| lit.format_display()).collect();
             format!("IN {{{}}}", rendered.join(", "))
         }
         Operator::StartsWith {
@@ -3580,12 +3579,16 @@ fn format_pattern_op(op_name: &str, pattern: &str, case_sensitive: bool) -> Stri
     rendered
 }
 
+fn escape_string(value: &str) -> String {
+    value.chars().flat_map(|c| c.escape_default()).collect()
+}
+
 // TODO: Move to llkv-types as Literal impl
 fn format_range_bound_lower(bound: &Bound<Literal>) -> String {
     match bound {
         Bound::Unbounded => "-inf".to_string(),
-        Bound::Included(lit) => format!("[{}", format_literal(lit)),
-        Bound::Excluded(lit) => format!("({}", format_literal(lit)),
+        Bound::Included(lit) => format!("[{}", lit.format_display()),
+        Bound::Excluded(lit) => format!("({}", lit.format_display()),
     }
 }
 
@@ -3593,8 +3596,8 @@ fn format_range_bound_lower(bound: &Bound<Literal>) -> String {
 fn format_range_bound_upper(bound: &Bound<Literal>) -> String {
     match bound {
         Bound::Unbounded => "+inf".to_string(),
-        Bound::Included(lit) => format!("{}]", format_literal(lit)),
-        Bound::Excluded(lit) => format!("{})", format_literal(lit)),
+        Bound::Included(lit) => format!("{}]", lit.format_display()),
+        Bound::Excluded(lit) => format!("{})", lit.format_display()),
     }
 }
 
@@ -3656,7 +3659,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
     for node in postorder.into_iter().rev() {
         match node {
             Column(fid) => result_stack.push(format!("col#{}", fid)),
-            Literal(lit) => result_stack.push(format_literal(lit)),
+            Literal(lit) => result_stack.push(lit.format_display()),
             Aggregate(agg) => result_stack.push(format!("AGG({:?})", agg)),
             GetField { field_name, .. } => {
                 let base = result_stack.pop().unwrap_or_default();
@@ -3771,59 +3774,6 @@ fn format_compare_op(op: CompareOp) -> &'static str {
         CompareOp::Gt => ">",
         CompareOp::GtEq => ">=",
     }
-}
-
-// TODO: Move to llkv-types as Literal impl
-fn format_literal(lit: &Literal) -> String {
-    match lit {
-        Literal::Integer(i) => i.to_string(),
-        Literal::Float(f) => f.to_string(),
-        Literal::Decimal(d) => d.to_string(),
-        Literal::Boolean(b) => b.to_string(),
-        Literal::String(s) => format!("\"{}\"", escape_string(s)),
-        Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
-        Literal::Interval(interval) => format!(
-            "INTERVAL {{ months: {}, days: {}, nanos: {} }}",
-            interval.months, interval.days, interval.nanos
-        ),
-        Literal::Null => "NULL".to_string(),
-        Literal::Struct(fields) => {
-            let field_strs: Vec<_> = fields
-                .iter()
-                .map(|(name, lit)| format!("{}: {}", name, format_literal(lit)))
-                .collect();
-            format!("{{{}}}", field_strs.join(", "))
-        }
-    }
-}
-
-// TODO: Move to llkv-compute as date method
-fn format_date32(days: i32) -> String {
-    let julian = match epoch_julian_day().checked_add(days) {
-        Some(value) => value,
-        None => return days.to_string(),
-    };
-
-    match Date::from_julian_day(julian) {
-        Ok(date) => {
-            let (year, month, day) = date.to_calendar_date();
-            let month_number = month as u8;
-            format!("{:04}-{:02}-{:02}", year, month_number, day)
-        }
-        Err(_) => days.to_string(),
-    }
-}
-
-// TODO: Move to llkv-compute as date method
-fn epoch_julian_day() -> i32 {
-    Date::from_calendar_date(1970, Month::January, 1)
-        .expect("1970-01-01 is a valid date")
-        .to_julian_day()
-}
-
-// TODO: Move to llkv-compute as string method
-fn escape_string(value: &str) -> String {
-    value.chars().flat_map(|c| c.escape_default()).collect()
 }
 
 struct PrimitiveOrderContext<'a> {
