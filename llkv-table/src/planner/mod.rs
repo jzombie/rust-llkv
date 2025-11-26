@@ -3494,7 +3494,7 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
                 result_stack.push(format!(
                     "{} {} {}",
                     format_scalar_expr(left),
-                    format_compare_op(*op),
+                    op.as_str(),
                     format_scalar_expr(right)
                 ));
             }
@@ -3672,12 +3672,12 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
             Binary { op, .. } => {
                 let right = result_stack.pop().unwrap_or_default();
                 let left = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("({} {} {})", left, format_binary_op(*op), right));
+                result_stack.push(format!("({} {} {})", left, op.as_str(), right));
             }
             Compare { op, .. } => {
                 let right = result_stack.pop().unwrap_or_default();
                 let left = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("({} {} {})", left, format_compare_op(*op), right));
+                result_stack.push(format!("({} {} {})", left, op.as_str(), right));
             }
             Not(_) => {
                 let operand = result_stack.pop().unwrap_or_default();
@@ -3749,32 +3749,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
     result_stack.pop().unwrap_or_default()
 }
 
-// TODO: Move to llkv-expr as BinaryOp impl
-fn format_binary_op(op: BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Add => "+",
-        BinaryOp::Subtract => "-",
-        BinaryOp::Multiply => "*",
-        BinaryOp::Divide => "/",
-        BinaryOp::Modulo => "%",
-        BinaryOp::And => "AND",
-        BinaryOp::Or => "OR",
-        BinaryOp::BitwiseShiftLeft => "<<",
-        BinaryOp::BitwiseShiftRight => ">>",
-    }
-}
 
-// TODO: Move to llkv-expr as CompareOp impl
-fn format_compare_op(op: CompareOp) -> &'static str {
-    match op {
-        CompareOp::Eq => "=",
-        CompareOp::NotEq => "!=",
-        CompareOp::Lt => "<",
-        CompareOp::LtEq => "<=",
-        CompareOp::Gt => ">",
-        CompareOp::GtEq => ">=",
-    }
-}
 
 struct PrimitiveOrderContext<'a> {
     out_schema: &'a Arc<Schema>,
