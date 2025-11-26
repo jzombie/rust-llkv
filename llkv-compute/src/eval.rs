@@ -25,12 +25,18 @@ enum VectorizedExpr {
 }
 
 impl VectorizedExpr {
-    fn materialize(self, len: usize, _target_type: DataType) -> ArrayRef {
+    fn materialize(self, len: usize, target_type: DataType) -> ArrayRef {
         match self {
-            VectorizedExpr::Array(array) => array, // TODO: Cast to target_type if needed
+            VectorizedExpr::Array(array) => {
+                if array.data_type() == &target_type {
+                    array
+                } else {
+                    cast::cast(&array, &target_type).unwrap_or(array)
+                }
+            }
             VectorizedExpr::Scalar(scalar_array) => {
                 if scalar_array.is_empty() {
-                    return new_null_array(&_target_type, len);
+                    return new_null_array(&target_type, len);
                 }
                 if scalar_array.is_null(0) {
                     return new_null_array(scalar_array.data_type(), len);
@@ -62,29 +68,28 @@ struct AffineState<F> {
     offset: f64,
 }
 
-// TODO: Place in impl?
-/// Combine field identifiers while tracking whether multiple fields were encountered.
-#[allow(dead_code)]
-fn merge_field<F: Eq + Copy>(lhs: Option<F>, rhs: Option<F>) -> Option<Option<F>> {
-    match (lhs, rhs) {
-        (Some(a), Some(b)) => {
-            if a == b {
-                Some(Some(a))
-            } else {
-                None
-            }
-        }
-        (Some(a), None) => Some(Some(a)),
-        (None, Some(b)) => Some(Some(b)),
-        (None, None) => Some(None),
-    }
-}
-
 /// Centralizes the numeric kernels applied to scalar expressions so they can be
 /// tuned without touching the surrounding table scan logic.
 pub struct ScalarEvaluator;
 
 impl ScalarEvaluator {
+    /// Combine field identifiers while tracking whether multiple fields were encountered.
+    #[allow(dead_code)]
+    fn merge_field<F: Eq + Copy>(lhs: Option<F>, rhs: Option<F>) -> Option<Option<F>> {
+        match (lhs, rhs) {
+            (Some(a), Some(b)) => {
+                if a == b {
+                    Some(Some(a))
+                } else {
+                    None
+                }
+            }
+            (Some(a), None) => Some(Some(a)),
+            (None, Some(b)) => Some(Some(b)),
+            (None, None) => Some(None),
+        }
+    }
+
     /// Collect every field referenced by the scalar expression into `acc`.
     pub fn collect_fields<F: Hash + Eq + Copy>(expr: &ScalarExpr<F>, acc: &mut FxHashSet<F>) {
         match expr {
@@ -837,7 +842,7 @@ impl ScalarEvaluator {
         lhs: AffineState<F>,
         rhs: AffineState<F>,
     ) -> Option<AffineState<F>> {
-        let merged_field = merge_field(lhs.field, rhs.field)?;
+        let merged_field = Self::merge_field(lhs.field, rhs.field)?;
         if merged_field.is_none() {
             // Both constant
             return Some(AffineState {
@@ -858,7 +863,7 @@ impl ScalarEvaluator {
         lhs: AffineState<F>,
         rhs: AffineState<F>,
     ) -> Option<AffineState<F>> {
-        let merged_field = merge_field(lhs.field, rhs.field)?;
+        let merged_field = Self::merge_field(lhs.field, rhs.field)?;
         if merged_field.is_none() {
             return Some(AffineState {
                 field: None,

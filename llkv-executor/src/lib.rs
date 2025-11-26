@@ -13154,7 +13154,7 @@ where
             ) {
                 (Some(column), None) => {
                     if let Some(literal) = extract_literal(right)
-                        && let Some(value) = literal_to_plan_value_for_join(literal)
+                        && let Some(value) = PlanValue::from_literal_for_join(literal)
                         && column.table < constraints.len()
                     {
                         constraints[column.table]
@@ -13163,7 +13163,7 @@ where
                 }
                 (None, Some(column)) => {
                     if let Some(literal) = extract_literal(left)
-                        && let Some(value) = literal_to_plan_value_for_join(literal)
+                        && let Some(value) = PlanValue::from_literal_for_join(literal)
                         && column.table < constraints.len()
                     {
                         constraints[column.table]
@@ -13183,7 +13183,7 @@ where
                 // Try to find which table this column belongs to
                 for info in &table_infos {
                     if let Some(&col_idx) = info.column_map.get(&field_name) {
-                        if let Some(value) = plan_value_from_operator_literal(literal_val) {
+                        if let Some(value) = PlanValue::from_operator_literal(literal_val) {
                             let column_ref = ColumnRef {
                                 table: info.index,
                                 column: col_idx,
@@ -13213,7 +13213,7 @@ where
                 let mut values = Vec::new();
                 for item in list {
                     if let Some(literal) = extract_literal(item)
-                        && let Some(value) = literal_to_plan_value_for_join(literal)
+                        && let Some(value) = PlanValue::from_literal_for_join(literal)
                     {
                         values.push(value);
                     }
@@ -13286,7 +13286,7 @@ fn try_extract_or_as_in_list(
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
             ) && let Some(literal) = extract_literal(right)
-                && let Some(value) = literal_to_plan_value_for_join(literal)
+                && let Some(value) = PlanValue::from_literal_for_join(literal)
             {
                 // Check if this is the same column as previous OR branches
                 match common_column {
@@ -13310,7 +13310,7 @@ fn try_extract_or_as_in_list(
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
             ) && let Some(literal) = extract_literal(left)
-                && let Some(value) = literal_to_plan_value_for_join(literal)
+                && let Some(value) = PlanValue::from_literal_for_join(literal)
             {
                 match common_column {
                     None => common_column = Some(column),
@@ -13327,7 +13327,7 @@ fn try_extract_or_as_in_list(
             && let Operator::Equals(ref literal) = filter.op
             && let Some(column) =
                 resolve_column_reference(&ScalarExpr::Column(filter.field_id.clone()), table_infos)
-            && let Some(value) = literal_to_plan_value_for_join(literal)
+            && let Some(value) = PlanValue::from_literal_for_join(literal)
         {
             match common_column {
                 None => common_column = Some(column),
@@ -13414,7 +13414,7 @@ fn extract_join_constraints(
                     }
                     (Some(column), None) => {
                         if let Some(literal) = extract_literal(right)
-                            && let Some(value) = literal_to_plan_value_for_join(literal)
+                            && let Some(value) = PlanValue::from_literal_for_join(literal)
                         {
                             literals
                                 .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
@@ -13424,7 +13424,7 @@ fn extract_join_constraints(
                     }
                     (None, Some(column)) => {
                         if let Some(literal) = extract_literal(left)
-                            && let Some(value) = literal_to_plan_value_for_join(literal)
+                            && let Some(value) = PlanValue::from_literal_for_join(literal)
                         {
                             literals
                                 .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
@@ -13447,7 +13447,7 @@ fn extract_join_constraints(
                     let mut in_list_values = Vec::new();
                     for item in list {
                         if let Some(literal) = extract_literal(item)
-                            && let Some(value) = literal_to_plan_value_for_join(literal)
+                            && let Some(value) = PlanValue::from_literal_for_join(literal)
                         {
                             in_list_values.push(value);
                         }
@@ -13482,7 +13482,7 @@ fn extract_join_constraints(
                         &ScalarExpr::Column(filter.field_id.clone()),
                         table_infos,
                     )
-                    && let Some(value) = literal_to_plan_value_for_join(literal)
+                    && let Some(value) = PlanValue::from_literal_for_join(literal)
                 {
                     literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                     handled_conjuncts += 1;
@@ -13588,25 +13588,6 @@ fn extract_literal(expr: &ScalarExpr<String>) -> Option<&Literal> {
     }
 }
 
-fn plan_value_from_operator_literal(op_value: &llkv_expr::literal::Literal) -> Option<PlanValue> {
-    match op_value {
-        llkv_expr::literal::Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
-        llkv_expr::literal::Literal::Float(v) => Some(PlanValue::Float(*v)),
-        llkv_expr::literal::Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
-        llkv_expr::literal::Literal::String(v) => Some(PlanValue::String(v.clone())),
-        _ => None,
-    }
-}
-
-fn literal_to_plan_value_for_join(literal: &Literal) -> Option<PlanValue> {
-    match literal {
-        Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
-        Literal::Float(v) => Some(PlanValue::Float(*v)),
-        Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
-        Literal::String(v) => Some(PlanValue::String(v.clone())),
-        _ => None,
-    }
-}
 
 #[derive(Default)]
 struct DistinctState {
