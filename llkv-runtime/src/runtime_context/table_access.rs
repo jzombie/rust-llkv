@@ -9,7 +9,7 @@ use crate::{RuntimeContext, RuntimeTableHandle, canonical_table_name};
 use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_executor::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
     translation,

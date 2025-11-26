@@ -42,7 +42,7 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_column_map::{
     ColumnStore,
     store::{GatherNullPolicy, ROW_ID_COLUMN_NAME, rowid_fid},
@@ -56,19 +56,19 @@ use crate::reserved::*;
 
 // ----- Namespacing helpers -----
 
-// TODO: Dedupe with llkv_column_map::types::lfid()
+// TODO: Dedupe with llkv_types::lfid()
 #[inline]
 fn lfid(table_id: TableId, col_id: u32) -> LogicalFieldId {
     LogicalFieldId::for_user(table_id, col_id)
 }
 
-// TODO: Migrate to llkv_column_map::types::rid_table()
+// TODO: Migrate to llkv_types::rid_table()
 #[inline]
 fn rid_table(table_id: TableId) -> u64 {
     LogicalFieldId::for_user(table_id, ROW_ID_FIELD_ID).into()
 }
 
-// TODO: Migrate to llkv_column_map::types::rid_col()
+// TODO: Migrate to llkv_types::rid_col()
 #[inline]
 fn rid_col(table_id: TableId, col_id: u32) -> u64 {
     rowid_fid(lfid(table_id, col_id)).into()

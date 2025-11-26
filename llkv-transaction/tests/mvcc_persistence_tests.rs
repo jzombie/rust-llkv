@@ -40,7 +40,7 @@ use tempfile::TempDir;
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_types::{LogicalFieldId, Namespace};
 use llkv_result::Result;
 use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
 use llkv_table::Table;

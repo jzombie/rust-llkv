@@ -10,7 +10,7 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_types::{LogicalFieldId, Namespace};
 use llkv_storage::pager::MemPager;
 
 fn seed_anchor_and_target() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId) {

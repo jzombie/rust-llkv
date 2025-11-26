@@ -50,7 +50,7 @@ use rand::{SeedableRng, rngs::StdRng};
 
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 const N_ROWS: usize = 1_000_000;

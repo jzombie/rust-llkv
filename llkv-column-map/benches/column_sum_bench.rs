@@ -23,7 +23,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
-use llkv_column_map::types::{LogicalFieldId, RowId};
+use llkv_types::{LogicalFieldId, RowId};
 use llkv_storage::pager::MemPager;
 
 use croaring::Treemap;

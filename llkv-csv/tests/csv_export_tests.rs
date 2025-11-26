@@ -3,7 +3,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use llkv_column_map::store::Projection;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_csv::CsvReadOptions;
 use llkv_csv::csv_export::{
     CsvExportColumn, CsvWriteOptions, export_csv_from_table, export_csv_from_table_with_filter,

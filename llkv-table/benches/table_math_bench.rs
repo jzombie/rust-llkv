@@ -14,7 +14,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::Projection;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_expr::{BinaryOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;

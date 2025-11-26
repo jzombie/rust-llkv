@@ -5,7 +5,7 @@ use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::Schema;
 use croaring::Treemap;
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy, MultiGatherContext};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_result::Result as LlkvResult;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;

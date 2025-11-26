@@ -1,7 +1,7 @@
 use crate::ExecutorResult;
 use crate::types::ExecutorTable;
 use llkv_column_map::store::Projection as StoreProjection;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_plan::SelectProjection;
 use llkv_result::Error;
 use llkv_storage::pager::Pager;

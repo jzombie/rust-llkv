@@ -28,7 +28,7 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 use rand::rngs::StdRng;

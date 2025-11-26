@@ -26,7 +26,7 @@
 
 use crate::resolvers::TableNameKey;
 use crate::types::TableId;
-use llkv_column_map::types::FieldId;
+use llkv_types::FieldId;
 use llkv_result::{Error, Result};
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};

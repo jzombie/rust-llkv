@@ -29,7 +29,7 @@ use arrow_buffer::IntervalMonthDayNano;
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::gather::gather_indices_from_batches;
 use llkv_column_map::store::Projection as StoreProjection;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_expr::SubqueryId;
 use llkv_expr::expr::{
     AggregateCall, BinaryOp, CompareOp, Expr as LlkvExpr, Filter, Operator, ScalarExpr,

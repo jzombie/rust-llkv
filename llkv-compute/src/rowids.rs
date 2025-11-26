@@ -6,7 +6,7 @@ use std::ops::Bound;
 use arrow::array::{Array, PrimitiveArray};
 use arrow::datatypes::ArrowPrimitiveType;
 use croaring::Treemap;
-use llkv_column_map::types::RowId;
+use llkv_types::RowId;
 use llkv_expr::Operator;
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_result::{Error, Result as LlkvResult};

@@ -150,7 +150,7 @@ fn run(
                     .unwrap_or(0)
             });
 
-        let lfid = llkv_column_map::types::LogicalFieldId::for_user(table.table_id(), fid);
+        let lfid = llkv_types::LogicalFieldId::for_user(table.table_id(), fid);
         let alias = field.name().to_string();
         projections.push(ScanProjection::from(Projection::with_alias(lfid, alias)));
     }

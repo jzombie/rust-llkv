@@ -487,7 +487,7 @@ where
         table_id: TableId,
         column_field_ids: &[FieldId],
     ) -> LlkvResult<()> {
-        use llkv_column_map::types::LogicalFieldId;
+        use llkv_types::LogicalFieldId;
 
         self.metadata
             .prepare_table_drop(table_id, column_field_ids)?;
@@ -674,7 +674,7 @@ where
         })?;
 
         // Remove column from the column store
-        use llkv_column_map::types::{LogicalFieldId, Namespace};
+        use llkv_types::{LogicalFieldId, Namespace};
         let logical_field_id = LogicalFieldId::from_parts(Namespace::UserData, table_id, col_id);
         self.store.remove_column(logical_field_id)?;
 
@@ -1383,7 +1383,7 @@ where
     fn sorted_user_fields(
         &self,
         table_id: TableId,
-    ) -> (Vec<llkv_column_map::types::LogicalFieldId>, Vec<FieldId>) {
+    ) -> (Vec<llkv_types::LogicalFieldId>, Vec<FieldId>) {
         let mut logical_fields = self.store.user_field_ids_for_table(table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
         let field_ids = logical_fields

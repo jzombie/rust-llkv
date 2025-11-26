@@ -17,6 +17,7 @@ llkv-column-map.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
+llkv-types.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 tracing.workspace = true
 

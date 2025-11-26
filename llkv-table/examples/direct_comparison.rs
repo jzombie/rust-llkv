@@ -14,7 +14,7 @@ use llkv_column_map::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{Projection, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;

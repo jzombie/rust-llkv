@@ -9,7 +9,7 @@
 use arrow::array::{Array, UInt64Array};
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_executor::{ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};

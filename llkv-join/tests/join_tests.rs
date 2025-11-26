@@ -4,7 +4,7 @@ use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::Projection;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_expr::{CompareOp, Expr, ScalarExpr};
 use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_storage::pager::MemPager;

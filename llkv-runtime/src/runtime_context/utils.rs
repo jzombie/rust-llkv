@@ -13,7 +13,7 @@ use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, IntervalUnit};
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_compute::date::parse_date32_literal;
 use llkv_compute::scalar::decimal::{
     align_decimal_to_scale, decimal_truthy, truncate_decimal_to_i64,

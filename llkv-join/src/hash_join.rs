@@ -38,7 +38,7 @@ use llkv_column_map::gather::{
     gather_indices, gather_indices_from_batches, gather_optional_indices_from_batches,
 };
 use llkv_column_map::store::Projection;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;

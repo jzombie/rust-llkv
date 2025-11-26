@@ -12,6 +12,7 @@ publish.workspace = true
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
 llkv-result = { workspace = true }
+modular-bitfield.workspace = true
 serde = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]

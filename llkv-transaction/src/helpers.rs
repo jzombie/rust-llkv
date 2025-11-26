@@ -6,7 +6,7 @@
 use arrow::array::{Array, ArrayRef, UInt64Array};
 use arrow::datatypes::{DataType, Field};
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::MvccColumnBuilder;

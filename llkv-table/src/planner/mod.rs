@@ -35,7 +35,7 @@ use llkv_column_map::ScanBuilder;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
+use llkv_types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };

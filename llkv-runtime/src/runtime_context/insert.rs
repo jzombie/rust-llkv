@@ -11,7 +11,7 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_column_map::types::{LogicalFieldId, RowId};
+use llkv_types::{LogicalFieldId, RowId};
 use llkv_executor::{
     ExecutorTable, build_array_for_column, normalize_insert_value_for_column,
     resolve_insert_columns,

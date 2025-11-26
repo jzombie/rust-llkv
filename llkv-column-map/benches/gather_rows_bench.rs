@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

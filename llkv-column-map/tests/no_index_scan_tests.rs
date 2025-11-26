@@ -10,7 +10,7 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
+use llkv_types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 
 #[test]
