@@ -14,6 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
+use llkv_compute::time::current_time_micros;
 use llkv_plan::{DropIndexPlan, ForeignKeySpec, PlanColumnSpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -1457,15 +1458,6 @@ fn field_id_for_index(idx: usize) -> LlkvResult<FieldId> {
             idx + 1
         ))
     })
-}
-
-// TODO: Dedupe (another instance exists in llkv-executor)
-#[allow(clippy::unnecessary_wraps)]
-fn current_time_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_micros() as u64)
-        .unwrap_or(0)
 }
 
 /// Parse a SQL type string (e.g., "INTEGER") back into a DataType.

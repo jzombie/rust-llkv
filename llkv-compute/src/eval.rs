@@ -6,11 +6,12 @@ use arrow::compute::kernels::cast;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{concat, is_not_null, take};
 use arrow::datatypes::{DataType, IntervalMonthDayNanoType};
-use llkv_expr::literal::Literal;
+use llkv_expr::literal::{IntervalValue, Literal, LiteralExt};
 use llkv_expr::{AggregateCall, BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
 use crate::kernels::{compute_binary, get_common_type};
 
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
@@ -682,6 +683,135 @@ impl ScalarEvaluator {
         }
     }
 
+    pub fn evaluate_constant_literal_expr<F: Hash + Eq + Copy>(
+        expr: &ScalarExpr<F>,
+    ) -> LlkvResult<Option<Literal>> {
+        let simplified = Self::simplify(expr);
+
+        if let Some(literal) = Self::evaluate_constant_literal_non_numeric(&simplified)? {
+            return Ok(Some(literal));
+        }
+
+        if let ScalarExpr::Literal(lit) = &simplified {
+            return Ok(Some(lit.clone()));
+        }
+
+        let arrays = NumericArrayMap::default();
+        let array = Self::evaluate_value(&simplified, 0, &arrays)?;
+        if array.is_null(0) {
+            return Ok(None);
+        }
+        Ok(Some(Literal::from_array_ref(&array, 0)?))
+    }
+
+    pub fn evaluate_constant_literal_non_numeric<F: Hash + Eq + Copy>(
+        expr: &ScalarExpr<F>,
+    ) -> LlkvResult<Option<Literal>> {
+        match expr {
+            ScalarExpr::Literal(lit) => Ok(Some(lit.clone())),
+            ScalarExpr::Cast {
+                expr,
+                data_type: DataType::Date32,
+            } => {
+                let inner = Self::evaluate_constant_literal_non_numeric(expr)?;
+                match inner {
+                    Some(Literal::Null) => Ok(Some(Literal::Null)),
+                    Some(Literal::String(text)) => {
+                        let days = parse_date32_literal(&text)?;
+                        Ok(Some(Literal::Date32(days)))
+                    }
+                    Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
+                    Some(other) => Err(Error::InvalidArgumentError(format!(
+                        "cannot cast literal of type {} to DATE",
+                        other.type_name()
+                    ))),
+                    None => Ok(None),
+                }
+            }
+            ScalarExpr::Cast { .. } => Ok(None),
+            ScalarExpr::Binary { left, op, right } => {
+                let left_lit = match Self::evaluate_constant_literal_non_numeric(left)? {
+                    Some(lit) => lit,
+                    None => return Ok(None),
+                };
+                let right_lit = match Self::evaluate_constant_literal_non_numeric(right)? {
+                    Some(lit) => lit,
+                    None => return Ok(None),
+                };
+
+                if matches!(left_lit, Literal::Null) || matches!(right_lit, Literal::Null) {
+                    return Ok(Some(Literal::Null));
+                }
+
+                match op {
+                    BinaryOp::Add => match (&left_lit, &right_lit) {
+                        (Literal::Date32(days), Literal::Interval(interval))
+                        | (Literal::Interval(interval), Literal::Date32(days)) => {
+                            let adjusted = add_interval_to_date32(*days, *interval)?;
+                            Ok(Some(Literal::Date32(adjusted)))
+                        }
+                        (Literal::Interval(left), Literal::Interval(right)) => {
+                            let sum = left.checked_add(*right).ok_or_else(|| {
+                                Error::InvalidArgumentError(
+                                    "interval addition overflow during constant folding".into(),
+                                )
+                            })?;
+                            Ok(Some(Literal::Interval(sum)))
+                        }
+                        _ => Ok(None),
+                    },
+                    BinaryOp::Subtract => match (&left_lit, &right_lit) {
+                        (Literal::Date32(days), Literal::Interval(interval)) => {
+                            let adjusted = subtract_interval_from_date32(*days, *interval)?;
+                            Ok(Some(Literal::Date32(adjusted)))
+                        }
+                        (Literal::Interval(left), Literal::Interval(right)) => {
+                            let diff = left.checked_sub(*right).ok_or_else(|| {
+                                Error::InvalidArgumentError(
+                                    "interval subtraction overflow during constant folding".into(),
+                                )
+                            })?;
+                            Ok(Some(Literal::Interval(diff)))
+                        }
+                        (Literal::Date32(lhs), Literal::Date32(rhs)) => {
+                            let delta = i64::from(*lhs) - i64::from(*rhs);
+                            if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
+                                return Err(Error::InvalidArgumentError(
+                                    "DATE subtraction overflowed day precision".into(),
+                                ));
+                            }
+                            Ok(Some(Literal::Interval(IntervalValue::new(
+                                0,
+                                delta as i32,
+                                0,
+                            ))))
+                        }
+                        _ => Ok(None),
+                    },
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn is_supported_numeric(dtype: &DataType) -> bool {
+        matches!(
+            dtype,
+            DataType::UInt64
+                | DataType::UInt32
+                | DataType::UInt16
+                | DataType::UInt8
+                | DataType::Int64
+                | DataType::Int32
+                | DataType::Int16
+                | DataType::Int8
+                | DataType::Float64
+                | DataType::Float32
+        )
+    }
+
+    // TODO: Move to ScalarExpr impl?
     fn infer_result_type_from_arrays<F: Hash + Eq + Copy>(
         expr: &ScalarExpr<F>,
         arrays: &NumericArrayMap<F>,
@@ -690,6 +820,7 @@ impl ScalarEvaluator {
         Self::infer_result_type(expr, &mut resolver).unwrap_or(DataType::Float64)
     }
 
+    // TODO: Move to ScalarExpr impl?
     fn expr_contains_interval<F: Hash + Eq + Copy>(expr: &ScalarExpr<F>) -> bool {
         match expr {
             ScalarExpr::Literal(Literal::Interval(_)) => true,

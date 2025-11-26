@@ -106,9 +106,10 @@ where
 
         if logical_fields.is_empty() {
             // Tables without user columns should still return row_id batches.
-            let mut row_id_builder = UInt64Builder::with_capacity(visible_row_ids.len());
-            for row_id in &visible_row_ids {
-                row_id_builder.append_value(*row_id);
+            let mut row_id_builder =
+                UInt64Builder::with_capacity(visible_row_ids.cardinality() as usize);
+            for row_id in visible_row_ids.iter() {
+                row_id_builder.append_value(row_id);
             }
             let arrays: Vec<ArrayRef> = vec![Arc::new(row_id_builder.finish()) as ArrayRef];
             let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
@@ -117,7 +118,7 @@ where
 
         let mut stream = table.table.stream_columns(
             Arc::from(logical_fields),
-            visible_row_ids,
+            &visible_row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 

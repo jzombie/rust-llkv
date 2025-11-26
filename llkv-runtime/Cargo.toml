@@ -13,6 +13,7 @@ readme = "README.md"
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
+croaring.workspace = true
 llkv-column-map.workspace = true
 llkv-compute.workspace = true
 llkv-executor.workspace = true

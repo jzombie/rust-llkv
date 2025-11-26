@@ -11,8 +11,10 @@ publish.workspace = true
 [dependencies]
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
-llkv-result = { workspace = true }
+croaring.workspace = true
+llkv-column-map = { workspace = true }
 llkv-expr = { workspace = true }
+llkv-result = { workspace = true }
 llkv-types = { workspace = true }
 time = { workspace = true }
 rand = { workspace = true }
