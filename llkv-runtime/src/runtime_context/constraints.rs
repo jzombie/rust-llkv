@@ -18,9 +18,9 @@ use llkv_table::{
     InsertUniqueColumn, RowId,
 };
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
+use roaring::RoaringTreemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
-use roaring::RoaringTreemap;
 
 use crate::TXN_ID_NONE;
 

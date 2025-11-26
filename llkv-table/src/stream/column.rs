@@ -153,9 +153,11 @@ where
             let start = self.position;
             self.position += window.len();
 
-            let batch =
-                self.store
-                    .gather_rows_with_reusable_context(&mut self.ctx, &window, self.policy)?;
+            let batch = self.store.gather_rows_with_reusable_context(
+                &mut self.ctx,
+                &window,
+                self.policy,
+            )?;
 
             if batch.num_rows() == 0 && matches!(self.policy, GatherNullPolicy::DropNulls) {
                 // All rows dropped; continue to the next chunk to avoid yielding empties.
@@ -202,4 +204,3 @@ impl ColumnStreamBatch {
         self.batch
     }
 }
-

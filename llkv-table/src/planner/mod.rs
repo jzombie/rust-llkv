@@ -1,13 +1,13 @@
 pub mod plan_graph;
 mod program;
 
+use roaring::RoaringTreemap;
 use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::convert::TryFrom;
 use std::mem;
 use std::ops::Bound;
 use std::sync::Arc;
-use roaring::RoaringTreemap;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
@@ -75,7 +75,7 @@ use self::program::{
     DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler, ProgramSet,
     normalize_predicate,
 };
-use crate::stream::{RowStream, RowStreamBuilder, RowIdSource};
+use crate::stream::{RowIdSource, RowStream, RowStreamBuilder};
 
 // NOTE: Planning and execution currently live together; once the dedicated
 // executor crate stabilizes we can migrate these components into `llkv-plan`.
@@ -836,7 +836,7 @@ where
                 .run(&mut collector)?;
             let rows = collector.into_inner();
             collected.extend(rows);
-            
+
             if expected > 0 && collected.len() >= expected {
                 break;
             }
@@ -1281,7 +1281,8 @@ where
                 "[SCAN_STREAM] MVCC + trivial filter: scanning created_by column for all row IDs"
             );
             // Get all rows where created_by exists (which is all rows that have been written)
-            let rows = self.table
+            let rows = self
+                .table
                 .store()
                 .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?;
             RoaringTreemap::from_iter(rows)
@@ -2421,7 +2422,8 @@ where
         all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
     ) -> LlkvResult<RoaringTreemap> {
         let mut stack: Vec<RoaringTreemap> = Vec::new();
-        let mut domain_cache: FxHashMap<DomainProgramId, Arc<RoaringTreemap>> = FxHashMap::default();
+        let mut domain_cache: FxHashMap<DomainProgramId, Arc<RoaringTreemap>> =
+            FxHashMap::default();
 
         let mut debug_stack_lens: Vec<usize> = Vec::with_capacity(programs.eval.ops.len());
 
@@ -2914,22 +2916,20 @@ where
         );
 
         match order.transform {
-            ScanOrderTransform::IdentityInt64 => {
-                self.sort_row_ids_with_primitive_transform::<Int64Type>(
+            ScanOrderTransform::IdentityInt64 => self
+                .sort_row_ids_with_primitive_transform::<Int64Type>(
                     row_ids,
                     primitive_context,
                     ascending,
                     order.nulls_first,
-                )
-            }
-            ScanOrderTransform::IdentityInt32 => {
-                self.sort_row_ids_with_primitive_transform::<Int32Type>(
+                ),
+            ScanOrderTransform::IdentityInt32 => self
+                .sort_row_ids_with_primitive_transform::<Int32Type>(
                     row_ids,
                     primitive_context,
                     ascending,
                     order.nulls_first,
-                )
-            }
+                ),
             ScanOrderTransform::IdentityUtf8 => {
                 let mut row_stream = RowStreamBuilder::new(
                     store,
@@ -2983,8 +2983,7 @@ where
                     ));
                 }
 
-                let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().enumerate().collect();
+                let mut indices: Vec<(usize, RowId)> = row_ids.iter().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let (chunk_a, offset_a) = positions[*ai];
                     let (chunk_b, offset_b) = positions[*bi];
@@ -3062,8 +3061,7 @@ where
                     ));
                 }
 
-                let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().enumerate().collect();
+                let mut indices: Vec<(usize, RowId)> = row_ids.iter().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let left = keys[*ai];
                     let right = keys[*bi];
@@ -3199,7 +3197,10 @@ where
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
-        let vec = self.table.store().filter_row_ids::<T>(field_id, &predicate)?;
+        let vec = self
+            .table
+            .store()
+            .filter_row_ids::<T>(field_id, &predicate)?;
         Ok(RoaringTreemap::from_iter(vec))
     }
 
@@ -3212,7 +3213,8 @@ where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
         let predicate = build_var_width_predicate(op).map_err(Error::predicate_build)?;
-        let vec = self.table
+        let vec = self
+            .table
             .store()
             .filter_row_ids::<llkv_column_map::store::scan::filter::Utf8Filter<O>>(
                 field_id, &predicate,
@@ -3250,7 +3252,8 @@ where
         op: &Operator<'_>,
     ) -> LlkvResult<RoaringTreemap> {
         let predicate = build_bool_predicate(op).map_err(Error::predicate_build)?;
-        let vec = self.table
+        let vec = self
+            .table
             .store()
             .filter_row_ids::<arrow::datatypes::BooleanType>(field_id, &predicate)?;
         Ok(RoaringTreemap::from_iter(vec))
@@ -3503,10 +3506,7 @@ fn get_field_dtype(
             .find(|f| f.name() == field_name)
             .map(|f| f.data_type().clone())
             .ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "Field '{}' not found in struct",
-                    field_name
-                ))
+                Error::InvalidArgumentError(format!("Field '{}' not found in struct", field_name))
             })
     } else {
         Err(Error::InvalidArgumentError(

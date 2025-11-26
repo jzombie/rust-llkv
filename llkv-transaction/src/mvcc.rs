@@ -12,11 +12,11 @@ use llkv_column_map::store::{
 };
 use llkv_column_map::types::{FieldId, RowId};
 use llkv_result::Error;
+use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use roaring::RoaringTreemap;
 
 /// Transaction ID type.
 pub type TxnId = u64;

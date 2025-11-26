@@ -9,7 +9,6 @@
 //! - Transaction state tracking
 //! - Table cache management
 
-use roaring::RoaringTreemap;
 use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, IntervalUnit};
 use llkv_column_map::store::GatherNullPolicy;
@@ -24,6 +23,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::FieldId;
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
+use roaring::RoaringTreemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 

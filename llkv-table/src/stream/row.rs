@@ -6,9 +6,9 @@ use arrow::datatypes::Schema;
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy, MultiGatherContext};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_result::Result as LlkvResult;
+use roaring::RoaringTreemap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
-use roaring::RoaringTreemap;
 
 use llkv_storage::pager::Pager;
 

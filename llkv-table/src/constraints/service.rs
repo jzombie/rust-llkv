@@ -17,10 +17,10 @@ use crate::view::ForeignKeyView;
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
+use roaring::RoaringTreemap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
-use roaring::RoaringTreemap;
 
 type ForeignKeyConstraintCache = FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>;
 type ForeignKeyCacheMap = FxHashMap<TableId, ForeignKeyConstraintCache>;

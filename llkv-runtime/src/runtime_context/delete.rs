@@ -12,10 +12,10 @@ use llkv_plan::DeletePlan;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_transaction::{TransactionSnapshot, mvcc};
-use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use roaring::RoaringTreemap;
+use simd_r_drive_entry_handle::EntryHandle;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::RuntimeContext;
 
