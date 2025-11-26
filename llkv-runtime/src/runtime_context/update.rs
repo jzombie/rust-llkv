@@ -21,11 +21,11 @@ use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::{
-    ConstraintEnforcementMode, FieldId, RowId, UniqueKey, build_composite_unique_key,
+    ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key,
 };
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use roaring::RoaringTreemap;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
 use std::sync::Arc;
@@ -293,11 +293,9 @@ where
             &new_rows,
         )?;
 
-        // TODO: Does rows_ids really have to be converted into a FxHashSet here?
         // For UPDATE, validate UNIQUE constraints against existing rows EXCLUDING
         // the rows being updated (since they'll be deleted before new values are inserted).
         // This prevents false duplicate detection when primary key values don't change.
-        let row_ids_set: FxHashSet<RowId> = row_ids.iter().collect();
         let all_visible_row_ids = {
             let first_field = table
                 .schema
@@ -324,7 +322,7 @@ where
                     .into_iter()
                     .zip(all_visible_row_ids.iter())
                     .filter_map(|(row, row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                        if !row_ids.contains(row_id) {
                             row.into_iter().next()
                         } else {
                             None
@@ -341,7 +339,7 @@ where
                     .into_iter()
                     .zip(all_visible_row_ids.iter())
                     .filter_map(|(row, row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                        if !row_ids.contains(row_id) {
                             Some(row)
                         } else {
                             None
@@ -641,7 +639,6 @@ where
         )?;
 
         // For UPDATE, validate UNIQUE constraints excluding rows being updated
-        let row_ids_set: FxHashSet<RowId> = row_ids.iter().collect();
         let all_visible_row_ids = {
             let first_field = table
                 .schema
@@ -667,7 +664,7 @@ where
                     .into_iter()
                     .zip(all_visible_row_ids.iter())
                     .filter_map(|(row, row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                        if !row_ids.contains(row_id) {
                             row.into_iter().next()
                         } else {
                             None
@@ -683,7 +680,7 @@ where
                     .into_iter()
                     .zip(all_visible_row_ids.iter())
                     .filter_map(|(row, row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                        if !row_ids.contains(row_id) {
                             Some(row)
                         } else {
                             None
