@@ -2477,7 +2477,9 @@ where
                 }
                 EvalOp::PushLiteral(value) => {
                     if *value {
-                        stack.push(RowIdSource::Bitmap(self.collect_all_row_ids(all_rows_cache)?));
+                        stack.push(RowIdSource::Bitmap(
+                            self.collect_all_row_ids(all_rows_cache)?,
+                        ));
                     } else {
                         stack.push(RowIdSource::Bitmap(RoaringTreemap::new()));
                     }
@@ -2498,7 +2500,7 @@ where
                         let next = stack
                             .pop()
                             .ok_or_else(|| Error::Internal("AND opcode underflow".into()))?;
-                        
+
                         let acc_empty = match &acc {
                             RowIdSource::Bitmap(b) => b.is_empty(),
                             RowIdSource::Vector(v) => v.is_empty(),
@@ -2540,7 +2542,7 @@ where
                         let next = stack
                             .pop()
                             .ok_or_else(|| Error::Internal("OR opcode underflow".into()))?;
-                        
+
                         let acc_empty = match &acc {
                             RowIdSource::Bitmap(b) => b.is_empty(),
                             RowIdSource::Vector(v) => v.is_empty(),
@@ -2578,7 +2580,7 @@ where
                         all_rows_cache,
                         &mut domain_cache,
                     )?;
-                    
+
                     let matched_empty = match &matched {
                         RowIdSource::Bitmap(b) => b.is_empty(),
                         RowIdSource::Vector(v) => v.is_empty(),
@@ -2678,7 +2680,7 @@ where
                 acc = RowIdSource::Bitmap(RoaringTreemap::new());
                 break;
             }
-            
+
             let mut acc_bitmap = match acc {
                 RowIdSource::Bitmap(b) => b,
                 RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
