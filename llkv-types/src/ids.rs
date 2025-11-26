@@ -11,6 +11,11 @@
 
 use modular_bitfield::prelude::*;
 
+#[inline]
+fn rowid_shadow(fid: LogicalFieldId) -> LogicalFieldId {
+    fid.with_namespace(Namespace::RowIdShadow)
+}
+
 // TODO: Rename to something more specific
 /// Category of data a column contains.
 ///
@@ -196,4 +201,23 @@ impl LogicalFieldId {
     pub fn for_mvcc_deleted_by(table_id: TableId) -> Self {
         Self::from_parts(Namespace::TxnDeletedBy, table_id, u32::MAX - 1)
     }
+}
+
+/// Convenience helper for constructing a user-space logical field id.
+#[inline]
+pub fn lfid(table_id: TableId, col_id: FieldId) -> LogicalFieldId {
+    LogicalFieldId::for_user(table_id, col_id)
+}
+
+/// Logical field id for the table's row id shadow column, as a `u64` key.
+#[inline]
+pub fn rid_col(table_id: TableId, col_id: FieldId) -> u64 {
+    let fid = lfid(table_id, col_id);
+    rowid_shadow(fid).into()
+}
+
+/// Logical field id for the reserved table row id column, as a `u64` key.
+#[inline]
+pub fn rid_table(table_id: TableId) -> u64 {
+    lfid(table_id, ROW_ID_FIELD_ID).into()
 }

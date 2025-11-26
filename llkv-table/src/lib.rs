@@ -41,7 +41,6 @@ pub mod metadata;
 mod planner;
 pub mod reserved;
 pub mod resolvers;
-pub mod scalar_eval;
 pub mod schema_ext;
 mod sys_catalog;
 pub mod view;
@@ -78,6 +77,9 @@ pub use reserved::{
 };
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
+pub use llkv_compute::compute_binary;
+pub use llkv_compute::eval::{AffineExpr, ScalarEvaluator as NumericKernels};
+pub type NumericArrayMap = llkv_compute::eval::NumericArrayMap<FieldId>;
 pub use sys_catalog::{
     ColMeta, CustomTypeMeta, MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
     TableMeta, TableMultiColumnIndexMeta, TableSingleColumnIndexMeta, TableTriggerMeta,
@@ -92,4 +94,3 @@ pub use planner::plan_graph::{
     PlanGraph, PlanGraphBuilder, PlanGraphError, PlanGraphResult, PlanGraphVersion, PlanInput,
     PlanNode, PlanNodeId, PlanOperator,
 };
-pub use scalar_eval::{NumericArrayMap, NumericKernels};

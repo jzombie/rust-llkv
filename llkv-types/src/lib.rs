@@ -9,6 +9,8 @@ pub mod interval;
 pub mod literal;
 
 pub use decimal::{DecimalError, DecimalValue};
-pub use ids::{FieldId, LogicalFieldId, Namespace, ROW_ID_FIELD_ID, RowId, TableId};
+pub use ids::{
+    FieldId, LogicalFieldId, Namespace, RowId, TableId, ROW_ID_FIELD_ID, lfid, rid_col, rid_table,
+};
 pub use interval::IntervalValue;
-pub use literal::Literal;
+pub use literal::{FromLiteral, Literal, LiteralCastError, LiteralExt};

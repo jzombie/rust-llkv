@@ -63,7 +63,7 @@ use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::reserved::is_information_schema_table;
-use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+use crate::{NumericArrayMap, NumericKernels};
 
 use crate::schema_ext::CachedSchema;
 use crate::table::{
