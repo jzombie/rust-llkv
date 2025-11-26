@@ -489,7 +489,7 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llkv_expr::literal::IntervalValue;
+    use llkv_types::IntervalValue;
     use sqlparser::ast::{Expr as SqlExpr, SelectItem, SetExpr, Statement, Value, ValueWithSpan};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;

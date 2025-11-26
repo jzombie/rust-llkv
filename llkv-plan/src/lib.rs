@@ -21,7 +21,8 @@ pub mod subquery_correlation;
 pub mod traversal;
 pub mod validation;
 
-pub use canonical::{CanonicalRow, CanonicalScalar};
+pub use canonical::canonical_scalar_from_plan_value;
+pub use llkv_types::{CanonicalRow, CanonicalScalar};
 pub use conversion::{
     RangeSelectRows, extract_rows_from_range, plan_value_from_sql_expr, plan_value_from_sql_value,
 };

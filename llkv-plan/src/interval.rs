@@ -5,7 +5,7 @@
 //! The planner and SQL layers share this module so literal handling stays
 //! consistent without duplicating parsing rules.
 
-use llkv_expr::literal::IntervalValue;
+use llkv_types::IntervalValue;
 use llkv_result::{Error, Result};
 use regex::Regex;
 use sqlparser::ast::{DateTimeField, Expr as SqlExpr, Interval as SqlInterval, UnaryOperator};

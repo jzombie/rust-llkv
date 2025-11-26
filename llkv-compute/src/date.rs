@@ -5,7 +5,7 @@
 //! literals. Having a single implementation avoids drift between crates and
 //! keeps overflow/validation handling centralized.
 
-use llkv_expr::literal::IntervalValue;
+use llkv_types::IntervalValue;
 use llkv_result::{Error, Result};
 use time::{Date, Duration, Month};
 

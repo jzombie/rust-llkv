@@ -4,10 +4,12 @@
 //! decoupled from the expression AST (`llkv-expr`) and compute kernels (`llkv-compute`).
 
 pub mod decimal;
+pub mod canonical;
 pub mod ids;
 pub mod interval;
 pub mod literal;
 
+pub use canonical::{CanonicalRow, CanonicalScalar};
 pub use decimal::{DecimalError, DecimalValue};
 pub use ids::{
     FieldId, LogicalFieldId, Namespace, RowId, TableId, ROW_ID_FIELD_ID, lfid, rid_col, rid_table,

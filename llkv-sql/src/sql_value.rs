@@ -3,7 +3,7 @@ use crate::{
     sql_engine::register_placeholder,
 };
 use llkv_compute::date::parse_date32_literal;
-use llkv_expr::literal::IntervalValue;
+use llkv_types::IntervalValue;
 use llkv_plan::plans::PlanValue;
 use llkv_plan::{add_interval_to_date32, subtract_interval_from_date32};
 use llkv_result::Error;
