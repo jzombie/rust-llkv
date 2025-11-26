@@ -61,7 +61,7 @@ where
 
         let mut stream = table.table.stream_columns(
             Arc::clone(&logical_fields),
-            row_ids.clone(),
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 
@@ -154,7 +154,7 @@ where
 
         let mut stream = match table.table.stream_columns(
             logical_field_ids.clone(),
-            visible_row_ids.clone(),
+            &visible_row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
             Ok(stream) => stream,
@@ -245,18 +245,14 @@ where
             return Ok(());
         }
 
-        // TODO: Is this *really* necessary? Can referenced_row_ids take a RoaringTreemap instead?
-        let row_ids_vec: Vec<RowId> = row_ids.iter().collect();
-
         self.constraint_service.validate_update_foreign_keys(
             table.table.table_id(),
-            &row_ids_vec,
+            row_ids,
             updated_field_ids,
             |request| {
-                let map: RoaringTreemap = request.referenced_row_ids.iter().copied().collect();
                 self.collect_row_values_for_ids(
                     table,
-                    &map,
+                    request.referenced_row_ids,
                     request.referenced_field_ids,
                 )
             },
@@ -285,17 +281,13 @@ where
             return Ok(());
         }
 
-        // TODO: Is this *really* necessary? Can validate_delete_foreign_keys take a RoaringTreemap instead?
-        let row_ids_vec: Vec<RowId> = row_ids.iter().collect();
-
         self.constraint_service.validate_delete_foreign_keys(
             table.table.table_id(),
-            &row_ids_vec,
+            row_ids,
             |request| {
-                let map: RoaringTreemap = request.referenced_row_ids.iter().copied().collect();
                 self.collect_row_values_for_ids(
                     table,
-                    &map,
+                    request.referenced_row_ids,
                     request.referenced_field_ids,
                 )
             },

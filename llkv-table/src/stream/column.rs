@@ -11,19 +11,72 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use roaring::RoaringTreemap;
 
+/// Iterator over row IDs that can own or borrow the underlying bitmap.
+pub enum RowIdIter<'a> {
+    Owned(roaring::treemap::IntoIter),
+    Borrowed(roaring::treemap::Iter<'a>),
+}
+
+impl<'a> Iterator for RowIdIter<'a> {
+    type Item = u64;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(iter) => iter.next(),
+            Self::Borrowed(iter) => iter.next(),
+        }
+    }
+}
+
+impl From<RoaringTreemap> for RowIdIter<'static> {
+    fn from(map: RoaringTreemap) -> Self {
+        Self::Owned(map.into_iter())
+    }
+}
+
+impl<'a> From<&'a RoaringTreemap> for RowIdIter<'a> {
+    fn from(map: &'a RoaringTreemap) -> Self {
+        Self::Borrowed(map.iter())
+    }
+}
+
+pub trait RowIdStreamSource<'a> {
+    fn count(&self) -> u64;
+    fn into_iter_source(self) -> RowIdIter<'a>;
+}
+
+impl RowIdStreamSource<'static> for RoaringTreemap {
+    fn count(&self) -> u64 {
+        self.len()
+    }
+    fn into_iter_source(self) -> RowIdIter<'static> {
+        RowIdIter::Owned(self.into_iter())
+    }
+}
+
+impl<'a> RowIdStreamSource<'a> for &'a RoaringTreemap {
+    fn count(&self) -> u64 {
+        self.len()
+    }
+    fn into_iter_source(self) -> RowIdIter<'a> {
+        RowIdIter::Borrowed(self.iter())
+    }
+}
+
 /// Streaming view over a set of row IDs for selected logical fields.
 ///
 /// `ColumnStream` keeps a reusable gather context so repeated calls avoid
 /// reparsing column descriptors or re-fetching chunk metadata. Each call to
 /// [`ColumnStream::next_batch`] returns at most `STREAM_BATCH_ROWS` values,
 /// backed by Arrow arrays without copying the column data.
-pub struct ColumnStream<'table, P = MemPager>
+pub struct ColumnStream<'table, 'a, P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     store: &'table ColumnStore<P>,
     ctx: MultiGatherContext,
-    row_ids: roaring::treemap::IntoIter,
+    row_ids: RowIdIter<'a>,
     position: usize,
     total_rows: usize,
     chunk_size: usize,
@@ -38,23 +91,23 @@ pub struct ColumnStreamBatch {
     batch: RecordBatch,
 }
 
-impl<'table, P> ColumnStream<'table, P>
+impl<'table, 'a, P> ColumnStream<'table, 'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub(crate) fn new(
         store: &'table ColumnStore<P>,
         ctx: MultiGatherContext,
-        row_ids: RoaringTreemap,
+        row_ids: RowIdIter<'a>,
+        total_rows: usize,
         chunk_size: usize,
         policy: GatherNullPolicy,
         logical_fields: Arc<[LogicalFieldId]>,
     ) -> Self {
-        let total_rows = row_ids.len() as usize;
         Self {
             store,
             ctx,
-            row_ids: row_ids.into_iter(),
+            row_ids,
             position: 0,
             total_rows,
             chunk_size,

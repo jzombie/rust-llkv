@@ -20,6 +20,7 @@ use llkv_storage::pager::Pager;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
+use roaring::RoaringTreemap;
 
 type ForeignKeyConstraintCache = FxHashMap<ConstraintId, Arc<FxHashSet<UniqueKey>>>;
 type ForeignKeyCacheMap = FxHashMap<TableId, ForeignKeyConstraintCache>;
@@ -58,7 +59,7 @@ pub struct ForeignKeyRowFetch<'a> {
 /// Context for collecting parent row values involved in a DELETE operation.
 pub struct ForeignKeyParentRowsFetch<'a> {
     pub referenced_table_id: TableId,
-    pub referenced_row_ids: &'a [RowId],
+    pub referenced_row_ids: &'a RoaringTreemap,
     pub referenced_field_ids: &'a [FieldId],
 }
 
@@ -419,7 +420,7 @@ where
     pub fn validate_delete_foreign_keys<FParents, FChildren>(
         &self,
         referenced_table_id: TableId,
-        referenced_row_ids: &[RowId],
+        referenced_row_ids: &RoaringTreemap,
         mut fetch_parent_rows: FParents,
         mut fetch_child_rows: FChildren,
     ) -> LlkvResult<()>
@@ -437,8 +438,6 @@ where
         if referencing.is_empty() {
             return Ok(());
         }
-
-        let deleting_row_ids: FxHashSet<RowId> = referenced_row_ids.iter().copied().collect();
 
         for (child_table_id, constraint_id) in referencing {
             let details = self
@@ -491,7 +490,7 @@ where
                 }
 
                 if detail.referencing_table_id == detail.referenced_table_id
-                    && deleting_row_ids.contains(&child_row_id)
+                    && referenced_row_ids.contains(child_row_id)
                 {
                     continue;
                 }
@@ -520,7 +519,7 @@ where
     pub fn validate_update_foreign_keys<FParents, FChildren>(
         &self,
         referenced_table_id: TableId,
-        referenced_row_ids: &[RowId],
+        referenced_row_ids: &RoaringTreemap,
         updated_field_ids: &[FieldId],
         mut fetch_parent_rows: FParents,
         mut fetch_child_rows: FChildren,

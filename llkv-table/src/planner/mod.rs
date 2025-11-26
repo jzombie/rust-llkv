@@ -736,13 +736,13 @@ where
         }
     }
 
-    fn table_row_ids(&self) -> LlkvResult<RoaringTreemap> {
-        if let Some(cached) = self.row_id_cache.borrow().as_ref() {
-            return Ok(cached.clone());
+    fn table_row_ids(&self) -> LlkvResult<std::cell::Ref<'_, RoaringTreemap>> {
+        if self.row_id_cache.borrow().is_none() {
+            let computed = self.compute_table_row_ids()?;
+            *self.row_id_cache.borrow_mut() = Some(computed);
         }
-        let computed = self.compute_table_row_ids()?;
-        *self.row_id_cache.borrow_mut() = Some(computed.clone());
-        Ok(computed)
+        let borrow = self.row_id_cache.borrow();
+        Ok(std::cell::Ref::map(borrow, |opt| opt.as_ref().unwrap()))
     }
 
     fn compute_table_row_ids(&self) -> LlkvResult<RoaringTreemap> {
@@ -1586,7 +1586,7 @@ where
                 }
                 let mut cache = FxHashMap::default();
                 let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
-                let null_ids = all_row_ids - non_null;
+                let null_ids = &*all_row_ids - non_null;
                 tracing::debug!(
                     field = ?filter_lfid,
                     row_count = null_ids.len(),

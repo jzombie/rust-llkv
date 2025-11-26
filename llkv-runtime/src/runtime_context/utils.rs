@@ -475,7 +475,7 @@ where
 
         let mut stream = match table.table.stream_columns(
             logical_field_ids.clone(),
-            row_ids.clone(),
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
             Ok(stream) => stream,
@@ -565,7 +565,7 @@ where
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
         let mut stream = table.table.stream_columns(
             Arc::clone(&logical_fields),
-            row_ids.iter().collect(),
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 

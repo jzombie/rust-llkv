@@ -727,18 +727,21 @@ where
     }
 
     /// Create a streaming view over the provided row IDs for the specified logical fields.
-    pub fn stream_columns(
-        &self,
+    pub fn stream_columns<'table, 'a>(
+        &'table self,
         logical_fields: impl Into<Arc<[LogicalFieldId]>>,
-        row_ids: RoaringTreemap,
+        row_ids: impl crate::stream::RowIdStreamSource<'a>,
         policy: GatherNullPolicy,
-    ) -> LlkvResult<ColumnStream<'_, P>> {
+    ) -> LlkvResult<ColumnStream<'table, 'a, P>> {
+        let total_rows = row_ids.count() as usize;
+        let iter = row_ids.into_iter_source();
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
         let ctx = self.store.prepare_gather_context(logical_fields.as_ref())?;
         Ok(ColumnStream::new(
             &self.store,
             ctx,
-            row_ids,
+            iter,
+            total_rows,
             STREAM_BATCH_ROWS,
             policy,
             logical_fields,

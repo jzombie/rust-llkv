@@ -173,7 +173,7 @@ where
 
         let mut stream = table.table.stream_columns(
             logical_fields.clone(),
-            row_ids.clone(),
+            &row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 
@@ -527,7 +527,7 @@ where
 
         let mut stream = table.table.stream_columns(
             logical_fields.clone(),
-            row_ids.clone(),
+            &row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 

@@ -494,7 +494,7 @@ where
                 let logical_field_id = LogicalFieldId::for_user(table_id, unique_col.field_id);
                 let mut stream = table.table.stream_columns(
                     vec![logical_field_id],
-                    row_ids.clone(),
+                    &row_ids,
                     GatherNullPolicy::IncludeNulls,
                 )?;
 
@@ -624,7 +624,7 @@ where
 
         let mut stream = table.table.stream_columns(
             logical_field_ids,
-            row_ids.clone(),
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 
