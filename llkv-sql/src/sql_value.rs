@@ -15,9 +15,9 @@ use sqlparser::ast::{
 #[derive(Clone, Debug)]
 pub(crate) enum SqlValue {
     Null,
-    Integer(i64),
-    Float(f64),
-    Decimal(DecimalValue),
+    Int64(i64),
+    Float64(f64),
+    Decimal128(DecimalValue),
     Boolean(bool),
     String(String),
     Date32(i32),
@@ -29,9 +29,9 @@ impl SqlValue {
     fn into_literal(self) -> SqlResult<Literal> {
         match self {
             SqlValue::Null => Ok(Literal::Null),
-            SqlValue::Integer(i) => Ok(Literal::Integer(i.into())),
-            SqlValue::Float(f) => Ok(Literal::Float(f)),
-            SqlValue::Decimal(d) => Ok(Literal::Decimal(d)),
+            SqlValue::Int64(i) => Ok(Literal::Int128(i.into())),
+            SqlValue::Float64(f) => Ok(Literal::Float64(f)),
+            SqlValue::Decimal128(d) => Ok(Literal::Decimal128(d)),
             SqlValue::Date32(days) => Ok(Literal::Date32(days)),
             SqlValue::Interval(interval) => Ok(Literal::Interval(interval)),
             SqlValue::Boolean(_) | SqlValue::String(_) | SqlValue::Struct(_) => Err(
@@ -42,14 +42,15 @@ impl SqlValue {
         }
     }
 
+    #[allow(dead_code)]
     fn from_literal(lit: &Literal) -> SqlResult<SqlValue> {
         Ok(match lit {
             Literal::Null => SqlValue::Null,
-            Literal::Integer(i) => SqlValue::Integer((*i).try_into().map_err(|_| {
+            Literal::Int128(i) => SqlValue::Int64((*i).try_into().map_err(|_| {
                 Error::InvalidArgumentError("integer literal out of range".into())
             })?),
-            Literal::Float(f) => SqlValue::Float(*f),
-            Literal::Decimal(d) => SqlValue::Decimal(*d),
+            Literal::Float64(f) => SqlValue::Float64(*f),
+            Literal::Decimal128(d) => SqlValue::Decimal128(*d),
             Literal::String(s) => SqlValue::String(s.clone()),
             Literal::Boolean(b) => SqlValue::Boolean(*b),
             Literal::Date32(days) => SqlValue::Date32(*days),
@@ -76,12 +77,12 @@ impl SqlValue {
                 op: UnaryOperator::Minus,
                 expr,
             } => match SqlValue::try_from_expr(expr)? {
-                SqlValue::Integer(v) => Ok(SqlValue::Integer(-v)),
-                SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
-                SqlValue::Decimal(dec) => {
+                SqlValue::Int64(v) => Ok(SqlValue::Int64(-v)),
+                SqlValue::Float64(v) => Ok(SqlValue::Float64(-v)),
+                SqlValue::Decimal128(dec) => {
                     // Negate the raw i128 value while preserving scale
                     DecimalValue::new(-dec.raw_value(), dec.scale())
-                        .map(SqlValue::Decimal)
+                        .map(SqlValue::Decimal128)
                         .map_err(|err| {
                             Error::InvalidArgumentError(format!(
                                 "decimal negation overflow: {}",
@@ -218,7 +219,7 @@ fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
         let value = text
             .parse::<f64>()
             .map_err(|err| Error::InvalidArgumentError(format!("invalid float literal: {err}")))?;
-        return Ok(SqlValue::Float(value));
+        return Ok(SqlValue::Float64(value));
     }
 
     // Decimal point → parse as Decimal with exact precision
@@ -240,23 +241,23 @@ fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
             Error::InvalidArgumentError(format!("invalid decimal literal: {}", err))
         })?;
 
-        return Ok(SqlValue::Decimal(decimal));
+        return Ok(SqlValue::Decimal128(decimal));
     }
 
     // No decimal point → integer
     let value = text
         .parse::<i64>()
         .map_err(|err| Error::InvalidArgumentError(format!("invalid integer literal: {err}")))?;
-    Ok(SqlValue::Integer(value))
+    Ok(SqlValue::Int64(value))
 }
 
 impl From<SqlValue> for PlanValue {
     fn from(value: SqlValue) -> Self {
         match value {
             SqlValue::Null => PlanValue::Null,
-            SqlValue::Integer(v) => PlanValue::Integer(v),
-            SqlValue::Float(v) => PlanValue::Float(v),
-            SqlValue::Decimal(d) => PlanValue::Decimal(d),
+            SqlValue::Int64(v) => PlanValue::Integer(v),
+            SqlValue::Float64(v) => PlanValue::Float(v),
+            SqlValue::Decimal128(d) => PlanValue::Decimal(d),
             SqlValue::Boolean(v) => PlanValue::Integer(if v { 1 } else { 0 }),
             SqlValue::String(s) => PlanValue::String(s),
             SqlValue::Date32(days) => PlanValue::Date32(days),
@@ -332,10 +333,10 @@ fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlRes
     }
 
     let lhs_i64 = match lhs_conv {
-        Literal::Integer(i) => i
+        Literal::Int128(i) => i
             .try_into()
             .map_err(|_| Error::InvalidArgumentError("bitshift lhs out of range".into()))?,
-        Literal::Float(f) => f as i64,
+        Literal::Float64(f) => f as i64,
         Literal::Date32(days) => days as i64,
         _ => {
             return Err(Error::InvalidArgumentError(
@@ -345,10 +346,10 @@ fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlRes
     };
 
     let rhs_i64 = match rhs_conv {
-        Literal::Integer(i) => i
+        Literal::Int128(i) => i
             .try_into()
             .map_err(|_| Error::InvalidArgumentError("bitshift rhs out of range".into()))?,
-        Literal::Float(f) => f as i64,
+        Literal::Float64(f) => f as i64,
         Literal::Date32(days) => days as i64,
         _ => {
             return Err(Error::InvalidArgumentError(
@@ -363,5 +364,5 @@ fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlRes
         _ => unreachable!(),
     };
 
-    Ok(SqlValue::Integer(result))
+    Ok(SqlValue::Int64(result))
 }

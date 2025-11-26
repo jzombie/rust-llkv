@@ -778,8 +778,8 @@ mod tests {
 
         match f.op {
             Operator::Range { lower, upper } => {
-                assert_eq!(lower, Bound::Included(Literal::Integer(150)));
-                assert_eq!(upper, Bound::Excluded(Literal::Integer(300)));
+                assert_eq!(lower, Bound::Included(Literal::Int128(150)));
+                assert_eq!(upper, Bound::Excluded(Literal::Int128(300)));
             }
             _ => panic!("Expected a range operator"),
         }

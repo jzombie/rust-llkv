@@ -55,9 +55,9 @@ pub fn infer_computed_data_type(
     expr: &ScalarExpr<FieldId>,
 ) -> ExecutorResult<DataType> {
     match expr {
-        ScalarExpr::Literal(Literal::Integer(_)) => Ok(DataType::Int64),
-        ScalarExpr::Literal(Literal::Float(_)) => Ok(DataType::Float64),
-        ScalarExpr::Literal(Literal::Decimal(value)) => {
+        ScalarExpr::Literal(Literal::Int128(_)) => Ok(DataType::Int64),
+        ScalarExpr::Literal(Literal::Float64(_)) => Ok(DataType::Float64),
+        ScalarExpr::Literal(Literal::Decimal128(value)) => {
             Ok(DataType::Decimal128(value.precision(), value.scale()))
         }
         ScalarExpr::Literal(Literal::Boolean(_)) => Ok(DataType::Boolean),
@@ -226,11 +226,11 @@ fn expression_uses_float(
     expr: &ScalarExpr<FieldId>,
 ) -> ExecutorResult<bool> {
     match expr {
-        ScalarExpr::Literal(Literal::Float(_)) => Ok(true),
-        ScalarExpr::Literal(Literal::Decimal(value)) => {
+        ScalarExpr::Literal(Literal::Float64(_)) => Ok(true),
+        ScalarExpr::Literal(Literal::Decimal128(value)) => {
             Ok(!decimal_literal_behaves_like_integer(value))
         }
-        ScalarExpr::Literal(Literal::Integer(_))
+        ScalarExpr::Literal(Literal::Int128(_))
         | ScalarExpr::Literal(Literal::Boolean(_))
         | ScalarExpr::Literal(Literal::Null)
         | ScalarExpr::Literal(Literal::String(_))
@@ -392,7 +392,7 @@ mod tests {
             right: Box::new(divisor),
         };
         let neg_col1 = ScalarExpr::Binary {
-            left: Box::new(ScalarExpr::Literal(Literal::Integer(0))),
+            left: Box::new(ScalarExpr::Literal(Literal::Int128(0))),
             op: BinaryOp::Subtract,
             right: Box::new(col1.clone()),
         };

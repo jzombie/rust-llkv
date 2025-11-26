@@ -22,8 +22,8 @@ use llkv_compute::date::parse_date32_literal;
 impl PlanValue {
     pub fn from_operator_literal(op_value: &llkv_expr::literal::Literal) -> Option<PlanValue> {
         match op_value {
-            Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
-            Literal::Float(v) => Some(PlanValue::Float(*v)),
+            Literal::Int128(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
+            Literal::Float64(v) => Some(PlanValue::Float(*v)),
             Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
             Literal::String(v) => Some(PlanValue::String(v.clone())),
             _ => None,
@@ -32,8 +32,8 @@ impl PlanValue {
 
     pub fn from_literal_for_join(literal: &Literal) -> Option<PlanValue> {
         match literal {
-            Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
-            Literal::Float(v) => Some(PlanValue::Float(*v)),
+            Literal::Int128(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
+            Literal::Float64(v) => Some(PlanValue::Float(*v)),
             Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
             Literal::String(v) => Some(PlanValue::String(v.clone())),
             _ => None,

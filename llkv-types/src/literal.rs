@@ -25,10 +25,10 @@ use crate::interval::IntervalValue;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
-    Integer(i128),
-    Float(f64),
+    Int128(i128),
+    Float64(f64),
     /// Decimal literal stored as scaled integer with fixed precision.
-    Decimal(DecimalValue),
+    Decimal128(DecimalValue),
     String(String),
     Boolean(bool),
     /// Date literal stored as days since the Unix epoch (1970-01-01).
@@ -52,11 +52,11 @@ macro_rules! impl_from_for_literal {
     };
 }
 
-impl_from_for_literal!(Integer, i8, i16, i32, i64, i128, u8, u16, u32, u64);
-impl_from_for_literal!(Float, f32, f64);
+impl_from_for_literal!(Int128, i8, i16, i32, i64, i128, u8, u16, u32, u64);
+impl_from_for_literal!(Float64, f32, f64);
 impl_from_for_literal!(String, String);
 impl_from_for_literal!(Boolean, bool);
-impl_from_for_literal!(Decimal, DecimalValue);
+impl_from_for_literal!(Decimal128, DecimalValue);
 impl_from_for_literal!(Interval, IntervalValue);
 
 impl From<&str> for Literal {
@@ -79,9 +79,9 @@ impl Literal {
     /// Human-friendly rendering used in plan/debug output.
     pub fn format_display(&self) -> String {
         match self {
-            Literal::Integer(i) => i.to_string(),
-            Literal::Float(f) => f.to_string(),
-            Literal::Decimal(d) => d.to_string(),
+            Literal::Int128(i) => i.to_string(),
+            Literal::Float64(f) => f.to_string(),
+            Literal::Decimal128(d) => d.to_string(),
             Literal::Boolean(b) => b.to_string(),
             Literal::String(s) => format!("\"{}\"", escape_string(s)),
             Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
@@ -176,9 +176,9 @@ pub trait LiteralExt {
 impl LiteralExt for Literal {
     fn type_name(&self) -> &'static str {
         match self {
-            Literal::Integer(_) => "integer",
-            Literal::Float(_) => "float",
-            Literal::Decimal(_) => "decimal",
+            Literal::Int128(_) => "integer",
+            Literal::Float64(_) => "float",
+            Literal::Decimal128(_) => "decimal",
             Literal::String(_) => "string",
             Literal::Boolean(_) => "boolean",
             Literal::Date32(_) => "date",
@@ -221,43 +221,43 @@ impl LiteralExt for Literal {
         match array.data_type() {
             DataType::Int8 => {
                 let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::Int16 => {
                 let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::Int32 => {
                 let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::Int64 => {
                 let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::UInt8 => {
                 let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::UInt16 => {
                 let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::UInt32 => {
                 let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::UInt64 => {
                 let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-                Ok(Literal::Integer(arr.value(index) as i128))
+                Ok(Literal::Int128(arr.value(index) as i128))
             }
             DataType::Float32 => {
                 let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-                Ok(Literal::Float(arr.value(index) as f64))
+                Ok(Literal::Float64(arr.value(index) as f64))
             }
             DataType::Float64 => {
                 let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                Ok(Literal::Float(arr.value(index)))
+                Ok(Literal::Float64(arr.value(index)))
             }
             DataType::Utf8 => {
                 let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
@@ -283,7 +283,7 @@ impl LiteralExt for Literal {
                         "invalid decimal value for literal conversion: {err}"
                     ))
                 })?;
-                Ok(Literal::Decimal(decimal))
+                Ok(Literal::Decimal128(decimal))
             }
             DataType::Struct(fields) => {
                 let struct_array =
@@ -331,13 +331,13 @@ macro_rules! impl_from_literal_int {
             impl FromLiteral for $ty {
                 fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
                     match lit {
-                        Literal::Integer(i) => <$ty>::try_from(*i).map_err(|_| {
+                        Literal::Int128(i) => <$ty>::try_from(*i).map_err(|_| {
                             LiteralCastError::OutOfRange {
                                 target: std::any::type_name::<$ty>(),
                                 value: *i,
                             }
                         }),
-                        Literal::Float(_) => Err(LiteralCastError::TypeMismatch {
+                        Literal::Float64(_) => Err(LiteralCastError::TypeMismatch {
                             expected: "integer",
                             got: "float",
                         }),
@@ -361,7 +361,7 @@ macro_rules! impl_from_literal_int {
                             expected: "integer",
                             got: "interval",
                         }),
-                        Literal::Decimal(decimal) => {
+                        Literal::Decimal128(decimal) => {
                             if decimal.scale() == 0 {
                                 let raw = decimal.raw_value();
                                 <$ty>::try_from(raw).map_err(|_| LiteralCastError::OutOfRange {
@@ -391,9 +391,9 @@ impl_from_literal_int!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, usize)
 impl FromLiteral for f32 {
     fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
         let value = match lit {
-            Literal::Float(f) => *f,
-            Literal::Integer(i) => *i as f64,
-            Literal::Decimal(d) => d.to_f64(),
+            Literal::Float64(f) => *f,
+            Literal::Int128(i) => *i as f64,
+            Literal::Decimal128(d) => d.to_f64(),
             Literal::Boolean(_) => {
                 return Err(LiteralCastError::TypeMismatch {
                     expected: "float",
@@ -447,9 +447,9 @@ impl FromLiteral for f32 {
 impl FromLiteral for f64 {
     fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
         match lit {
-            Literal::Float(f) => Ok(*f),
-            Literal::Integer(i) => Ok(*i as f64),
-            Literal::Decimal(d) => Ok(d.to_f64()),
+            Literal::Float64(f) => Ok(*f),
+            Literal::Int128(i) => Ok(*i as f64),
+            Literal::Decimal128(d) => Ok(d.to_f64()),
             Literal::Boolean(_) => Err(LiteralCastError::TypeMismatch {
                 expected: "float",
                 got: "boolean",
@@ -482,7 +482,7 @@ impl FromLiteral for bool {
     fn from_literal(lit: &Literal) -> Result<Self, LiteralCastError> {
         match lit {
             Literal::Boolean(b) => Ok(*b),
-            Literal::Integer(i) => match *i {
+            Literal::Int128(i) => match *i {
                 0 => Ok(false),
                 1 => Ok(true),
                 value => Err(LiteralCastError::OutOfRange {
@@ -490,7 +490,7 @@ impl FromLiteral for bool {
                     value,
                 }),
             },
-            Literal::Float(_) => Err(LiteralCastError::TypeMismatch {
+            Literal::Float64(_) => Err(LiteralCastError::TypeMismatch {
                 expected: "bool",
                 got: "float",
             }),
@@ -517,7 +517,7 @@ impl FromLiteral for bool {
                 expected: "bool",
                 got: "interval",
             }),
-            Literal::Decimal(_) => Err(LiteralCastError::TypeMismatch {
+            Literal::Decimal128(_) => Err(LiteralCastError::TypeMismatch {
                 expected: "bool",
                 got: "decimal",
             }),

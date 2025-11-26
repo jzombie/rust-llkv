@@ -1148,9 +1148,9 @@ where
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     } else {
                         let dtype = match &info.expr {
-                            ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
-                            ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
-                            ScalarExpr::Literal(Literal::Decimal(value)) => {
+                            ScalarExpr::Literal(Literal::Int128(_)) => DataType::Int64,
+                            ScalarExpr::Literal(Literal::Float64(_)) => DataType::Float64,
+                            ScalarExpr::Literal(Literal::Decimal128(value)) => {
                                 DataType::Decimal128(value.precision(), value.scale())
                             }
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
@@ -1682,24 +1682,24 @@ where
         fn compare_literals(left: &Literal, right: &Literal) -> Option<std::cmp::Ordering> {
             match (left, right) {
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
-                (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
-                (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
-                (Literal::Decimal(l), Literal::Decimal(r)) => Some(l.cmp(r)),
-                (Literal::Decimal(l), Literal::Integer(r)) => {
+                (Literal::Int128(l), Literal::Int128(r)) => l.partial_cmp(r),
+                (Literal::Float64(l), Literal::Float64(r)) => l.partial_cmp(r),
+                (Literal::Decimal128(l), Literal::Decimal128(r)) => Some(l.cmp(r)),
+                (Literal::Decimal128(l), Literal::Int128(r)) => {
                     DecimalValue::new(*r, 0).ok().map(|int| l.cmp(&int))
                 }
-                (Literal::Integer(l), Literal::Decimal(r)) => {
+                (Literal::Int128(l), Literal::Decimal128(r)) => {
                     DecimalValue::new(*l, 0).ok().map(|int| int.cmp(r))
                 }
-                (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
-                (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
+                (Literal::Decimal128(l), Literal::Float64(r)) => l.to_f64().partial_cmp(r),
+                (Literal::Float64(l), Literal::Decimal128(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
                 (Literal::Date32(l), Literal::Date32(r)) => l.partial_cmp(r),
                 (Literal::Interval(l), Literal::Interval(r)) => {
                     Some(compare_interval_values(*l, *r))
                 }
-                (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r),
-                (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64)),
+                (Literal::Int128(l), Literal::Float64(r)) => (*l as f64).partial_cmp(r),
+                (Literal::Float64(l), Literal::Int128(r)) => l.partial_cmp(&(*r as f64)),
                 _ => None,
             }
         }

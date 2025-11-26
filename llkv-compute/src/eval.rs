@@ -305,9 +305,9 @@ impl ScalarEvaluator {
         match lit {
             Literal::Null => DataType::Null,
             Literal::Boolean(_) => DataType::Boolean,
-            Literal::Integer(_) => DataType::Int64, // Default to Int64 for literals
-            Literal::Float(_) => DataType::Float64,
-            Literal::Decimal(d) => DataType::Decimal128(d.precision(), d.scale()),
+            Literal::Int128(_) => DataType::Int64, // Default to Int64 for literals
+            Literal::Float64(_) => DataType::Float64,
+            Literal::Decimal128(d) => DataType::Decimal128(d.precision(), d.scale()),
             Literal::String(_) => DataType::Utf8,
             Literal::Date32(_) => DataType::Date32,
             Literal::Interval(_) => {
@@ -441,9 +441,9 @@ impl ScalarEvaluator {
         match lit {
             Literal::Null => new_null_array(&DataType::Null, 1),
             Literal::Boolean(b) => Arc::new(arrow::array::BooleanArray::from(vec![*b])),
-            Literal::Integer(i) => Arc::new(arrow::array::Int64Array::from(vec![*i as i64])),
-            Literal::Float(f) => Arc::new(Float64Array::from(vec![*f])),
-            Literal::Decimal(d) => {
+            Literal::Int128(i) => Arc::new(arrow::array::Int64Array::from(vec![*i as i64])),
+            Literal::Float64(f) => Arc::new(Float64Array::from(vec![*f])),
+            Literal::Decimal128(d) => {
                 let array = arrow::array::Decimal128Array::from(vec![Some(d.raw_value())])
                     .with_precision_and_scale(d.precision(), d.scale())
                     .unwrap();
