@@ -118,7 +118,7 @@ where
 
         let mut stream = table.table.stream_columns(
             Arc::from(logical_fields),
-            visible_row_ids,
+            &visible_row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 

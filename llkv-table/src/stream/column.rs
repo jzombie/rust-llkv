@@ -13,12 +13,12 @@ use croaring::Treemap;
 
 /// Iterator over row IDs that can own or borrow the underlying bitmap.
 pub enum RowIdIter<'a> {
-    Owned(std::vec::IntoIter<u64>),
-    Borrowed(Box<dyn Iterator<Item = u64> + 'a>),
+    Owned(std::vec::IntoIter<RowId>),
+    Borrowed(Box<dyn Iterator<Item = RowId> + 'a>),
 }
 
 impl<'a> Iterator for RowIdIter<'a> {
-    type Item = u64;
+    type Item = RowId;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -31,6 +31,8 @@ impl<'a> Iterator for RowIdIter<'a> {
 
 impl From<Treemap> for RowIdIter<'static> {
     fn from(map: Treemap) -> Self {
+        // FIXME: This iter->vec-iter is not ideal but faster than
+        // manipulating the treemap on each iteration
         Self::Owned(map.iter().collect::<Vec<_>>().into_iter())
     }
 }
@@ -42,21 +44,23 @@ impl<'a> From<&'a Treemap> for RowIdIter<'a> {
 }
 
 pub trait RowIdStreamSource<'a> {
-    fn count(&self) -> u64;
+    fn count(&self) -> RowId;
     fn into_iter_source(self) -> RowIdIter<'a>;
 }
 
 impl RowIdStreamSource<'static> for Treemap {
-    fn count(&self) -> u64 {
+    fn count(&self) -> RowId {
         self.cardinality()
     }
     fn into_iter_source(self) -> RowIdIter<'static> {
+        // FIXME: This iter->vec-iter is not ideal but faster than
+        // manipulating the treemap on each iteration
         RowIdIter::Owned(self.iter().collect::<Vec<_>>().into_iter())
     }
 }
 
 impl<'a> RowIdStreamSource<'a> for &'a Treemap {
-    fn count(&self) -> u64 {
+    fn count(&self) -> RowId {
         self.cardinality()
     }
     fn into_iter_source(self) -> RowIdIter<'a> {
