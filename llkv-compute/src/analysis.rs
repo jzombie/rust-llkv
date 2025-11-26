@@ -1,7 +1,7 @@
 use arrow::datatypes::DataType;
 use llkv_column_map::types::{FieldId, LogicalFieldId, TableId};
-use llkv_expr::literal::Literal;
 use llkv_expr::ScalarExpr;
+use llkv_expr::literal::Literal;
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::FxHashMap;
 

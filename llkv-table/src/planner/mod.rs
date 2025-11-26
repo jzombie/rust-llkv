@@ -39,13 +39,13 @@ use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
-use llkv_compute::projection::{
-    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
-    synthesize_computed_literal_array,
-};
 use llkv_compute::analysis::{
     computed_expr_prefers_float, computed_expr_requires_numeric, get_field_dtype,
     scalar_expr_contains_coalesce,
+};
+use llkv_compute::projection::{
+    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
+    synthesize_computed_literal_array,
 };
 use llkv_compute::rowids::{RowIdFilter, compare_option_values, sort_by_primitive};
 use llkv_compute::scalar::interval::compare_interval_values;
@@ -3323,15 +3323,6 @@ where
     executor.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)
 }
 
-
-
-
-
-
-
-
-
-
 fn plan_graph_err(err: PlanGraphError) -> Error {
     Error::Internal(format!("plan graph construction failed: {err}"))
 }
@@ -3498,6 +3489,7 @@ fn format_pattern_op(op_name: &str, pattern: &str, case_sensitive: bool) -> Stri
     rendered
 }
 
+// TODO: Move to llkv-types as Literal impl
 fn format_range_bound_lower(bound: &Bound<Literal>) -> String {
     match bound {
         Bound::Unbounded => "-inf".to_string(),
@@ -3506,6 +3498,7 @@ fn format_range_bound_lower(bound: &Bound<Literal>) -> String {
     }
 }
 
+// TODO: Move to llkv-types as Literal impl
 fn format_range_bound_upper(bound: &Bound<Literal>) -> String {
     match bound {
         Bound::Unbounded => "+inf".to_string(),
@@ -3514,6 +3507,7 @@ fn format_range_bound_upper(bound: &Bound<Literal>) -> String {
     }
 }
 
+// TODO: Move to llkv-expr
 fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
     use ScalarExpr::*;
 
@@ -3661,6 +3655,7 @@ fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
     result_stack.pop().unwrap_or_default()
 }
 
+// TODO: Move to llkv-expr as BinaryOp impl
 fn format_binary_op(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
@@ -3675,6 +3670,7 @@ fn format_binary_op(op: BinaryOp) -> &'static str {
     }
 }
 
+// TODO: Move to llkv-expr as CompareOp impl
 fn format_compare_op(op: CompareOp) -> &'static str {
     match op {
         CompareOp::Eq => "=",
@@ -3686,6 +3682,7 @@ fn format_compare_op(op: CompareOp) -> &'static str {
     }
 }
 
+// TODO: Move to llkv-types as Literal impl
 fn format_literal(lit: &Literal) -> String {
     match lit {
         Literal::Integer(i) => i.to_string(),
@@ -3709,6 +3706,7 @@ fn format_literal(lit: &Literal) -> String {
     }
 }
 
+// TODO: Move to llkv-compute as date method
 fn format_date32(days: i32) -> String {
     let julian = match epoch_julian_day().checked_add(days) {
         Some(value) => value,
@@ -3725,17 +3723,17 @@ fn format_date32(days: i32) -> String {
     }
 }
 
+// TODO: Move to llkv-compute as date method
 fn epoch_julian_day() -> i32 {
     Date::from_calendar_date(1970, Month::January, 1)
         .expect("1970-01-01 is a valid date")
         .to_julian_day()
 }
 
+// TODO: Move to llkv-compute as string method
 fn escape_string(value: &str) -> String {
     value.chars().flat_map(|c| c.escape_default()).collect()
 }
-
-
 
 struct PrimitiveOrderContext<'a> {
     out_schema: &'a Arc<Schema>,
@@ -3773,8 +3771,6 @@ where
     chunks: Vec<PrimitiveArray<T>>,
     positions: Vec<(usize, usize)>,
 }
-
-
 
 // TODO: Move to llkv-expr?
 fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {
