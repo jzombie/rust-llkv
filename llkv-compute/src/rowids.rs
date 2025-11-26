@@ -9,7 +9,7 @@ use llkv_column_map::types::RowId;
 use llkv_expr::Operator;
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_result::{Error, Result as LlkvResult};
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 
 pub fn literal_to_row_id(lit: &Literal) -> LlkvResult<RowId> {
     u64::from_literal(lit)
@@ -18,20 +18,20 @@ pub fn literal_to_row_id(lit: &Literal) -> LlkvResult<RowId> {
 
 // TODO: Is this more generic than just RowId filtering? If so, it should be renamed and made more generic.
 pub trait RowIdFilter {
-    fn filter_by_operator(&self, op: &Operator<'_>) -> LlkvResult<RoaringTreemap>;
+    fn filter_by_operator(&self, op: &Operator<'_>) -> LlkvResult<Treemap>;
 }
 
-impl RowIdFilter for RoaringTreemap {
-    fn filter_by_operator(&self, op: &Operator<'_>) -> LlkvResult<RoaringTreemap> {
+impl RowIdFilter for Treemap {
+    fn filter_by_operator(&self, op: &Operator<'_>) -> LlkvResult<Treemap> {
         use Operator::*;
 
         match op {
             Equals(lit) => {
                 let value = literal_to_row_id(lit)?;
                 if self.contains(value) {
-                    Ok(RoaringTreemap::from_iter([value]))
+                    Ok(Treemap::from_iter([value]))
                 } else {
-                    Ok(RoaringTreemap::new())
+                    Ok(Treemap::new())
                 }
             }
             GreaterThan(lit) => {
@@ -94,11 +94,11 @@ impl RowIdFilter for RoaringTreemap {
             }
             In(literals) => {
                 if literals.is_empty() {
-                    return Ok(RoaringTreemap::new());
+                    return Ok(Treemap::new());
                 }
-                let mut targets = RoaringTreemap::new();
+                let mut targets = Treemap::new();
                 for lit in *literals {
-                    targets.insert(literal_to_row_id(lit)?);
+                    targets.add(literal_to_row_id(lit)?);
                 }
                 Ok(self & &targets)
             }
@@ -150,7 +150,7 @@ pub fn compare_option_values<T: Ord>(
 // TODO: Rename to `sort_row_ids_by_primitive` (or equivalent)
 /// Sorts row ids by the values stored in `chunks`, preserving stable ordering for ties.
 pub fn sort_by_primitive<T>(
-    row_ids: &RoaringTreemap,
+    row_ids: &Treemap,
     chunks: &[PrimitiveArray<T>],
     positions: &[(usize, usize)],
     ascending: bool,

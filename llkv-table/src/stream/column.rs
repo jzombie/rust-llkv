@@ -9,12 +9,12 @@ use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 
 /// Iterator over row IDs that can own or borrow the underlying bitmap.
 pub enum RowIdIter<'a> {
-    Owned(roaring::treemap::IntoIter),
-    Borrowed(roaring::treemap::Iter<'a>),
+    Owned(std::vec::IntoIter<u64>),
+    Borrowed(Box<dyn Iterator<Item = u64> + 'a>),
 }
 
 impl<'a> Iterator for RowIdIter<'a> {
@@ -29,15 +29,15 @@ impl<'a> Iterator for RowIdIter<'a> {
     }
 }
 
-impl From<RoaringTreemap> for RowIdIter<'static> {
-    fn from(map: RoaringTreemap) -> Self {
-        Self::Owned(map.into_iter())
+impl From<Treemap> for RowIdIter<'static> {
+    fn from(map: Treemap) -> Self {
+        Self::Owned(map.iter().collect::<Vec<_>>().into_iter())
     }
 }
 
-impl<'a> From<&'a RoaringTreemap> for RowIdIter<'a> {
-    fn from(map: &'a RoaringTreemap) -> Self {
-        Self::Borrowed(map.iter())
+impl<'a> From<&'a Treemap> for RowIdIter<'a> {
+    fn from(map: &'a Treemap) -> Self {
+        Self::Borrowed(Box::new(map.iter()))
     }
 }
 
@@ -46,21 +46,21 @@ pub trait RowIdStreamSource<'a> {
     fn into_iter_source(self) -> RowIdIter<'a>;
 }
 
-impl RowIdStreamSource<'static> for RoaringTreemap {
+impl RowIdStreamSource<'static> for Treemap {
     fn count(&self) -> u64 {
-        self.len()
+        self.cardinality()
     }
     fn into_iter_source(self) -> RowIdIter<'static> {
-        RowIdIter::Owned(self.into_iter())
+        RowIdIter::Owned(self.iter().collect::<Vec<_>>().into_iter())
     }
 }
 
-impl<'a> RowIdStreamSource<'a> for &'a RoaringTreemap {
+impl<'a> RowIdStreamSource<'a> for &'a Treemap {
     fn count(&self) -> u64 {
-        self.len()
+        self.cardinality()
     }
     fn into_iter_source(self) -> RowIdIter<'a> {
-        RowIdIter::Borrowed(self.iter())
+        RowIdIter::Borrowed(Box::new(self.iter()))
     }
 }
 

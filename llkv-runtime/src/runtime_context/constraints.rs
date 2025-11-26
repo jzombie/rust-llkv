@@ -18,7 +18,7 @@ use llkv_table::{
     InsertUniqueColumn, RowId,
 };
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: &str,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
         if row_ids.is_empty() {
@@ -162,7 +162,7 @@ where
             Err(e) => return Err(e),
         };
 
-        let mut rows = vec![Vec::with_capacity(field_ids.len()); visible_row_ids.len() as usize];
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); visible_row_ids.cardinality() as usize];
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             let base = chunk.row_offset();
@@ -179,7 +179,7 @@ where
             }
         }
 
-        Ok(visible_row_ids.into_iter().zip(rows).collect())
+        Ok(visible_row_ids.iter().zip(rows).collect())
     }
 
     /// Validate foreign key constraints for INSERT operations.
@@ -237,7 +237,7 @@ where
         table: &ExecutorTable<P>,
         _display_name: &str,
         _canonical_name: &str,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         updated_field_ids: &[FieldId],
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
@@ -274,7 +274,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         _display_name: &str,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
         if row_ids.is_empty() {

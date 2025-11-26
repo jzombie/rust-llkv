@@ -1,7 +1,7 @@
 pub mod plan_graph;
 mod program;
 
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::convert::TryFrom;
@@ -578,7 +578,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     table: &'a Table<P>,
-    row_id_cache: RefCell<Option<RoaringTreemap>>,
+    row_id_cache: RefCell<Option<Treemap>>,
 }
 
 pub(crate) struct TablePlanner<'a, P>
@@ -740,7 +740,7 @@ where
         }
     }
 
-    fn table_row_ids(&self) -> LlkvResult<std::cell::Ref<'_, RoaringTreemap>> {
+    fn table_row_ids(&self) -> LlkvResult<std::cell::Ref<'_, Treemap>> {
         if self.row_id_cache.borrow().is_none() {
             let computed = self.compute_table_row_ids()?;
             *self.row_id_cache.borrow_mut() = Some(computed);
@@ -749,7 +749,7 @@ where
         Ok(std::cell::Ref::map(borrow, |opt| opt.as_ref().unwrap()))
     }
 
-    fn compute_table_row_ids(&self) -> LlkvResult<RoaringTreemap> {
+    fn compute_table_row_ids(&self) -> LlkvResult<Treemap> {
         use llkv_column_map::store::rowid_fid;
 
         let fields = self
@@ -757,7 +757,7 @@ where
             .store()
             .user_field_ids_for_table(self.table.table_id());
         if fields.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
 
         let expected = self
@@ -792,16 +792,16 @@ where
                     let row_ids = collector.into_inner();
                     tracing::trace!(
                         "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
-                        row_ids.len(),
+                        row_ids.cardinality(),
                         self.table.table_id()
                     );
-                    if row_ids.len() == expected {
+                    if row_ids.cardinality() == expected {
                         return Ok(row_ids);
                     }
                     tracing::debug!(
                         "[PERF] Shadow column for table {} returned {} row_ids but expected {}; falling back",
                         self.table.table_id(),
-                        row_ids.len(),
+                        row_ids.cardinality(),
                         expected
                     );
                 }
@@ -828,7 +828,7 @@ where
         // - The shadow column doesn't exist (for whatever reason)
         // - Columns may have different row_id sets (sparse columns)
         // - We need the union of all visible rows
-        let mut collected = RoaringTreemap::new();
+        let mut collected = Treemap::new();
 
         for lfid in fields.clone() {
             let mut collector = RowIdScanCollector::default();
@@ -839,16 +839,16 @@ where
                 })
                 .run(&mut collector)?;
             let rows = collector.into_inner();
-            collected.extend(rows);
+            collected.or_inplace(&rows);
 
-            if expected > 0 && collected.len() >= expected {
+            if expected > 0 && collected.cardinality() >= expected {
                 break;
             }
         }
 
         tracing::trace!(
             "[PERF] Multi-column scan: collected {} row_ids for table {}",
-            collected.len(),
+            collected.cardinality(),
             self.table.table_id()
         );
 
@@ -939,9 +939,9 @@ where
 
         let mut process_chunk = |mut chunk: Vec<RowId>| -> LlkvResult<()> {
             if let Some(filter) = options.row_id_filter.as_ref() {
-                let bitmap: RoaringTreemap = chunk.iter().copied().collect();
+                let bitmap: Treemap = chunk.iter().copied().collect();
                 let filtered = filter.filter(self.table, bitmap)?;
-                chunk = filtered.into_iter().collect();
+                chunk = filtered.iter().collect();
             }
             if chunk.is_empty() {
                 return Ok(());
@@ -1004,10 +1004,10 @@ where
         Ok(StreamOutcome::Handled)
     }
 
-    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<RoaringTreemap> {
+    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Treemap> {
         let all_row_ids = self.table_row_ids()?;
         if all_row_ids.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
         all_row_ids.filter_by_operator(op)
     }
@@ -1257,7 +1257,7 @@ where
         }
 
         let fusion_cache = PredicateFusionCache::from_expr(filter_expr.as_ref());
-        let mut all_rows_cache: FxHashMap<FieldId, RoaringTreemap> = FxHashMap::default();
+        let mut all_rows_cache: FxHashMap<FieldId, Treemap> = FxHashMap::default();
 
         // Intentionally skip logging the full filter expression here; deeply nested
         // expressions can exceed the default thread stack when rendered recursively.
@@ -1309,7 +1309,7 @@ where
         };
 
         let row_count = match &row_ids_source {
-            RowIdSource::Bitmap(b) => b.len(),
+            RowIdSource::Bitmap(b) => b.cardinality(),
             RowIdSource::Vector(v) => v.len() as u64,
         };
 
@@ -1322,14 +1322,14 @@ where
         let final_row_ids: RowIdSource = if let Some(filter) = options.row_id_filter.as_ref() {
             let bitmap = match row_ids_source {
                 RowIdSource::Bitmap(b) => b,
-                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
             };
-            let before_len = bitmap.len();
+            let before_len = bitmap.cardinality();
             let filtered = filter.filter(self.table, bitmap)?;
             tracing::trace!(
                 "[SCAN_STREAM] after MVCC filter: {} -> {} row_ids",
                 before_len,
-                filtered.len()
+                filtered.cardinality()
             );
 
             if let Some(order_spec) = options.order {
@@ -1341,7 +1341,7 @@ where
         } else if let Some(order_spec) = options.order {
             let bitmap = match row_ids_source {
                 RowIdSource::Bitmap(b) => b,
-                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
             };
             let sorted = self.sort_row_ids_with_order(&bitmap, order_spec)?;
             RowIdSource::Vector(sorted)
@@ -1579,7 +1579,7 @@ where
             let row_ids = self.collect_row_ids_for_rowid_filter(&op)?;
             tracing::debug!(
                 field = "rowid",
-                row_count = row_ids.len(),
+                row_count = row_ids.cardinality(),
                 "collect_row_ids_for_filter rowid"
             );
             return Ok(RowIdSource::Bitmap(row_ids));
@@ -1594,7 +1594,7 @@ where
                 let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
                 tracing::debug!(
                     field = ?filter_lfid,
-                    row_count = non_null.len(),
+                    row_count = non_null.cardinality(),
                     "collect_row_ids_for_filter NOT NULL fast path"
                 );
                 return Ok(RowIdSource::Bitmap(non_null));
@@ -1602,14 +1602,14 @@ where
             OwnedOperator::IsNull => {
                 let all_row_ids = self.table_row_ids()?;
                 if all_row_ids.is_empty() {
-                    return Ok(RowIdSource::Bitmap(RoaringTreemap::new()));
+                    return Ok(RowIdSource::Bitmap(Treemap::new()));
                 }
                 let mut cache = FxHashMap::default();
                 let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
-                let null_ids = &*all_row_ids - non_null;
+                let null_ids = all_row_ids.clone() - non_null;
                 tracing::debug!(
                     field = ?filter_lfid,
-                    row_count = null_ids.len(),
+                    row_count = null_ids.cardinality(),
                     "collect_row_ids_for_filter NULL fast path"
                 );
                 return Ok(RowIdSource::Bitmap(null_ids));
@@ -1648,7 +1648,7 @@ where
         }?;
         tracing::debug!(
             field = ?filter_lfid,
-            row_count = row_ids.len(),
+            row_count = row_ids.cardinality(),
             "collect_row_ids_for_filter general path"
         );
 
@@ -1734,8 +1734,8 @@ where
     /// to return all rows.
     fn collect_all_row_ids(
         &self,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         // Use ROW_ID_FIELD_ID to get all row IDs from the table
         self.collect_all_row_ids_for_field(ROW_ID_FIELD_ID, all_rows_cache)
     }
@@ -1745,8 +1745,8 @@ where
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(left, &mut fields);
         NumericKernels::collect_fields(right, &mut fields);
@@ -1757,7 +1757,7 @@ where
             // Evaluate the constant comparison
             return match Self::evaluate_constant_compare(left, op, right)? {
                 Some(true) => self.collect_all_row_ids(all_rows_cache),
-                Some(false) | None => Ok(RoaringTreemap::new()),
+                Some(false) | None => Ok(Treemap::new()),
             };
         }
 
@@ -1768,14 +1768,14 @@ where
             scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right);
 
         let domain = if requires_full_scan {
-            let mut union_rows = RoaringTreemap::new();
+            let mut union_rows = Treemap::new();
             for fid in &ordered_fields {
                 let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
                 union_rows |= rows;
             }
             union_rows
         } else {
-            let mut domain: Option<RoaringTreemap> = None;
+            let mut domain: Option<Treemap> = None;
             for fid in &ordered_fields {
                 let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
                 domain = Some(match domain {
@@ -1785,13 +1785,13 @@ where
                 if let Some(ref d) = domain
                     && d.is_empty()
                 {
-                    return Ok(RoaringTreemap::new());
+                    return Ok(Treemap::new());
                 }
             }
             if let Some(ref domain_rows) = domain {
                 tracing::debug!(
                     ?ordered_fields,
-                    domain_len = domain_rows.len(),
+                    domain_len = domain_rows.cardinality(),
                     "collect_row_ids_for_compare domain"
                 );
             } else {
@@ -1806,7 +1806,7 @@ where
         let result = self.evaluate_compare_over_rows(&domain, &ordered_fields, left, op, right)?;
         tracing::debug!(
             ?ordered_fields,
-            result_len = result.len(),
+            result_len = result.cardinality(),
             "collect_row_ids_for_compare result"
         );
         Ok(result)
@@ -1817,14 +1817,14 @@ where
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<(RoaringTreemap, RoaringTreemap)> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<(Treemap, Treemap)> {
         let arrays: NumericArrayMap = FxHashMap::default();
         let target_array = NumericKernels::evaluate_value(expr, 0, &arrays)?;
 
         if target_array.data_type() == &arrow::datatypes::DataType::Null || target_array.is_null(0)
         {
-            return Ok((RoaringTreemap::new(), RoaringTreemap::new()));
+            return Ok((Treemap::new(), Treemap::new()));
         }
 
         let mut matched = false;
@@ -1863,9 +1863,9 @@ where
             }
             Some(false) => {
                 let rows = self.collect_all_row_ids(all_rows_cache)?;
-                Ok((RoaringTreemap::new(), rows))
+                Ok((Treemap::new(), rows))
             }
-            None => Ok((RoaringTreemap::new(), RoaringTreemap::new())),
+            None => Ok((Treemap::new(), Treemap::new())),
         }
     }
 
@@ -1873,7 +1873,7 @@ where
         &self,
         expr: &ScalarExpr<FieldId>,
         negated: bool,
-        _all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
+        _all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
     ) -> LlkvResult<bool> {
         let arrays: NumericArrayMap = FxHashMap::default();
         let value = NumericKernels::evaluate_value(expr, 0, &arrays)?;
@@ -1884,14 +1884,14 @@ where
     // TODO: Can Rayon be used internally?
     fn evaluate_in_list_over_rows(
         &self,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         fields: &[FieldId],
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         negated: bool,
-    ) -> LlkvResult<(RoaringTreemap, RoaringTreemap)> {
+    ) -> LlkvResult<(Treemap, Treemap)> {
         if row_ids.is_empty() {
-            return Ok((RoaringTreemap::new(), RoaringTreemap::new()));
+            return Ok((Treemap::new(), Treemap::new()));
         }
 
         let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
@@ -1946,8 +1946,8 @@ where
         let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
         let unique_index_arc = Arc::new(unique_index);
 
-        let mut matched_rows = RoaringTreemap::new();
-        let mut determined_rows = RoaringTreemap::new();
+        let mut matched_rows = Treemap::new();
+        let mut determined_rows = Treemap::new();
 
         let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
             if window.is_empty() {
@@ -2014,10 +2014,10 @@ where
                     continue;
                 }
                 if final_bool.value(i) {
-                    matched_rows.insert(row_id);
-                    determined_rows.insert(row_id);
+                    matched_rows.add(row_id);
+                    determined_rows.add(row_id);
                 } else {
-                    determined_rows.insert(row_id);
+                    determined_rows.add(row_id);
                 }
             }
 
@@ -2054,8 +2054,8 @@ where
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(expr, &mut fields);
         for value in list {
@@ -2068,7 +2068,7 @@ where
             return Ok(matched);
         }
 
-        let mut domain: Option<RoaringTreemap> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
         ordered_fields.dedup();
@@ -2081,13 +2081,13 @@ where
             if let Some(ref d) = domain
                 && d.is_empty()
             {
-                return Ok(RoaringTreemap::new());
+                return Ok(Treemap::new());
             }
         }
 
         let domain_rows = domain.unwrap_or_default();
         if domain_rows.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
 
         let (matched, _) =
@@ -2099,8 +2099,8 @@ where
         &self,
         expr: &ScalarExpr<FieldId>,
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(expr, &mut fields);
 
@@ -2109,12 +2109,12 @@ where
             if matches {
                 return self.collect_all_row_ids(all_rows_cache);
             } else {
-                return Ok(RoaringTreemap::new());
+                return Ok(Treemap::new());
             }
         }
 
         // Build domain from all referenced fields
-        let mut domain: Option<RoaringTreemap> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
         for fid in &ordered_fields {
@@ -2126,13 +2126,13 @@ where
             if let Some(ref d) = domain
                 && d.is_empty()
             {
-                return Ok(RoaringTreemap::new());
+                return Ok(Treemap::new());
             }
         }
 
         let domain_rows = domain.unwrap_or_default();
         if domain_rows.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
 
         // Evaluate IS NULL over the domain rows using the same pattern as in_list
@@ -2141,13 +2141,13 @@ where
 
     fn evaluate_is_null_over_rows(
         &self,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         fields: &[FieldId],
         expr: &ScalarExpr<FieldId>,
         negated: bool,
-    ) -> LlkvResult<RoaringTreemap> {
+    ) -> LlkvResult<Treemap> {
         if row_ids.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
 
         // Follow the exact same pattern as evaluate_in_list_over_rows
@@ -2203,7 +2203,7 @@ where
         let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
         let unique_index_arc = Arc::new(unique_index);
 
-        let mut matched_rows = RoaringTreemap::new();
+        let mut matched_rows = Treemap::new();
 
         let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
             if window.is_empty() {
@@ -2231,7 +2231,7 @@ where
                 let is_null = value.is_null(0);
                 let matches = if negated { !is_null } else { is_null };
                 if matches {
-                    matched_rows.insert(row_id);
+                    matched_rows.add(row_id);
                 }
             }
 
@@ -2265,16 +2265,16 @@ where
 
     fn evaluate_compare_over_rows(
         &self,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         fields: &[FieldId],
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-    ) -> LlkvResult<RoaringTreemap> {
+    ) -> LlkvResult<Treemap> {
         if row_ids.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
-        let mut result = RoaringTreemap::new();
+        let mut result = Treemap::new();
         self.for_each_compare_row(
             row_ids,
             fields,
@@ -2292,7 +2292,7 @@ where
                     {
                         let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
                         if cmp.value(0) {
-                            result.insert(row_id);
+                            result.add(row_id);
                         }
                     }
                 }
@@ -2304,7 +2304,7 @@ where
 
     fn for_each_compare_row<F>(
         &self,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         fields: &[FieldId],
         left: &ScalarExpr<FieldId>,
         right: &ScalarExpr<FieldId>,
@@ -2440,10 +2440,10 @@ where
         &self,
         programs: &ProgramSet<'_>,
         fusion_cache: &PredicateFusionCache,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
     ) -> LlkvResult<RowIdSource> {
         let mut stack: Vec<RowIdSource> = Vec::new();
-        let mut domain_cache: FxHashMap<DomainProgramId, Arc<RoaringTreemap>> =
+        let mut domain_cache: FxHashMap<DomainProgramId, Arc<Treemap>> =
             FxHashMap::default();
 
         let mut debug_stack_lens: Vec<usize> = Vec::with_capacity(programs.eval.ops.len());
@@ -2481,7 +2481,7 @@ where
                             self.collect_all_row_ids(all_rows_cache)?,
                         ));
                     } else {
-                        stack.push(RowIdSource::Bitmap(RoaringTreemap::new()));
+                        stack.push(RowIdSource::Bitmap(Treemap::new()));
                     }
                 }
                 EvalOp::FusedAnd { field_id, filters } => {
@@ -2514,17 +2514,17 @@ where
                             RowIdSource::Vector(v) => v.is_empty(),
                         };
                         if next_empty {
-                            acc = RowIdSource::Bitmap(RoaringTreemap::new());
+                            acc = RowIdSource::Bitmap(Treemap::new());
                             continue;
                         }
 
                         let mut acc_bitmap = match acc {
                             RowIdSource::Bitmap(b) => b,
-                            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                            RowIdSource::Vector(v) => Treemap::from_iter(v),
                         };
                         let next_bitmap = match next {
                             RowIdSource::Bitmap(b) => b,
-                            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                            RowIdSource::Vector(v) => Treemap::from_iter(v),
                         };
                         acc_bitmap &= next_bitmap;
                         acc = RowIdSource::Bitmap(acc_bitmap);
@@ -2557,11 +2557,11 @@ where
                             if !next_empty {
                                 let mut acc_bitmap = match acc {
                                     RowIdSource::Bitmap(b) => b,
-                                    RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                                    RowIdSource::Vector(v) => Treemap::from_iter(v),
                                 };
                                 let next_bitmap = match next {
                                     RowIdSource::Bitmap(b) => b,
-                                    RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                                    RowIdSource::Vector(v) => Treemap::from_iter(v),
                                 };
                                 acc_bitmap |= next_bitmap;
                                 acc = RowIdSource::Bitmap(acc_bitmap);
@@ -2589,11 +2589,11 @@ where
                     if matched_empty {
                         stack.push(RowIdSource::Bitmap(domain_rows.as_ref().clone()));
                     } else if domain_rows.is_empty() {
-                        stack.push(RowIdSource::Bitmap(RoaringTreemap::new()));
+                        stack.push(RowIdSource::Bitmap(Treemap::new()));
                     } else {
                         let matched_bitmap = match matched {
                             RowIdSource::Bitmap(b) => b,
-                            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                            RowIdSource::Vector(v) => Treemap::from_iter(v),
                         };
                         stack.push(RowIdSource::Bitmap(domain_rows.as_ref() - &matched_bitmap));
                     }
@@ -2624,7 +2624,7 @@ where
         fusion_cache: &PredicateFusionCache,
     ) -> LlkvResult<RowIdSource> {
         if filters.is_empty() {
-            return Ok(RowIdSource::Bitmap(RoaringTreemap::new()));
+            return Ok(RowIdSource::Bitmap(Treemap::new()));
         }
 
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
@@ -2677,17 +2677,17 @@ where
                 RowIdSource::Vector(v) => v.is_empty(),
             };
             if rows_empty {
-                acc = RowIdSource::Bitmap(RoaringTreemap::new());
+                acc = RowIdSource::Bitmap(Treemap::new());
                 break;
             }
 
             let mut acc_bitmap = match acc {
                 RowIdSource::Bitmap(b) => b,
-                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
             };
             let rows_bitmap = match rows {
                 RowIdSource::Bitmap(b) => b,
-                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
             };
             acc_bitmap &= rows_bitmap;
             acc = RowIdSource::Bitmap(acc_bitmap);
@@ -2700,9 +2700,9 @@ where
         &self,
         programs: &ProgramSet<'_>,
         domain_id: DomainProgramId,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-        cache: &mut FxHashMap<DomainProgramId, Arc<RoaringTreemap>>,
-    ) -> LlkvResult<Arc<RoaringTreemap>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+        cache: &mut FxHashMap<DomainProgramId, Arc<Treemap>>,
+    ) -> LlkvResult<Arc<Treemap>> {
         if let Some(rows) = cache.get(&domain_id) {
             return Ok(Arc::clone(rows));
         }
@@ -2712,7 +2712,7 @@ where
             .domain(domain_id)
             .ok_or_else(|| Error::Internal(format!("missing domain program {domain_id}")))?;
 
-        let mut stack: Vec<RoaringTreemap> = Vec::new();
+        let mut stack: Vec<Treemap> = Vec::new();
         for op in &program.ops {
             match op {
                 DomainOp::PushFieldAll(field_id) => {
@@ -2756,11 +2756,11 @@ where
                     )?;
                     stack.push(rows);
                 }
-                DomainOp::PushLiteralFalse => stack.push(RoaringTreemap::new()),
+                DomainOp::PushLiteralFalse => stack.push(Treemap::new()),
                 DomainOp::PushAllRows => stack.push(self.collect_all_row_ids(all_rows_cache)?),
                 DomainOp::Union { child_count } => {
                     if *child_count == 0 {
-                        stack.push(RoaringTreemap::new());
+                        stack.push(Treemap::new());
                         continue;
                     }
                     let mut acc = stack
@@ -2780,7 +2780,7 @@ where
                 }
                 DomainOp::Intersect { child_count } => {
                     if *child_count == 0 {
-                        stack.push(RoaringTreemap::new());
+                        stack.push(Treemap::new());
                         continue;
                     }
                     let mut acc = stack
@@ -2819,8 +2819,8 @@ where
         right: &ScalarExpr<FieldId>,
         op: CompareOp,
         fields: &[FieldId],
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if fields.is_empty() {
             // Domain evaluation only cares whether rows might satisfy the predicate.
             // Constant comparisons therefore mark every row as determined (even if
@@ -2829,7 +2829,7 @@ where
             // indicates "unknown", which leaves the domain empty.
             return match Self::evaluate_constant_compare(left, op, right)? {
                 Some(_) => self.collect_all_row_ids(all_rows_cache),
-                None => Ok(RoaringTreemap::new()),
+                None => Ok(Treemap::new()),
             };
         }
 
@@ -2837,7 +2837,7 @@ where
         ordered_fields.sort_unstable();
         ordered_fields.dedup();
 
-        let mut domain: Option<RoaringTreemap> = None;
+        let mut domain: Option<Treemap> = None;
         for &fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
             domain = Some(match domain {
@@ -2853,10 +2853,10 @@ where
 
         let candidate_rows = domain.unwrap_or_default();
         if candidate_rows.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
 
-        let mut usable_rows = RoaringTreemap::new();
+        let mut usable_rows = Treemap::new();
         self.for_each_compare_row(
             &candidate_rows,
             &ordered_fields,
@@ -2864,7 +2864,7 @@ where
             right,
             |row_id, left_val, right_val| {
                 if !left_val.is_null(0) && !right_val.is_null(0) {
-                    usable_rows.insert(row_id);
+                    usable_rows.add(row_id);
                 }
             },
         )?;
@@ -2878,15 +2878,15 @@ where
         list: &[ScalarExpr<FieldId>],
         fields: &[FieldId],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if fields.is_empty() {
             let (_, domain_rows) =
                 self.evaluate_constant_in_list(expr, list, negated, all_rows_cache)?;
             return Ok(domain_rows);
         }
 
-        let mut domain: Option<RoaringTreemap> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.to_vec();
         ordered_fields.sort_unstable();
         ordered_fields.dedup();
@@ -2906,7 +2906,7 @@ where
 
         let candidate_rows = domain.unwrap_or_default();
         if candidate_rows.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
 
         let (_, determined) =
@@ -2919,19 +2919,19 @@ where
         expr: &ScalarExpr<FieldId>,
         fields: &[FieldId],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if fields.is_empty() {
             // Constant expression: evaluate once
             let is_constant_null = self.evaluate_constant_is_null(expr, negated, all_rows_cache)?;
             if is_constant_null {
                 return self.collect_all_row_ids(all_rows_cache);
             } else {
-                return Ok(RoaringTreemap::new());
+                return Ok(Treemap::new());
             }
         }
 
-        let mut domain: Option<RoaringTreemap> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.to_vec();
         ordered_fields.sort_unstable();
         ordered_fields.dedup();
@@ -2951,7 +2951,7 @@ where
 
         let candidate_rows = domain.unwrap_or_default();
         if candidate_rows.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(Treemap::new());
         }
 
         let determined =
@@ -2961,10 +2961,10 @@ where
 
     fn sort_row_ids_with_order(
         &self,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         order: ScanOrderSpec,
     ) -> LlkvResult<Vec<RowId>> {
-        if row_ids.len() <= 1 {
+        if row_ids.cardinality() <= 1 {
             return Ok(row_ids.iter().collect());
         }
 
@@ -3039,7 +3039,7 @@ where
                 .build()?;
 
                 let mut chunks: Vec<StringArray> = Vec::new();
-                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len() as usize);
+                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.cardinality() as usize);
 
                 while let Some(chunk) = row_stream.next_chunk()? {
                     let batch = chunk.to_record_batch();
@@ -3068,7 +3068,7 @@ where
                     }
                 }
 
-                if positions.len() != row_ids.len() as usize {
+                if positions.len() != row_ids.cardinality() as usize {
                     return Err(Error::Internal(
                         "ORDER BY gather produced inconsistent row counts".into(),
                     ));
@@ -3116,7 +3116,7 @@ where
                 )
                 .build()?;
 
-                let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.len() as usize);
+                let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.cardinality() as usize);
 
                 while let Some(chunk) = row_stream.next_chunk()? {
                     let batch = chunk.to_record_batch();
@@ -3146,7 +3146,7 @@ where
                     }
                 }
 
-                if keys.len() != row_ids.len() as usize {
+                if keys.len() != row_ids.cardinality() as usize {
                     return Err(Error::Internal(
                         "ORDER BY gather produced inconsistent row counts".into(),
                     ));
@@ -3170,7 +3170,7 @@ where
 
     fn sort_row_ids_with_primitive_transform<T>(
         &self,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         context: PrimitiveOrderContext<'_>,
         ascending: bool,
         nulls_first: bool,
@@ -3192,7 +3192,7 @@ where
 
     fn gather_primitive_order_chunks<T>(
         &self,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         context: PrimitiveOrderContext<'_>,
     ) -> LlkvResult<PrimitiveOrderData<T>>
     where
@@ -3215,7 +3215,7 @@ where
         .build()?;
 
         let mut chunks: Vec<PrimitiveArray<T>> = Vec::new();
-        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len() as usize);
+        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.cardinality() as usize);
 
         while let Some(chunk) = row_stream.next_chunk()? {
             let batch = chunk.to_record_batch();
@@ -3247,7 +3247,7 @@ where
             }
         }
 
-        if positions.len() != row_ids.len() as usize {
+        if positions.len() != row_ids.cardinality() as usize {
             return Err(Error::Internal(
                 "ORDER BY gather produced inconsistent row counts".into(),
             ));
@@ -3259,8 +3259,8 @@ where
     fn collect_all_row_ids_for_field(
         &self,
         field_id: FieldId,
-        cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
+        cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if let Some(existing) = cache.get(&field_id) {
             return Ok(existing.clone());
         }
@@ -3276,7 +3276,7 @@ where
         let ids_source = self.collect_row_ids_for_filter(&filter)?;
         let ids = match ids_source {
             RowIdSource::Bitmap(b) => b,
-            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+            RowIdSource::Vector(v) => Treemap::from_iter(v),
         };
         cache.insert(field_id, ids.clone());
         Ok(ids)
@@ -3286,7 +3286,7 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<RoaringTreemap>
+    ) -> LlkvResult<Treemap>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
@@ -3296,14 +3296,14 @@ where
             .table
             .store()
             .filter_row_ids::<T>(field_id, &predicate)?;
-        Ok(RoaringTreemap::from_iter(vec))
+        Ok(Treemap::from_iter(vec))
     }
 
     fn collect_matching_row_ids_string<O>(
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<RoaringTreemap>
+    ) -> LlkvResult<Treemap>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
@@ -3314,14 +3314,14 @@ where
             .filter_row_ids::<llkv_column_map::store::scan::filter::Utf8Filter<O>>(
                 field_id, &predicate,
             )?;
-        Ok(RoaringTreemap::from_iter(vec))
+        Ok(Treemap::from_iter(vec))
     }
 
     fn collect_matching_row_ids_string_fused<O>(
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<RoaringTreemap>
+    ) -> LlkvResult<Treemap>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
@@ -3338,27 +3338,27 @@ where
             field_id,
             &preds,
         )?;
-        Ok(RoaringTreemap::from_iter(fused))
+        Ok(Treemap::from_iter(fused))
     }
 
     fn collect_matching_row_ids_bool(
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<RoaringTreemap> {
+    ) -> LlkvResult<Treemap> {
         let predicate = build_bool_predicate(op).map_err(Error::predicate_build)?;
         let vec = self
             .table
             .store()
             .filter_row_ids::<arrow::datatypes::BooleanType>(field_id, &predicate)?;
-        Ok(RoaringTreemap::from_iter(vec))
+        Ok(Treemap::from_iter(vec))
     }
 
     fn collect_matching_row_ids_bool_fused(
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<RoaringTreemap> {
+    ) -> LlkvResult<Treemap> {
         let mut preds: Vec<llkv_expr::typed_predicate::Predicate<bool>> =
             Vec::with_capacity(ops.len());
         for op in ops {
@@ -3370,14 +3370,14 @@ where
             field_id,
             &preds,
         )?;
-        Ok(RoaringTreemap::from_iter(fused))
+        Ok(Treemap::from_iter(fused))
     }
 
     fn collect_matching_row_ids_fused<T>(
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<RoaringTreemap>
+    ) -> LlkvResult<Treemap>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
@@ -3395,7 +3395,7 @@ where
             field_id,
             &preds,
         )?;
-        Ok(RoaringTreemap::from_iter(fused))
+        Ok(Treemap::from_iter(fused))
     }
 }
 
@@ -3408,7 +3408,7 @@ where
 {
     let executor = TableExecutor::new(table);
     let fusion_cache = PredicateFusionCache::from_expr(filter_expr);
-    let mut all_rows_cache: FxHashMap<FieldId, RoaringTreemap> = FxHashMap::default();
+    let mut all_rows_cache: FxHashMap<FieldId, Treemap> = FxHashMap::default();
     let filter_arc = Arc::new(filter_expr.clone());
     let programs = ProgramCompiler::new(filter_arc).compile()?;
     executor.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)
@@ -4212,13 +4212,13 @@ where
 
 #[derive(Default)]
 struct RowIdScanCollector {
-    row_ids: RoaringTreemap,
+    row_ids: Treemap,
 }
 
 impl RowIdScanCollector {
     fn extend_from_array(&mut self, row_ids: &UInt64Array) {
         for idx in 0..row_ids.len() {
-            self.row_ids.insert(row_ids.value(idx));
+            self.row_ids.add(row_ids.value(idx));
         }
     }
 
@@ -4228,11 +4228,11 @@ impl RowIdScanCollector {
         }
         let end = (start + len).min(row_ids.len());
         for idx in start..end {
-            self.row_ids.insert(row_ids.value(idx));
+            self.row_ids.add(row_ids.value(idx));
         }
     }
 
-    fn into_inner(self) -> RoaringTreemap {
+    fn into_inner(self) -> Treemap {
         self.row_ids
     }
 }

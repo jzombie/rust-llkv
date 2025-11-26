@@ -1,4 +1,4 @@
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -65,7 +65,7 @@ where
     /// # Errors
     ///
     /// Returns an error if visibility metadata cannot be loaded or is corrupted.
-    fn filter(&self, table: &Table<P>, row_ids: RoaringTreemap) -> LlkvResult<RoaringTreemap>;
+    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> LlkvResult<Treemap>;
 }
 
 /// Options for configuring table scans.
@@ -636,11 +636,11 @@ where
     pub fn filter_row_ids<'a>(
         &self,
         filter_expr: &Expr<'a, FieldId>,
-    ) -> LlkvResult<RoaringTreemap> {
+    ) -> LlkvResult<Treemap> {
         let source = collect_row_ids_for_table(self, filter_expr)?;
         Ok(match source {
             RowIdSource::Bitmap(b) => b,
-            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+            RowIdSource::Vector(v) => Treemap::from_iter(v),
         })
     }
 

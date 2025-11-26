@@ -6,7 +6,7 @@ use arrow::datatypes::Schema;
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy, MultiGatherContext};
 use llkv_column_map::types::LogicalFieldId;
 use llkv_result::Result as LlkvResult;
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -17,12 +17,12 @@ use crate::types::{FieldId, RowId, TableId};
 use crate::planner::{ProjectionEval, materialize_row_window};
 
 pub enum RowIdSource {
-    Bitmap(RoaringTreemap),
+    Bitmap(Treemap),
     Vector(Vec<RowId>),
 }
 
-impl From<RoaringTreemap> for RowIdSource {
-    fn from(bitmap: RoaringTreemap) -> Self {
+impl From<Treemap> for RowIdSource {
+    fn from(bitmap: Treemap) -> Self {
         RowIdSource::Bitmap(bitmap)
     }
 }
@@ -181,8 +181,8 @@ where
 
         let (row_id_array, total_rows) = match row_ids {
             RowIdSource::Bitmap(bitmap) => {
-                let len = bitmap.len();
-                let array = Arc::new(UInt64Array::from(bitmap.into_iter().collect::<Vec<_>>()));
+                let len = bitmap.cardinality();
+                let array = Arc::new(UInt64Array::from_iter_values(bitmap.iter()));
                 (array, len as usize)
             }
             RowIdSource::Vector(vector) => {

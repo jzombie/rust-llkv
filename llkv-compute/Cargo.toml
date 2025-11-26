@@ -11,11 +11,11 @@ publish.workspace = true
 [dependencies]
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
+croaring.workspace = true
 llkv-column-map = { workspace = true }
 llkv-expr = { workspace = true }
 llkv-result = { workspace = true }
 llkv-types = { workspace = true }
-roaring = { workspace = true }
 time = { workspace = true }
 rand = { workspace = true }
 rustc-hash = { workspace = true }

@@ -17,7 +17,7 @@ use crate::view::ForeignKeyView;
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLock};
@@ -59,7 +59,7 @@ pub struct ForeignKeyRowFetch<'a> {
 /// Context for collecting parent row values involved in a DELETE operation.
 pub struct ForeignKeyParentRowsFetch<'a> {
     pub referenced_table_id: TableId,
-    pub referenced_row_ids: &'a RoaringTreemap,
+    pub referenced_row_ids: &'a Treemap,
     pub referenced_field_ids: &'a [FieldId],
 }
 
@@ -420,7 +420,7 @@ where
     pub fn validate_delete_foreign_keys<FParents, FChildren>(
         &self,
         referenced_table_id: TableId,
-        referenced_row_ids: &RoaringTreemap,
+        referenced_row_ids: &Treemap,
         mut fetch_parent_rows: FParents,
         mut fetch_child_rows: FChildren,
     ) -> LlkvResult<()>
@@ -519,7 +519,7 @@ where
     pub fn validate_update_foreign_keys<FParents, FChildren>(
         &self,
         referenced_table_id: TableId,
-        referenced_row_ids: &RoaringTreemap,
+        referenced_row_ids: &Treemap,
         updated_field_ids: &[FieldId],
         mut fetch_parent_rows: FParents,
         mut fetch_child_rows: FChildren,

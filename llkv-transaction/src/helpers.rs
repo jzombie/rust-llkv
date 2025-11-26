@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::mvcc::{self, RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE};
 use crate::{TransactionSnapshot, TxnIdManager};
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 
 /// Builder for MVCC columns that delegates to the `mvcc` module functions.
 ///
@@ -80,10 +80,10 @@ impl MvccColumnBuilder for TransactionMvccBuilder {
 /// is treated as all rows being visible).
 pub fn filter_row_ids_for_fk_check<P>(
     table: &Table<P>,
-    row_ids: RoaringTreemap,
+    row_ids: Treemap,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
-) -> Result<RoaringTreemap>
+) -> Result<Treemap>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -98,10 +98,10 @@ where
 /// is treated as all rows being visible).
 pub fn filter_row_ids_for_snapshot<P>(
     table: &Table<P>,
-    row_ids: RoaringTreemap,
+    row_ids: Treemap,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
-) -> Result<RoaringTreemap>
+) -> Result<Treemap>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -111,11 +111,11 @@ where
 /// Internal implementation for filtering row IDs with optional FK-aware visibility.
 fn filter_row_ids_impl<P>(
     table: &Table<P>,
-    row_ids: RoaringTreemap,
+    row_ids: Treemap,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
     for_fk_check: bool,
-) -> Result<RoaringTreemap>
+) -> Result<Treemap>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -124,7 +124,7 @@ where
     tracing::debug!(
         "[FILTER_ROWS-{}] Filtering {} row IDs for snapshot txn_id={}, snapshot_id={}",
         filter_type,
-        row_ids.len(),
+        row_ids.cardinality(),
         snapshot.txn_id,
         snapshot.snapshot_id
     );
@@ -160,10 +160,10 @@ where
         }
     }
 
-    let total_rows = row_ids.len();
+    let total_rows = row_ids.cardinality();
     let mut stream = match table.stream_columns(
         Arc::clone(&logical_fields),
-        row_ids,
+        &row_ids,
         GatherNullPolicy::IncludeNulls,
     ) {
         Ok(stream) => stream,
@@ -173,7 +173,7 @@ where
         }
     };
 
-    let mut visible = RoaringTreemap::new();
+    let mut visible = Treemap::new();
 
     while let Some(chunk) = stream.next_batch()? {
         let batch = chunk.batch();
@@ -185,7 +185,7 @@ where
                 table_id
             );
             for rid in window {
-                visible.insert(*rid);
+                visible.add(*rid);
             }
             continue;
         }
@@ -199,7 +199,7 @@ where
                 table_id
             );
             for rid in window {
-                visible.insert(*rid);
+                visible.add(*rid);
             }
             continue;
         }
@@ -236,7 +236,7 @@ where
                 is_visible
             );
             if is_visible {
-                visible.insert(*row_id);
+                visible.add(*row_id);
             }
         }
     }
@@ -244,7 +244,7 @@ where
     tracing::debug!(
         "[FILTER_ROWS] Filtered from {} to {} visible rows",
         total_rows,
-        visible.len()
+        visible.cardinality()
     );
     Ok(visible)
 }
@@ -280,7 +280,7 @@ impl<P> RowIdFilter<P> for MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn filter(&self, table: &Table<P>, row_ids: RoaringTreemap) -> Result<RoaringTreemap> {
+    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> Result<Treemap> {
         tracing::trace!(
             "[MVCC_FILTER] filter() called with row_ids {:?}, snapshot txn={}, snapshot_id={}",
             row_ids,

@@ -20,7 +20,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::ConstraintEnforcementMode;
 use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -180,7 +180,8 @@ where
                         schema_index, display_name
                     ))
                 })?;
-                let normalized = normalize_insert_value_for_column(column, value.clone())?;
+                let val = std::mem::replace(value, PlanValue::Null);
+                let normalized = normalize_insert_value_for_column(column, val)?;
                 *value = normalized;
             }
         }
@@ -555,7 +556,7 @@ where
     fn find_multi_column_conflicts(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: &RoaringTreemap,
+        row_ids: &Treemap,
         new_rows: &[Vec<PlanValue>],
         columns: &[String],
         constraint: &llkv_table::InsertMultiColumnUnique,

@@ -22,7 +22,7 @@ use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::{ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
@@ -160,7 +160,7 @@ where
             });
         }
 
-        let row_count = row_ids.len();
+        let row_count = row_ids.cardinality();
         let table_id = table.table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
@@ -169,29 +169,32 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let mut stream = table.table.stream_columns(
-            logical_fields.clone(),
-            &row_ids,
-            GatherNullPolicy::IncludeNulls,
-        )?;
-
         let mut new_rows: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
-            let local_len = batch.num_rows();
-            for col_idx in 0..batch.num_columns() {
-                let array = batch.column(col_idx);
-                for local_idx in 0..local_len {
-                    let target_index = base + local_idx;
-                    debug_assert!(
-                        target_index < new_rows.len(),
-                        "column stream produced out-of-range row index"
-                    );
-                    if let Some(row) = new_rows.get_mut(target_index) {
-                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
-                        row.push(value);
+
+        {
+            let mut stream = table.table.stream_columns(
+                logical_fields,
+                &row_ids,
+                GatherNullPolicy::IncludeNulls,
+            )?;
+
+            while let Some(chunk) = stream.next_batch()? {
+                let batch = chunk.batch();
+                let base = chunk.row_offset();
+                let local_len = batch.num_rows();
+                for col_idx in 0..batch.num_columns() {
+                    let array = batch.column(col_idx);
+                    for local_idx in 0..local_len {
+                        let target_index = base + local_idx;
+                        debug_assert!(
+                            target_index < new_rows.len(),
+                            "column stream produced out-of-range row index"
+                        );
+                        if let Some(row) = new_rows.get_mut(target_index) {
+                            let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                            row.push(value);
+                        }
                     }
                 }
             }
@@ -512,7 +515,7 @@ where
             });
         }
 
-        let row_count = row_ids.len();
+        let row_count = row_ids.cardinality();
         let table_id = table.table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
@@ -521,29 +524,32 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let mut stream = table.table.stream_columns(
-            logical_fields.clone(),
-            &row_ids,
-            GatherNullPolicy::IncludeNulls,
-        )?;
-
         let mut new_rows: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
-            let local_len = batch.num_rows();
-            for col_idx in 0..batch.num_columns() {
-                let array = batch.column(col_idx);
-                for local_idx in 0..local_len {
-                    let target_index = base + local_idx;
-                    debug_assert!(
-                        target_index < new_rows.len(),
-                        "column stream produced out-of-range row index"
-                    );
-                    if let Some(row) = new_rows.get_mut(target_index) {
-                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
-                        row.push(value);
+
+        {
+            let mut stream = table.table.stream_columns(
+                logical_fields,
+                &row_ids,
+                GatherNullPolicy::IncludeNulls,
+            )?;
+
+            while let Some(chunk) = stream.next_batch()? {
+                let batch = chunk.batch();
+                let base = chunk.row_offset();
+                let local_len = batch.num_rows();
+                for col_idx in 0..batch.num_columns() {
+                    let array = batch.column(col_idx);
+                    for local_idx in 0..local_len {
+                        let target_index = base + local_idx;
+                        debug_assert!(
+                            target_index < new_rows.len(),
+                            "column stream produced out-of-range row index"
+                        );
+                        if let Some(row) = new_rows.get_mut(target_index) {
+                            let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                            row.push(value);
+                        }
                     }
                 }
             }
@@ -774,7 +780,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: &str,
-        row_ids: RoaringTreemap,
+        row_ids: Treemap,
         new_rows: Vec<Vec<PlanValue>>,
         updated_field_ids: Vec<FieldId>,
         snapshot: TransactionSnapshot,
@@ -790,7 +796,7 @@ where
             "update_rows_in_place should only be called for auto-commit transactions",
         );
         debug_assert_eq!(
-            row_ids.len() as usize,
+            row_ids.cardinality() as usize,
             new_rows.len(),
             "row_ids and new_rows must have the same length",
         );
@@ -802,7 +808,7 @@ where
         // Preserve conflict detection semantics from delete+insert path.
         self.detect_delete_conflicts(table, display_name, &row_ids, snapshot)?;
 
-        let row_count = row_ids.len();
+        let row_count = row_ids.cardinality();
         tracing::debug!(
             table_id = table.table.table_id(),
             row_count,
@@ -926,11 +932,11 @@ where
         filter_expr: &LlkvExpr<'static, FieldId>,
         expressions: &[ScalarExpr<FieldId>],
         snapshot: TransactionSnapshot,
-    ) -> Result<(RoaringTreemap, Vec<Vec<PlanValue>>)> {
+    ) -> Result<(Treemap, Vec<Vec<PlanValue>>)> {
         let row_ids = table.table.filter_row_ids(filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
-            return Ok((RoaringTreemap::new(), vec![Vec::new(); expressions.len()]));
+            return Ok((Treemap::new(), vec![Vec::new(); expressions.len()]));
         }
 
         if expressions.is_empty() {
@@ -944,7 +950,7 @@ where
         }
 
         let mut expr_values: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(row_ids.len() as usize); expressions.len()];
+            vec![Vec::with_capacity(row_ids.cardinality() as usize); expressions.len()];
         let mut error: Option<Error> = None;
         let row_filter: Arc<dyn llkv_table::table::RowIdFilter<P>> = Arc::new(
             MvccRowIdFilter::new(Arc::clone(&self.txn_manager), snapshot),
@@ -971,7 +977,7 @@ where
         }
 
         for values in &expr_values {
-            if values.len() != row_ids.len() as usize {
+            if values.len() != row_ids.cardinality() as usize {
                 return Err(Error::InvalidArgumentError(
                     "expression result count did not match targeted row count".into(),
                 ));
