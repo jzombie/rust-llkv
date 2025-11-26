@@ -1439,7 +1439,7 @@ where
                     )));
                 }
 
-                if !is_full_range_filter(filter_expr, p.logical_field_id.field_id()) {
+                if !filter_expr.is_full_range_for(&p.logical_field_id.field_id()) {
                     return Ok(StreamOutcome::Fallback);
                 }
 
@@ -1474,7 +1474,7 @@ where
 
                 let field_id = *fields_set.iter().next().unwrap();
                 let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
-                if !is_full_range_filter(filter_expr, field_id) {
+                if !filter_expr.is_full_range_for(&field_id) {
                     return Ok(StreamOutcome::Fallback);
                 }
 
@@ -3468,21 +3468,6 @@ where
 {
     chunks: Vec<PrimitiveArray<T>>,
     positions: Vec<(usize, usize)>,
-}
-
-// TODO: Move to llkv-expr?
-fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {
-    matches!(
-        expr,
-        Expr::Pred(Filter {
-            field_id,
-            op:
-                Operator::Range {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-        }) if *field_id == expected_field
-    )
 }
 
 struct SingleColumnStreamVisitor<'a, F>

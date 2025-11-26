@@ -83,6 +83,24 @@ impl<'a, F> Expr<'a, F> {
     pub fn not(e: Expr<'a, F>) -> Expr<'a, F> {
         Expr::Not(Box::new(e))
     }
+
+    /// Returns true if this expression is a full range filter on the provided field id.
+    pub fn is_full_range_for(&self, expected_field: &F) -> bool
+    where
+        F: PartialEq,
+    {
+        matches!(
+            self,
+            Expr::Pred(Filter {
+                field_id,
+                op:
+                    Operator::Range {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+            }) if field_id == expected_field
+        )
+    }
 }
 
 /// Arithmetic scalar expression that can reference multiple fields.
