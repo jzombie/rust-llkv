@@ -42,6 +42,44 @@ impl SqlValue {
         }
     }
 
+    pub fn from_number_literal(text: &str) -> SqlResult<SqlValue> {
+        // Scientific notation (e/E) requires float
+        if text.contains(['e', 'E']) {
+            let value = text
+                .parse::<f64>()
+                .map_err(|err| Error::InvalidArgumentError(format!("invalid float literal: {err}")))?;
+            return Ok(SqlValue::Float64(value));
+        }
+
+        // Decimal point → parse as Decimal with exact precision
+        if let Some(dot_pos) = text.find('.') {
+            let integer_part = &text[..dot_pos];
+            let fractional_part = &text[dot_pos + 1..];
+
+            // Parse the number as i128 by removing the decimal point
+            let combined = format!("{}{}", integer_part, fractional_part);
+            let raw_value = combined.parse::<i128>().map_err(|err| {
+                Error::InvalidArgumentError(format!("invalid decimal literal: {err}"))
+            })?;
+
+            // Scale is the number of digits after the decimal point
+            let scale = fractional_part.len() as i8;
+
+            // Create DecimalValue
+            let decimal = DecimalValue::new(raw_value, scale).map_err(|err| {
+                Error::InvalidArgumentError(format!("invalid decimal literal: {}", err))
+            })?;
+
+            return Ok(SqlValue::Decimal128(decimal));
+        }
+
+        // No decimal point → integer
+        let value = text
+            .parse::<i64>()
+            .map_err(|err| Error::InvalidArgumentError(format!("invalid integer literal: {err}")))?;
+        Ok(SqlValue::Int64(value))
+    }
+
     #[allow(dead_code)]
     fn from_literal(lit: &Literal) -> SqlResult<SqlValue> {
         Ok(match lit {
@@ -175,7 +213,7 @@ impl SqlValue {
     fn from_value(value: &ValueWithSpan) -> SqlResult<Self> {
         match &value.value {
             Value::Null => Ok(SqlValue::Null),
-            Value::Number(text, _) => parse_number_literal(text),
+            Value::Number(text, _) => SqlValue::from_number_literal(text),
             Value::Boolean(value) => Ok(SqlValue::Boolean(*value)),
             Value::Placeholder(raw) => {
                 let index = register_placeholder(raw)?;
@@ -213,43 +251,7 @@ impl SqlValue {
     }
 }
 
-fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
-    // Scientific notation (e/E) requires float
-    if text.contains(['e', 'E']) {
-        let value = text
-            .parse::<f64>()
-            .map_err(|err| Error::InvalidArgumentError(format!("invalid float literal: {err}")))?;
-        return Ok(SqlValue::Float64(value));
-    }
 
-    // Decimal point → parse as Decimal with exact precision
-    if let Some(dot_pos) = text.find('.') {
-        let integer_part = &text[..dot_pos];
-        let fractional_part = &text[dot_pos + 1..];
-
-        // Parse the number as i128 by removing the decimal point
-        let combined = format!("{}{}", integer_part, fractional_part);
-        let raw_value = combined.parse::<i128>().map_err(|err| {
-            Error::InvalidArgumentError(format!("invalid decimal literal: {err}"))
-        })?;
-
-        // Scale is the number of digits after the decimal point
-        let scale = fractional_part.len() as i8;
-
-        // Create DecimalValue
-        let decimal = DecimalValue::new(raw_value, scale).map_err(|err| {
-            Error::InvalidArgumentError(format!("invalid decimal literal: {}", err))
-        })?;
-
-        return Ok(SqlValue::Decimal128(decimal));
-    }
-
-    // No decimal point → integer
-    let value = text
-        .parse::<i64>()
-        .map_err(|err| Error::InvalidArgumentError(format!("invalid integer literal: {err}")))?;
-    Ok(SqlValue::Int64(value))
-}
 
 impl From<SqlValue> for PlanValue {
     fn from(value: SqlValue) -> Self {
