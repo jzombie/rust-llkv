@@ -43,7 +43,11 @@ use llkv_compute::projection::{
     ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
     synthesize_computed_literal_array,
 };
-use llkv_compute::rowids::RowIdFilter;
+use llkv_compute::analysis::{
+    computed_expr_prefers_float, computed_expr_requires_numeric, get_field_dtype,
+    scalar_expr_contains_coalesce,
+};
+use llkv_compute::rowids::{RowIdFilter, compare_option_values, sort_by_primitive};
 use llkv_compute::scalar::interval::compare_interval_values;
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
@@ -3319,201 +3323,14 @@ where
     executor.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)
 }
 
-fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
-    match expr {
-        ScalarExpr::Literal(_) => false,
-        ScalarExpr::Column(_) => true,
-        ScalarExpr::Binary { .. } => true,
-        ScalarExpr::Compare { .. } => true,
-        ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
-        ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
-        ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
-        ScalarExpr::Not(expr) => computed_expr_requires_numeric(expr),
-        ScalarExpr::IsNull { expr, .. } => computed_expr_requires_numeric(expr),
-        ScalarExpr::Case { .. } => true,
-        ScalarExpr::Coalesce(items) => items.iter().any(computed_expr_requires_numeric),
-        ScalarExpr::Random => true,
-        ScalarExpr::ScalarSubquery(_) => false,
-    }
-}
 
-fn computed_expr_prefers_float(
-    expr: &ScalarExpr<FieldId>,
-    table_id: TableId,
-    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
-) -> LlkvResult<bool> {
-    match expr {
-        ScalarExpr::Literal(lit) => literal_prefers_float(lit),
-        ScalarExpr::Column(fid) => {
-            let lfid = LogicalFieldId::for_user(table_id, *fid);
-            let dtype = lfid_dtypes
-                .get(&lfid)
-                .ok_or_else(|| Error::Internal("missing dtype for computed column".into()))?;
-            Ok(matches!(
-                dtype,
-                DataType::Float16 | DataType::Float32 | DataType::Float64
-            ))
-        }
-        ScalarExpr::Binary { left, right, .. } => {
-            Ok(
-                computed_expr_prefers_float(left.as_ref(), table_id, lfid_dtypes)?
-                    || computed_expr_prefers_float(right.as_ref(), table_id, lfid_dtypes)?,
-            )
-        }
-        ScalarExpr::Compare { .. } => Ok(false),
-        ScalarExpr::Aggregate(_) => Ok(false),
-        ScalarExpr::GetField { base, field_name } => {
-            let dtype = get_field_dtype(base.as_ref(), field_name, table_id, lfid_dtypes)?;
-            Ok(matches!(
-                dtype,
-                DataType::Float16 | DataType::Float32 | DataType::Float64
-            ))
-        }
-        ScalarExpr::Cast { expr, data_type } => {
-            if matches!(
-                data_type,
-                DataType::Float16 | DataType::Float32 | DataType::Float64
-            ) {
-                Ok(true)
-            } else {
-                computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)
-            }
-        }
-        ScalarExpr::Not(expr) => computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes),
 
-        ScalarExpr::IsNull { expr, .. } => {
-            let _ = computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)?;
-            Ok(false)
-        }
-        ScalarExpr::Case {
-            operand,
-            branches,
-            else_expr,
-        } => {
-            if let Some(inner) = operand.as_deref()
-                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
-            {
-                return Ok(true);
-            }
-            for (when_expr, then_expr) in branches {
-                if computed_expr_prefers_float(when_expr, table_id, lfid_dtypes)?
-                    || computed_expr_prefers_float(then_expr, table_id, lfid_dtypes)?
-                {
-                    return Ok(true);
-                }
-            }
-            if let Some(inner) = else_expr.as_deref()
-                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
-            {
-                return Ok(true);
-            }
-            Ok(false)
-        }
-        ScalarExpr::Coalesce(items) => {
-            for item in items {
-                if computed_expr_prefers_float(item, table_id, lfid_dtypes)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        ScalarExpr::Random => Ok(true),
-        ScalarExpr::ScalarSubquery(_) => Ok(false),
-    }
-}
 
-fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
-    match expr {
-        ScalarExpr::Coalesce(_) => true,
-        ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
-            scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right)
-        }
-        ScalarExpr::Not(expr) => scalar_expr_contains_coalesce(expr),
-        ScalarExpr::IsNull { expr, .. } => scalar_expr_contains_coalesce(expr),
-        ScalarExpr::Cast { expr, .. } => scalar_expr_contains_coalesce(expr),
-        ScalarExpr::Case {
-            operand,
-            branches,
-            else_expr,
-        } => {
-            operand
-                .as_deref()
-                .map(scalar_expr_contains_coalesce)
-                .unwrap_or(false)
-                || branches.iter().any(|(when_expr, then_expr)| {
-                    scalar_expr_contains_coalesce(when_expr)
-                        || scalar_expr_contains_coalesce(then_expr)
-                })
-                || else_expr
-                    .as_deref()
-                    .map(scalar_expr_contains_coalesce)
-                    .unwrap_or(false)
-        }
-        ScalarExpr::GetField { base, .. } => scalar_expr_contains_coalesce(base),
-        ScalarExpr::Aggregate(_)
-        | ScalarExpr::Column(_)
-        | ScalarExpr::Literal(_)
-        | ScalarExpr::Random
-        | ScalarExpr::ScalarSubquery(_) => false,
-    }
-}
-fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
-    match literal {
-        Literal::Float(_) => Ok(true),
-        Literal::Decimal(_) => Ok(true),
-        Literal::Struct(fields) => {
-            for (_, nested) in fields {
-                if literal_prefers_float(nested.as_ref())? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        Literal::Integer(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
-        Literal::Date32(_) => Ok(false),
-        Literal::Interval(_) => Ok(false),
-    }
-}
 
-fn get_field_dtype(
-    expr: &ScalarExpr<FieldId>,
-    field_name: &str,
-    table_id: TableId,
-    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
-) -> LlkvResult<DataType> {
-    let base_dtype = match expr {
-        ScalarExpr::Column(fid) => {
-            let lfid = LogicalFieldId::for_user(table_id, *fid);
-            lfid_dtypes
-                .get(&lfid)
-                .cloned()
-                .ok_or_else(|| Error::Internal("missing dtype for computed column".into()))?
-        }
-        ScalarExpr::GetField {
-            base: inner_base,
-            field_name: inner_field,
-        } => get_field_dtype(inner_base.as_ref(), inner_field, table_id, lfid_dtypes)?,
-        _ => {
-            return Err(Error::InvalidArgumentError(
-                "GetField base must be a column or another GetField".into(),
-            ));
-        }
-    };
 
-    if let DataType::Struct(fields) = base_dtype {
-        fields
-            .iter()
-            .find(|f| f.name() == field_name)
-            .map(|f| f.data_type().clone())
-            .ok_or_else(|| {
-                Error::InvalidArgumentError(format!("Field '{}' not found in struct", field_name))
-            })
-    } else {
-        Err(Error::InvalidArgumentError(
-            "GetField can only be applied to struct types".into(),
-        ))
-    }
-}
+
+
+
 
 fn plan_graph_err(err: PlanGraphError) -> Error {
     Error::Internal(format!("plan graph construction failed: {err}"))
@@ -3532,6 +3349,7 @@ fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
     )
 }
 
+// TODO: Move to llkv-expr?
 fn format_expr(expr: &Expr<'_, FieldId>) -> String {
     use Expr::*;
 
@@ -3633,10 +3451,12 @@ fn format_expr(expr: &Expr<'_, FieldId>) -> String {
     result_stack.pop().unwrap_or_default()
 }
 
+// TODO: Move to llkv-expr?
 fn format_filter(filter: &Filter<'_, FieldId>) -> String {
     format!("field#{} {}", filter.field_id, format_operator(&filter.op))
 }
 
+// TODO: Move to llkv-expr?
 fn format_operator(op: &Operator<'_>) -> String {
     match op {
         Operator::Equals(lit) => format!("= {}", format_literal(lit)),
@@ -3915,37 +3735,7 @@ fn escape_string(value: &str) -> String {
     value.chars().flat_map(|c| c.escape_default()).collect()
 }
 
-fn compare_option_values<T: Ord>(
-    left: Option<T>,
-    right: Option<T>,
-    ascending: bool,
-    nulls_first: bool,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => {
-            if nulls_first {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Some(_), None) => {
-            if nulls_first {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Some(a), Some(b)) => {
-            if ascending {
-                a.cmp(&b)
-            } else {
-                b.cmp(&a)
-            }
-        }
-    }
-}
+
 
 struct PrimitiveOrderContext<'a> {
     out_schema: &'a Arc<Schema>,
@@ -3984,44 +3774,9 @@ where
     positions: Vec<(usize, usize)>,
 }
 
-/// Sorts row ids by the values stored in `chunks`, preserving stable ordering for ties.
-fn sort_by_primitive<T>(
-    row_ids: &RoaringTreemap,
-    chunks: &[PrimitiveArray<T>],
-    positions: &[(usize, usize)],
-    ascending: bool,
-    nulls_first: bool,
-) -> Vec<RowId>
-where
-    T: ArrowPrimitiveType,
-    T::Native: Ord,
-{
-    let mut indices: Vec<(usize, RowId)> = row_ids.iter().enumerate().collect();
-    indices.sort_by(|(ai, arid), (bi, brid)| {
-        let (chunk_a, offset_a) = positions[*ai];
-        let (chunk_b, offset_b) = positions[*bi];
-        let array_a = &chunks[chunk_a];
-        let array_b = &chunks[chunk_b];
-        let left = if array_a.is_null(offset_a) {
-            None
-        } else {
-            Some(array_a.value(offset_a))
-        };
-        let right = if array_b.is_null(offset_b) {
-            None
-        } else {
-            Some(array_b.value(offset_b))
-        };
-        let ord = compare_option_values(left, right, ascending, nulls_first);
-        if ord == Ordering::Equal {
-            arid.cmp(brid)
-        } else {
-            ord
-        }
-    });
-    indices.into_iter().map(|(_, rid)| rid).collect()
-}
 
+
+// TODO: Move to llkv-expr?
 fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {
     matches!(
         expr,
