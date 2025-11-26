@@ -1277,7 +1277,7 @@ where
         let is_info_schema = is_information_schema_table(self.table.table_id());
         let is_trivial = is_trivial_filter(filter_expr.as_ref());
 
-        let row_ids_bitmap = if is_trivial {
+        let row_ids_source = if is_trivial {
             use arrow::datatypes::UInt64Type;
             use llkv_expr::typed_predicate::Predicate;
             let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
@@ -1289,11 +1289,15 @@ where
                 .table
                 .store()
                 .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?;
-            RoaringTreemap::from_iter(rows)
+            RowIdSource::Vector(rows)
         } else if is_info_schema {
             let row_ids =
                 self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?;
-            if row_ids.is_empty() {
+            let is_empty = match &row_ids {
+                RowIdSource::Bitmap(b) => b.is_empty(),
+                RowIdSource::Vector(v) => v.is_empty(),
+            };
+            if is_empty {
                 tracing::debug!(
                     "[SCAN_STREAM] information_schema table {}: predicate returned 0 rows",
                     self.table.table_id()
@@ -1304,15 +1308,24 @@ where
             self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?
         };
 
+        let row_count = match &row_ids_source {
+            RowIdSource::Bitmap(b) => b.len(),
+            RowIdSource::Vector(v) => v.len() as u64,
+        };
+
         tracing::trace!(
             "[SCAN_STREAM] collected {} row_ids, has_row_filter={}",
-            row_ids_bitmap.len(),
+            row_count,
             options.row_id_filter.is_some()
         );
 
         let final_row_ids: RowIdSource = if let Some(filter) = options.row_id_filter.as_ref() {
-            let before_len = row_ids_bitmap.len();
-            let filtered = filter.filter(self.table, row_ids_bitmap)?;
+            let bitmap = match row_ids_source {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+            };
+            let before_len = bitmap.len();
+            let filtered = filter.filter(self.table, bitmap)?;
             tracing::trace!(
                 "[SCAN_STREAM] after MVCC filter: {} -> {} row_ids",
                 before_len,
@@ -1326,10 +1339,14 @@ where
                 RowIdSource::Bitmap(filtered)
             }
         } else if let Some(order_spec) = options.order {
-            let sorted = self.sort_row_ids_with_order(&row_ids_bitmap, order_spec)?;
+            let bitmap = match row_ids_source {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+            };
+            let sorted = self.sort_row_ids_with_order(&bitmap, order_spec)?;
             RowIdSource::Vector(sorted)
         } else {
-            RowIdSource::Bitmap(row_ids_bitmap)
+            row_ids_source
         };
 
         let is_empty = match &final_row_ids {
@@ -1556,7 +1573,7 @@ where
         }
     }
 
-    fn collect_row_ids_for_filter(&self, filter: &OwnedFilter) -> LlkvResult<RoaringTreemap> {
+    fn collect_row_ids_for_filter(&self, filter: &OwnedFilter) -> LlkvResult<RowIdSource> {
         if filter.field_id == ROW_ID_FIELD_ID {
             let op = filter.op.to_operator();
             let row_ids = self.collect_row_ids_for_rowid_filter(&op)?;
@@ -1565,7 +1582,7 @@ where
                 row_count = row_ids.len(),
                 "collect_row_ids_for_filter rowid"
             );
-            return Ok(row_ids);
+            return Ok(RowIdSource::Bitmap(row_ids));
         }
 
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
@@ -1580,12 +1597,12 @@ where
                     row_count = non_null.len(),
                     "collect_row_ids_for_filter NOT NULL fast path"
                 );
-                return Ok(non_null);
+                return Ok(RowIdSource::Bitmap(non_null));
             }
             OwnedOperator::IsNull => {
                 let all_row_ids = self.table_row_ids()?;
                 if all_row_ids.is_empty() {
-                    return Ok(RoaringTreemap::new());
+                    return Ok(RowIdSource::Bitmap(RoaringTreemap::new()));
                 }
                 let mut cache = FxHashMap::default();
                 let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
@@ -1595,7 +1612,7 @@ where
                     row_count = null_ids.len(),
                     "collect_row_ids_for_filter NULL fast path"
                 );
-                return Ok(null_ids);
+                return Ok(RowIdSource::Bitmap(null_ids));
             }
             _ => {}
         }
@@ -1612,7 +1629,7 @@ where
                 row_count = rows.len(),
                 "collect_row_ids_for_filter using dense runs"
             );
-            return Ok(RoaringTreemap::from_iter(rows));
+            return Ok(RowIdSource::Vector(rows));
         }
 
         let op = filter.op.to_operator();
@@ -1635,7 +1652,7 @@ where
             "collect_row_ids_for_filter general path"
         );
 
-        Ok(row_ids)
+        Ok(RowIdSource::Bitmap(row_ids))
     }
 
     /// Evaluate a constant-only comparison expression.
@@ -2424,8 +2441,8 @@ where
         programs: &ProgramSet<'_>,
         fusion_cache: &PredicateFusionCache,
         all_rows_cache: &mut FxHashMap<FieldId, RoaringTreemap>,
-    ) -> LlkvResult<RoaringTreemap> {
-        let mut stack: Vec<RoaringTreemap> = Vec::new();
+    ) -> LlkvResult<RowIdSource> {
+        let mut stack: Vec<RowIdSource> = Vec::new();
         let mut domain_cache: FxHashMap<DomainProgramId, Arc<RoaringTreemap>> =
             FxHashMap::default();
 
@@ -2439,7 +2456,7 @@ where
                 EvalOp::PushCompare { left, op, right } => {
                     let rows =
                         self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)?;
-                    stack.push(rows);
+                    stack.push(RowIdSource::Bitmap(rows));
                 }
                 EvalOp::PushInList {
                     expr,
@@ -2452,17 +2469,17 @@ where
                         *negated,
                         all_rows_cache,
                     )?;
-                    stack.push(rows);
+                    stack.push(RowIdSource::Bitmap(rows));
                 }
                 EvalOp::PushIsNull { expr, negated } => {
                     let rows = self.collect_row_ids_for_is_null(expr, *negated, all_rows_cache)?;
-                    stack.push(rows);
+                    stack.push(RowIdSource::Bitmap(rows));
                 }
                 EvalOp::PushLiteral(value) => {
                     if *value {
-                        stack.push(self.collect_all_row_ids(all_rows_cache)?);
+                        stack.push(RowIdSource::Bitmap(self.collect_all_row_ids(all_rows_cache)?));
                     } else {
-                        stack.push(RoaringTreemap::new());
+                        stack.push(RowIdSource::Bitmap(RoaringTreemap::new()));
                     }
                 }
                 EvalOp::FusedAnd { field_id, filters } => {
@@ -2481,14 +2498,34 @@ where
                         let next = stack
                             .pop()
                             .ok_or_else(|| Error::Internal("AND opcode underflow".into()))?;
-                        if acc.is_empty() {
+                        
+                        let acc_empty = match &acc {
+                            RowIdSource::Bitmap(b) => b.is_empty(),
+                            RowIdSource::Vector(v) => v.is_empty(),
+                        };
+                        if acc_empty {
                             continue;
                         }
-                        if next.is_empty() {
-                            acc.clear();
+
+                        let next_empty = match &next {
+                            RowIdSource::Bitmap(b) => b.is_empty(),
+                            RowIdSource::Vector(v) => v.is_empty(),
+                        };
+                        if next_empty {
+                            acc = RowIdSource::Bitmap(RoaringTreemap::new());
                             continue;
                         }
-                        acc &= next;
+
+                        let mut acc_bitmap = match acc {
+                            RowIdSource::Bitmap(b) => b,
+                            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                        };
+                        let next_bitmap = match next {
+                            RowIdSource::Bitmap(b) => b,
+                            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                        };
+                        acc_bitmap &= next_bitmap;
+                        acc = RowIdSource::Bitmap(acc_bitmap);
                     }
                     stack.push(acc);
                 }
@@ -2503,10 +2540,30 @@ where
                         let next = stack
                             .pop()
                             .ok_or_else(|| Error::Internal("OR opcode underflow".into()))?;
-                        if acc.is_empty() {
+                        
+                        let acc_empty = match &acc {
+                            RowIdSource::Bitmap(b) => b.is_empty(),
+                            RowIdSource::Vector(v) => v.is_empty(),
+                        };
+                        if acc_empty {
                             acc = next;
-                        } else if !next.is_empty() {
-                            acc |= next;
+                        } else {
+                            let next_empty = match &next {
+                                RowIdSource::Bitmap(b) => b.is_empty(),
+                                RowIdSource::Vector(v) => v.is_empty(),
+                            };
+                            if !next_empty {
+                                let mut acc_bitmap = match acc {
+                                    RowIdSource::Bitmap(b) => b,
+                                    RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                                };
+                                let next_bitmap = match next {
+                                    RowIdSource::Bitmap(b) => b,
+                                    RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                                };
+                                acc_bitmap |= next_bitmap;
+                                acc = RowIdSource::Bitmap(acc_bitmap);
+                            }
                         }
                     }
                     stack.push(acc);
@@ -2521,12 +2578,22 @@ where
                         all_rows_cache,
                         &mut domain_cache,
                     )?;
-                    if matched.is_empty() {
-                        stack.push(domain_rows.as_ref().clone());
+                    
+                    let matched_empty = match &matched {
+                        RowIdSource::Bitmap(b) => b.is_empty(),
+                        RowIdSource::Vector(v) => v.is_empty(),
+                    };
+
+                    if matched_empty {
+                        stack.push(RowIdSource::Bitmap(domain_rows.as_ref().clone()));
                     } else if domain_rows.is_empty() {
-                        stack.push(RoaringTreemap::new());
+                        stack.push(RowIdSource::Bitmap(RoaringTreemap::new()));
                     } else {
-                        stack.push(domain_rows.as_ref() - &matched);
+                        let matched_bitmap = match matched {
+                            RowIdSource::Bitmap(b) => b,
+                            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+                        };
+                        stack.push(RowIdSource::Bitmap(domain_rows.as_ref() - &matched_bitmap));
                     }
                 }
             }
@@ -2553,9 +2620,9 @@ where
         field_id: FieldId,
         filters: &[OwnedFilter],
         fusion_cache: &PredicateFusionCache,
-    ) -> LlkvResult<RoaringTreemap> {
+    ) -> LlkvResult<RowIdSource> {
         if filters.is_empty() {
-            return Ok(RoaringTreemap::new());
+            return Ok(RowIdSource::Bitmap(RoaringTreemap::new()));
         }
 
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
@@ -2588,22 +2655,40 @@ where
                     ))),
                 ),
             }?;
-            return Ok(rows);
+            return Ok(RowIdSource::Bitmap(rows));
         }
 
         let mut iter = filters.iter();
         let mut acc =
             self.collect_row_ids_for_filter(iter.next().expect("expected at least one filter"))?;
         for filter in iter {
-            if acc.is_empty() {
+            let acc_empty = match &acc {
+                RowIdSource::Bitmap(b) => b.is_empty(),
+                RowIdSource::Vector(v) => v.is_empty(),
+            };
+            if acc_empty {
                 break;
             }
             let rows = self.collect_row_ids_for_filter(filter)?;
-            if rows.is_empty() {
-                acc.clear();
+            let rows_empty = match &rows {
+                RowIdSource::Bitmap(b) => b.is_empty(),
+                RowIdSource::Vector(v) => v.is_empty(),
+            };
+            if rows_empty {
+                acc = RowIdSource::Bitmap(RoaringTreemap::new());
                 break;
             }
-            acc &= rows;
+            
+            let mut acc_bitmap = match acc {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+            };
+            let rows_bitmap = match rows {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+            };
+            acc_bitmap &= rows_bitmap;
+            acc = RowIdSource::Bitmap(acc_bitmap);
         }
         Ok(acc)
     }
@@ -3186,7 +3271,11 @@ where
             },
         };
 
-        let ids = self.collect_row_ids_for_filter(&filter)?;
+        let ids_source = self.collect_row_ids_for_filter(&filter)?;
+        let ids = match ids_source {
+            RowIdSource::Bitmap(b) => b,
+            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+        };
         cache.insert(field_id, ids.clone());
         Ok(ids)
     }
@@ -3311,7 +3400,7 @@ where
 pub(crate) fn collect_row_ids_for_table<'expr, P>(
     table: &Table<P>,
     filter_expr: &Expr<'expr, FieldId>,
-) -> LlkvResult<RoaringTreemap>
+) -> LlkvResult<RowIdSource>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {

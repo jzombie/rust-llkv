@@ -5,6 +5,7 @@ use std::sync::RwLock;
 
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::stream::ColumnStream;
+use crate::stream::RowIdSource;
 use crate::types::TableId;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
@@ -636,7 +637,11 @@ where
         &self,
         filter_expr: &Expr<'a, FieldId>,
     ) -> LlkvResult<RoaringTreemap> {
-        collect_row_ids_for_table(self, filter_expr)
+        let source = collect_row_ids_for_table(self, filter_expr)?;
+        Ok(match source {
+            RowIdSource::Bitmap(b) => b,
+            RowIdSource::Vector(v) => RoaringTreemap::from_iter(v),
+        })
     }
 
     #[inline]
@@ -1625,7 +1630,7 @@ mod tests {
         ]));
 
         let batch = RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![
                 Arc::new(UInt64Array::from(vec![5, 6])),
                 Arc::new(UInt64Array::from(vec![500, 600])),
