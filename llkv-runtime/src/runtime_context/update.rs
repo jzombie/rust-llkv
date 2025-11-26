@@ -20,9 +20,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
-use llkv_table::{
-    ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key,
-};
+use llkv_table::{ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use roaring::RoaringTreemap;
 use rustc_hash::FxHashMap;

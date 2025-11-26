@@ -140,9 +140,7 @@ where
         let batch = mvcc::build_delete_batch(row_ids.clone(), snapshot.txn_id)?;
         table.table.append(&batch)?;
 
-        let removed_u64 = u64::try_from(removed)
-            .map_err(|_| Error::InvalidArgumentError("row count exceeds supported range".into()))?;
-        table.total_rows.fetch_sub(removed_u64, Ordering::SeqCst);
+        table.total_rows.fetch_sub(removed, Ordering::SeqCst);
 
         Ok(RuntimeStatementResult::Delete {
             table_name: display_name,

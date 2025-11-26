@@ -31,13 +31,13 @@ pub enum ProjectionLiteral<F> {
     },
 }
 
-pub fn emit_synthetic_null_batch<F: Hash + Eq + Copy>(
+pub fn emit_synthetic_null_batch<F>(
     projections: &[ProjectionLiteral<F>],
     out_schema: &Arc<Schema>,
     row_count: usize,
 ) -> LlkvResult<Option<RecordBatch>>
 where
-    F: 'static,
+    F: Hash + Eq + Copy + 'static,
 {
     if row_count == 0 {
         return Ok(None);
