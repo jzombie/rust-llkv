@@ -7,6 +7,7 @@
 //! - Constraint context building
 
 use arrow::array::{Array, UInt64Array};
+use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{ExecutorTable, translation};
@@ -18,7 +19,6 @@ use llkv_table::{
     InsertUniqueColumn, RowId,
 };
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
-use croaring::Treemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
@@ -162,7 +162,8 @@ where
             Err(e) => return Err(e),
         };
 
-        let mut rows = vec![Vec::with_capacity(field_ids.len()); visible_row_ids.cardinality() as usize];
+        let mut rows =
+            vec![Vec::with_capacity(field_ids.len()); visible_row_ids.cardinality() as usize];
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             let base = chunk.row_offset();

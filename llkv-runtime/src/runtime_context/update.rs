@@ -9,6 +9,7 @@
 use crate::{RuntimeStatementResult, canonical_table_name};
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
+use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
@@ -22,7 +23,6 @@ use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::{ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
-use croaring::Treemap;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;

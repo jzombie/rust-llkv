@@ -633,10 +633,7 @@ where
         TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
     }
 
-    pub fn filter_row_ids<'a>(
-        &self,
-        filter_expr: &Expr<'a, FieldId>,
-    ) -> LlkvResult<Treemap> {
+    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Treemap> {
         let source = collect_row_ids_for_table(self, filter_expr)?;
         Ok(match source {
             RowIdSource::Bitmap(b) => b,

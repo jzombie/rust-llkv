@@ -11,6 +11,7 @@
 
 use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, IntervalUnit};
+use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::types::LogicalFieldId;
 use llkv_compute::date::parse_date32_literal;
@@ -23,7 +24,6 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::FieldId;
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
-use croaring::Treemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 

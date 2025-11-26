@@ -6,13 +6,13 @@
 //! - MVCC-based soft deletion
 
 use crate::{RuntimeStatementResult, canonical_table_name};
+use croaring::Treemap;
 use llkv_executor::{ExecutorTable, translation};
 use llkv_expr::Expr as LlkvExpr;
 use llkv_plan::DeletePlan;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_transaction::{TransactionSnapshot, mvcc};
-use croaring::Treemap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

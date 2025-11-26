@@ -7,12 +7,12 @@
 use arrow::array::{ArrayRef, UInt64Array, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use croaring::Treemap;
 use llkv_column_map::store::{
     CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, FIELD_ID_META_KEY, ROW_ID_COLUMN_NAME,
 };
 use llkv_column_map::types::{FieldId, RowId};
 use llkv_result::Error;
-use croaring::Treemap;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

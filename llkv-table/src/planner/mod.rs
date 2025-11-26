@@ -2443,8 +2443,7 @@ where
         all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
     ) -> LlkvResult<RowIdSource> {
         let mut stack: Vec<RowIdSource> = Vec::new();
-        let mut domain_cache: FxHashMap<DomainProgramId, Arc<Treemap>> =
-            FxHashMap::default();
+        let mut domain_cache: FxHashMap<DomainProgramId, Arc<Treemap>> = FxHashMap::default();
 
         let mut debug_stack_lens: Vec<usize> = Vec::with_capacity(programs.eval.ops.len());
 
@@ -3039,7 +3038,8 @@ where
                 .build()?;
 
                 let mut chunks: Vec<StringArray> = Vec::new();
-                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.cardinality() as usize);
+                let mut positions: Vec<(usize, usize)> =
+                    Vec::with_capacity(row_ids.cardinality() as usize);
 
                 while let Some(chunk) = row_stream.next_chunk()? {
                     let batch = chunk.to_record_batch();

@@ -106,7 +106,8 @@ where
 
         if logical_fields.is_empty() {
             // Tables without user columns should still return row_id batches.
-            let mut row_id_builder = UInt64Builder::with_capacity(visible_row_ids.cardinality() as usize);
+            let mut row_id_builder =
+                UInt64Builder::with_capacity(visible_row_ids.cardinality() as usize);
             for row_id in visible_row_ids.iter() {
                 row_id_builder.append_value(row_id);
             }
