@@ -2,7 +2,6 @@ pub mod analysis;
 pub mod date;
 pub mod eval;
 pub mod kernels;
-pub mod literal_ops;
 pub mod projection;
 pub mod rowids;
 pub mod scalar;
