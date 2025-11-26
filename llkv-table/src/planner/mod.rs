@@ -1315,15 +1315,13 @@ where
             );
 
             if let Some(order_spec) = options.order {
-                let vec: Vec<RowId> = filtered.iter().collect();
-                let sorted = self.sort_row_ids_with_order(vec, order_spec)?;
+                let sorted = self.sort_row_ids_with_order(&filtered, order_spec)?;
                 RowIdSource::Vector(sorted)
             } else {
                 RowIdSource::Bitmap(filtered)
             }
         } else if let Some(order_spec) = options.order {
-            let vec: Vec<RowId> = row_ids_bitmap.iter().collect();
-            let sorted = self.sort_row_ids_with_order(vec, order_spec)?;
+            let sorted = self.sort_row_ids_with_order(&row_ids_bitmap, order_spec)?;
             RowIdSource::Vector(sorted)
         } else {
             RowIdSource::Bitmap(row_ids_bitmap)
@@ -2870,11 +2868,11 @@ where
 
     fn sort_row_ids_with_order(
         &self,
-        mut row_ids: Vec<RowId>,
+        row_ids: &RoaringTreemap,
         order: ScanOrderSpec,
     ) -> LlkvResult<Vec<RowId>> {
         if row_ids.len() <= 1 {
-            return Ok(row_ids);
+            return Ok(row_ids.iter().collect());
         }
 
         let lfid = LogicalFieldId::for_user(self.table.table_id(), order.field_id);
@@ -2917,20 +2915,20 @@ where
 
         match order.transform {
             ScanOrderTransform::IdentityInt64 => {
-                row_ids = self.sort_row_ids_with_primitive_transform::<Int64Type>(
+                self.sort_row_ids_with_primitive_transform::<Int64Type>(
                     row_ids,
                     primitive_context,
                     ascending,
                     order.nulls_first,
-                )?;
+                )
             }
             ScanOrderTransform::IdentityInt32 => {
-                row_ids = self.sort_row_ids_with_primitive_transform::<Int32Type>(
+                self.sort_row_ids_with_primitive_transform::<Int32Type>(
                     row_ids,
                     primitive_context,
                     ascending,
                     order.nulls_first,
-                )?;
+                )
             }
             ScanOrderTransform::IdentityUtf8 => {
                 let mut row_stream = RowStreamBuilder::new(
@@ -2950,7 +2948,7 @@ where
                 .build()?;
 
                 let mut chunks: Vec<StringArray> = Vec::new();
-                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len() as usize);
 
                 while let Some(chunk) = row_stream.next_chunk()? {
                     let batch = chunk.to_record_batch();
@@ -2979,14 +2977,14 @@ where
                     }
                 }
 
-                if positions.len() != row_ids.len() {
+                if positions.len() != row_ids.len() as usize {
                     return Err(Error::Internal(
                         "ORDER BY gather produced inconsistent row counts".into(),
                     ));
                 }
 
                 let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().copied().enumerate().collect();
+                    row_ids.iter().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let (chunk_a, offset_a) = positions[*ai];
                     let (chunk_b, offset_b) = positions[*bi];
@@ -3009,7 +3007,7 @@ where
                         ord
                     }
                 });
-                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+                Ok(indices.into_iter().map(|(_, rid)| rid).collect())
             }
             ScanOrderTransform::CastUtf8ToInteger => {
                 let mut row_stream = RowStreamBuilder::new(
@@ -3028,7 +3026,7 @@ where
                 )
                 .build()?;
 
-                let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.len());
+                let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.len() as usize);
 
                 while let Some(chunk) = row_stream.next_chunk()? {
                     let batch = chunk.to_record_batch();
@@ -3058,14 +3056,14 @@ where
                     }
                 }
 
-                if keys.len() != row_ids.len() {
+                if keys.len() != row_ids.len() as usize {
                     return Err(Error::Internal(
                         "ORDER BY gather produced inconsistent row counts".into(),
                     ));
                 }
 
                 let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().copied().enumerate().collect();
+                    row_ids.iter().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let left = keys[*ai];
                     let right = keys[*bi];
@@ -3076,16 +3074,14 @@ where
                         ord
                     }
                 });
-                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+                Ok(indices.into_iter().map(|(_, rid)| rid).collect())
             }
         }
-
-        Ok(row_ids)
     }
 
     fn sort_row_ids_with_primitive_transform<T>(
         &self,
-        row_ids: Vec<RowId>,
+        row_ids: &RoaringTreemap,
         context: PrimitiveOrderContext<'_>,
         ascending: bool,
         nulls_first: bool,
@@ -3094,10 +3090,10 @@ where
         T: ArrowPrimitiveType,
         T::Native: Ord,
     {
-        let order_data = self.gather_primitive_order_chunks::<T>(&row_ids, context)?;
+        let order_data = self.gather_primitive_order_chunks::<T>(row_ids, context)?;
 
         Ok(sort_by_primitive::<T>(
-            &row_ids,
+            row_ids,
             &order_data.chunks,
             &order_data.positions,
             ascending,
@@ -3107,7 +3103,7 @@ where
 
     fn gather_primitive_order_chunks<T>(
         &self,
-        row_ids: &[RowId],
+        row_ids: &RoaringTreemap,
         context: PrimitiveOrderContext<'_>,
     ) -> LlkvResult<PrimitiveOrderData<T>>
     where
@@ -3124,13 +3120,13 @@ where
             Arc::clone(context.numeric_fields),
             false,
             GatherNullPolicy::IncludeNulls,
-            row_ids.to_vec(),
+            row_ids.clone(),
             STREAM_BATCH_ROWS,
         )
         .build()?;
 
         let mut chunks: Vec<PrimitiveArray<T>> = Vec::new();
-        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len() as usize);
 
         while let Some(chunk) = row_stream.next_chunk()? {
             let batch = chunk.to_record_batch();
@@ -3162,7 +3158,7 @@ where
             }
         }
 
-        if positions.len() != row_ids.len() {
+        if positions.len() != row_ids.len() as usize {
             return Err(Error::Internal(
                 "ORDER BY gather produced inconsistent row counts".into(),
             ));
@@ -3990,7 +3986,7 @@ where
 
 /// Sorts row ids by the values stored in `chunks`, preserving stable ordering for ties.
 fn sort_by_primitive<T>(
-    row_ids: &[RowId],
+    row_ids: &RoaringTreemap,
     chunks: &[PrimitiveArray<T>],
     positions: &[(usize, usize)],
     ascending: bool,
@@ -4000,7 +3996,7 @@ where
     T: ArrowPrimitiveType,
     T::Native: Ord,
 {
-    let mut indices: Vec<(usize, RowId)> = row_ids.iter().copied().enumerate().collect();
+    let mut indices: Vec<(usize, RowId)> = row_ids.iter().enumerate().collect();
     indices.sort_by(|(ai, arid), (bi, brid)| {
         let (chunk_a, offset_a) = positions[*ai];
         let (chunk_b, offset_b) = positions[*bi];
