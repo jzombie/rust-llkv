@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::mvcc::{self, RowVersion, TXN_ID_AUTO_COMMIT, TXN_ID_NONE};
 use crate::{TransactionSnapshot, TxnIdManager};
+use roaring::RoaringTreemap;
 
 /// Builder for MVCC columns that delegates to the `mvcc` module functions.
 ///
@@ -79,10 +80,10 @@ impl MvccColumnBuilder for TransactionMvccBuilder {
 /// is treated as all rows being visible).
 pub fn filter_row_ids_for_fk_check<P>(
     table: &Table<P>,
-    row_ids: Vec<RowId>,
+    row_ids: RoaringTreemap,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
-) -> Result<Vec<RowId>>
+) -> Result<RoaringTreemap>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -97,10 +98,10 @@ where
 /// is treated as all rows being visible).
 pub fn filter_row_ids_for_snapshot<P>(
     table: &Table<P>,
-    row_ids: Vec<RowId>,
+    row_ids: RoaringTreemap,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
-) -> Result<Vec<RowId>>
+) -> Result<RoaringTreemap>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -110,11 +111,11 @@ where
 /// Internal implementation for filtering row IDs with optional FK-aware visibility.
 fn filter_row_ids_impl<P>(
     table: &Table<P>,
-    row_ids: Vec<RowId>,
+    row_ids: RoaringTreemap,
     txn_manager: &TxnIdManager,
     snapshot: TransactionSnapshot,
     for_fk_check: bool,
-) -> Result<Vec<RowId>>
+) -> Result<RoaringTreemap>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -172,7 +173,7 @@ where
         }
     };
 
-    let mut visible = Vec::with_capacity(total_rows);
+    let mut visible = RoaringTreemap::new();
 
     while let Some(chunk) = stream.next_batch()? {
         let batch = chunk.batch();
@@ -183,7 +184,9 @@ where
                 "[FILTER_ROWS] version_batch has < 2 columns for table_id={}, returning window rows unfiltered",
                 table_id
             );
-            visible.extend_from_slice(window);
+            for rid in window {
+                visible.insert(*rid);
+            }
             continue;
         }
 
@@ -195,7 +198,9 @@ where
                 "[FILTER_ROWS] Failed to downcast MVCC columns for table_id={}, returning window rows unfiltered",
                 table_id
             );
-            visible.extend_from_slice(window);
+            for rid in window {
+                visible.insert(*rid);
+            }
             continue;
         }
 
@@ -231,7 +236,7 @@ where
                 is_visible
             );
             if is_visible {
-                visible.push(*row_id);
+                visible.insert(*row_id);
             }
         }
     }
@@ -275,7 +280,7 @@ impl<P> RowIdFilter<P> for MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn filter(&self, table: &Table<P>, row_ids: Vec<RowId>) -> Result<Vec<RowId>> {
+    fn filter(&self, table: &Table<P>, row_ids: RoaringTreemap) -> Result<RoaringTreemap> {
         tracing::trace!(
             "[MVCC_FILTER] filter() called with row_ids {:?}, snapshot txn={}, snapshot_id={}",
             row_ids,

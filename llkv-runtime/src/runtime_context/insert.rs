@@ -23,6 +23,7 @@ use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use roaring::RoaringTreemap;
 
 use super::RuntimeContext;
 
@@ -317,7 +318,7 @@ where
                 table,
                 ctx.display_name.clone(),
                 ctx.canonical_name.clone(),
-                row_ids,
+                row_ids.into_iter().collect(),
                 ctx.snapshot,
                 false, // Don't enforce foreign keys for REPLACE
             )?;
@@ -503,14 +504,14 @@ where
                         continue;
                     }
                     let array = batch.column(0);
-                    let base_idx = chunk.row_offset();
+                    let _base_idx = chunk.row_offset();
 
                     for local_idx in 0..batch.num_rows() {
                         if let Ok(existing_value) =
                             llkv_plan::plan_value_from_array(array, local_idx)
                             && new_values.contains(&existing_value)
                         {
-                            let rid = row_ids[base_idx + local_idx];
+                            let rid = chunk.row_ids()[local_idx];
                             if !conflicting_row_ids.contains(&rid) {
                                 conflicting_row_ids.push(rid);
                             }
@@ -554,7 +555,7 @@ where
     fn find_multi_column_conflicts(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: &[RowId],
+        row_ids: &RoaringTreemap,
         new_rows: &[Vec<PlanValue>],
         columns: &[String],
         constraint: &llkv_table::InsertMultiColumnUnique,
@@ -623,7 +624,7 @@ where
 
         let mut stream = table.table.stream_columns(
             logical_field_ids,
-            row_ids.to_vec(),
+            row_ids.clone(),
             GatherNullPolicy::IncludeNulls,
         )?;
 
@@ -633,7 +634,6 @@ where
                 continue;
             }
 
-            let base_idx = chunk.row_offset();
             let num_rows = batch.num_rows();
 
             for local_idx in 0..num_rows {
@@ -652,7 +652,7 @@ where
                 }
 
                 if has_all_values && new_values.contains(&existing_value) {
-                    let rid = row_ids[base_idx + local_idx];
+                    let rid = chunk.row_ids()[local_idx];
                     if !conflicting_row_ids.contains(&rid) {
                         conflicting_row_ids.push(rid);
                     }

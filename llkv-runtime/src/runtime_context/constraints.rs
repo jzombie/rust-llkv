@@ -20,6 +20,7 @@ use llkv_table::{
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
+use roaring::RoaringTreemap;
 
 use crate::TXN_ID_NONE;
 
@@ -36,7 +37,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: &str,
-        row_ids: &[RowId],
+        row_ids: &RoaringTreemap,
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
         if row_ids.is_empty() {
@@ -60,7 +61,7 @@ where
 
         let mut stream = table.table.stream_columns(
             Arc::clone(&logical_fields),
-            row_ids.to_vec(),
+            row_ids.clone(),
             GatherNullPolicy::IncludeNulls,
         )?;
 
@@ -136,7 +137,7 @@ where
 
         let visible_row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            raw_row_ids.iter().collect(),
+            raw_row_ids,
             &self.txn_manager,
             snapshot,
         )?;
@@ -161,7 +162,7 @@ where
             Err(e) => return Err(e),
         };
 
-        let mut rows = vec![Vec::with_capacity(field_ids.len()); visible_row_ids.len()];
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); visible_row_ids.len() as usize];
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             let base = chunk.row_offset();
@@ -236,7 +237,7 @@ where
         table: &ExecutorTable<P>,
         _display_name: &str,
         _canonical_name: &str,
-        row_ids: &[RowId],
+        row_ids: &RoaringTreemap,
         updated_field_ids: &[FieldId],
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
@@ -244,14 +245,18 @@ where
             return Ok(());
         }
 
+        // TODO: Is this *really* necessary? Can referenced_row_ids take a RoaringTreemap instead?
+        let row_ids_vec: Vec<RowId> = row_ids.iter().collect();
+
         self.constraint_service.validate_update_foreign_keys(
             table.table.table_id(),
-            row_ids,
+            &row_ids_vec,
             updated_field_ids,
             |request| {
+                let map: RoaringTreemap = request.referenced_row_ids.iter().copied().collect();
                 self.collect_row_values_for_ids(
                     table,
-                    request.referenced_row_ids,
+                    &map,
                     request.referenced_field_ids,
                 )
             },
@@ -273,20 +278,24 @@ where
         &self,
         table: &ExecutorTable<P>,
         _display_name: &str,
-        row_ids: &[RowId],
+        row_ids: &RoaringTreemap,
         snapshot: TransactionSnapshot,
     ) -> Result<()> {
         if row_ids.is_empty() {
             return Ok(());
         }
 
+        // TODO: Is this *really* necessary? Can validate_delete_foreign_keys take a RoaringTreemap instead?
+        let row_ids_vec: Vec<RowId> = row_ids.iter().collect();
+
         self.constraint_service.validate_delete_foreign_keys(
             table.table.table_id(),
-            row_ids,
+            &row_ids_vec,
             |request| {
+                let map: RoaringTreemap = request.referenced_row_ids.iter().copied().collect();
                 self.collect_row_values_for_ids(
                     table,
-                    request.referenced_row_ids,
+                    &map,
                     request.referenced_field_ids,
                 )
             },

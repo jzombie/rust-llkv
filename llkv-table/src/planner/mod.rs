@@ -7,6 +7,7 @@ use std::convert::TryFrom;
 use std::mem;
 use std::ops::Bound;
 use std::sync::Arc;
+use roaring::RoaringTreemap;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
@@ -51,7 +52,6 @@ use llkv_expr::typed_predicate::{
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::decimal::DecimalValue;
-use roaring::RoaringTreemap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -935,7 +935,9 @@ where
 
         let mut process_chunk = |mut chunk: Vec<RowId>| -> LlkvResult<()> {
             if let Some(filter) = options.row_id_filter.as_ref() {
-                chunk = filter.filter(self.table, chunk)?;
+                let bitmap: RoaringTreemap = chunk.iter().copied().collect();
+                let filtered = filter.filter(self.table, bitmap)?;
+                chunk = filtered.into_iter().collect();
             }
             if chunk.is_empty() {
                 return Ok(());
@@ -1304,9 +1306,8 @@ where
         );
 
         let final_row_ids: RowIdSource = if let Some(filter) = options.row_id_filter.as_ref() {
-            let vec: Vec<RowId> = row_ids_bitmap.iter().collect();
-            let before_len = vec.len();
-            let filtered = filter.filter(self.table, vec)?;
+            let before_len = row_ids_bitmap.len();
+            let filtered = filter.filter(self.table, row_ids_bitmap)?;
             tracing::trace!(
                 "[SCAN_STREAM] after MVCC filter: {} -> {} row_ids",
                 before_len,
@@ -1314,10 +1315,11 @@ where
             );
 
             if let Some(order_spec) = options.order {
-                let sorted = self.sort_row_ids_with_order(filtered, order_spec)?;
+                let vec: Vec<RowId> = filtered.iter().collect();
+                let sorted = self.sort_row_ids_with_order(vec, order_spec)?;
                 RowIdSource::Vector(sorted)
             } else {
-                RowIdSource::Vector(filtered)
+                RowIdSource::Bitmap(filtered)
             }
         } else if let Some(order_spec) = options.order {
             let vec: Vec<RowId> = row_ids_bitmap.iter().collect();

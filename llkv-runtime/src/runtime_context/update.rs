@@ -24,6 +24,7 @@ use llkv_table::{
     ConstraintEnforcementMode, FieldId, RowId, UniqueKey, build_composite_unique_key,
 };
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
+use roaring::RoaringTreemap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
@@ -177,7 +178,7 @@ where
         )?;
 
         let mut new_rows: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(table.schema.columns.len()); row_count];
+            vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             let base = chunk.row_offset();
@@ -214,7 +215,7 @@ where
         let primary_key_spec = constraint_ctx.primary_key.as_ref();
         let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
         if let Some(pk) = primary_key_spec {
-            original_primary_key_keys.reserve(row_count);
+            original_primary_key_keys.reserve(row_count as usize);
             for row in &new_rows {
                 let mut values = Vec::with_capacity(pk.schema_indices.len());
                 for &idx in &pk.schema_indices {
@@ -252,14 +253,14 @@ where
                     })?;
 
             let values = match value {
-                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count],
+                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count as usize],
                 PreparedAssignmentValue::Expression { expr_index } => {
                     let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
                         Error::InvalidArgumentError(
                             "expression assignment value missing during UPDATE".into(),
                         )
                     })?;
-                    if column_values.len() != row_count {
+                    if column_values.len() != row_count as usize {
                         return Err(Error::InvalidArgumentError(
                             "expression result count did not match targeted row count".into(),
                         ));
@@ -292,10 +293,11 @@ where
             &new_rows,
         )?;
 
+        // TODO: Does rows_ids really have to be converted into a FxHashSet here?
         // For UPDATE, validate UNIQUE constraints against existing rows EXCLUDING
         // the rows being updated (since they'll be deleted before new values are inserted).
         // This prevents false duplicate detection when primary key values don't change.
-        let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
+        let row_ids_set: FxHashSet<RowId> = row_ids.iter().collect();
         let all_visible_row_ids = {
             let first_field = table
                 .schema
@@ -303,7 +305,7 @@ where
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
-            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids.iter().collect(), &self.txn_manager, snapshot)?
+            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
 
         self.constraint_service.validate_insert_constraints(
@@ -320,8 +322,8 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
                 let filtered: Vec<PlanValue> = all_vals
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
                         if !row_ids_set.contains(&row_id) {
                             row.into_iter().next()
                         } else {
@@ -337,8 +339,8 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
                 let filtered: Vec<Vec<PlanValue>> = all_rows
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
                         if !row_ids_set.contains(&row_id) {
                             Some(row)
                         } else {
@@ -418,7 +420,7 @@ where
 
         Ok(RuntimeStatementResult::Update {
             table_name: display_name,
-            rows_updated: row_count,
+            rows_updated: row_count as usize,
         })
     }
 
@@ -530,7 +532,7 @@ where
         )?;
 
         let mut new_rows: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(table.schema.columns.len()); row_count];
+            vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             let base = chunk.row_offset();
@@ -560,7 +562,7 @@ where
         let primary_key_spec = constraint_ctx.primary_key.as_ref();
         let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
         if let Some(pk) = primary_key_spec {
-            original_primary_key_keys.reserve(row_count);
+            original_primary_key_keys.reserve(row_count as usize);
             for row in &new_rows {
                 let mut values = Vec::with_capacity(pk.schema_indices.len());
                 for &idx in &pk.schema_indices {
@@ -598,14 +600,14 @@ where
                     })?;
 
             let values = match value {
-                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count],
+                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count as usize],
                 PreparedAssignmentValue::Expression { expr_index } => {
                     let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
                         Error::InvalidArgumentError(
                             "expression assignment value missing during UPDATE".into(),
                         )
                     })?;
-                    if column_values.len() != row_count {
+                    if column_values.len() != row_count as usize {
                         return Err(Error::InvalidArgumentError(
                             "expression result count did not match targeted row count".into(),
                         ));
@@ -639,7 +641,7 @@ where
         )?;
 
         // For UPDATE, validate UNIQUE constraints excluding rows being updated
-        let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
+        let row_ids_set: FxHashSet<RowId> = row_ids.iter().collect();
         let all_visible_row_ids = {
             let first_field = table
                 .schema
@@ -647,7 +649,7 @@ where
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
             let all_ids = table.table.filter_row_ids(&filter_expr)?;
-            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids.iter().collect(), &self.txn_manager, snapshot)?
+            filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
 
         self.constraint_service.validate_insert_constraints(
@@ -663,8 +665,8 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
                 let filtered: Vec<PlanValue> = all_vals
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
                         if !row_ids_set.contains(&row_id) {
                             row.into_iter().next()
                         } else {
@@ -679,8 +681,8 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
                 let filtered: Vec<Vec<PlanValue>> = all_rows
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
                         if !row_ids_set.contains(&row_id) {
                             Some(row)
                         } else {
@@ -759,7 +761,7 @@ where
 
         Ok(RuntimeStatementResult::Update {
             table_name: display_name,
-            rows_updated: row_count,
+            rows_updated: row_count as usize,
         })
     }
 
@@ -777,7 +779,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: &str,
-        row_ids: Vec<RowId>,
+        row_ids: RoaringTreemap,
         new_rows: Vec<Vec<PlanValue>>,
         updated_field_ids: Vec<FieldId>,
         snapshot: TransactionSnapshot,
@@ -793,7 +795,7 @@ where
             "update_rows_in_place should only be called for auto-commit transactions",
         );
         debug_assert_eq!(
-            row_ids.len(),
+            row_ids.len() as usize,
             new_rows.len(),
             "row_ids and new_rows must have the same length",
         );
@@ -832,7 +834,7 @@ where
         }
 
         let mut column_values: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(row_count); update_columns.len()];
+            vec![Vec::with_capacity(row_count as usize); update_columns.len()];
         for row in &new_rows {
             debug_assert_eq!(
                 row.len(),
@@ -845,8 +847,8 @@ where
             }
         }
 
-        let mut row_id_builder = UInt64Builder::with_capacity(row_count);
-        for &rid in &row_ids {
+        let mut row_id_builder = UInt64Builder::with_capacity(row_count as usize);
+        for rid in row_ids.iter() {
             row_id_builder.append_value(rid);
         }
         let row_id_array = Arc::new(row_id_builder.finish()) as ArrayRef;
@@ -929,11 +931,11 @@ where
         filter_expr: &LlkvExpr<'static, FieldId>,
         expressions: &[ScalarExpr<FieldId>],
         snapshot: TransactionSnapshot,
-    ) -> Result<(Vec<RowId>, Vec<Vec<PlanValue>>)> {
+    ) -> Result<(RoaringTreemap, Vec<Vec<PlanValue>>)> {
         let row_ids = table.table.filter_row_ids(filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
-            return Ok((row_ids, vec![Vec::new(); expressions.len()]));
+            return Ok((RoaringTreemap::new(), vec![Vec::new(); expressions.len()]));
         }
 
         if expressions.is_empty() {
@@ -947,7 +949,7 @@ where
         }
 
         let mut expr_values: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(row_ids.len()); expressions.len()];
+            vec![Vec::with_capacity(row_ids.len() as usize); expressions.len()];
         let mut error: Option<Error> = None;
         let row_filter: Arc<dyn llkv_table::table::RowIdFilter<P>> = Arc::new(
             MvccRowIdFilter::new(Arc::clone(&self.txn_manager), snapshot),
@@ -974,7 +976,7 @@ where
         }
 
         for values in &expr_values {
-            if values.len() != row_ids.len() {
+            if values.len() != row_ids.len() as usize {
                 return Err(Error::InvalidArgumentError(
                     "expression result count did not match targeted row count".into(),
                 ));

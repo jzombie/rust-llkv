@@ -9,6 +9,8 @@ use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::{MemPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
 
+use roaring::RoaringTreemap;
+
 /// Streaming view over a set of row IDs for selected logical fields.
 ///
 /// `ColumnStream` keeps a reusable gather context so repeated calls avoid
@@ -21,17 +23,18 @@ where
 {
     store: &'table ColumnStore<P>,
     ctx: MultiGatherContext,
-    row_ids: Vec<RowId>,
+    row_ids: roaring::treemap::IntoIter,
     position: usize,
+    total_rows: usize,
     chunk_size: usize,
     policy: GatherNullPolicy,
     logical_fields: Arc<[LogicalFieldId]>,
 }
 
 /// Single batch produced by [`ColumnStream`].
-pub struct ColumnStreamBatch<'stream> {
+pub struct ColumnStreamBatch {
     start: usize,
-    row_ids: &'stream [RowId],
+    row_ids: Vec<RowId>,
     batch: RecordBatch,
 }
 
@@ -42,16 +45,18 @@ where
     pub(crate) fn new(
         store: &'table ColumnStore<P>,
         ctx: MultiGatherContext,
-        row_ids: Vec<RowId>,
+        row_ids: RoaringTreemap,
         chunk_size: usize,
         policy: GatherNullPolicy,
         logical_fields: Arc<[LogicalFieldId]>,
     ) -> Self {
+        let total_rows = row_ids.len() as usize;
         Self {
             store,
             ctx,
-            row_ids,
+            row_ids: row_ids.into_iter(),
             position: 0,
+            total_rows,
             chunk_size,
             policy,
             logical_fields,
@@ -61,13 +66,13 @@ where
     /// Total number of row IDs covered by this stream.
     #[inline]
     pub fn total_rows(&self) -> usize {
-        self.row_ids.len()
+        self.total_rows
     }
 
     /// Remaining number of row IDs that have not yet been yielded.
     #[inline]
     pub fn remaining_rows(&self) -> usize {
-        self.row_ids.len().saturating_sub(self.position)
+        self.total_rows.saturating_sub(self.position)
     }
 
     /// Logical fields produced by this stream.
@@ -77,17 +82,27 @@ where
     }
 
     /// Fetch the next chunk of rows, if any remain.
-    pub fn next_batch(&mut self) -> LlkvResult<Option<ColumnStreamBatch<'_>>> {
-        while self.position < self.row_ids.len() {
+    pub fn next_batch(&mut self) -> LlkvResult<Option<ColumnStreamBatch>> {
+        loop {
+            let mut window = Vec::with_capacity(self.chunk_size);
+            for _ in 0..self.chunk_size {
+                if let Some(rid) = self.row_ids.next() {
+                    window.push(rid);
+                } else {
+                    break;
+                }
+            }
+
+            if window.is_empty() {
+                return Ok(None);
+            }
+
             let start = self.position;
-            let end = (start + self.chunk_size).min(self.row_ids.len());
-            let window = &self.row_ids[start..end];
+            self.position += window.len();
 
             let batch =
                 self.store
-                    .gather_rows_with_reusable_context(&mut self.ctx, window, self.policy)?;
-
-            self.position = end;
+                    .gather_rows_with_reusable_context(&mut self.ctx, &window, self.policy)?;
 
             if batch.num_rows() == 0 && matches!(self.policy, GatherNullPolicy::DropNulls) {
                 // All rows dropped; continue to the next chunk to avoid yielding empties.
@@ -100,15 +115,13 @@ where
                 batch,
             }));
         }
-
-        Ok(None)
     }
 }
 
-impl<'stream> ColumnStreamBatch<'stream> {
+impl ColumnStreamBatch {
     #[inline]
-    pub fn row_ids(&self) -> &'stream [RowId] {
-        self.row_ids
+    pub fn row_ids(&self) -> &[RowId] {
+        &self.row_ids
     }
 
     #[inline]
@@ -136,3 +149,4 @@ impl<'stream> ColumnStreamBatch<'stream> {
         self.batch
     }
 }
+

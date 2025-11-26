@@ -18,6 +18,7 @@ llkv-executor.workspace = true
 llkv-expr.workspace = true
 llkv-plan.workspace = true
 llkv-result.workspace = true
+roaring.workspace = true
 llkv-storage.workspace = true
 simd-r-drive-entry-handle.workspace = true
 llkv-table.workspace = true

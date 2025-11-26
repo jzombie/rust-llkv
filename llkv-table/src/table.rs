@@ -19,7 +19,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
-use crate::types::{FieldId, RowId};
+use crate::types::FieldId;
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 
@@ -64,7 +64,7 @@ where
     /// # Errors
     ///
     /// Returns an error if visibility metadata cannot be loaded or is corrupted.
-    fn filter(&self, table: &Table<P>, row_ids: Vec<RowId>) -> LlkvResult<Vec<RowId>>;
+    fn filter(&self, table: &Table<P>, row_ids: RoaringTreemap) -> LlkvResult<RoaringTreemap>;
 }
 
 /// Options for configuring table scans.
@@ -730,7 +730,7 @@ where
     pub fn stream_columns(
         &self,
         logical_fields: impl Into<Arc<[LogicalFieldId]>>,
-        row_ids: Vec<RowId>,
+        row_ids: RoaringTreemap,
         policy: GatherNullPolicy,
     ) -> LlkvResult<ColumnStream<'_, P>> {
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();

@@ -16,6 +16,7 @@ use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use roaring::RoaringTreemap;
 
 /// Transaction ID type.
 pub type TxnId = u64;
@@ -481,18 +482,20 @@ pub fn build_field_with_metadata(
 
 /// Build DELETE batch with row_id and deleted_by columns.
 pub fn build_delete_batch(
-    row_ids: Vec<RowId>,
+    row_ids: RoaringTreemap,
     deleted_by_txn_id: TxnId,
 ) -> llkv_result::Result<RecordBatch> {
-    let row_count = row_ids.len();
+    let row_count = row_ids.len() as usize;
 
     let fields = vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
         Field::new(DELETED_BY_COLUMN_NAME, DataType::UInt64, false),
     ];
 
+    let row_ids_vec: Vec<u64> = row_ids.into_iter().collect();
+
     let arrays: Vec<ArrayRef> = vec![
-        Arc::new(UInt64Array::from(row_ids)),
+        Arc::new(UInt64Array::from(row_ids_vec)),
         Arc::new(UInt64Array::from(vec![deleted_by_txn_id; row_count])),
     ];
 

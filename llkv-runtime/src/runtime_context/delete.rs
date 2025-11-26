@@ -11,10 +11,11 @@ use llkv_expr::Expr as LlkvExpr;
 use llkv_plan::DeletePlan;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::RowId;
 use llkv_transaction::{TransactionSnapshot, mvcc};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use roaring::RoaringTreemap;
 
 use super::RuntimeContext;
 
@@ -116,7 +117,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         _canonical_name: String,
-        row_ids: Vec<RowId>,
+        row_ids: RoaringTreemap,
         snapshot: TransactionSnapshot,
         enforce_foreign_keys: bool,
     ) -> Result<RuntimeStatementResult<P>> {
@@ -145,7 +146,7 @@ where
 
         Ok(RuntimeStatementResult::Delete {
             table_name: display_name,
-            rows_deleted: removed,
+            rows_deleted: removed as usize,
         })
     }
 }

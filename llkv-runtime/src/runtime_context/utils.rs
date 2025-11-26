@@ -22,7 +22,7 @@ use llkv_executor::{ExecutorColumn, ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::{FieldId, RowId};
+use llkv_table::FieldId;
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
@@ -227,7 +227,7 @@ where
         // Apply MVCC filtering manually using filter_row_ids_for_snapshot
         let row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            row_ids.iter().collect(),
+            row_ids,
             &self.txn_manager,
             snapshot,
         )?;
@@ -238,7 +238,7 @@ where
 
         // Gather the column values for visible rows
         let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-        let row_count = row_ids.len();
+        let row_count = row_ids.len() as usize;
         let mut stream = match table.table.stream_columns(
             vec![logical_field_id],
             row_ids,
@@ -307,7 +307,7 @@ where
 
         let row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            row_ids.iter().collect(),
+            row_ids,
             &self.txn_manager,
             snapshot,
         )?;
@@ -321,7 +321,7 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let total_rows = row_ids.len();
+        let total_rows = row_ids.len() as usize;
         let mut stream = match table.table.stream_columns(
             logical_field_ids,
             row_ids,
@@ -399,7 +399,7 @@ where
         // Use FK-specific filtering that treats deleted rows as still visible
         let row_ids = llkv_transaction::filter_row_ids_for_fk_check(
             table.table.as_ref(),
-            row_ids.iter().collect(),
+            row_ids,
             &self.txn_manager,
             snapshot,
         )?;
@@ -413,7 +413,7 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let total_rows = row_ids.len();
+        let total_rows = row_ids.len() as usize;
         let mut stream = match table.table.stream_columns(
             logical_field_ids,
             row_ids,
@@ -460,7 +460,7 @@ where
     pub(super) fn collect_row_values_for_ids(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: &[RowId],
+        row_ids: &RoaringTreemap,
         field_ids: &[FieldId],
     ) -> Result<Vec<Vec<PlanValue>>> {
         if row_ids.is_empty() || field_ids.is_empty() {
@@ -475,7 +475,7 @@ where
 
         let mut stream = match table.table.stream_columns(
             logical_field_ids.clone(),
-            row_ids.to_vec(),
+            row_ids.clone(),
             GatherNullPolicy::IncludeNulls,
         ) {
             Ok(stream) => stream,
@@ -483,7 +483,7 @@ where
             Err(e) => return Err(e),
         };
 
-        let mut rows = vec![Vec::with_capacity(field_ids.len()); row_ids.len()];
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); row_ids.len() as usize];
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             let base = chunk.row_offset();
@@ -511,9 +511,8 @@ where
         table: &ExecutorTable<P>,
         row_ids: RoaringTreemap,
         snapshot: TransactionSnapshot,
-    ) -> Result<Vec<RowId>> {
-        let row_ids_vec: Vec<RowId> = row_ids.iter().collect();
-        filter_row_ids_for_snapshot(table.table.as_ref(), row_ids_vec, &self.txn_manager, snapshot)
+    ) -> Result<RoaringTreemap> {
+        filter_row_ids_for_snapshot(table.table.as_ref(), row_ids, &self.txn_manager, snapshot)
     }
 
     /// Record that a transaction has inserted rows into a table.
