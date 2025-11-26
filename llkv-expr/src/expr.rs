@@ -283,6 +283,23 @@ pub enum BinaryOp {
     BitwiseShiftRight,
 }
 
+impl BinaryOp {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BinaryOp::Add => "+",
+            BinaryOp::Subtract => "-",
+            BinaryOp::Multiply => "*",
+            BinaryOp::Divide => "/",
+            BinaryOp::Modulo => "%",
+            BinaryOp::And => "AND",
+            BinaryOp::Or => "OR",
+            BinaryOp::BitwiseShiftLeft => "<<",
+            BinaryOp::BitwiseShiftRight => ">>",
+        }
+    }
+}
+
 /// Comparison operator for scalar expressions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompareOp {
@@ -292,6 +309,20 @@ pub enum CompareOp {
     LtEq,
     Gt,
     GtEq,
+}
+
+impl CompareOp {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompareOp::Eq => "=",
+            CompareOp::NotEq => "!=",
+            CompareOp::Lt => "<",
+            CompareOp::LtEq => "<=",
+            CompareOp::Gt => ">",
+            CompareOp::GtEq => ">=",
+        }
+    }
 }
 
 /// Single predicate against a field.
