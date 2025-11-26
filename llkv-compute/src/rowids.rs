@@ -11,11 +11,6 @@ use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_result::{Error, Result as LlkvResult};
 use roaring::RoaringTreemap;
 
-/// Sort and deduplicate a set of values (typically row ids).
-pub fn normalize_row_ids(values: Vec<RowId>) -> RoaringTreemap {
-    values.into_iter().collect()
-}
-
 pub fn literal_to_row_id(lit: &Literal) -> LlkvResult<RowId> {
     u64::from_literal(lit)
         .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
