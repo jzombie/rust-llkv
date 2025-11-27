@@ -12,7 +12,7 @@ use llkv_column_map::store::scan::{
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_storage::pager::MemPager;
-use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
+use llkv_types::{LogicalFieldId, Namespace};
 
 // Minimal visitor that records that callbacks occurred (to ensure scan executed).
 struct TouchVisitor {
@@ -106,9 +106,7 @@ fn indices_persist_after_drop_and_reopen() {
                     offset: 0,
                     include_nulls: true,
                     nulls_first: true,
-                    anchor_row_id_field: Some(
-                        anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
-                    ),
+                    anchor_row_id_field: Some(anchor_fid.with_namespace(Namespace::RowIdShadow)),
                 },
                 &mut v,
             )

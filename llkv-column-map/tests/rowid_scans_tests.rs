@@ -11,7 +11,7 @@ use llkv_column_map::store::scan::{
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_storage::pager::MemPager;
-use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
+use llkv_types::{LogicalFieldId, Namespace};
 
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
@@ -57,7 +57,7 @@ fn seed_u64_perm(
     store.append(&batch).unwrap();
     store.register_index(field_id, IndexKind::Sort).unwrap();
 
-    let rid_fid = field_id.with_namespace(LogicalStorageNamespace::RowIdShadow);
+    let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
     (store, field_id, rid_fid, vals, pos_of_val)
 }
 

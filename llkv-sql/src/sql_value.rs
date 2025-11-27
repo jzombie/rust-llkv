@@ -3,10 +3,11 @@ use crate::{
     sql_engine::register_placeholder,
 };
 use llkv_compute::date::parse_date32_literal;
+use llkv_expr::literal::IntervalValue;
 use llkv_plan::plans::PlanValue;
+use llkv_plan::{add_interval_to_date32, subtract_interval_from_date32};
 use llkv_result::Error;
 use llkv_types::decimal::DecimalValue;
-use llkv_types::{IntervalValue, Literal};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr as SqlExpr, TypedString, UnaryOperator, Value, ValueWithSpan,
@@ -15,9 +16,9 @@ use sqlparser::ast::{
 #[derive(Clone, Debug)]
 pub(crate) enum SqlValue {
     Null,
-    Int64(i64),
-    Float64(f64),
-    Decimal128(DecimalValue),
+    Integer(i64),
+    Float(f64),
+    Decimal(DecimalValue),
     Boolean(bool),
     String(String),
     Date32(i32),
@@ -26,85 +27,6 @@ pub(crate) enum SqlValue {
 }
 
 impl SqlValue {
-    fn into_literal(self) -> SqlResult<Literal> {
-        match self {
-            SqlValue::Null => Ok(Literal::Null),
-            SqlValue::Int64(i) => Ok(Literal::Int128(i.into())),
-            SqlValue::Float64(f) => Ok(Literal::Float64(f)),
-            SqlValue::Decimal128(d) => Ok(Literal::Decimal128(d)),
-            SqlValue::Date32(days) => Ok(Literal::Date32(days)),
-            SqlValue::Interval(interval) => Ok(Literal::Interval(interval)),
-            SqlValue::Boolean(_) | SqlValue::String(_) | SqlValue::Struct(_) => {
-                Err(Error::InvalidArgumentError(
-                    "unsupported literal expression: binary operation".into(),
-                ))
-            }
-        }
-    }
-
-    pub fn from_number_literal(text: &str) -> SqlResult<SqlValue> {
-        // Scientific notation (e/E) requires float
-        if text.contains(['e', 'E']) {
-            let value = text.parse::<f64>().map_err(|err| {
-                Error::InvalidArgumentError(format!("invalid float literal: {err}"))
-            })?;
-            return Ok(SqlValue::Float64(value));
-        }
-
-        // Decimal point → parse as Decimal with exact precision
-        if let Some(dot_pos) = text.find('.') {
-            let integer_part = &text[..dot_pos];
-            let fractional_part = &text[dot_pos + 1..];
-
-            // Parse the number as i128 by removing the decimal point
-            let combined = format!("{}{}", integer_part, fractional_part);
-            let raw_value = combined.parse::<i128>().map_err(|err| {
-                Error::InvalidArgumentError(format!("invalid decimal literal: {err}"))
-            })?;
-
-            // Scale is the number of digits after the decimal point
-            let scale = fractional_part.len() as i8;
-
-            // Create DecimalValue
-            let decimal = DecimalValue::new(raw_value, scale).map_err(|err| {
-                Error::InvalidArgumentError(format!("invalid decimal literal: {}", err))
-            })?;
-
-            return Ok(SqlValue::Decimal128(decimal));
-        }
-
-        // No decimal point → integer
-        let value = text.parse::<i64>().map_err(|err| {
-            Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
-        })?;
-        Ok(SqlValue::Int64(value))
-    }
-
-    #[allow(dead_code)]
-    fn from_literal(lit: &Literal) -> SqlResult<SqlValue> {
-        Ok(match lit {
-            Literal::Null => SqlValue::Null,
-            Literal::Int128(i) => {
-                SqlValue::Int64((*i).try_into().map_err(|_| {
-                    Error::InvalidArgumentError("integer literal out of range".into())
-                })?)
-            }
-            Literal::Float64(f) => SqlValue::Float64(*f),
-            Literal::Decimal128(d) => SqlValue::Decimal128(*d),
-            Literal::String(s) => SqlValue::String(s.clone()),
-            Literal::Boolean(b) => SqlValue::Boolean(*b),
-            Literal::Date32(days) => SqlValue::Date32(*days),
-            Literal::Interval(interval) => SqlValue::Interval(*interval),
-            Literal::Struct(fields) => {
-                let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
-                for (k, v) in fields {
-                    map.insert(k.clone(), SqlValue::from_literal(v)?);
-                }
-                SqlValue::Struct(map)
-            }
-        })
-    }
-
     pub(crate) fn try_from_expr(expr: &SqlExpr) -> SqlResult<Self> {
         match expr {
             SqlExpr::Value(value) => SqlValue::from_value(value),
@@ -117,12 +39,12 @@ impl SqlValue {
                 op: UnaryOperator::Minus,
                 expr,
             } => match SqlValue::try_from_expr(expr)? {
-                SqlValue::Int64(v) => Ok(SqlValue::Int64(-v)),
-                SqlValue::Float64(v) => Ok(SqlValue::Float64(-v)),
-                SqlValue::Decimal128(dec) => {
+                SqlValue::Integer(v) => Ok(SqlValue::Integer(-v)),
+                SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
+                SqlValue::Decimal(dec) => {
                     // Negate the raw i128 value while preserving scale
                     DecimalValue::new(-dec.raw_value(), dec.scale())
-                        .map(SqlValue::Decimal128)
+                        .map(SqlValue::Decimal)
                         .map_err(|err| {
                             Error::InvalidArgumentError(format!(
                                 "decimal negation overflow: {}",
@@ -215,7 +137,7 @@ impl SqlValue {
     fn from_value(value: &ValueWithSpan) -> SqlResult<Self> {
         match &value.value {
             Value::Null => Ok(SqlValue::Null),
-            Value::Number(text, _) => SqlValue::from_number_literal(text),
+            Value::Number(text, _) => parse_number_literal(text),
             Value::Boolean(value) => Ok(SqlValue::Boolean(*value)),
             Value::Placeholder(raw) => {
                 let index = register_placeholder(raw)?;
@@ -253,13 +175,51 @@ impl SqlValue {
     }
 }
 
+fn parse_number_literal(text: &str) -> SqlResult<SqlValue> {
+    // Scientific notation (e/E) requires float
+    if text.contains(['e', 'E']) {
+        let value = text
+            .parse::<f64>()
+            .map_err(|err| Error::InvalidArgumentError(format!("invalid float literal: {err}")))?;
+        return Ok(SqlValue::Float(value));
+    }
+
+    // Decimal point → parse as Decimal with exact precision
+    if let Some(dot_pos) = text.find('.') {
+        let integer_part = &text[..dot_pos];
+        let fractional_part = &text[dot_pos + 1..];
+
+        // Parse the number as i128 by removing the decimal point
+        let combined = format!("{}{}", integer_part, fractional_part);
+        let raw_value = combined.parse::<i128>().map_err(|err| {
+            Error::InvalidArgumentError(format!("invalid decimal literal: {err}"))
+        })?;
+
+        // Scale is the number of digits after the decimal point
+        let scale = fractional_part.len() as i8;
+
+        // Create DecimalValue
+        let decimal = DecimalValue::new(raw_value, scale).map_err(|err| {
+            Error::InvalidArgumentError(format!("invalid decimal literal: {}", err))
+        })?;
+
+        return Ok(SqlValue::Decimal(decimal));
+    }
+
+    // No decimal point → integer
+    let value = text
+        .parse::<i64>()
+        .map_err(|err| Error::InvalidArgumentError(format!("invalid integer literal: {err}")))?;
+    Ok(SqlValue::Integer(value))
+}
+
 impl From<SqlValue> for PlanValue {
     fn from(value: SqlValue) -> Self {
         match value {
             SqlValue::Null => PlanValue::Null,
-            SqlValue::Int64(v) => PlanValue::Integer(v),
-            SqlValue::Float64(v) => PlanValue::Float(v),
-            SqlValue::Decimal128(d) => PlanValue::Decimal(d),
+            SqlValue::Integer(v) => PlanValue::Integer(v),
+            SqlValue::Float(v) => PlanValue::Float(v),
+            SqlValue::Decimal(d) => PlanValue::Decimal(d),
             SqlValue::Boolean(v) => PlanValue::Integer(if v { 1 } else { 0 }),
             SqlValue::String(s) => PlanValue::String(s),
             SqlValue::Date32(days) => PlanValue::Date32(days),
@@ -275,23 +235,88 @@ impl From<SqlValue> for PlanValue {
     }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn add_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
-    let lhs_conv = lhs.into_literal()?;
-    let rhs_conv = rhs.into_literal()?;
-    let result = llkv_compute::literal::add_literals(&lhs_conv, &rhs_conv)?;
-    SqlValue::from_literal(&result)
+    match (lhs, rhs) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (SqlValue::Date32(days), SqlValue::Interval(interval)) => {
+            let adjusted = add_interval_to_date32(days, interval)?;
+            Ok(SqlValue::Date32(adjusted))
+        }
+        (SqlValue::Interval(interval), SqlValue::Date32(days)) => {
+            let adjusted = add_interval_to_date32(days, interval)?;
+            Ok(SqlValue::Date32(adjusted))
+        }
+        (SqlValue::Interval(left), SqlValue::Interval(right)) => left
+            .checked_add(right)
+            .map(SqlValue::Interval)
+            .ok_or_else(|| Error::InvalidArgumentError("interval addition overflow".into())),
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported literal expression: binary operation".into(),
+        )),
+    }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn subtract_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
-    let lhs_conv = lhs.into_literal()?;
-    let rhs_conv = rhs.into_literal()?;
-    let result = llkv_compute::literal::subtract_literals(&lhs_conv, &rhs_conv)?;
-    SqlValue::from_literal(&result)
+    match (lhs, rhs) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (SqlValue::Date32(days), SqlValue::Interval(interval)) => {
+            let adjusted = subtract_interval_from_date32(days, interval)?;
+            Ok(SqlValue::Date32(adjusted))
+        }
+        (SqlValue::Date32(lhs_days), SqlValue::Date32(rhs_days)) => {
+            let delta = i64::from(lhs_days) - i64::from(rhs_days);
+            if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
+                return Err(Error::InvalidArgumentError(
+                    "DATE subtraction overflowed day precision".into(),
+                ));
+            }
+            Ok(SqlValue::Interval(IntervalValue::new(0, delta as i32, 0)))
+        }
+        (SqlValue::Interval(left), SqlValue::Interval(right)) => left
+            .checked_sub(right)
+            .map(SqlValue::Interval)
+            .ok_or_else(|| Error::InvalidArgumentError("interval subtraction overflow".into())),
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported literal expression: binary operation".into(),
+        )),
+    }
 }
 
+// TODO: Move logic handling to llkv-compute?
 fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
-    let lhs_conv = lhs.into_literal()?;
-    let rhs_conv = rhs.into_literal()?;
-    let result = llkv_compute::literal::bitshift_literals(op, &lhs_conv, &rhs_conv)?;
-    SqlValue::from_literal(&result)
+    if matches!(lhs, SqlValue::Null) || matches!(rhs, SqlValue::Null) {
+        return Ok(SqlValue::Null);
+    }
+
+    let lhs_i64 = match lhs {
+        SqlValue::Integer(i) => i,
+        SqlValue::Float(f) => f as i64,
+        SqlValue::Date32(days) => days as i64,
+        _ => {
+            return Err(Error::InvalidArgumentError(
+                "bitwise shift requires numeric operands".into(),
+            ));
+        }
+    };
+
+    let rhs_i64 = match rhs {
+        SqlValue::Integer(i) => i,
+        SqlValue::Float(f) => f as i64,
+        SqlValue::Date32(days) => days as i64,
+        _ => {
+            return Err(Error::InvalidArgumentError(
+                "bitwise shift requires numeric operands".into(),
+            ));
+        }
+    };
+
+    let result = match op {
+        BinaryOperator::PGBitwiseShiftLeft => lhs_i64.wrapping_shl(rhs_i64 as u32),
+        BinaryOperator::PGBitwiseShiftRight => lhs_i64.wrapping_shr(rhs_i64 as u32),
+        _ => unreachable!(),
+    };
+
+    Ok(SqlValue::Integer(result))
 }

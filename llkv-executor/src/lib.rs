@@ -268,10 +268,10 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
             match op {
                 BinaryOp::Add => {
                     // Check if one side is zero (identity for addition)
-                    if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Int128(0))) {
+                    if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Integer(0))) {
                         return try_extract_simple_column(right);
                     }
-                    if matches!(right.as_ref(), ScalarExpr::Literal(Literal::Int128(0))) {
+                    if matches!(right.as_ref(), ScalarExpr::Literal(Literal::Integer(0))) {
                         return try_extract_simple_column(left);
                     }
                 }
@@ -279,10 +279,10 @@ fn try_extract_simple_column<F: AsRef<str>>(expr: &ScalarExpr<F>) -> Option<&str
                 // It needs to be evaluated as a negation
                 BinaryOp::Multiply => {
                     // +col might be Multiply(1, col)
-                    if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Int128(1))) {
+                    if matches!(left.as_ref(), ScalarExpr::Literal(Literal::Integer(1))) {
                         return try_extract_simple_column(right);
                     }
-                    if matches!(right.as_ref(), ScalarExpr::Literal(Literal::Int128(1))) {
+                    if matches!(right.as_ref(), ScalarExpr::Literal(Literal::Integer(1))) {
                         return try_extract_simple_column(left);
                     }
                 }
@@ -897,7 +897,7 @@ where
             let literal = &job_literals[row_job_indices[row_idx]];
             match literal {
                 Literal::Null => values.push(None),
-                Literal::Int128(value) => {
+                Literal::Integer(value) => {
                     let cast = i64::try_from(*value).map_err(|_| {
                         Error::InvalidArgumentError(
                             "scalar subquery integer result exceeds supported range".into(),
@@ -905,7 +905,7 @@ where
                     })?;
                     values.push(Some(cast as f64));
                 }
-                Literal::Float64(value) => {
+                Literal::Float(value) => {
                     all_integer = false;
                     values.push(Some(*value));
                 }
@@ -913,7 +913,7 @@ where
                     let numeric = if *flag { 1.0 } else { 0.0 };
                     values.push(Some(numeric));
                 }
-                Literal::Decimal128(decimal) => {
+                Literal::Decimal(decimal) => {
                     if let Some(value) = decimal_exact_i64(*decimal) {
                         values.push(Some(value as f64));
                     } else {
@@ -1052,14 +1052,14 @@ where
         use llkv_expr::literal::Literal;
 
         match lit {
-            Literal::Int128(v) => {
+            Literal::Integer(v) => {
                 let val = i64::try_from(*v).unwrap_or(0);
                 Ok((
                     DataType::Int64,
                     Arc::new(Int64Array::from(vec![val])) as ArrayRef,
                 ))
             }
-            Literal::Float64(v) => Ok((
+            Literal::Float(v) => Ok((
                 DataType::Float64,
                 Arc::new(Float64Array::from(vec![*v])) as ArrayRef,
             )),
@@ -1067,7 +1067,7 @@ where
                 DataType::Boolean,
                 Arc::new(BooleanArray::from(vec![*v])) as ArrayRef,
             )),
-            Literal::Decimal128(value) => {
+            Literal::Decimal(value) => {
                 let iter = std::iter::once(value.raw_value());
                 let precision = std::cmp::max(value.precision(), value.scale() as u8);
                 let array = Decimal128Array::from_iter_values(iter)
@@ -1947,37 +1947,33 @@ fn compare_literals_with_mode(
         (Literal::Null, _) | (_, Literal::Null) => match null_behavior {
             NullComparisonBehavior::ThreeValuedLogic => None,
         },
-        (Literal::Int128(lhs), Literal::Int128(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
-        (Literal::Float64(lhs), Literal::Float64(rhs)) => Some(compare_f64(*lhs, *rhs, op)),
-        (Literal::Int128(lhs), Literal::Float64(rhs)) => Some(compare_f64(*lhs as f64, *rhs, op)),
-        (Literal::Float64(lhs), Literal::Int128(rhs)) => Some(compare_f64(*lhs, *rhs as f64, op)),
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
+        (Literal::Float(lhs), Literal::Float(rhs)) => Some(compare_f64(*lhs, *rhs, op)),
+        (Literal::Integer(lhs), Literal::Float(rhs)) => Some(compare_f64(*lhs as f64, *rhs, op)),
+        (Literal::Float(lhs), Literal::Integer(rhs)) => Some(compare_f64(*lhs, *rhs as f64, op)),
         (Literal::Boolean(lhs), Literal::Boolean(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
         (Literal::String(lhs), Literal::String(rhs)) => Some(ordering_result(lhs.cmp(rhs), op)),
-        (Literal::Decimal128(lhs), Literal::Decimal128(rhs)) => {
+        (Literal::Decimal(lhs), Literal::Decimal(rhs)) => {
             llkv_compute::scalar::decimal::compare(*lhs, *rhs)
                 .ok()
                 .map(|ord| ordering_result(ord, op))
         }
-        (Literal::Decimal128(lhs), Literal::Int128(rhs)) => {
+        (Literal::Decimal(lhs), Literal::Integer(rhs)) => {
             DecimalValue::new(*rhs, 0).ok().and_then(|rhs_dec| {
                 llkv_compute::scalar::decimal::compare(*lhs, rhs_dec)
                     .ok()
                     .map(|ord| ordering_result(ord, op))
             })
         }
-        (Literal::Int128(lhs), Literal::Decimal128(rhs)) => {
+        (Literal::Integer(lhs), Literal::Decimal(rhs)) => {
             DecimalValue::new(*lhs, 0).ok().and_then(|lhs_dec| {
                 llkv_compute::scalar::decimal::compare(lhs_dec, *rhs)
                     .ok()
                     .map(|ord| ordering_result(ord, op))
             })
         }
-        (Literal::Decimal128(lhs), Literal::Float64(rhs)) => {
-            Some(compare_f64(lhs.to_f64(), *rhs, op))
-        }
-        (Literal::Float64(lhs), Literal::Decimal128(rhs)) => {
-            Some(compare_f64(*lhs, rhs.to_f64(), op))
-        }
+        (Literal::Decimal(lhs), Literal::Float(rhs)) => Some(compare_f64(lhs.to_f64(), *rhs, op)),
+        (Literal::Float(lhs), Literal::Decimal(rhs)) => Some(compare_f64(*lhs, rhs.to_f64(), op)),
         (Literal::Struct(_), _) | (_, Literal::Struct(_)) => None,
         _ => None,
     }
@@ -2917,7 +2913,7 @@ mod join_condition_tests {
     #[test]
     fn analyze_handles_not_applied_to_is_not_null() {
         let expr = LlkvExpr::Not(Box::new(LlkvExpr::IsNull {
-            expr: ScalarExpr::Literal(Literal::Int128(86)),
+            expr: ScalarExpr::Literal(Literal::Integer(86)),
             negated: true,
         }));
 
@@ -2930,7 +2926,7 @@ mod join_condition_tests {
     #[test]
     fn analyze_literal_is_null_is_always_false() {
         let expr = LlkvExpr::IsNull {
-            expr: ScalarExpr::Literal(Literal::Int128(1)),
+            expr: ScalarExpr::Literal(Literal::Integer(1)),
             negated: false,
         };
 
@@ -6996,9 +6992,9 @@ where
         use llkv_expr::literal::Literal;
 
         match expr {
-            ScalarExpr::Literal(Literal::Int128(v)) => Ok(PlanValue::Integer(*v as i64)),
-            ScalarExpr::Literal(Literal::Float64(v)) => Ok(PlanValue::Float(*v)),
-            ScalarExpr::Literal(Literal::Decimal128(value)) => Ok(PlanValue::Decimal(*value)),
+            ScalarExpr::Literal(Literal::Integer(v)) => Ok(PlanValue::Integer(*v as i64)),
+            ScalarExpr::Literal(Literal::Float(v)) => Ok(PlanValue::Float(*v)),
+            ScalarExpr::Literal(Literal::Decimal(value)) => Ok(PlanValue::Decimal(*value)),
             ScalarExpr::Literal(Literal::Boolean(v)) => {
                 Ok(PlanValue::Integer(if *v { 1 } else { 0 }))
             }
@@ -7619,9 +7615,9 @@ where
         use llkv_expr::literal::Literal;
 
         match expr {
-            ScalarExpr::Literal(Literal::Int128(v)) => Ok(Some(*v as i64)),
-            ScalarExpr::Literal(Literal::Float64(v)) => Ok(Some(*v as i64)),
-            ScalarExpr::Literal(Literal::Decimal128(value)) => {
+            ScalarExpr::Literal(Literal::Integer(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Float(v)) => Ok(Some(*v as i64)),
+            ScalarExpr::Literal(Literal::Decimal(value)) => {
                 if let Some(int) = decimal_exact_i64(*value) {
                     Ok(Some(int))
                 } else {
@@ -7923,15 +7919,15 @@ impl ColumnAccessor {
             return Ok(Literal::Null);
         }
         match self {
-            ColumnAccessor::Int64(array) => Ok(Literal::Int128(array.value(idx) as i128)),
-            ColumnAccessor::Float64(array) => Ok(Literal::Float64(array.value(idx))),
+            ColumnAccessor::Int64(array) => Ok(Literal::Integer(array.value(idx) as i128)),
+            ColumnAccessor::Float64(array) => Ok(Literal::Float(array.value(idx))),
             ColumnAccessor::Boolean(array) => Ok(Literal::Boolean(array.value(idx))),
             ColumnAccessor::Utf8(array) => Ok(Literal::String(array.value(idx).to_string())),
             ColumnAccessor::Date32(array) => Ok(Literal::Date32(array.value(idx))),
             ColumnAccessor::Interval(array) => Ok(Literal::Interval(interval_value_from_arrow(
                 array.value(idx),
             ))),
-            ColumnAccessor::Decimal128 { array, .. } => Ok(Literal::Int128(array.value(idx))),
+            ColumnAccessor::Decimal128 { array, .. } => Ok(Literal::Integer(array.value(idx))),
             ColumnAccessor::Null(_) => Ok(Literal::Null),
         }
     }
@@ -8053,12 +8049,12 @@ fn truth_not(value: Option<bool>) -> Option<bool> {
 
 fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<ArrayRef> {
     match literal {
-        Literal::Int128(v) => {
+        Literal::Integer(v) => {
             let value = i64::try_from(*v).unwrap_or(0);
             let values = vec![value; len];
             Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
         }
-        Literal::Float64(v) => {
+        Literal::Float(v) => {
             let values = vec![*v; len];
             Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
         }
@@ -8074,7 +8070,7 @@ fn literal_to_constant_array(literal: &Literal, len: usize) -> ExecutorResult<Ar
             let values = vec![*days; len];
             Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
         }
-        Literal::Decimal128(value) => {
+        Literal::Decimal(value) => {
             let iter = std::iter::repeat_n(value.raw_value(), len);
             let array = Decimal128Array::from_iter_values(iter)
                 .with_precision_and_scale(value.precision(), value.scale())
@@ -8125,13 +8121,13 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
     for literal in values {
         match literal {
             Literal::Null => {}
-            Literal::Int128(_) => {
+            Literal::Integer(_) => {
                 has_integer = true;
             }
-            Literal::Float64(_) => {
+            Literal::Float(_) => {
                 has_float = true;
             }
-            Literal::Decimal128(_) => {
+            Literal::Decimal(_) => {
                 has_decimal = true;
             }
             Literal::Boolean(_) => {
@@ -8190,7 +8186,7 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
             for literal in values {
                 match literal {
                     Literal::Null => coerced.push(None),
-                    Literal::Int128(value) => {
+                    Literal::Integer(value) => {
                         let v = i64::try_from(*value).map_err(|_| {
                             Error::InvalidArgumentError(
                                 "scalar subquery integer result exceeds supported range".into(),
@@ -8209,7 +8205,7 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
             for literal in values {
                 match literal {
                     Literal::Null => coerced.push(None),
-                    Literal::Int128(_) | Literal::Float64(_) | Literal::Decimal128(_) => {
+                    Literal::Integer(_) | Literal::Float(_) | Literal::Decimal(_) => {
                         let value = literal_to_f64(literal).ok_or_else(|| {
                             Error::InvalidArgumentError(
                                 "failed to coerce scalar subquery value to FLOAT".into(),
@@ -8262,7 +8258,7 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
         LiteralArrayKind::Decimal => {
             let mut target_scale: Option<i8> = None;
             for literal in values {
-                if let Literal::Decimal128(value) = literal {
+                if let Literal::Decimal(value) = literal {
                     target_scale = Some(match target_scale {
                         Some(scale) => scale.max(value.scale()),
                         None => value.scale(),
@@ -8276,7 +8272,7 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
             for literal in values {
                 match literal {
                     Literal::Null => aligned.push(None),
-                    Literal::Decimal128(value) => {
+                    Literal::Decimal(value) => {
                         let adjusted = if value.scale() != target_scale {
                             llkv_compute::scalar::decimal::rescale(*value, target_scale).map_err(
                                 |err| {
@@ -8291,7 +8287,7 @@ fn literals_to_array(values: &[Literal]) -> ExecutorResult<ArrayRef> {
                         max_precision = max_precision.max(adjusted.precision());
                         aligned.push(Some(adjusted));
                     }
-                    Literal::Int128(value) => {
+                    Literal::Integer(value) => {
                         let decimal = DecimalValue::new(*value, 0).map_err(|err| {
                             Error::InvalidArgumentError(format!(
                                 "failed to build decimal from integer: {err}"
@@ -8628,7 +8624,7 @@ impl CrossProductExpressionContext {
                         }
                         let raw_value = array.value(idx);
                         let decimal_value = raw_value as f64 / scale_factor;
-                        let literal = Literal::Float64(decimal_value);
+                        let literal = Literal::Float(decimal_value);
                         let matches = evaluate_filter_against_literal(&literal, &filter.op)?;
                         out.push(Some(matches));
                     }
@@ -9641,8 +9637,8 @@ fn evaluate_constant_scalar_internal(
         ScalarExpr::Not(inner) => {
             let value = evaluate_constant_scalar_internal(inner, allow_aggregates)?;
             match literal_truthiness(&value) {
-                Some(true) => Some(Literal::Int128(0)),
-                Some(false) => Some(Literal::Int128(1)),
+                Some(true) => Some(Literal::Integer(0)),
+                Some(false) => Some(Literal::Integer(1)),
                 None => Some(Literal::Null),
             }
         }
@@ -9728,32 +9724,32 @@ fn evaluate_constant_aggregate(
     allow_aggregates: bool,
 ) -> Option<Literal> {
     match call {
-        AggregateCall::CountStar => Some(Literal::Int128(1)),
+        AggregateCall::CountStar => Some(Literal::Integer(1)),
         AggregateCall::Count { expr, .. } => {
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             if matches!(value, Literal::Null) {
-                Some(Literal::Int128(0))
+                Some(Literal::Integer(0))
             } else {
-                Some(Literal::Int128(1))
+                Some(Literal::Integer(1))
             }
         }
         AggregateCall::Sum { expr, .. } => {
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             match value {
                 Literal::Null => Some(Literal::Null),
-                Literal::Int128(value) => Some(Literal::Int128(value)),
-                Literal::Float64(value) => Some(Literal::Float64(value)),
-                Literal::Boolean(flag) => Some(Literal::Int128(if flag { 1 } else { 0 })),
+                Literal::Integer(value) => Some(Literal::Integer(value)),
+                Literal::Float(value) => Some(Literal::Float(value)),
+                Literal::Boolean(flag) => Some(Literal::Integer(if flag { 1 } else { 0 })),
                 _ => None,
             }
         }
         AggregateCall::Total { expr, .. } => {
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             match value {
-                Literal::Null => Some(Literal::Int128(0)),
-                Literal::Int128(value) => Some(Literal::Int128(value)),
-                Literal::Float64(value) => Some(Literal::Float64(value)),
-                Literal::Boolean(flag) => Some(Literal::Int128(if flag { 1 } else { 0 })),
+                Literal::Null => Some(Literal::Integer(0)),
+                Literal::Integer(value) => Some(Literal::Integer(value)),
+                Literal::Float(value) => Some(Literal::Float(value)),
+                Literal::Boolean(flag) => Some(Literal::Integer(if flag { 1 } else { 0 })),
                 _ => None,
             }
         }
@@ -9763,7 +9759,7 @@ fn evaluate_constant_aggregate(
                 Literal::Null => Some(Literal::Null),
                 other => {
                     let numeric = literal_to_f64(&other)?;
-                    Some(Literal::Float64(numeric))
+                    Some(Literal::Float(numeric))
                 }
             }
         }
@@ -9784,7 +9780,7 @@ fn evaluate_constant_aggregate(
         AggregateCall::CountNulls(expr) => {
             let value = evaluate_constant_scalar_internal(expr, allow_aggregates)?;
             let count = if matches!(value, Literal::Null) { 1 } else { 0 };
-            Some(Literal::Int128(count))
+            Some(Literal::Integer(count))
         }
         AggregateCall::GroupConcat {
             expr, separator: _, ..
@@ -9793,8 +9789,8 @@ fn evaluate_constant_aggregate(
             match value {
                 Literal::Null => Some(Literal::Null),
                 Literal::String(s) => Some(Literal::String(s)),
-                Literal::Int128(i) => Some(Literal::String(i.to_string())),
-                Literal::Float64(f) => Some(Literal::String(f.to_string())),
+                Literal::Integer(i) => Some(Literal::String(i.to_string())),
+                Literal::Float(f) => Some(Literal::String(f.to_string())),
                 Literal::Boolean(b) => Some(Literal::String(if b { "1" } else { "0" }.to_string())),
                 _ => None,
             }
@@ -9843,7 +9839,7 @@ fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Opt
                 _ => unreachable!(),
             };
 
-            Some(Literal::Int128(result))
+            Some(Literal::Integer(result))
         }
     }
 }
@@ -9851,16 +9847,16 @@ fn evaluate_binary_literal(op: BinaryOp, left: &Literal, right: &Literal) -> Opt
 fn evaluate_literal_logical_and(left: &Literal, right: &Literal) -> Option<Literal> {
     let left_truth = literal_truthiness(left);
     if matches!(left_truth, Some(false)) {
-        return Some(Literal::Int128(0));
+        return Some(Literal::Integer(0));
     }
 
     let right_truth = literal_truthiness(right);
     if matches!(right_truth, Some(false)) {
-        return Some(Literal::Int128(0));
+        return Some(Literal::Integer(0));
     }
 
     match (left_truth, right_truth) {
-        (Some(true), Some(true)) => Some(Literal::Int128(1)),
+        (Some(true), Some(true)) => Some(Literal::Integer(1)),
         (Some(true), None) | (None, Some(true)) | (None, None) => Some(Literal::Null),
         _ => Some(Literal::Null),
     }
@@ -9869,16 +9865,16 @@ fn evaluate_literal_logical_and(left: &Literal, right: &Literal) -> Option<Liter
 fn evaluate_literal_logical_or(left: &Literal, right: &Literal) -> Option<Literal> {
     let left_truth = literal_truthiness(left);
     if matches!(left_truth, Some(true)) {
-        return Some(Literal::Int128(1));
+        return Some(Literal::Integer(1));
     }
 
     let right_truth = literal_truthiness(right);
     if matches!(right_truth, Some(true)) {
-        return Some(Literal::Int128(1));
+        return Some(Literal::Integer(1));
     }
 
     match (left_truth, right_truth) {
-        (Some(false), Some(false)) => Some(Literal::Int128(0)),
+        (Some(false), Some(false)) => Some(Literal::Integer(0)),
         (Some(false), None) | (None, Some(false)) | (None, None) => Some(Literal::Null),
         _ => Some(Literal::Null),
     }
@@ -9886,39 +9882,39 @@ fn evaluate_literal_logical_or(left: &Literal, right: &Literal) -> Option<Litera
 
 fn add_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     match (left, right) {
-        (Literal::Int128(lhs), Literal::Int128(rhs)) => {
-            Some(Literal::Int128(lhs.saturating_add(*rhs)))
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_add(*rhs)))
         }
         _ => {
             let lhs = literal_to_f64(left)?;
             let rhs = literal_to_f64(right)?;
-            Some(Literal::Float64(lhs + rhs))
+            Some(Literal::Float(lhs + rhs))
         }
     }
 }
 
 fn subtract_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     match (left, right) {
-        (Literal::Int128(lhs), Literal::Int128(rhs)) => {
-            Some(Literal::Int128(lhs.saturating_sub(*rhs)))
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_sub(*rhs)))
         }
         _ => {
             let lhs = literal_to_f64(left)?;
             let rhs = literal_to_f64(right)?;
-            Some(Literal::Float64(lhs - rhs))
+            Some(Literal::Float(lhs - rhs))
         }
     }
 }
 
 fn multiply_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     match (left, right) {
-        (Literal::Int128(lhs), Literal::Int128(rhs)) => {
-            Some(Literal::Int128(lhs.saturating_mul(*rhs)))
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => {
+            Some(Literal::Integer(lhs.saturating_mul(*rhs)))
         }
         _ => {
             let lhs = literal_to_f64(left)?;
             let rhs = literal_to_f64(right)?;
-            Some(Literal::Float64(lhs * rhs))
+            Some(Literal::Float(lhs * rhs))
         }
     }
 }
@@ -9926,8 +9922,8 @@ fn multiply_literals(left: &Literal, right: &Literal) -> Option<Literal> {
 fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     fn literal_to_i128_from_integer_like(literal: &Literal) -> Option<i128> {
         match literal {
-            Literal::Int128(value) => Some(*value),
-            Literal::Decimal128(value) => llkv_compute::scalar::decimal::rescale(*value, 0)
+            Literal::Integer(value) => Some(*value),
+            Literal::Decimal(value) => llkv_compute::scalar::decimal::rescale(*value, 0)
                 .ok()
                 .map(|integral| integral.raw_value()),
             Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
@@ -9945,10 +9941,10 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
         }
 
         if lhs == i128::MIN && rhs == -1 {
-            return Some(Literal::Float64((lhs as f64) / (rhs as f64)));
+            return Some(Literal::Float((lhs as f64) / (rhs as f64)));
         }
 
-        return Some(Literal::Int128(lhs / rhs));
+        return Some(Literal::Integer(lhs / rhs));
     }
 
     let lhs = literal_to_f64(left)?;
@@ -9956,7 +9952,7 @@ fn divide_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     if rhs == 0.0 {
         return Some(Literal::Null);
     }
-    Some(Literal::Float64(lhs / rhs))
+    Some(Literal::Float(lhs / rhs))
 }
 
 fn modulo_literals(left: &Literal, right: &Literal) -> Option<Literal> {
@@ -9965,14 +9961,14 @@ fn modulo_literals(left: &Literal, right: &Literal) -> Option<Literal> {
     if rhs == 0 {
         return Some(Literal::Null);
     }
-    Some(Literal::Int128(lhs % rhs))
+    Some(Literal::Integer(lhs % rhs))
 }
 
 fn literal_to_f64(literal: &Literal) -> Option<f64> {
     match literal {
-        Literal::Int128(value) => Some(*value as f64),
-        Literal::Float64(value) => Some(*value),
-        Literal::Decimal128(value) => Some(value.to_f64()),
+        Literal::Integer(value) => Some(*value as f64),
+        Literal::Float(value) => Some(*value),
+        Literal::Decimal(value) => Some(value.to_f64()),
         Literal::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
         Literal::Date32(value) => Some(*value as f64),
         _ => None,
@@ -9981,9 +9977,9 @@ fn literal_to_f64(literal: &Literal) -> Option<f64> {
 
 fn literal_to_i128(literal: &Literal) -> Option<i128> {
     match literal {
-        Literal::Int128(value) => Some(*value),
-        Literal::Float64(value) => Some(*value as i128),
-        Literal::Decimal128(value) => llkv_compute::scalar::decimal::rescale(*value, 0)
+        Literal::Integer(value) => Some(*value),
+        Literal::Float(value) => Some(*value as i128),
+        Literal::Decimal(value) => llkv_compute::scalar::decimal::rescale(*value, 0)
             .ok()
             .map(|integral| integral.raw_value()),
         Literal::Boolean(value) => Some(if *value { 1 } else { 0 }),
@@ -9995,9 +9991,9 @@ fn literal_to_i128(literal: &Literal) -> Option<i128> {
 fn literal_truthiness(literal: &Literal) -> Option<bool> {
     match literal {
         Literal::Boolean(value) => Some(*value),
-        Literal::Int128(value) => Some(*value != 0),
-        Literal::Float64(value) => Some(*value != 0.0),
-        Literal::Decimal128(value) => Some(decimal_truthy(*value)),
+        Literal::Integer(value) => Some(*value != 0),
+        Literal::Float(value) => Some(*value != 0.0),
+        Literal::Decimal(value) => Some(decimal_truthy(*value)),
         Literal::Date32(value) => Some(*value != 0),
         Literal::Null => None,
         _ => None,
@@ -10100,7 +10096,7 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
         DataType::Boolean => literal_truthiness(literal).map(Literal::Boolean),
         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
             let value = literal_to_f64(literal)?;
-            Some(Literal::Float64(value))
+            Some(Literal::Float(value))
         }
         DataType::Int8
         | DataType::Int16
@@ -10111,13 +10107,13 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
         | DataType::UInt32
         | DataType::UInt64 => {
             let value = literal_to_i128(literal)?;
-            Some(Literal::Int128(value))
+            Some(Literal::Integer(value))
         }
         DataType::Utf8 | DataType::LargeUtf8 => Some(Literal::String(match literal {
             Literal::String(text) => text.clone(),
-            Literal::Int128(value) => value.to_string(),
-            Literal::Float64(value) => value.to_string(),
-            Literal::Decimal128(value) => value.to_string(),
+            Literal::Integer(value) => value.to_string(),
+            Literal::Float(value) => value.to_string(),
+            Literal::Decimal(value) => value.to_string(),
             Literal::Boolean(value) => {
                 if *value {
                     "1".to_string()
@@ -10151,23 +10147,23 @@ fn cast_literal_to_type(literal: &Literal, data_type: &DataType) -> Option<Liter
 
 fn literal_to_decimal_literal(literal: &Literal, precision: u8, scale: i8) -> Option<Literal> {
     match literal {
-        Literal::Decimal128(value) => align_decimal_to_scale(*value, precision, scale)
+        Literal::Decimal(value) => align_decimal_to_scale(*value, precision, scale)
             .ok()
-            .map(Literal::Decimal128),
-        Literal::Int128(value) => {
+            .map(Literal::Decimal),
+        Literal::Integer(value) => {
             let int = i64::try_from(*value).ok()?;
             decimal_from_i64(int, precision, scale)
                 .ok()
-                .map(Literal::Decimal128)
+                .map(Literal::Decimal)
         }
-        Literal::Float64(value) => decimal_from_f64(*value, precision, scale)
+        Literal::Float(value) => decimal_from_f64(*value, precision, scale)
             .ok()
-            .map(Literal::Decimal128),
+            .map(Literal::Decimal),
         Literal::Boolean(value) => {
             let int = if *value { 1 } else { 0 };
             decimal_from_i64(int, precision, scale)
                 .ok()
-                .map(Literal::Decimal128)
+                .map(Literal::Decimal)
         }
         Literal::Null => Some(Literal::Null),
         _ => None,
@@ -10513,15 +10509,15 @@ fn evaluate_filter_against_literal(value: &Literal, op: &Operator) -> ExecutorRe
 
 fn literal_compare(lhs: &Literal, rhs: &Literal) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
-        (Literal::Int128(a), Literal::Int128(b)) => Some(a.cmp(b)),
-        (Literal::Float64(a), Literal::Float64(b)) => a.partial_cmp(b),
-        (Literal::Int128(a), Literal::Float64(b)) => (*a as f64).partial_cmp(b),
-        (Literal::Float64(a), Literal::Int128(b)) => a.partial_cmp(&(*b as f64)),
+        (Literal::Integer(a), Literal::Integer(b)) => Some(a.cmp(b)),
+        (Literal::Float(a), Literal::Float(b)) => a.partial_cmp(b),
+        (Literal::Integer(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
+        (Literal::Float(a), Literal::Integer(b)) => a.partial_cmp(&(*b as f64)),
         (Literal::Date32(a), Literal::Date32(b)) => Some(a.cmp(b)),
-        (Literal::Date32(a), Literal::Int128(b)) => Some((*a as i128).cmp(b)),
-        (Literal::Int128(a), Literal::Date32(b)) => Some(a.cmp(&(*b as i128))),
-        (Literal::Date32(a), Literal::Float64(b)) => (*a as f64).partial_cmp(b),
-        (Literal::Float64(a), Literal::Date32(b)) => a.partial_cmp(&(*b as f64)),
+        (Literal::Date32(a), Literal::Integer(b)) => Some((*a as i128).cmp(b)),
+        (Literal::Integer(a), Literal::Date32(b)) => Some(a.cmp(&(*b as i128))),
+        (Literal::Date32(a), Literal::Float(b)) => (*a as f64).partial_cmp(b),
+        (Literal::Float(a), Literal::Date32(b)) => a.partial_cmp(&(*b as f64)),
         (Literal::String(a), Literal::String(b)) => Some(a.cmp(b)),
         (Literal::Interval(a), Literal::Interval(b)) => Some(compare_interval_values(*a, *b)),
         _ => None,
@@ -10532,15 +10528,15 @@ fn literal_equals(lhs: &Literal, rhs: &Literal) -> Option<bool> {
     match (lhs, rhs) {
         (Literal::Boolean(a), Literal::Boolean(b)) => Some(a == b),
         (Literal::String(a), Literal::String(b)) => Some(a == b),
-        (Literal::Int128(_), Literal::Int128(_))
-        | (Literal::Int128(_), Literal::Float64(_))
-        | (Literal::Float64(_), Literal::Int128(_))
-        | (Literal::Float64(_), Literal::Float64(_))
+        (Literal::Integer(_), Literal::Integer(_))
+        | (Literal::Integer(_), Literal::Float(_))
+        | (Literal::Float(_), Literal::Integer(_))
+        | (Literal::Float(_), Literal::Float(_))
         | (Literal::Date32(_), Literal::Date32(_))
-        | (Literal::Date32(_), Literal::Int128(_))
-        | (Literal::Int128(_), Literal::Date32(_))
-        | (Literal::Date32(_), Literal::Float64(_))
-        | (Literal::Float64(_), Literal::Date32(_))
+        | (Literal::Date32(_), Literal::Integer(_))
+        | (Literal::Integer(_), Literal::Date32(_))
+        | (Literal::Date32(_), Literal::Float(_))
+        | (Literal::Float(_), Literal::Date32(_))
         | (Literal::Interval(_), Literal::Interval(_)) => {
             literal_compare(lhs, rhs).map(|cmp| cmp == std::cmp::Ordering::Equal)
         }
@@ -11095,9 +11091,9 @@ fn infer_type_recursive(
         ScalarExpr::Column(name) => resolve_column_name_to_index(name, column_lookup_map)
             .map(|idx| base_schema.field(idx).data_type().clone()),
         ScalarExpr::Literal(lit) => match lit {
-            Literal::Decimal128(v) => Some(DataType::Decimal128(v.precision(), v.scale())),
-            Literal::Float64(_) => Some(DataType::Float64),
-            Literal::Int128(_) => Some(DataType::Int64),
+            Literal::Decimal(v) => Some(DataType::Decimal128(v.precision(), v.scale())),
+            Literal::Float(_) => Some(DataType::Float64),
+            Literal::Integer(_) => Some(DataType::Int64),
             Literal::Boolean(_) => Some(DataType::Boolean),
             Literal::String(_) => Some(DataType::Utf8),
             Literal::Date32(_) => Some(DataType::Date32),
@@ -11304,11 +11300,11 @@ struct TableCrossProductData {
 fn plan_value_to_literal(value: &PlanValue) -> ExecutorResult<Literal> {
     match value {
         PlanValue::String(s) => Ok(Literal::String(s.clone())),
-        PlanValue::Integer(i) => Ok(Literal::Int128(*i as i128)),
-        PlanValue::Float(f) => Ok(Literal::Float64(*f)),
+        PlanValue::Integer(i) => Ok(Literal::Integer(*i as i128)),
+        PlanValue::Float(f) => Ok(Literal::Float(*f)),
         PlanValue::Null => Ok(Literal::Null),
         PlanValue::Date32(d) => Ok(Literal::Date32(*d)),
-        PlanValue::Decimal(d) => Ok(Literal::Decimal128(*d)),
+        PlanValue::Decimal(d) => Ok(Literal::Decimal(*d)),
         _ => Err(Error::Internal(format!(
             "unsupported plan value for literal conversion: {:?}",
             value
@@ -13158,7 +13154,7 @@ where
             ) {
                 (Some(column), None) => {
                     if let Some(literal) = extract_literal(right)
-                        && let Some(value) = PlanValue::from_literal_for_join(literal)
+                        && let Some(value) = literal_to_plan_value_for_join(literal)
                         && column.table < constraints.len()
                     {
                         constraints[column.table]
@@ -13167,7 +13163,7 @@ where
                 }
                 (None, Some(column)) => {
                     if let Some(literal) = extract_literal(left)
-                        && let Some(value) = PlanValue::from_literal_for_join(literal)
+                        && let Some(value) = literal_to_plan_value_for_join(literal)
                         && column.table < constraints.len()
                     {
                         constraints[column.table]
@@ -13187,7 +13183,7 @@ where
                 // Try to find which table this column belongs to
                 for info in &table_infos {
                     if let Some(&col_idx) = info.column_map.get(&field_name) {
-                        if let Some(value) = PlanValue::from_operator_literal(literal_val) {
+                        if let Some(value) = plan_value_from_operator_literal(literal_val) {
                             let column_ref = ColumnRef {
                                 table: info.index,
                                 column: col_idx,
@@ -13217,7 +13213,7 @@ where
                 let mut values = Vec::new();
                 for item in list {
                     if let Some(literal) = extract_literal(item)
-                        && let Some(value) = PlanValue::from_literal_for_join(literal)
+                        && let Some(value) = literal_to_plan_value_for_join(literal)
                     {
                         values.push(value);
                     }
@@ -13290,7 +13286,7 @@ fn try_extract_or_as_in_list(
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
             ) && let Some(literal) = extract_literal(right)
-                && let Some(value) = PlanValue::from_literal_for_join(literal)
+                && let Some(value) = literal_to_plan_value_for_join(literal)
             {
                 // Check if this is the same column as previous OR branches
                 match common_column {
@@ -13314,7 +13310,7 @@ fn try_extract_or_as_in_list(
                 resolve_column_reference(left, table_infos),
                 resolve_column_reference(right, table_infos),
             ) && let Some(literal) = extract_literal(left)
-                && let Some(value) = PlanValue::from_literal_for_join(literal)
+                && let Some(value) = literal_to_plan_value_for_join(literal)
             {
                 match common_column {
                     None => common_column = Some(column),
@@ -13331,7 +13327,7 @@ fn try_extract_or_as_in_list(
             && let Operator::Equals(ref literal) = filter.op
             && let Some(column) =
                 resolve_column_reference(&ScalarExpr::Column(filter.field_id.clone()), table_infos)
-            && let Some(value) = PlanValue::from_literal_for_join(literal)
+            && let Some(value) = literal_to_plan_value_for_join(literal)
         {
             match common_column {
                 None => common_column = Some(column),
@@ -13418,7 +13414,7 @@ fn extract_join_constraints(
                     }
                     (Some(column), None) => {
                         if let Some(literal) = extract_literal(right)
-                            && let Some(value) = PlanValue::from_literal_for_join(literal)
+                            && let Some(value) = literal_to_plan_value_for_join(literal)
                         {
                             literals
                                 .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
@@ -13428,7 +13424,7 @@ fn extract_join_constraints(
                     }
                     (None, Some(column)) => {
                         if let Some(literal) = extract_literal(left)
-                            && let Some(value) = PlanValue::from_literal_for_join(literal)
+                            && let Some(value) = literal_to_plan_value_for_join(literal)
                         {
                             literals
                                 .push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
@@ -13451,7 +13447,7 @@ fn extract_join_constraints(
                     let mut in_list_values = Vec::new();
                     for item in list {
                         if let Some(literal) = extract_literal(item)
-                            && let Some(value) = PlanValue::from_literal_for_join(literal)
+                            && let Some(value) = literal_to_plan_value_for_join(literal)
                         {
                             in_list_values.push(value);
                         }
@@ -13486,7 +13482,7 @@ fn extract_join_constraints(
                         &ScalarExpr::Column(filter.field_id.clone()),
                         table_infos,
                     )
-                    && let Some(value) = PlanValue::from_literal_for_join(literal)
+                    && let Some(value) = literal_to_plan_value_for_join(literal)
                 {
                     literals.push(ColumnConstraint::Equality(ColumnLiteral { column, value }));
                     handled_conjuncts += 1;
@@ -13588,6 +13584,26 @@ fn matches_table_ident(table_ref: &llkv_plan::TableRef, ident: &str) -> bool {
 fn extract_literal(expr: &ScalarExpr<String>) -> Option<&Literal> {
     match expr {
         ScalarExpr::Literal(lit) => Some(lit),
+        _ => None,
+    }
+}
+
+fn plan_value_from_operator_literal(op_value: &llkv_expr::literal::Literal) -> Option<PlanValue> {
+    match op_value {
+        llkv_expr::literal::Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
+        llkv_expr::literal::Literal::Float(v) => Some(PlanValue::Float(*v)),
+        llkv_expr::literal::Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
+        llkv_expr::literal::Literal::String(v) => Some(PlanValue::String(v.clone())),
+        _ => None,
+    }
+}
+
+fn literal_to_plan_value_for_join(literal: &Literal) -> Option<PlanValue> {
+    match literal {
+        Literal::Integer(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
+        Literal::Float(v) => Some(PlanValue::Float(*v)),
+        Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
+        Literal::String(v) => Some(PlanValue::String(v.clone())),
         _ => None,
     }
 }

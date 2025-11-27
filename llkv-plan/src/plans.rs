@@ -12,8 +12,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_expr::expr::SubqueryId;
+use llkv_expr::literal::IntervalValue;
 use llkv_result::Error;
-use llkv_types::IntervalValue;
 use llkv_types::decimal::DecimalValue;
 use rustc_hash::FxHashMap;
 
@@ -132,7 +132,7 @@ pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanV
 
     match literal {
         Literal::Null => Ok(PlanValue::Null),
-        Literal::Int128(i) => {
+        Literal::Integer(i) => {
             // Convert i128 to i64, checking for overflow
             if *i > i64::MAX as i128 || *i < i64::MIN as i128 {
                 Err(Error::InvalidArgumentError(format!(
@@ -143,8 +143,8 @@ pub fn plan_value_from_literal(literal: &llkv_expr::Literal) -> PlanResult<PlanV
                 Ok(PlanValue::Integer(*i as i64))
             }
         }
-        Literal::Float64(f) => Ok(PlanValue::Float(*f)),
-        Literal::Decimal128(decimal) => Ok(PlanValue::Decimal(*decimal)),
+        Literal::Float(f) => Ok(PlanValue::Float(*f)),
+        Literal::Decimal(decimal) => Ok(PlanValue::Decimal(*decimal)),
         Literal::String(s) => Ok(PlanValue::String(s.clone())),
         Literal::Boolean(b) => Ok(PlanValue::from(*b)),
         Literal::Date32(days) => Ok(PlanValue::Date32(*days)),

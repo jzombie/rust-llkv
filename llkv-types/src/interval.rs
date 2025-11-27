@@ -1,9 +1,5 @@
 //! Interval value stored as a combination of calendar months, whole days, and nanoseconds.
 
-use std::convert::TryFrom;
-
-use llkv_result::{Error, Result};
-
 /// Interval value stored as a combination of calendar months, whole days, and nanoseconds.
 ///
 /// Months capture both month and year components (12 months == 1 year). Days represent
@@ -27,15 +23,6 @@ impl IntervalValue {
 
     pub const fn zero() -> Self {
         Self::new(0, 0, 0)
-    }
-
-    /// Construct an interval from raw component totals, validating range limits.
-    pub fn from_components(months: i64, days: i64, nanos: i64) -> Result<Self> {
-        let months = i32::try_from(months)
-            .map_err(|_| Error::InvalidArgumentError("interval months out of range".into()))?;
-        let days = i32::try_from(days)
-            .map_err(|_| Error::InvalidArgumentError("interval days out of range".into()))?;
-        Ok(Self::new(months, days, nanos))
     }
 
     pub fn checked_add(self, other: Self) -> Option<Self> {

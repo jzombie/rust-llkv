@@ -1,18 +1,22 @@
+// TODO: Move portions of this to llkv-compute?
+
 //! Parse SQL `INTERVAL` literals into [`IntervalValue`] instances.
 //!
-//! Centralized here to keep interval parsing alongside other date helpers.
+//! The planner and SQL layers share this module so literal handling stays
+//! consistent without duplicating parsing rules.
 
-use std::convert::TryFrom;
-use std::sync::OnceLock;
-
+use llkv_expr::literal::IntervalValue;
 use llkv_result::{Error, Result};
-use llkv_types::IntervalValue;
 use regex::Regex;
 use sqlparser::ast::{DateTimeField, Expr as SqlExpr, Interval as SqlInterval, UnaryOperator};
+use std::convert::TryFrom;
+use std::sync::OnceLock;
 
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
 const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
+
+type SqlResult<T> = Result<T>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntervalUnit {
@@ -101,7 +105,7 @@ fn parse_year_interval(
     value: &str,
     last: Option<IntervalUnit>,
     leading_precision: Option<u64>,
-) -> Result<IntervalValue> {
+) -> SqlResult<IntervalValue> {
     match last {
         None => {
             let years = parse_signed_integer(value, "year")?;
@@ -110,7 +114,7 @@ fn parse_year_interval(
                 .value
                 .checked_mul(12)
                 .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into()))?;
-            IntervalValue::from_components(months, 0, 0)
+            interval_from_components(months, 0, 0)
         }
         Some(IntervalUnit::Month) => parse_year_to_month(value, leading_precision),
         Some(other) => Err(Error::InvalidArgumentError(format!(
@@ -120,7 +124,7 @@ fn parse_year_interval(
     }
 }
 
-fn parse_year_to_month(value: &str, leading_precision: Option<u64>) -> Result<IntervalValue> {
+fn parse_year_to_month(value: &str, leading_precision: Option<u64>) -> SqlResult<IntervalValue> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(Error::InvalidArgumentError(
@@ -162,13 +166,13 @@ fn parse_year_to_month(value: &str, leading_precision: Option<u64>) -> Result<In
         .and_then(|base| base.checked_add(months_i64))
         .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into()))?;
     let total_months = total_months * i64::from(sign);
-    IntervalValue::from_components(total_months, 0, 0)
+    interval_from_components(total_months, 0, 0)
 }
 
-fn parse_month_interval(value: &str, leading_precision: Option<u64>) -> Result<IntervalValue> {
+fn parse_month_interval(value: &str, leading_precision: Option<u64>) -> SqlResult<IntervalValue> {
     let months = parse_signed_integer(value, "month")?;
     enforce_precision(months.digits_len, leading_precision, "month")?;
-    IntervalValue::from_components(months.value, 0, 0)
+    interval_from_components(months.value, 0, 0)
 }
 
 fn parse_day_interval(
@@ -176,7 +180,7 @@ fn parse_day_interval(
     last: Option<IntervalUnit>,
     leading_precision: Option<u64>,
     fractional_precision: Option<u64>,
-) -> Result<IntervalValue> {
+) -> SqlResult<IntervalValue> {
     let (days, remainder) = split_primary_component(value, "day")?;
     enforce_precision(days.digits_len, leading_precision, "day")?;
 
@@ -246,7 +250,7 @@ fn parse_day_interval(
         }
     }
 
-    IntervalValue::from_components(0, days.value, nanos)
+    interval_from_components(0, days.value, nanos)
 }
 
 fn parse_hour_interval(
@@ -254,13 +258,13 @@ fn parse_hour_interval(
     last: Option<IntervalUnit>,
     leading_precision: Option<u64>,
     fractional_precision: Option<u64>,
-) -> Result<IntervalValue> {
+) -> SqlResult<IntervalValue> {
     match last {
         None => {
             let hours = parse_signed_integer(value, "hour")?;
             enforce_precision(hours.digits_len, leading_precision, "hour")?;
             let nanos = checked_mul(hours.value, NANOS_PER_HOUR, "hour")?;
-            IntervalValue::from_components(0, 0, nanos)
+            interval_from_components(0, 0, nanos)
         }
         Some(IntervalUnit::Minute) => {
             let (hours, minutes) = parse_signed_hh_mm(value)?;
@@ -272,7 +276,7 @@ fn parse_hour_interval(
             }
             let signed_minutes = signed_component(hours.sign, minutes, "minute")?;
             let nanos = compose_time_nanos(hours.value, signed_minutes, 0, 0)?;
-            IntervalValue::from_components(0, 0, nanos)
+            interval_from_components(0, 0, nanos)
         }
         Some(IntervalUnit::Second) => {
             let (hours, minutes, seconds, fraction) =
@@ -288,7 +292,7 @@ fn parse_hour_interval(
             let signed_fraction = apply_sign_i64(hours.sign, fraction);
             let nanos =
                 compose_time_nanos(hours.value, signed_minutes, signed_seconds, signed_fraction)?;
-            IntervalValue::from_components(0, 0, nanos)
+            interval_from_components(0, 0, nanos)
         }
         Some(other) => Err(Error::InvalidArgumentError(format!(
             "unsupported interval field combination: HOUR TO {:?}",
@@ -302,13 +306,13 @@ fn parse_minute_interval(
     last: Option<IntervalUnit>,
     leading_precision: Option<u64>,
     fractional_precision: Option<u64>,
-) -> Result<IntervalValue> {
+) -> SqlResult<IntervalValue> {
     match last {
         None => {
             let minutes = parse_signed_integer(value, "minute")?;
             enforce_precision(minutes.digits_len, leading_precision, "minute")?;
             let nanos = checked_mul(minutes.value, NANOS_PER_MINUTE, "minute")?;
-            IntervalValue::from_components(0, 0, nanos)
+            interval_from_components(0, 0, nanos)
         }
         Some(IntervalUnit::Second) => {
             let (minutes, seconds, fraction) = parse_signed_mm_ss(value, fractional_precision)?;
@@ -321,7 +325,7 @@ fn parse_minute_interval(
             let signed_seconds = signed_component(minutes.sign, seconds, "second")?;
             let signed_fraction = apply_sign_i64(minutes.sign, fraction);
             let nanos = compose_time_nanos(0, minutes.value, signed_seconds, signed_fraction)?;
-            IntervalValue::from_components(0, 0, nanos)
+            interval_from_components(0, 0, nanos)
         }
         Some(other) => Err(Error::InvalidArgumentError(format!(
             "unsupported interval field combination: MINUTE TO {:?}",
@@ -334,16 +338,16 @@ fn parse_second_interval(
     value: &str,
     leading_precision: Option<u64>,
     fractional_precision: Option<u64>,
-) -> Result<IntervalValue> {
+) -> SqlResult<IntervalValue> {
     let seconds = parse_signed_decimal_seconds(value, fractional_precision)?;
     enforce_precision(seconds.int_digits, leading_precision, "second")?;
     let total_nanos = checked_mul(seconds.seconds, NANOS_PER_SECOND, "second")?
         .checked_add(seconds.nanos)
         .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into()))?;
-    IntervalValue::from_components(0, 0, total_nanos)
+    interval_from_components(0, 0, total_nanos)
 }
 
-fn parse_unqualified_interval(value: &str) -> Result<IntervalValue> {
+fn parse_unqualified_interval(value: &str) -> SqlResult<IntervalValue> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(Error::InvalidArgumentError(
@@ -462,7 +466,7 @@ fn parse_unqualified_interval(value: &str) -> Result<IntervalValue> {
         let nanos = nanos
             .try_into()
             .map_err(|_| Error::InvalidArgumentError("interval overflow".into()))?;
-        IntervalValue::from_components(months, days, nanos)
+        interval_from_components(months, days, nanos)
     } else {
         Err(Error::InvalidArgumentError(format!(
             "invalid trailing content '{}' in interval literal",
@@ -471,7 +475,7 @@ fn parse_unqualified_interval(value: &str) -> Result<IntervalValue> {
     }
 }
 
-fn parse_hh_mm(value: &str) -> Result<(u64, u64)> {
+fn parse_hh_mm(value: &str) -> SqlResult<(u64, u64)> {
     let mut parts = value.split(':');
     let hour = parts
         .next()
@@ -487,7 +491,10 @@ fn parse_hh_mm(value: &str) -> Result<(u64, u64)> {
     Ok((hours, minutes))
 }
 
-fn parse_hh_mm_ss(value: &str, fractional_precision: Option<u64>) -> Result<(u64, u64, u64, i64)> {
+fn parse_hh_mm_ss(
+    value: &str,
+    fractional_precision: Option<u64>,
+) -> SqlResult<(u64, u64, u64, i64)> {
     let mut parts = value.split(':');
     let hour = parts
         .next()
@@ -509,7 +516,7 @@ fn parse_hh_mm_ss(value: &str, fractional_precision: Option<u64>) -> Result<(u64
     Ok((hours, minutes, seconds, fraction))
 }
 
-fn parse_signed_hh_mm(value: &str) -> Result<(SignedInteger, u64)> {
+fn parse_signed_hh_mm(value: &str) -> SqlResult<(SignedInteger, u64)> {
     let mut parts = value.split(':');
     let hour = parts
         .next()
@@ -528,7 +535,7 @@ fn parse_signed_hh_mm(value: &str) -> Result<(SignedInteger, u64)> {
 fn parse_signed_hh_mm_ss(
     value: &str,
     fractional_precision: Option<u64>,
-) -> Result<(SignedInteger, u64, u64, i64)> {
+) -> SqlResult<(SignedInteger, u64, u64, i64)> {
     let mut parts = value.split(':');
     let hour = parts
         .next()
@@ -553,7 +560,7 @@ fn parse_signed_hh_mm_ss(
 fn parse_signed_mm_ss(
     value: &str,
     fractional_precision: Option<u64>,
-) -> Result<(SignedInteger, u64, i64)> {
+) -> SqlResult<(SignedInteger, u64, i64)> {
     let mut parts = value.split(':');
     let minute = parts
         .next()
@@ -569,7 +576,7 @@ fn parse_signed_mm_ss(
     Ok((minutes, seconds, fraction))
 }
 
-fn parse_unsigned_seconds(value: &str, fractional_precision: Option<u64>) -> Result<(u64, i64)> {
+fn parse_unsigned_seconds(value: &str, fractional_precision: Option<u64>) -> SqlResult<(u64, i64)> {
     let trimmed = value.trim();
     if trimmed.starts_with(['+', '-']) {
         return Err(Error::InvalidArgumentError(
@@ -618,7 +625,7 @@ fn parse_unsigned_seconds(value: &str, fractional_precision: Option<u64>) -> Res
 fn parse_signed_decimal_seconds(
     value: &str,
     fractional_precision: Option<u64>,
-) -> Result<SignedDecimal> {
+) -> SqlResult<SignedDecimal> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(Error::InvalidArgumentError(
@@ -676,7 +683,7 @@ fn parse_signed_decimal_seconds(
     })
 }
 
-fn split_primary_component(value: &str, label: &str) -> Result<(SignedInteger, Option<String>)> {
+fn split_primary_component(value: &str, label: &str) -> SqlResult<(SignedInteger, Option<String>)> {
     let mut parts = value.split_whitespace();
     let primary = parts
         .next()
@@ -694,7 +701,15 @@ fn split_primary_component(value: &str, label: &str) -> Result<(SignedInteger, O
     Ok((primary_parsed, remainder))
 }
 
-fn signed_component(sign: i32, magnitude: u64, label: &str) -> Result<i64> {
+fn interval_from_components(months: i64, days: i64, nanos: i64) -> SqlResult<IntervalValue> {
+    let months = i32::try_from(months)
+        .map_err(|_| Error::InvalidArgumentError("interval months out of range".into()))?;
+    let days = i32::try_from(days)
+        .map_err(|_| Error::InvalidArgumentError("interval days out of range".into()))?;
+    Ok(IntervalValue::new(months, days, nanos))
+}
+
+fn signed_component(sign: i32, magnitude: u64, label: &str) -> SqlResult<i64> {
     let magnitude_i64 = i64::try_from(magnitude)
         .map_err(|_| Error::InvalidArgumentError(format!("{label} component out of range")))?;
     Ok(i64::from(sign) * magnitude_i64)
@@ -704,7 +719,7 @@ fn apply_sign_i64(sign: i32, magnitude: i64) -> i64 {
     i64::from(sign) * magnitude
 }
 
-fn compose_time_nanos(hours: i64, minutes: i64, seconds: i64, nanos: i64) -> Result<i64> {
+fn compose_time_nanos(hours: i64, minutes: i64, seconds: i64, nanos: i64) -> SqlResult<i64> {
     let hour_part = checked_mul(hours, NANOS_PER_HOUR, "hour")?;
     let minute_part = checked_mul(minutes, NANOS_PER_MINUTE, "minute")?;
     let second_part = checked_mul(seconds, NANOS_PER_SECOND, "second")?;
@@ -715,13 +730,13 @@ fn compose_time_nanos(hours: i64, minutes: i64, seconds: i64, nanos: i64) -> Res
         .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into()))
 }
 
-fn checked_mul(value: i64, factor: i64, label: &str) -> Result<i64> {
+fn checked_mul(value: i64, factor: i64, label: &str) -> SqlResult<i64> {
     value.checked_mul(factor).ok_or_else(|| {
         Error::InvalidArgumentError(format!("{label} component overflowed interval range"))
     })
 }
 
-fn parse_unsigned_digits(value: &str, label: &str) -> Result<u64> {
+fn parse_unsigned_digits(value: &str, label: &str) -> SqlResult<u64> {
     let trimmed = value.trim();
     if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
         return Err(Error::InvalidArgumentError(format!(
@@ -733,7 +748,7 @@ fn parse_unsigned_digits(value: &str, label: &str) -> Result<u64> {
         .map_err(|_| Error::InvalidArgumentError(format!("{label} component out of range")))
 }
 
-fn parse_signed_integer(value: &str, label: &str) -> Result<SignedInteger> {
+fn parse_signed_integer(value: &str, label: &str) -> SqlResult<SignedInteger> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(Error::InvalidArgumentError(format!(
@@ -756,7 +771,7 @@ fn parse_signed_integer(value: &str, label: &str) -> Result<SignedInteger> {
     })
 }
 
-fn enforce_precision(length: usize, precision: Option<u64>, label: &str) -> Result<()> {
+fn enforce_precision(length: usize, precision: Option<u64>, label: &str) -> SqlResult<()> {
     if let Some(max_digits) = precision
         && length as u64 > max_digits
     {
@@ -767,7 +782,7 @@ fn enforce_precision(length: usize, precision: Option<u64>, label: &str) -> Resu
     Ok(())
 }
 
-fn ensure_no_fraction(value: &str, label: &str) -> Result<()> {
+fn ensure_no_fraction(value: &str, label: &str) -> SqlResult<()> {
     if value.contains('.') {
         return Err(Error::InvalidArgumentError(format!(
             "fractional value not allowed for {label}"
@@ -784,7 +799,7 @@ fn split_sign(text: &str) -> (i32, &str) {
     }
 }
 
-fn interval_value_text(expr: &SqlExpr) -> Result<String> {
+fn interval_value_text(expr: &SqlExpr) -> SqlResult<String> {
     match expr {
         SqlExpr::Value(value) => match &value.value {
             sqlparser::ast::Value::Number(text, _) => Ok(text.clone()),
@@ -813,7 +828,7 @@ fn interval_value_text(expr: &SqlExpr) -> Result<String> {
     }
 }
 
-fn map_field(field: &DateTimeField) -> Result<IntervalUnit> {
+fn map_field(field: &DateTimeField) -> SqlResult<IntervalUnit> {
     match field {
         DateTimeField::Year | DateTimeField::Years => Ok(IntervalUnit::Year),
         DateTimeField::Month | DateTimeField::Months => Ok(IntervalUnit::Month),

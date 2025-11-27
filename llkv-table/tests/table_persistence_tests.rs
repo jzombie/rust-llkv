@@ -105,10 +105,10 @@ fn table_persistence_many_columns_simd_r_drive() {
         let table = Table::from_id(TID, pager).expect("reopen table");
         let store = table.store();
 
-        use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
+        use llkv_types::{LogicalFieldId, Namespace};
         let lfid = |fid: FieldId| {
             LogicalFieldId::new()
-                .with_namespace(LogicalStorageNamespace::UserData)
+                .with_namespace(Namespace::UserData)
                 .with_table_id(TID)
                 .with_field_id(fid)
         };

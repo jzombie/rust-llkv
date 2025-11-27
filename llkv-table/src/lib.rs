@@ -35,13 +35,13 @@ pub mod catalog;
 pub mod constants;
 pub mod constraints;
 pub mod ddl;
-// TODO: Please don't separate these
 pub mod diagnostics;
 pub mod gather;
 pub mod metadata;
 mod planner;
 pub mod reserved;
 pub mod resolvers;
+pub mod scalar_eval;
 pub mod schema_ext;
 mod sys_catalog;
 pub mod view;
@@ -69,10 +69,7 @@ pub use constraints::{
     validate_check_constraints, validate_foreign_key_rows, validate_foreign_keys,
 };
 pub use ddl::CatalogDdl;
-pub use ddl::{ObjectNameExt, OrderCreateTablesExt, TableConstraintExt};
 pub use diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
-pub use llkv_compute::compute_binary;
-pub use llkv_compute::eval::{AffineExpr, ScalarEvaluator as NumericKernels};
 pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::{
@@ -81,7 +78,6 @@ pub use reserved::{
 };
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
-pub type NumericArrayMap = llkv_compute::eval::NumericArrayMap<FieldId>;
 pub use sys_catalog::{
     ColMeta, CustomTypeMeta, MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
     TableMeta, TableMultiColumnIndexMeta, TableSingleColumnIndexMeta, TableTriggerMeta,
@@ -96,3 +92,4 @@ pub use planner::plan_graph::{
     PlanGraph, PlanGraphBuilder, PlanGraphError, PlanGraphResult, PlanGraphVersion, PlanInput,
     PlanNode, PlanNodeId, PlanOperator,
 };
+pub use scalar_eval::{NumericArrayMap, NumericKernels};

@@ -146,8 +146,8 @@ pub fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
 
 pub fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
     match literal {
-        Literal::Float64(_) => Ok(true),
-        Literal::Decimal128(_) => Ok(true),
+        Literal::Float(_) => Ok(true),
+        Literal::Decimal(_) => Ok(true),
         Literal::Struct(fields) => {
             for (_, nested) in fields {
                 if literal_prefers_float(nested.as_ref())? {
@@ -156,7 +156,7 @@ pub fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
             }
             Ok(false)
         }
-        Literal::Int128(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
+        Literal::Integer(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
         Literal::Date32(_) => Ok(false),
         Literal::Interval(_) => Ok(false),
     }
