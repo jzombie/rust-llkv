@@ -675,7 +675,8 @@ where
 
         // Remove column from the column store
         use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
-        let logical_field_id = LogicalFieldId::from_parts(LogicalStorageNamespace::UserData, table_id, col_id);
+        let logical_field_id =
+            LogicalFieldId::from_parts(LogicalStorageNamespace::UserData, table_id, col_id);
         self.store.remove_column(logical_field_id)?;
 
         // Delete from catalog

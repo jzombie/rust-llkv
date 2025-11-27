@@ -191,7 +191,7 @@ impl OrderCreateTablesExt for Vec<CreateTable> {
             }
 
             if !progress {
-                ordered.extend(next_round.drain(..));
+                ordered.append(&mut next_round);
                 break;
             }
 
@@ -205,10 +205,10 @@ impl OrderCreateTablesExt for Vec<CreateTable> {
 fn collect_foreign_key_dependencies(table: &CreateTable) -> Vec<String> {
     let mut deps = Vec::new();
     for constraint in &table.constraints {
-        if let TableConstraint::ForeignKey { foreign_table, .. } = constraint {
-            if let Some(name) = foreign_table.canonical_ident() {
-                deps.push(name);
-            }
+        if let TableConstraint::ForeignKey { foreign_table, .. } = constraint
+            && let Some(name) = foreign_table.canonical_ident()
+        {
+            deps.push(name);
         }
     }
     deps

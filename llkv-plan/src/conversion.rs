@@ -18,8 +18,6 @@ use crate::PlanValue;
 use llkv_compute::date::parse_date32_literal;
 use llkv_compute::interval::parse_interval_literal;
 
-
-
 impl PlanValue {
     pub fn from_operator_literal(op_value: &llkv_expr::literal::Literal) -> Option<PlanValue> {
         match op_value {

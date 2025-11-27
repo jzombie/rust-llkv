@@ -455,7 +455,9 @@ where
         let candidates: Vec<LogicalFieldId> = catalog
             .map
             .keys()
-            .filter(|fid| fid.namespace() == LogicalStorageNamespace::UserData && fid.table_id() == table_id)
+            .filter(|fid| {
+                fid.namespace() == LogicalStorageNamespace::UserData && fid.table_id() == table_id
+            })
             .copied()
             .collect();
         drop(catalog);
@@ -490,7 +492,9 @@ where
         catalog
             .map
             .keys()
-            .filter(|fid| fid.namespace() == LogicalStorageNamespace::UserData && fid.table_id() == table_id)
+            .filter(|fid| {
+                fid.namespace() == LogicalStorageNamespace::UserData && fid.table_id() == table_id
+            })
             .copied()
             .collect()
     }

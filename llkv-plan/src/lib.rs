@@ -21,14 +21,12 @@ pub mod traversal;
 pub mod validation;
 
 pub use canonical::canonical_scalar_from_plan_value;
-pub use llkv_types::{CanonicalRow, CanonicalScalar};
-pub use conversion::{
-    RangeSelectRows, extract_rows_from_range
-};
+pub use conversion::{RangeSelectRows, extract_rows_from_range};
 pub use llkv_compute::interval::parse_interval_literal;
 pub use llkv_compute::{
     add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
 };
+pub use llkv_types::{CanonicalRow, CanonicalScalar};
 pub use plan_graph::*;
 pub use plans::*;
 pub use subquery_correlation::{

@@ -35,7 +35,7 @@ fn coerce_decimals(lhs: (u8, i8), rhs: (u8, i8)) -> DataType {
     let lhs_int = i32::from(lhs.0) - i32::from(lhs.1);
     let rhs_int = i32::from(rhs.0) - i32::from(rhs.1);
     let int_digits = lhs_int.max(rhs_int);
-    let precision = ((int_digits + i32::from(scale)).min(38)).max(1) as u8;
+    let precision = (int_digits + i32::from(scale)).clamp(1, 38) as u8;
     DataType::Decimal128(precision, scale)
 }
 
@@ -126,20 +126,18 @@ pub fn get_common_type(lhs_type: &DataType, rhs_type: &DataType) -> DataType {
         (DataType::Decimal128(lp, ls), DataType::Decimal128(rp, rs)) => {
             coerce_decimals((*lp, *ls), (*rp, *rs))
         }
-        (DataType::Decimal128(p, s), other) | (other, DataType::Decimal128(p, s)) => {
-            match other {
-                DataType::Float64 | DataType::Float32 => DataType::Float64,
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64 => coerce_decimals((*p, *s), (38u8, 0)),
-                _ => DataType::Float64,
-            }
-        }
+        (DataType::Decimal128(p, s), other) | (other, DataType::Decimal128(p, s)) => match other {
+            DataType::Float64 | DataType::Float32 => DataType::Float64,
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => coerce_decimals((*p, *s), (38u8, 0)),
+            _ => DataType::Float64,
+        },
         _ => match (numeric_priority(lhs_type), numeric_priority(rhs_type)) {
             (Some(Numeric::F64), _) | (_, Some(Numeric::F64)) => DataType::Float64,
             (Some(Numeric::F32), _) | (_, Some(Numeric::F32)) => DataType::Float64,

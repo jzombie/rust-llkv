@@ -71,6 +71,8 @@ pub use constraints::{
 pub use ddl::CatalogDdl;
 pub use ddl::{ObjectNameExt, OrderCreateTablesExt, TableConstraintExt};
 pub use diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
+pub use llkv_compute::compute_binary;
+pub use llkv_compute::eval::{AffineExpr, ScalarEvaluator as NumericKernels};
 pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};
 pub use reserved::{
@@ -79,8 +81,6 @@ pub use reserved::{
 };
 pub use resolvers::{canonical_table_name, resolve_table_name};
 pub use stream::{ColumnStream, ColumnStreamBatch};
-pub use llkv_compute::compute_binary;
-pub use llkv_compute::eval::{AffineExpr, ScalarEvaluator as NumericKernels};
 pub type NumericArrayMap = llkv_compute::eval::NumericArrayMap<FieldId>;
 pub use sys_catalog::{
     ColMeta, CustomTypeMeta, MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,

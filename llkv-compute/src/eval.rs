@@ -8,8 +8,8 @@ use arrow::compute::{concat, is_not_null, take};
 use arrow::datatypes::{DataType, Field, IntervalMonthDayNanoType};
 use llkv_expr::literal::{Literal, LiteralExt};
 use llkv_expr::{AggregateCall, BinaryOp, CompareOp, ScalarExpr};
-use llkv_types::IntervalValue;
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::IntervalValue;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast::BinaryOperator;
 
@@ -148,7 +148,8 @@ impl<F: Hash + Eq + Copy> ScalarExprTypeExt<F> for ScalarExpr<F> {
 
     fn infer_result_type_from_arrays(&self, arrays: &NumericArrayMap<F>) -> DataType {
         let mut resolver = |fid| arrays.get(&fid).map(|a| a.data_type().clone());
-        self.infer_result_type(&mut resolver).unwrap_or(DataType::Float64)
+        self.infer_result_type(&mut resolver)
+            .unwrap_or(DataType::Float64)
     }
 
     fn contains_interval(&self) -> bool {
@@ -182,10 +183,7 @@ fn literal_type(lit: &Literal) -> DataType {
     }
 }
 
-fn aggregate_result_type<F, R>(
-    call: &AggregateCall<F>,
-    resolve_type: &mut R,
-) -> Option<DataType>
+fn aggregate_result_type<F, R>(call: &AggregateCall<F>, resolve_type: &mut R) -> Option<DataType>
 where
     F: Hash + Eq + Copy,
     R: FnMut(F) -> Option<DataType>,
@@ -216,9 +214,7 @@ where
                 _ => DataType::Float64,
             })
         }
-        AggregateCall::Min(expr) | AggregateCall::Max(expr) => {
-            expr.infer_result_type(resolve_type)
-        }
+        AggregateCall::Min(expr) | AggregateCall::Max(expr) => expr.infer_result_type(resolve_type),
         AggregateCall::GroupConcat { .. } => Some(DataType::Utf8),
     }
 }
@@ -755,10 +751,10 @@ impl ScalarEvaluator {
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
-                if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r) {
-                    if let Some(folded) = fold_binary_literals(*op, ll, rr) {
-                        return ScalarExpr::Literal(folded);
-                    }
+                if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r)
+                    && let Some(folded) = fold_binary_literals(*op, ll, rr)
+                {
+                    return ScalarExpr::Literal(folded);
                 }
                 ScalarExpr::Binary {
                     left: Box::new(l),
@@ -768,10 +764,10 @@ impl ScalarEvaluator {
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
-                if let ScalarExpr::Literal(lit) = &inner {
-                    if let Some(folded) = fold_cast_literal(lit, data_type) {
-                        return ScalarExpr::Literal(folded);
-                    }
+                if let ScalarExpr::Literal(lit) = &inner
+                    && let Some(folded) = fold_cast_literal(lit, data_type)
+                {
+                    return ScalarExpr::Literal(folded);
                 }
                 ScalarExpr::Cast {
                     expr: Box::new(inner),

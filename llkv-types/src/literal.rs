@@ -7,9 +7,9 @@
 use std::ops::Bound;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray, StructArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, StructArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
 

@@ -3,10 +3,10 @@ use crate::{
     sql_engine::register_placeholder,
 };
 use llkv_compute::date::parse_date32_literal;
-use llkv_types::{IntervalValue, Literal};
 use llkv_plan::plans::PlanValue;
 use llkv_result::Error;
 use llkv_types::decimal::DecimalValue;
+use llkv_types::{IntervalValue, Literal};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr as SqlExpr, TypedString, UnaryOperator, Value, ValueWithSpan,
@@ -34,20 +34,20 @@ impl SqlValue {
             SqlValue::Decimal128(d) => Ok(Literal::Decimal128(d)),
             SqlValue::Date32(days) => Ok(Literal::Date32(days)),
             SqlValue::Interval(interval) => Ok(Literal::Interval(interval)),
-            SqlValue::Boolean(_) | SqlValue::String(_) | SqlValue::Struct(_) => Err(
-                Error::InvalidArgumentError(
+            SqlValue::Boolean(_) | SqlValue::String(_) | SqlValue::Struct(_) => {
+                Err(Error::InvalidArgumentError(
                     "unsupported literal expression: binary operation".into(),
-                ),
-            ),
+                ))
+            }
         }
     }
 
     pub fn from_number_literal(text: &str) -> SqlResult<SqlValue> {
         // Scientific notation (e/E) requires float
         if text.contains(['e', 'E']) {
-            let value = text
-                .parse::<f64>()
-                .map_err(|err| Error::InvalidArgumentError(format!("invalid float literal: {err}")))?;
+            let value = text.parse::<f64>().map_err(|err| {
+                Error::InvalidArgumentError(format!("invalid float literal: {err}"))
+            })?;
             return Ok(SqlValue::Float64(value));
         }
 
@@ -74,9 +74,9 @@ impl SqlValue {
         }
 
         // No decimal point → integer
-        let value = text
-            .parse::<i64>()
-            .map_err(|err| Error::InvalidArgumentError(format!("invalid integer literal: {err}")))?;
+        let value = text.parse::<i64>().map_err(|err| {
+            Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
+        })?;
         Ok(SqlValue::Int64(value))
     }
 
@@ -84,9 +84,11 @@ impl SqlValue {
     fn from_literal(lit: &Literal) -> SqlResult<SqlValue> {
         Ok(match lit {
             Literal::Null => SqlValue::Null,
-            Literal::Int128(i) => SqlValue::Int64((*i).try_into().map_err(|_| {
-                Error::InvalidArgumentError("integer literal out of range".into())
-            })?),
+            Literal::Int128(i) => {
+                SqlValue::Int64((*i).try_into().map_err(|_| {
+                    Error::InvalidArgumentError("integer literal out of range".into())
+                })?)
+            }
             Literal::Float64(f) => SqlValue::Float64(*f),
             Literal::Decimal128(d) => SqlValue::Decimal128(*d),
             Literal::String(s) => SqlValue::String(s.clone()),
@@ -250,8 +252,6 @@ impl SqlValue {
         }
     }
 }
-
-
 
 impl From<SqlValue> for PlanValue {
     fn from(value: SqlValue) -> Self {

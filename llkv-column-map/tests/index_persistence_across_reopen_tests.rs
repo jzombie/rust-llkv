@@ -106,7 +106,9 @@ fn indices_persist_after_drop_and_reopen() {
                     offset: 0,
                     include_nulls: true,
                     nulls_first: true,
-                    anchor_row_id_field: Some(anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow)),
+                    anchor_row_id_field: Some(
+                        anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
+                    ),
                 },
                 &mut v,
             )

@@ -46,8 +46,8 @@ use llkv_compute::projection::{
     ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
     synthesize_computed_literal_array,
 };
-use llkv_compute::{RowIdFilter, compare_option_values, sort_row_ids_by_primitive};
 use llkv_compute::scalar::interval::compare_interval_values;
+use llkv_compute::{RowIdFilter, compare_option_values, sort_row_ids_by_primitive};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -1495,8 +1495,9 @@ where
                         None
                     }
                 };
-                let output_dtype =
-                    simplified.infer_result_type(&mut resolver).unwrap_or(DataType::Float64);
+                let output_dtype = simplified
+                    .infer_result_type(&mut resolver)
+                    .unwrap_or(DataType::Float64);
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
                     if passthrough_fid != field_id {

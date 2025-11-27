@@ -315,8 +315,7 @@ fn parse_minute_interval(
             enforce_precision(minutes.digits_len, leading_precision, "minute")?;
             if seconds >= 60 {
                 return Err(Error::InvalidArgumentError(
-                    "second component in MINUTE TO SECOND interval must be between 0 and 59"
-                        .into(),
+                    "second component in MINUTE TO SECOND interval must be between 0 and 59".into(),
                 ));
             }
             let signed_seconds = signed_component(minutes.sign, seconds, "second")?;
@@ -488,10 +487,7 @@ fn parse_hh_mm(value: &str) -> Result<(u64, u64)> {
     Ok((hours, minutes))
 }
 
-fn parse_hh_mm_ss(
-    value: &str,
-    fractional_precision: Option<u64>,
-) -> Result<(u64, u64, u64, i64)> {
+fn parse_hh_mm_ss(value: &str, fractional_precision: Option<u64>) -> Result<(u64, u64, u64, i64)> {
     let mut parts = value.split(':');
     let hour = parts
         .next()

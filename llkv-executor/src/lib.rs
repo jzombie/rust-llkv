@@ -1972,8 +1972,12 @@ fn compare_literals_with_mode(
                     .map(|ord| ordering_result(ord, op))
             })
         }
-        (Literal::Decimal128(lhs), Literal::Float64(rhs)) => Some(compare_f64(lhs.to_f64(), *rhs, op)),
-        (Literal::Float64(lhs), Literal::Decimal128(rhs)) => Some(compare_f64(*lhs, rhs.to_f64(), op)),
+        (Literal::Decimal128(lhs), Literal::Float64(rhs)) => {
+            Some(compare_f64(lhs.to_f64(), *rhs, op))
+        }
+        (Literal::Float64(lhs), Literal::Decimal128(rhs)) => {
+            Some(compare_f64(*lhs, rhs.to_f64(), op))
+        }
         (Literal::Struct(_), _) | (_, Literal::Struct(_)) => None,
         _ => None,
     }
@@ -13587,7 +13591,6 @@ fn extract_literal(expr: &ScalarExpr<String>) -> Option<&Literal> {
         _ => None,
     }
 }
-
 
 #[derive(Default)]
 struct DistinctState {

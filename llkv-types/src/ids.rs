@@ -158,7 +158,11 @@ impl LogicalFieldId {
     /// ([`for_user`](Self::for_user), [`for_mvcc_created_by`](Self::for_mvcc_created_by), etc.)
     /// for common cases.
     #[inline]
-    pub fn from_parts(namespace: LogicalStorageNamespace, table_id: TableId, field_id: FieldId) -> Self {
+    pub fn from_parts(
+        namespace: LogicalStorageNamespace,
+        table_id: TableId,
+        field_id: FieldId,
+    ) -> Self {
         LogicalFieldId::new()
             .with_namespace(namespace)
             .with_table_id(table_id)
@@ -198,7 +202,11 @@ impl LogicalFieldId {
     /// as a sentinel value.
     #[inline]
     pub fn for_mvcc_deleted_by(table_id: TableId) -> Self {
-        Self::from_parts(LogicalStorageNamespace::TxnDeletedBy, table_id, u32::MAX - 1)
+        Self::from_parts(
+            LogicalStorageNamespace::TxnDeletedBy,
+            table_id,
+            u32::MAX - 1,
+        )
     }
 }
 

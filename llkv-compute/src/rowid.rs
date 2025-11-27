@@ -1,8 +1,8 @@
 use std::ops::Bound;
 
 use croaring::Treemap;
-use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::Operator;
+use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::RowId;
 

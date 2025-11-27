@@ -10416,8 +10416,9 @@ fn translate_scalar_internal(
                                 ));
                             }
                             Literal::Float64(v) => {
-                                result_stack
-                                    .push(llkv_expr::expr::ScalarExpr::literal(Literal::Float64(-v)));
+                                result_stack.push(llkv_expr::expr::ScalarExpr::literal(
+                                    Literal::Float64(-v),
+                                ));
                             }
                             Literal::Boolean(_) => {
                                 return Err(Error::InvalidArgumentError(
@@ -10878,7 +10879,9 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::Scala
                     let parsed = text.parse::<f64>().map_err(|err| {
                         Error::InvalidArgumentError(format!("invalid float literal: {err}"))
                     })?;
-                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float64(parsed)))
+                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float64(
+                        parsed,
+                    )))
                 }
             } else {
                 let parsed = text.parse::<i128>().map_err(|err| {

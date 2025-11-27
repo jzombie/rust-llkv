@@ -30,7 +30,12 @@ where
                     }
                 }
                 Not(inner) => traverse_stack.push(inner),
-                Pred(_) | Compare { .. } | InList { .. } | IsNull { .. } | Literal(_) | Exists(_) => {}
+                Pred(_)
+                | Compare { .. }
+                | InList { .. }
+                | IsNull { .. }
+                | Literal(_)
+                | Exists(_) => {}
             }
         }
 
@@ -198,7 +203,11 @@ where
                         result_stack.push(format!("({operand} IS NULL)"));
                     }
                 }
-                Case { branches, else_expr, .. } => {
+                Case {
+                    branches,
+                    else_expr,
+                    ..
+                } => {
                     let mut parts = Vec::with_capacity(branches.len() + 2);
                     for _ in 0..branches.len() {
                         let then_str = result_stack.pop().unwrap_or_default();

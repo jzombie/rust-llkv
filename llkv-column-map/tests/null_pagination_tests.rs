@@ -109,7 +109,9 @@ fn sorted_with_nulls_last_pagination() {
                 offset: 10,
                 include_nulls: true,
                 nulls_first: false,
-                anchor_row_id_field: Some(anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow)),
+                anchor_row_id_field: Some(
+                    anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
+                ),
             },
             &mut c,
         )

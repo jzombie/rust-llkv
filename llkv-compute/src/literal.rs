@@ -66,9 +66,9 @@ pub fn bitshift_literals(
     }
 
     let lhs_i64 = match lhs {
-        Literal::Int128(i) => (*i).try_into().map_err(|_| {
-            Error::InvalidArgumentError("bitwise shift requires i64 range".into())
-        })?,
+        Literal::Int128(i) => (*i)
+            .try_into()
+            .map_err(|_| Error::InvalidArgumentError("bitwise shift requires i64 range".into()))?,
         Literal::Float64(f) => *f as i64,
         Literal::Date32(days) => *days as i64,
         _ => {
@@ -79,9 +79,9 @@ pub fn bitshift_literals(
     };
 
     let rhs_i64 = match rhs {
-        Literal::Int128(i) => (*i).try_into().map_err(|_| {
-            Error::InvalidArgumentError("bitwise shift requires i64 range".into())
-        })?,
+        Literal::Int128(i) => (*i)
+            .try_into()
+            .map_err(|_| Error::InvalidArgumentError("bitwise shift requires i64 range".into()))?,
         Literal::Float64(f) => *f as i64,
         Literal::Date32(days) => *days as i64,
         _ => {
