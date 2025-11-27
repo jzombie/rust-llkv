@@ -1,6 +1,6 @@
-# LLKV CSV
+# LLKV Types
 
-`llkv-csv` is a small frontend and ingestion helper for the [LLKV](../) database toolkit.
+`llkv-types` provides common data types for the [LLKV](../) database toolkit.
 
 This crate is not intended for direct standalone use.
 
