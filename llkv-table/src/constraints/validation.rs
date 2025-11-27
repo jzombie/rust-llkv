@@ -1,6 +1,7 @@
 use arrow::datatypes::DataType;
 use llkv_plan::{
     CanonicalScalar, ForeignKeyAction as PlanForeignKeyAction, ForeignKeySpec, PlanValue,
+    canonical_scalar_from_plan_value,
 };
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -133,7 +134,7 @@ pub fn unique_key_component(value: &PlanValue, column_name: &str) -> LlkvResult<
             column_name
         ))),
         _ => {
-            let scalar = CanonicalScalar::from_plan_value(value)?;
+            let scalar = canonical_scalar_from_plan_value(value)?;
             if matches!(scalar, CanonicalScalar::Null) {
                 Ok(None)
             } else {

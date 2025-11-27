@@ -73,7 +73,7 @@ pub fn synthesize_computed_literal_array<F: Hash + Eq + Copy>(
     }
 
     match &info.expr {
-        ScalarExpr::Literal(Literal::Integer(value)) => {
+        ScalarExpr::Literal(Literal::Int128(value)) => {
             let v = i64::try_from(*value).map_err(|_| {
                 Error::InvalidArgumentError(
                     "integer literal exceeds supported range for INT64 column".into(),
@@ -81,10 +81,10 @@ pub fn synthesize_computed_literal_array<F: Hash + Eq + Copy>(
             })?;
             Ok(Arc::new(Int64Array::from(vec![v; row_count])) as ArrayRef)
         }
-        ScalarExpr::Literal(Literal::Float(value)) => {
+        ScalarExpr::Literal(Literal::Float64(value)) => {
             Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
         }
-        ScalarExpr::Literal(Literal::Decimal(value)) => {
+        ScalarExpr::Literal(Literal::Decimal128(value)) => {
             let iter = std::iter::repeat_n(value.raw_value(), row_count);
             let precision = std::cmp::max(value.precision(), value.scale() as u8);
             let array = Decimal128Array::from_iter_values(iter)
@@ -122,14 +122,14 @@ pub fn synthesize_computed_literal_array<F: Hash + Eq + Copy>(
 
                 // Create the array for this field
                 let field_array = match field_literal.as_ref() {
-                    Literal::Integer(v) => {
+                    Literal::Int128(v) => {
                         let int_val = i64::try_from(*v).unwrap_or(0);
                         Arc::new(Int64Array::from(vec![int_val; row_count])) as ArrayRef
                     }
-                    Literal::Float(v) => {
+                    Literal::Float64(v) => {
                         Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
                     }
-                    Literal::Decimal(v) => {
+                    Literal::Decimal128(v) => {
                         let iter = std::iter::repeat_n(v.raw_value(), row_count);
                         let precision = std::cmp::max(v.precision(), v.scale() as u8);
                         let array = Decimal128Array::from_iter_values(iter)
@@ -211,9 +211,9 @@ pub fn synthesize_computed_literal_array<F: Hash + Eq + Copy>(
 
 pub fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
     match literal {
-        Literal::Integer(_) => Ok(DataType::Int64),
-        Literal::Float(_) => Ok(DataType::Float64),
-        Literal::Decimal(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
+        Literal::Int128(_) => Ok(DataType::Int64),
+        Literal::Float64(_) => Ok(DataType::Float64),
+        Literal::Decimal128(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
         Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
         Literal::Date32(_) => Ok(DataType::Date32),

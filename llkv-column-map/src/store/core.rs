@@ -448,14 +448,16 @@ where
     ///
     /// Returns an error if column descriptors cannot be loaded.
     pub fn total_rows_for_table(&self, table_id: llkv_types::ids::TableId) -> Result<u64> {
-        use llkv_types::ids::Namespace;
+        use llkv_types::ids::LogicalStorageNamespace;
         // Acquire read lock on catalog and find any matching user-data field
         let catalog = self.catalog.read().unwrap();
         // Collect all user-data logical field ids for this table.
         let candidates: Vec<LogicalFieldId> = catalog
             .map
             .keys()
-            .filter(|fid| fid.namespace() == Namespace::UserData && fid.table_id() == table_id)
+            .filter(|fid| {
+                fid.namespace() == LogicalStorageNamespace::UserData && fid.table_id() == table_id
+            })
             .copied()
             .collect();
         drop(catalog);
@@ -484,13 +486,15 @@ where
         &self,
         table_id: llkv_types::ids::TableId,
     ) -> Vec<LogicalFieldId> {
-        use llkv_types::ids::Namespace;
+        use llkv_types::ids::LogicalStorageNamespace;
 
         let catalog = self.catalog.read().unwrap();
         catalog
             .map
             .keys()
-            .filter(|fid| fid.namespace() == Namespace::UserData && fid.table_id() == table_id)
+            .filter(|fid| {
+                fid.namespace() == LogicalStorageNamespace::UserData && fid.table_id() == table_id
+            })
             .copied()
             .collect()
     }

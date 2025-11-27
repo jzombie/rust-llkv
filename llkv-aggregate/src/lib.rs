@@ -804,6 +804,10 @@ impl AggregateAccumulator {
                 has_values,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "SUM aggregate expected an INT column in execution".into(),
@@ -830,6 +834,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "SUM(DISTINCT) aggregate expected an INT column in execution".into(),
@@ -962,6 +970,10 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "TOTAL aggregate expected an INT column in execution".into(),
@@ -981,6 +993,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "TOTAL(DISTINCT) aggregate expected an INT column in execution".into(),
@@ -1101,6 +1117,10 @@ impl AggregateAccumulator {
                 count,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "AVG aggregate expected an INT column in execution".into(),
@@ -1128,6 +1148,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "AVG(DISTINCT) aggregate expected an INT column in execution".into(),
@@ -1263,6 +1287,10 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "MIN aggregate expected an INT column in execution".into(),
@@ -1328,6 +1356,9 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let array = batch.column(*column_index);
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "MAX aggregate expected an INT column in execution".into(),

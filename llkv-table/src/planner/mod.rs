@@ -16,7 +16,6 @@ use arrow::array::{
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
 use arrow_array::types::{Int32Type, Int64Type};
-use time::{Date, Month};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
@@ -42,12 +41,13 @@ use llkv_compute::analysis::{
     computed_expr_prefers_float, computed_expr_requires_numeric, get_field_dtype,
     scalar_expr_contains_coalesce,
 };
+use llkv_compute::eval::ScalarExprTypeExt;
 use llkv_compute::projection::{
     ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
     synthesize_computed_literal_array,
 };
-use llkv_compute::rowids::{RowIdFilter, compare_option_values, sort_by_primitive};
 use llkv_compute::scalar::interval::compare_interval_values;
+use llkv_compute::{RowIdFilter, compare_option_values, sort_row_ids_by_primitive};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -55,7 +55,7 @@ use llkv_expr::typed_predicate::{
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::decimal::DecimalValue;
-use llkv_types::{LogicalFieldId, Namespace};
+use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -63,7 +63,7 @@ use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::reserved::is_information_schema_table;
-use crate::scalar_eval::{NumericArrayMap, NumericKernels};
+use crate::{NumericArrayMap, NumericKernels};
 
 use crate::schema_ext::CachedSchema;
 use crate::table::{
@@ -695,7 +695,7 @@ where
                     project_node.add_projection(PlanExpression::new(format!(
                         "{} := {}",
                         alias,
-                        format_scalar_expr(expr)
+                        expr.format_display()
                     )));
                     project_node
                         .add_field(PlanField::new(alias.clone(), "Float64").with_nullability(true));
@@ -1053,7 +1053,7 @@ where
                             self.table.table_id()
                         )));
                     }
-                    if lfid.namespace() != Namespace::UserData {
+                    if lfid.namespace() != LogicalStorageNamespace::UserData {
                         return Err(Error::InvalidArgumentError(format!(
                             "Projection {:?} must target user data namespace",
                             lfid
@@ -1089,7 +1089,7 @@ where
                     for field_id in fields_set.iter().copied() {
                         numeric_fields.insert(field_id);
                         let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
-                        if lfid.namespace() != Namespace::UserData {
+                        if lfid.namespace() != LogicalStorageNamespace::UserData {
                             return Err(Error::InvalidArgumentError(format!(
                                 "Computed projection field {:?} must target user data namespace",
                                 lfid
@@ -1149,9 +1149,9 @@ where
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     } else {
                         let dtype = match &info.expr {
-                            ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
-                            ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
-                            ScalarExpr::Literal(Literal::Decimal(value)) => {
+                            ScalarExpr::Literal(Literal::Int128(_)) => DataType::Int64,
+                            ScalarExpr::Literal(Literal::Float64(_)) => DataType::Float64,
+                            ScalarExpr::Literal(Literal::Decimal128(value)) => {
                                 DataType::Decimal128(value.precision(), value.scale())
                             }
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
@@ -1184,8 +1184,7 @@ where
                                     lfid_dtypes.get(&lfid).cloned()
                                 };
 
-                                let inferred_type =
-                                    NumericKernels::infer_result_type(&info.expr, &mut resolver);
+                                let inferred_type = info.expr.infer_result_type(&mut resolver);
 
                                 if let Some(dtype) = inferred_type {
                                     dtype
@@ -1440,7 +1439,7 @@ where
                     )));
                 }
 
-                if !is_full_range_filter(filter_expr, p.logical_field_id.field_id()) {
+                if !filter_expr.is_full_range_for(&p.logical_field_id.field_id()) {
                     return Ok(StreamOutcome::Fallback);
                 }
 
@@ -1475,11 +1474,11 @@ where
 
                 let field_id = *fields_set.iter().next().unwrap();
                 let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
-                if !is_full_range_filter(filter_expr, field_id) {
+                if !filter_expr.is_full_range_for(&field_id) {
                     return Ok(StreamOutcome::Fallback);
                 }
 
-                if lfid.namespace() != Namespace::UserData {
+                if lfid.namespace() != LogicalStorageNamespace::UserData {
                     return Err(Error::InvalidArgumentError(format!(
                         "Computed projection field {:?} must target user data namespace",
                         lfid
@@ -1496,7 +1495,8 @@ where
                         None
                     }
                 };
-                let output_dtype = NumericKernels::infer_result_type(&simplified, &mut resolver)
+                let output_dtype = simplified
+                    .infer_result_type(&mut resolver)
                     .unwrap_or(DataType::Float64);
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
@@ -1683,24 +1683,24 @@ where
         fn compare_literals(left: &Literal, right: &Literal) -> Option<std::cmp::Ordering> {
             match (left, right) {
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
-                (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
-                (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
-                (Literal::Decimal(l), Literal::Decimal(r)) => Some(l.cmp(r)),
-                (Literal::Decimal(l), Literal::Integer(r)) => {
+                (Literal::Int128(l), Literal::Int128(r)) => l.partial_cmp(r),
+                (Literal::Float64(l), Literal::Float64(r)) => l.partial_cmp(r),
+                (Literal::Decimal128(l), Literal::Decimal128(r)) => Some(l.cmp(r)),
+                (Literal::Decimal128(l), Literal::Int128(r)) => {
                     DecimalValue::new(*r, 0).ok().map(|int| l.cmp(&int))
                 }
-                (Literal::Integer(l), Literal::Decimal(r)) => {
+                (Literal::Int128(l), Literal::Decimal128(r)) => {
                     DecimalValue::new(*l, 0).ok().map(|int| int.cmp(r))
                 }
-                (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
-                (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
+                (Literal::Decimal128(l), Literal::Float64(r)) => l.to_f64().partial_cmp(r),
+                (Literal::Float64(l), Literal::Decimal128(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
                 (Literal::Date32(l), Literal::Date32(r)) => l.partial_cmp(r),
                 (Literal::Interval(l), Literal::Interval(r)) => {
                     Some(compare_interval_values(*l, *r))
                 }
-                (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r),
-                (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64)),
+                (Literal::Int128(l), Literal::Float64(r)) => (*l as f64).partial_cmp(r),
+                (Literal::Float64(l), Literal::Int128(r)) => l.partial_cmp(&(*r as f64)),
                 _ => None,
             }
         }
@@ -3181,7 +3181,7 @@ where
     {
         let order_data = self.gather_primitive_order_chunks::<T>(row_ids, context)?;
 
-        Ok(sort_by_primitive::<T>(
+        Ok(sort_row_ids_by_primitive::<T>(
             row_ids,
             &order_data.chunks,
             &order_data.positions,
@@ -3431,401 +3431,9 @@ fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
     )
 }
 
-// TODO: Move to llkv-expr?
 fn format_expr(expr: &Expr<'_, FieldId>) -> String {
-    use Expr::*;
-
-    // Iterative postorder traversal using work/result stack pattern.
-    // See llkv-plan::traversal module documentation for pattern details.
-    //
-    // This uses a two-pass approach: first collect nodes in postorder, then format them.
-    // This avoids stack overflow on deeply nested expressions (50k+ nodes).
-    let mut traverse_stack = Vec::new();
-    let mut postorder = Vec::new();
-    traverse_stack.push(expr);
-
-    while let Some(node) = traverse_stack.pop() {
-        postorder.push(node);
-        match node {
-            And(children) | Or(children) => {
-                for child in children {
-                    traverse_stack.push(child);
-                }
-            }
-            Not(inner) => traverse_stack.push(inner),
-            Pred(_) | Compare { .. } | InList { .. } | IsNull { .. } | Literal(_) | Exists(_) => {}
-        }
-    }
-
-    let mut result_stack: Vec<String> = Vec::new();
-    for node in postorder.into_iter().rev() {
-        match node {
-            And(children) => {
-                if children.is_empty() {
-                    result_stack.push("TRUE".to_string());
-                } else {
-                    let mut parts = Vec::with_capacity(children.len());
-                    for _ in 0..children.len() {
-                        parts.push(result_stack.pop().unwrap_or_default());
-                    }
-                    parts.reverse();
-                    result_stack.push(parts.join(" AND "));
-                }
-            }
-            Or(children) => {
-                if children.is_empty() {
-                    result_stack.push("FALSE".to_string());
-                } else {
-                    let mut parts = Vec::with_capacity(children.len());
-                    for _ in 0..children.len() {
-                        parts.push(result_stack.pop().unwrap_or_default());
-                    }
-                    parts.reverse();
-                    result_stack.push(parts.join(" OR "));
-                }
-            }
-            Not(_) => {
-                let inner = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("NOT ({inner})"));
-            }
-            Pred(filter) => {
-                result_stack.push(format_filter(filter));
-            }
-            Compare { left, op, right } => {
-                result_stack.push(format!(
-                    "{} {} {}",
-                    format_scalar_expr(left),
-                    format_compare_op(*op),
-                    format_scalar_expr(right)
-                ));
-            }
-            InList {
-                expr,
-                list,
-                negated,
-            } => {
-                let expr_str = format_scalar_expr(expr);
-                let mut parts = Vec::with_capacity(list.len());
-                for value in list {
-                    parts.push(format_scalar_expr(value));
-                }
-                let keyword = if *negated { "NOT IN" } else { "IN" };
-                result_stack.push(format!("{} {} ({})", expr_str, keyword, parts.join(", ")));
-            }
-            IsNull { expr, negated } => {
-                let expr_str = format_scalar_expr(expr);
-                let keyword = if *negated { "IS NOT NULL" } else { "IS NULL" };
-                result_stack.push(format!("{} {}", expr_str, keyword));
-            }
-            Literal(value) => {
-                result_stack.push(if *value {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
-                });
-            }
-            Exists(_) => {
-                result_stack.push("EXISTS(...)".to_string());
-            }
-        }
-    }
-
-    result_stack.pop().unwrap_or_default()
+    expr.format_display()
 }
-
-// TODO: Move to llkv-expr?
-fn format_filter(filter: &Filter<'_, FieldId>) -> String {
-    format!("field#{} {}", filter.field_id, format_operator(&filter.op))
-}
-
-// TODO: Move to llkv-expr?
-fn format_operator(op: &Operator<'_>) -> String {
-    match op {
-        Operator::Equals(lit) => format!("= {}", format_literal(lit)),
-        Operator::Range { lower, upper } => format!(
-            "IN {} .. {}",
-            format_range_bound_lower(lower),
-            format_range_bound_upper(upper)
-        ),
-        Operator::GreaterThan(lit) => format!("> {}", format_literal(lit)),
-        Operator::GreaterThanOrEquals(lit) => format!(">= {}", format_literal(lit)),
-        Operator::LessThan(lit) => format!("< {}", format_literal(lit)),
-        Operator::LessThanOrEquals(lit) => format!("<= {}", format_literal(lit)),
-        Operator::In(values) => {
-            let rendered: Vec<String> = values.iter().map(format_literal).collect();
-            format!("IN {{{}}}", rendered.join(", "))
-        }
-        Operator::StartsWith {
-            pattern,
-            case_sensitive,
-        } => format_pattern_op("STARTS WITH", pattern, *case_sensitive),
-        Operator::EndsWith {
-            pattern,
-            case_sensitive,
-        } => format_pattern_op("ENDS WITH", pattern, *case_sensitive),
-        Operator::Contains {
-            pattern,
-            case_sensitive,
-        } => format_pattern_op("CONTAINS", pattern, *case_sensitive),
-        Operator::IsNull => "IS NULL".to_string(),
-        Operator::IsNotNull => "IS NOT NULL".to_string(),
-    }
-}
-
-fn format_pattern_op(op_name: &str, pattern: &str, case_sensitive: bool) -> String {
-    let mut rendered = format!("{} \"{}\"", op_name, escape_string(pattern));
-    if !case_sensitive {
-        rendered.push_str(" (case-insensitive)");
-    }
-    rendered
-}
-
-// TODO: Move to llkv-types as Literal impl
-fn format_range_bound_lower(bound: &Bound<Literal>) -> String {
-    match bound {
-        Bound::Unbounded => "-inf".to_string(),
-        Bound::Included(lit) => format!("[{}", format_literal(lit)),
-        Bound::Excluded(lit) => format!("({}", format_literal(lit)),
-    }
-}
-
-// TODO: Move to llkv-types as Literal impl
-fn format_range_bound_upper(bound: &Bound<Literal>) -> String {
-    match bound {
-        Bound::Unbounded => "+inf".to_string(),
-        Bound::Included(lit) => format!("{}]", format_literal(lit)),
-        Bound::Excluded(lit) => format!("{})", format_literal(lit)),
-    }
-}
-
-// TODO: Move to llkv-expr
-fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
-    use ScalarExpr::*;
-
-    // Iterative postorder traversal using work/result stack pattern.
-    // See llkv-plan::traversal module documentation for pattern details.
-    //
-    // This uses a two-pass approach: first collect nodes in postorder, then format them.
-    // This avoids stack overflow on deeply nested expressions (50k+ nodes).
-    let mut traverse_stack = Vec::new();
-    let mut postorder = Vec::new();
-    traverse_stack.push(expr);
-
-    while let Some(node) = traverse_stack.pop() {
-        postorder.push(node);
-        match node {
-            Binary { left, right, .. } => {
-                traverse_stack.push(left);
-                traverse_stack.push(right);
-            }
-            Compare { left, right, .. } => {
-                traverse_stack.push(left);
-                traverse_stack.push(right);
-            }
-            GetField { base, .. } => traverse_stack.push(base),
-            Cast { expr, .. } => traverse_stack.push(expr),
-            Not(expr) => traverse_stack.push(expr),
-            ScalarExpr::IsNull { expr, .. } => traverse_stack.push(expr),
-            Case {
-                operand,
-                branches,
-                else_expr,
-            } => {
-                if let Some(inner) = else_expr.as_deref() {
-                    traverse_stack.push(inner);
-                }
-                for (when_expr, then_expr) in branches.iter().rev() {
-                    traverse_stack.push(then_expr);
-                    traverse_stack.push(when_expr);
-                }
-                if let Some(inner) = operand.as_deref() {
-                    traverse_stack.push(inner);
-                }
-            }
-            Coalesce(items) => {
-                for item in items {
-                    traverse_stack.push(item);
-                }
-            }
-            Column(_) | Literal(_) | Aggregate(_) | ScalarExpr::Random => {}
-            ScalarExpr::ScalarSubquery(_) => {}
-        }
-    }
-
-    let mut result_stack: Vec<String> = Vec::new();
-    for node in postorder.into_iter().rev() {
-        match node {
-            Column(fid) => result_stack.push(format!("col#{}", fid)),
-            Literal(lit) => result_stack.push(format_literal(lit)),
-            Aggregate(agg) => result_stack.push(format!("AGG({:?})", agg)),
-            GetField { field_name, .. } => {
-                let base = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("{base}.{field_name}"));
-            }
-            Cast { data_type, .. } => {
-                let value = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("CAST({value} AS {data_type:?})"));
-            }
-            Binary { op, .. } => {
-                let right = result_stack.pop().unwrap_or_default();
-                let left = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("({} {} {})", left, format_binary_op(*op), right));
-            }
-            Compare { op, .. } => {
-                let right = result_stack.pop().unwrap_or_default();
-                let left = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("({} {} {})", left, format_compare_op(*op), right));
-            }
-            Not(_) => {
-                let operand = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("(NOT {})", operand));
-            }
-            ScalarExpr::IsNull { negated, .. } => {
-                let operand = result_stack.pop().unwrap_or_default();
-                if *negated {
-                    result_stack.push(format!("({operand} IS NOT NULL)"));
-                } else {
-                    result_stack.push(format!("({operand} IS NULL)"));
-                }
-            }
-            Case {
-                operand,
-                branches,
-                else_expr,
-            } => {
-                let else_str = if else_expr.is_some() {
-                    Some(result_stack.pop().unwrap_or_default())
-                } else {
-                    None
-                };
-                let mut branch_pairs = Vec::with_capacity(branches.len());
-                for _ in 0..branches.len() {
-                    let then_str = result_stack.pop().unwrap_or_default();
-                    let when_str = result_stack.pop().unwrap_or_default();
-                    branch_pairs.push((when_str, then_str));
-                }
-                branch_pairs.reverse();
-                let operand_str = if operand.is_some() {
-                    Some(result_stack.pop().unwrap_or_default())
-                } else {
-                    None
-                };
-
-                let mut parts = Vec::new();
-                if let Some(op_str) = operand_str {
-                    parts.push(format!("CASE {op_str}"));
-                } else {
-                    parts.push("CASE".to_string());
-                }
-                for (when_str, then_str) in branch_pairs {
-                    parts.push(format!("WHEN {when_str} THEN {then_str}"));
-                }
-                if let Some(else_str) = else_str {
-                    parts.push(format!("ELSE {else_str}"));
-                }
-                parts.push("END".to_string());
-                result_stack.push(parts.join(" "));
-            }
-            Coalesce(items) => {
-                let mut args = Vec::with_capacity(items.len());
-                for _ in 0..items.len() {
-                    args.push(result_stack.pop().unwrap_or_default());
-                }
-                args.reverse();
-                result_stack.push(format!("COALESCE({})", args.join(", ")));
-            }
-            ScalarExpr::Random => {
-                result_stack.push("RANDOM()".to_string());
-            }
-            ScalarExpr::ScalarSubquery(sub) => {
-                result_stack.push(format!("(SCALAR_SUBQUERY#{})", sub.id.0));
-            }
-        }
-    }
-
-    result_stack.pop().unwrap_or_default()
-}
-
-// TODO: Move to llkv-expr as BinaryOp impl
-fn format_binary_op(op: BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Add => "+",
-        BinaryOp::Subtract => "-",
-        BinaryOp::Multiply => "*",
-        BinaryOp::Divide => "/",
-        BinaryOp::Modulo => "%",
-        BinaryOp::And => "AND",
-        BinaryOp::Or => "OR",
-        BinaryOp::BitwiseShiftLeft => "<<",
-        BinaryOp::BitwiseShiftRight => ">>",
-    }
-}
-
-// TODO: Move to llkv-expr as CompareOp impl
-fn format_compare_op(op: CompareOp) -> &'static str {
-    match op {
-        CompareOp::Eq => "=",
-        CompareOp::NotEq => "!=",
-        CompareOp::Lt => "<",
-        CompareOp::LtEq => "<=",
-        CompareOp::Gt => ">",
-        CompareOp::GtEq => ">=",
-    }
-}
-
-// TODO: Move to llkv-types as Literal impl
-fn format_literal(lit: &Literal) -> String {
-    match lit {
-        Literal::Integer(i) => i.to_string(),
-        Literal::Float(f) => f.to_string(),
-        Literal::Decimal(d) => d.to_string(),
-        Literal::Boolean(b) => b.to_string(),
-        Literal::String(s) => format!("\"{}\"", escape_string(s)),
-        Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
-        Literal::Interval(interval) => format!(
-            "INTERVAL {{ months: {}, days: {}, nanos: {} }}",
-            interval.months, interval.days, interval.nanos
-        ),
-        Literal::Null => "NULL".to_string(),
-        Literal::Struct(fields) => {
-            let field_strs: Vec<_> = fields
-                .iter()
-                .map(|(name, lit)| format!("{}: {}", name, format_literal(lit)))
-                .collect();
-            format!("{{{}}}", field_strs.join(", "))
-        }
-    }
-}
-
-// TODO: Move to llkv-compute as date method
-fn format_date32(days: i32) -> String {
-    let julian = match epoch_julian_day().checked_add(days) {
-        Some(value) => value,
-        None => return days.to_string(),
-    };
-
-    match Date::from_julian_day(julian) {
-        Ok(date) => {
-            let (year, month, day) = date.to_calendar_date();
-            let month_number = month as u8;
-            format!("{:04}-{:02}-{:02}", year, month_number, day)
-        }
-        Err(_) => days.to_string(),
-    }
-}
-
-// TODO: Move to llkv-compute as date method
-fn epoch_julian_day() -> i32 {
-    Date::from_calendar_date(1970, Month::January, 1)
-        .expect("1970-01-01 is a valid date")
-        .to_julian_day()
-}
-
-// TODO: Move to llkv-compute as string method
-fn escape_string(value: &str) -> String {
-    value.chars().flat_map(|c| c.escape_default()).collect()
-}
-
 struct PrimitiveOrderContext<'a> {
     out_schema: &'a Arc<Schema>,
     logical_fields: &'a Arc<Vec<LogicalFieldId>>,
@@ -3861,21 +3469,6 @@ where
 {
     chunks: Vec<PrimitiveArray<T>>,
     positions: Vec<(usize, usize)>,
-}
-
-// TODO: Move to llkv-expr?
-fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {
-    matches!(
-        expr,
-        Expr::Pred(Filter {
-            field_id,
-            op:
-                Operator::Range {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-        }) if *field_id == expected_field
-    )
 }
 
 struct SingleColumnStreamVisitor<'a, F>

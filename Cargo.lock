@@ -1649,7 +1649,9 @@ dependencies = [
  "llkv-test-utils",
  "llkv-types",
  "rand 0.9.2",
+ "regex",
  "rustc-hash",
+ "sqlparser",
  "time",
 ]
 
@@ -1946,6 +1948,7 @@ dependencies = [
  "llkv-test-utils",
  "modular-bitfield",
  "serde",
+ "time",
 ]
 
 [[package]]
