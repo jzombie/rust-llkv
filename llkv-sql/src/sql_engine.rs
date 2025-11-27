@@ -295,8 +295,8 @@ impl SqlParamValue {
     fn as_literal(&self) -> Literal {
         match self {
             SqlParamValue::Null => Literal::Null,
-            SqlParamValue::Integer(v) => Literal::Integer(i128::from(*v)),
-            SqlParamValue::Float(v) => Literal::Float(*v),
+            SqlParamValue::Integer(v) => Literal::Int128(i128::from(*v)),
+            SqlParamValue::Float(v) => Literal::Float64(*v),
             SqlParamValue::Boolean(v) => Literal::Boolean(*v),
             SqlParamValue::String(s) => Literal::String(s.clone()),
             SqlParamValue::Date32(days) => Literal::Date32(*days),
@@ -7378,9 +7378,9 @@ fn bind_literal(literal: &mut Literal, params: &[SqlParamValue]) -> SqlResult<()
             }
             Ok(())
         }
-        Literal::Integer(_)
-        | Literal::Float(_)
-        | Literal::Decimal(_)
+        Literal::Int128(_)
+        | Literal::Float64(_)
+        | Literal::Decimal128(_)
         | Literal::Boolean(_)
         | Literal::Null
         | Literal::Date32(_)
@@ -9853,9 +9853,9 @@ fn translate_scalar_internal(
                 } => {
                     if list.is_empty() {
                         let literal_value = if *negated {
-                            llkv_expr::expr::ScalarExpr::literal(Literal::Integer(1))
+                            llkv_expr::expr::ScalarExpr::literal(Literal::Int128(1))
                         } else {
-                            llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0))
+                            llkv_expr::expr::ScalarExpr::literal(Literal::Int128(0))
                         };
                         work_stack.push(ScalarFrame::Leaf(literal_value));
                     } else {
@@ -10410,14 +10410,15 @@ fn translate_scalar_internal(
                     })?;
                     match inner {
                         llkv_expr::expr::ScalarExpr::Literal(lit) => match lit {
-                            Literal::Integer(v) => {
+                            Literal::Int128(v) => {
                                 result_stack.push(llkv_expr::expr::ScalarExpr::literal(
-                                    Literal::Integer(-v),
+                                    Literal::Int128(-v),
                                 ));
                             }
-                            Literal::Float(v) => {
-                                result_stack
-                                    .push(llkv_expr::expr::ScalarExpr::literal(Literal::Float(-v)));
+                            Literal::Float64(v) => {
+                                result_stack.push(llkv_expr::expr::ScalarExpr::literal(
+                                    Literal::Float64(-v),
+                                ));
                             }
                             Literal::Boolean(_) => {
                                 return Err(Error::InvalidArgumentError(
@@ -10451,7 +10452,7 @@ fn translate_scalar_internal(
                                 result_stack
                                     .push(llkv_expr::expr::ScalarExpr::literal(Literal::Null));
                             }
-                            Literal::Decimal(value) => {
+                            Literal::Decimal128(value) => {
                                 let negated_raw =
                                     value.raw_value().checked_neg().ok_or_else(|| {
                                         Error::InvalidArgumentError(
@@ -10465,12 +10466,12 @@ fn translate_scalar_internal(
                                         ))
                                     })?;
                                 result_stack.push(llkv_expr::expr::ScalarExpr::literal(
-                                    Literal::Decimal(negated),
+                                    Literal::Decimal128(negated),
                                 ));
                             }
                         },
                         other => {
-                            let zero = llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0));
+                            let zero = llkv_expr::expr::ScalarExpr::literal(Literal::Int128(0));
                             result_stack.push(llkv_expr::expr::ScalarExpr::binary(
                                 zero,
                                 llkv_expr::expr::BinaryOp::Subtract,
@@ -10543,7 +10544,7 @@ fn translate_scalar_internal(
                     for comparison in &comparisons {
                         branches.push((
                             comparison.clone(),
-                            llkv_expr::expr::ScalarExpr::literal(Literal::Integer(1)),
+                            llkv_expr::expr::ScalarExpr::literal(Literal::Int128(1)),
                         ));
                     }
 
@@ -10556,7 +10557,7 @@ fn translate_scalar_internal(
                         ));
                     }
 
-                    let else_expr = Some(llkv_expr::expr::ScalarExpr::literal(Literal::Integer(0)));
+                    let else_expr = Some(llkv_expr::expr::ScalarExpr::literal(Literal::Int128(0)));
                     let in_result = llkv_expr::expr::ScalarExpr::case(None, branches, else_expr);
                     let final_expr = if negated {
                         llkv_expr::expr::ScalarExpr::logical_not(in_result)
@@ -10727,9 +10728,9 @@ fn infer_expr_type(
     use llkv_expr::expr::ScalarExpr;
     match expr {
         ScalarExpr::Literal(lit) => Ok(match lit {
-            Literal::Integer(_) => DataType::Int64,
-            Literal::Float(_) => DataType::Float64,
-            Literal::Decimal(v) => DataType::Decimal128(v.precision(), v.scale()),
+            Literal::Int128(_) => DataType::Int64,
+            Literal::Float64(_) => DataType::Float64,
+            Literal::Decimal128(v) => DataType::Decimal128(v.precision(), v.scale()),
             Literal::Boolean(_) => DataType::Boolean,
             Literal::String(_) => DataType::Utf8,
             Literal::Date32(_) => DataType::Date32,
@@ -10852,7 +10853,7 @@ fn build_abs_case_expr(
 ) -> llkv_expr::expr::ScalarExpr<String> {
     use llkv_expr::expr::{BinaryOp, CompareOp, ScalarExpr};
 
-    let zero = ScalarExpr::literal(Literal::Integer(0));
+    let zero = ScalarExpr::literal(Literal::Int128(0));
     let condition = ScalarExpr::compare(arg.clone(), CompareOp::Lt, zero.clone());
     let negated = ScalarExpr::binary(zero.clone(), BinaryOp::Subtract, arg.clone());
 
@@ -10871,20 +10872,22 @@ fn literal_from_value(value: &ValueWithSpan) -> SqlResult<llkv_expr::expr::Scala
             if text.contains(['.', 'e', 'E']) {
                 // Try parsing as Decimal first to preserve precision
                 if let Ok(decimal) = text.parse::<DecimalValue>() {
-                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Decimal(
+                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Decimal128(
                         decimal,
                     )))
                 } else {
                     let parsed = text.parse::<f64>().map_err(|err| {
                         Error::InvalidArgumentError(format!("invalid float literal: {err}"))
                     })?;
-                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float(parsed)))
+                    Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Float64(
+                        parsed,
+                    )))
                 }
             } else {
                 let parsed = text.parse::<i128>().map_err(|err| {
                     Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
                 })?;
-                Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Integer(
+                Ok(llkv_expr::expr::ScalarExpr::literal(Literal::Int128(
                     parsed,
                 )))
             }
@@ -12450,7 +12453,7 @@ mod tests {
                 assert!(!negated, "expected NOT to flip into IS NULL");
                 assert!(matches!(
                     expr,
-                    llkv_expr::expr::ScalarExpr::Literal(llkv_expr::literal::Literal::Integer(86))
+                    llkv_expr::expr::ScalarExpr::Literal(llkv_expr::literal::Literal::Int128(86))
                 ));
             }
             other => panic!("unexpected ON predicate: {other:?}"),

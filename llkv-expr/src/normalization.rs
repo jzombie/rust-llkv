@@ -168,7 +168,7 @@ mod tests {
     fn normalize_not_between_expands_to_or() {
         let field: TestId = 7;
         let column = ScalarExpr::Column(field);
-        let lower = ScalarExpr::Literal(Literal::Integer(5));
+        let lower = ScalarExpr::Literal(Literal::Int128(5));
         let upper = ScalarExpr::Literal(Literal::Null);
 
         let between = Expr::And(vec![

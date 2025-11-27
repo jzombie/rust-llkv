@@ -6,6 +6,39 @@ use llkv_expr::expr::{BinaryOp, CompareOp};
 use llkv_result::Error;
 use std::sync::Arc;
 
+fn numeric_priority(dt: &DataType) -> Option<Numeric> {
+    match dt {
+        DataType::Int8 => Some(Numeric::Signed(8)),
+        DataType::Int16 => Some(Numeric::Signed(16)),
+        DataType::Int32 => Some(Numeric::Signed(32)),
+        DataType::Int64 => Some(Numeric::Signed(64)),
+        DataType::UInt8 => Some(Numeric::Unsigned(8)),
+        DataType::UInt16 => Some(Numeric::Unsigned(16)),
+        DataType::UInt32 => Some(Numeric::Unsigned(32)),
+        DataType::UInt64 => Some(Numeric::Unsigned(64)),
+        DataType::Float32 => Some(Numeric::F32),
+        DataType::Float64 => Some(Numeric::F64),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Numeric {
+    Signed(u8),
+    Unsigned(u8),
+    F32,
+    F64,
+}
+
+fn coerce_decimals(lhs: (u8, i8), rhs: (u8, i8)) -> DataType {
+    let scale = lhs.1.max(rhs.1);
+    let lhs_int = i32::from(lhs.0) - i32::from(lhs.1);
+    let rhs_int = i32::from(rhs.0) - i32::from(rhs.1);
+    let int_digits = lhs_int.max(rhs_int);
+    let precision = (int_digits + i32::from(scale)).clamp(1, 38) as u8;
+    DataType::Decimal128(precision, scale)
+}
+
 pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<ArrayRef, Error> {
     // Coerce inputs to common type
     let (lhs_arr, rhs_arr) = coerce_types(lhs, rhs, op)?;
@@ -89,28 +122,58 @@ pub fn get_common_type(lhs_type: &DataType, rhs_type: &DataType) -> DataType {
 
     match (lhs_type, rhs_type) {
         (DataType::Null, other) | (other, DataType::Null) => other.clone(),
-        (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
-        (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64, // Promote to f64
-
-        (DataType::Int64, DataType::Int64) => DataType::Int64,
-        (DataType::Int32, DataType::Int32) => DataType::Int32,
-        (DataType::Int16, DataType::Int16) => DataType::Int16,
-        (DataType::Int8, DataType::Int8) => DataType::Int8,
-
-        (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => DataType::Int64,
-        (DataType::Int16, DataType::Int64) | (DataType::Int64, DataType::Int16) => DataType::Int64,
-        (DataType::Int8, DataType::Int64) | (DataType::Int64, DataType::Int8) => DataType::Int64,
-
-        (DataType::Int16, DataType::Int32) | (DataType::Int32, DataType::Int16) => DataType::Int32,
-        (DataType::Int8, DataType::Int32) | (DataType::Int32, DataType::Int8) => DataType::Int32,
-
-        (DataType::Int8, DataType::Int16) | (DataType::Int16, DataType::Int8) => DataType::Int16,
-
-        (DataType::Int64, DataType::UInt64) => DataType::Float64, // Avoid overflow
-        (DataType::UInt64, DataType::Int64) => DataType::Float64,
-        (DataType::UInt64, DataType::UInt64) => DataType::UInt64,
-        // ... handle other types
-        _ => DataType::Float64, // Fallback
+        (DataType::Boolean, DataType::Boolean) => DataType::Boolean,
+        (DataType::Decimal128(lp, ls), DataType::Decimal128(rp, rs)) => {
+            coerce_decimals((*lp, *ls), (*rp, *rs))
+        }
+        (DataType::Decimal128(p, s), other) | (other, DataType::Decimal128(p, s)) => match other {
+            DataType::Float64 | DataType::Float32 => DataType::Float64,
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => coerce_decimals((*p, *s), (38u8, 0)),
+            _ => DataType::Float64,
+        },
+        _ => match (numeric_priority(lhs_type), numeric_priority(rhs_type)) {
+            (Some(Numeric::F64), _) | (_, Some(Numeric::F64)) => DataType::Float64,
+            (Some(Numeric::F32), _) | (_, Some(Numeric::F32)) => DataType::Float64,
+            (Some(Numeric::Signed(lhs)), Some(Numeric::Unsigned(rhs)))
+            | (Some(Numeric::Unsigned(lhs)), Some(Numeric::Signed(rhs))) => {
+                let max = std::cmp::max(lhs, rhs);
+                if max >= 64 {
+                    DataType::Float64
+                } else {
+                    DataType::Int64
+                }
+            }
+            (Some(Numeric::Signed(lhs)), Some(Numeric::Signed(rhs))) => {
+                if lhs >= 64 || rhs >= 64 {
+                    DataType::Int64
+                } else if lhs >= 32 || rhs >= 32 {
+                    DataType::Int32
+                } else if lhs >= 16 || rhs >= 16 {
+                    DataType::Int16
+                } else {
+                    DataType::Int8
+                }
+            }
+            (Some(Numeric::Unsigned(lhs)), Some(Numeric::Unsigned(rhs))) => {
+                if lhs >= 64 || rhs >= 64 {
+                    DataType::UInt64
+                } else if lhs >= 32 || rhs >= 32 {
+                    DataType::UInt32
+                } else if lhs >= 16 || rhs >= 16 {
+                    DataType::UInt16
+                } else {
+                    DataType::UInt8
+                }
+            }
+            _ => DataType::Float64,
+        },
     }
 }
 

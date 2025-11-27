@@ -11,7 +11,7 @@ use llkv_column_map::store::scan::{
 };
 use llkv_column_map::store::{ColumnStore, ROW_ID_COLUMN_NAME};
 use llkv_storage::pager::MemPager;
-use llkv_types::{LogicalFieldId, Namespace};
+use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
 
 #[test]
 fn unsorted_with_nulls_anchor_order() {
@@ -106,7 +106,9 @@ fn unsorted_with_nulls_anchor_order() {
                 offset: 0,
                 include_nulls: true,
                 nulls_first: false,
-                anchor_row_id_field: Some(anchor_fid.with_namespace(Namespace::RowIdShadow)),
+                anchor_row_id_field: Some(
+                    anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
+                ),
             },
             &mut c,
         )

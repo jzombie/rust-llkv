@@ -1,6 +1,6 @@
 use super::*;
 use arrow::datatypes::DataType;
-use llkv_types::ids::Namespace;
+use llkv_types::ids::LogicalStorageNamespace;
 use rustc_hash::FxHashMap;
 
 /// Owned handles to sorted value chunks and their permutation arrays.
@@ -1589,7 +1589,7 @@ where
         Option<crate::store::descriptor::ColumnDescriptor>,
         Vec<ChunkMetadata>,
     ) = if opts.with_row_ids {
-        let rid_fid = field_id.with_namespace(Namespace::RowIdShadow);
+        let rid_fid = field_id.with_namespace(LogicalStorageNamespace::RowIdShadow);
         let rid_pk = *catalog.map.get(&rid_fid).ok_or(Error::NotFound)?;
         let rid_desc_blob = store
             .pager

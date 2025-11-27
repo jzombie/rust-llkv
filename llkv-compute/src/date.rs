@@ -5,8 +5,8 @@
 //! literals. Having a single implementation avoids drift between crates and
 //! keeps overflow/validation handling centralized.
 
-use llkv_expr::literal::IntervalValue;
 use llkv_result::{Error, Result};
+use llkv_types::IntervalValue;
 use time::{Date, Duration, Month};
 
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
