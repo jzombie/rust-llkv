@@ -1,3 +1,5 @@
+// TODO: Can portions of this be offloaded to llkv-compute as vectorized ops?
+
 //! Runtime aggregation utilities used by the planner and executor.
 //!
 //! The crate evaluates logical aggregates described by [`llkv_plan::AggregateExpr`] against Arrow
@@ -8,8 +10,8 @@ use arrow::array::{
     Int64Builder, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field};
-use llkv_column_map::types::FieldId;
 use llkv_result::Error;
+use llkv_types::FieldId;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 use std::{cmp::Ordering, convert::TryFrom};
@@ -802,6 +804,10 @@ impl AggregateAccumulator {
                 has_values,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "SUM aggregate expected an INT column in execution".into(),
@@ -828,6 +834,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "SUM(DISTINCT) aggregate expected an INT column in execution".into(),
@@ -960,6 +970,10 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "TOTAL aggregate expected an INT column in execution".into(),
@@ -979,6 +993,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "TOTAL(DISTINCT) aggregate expected an INT column in execution".into(),
@@ -1099,6 +1117,10 @@ impl AggregateAccumulator {
                 count,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "AVG aggregate expected an INT column in execution".into(),
@@ -1126,6 +1148,10 @@ impl AggregateAccumulator {
                 seen,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "AVG(DISTINCT) aggregate expected an INT column in execution".into(),
@@ -1223,10 +1249,10 @@ impl AggregateAccumulator {
                 for i in 0..arr.len() {
                     if arr.is_valid(i) {
                         *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
-                            Error::InvalidArgumentError("Decimal128 avg sum overflow".into())
+                            Error::InvalidArgumentError("Decimal128 sum overflow".into())
                         })?;
                         *count = count.checked_add(1).ok_or_else(|| {
-                            Error::InvalidArgumentError("AVG count exceeds i64 range".into())
+                            Error::InvalidArgumentError("AVG count overflow".into())
                         })?;
                     }
                 }
@@ -1251,7 +1277,7 @@ impl AggregateAccumulator {
                     let key = DistinctKey::from_array(column, i)?;
                     if seen.insert(key) {
                         *sum = sum.checked_add(arr.value(i)).ok_or_else(|| {
-                            Error::InvalidArgumentError("Decimal128 avg sum overflow".into())
+                            Error::InvalidArgumentError("Decimal128 sum overflow".into())
                         })?;
                     }
                 }
@@ -1261,6 +1287,10 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let array = batch.column(*column_index);
+                // Skip accumulation for Null-type columns - all values are implicitly NULL
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "MIN aggregate expected an INT column in execution".into(),
@@ -1326,6 +1356,9 @@ impl AggregateAccumulator {
                 value,
             } => {
                 let array = batch.column(*column_index);
+                if matches!(array.data_type(), DataType::Null) {
+                    return Ok(());
+                }
                 let array = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                     Error::InvalidArgumentError(
                         "MAX aggregate expected an INT column in execution".into(),
@@ -1391,20 +1424,24 @@ impl AggregateAccumulator {
                 non_null_rows,
                 total_rows_seen,
             } => {
+                let rows = i64::try_from(batch.num_rows()).map_err(|_| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+                *total_rows_seen = total_rows_seen.checked_add(rows).ok_or_else(|| {
+                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                })?;
+
                 let array = batch.column(*column_index);
-                let batch_size = i64::try_from(array.len()).map_err(|_| {
-                    Error::InvalidArgumentError("Batch size exceeds i64 range".into())
-                })?;
-                let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
-                let non_null = i64::try_from(non_null).map_err(|_| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
-                *total_rows_seen = total_rows_seen.checked_add(batch_size).ok_or_else(|| {
-                    Error::InvalidArgumentError("Total rows exceeds i64 range".into())
-                })?;
-                *non_null_rows = non_null_rows.checked_add(non_null).ok_or_else(|| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
+                // If column is Null type, non_null_rows doesn't increase
+                if !matches!(array.data_type(), DataType::Null) {
+                    let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
+                    let non_null = i64::try_from(non_null).map_err(|_| {
+                        Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                    })?;
+                    *non_null_rows = non_null_rows.checked_add(non_null).ok_or_else(|| {
+                        Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
+                    })?;
+                }
             }
             AggregateAccumulator::GroupConcat {
                 column_index,
@@ -1690,7 +1727,20 @@ impl AggregateAccumulator {
                 let data_type = DataType::Decimal128(precision, scale);
                 let array = if count > 0 {
                     // Compute average in decimal space: sum / count
-                    let avg = sum / (count as i128);
+                    // Use rounding division instead of truncating division
+                    let count_i128 = count as i128;
+                    let mut avg = sum / count_i128;
+                    let rem = sum % count_i128;
+
+                    // Round half away from zero
+                    if rem.abs() * 2 >= count_i128.abs() {
+                        if sum.signum() == count_i128.signum() {
+                            avg += 1;
+                        } else {
+                            avg -= 1;
+                        }
+                    }
+
                     Arc::new(
                         arrow::array::Decimal128Array::from(vec![avg])
                             .with_precision_and_scale(precision, scale)
@@ -1720,7 +1770,20 @@ impl AggregateAccumulator {
                 let count = seen.len();
                 let array = if count > 0 {
                     // Compute average in decimal space: sum / count
-                    let avg = sum / (count as i128);
+                    // Use rounding division instead of truncating division
+                    let count_i128 = count as i128;
+                    let mut avg = sum / count_i128;
+                    let rem = sum % count_i128;
+
+                    // Round half away from zero
+                    if rem.abs() * 2 >= count_i128.abs() {
+                        if sum.signum() == count_i128.signum() {
+                            avg += 1;
+                        } else {
+                            avg -= 1;
+                        }
+                    }
+
                     Arc::new(
                         arrow::array::Decimal128Array::from(vec![avg])
                             .with_precision_and_scale(precision, scale)

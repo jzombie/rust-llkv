@@ -18,10 +18,10 @@ use arrow::datatypes::{ArrowPrimitiveType, DataType};
 
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::ChunkMetadata;
-use crate::types::RowId;
 use crate::{Error, Result};
 use llkv_result::Result as LlkvResult;
 use llkv_storage::types::PhysicalKey;
+use llkv_types::ids::RowId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 

@@ -60,6 +60,8 @@ pub struct SubqueryExpr {
 pub struct ScalarSubqueryExpr {
     /// Identifier referencing the subquery definition attached to the parent projection.
     pub id: SubqueryId,
+    /// The data type of the single column returned by the subquery.
+    pub data_type: DataType,
 }
 
 impl<'a, F> Expr<'a, F> {
@@ -80,6 +82,24 @@ impl<'a, F> Expr<'a, F> {
     #[inline]
     pub fn not(e: Expr<'a, F>) -> Expr<'a, F> {
         Expr::Not(Box::new(e))
+    }
+
+    /// Returns true if this expression is a full range filter on the provided field id.
+    pub fn is_full_range_for(&self, expected_field: &F) -> bool
+    where
+        F: PartialEq,
+    {
+        matches!(
+            self,
+            Expr::Pred(Filter {
+                field_id,
+                op:
+                    Operator::Range {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+            }) if field_id == expected_field
+        )
     }
 }
 
@@ -244,8 +264,8 @@ impl<F> ScalarExpr<F> {
     }
 
     #[inline]
-    pub fn scalar_subquery(id: SubqueryId) -> Self {
-        Self::ScalarSubquery(ScalarSubqueryExpr { id })
+    pub fn scalar_subquery(id: SubqueryId, data_type: DataType) -> Self {
+        Self::ScalarSubquery(ScalarSubqueryExpr { id, data_type })
     }
 
     #[inline]
@@ -281,6 +301,23 @@ pub enum BinaryOp {
     BitwiseShiftRight,
 }
 
+impl BinaryOp {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BinaryOp::Add => "+",
+            BinaryOp::Subtract => "-",
+            BinaryOp::Multiply => "*",
+            BinaryOp::Divide => "/",
+            BinaryOp::Modulo => "%",
+            BinaryOp::And => "AND",
+            BinaryOp::Or => "OR",
+            BinaryOp::BitwiseShiftLeft => "<<",
+            BinaryOp::BitwiseShiftRight => ">>",
+        }
+    }
+}
+
 /// Comparison operator for scalar expressions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompareOp {
@@ -290,6 +327,20 @@ pub enum CompareOp {
     LtEq,
     Gt,
     GtEq,
+}
+
+impl CompareOp {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompareOp::Eq => "=",
+            CompareOp::NotEq => "!=",
+            CompareOp::Lt => "<",
+            CompareOp::LtEq => "<=",
+            CompareOp::Gt => ">",
+            CompareOp::GtEq => ">=",
+        }
+    }
 }
 
 /// Single predicate against a field.
@@ -727,8 +778,8 @@ mod tests {
 
         match f.op {
             Operator::Range { lower, upper } => {
-                assert_eq!(lower, Bound::Included(Literal::Integer(150)));
-                assert_eq!(upper, Bound::Excluded(Literal::Integer(300)));
+                assert_eq!(lower, Bound::Included(Literal::Int128(150)));
+                assert_eq!(upper, Bound::Excluded(Literal::Int128(300)));
             }
             _ => panic!("Expected a range operator"),
         }

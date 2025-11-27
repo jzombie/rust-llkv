@@ -9,8 +9,8 @@
 use crate::{RuntimeStatementResult, canonical_table_name};
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
+use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
     ExecutorColumn, ExecutorTable, build_array_for_column, resolve_insert_columns, translation,
 };
@@ -20,11 +20,10 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
-use llkv_table::{
-    ConstraintEnforcementMode, FieldId, RowId, UniqueKey, build_composite_unique_key,
-};
+use llkv_table::{ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
-use rustc_hash::{FxHashMap, FxHashSet};
+use llkv_types::LogicalFieldId;
+use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::mem;
 use std::sync::Arc;
@@ -161,7 +160,7 @@ where
             });
         }
 
-        let row_count = row_ids.len();
+        let row_count = row_ids.cardinality();
         let table_id = table.table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
@@ -170,29 +169,32 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let mut stream = table.table.stream_columns(
-            logical_fields.clone(),
-            row_ids.clone(),
-            GatherNullPolicy::IncludeNulls,
-        )?;
-
         let mut new_rows: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(table.schema.columns.len()); row_count];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
-            let local_len = batch.num_rows();
-            for col_idx in 0..batch.num_columns() {
-                let array = batch.column(col_idx);
-                for local_idx in 0..local_len {
-                    let target_index = base + local_idx;
-                    debug_assert!(
-                        target_index < new_rows.len(),
-                        "column stream produced out-of-range row index"
-                    );
-                    if let Some(row) = new_rows.get_mut(target_index) {
-                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
-                        row.push(value);
+            vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
+
+        {
+            let mut stream = table.table.stream_columns(
+                logical_fields,
+                &row_ids,
+                GatherNullPolicy::IncludeNulls,
+            )?;
+
+            while let Some(chunk) = stream.next_batch()? {
+                let batch = chunk.batch();
+                let base = chunk.row_offset();
+                let local_len = batch.num_rows();
+                for col_idx in 0..batch.num_columns() {
+                    let array = batch.column(col_idx);
+                    for local_idx in 0..local_len {
+                        let target_index = base + local_idx;
+                        debug_assert!(
+                            target_index < new_rows.len(),
+                            "column stream produced out-of-range row index"
+                        );
+                        if let Some(row) = new_rows.get_mut(target_index) {
+                            let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                            row.push(value);
+                        }
                     }
                 }
             }
@@ -214,7 +216,7 @@ where
         let primary_key_spec = constraint_ctx.primary_key.as_ref();
         let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
         if let Some(pk) = primary_key_spec {
-            original_primary_key_keys.reserve(row_count);
+            original_primary_key_keys.reserve(row_count as usize);
             for row in &new_rows {
                 let mut values = Vec::with_capacity(pk.schema_indices.len());
                 for &idx in &pk.schema_indices {
@@ -252,14 +254,14 @@ where
                     })?;
 
             let values = match value {
-                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count],
+                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count as usize],
                 PreparedAssignmentValue::Expression { expr_index } => {
                     let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
                         Error::InvalidArgumentError(
                             "expression assignment value missing during UPDATE".into(),
                         )
                     })?;
-                    if column_values.len() != row_count {
+                    if column_values.len() != row_count as usize {
                         return Err(Error::InvalidArgumentError(
                             "expression result count did not match targeted row count".into(),
                         ));
@@ -295,7 +297,6 @@ where
         // For UPDATE, validate UNIQUE constraints against existing rows EXCLUDING
         // the rows being updated (since they'll be deleted before new values are inserted).
         // This prevents false duplicate detection when primary key values don't change.
-        let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
         let all_visible_row_ids = {
             let first_field = table
                 .schema
@@ -320,9 +321,9 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
                 let filtered: Vec<PlanValue> = all_vals
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
+                        if !row_ids.contains(row_id) {
                             row.into_iter().next()
                         } else {
                             None
@@ -337,9 +338,9 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
                 let filtered: Vec<Vec<PlanValue>> = all_rows
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
+                        if !row_ids.contains(row_id) {
                             Some(row)
                         } else {
                             None
@@ -418,7 +419,7 @@ where
 
         Ok(RuntimeStatementResult::Update {
             table_name: display_name,
-            rows_updated: row_count,
+            rows_updated: row_count as usize,
         })
     }
 
@@ -514,7 +515,7 @@ where
             });
         }
 
-        let row_count = row_ids.len();
+        let row_count = row_ids.cardinality();
         let table_id = table.table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
@@ -523,29 +524,32 @@ where
             .map(|column| LogicalFieldId::for_user(table_id, column.field_id))
             .collect();
 
-        let mut stream = table.table.stream_columns(
-            logical_fields.clone(),
-            row_ids.clone(),
-            GatherNullPolicy::IncludeNulls,
-        )?;
-
         let mut new_rows: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(table.schema.columns.len()); row_count];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
-            let local_len = batch.num_rows();
-            for col_idx in 0..batch.num_columns() {
-                let array = batch.column(col_idx);
-                for local_idx in 0..local_len {
-                    let target_index = base + local_idx;
-                    debug_assert!(
-                        target_index < new_rows.len(),
-                        "column stream produced out-of-range row index"
-                    );
-                    if let Some(row) = new_rows.get_mut(target_index) {
-                        let value = llkv_plan::plan_value_from_array(array, local_idx)?;
-                        row.push(value);
+            vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
+
+        {
+            let mut stream = table.table.stream_columns(
+                logical_fields,
+                &row_ids,
+                GatherNullPolicy::IncludeNulls,
+            )?;
+
+            while let Some(chunk) = stream.next_batch()? {
+                let batch = chunk.batch();
+                let base = chunk.row_offset();
+                let local_len = batch.num_rows();
+                for col_idx in 0..batch.num_columns() {
+                    let array = batch.column(col_idx);
+                    for local_idx in 0..local_len {
+                        let target_index = base + local_idx;
+                        debug_assert!(
+                            target_index < new_rows.len(),
+                            "column stream produced out-of-range row index"
+                        );
+                        if let Some(row) = new_rows.get_mut(target_index) {
+                            let value = llkv_plan::plan_value_from_array(array, local_idx)?;
+                            row.push(value);
+                        }
                     }
                 }
             }
@@ -560,7 +564,7 @@ where
         let primary_key_spec = constraint_ctx.primary_key.as_ref();
         let mut original_primary_key_keys: Vec<Option<UniqueKey>> = Vec::new();
         if let Some(pk) = primary_key_spec {
-            original_primary_key_keys.reserve(row_count);
+            original_primary_key_keys.reserve(row_count as usize);
             for row in &new_rows {
                 let mut values = Vec::with_capacity(pk.schema_indices.len());
                 for &idx in &pk.schema_indices {
@@ -598,14 +602,14 @@ where
                     })?;
 
             let values = match value {
-                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count],
+                PreparedAssignmentValue::Literal(lit) => vec![lit; row_count as usize],
                 PreparedAssignmentValue::Expression { expr_index } => {
                     let column_values = expr_values.get_mut(expr_index).ok_or_else(|| {
                         Error::InvalidArgumentError(
                             "expression assignment value missing during UPDATE".into(),
                         )
                     })?;
-                    if column_values.len() != row_count {
+                    if column_values.len() != row_count as usize {
                         return Err(Error::InvalidArgumentError(
                             "expression result count did not match targeted row count".into(),
                         ));
@@ -639,7 +643,6 @@ where
         )?;
 
         // For UPDATE, validate UNIQUE constraints excluding rows being updated
-        let row_ids_set: FxHashSet<RowId> = row_ids.iter().copied().collect();
         let all_visible_row_ids = {
             let first_field = table
                 .schema
@@ -663,9 +666,9 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, &[field_id])?;
                 let filtered: Vec<PlanValue> = all_vals
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
+                        if !row_ids.contains(row_id) {
                             row.into_iter().next()
                         } else {
                             None
@@ -679,9 +682,9 @@ where
                     self.collect_row_values_for_ids(table, &all_visible_row_ids, field_ids)?;
                 let filtered: Vec<Vec<PlanValue>> = all_rows
                     .into_iter()
-                    .zip(&all_visible_row_ids)
-                    .filter_map(|(row, &row_id)| {
-                        if !row_ids_set.contains(&row_id) {
+                    .zip(all_visible_row_ids.iter())
+                    .filter_map(|(row, row_id)| {
+                        if !row_ids.contains(row_id) {
                             Some(row)
                         } else {
                             None
@@ -759,7 +762,7 @@ where
 
         Ok(RuntimeStatementResult::Update {
             table_name: display_name,
-            rows_updated: row_count,
+            rows_updated: row_count as usize,
         })
     }
 
@@ -777,7 +780,7 @@ where
         &self,
         table: &ExecutorTable<P>,
         display_name: &str,
-        row_ids: Vec<RowId>,
+        row_ids: Treemap,
         new_rows: Vec<Vec<PlanValue>>,
         updated_field_ids: Vec<FieldId>,
         snapshot: TransactionSnapshot,
@@ -793,7 +796,7 @@ where
             "update_rows_in_place should only be called for auto-commit transactions",
         );
         debug_assert_eq!(
-            row_ids.len(),
+            row_ids.cardinality() as usize,
             new_rows.len(),
             "row_ids and new_rows must have the same length",
         );
@@ -805,7 +808,7 @@ where
         // Preserve conflict detection semantics from delete+insert path.
         self.detect_delete_conflicts(table, display_name, &row_ids, snapshot)?;
 
-        let row_count = row_ids.len();
+        let row_count = row_ids.cardinality();
         tracing::debug!(
             table_id = table.table.table_id(),
             row_count,
@@ -832,7 +835,7 @@ where
         }
 
         let mut column_values: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(row_count); update_columns.len()];
+            vec![Vec::with_capacity(row_count as usize); update_columns.len()];
         for row in &new_rows {
             debug_assert_eq!(
                 row.len(),
@@ -845,8 +848,8 @@ where
             }
         }
 
-        let mut row_id_builder = UInt64Builder::with_capacity(row_count);
-        for &rid in &row_ids {
+        let mut row_id_builder = UInt64Builder::with_capacity(row_count as usize);
+        for rid in row_ids.iter() {
             row_id_builder.append_value(rid);
         }
         let row_id_array = Arc::new(row_id_builder.finish()) as ArrayRef;
@@ -929,11 +932,11 @@ where
         filter_expr: &LlkvExpr<'static, FieldId>,
         expressions: &[ScalarExpr<FieldId>],
         snapshot: TransactionSnapshot,
-    ) -> Result<(Vec<RowId>, Vec<Vec<PlanValue>>)> {
+    ) -> Result<(Treemap, Vec<Vec<PlanValue>>)> {
         let row_ids = table.table.filter_row_ids(filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
-            return Ok((row_ids, vec![Vec::new(); expressions.len()]));
+            return Ok((Treemap::new(), vec![Vec::new(); expressions.len()]));
         }
 
         if expressions.is_empty() {
@@ -947,7 +950,7 @@ where
         }
 
         let mut expr_values: Vec<Vec<PlanValue>> =
-            vec![Vec::with_capacity(row_ids.len()); expressions.len()];
+            vec![Vec::with_capacity(row_ids.cardinality() as usize); expressions.len()];
         let mut error: Option<Error> = None;
         let row_filter: Arc<dyn llkv_table::table::RowIdFilter<P>> = Arc::new(
             MvccRowIdFilter::new(Arc::clone(&self.txn_manager), snapshot),
@@ -974,7 +977,7 @@ where
         }
 
         for values in &expr_values {
-            if values.len() != row_ids.len() {
+            if values.len() != row_ids.cardinality() as usize {
                 return Err(Error::InvalidArgumentError(
                     "expression result count did not match targeted row count".into(),
                 ));

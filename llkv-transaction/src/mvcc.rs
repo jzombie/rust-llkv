@@ -7,11 +7,12 @@
 use arrow::array::{ArrayRef, UInt64Array, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use croaring::Treemap;
 use llkv_column_map::store::{
     CREATED_BY_COLUMN_NAME, DELETED_BY_COLUMN_NAME, FIELD_ID_META_KEY, ROW_ID_COLUMN_NAME,
 };
-use llkv_column_map::types::{FieldId, RowId};
 use llkv_result::Error;
+use llkv_types::{FieldId, RowId};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -481,10 +482,10 @@ pub fn build_field_with_metadata(
 
 /// Build DELETE batch with row_id and deleted_by columns.
 pub fn build_delete_batch(
-    row_ids: Vec<RowId>,
+    row_ids: Treemap,
     deleted_by_txn_id: TxnId,
 ) -> llkv_result::Result<RecordBatch> {
-    let row_count = row_ids.len();
+    let row_count = row_ids.cardinality() as usize;
 
     let fields = vec![
         Field::new(ROW_ID_COLUMN_NAME, DataType::UInt64, false),
@@ -492,7 +493,7 @@ pub fn build_delete_batch(
     ];
 
     let arrays: Vec<ArrayRef> = vec![
-        Arc::new(UInt64Array::from(row_ids)),
+        Arc::new(UInt64Array::from_iter_values(row_ids.iter())),
         Arc::new(UInt64Array::from(vec![deleted_by_txn_id; row_count])),
     ];
 

@@ -1,0 +1,23 @@
+[package]
+name = "llkv-types"
+description = "Common data types for the LLKV toolkit."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-buffer = { workspace = true }
+llkv-result = { workspace = true }
+modular-bitfield.workspace = true
+serde = { workspace = true, features = ["derive"], optional = true }
+time.workspace = true
+
+[dev-dependencies]
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
+
+[lints]
+workspace = true

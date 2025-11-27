@@ -4,7 +4,7 @@
 
 use arrow::datatypes::DataType;
 
-pub use llkv_column_map::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
+pub use llkv_types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 
 /// Column definition with assigned field id used when registering table metadata.
 #[derive(Clone, Debug)]

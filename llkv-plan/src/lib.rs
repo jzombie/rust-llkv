@@ -14,20 +14,19 @@
 
 pub mod canonical;
 pub mod conversion;
-pub mod date;
-pub mod interval;
 pub mod plan_graph;
 pub mod plans;
 pub mod subquery_correlation;
 pub mod traversal;
 pub mod validation;
 
-pub use canonical::{CanonicalRow, CanonicalScalar};
-pub use conversion::{
-    RangeSelectRows, extract_rows_from_range, plan_value_from_sql_expr, plan_value_from_sql_value,
+pub use canonical::canonical_scalar_from_plan_value;
+pub use conversion::{RangeSelectRows, extract_rows_from_range};
+pub use llkv_compute::interval::parse_interval_literal;
+pub use llkv_compute::{
+    add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
 };
-pub use date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
-pub use interval::parse_interval_literal;
+pub use llkv_types::{CanonicalRow, CanonicalScalar};
 pub use plan_graph::*;
 pub use plans::*;
 pub use subquery_correlation::{

@@ -1,3 +1,9 @@
-Prototype TPC-H testing tools.
+# LLKV TPC-H
 
-Not intended for general usage at the moment.
+Prototype TPC-H testing tools for the [LLKV](../) database toolkit.
+
+This crate is not intended for direct standalone use.
+
+## License
+
+Licensed under the [Apache-2.0 License](../LICENSE).

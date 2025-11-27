@@ -8,7 +8,6 @@ use crate::store::{
     descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator},
     rowid_fid,
 };
-use crate::types::LogicalFieldId;
 use arrow::array::UInt64Array;
 use arrow::compute::{SortColumn, lexsort_to_indices};
 use llkv_result::{Error, Result};
@@ -16,6 +15,7 @@ use llkv_storage::{
     pager::{BatchGet, BatchPut, GetResult, Pager},
     types::PhysicalKey,
 };
+use llkv_types::ids::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{Arc, RwLockReadGuard};
 

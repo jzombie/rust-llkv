@@ -14,19 +14,21 @@ readme = "README.md"
 [dependencies]
 arrow = { workspace = true, default-features = false }
 llkv-column-map.workspace = true
+llkv-compute.workspace = true
 llkv-executor.workspace = true
 llkv-expr.workspace = true
+llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-runtime.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
 llkv-transaction.workspace = true
+llkv-types.workspace = true
 regex.workspace = true
+rustc-hash.workspace = true
 simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
-tracing = { workspace = true }
-llkv-plan.workspace = true
-rustc-hash.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }

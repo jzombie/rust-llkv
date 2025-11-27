@@ -1,6 +1,6 @@
 use super::config::ColumnStoreConfig;
 use super::constants::TARGET_CHUNK_BYTES;
-use crate::types::RowId;
+use llkv_types::ids::RowId;
 
 /// Heuristics that guide callers when sizing write batches for the column store.
 ///

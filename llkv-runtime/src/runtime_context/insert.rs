@@ -9,8 +9,8 @@ use crate::{RuntimeStatementResult, TXN_ID_NONE, canonical_table_name};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
+use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_column_map::types::{LogicalFieldId, RowId};
 use llkv_executor::{
     ExecutorTable, build_array_for_column, normalize_insert_value_for_column,
     resolve_insert_columns,
@@ -20,6 +20,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::ConstraintEnforcementMode;
 use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
+use llkv_types::{LogicalFieldId, RowId};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -179,7 +180,8 @@ where
                         schema_index, display_name
                     ))
                 })?;
-                let normalized = normalize_insert_value_for_column(column, value.clone())?;
+                let val = std::mem::replace(value, PlanValue::Null);
+                let normalized = normalize_insert_value_for_column(column, val)?;
                 *value = normalized;
             }
         }
@@ -317,7 +319,7 @@ where
                 table,
                 ctx.display_name.clone(),
                 ctx.canonical_name.clone(),
-                row_ids,
+                row_ids.into_iter().collect(),
                 ctx.snapshot,
                 false, // Don't enforce foreign keys for REPLACE
             )?;
@@ -461,7 +463,7 @@ where
 
         let row_ids = filter_row_ids_for_snapshot(
             table.table.as_ref(),
-            row_ids,
+            row_ids.iter().collect(),
             &self.txn_manager,
             snapshot,
         )?;
@@ -493,7 +495,7 @@ where
                 let logical_field_id = LogicalFieldId::for_user(table_id, unique_col.field_id);
                 let mut stream = table.table.stream_columns(
                     vec![logical_field_id],
-                    row_ids.clone(),
+                    &row_ids,
                     GatherNullPolicy::IncludeNulls,
                 )?;
 
@@ -503,14 +505,14 @@ where
                         continue;
                     }
                     let array = batch.column(0);
-                    let base_idx = chunk.row_offset();
+                    let _base_idx = chunk.row_offset();
 
                     for local_idx in 0..batch.num_rows() {
                         if let Ok(existing_value) =
                             llkv_plan::plan_value_from_array(array, local_idx)
                             && new_values.contains(&existing_value)
                         {
-                            let rid = row_ids[base_idx + local_idx];
+                            let rid = chunk.row_ids()[local_idx];
                             if !conflicting_row_ids.contains(&rid) {
                                 conflicting_row_ids.push(rid);
                             }
@@ -554,7 +556,7 @@ where
     fn find_multi_column_conflicts(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: &[RowId],
+        row_ids: &Treemap,
         new_rows: &[Vec<PlanValue>],
         columns: &[String],
         constraint: &llkv_table::InsertMultiColumnUnique,
@@ -623,7 +625,7 @@ where
 
         let mut stream = table.table.stream_columns(
             logical_field_ids,
-            row_ids.to_vec(),
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 
@@ -633,7 +635,6 @@ where
                 continue;
             }
 
-            let base_idx = chunk.row_offset();
             let num_rows = batch.num_rows();
 
             for local_idx in 0..num_rows {
@@ -652,7 +653,7 @@ where
                 }
 
                 if has_all_values && new_values.contains(&existing_value) {
-                    let rid = row_ids[base_idx + local_idx];
+                    let rid = chunk.row_ids()[local_idx];
                     if !conflicting_row_ids.contains(&rid) {
                         conflicting_row_ids.push(rid);
                     }

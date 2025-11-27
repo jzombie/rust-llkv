@@ -12,10 +12,9 @@
 //! “cells” = number of (key,value) entries written, i.e., len(items) per
 //! column.
 
-use llkv_column_map::{
-    ColumnStore, ROW_ID_COLUMN_NAME, debug::ColumnStoreDebug, types::LogicalFieldId,
-};
+use llkv_column_map::{ColumnStore, ROW_ID_COLUMN_NAME, debug::ColumnStoreDebug};
 use llkv_storage::pager::{InstrumentedPager, IoStats, MemPager};
+use llkv_types::ids::LogicalFieldId;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

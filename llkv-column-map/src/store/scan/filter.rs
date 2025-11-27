@@ -13,9 +13,9 @@ use crate::parallel;
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
-use crate::types::{LogicalFieldId, RowId};
 use llkv_expr::typed_predicate::{Predicate, PredicateValue};
 use llkv_result::{Error, Result};
+use llkv_types::ids::{LogicalFieldId, RowId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use super::{

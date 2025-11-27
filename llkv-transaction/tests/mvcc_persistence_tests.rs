@@ -40,16 +40,16 @@ use tempfile::TempDir;
 
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_result::Result;
 use llkv_storage::pager::simd_r_drive_pager::SimdRDrivePager;
 use llkv_table::Table;
 use llkv_table::types::{FieldId, TableId};
 use llkv_transaction::mvcc::{RowVersion, TransactionSnapshot, TxnIdManager};
+use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
 
 /// Helper to create a logical field ID for a user data column.
 fn lfid(table_id: TableId, field_id: FieldId) -> LogicalFieldId {
-    LogicalFieldId::from_parts(Namespace::UserData, table_id, field_id)
+    LogicalFieldId::from_parts(LogicalStorageNamespace::UserData, table_id, field_id)
 }
 
 /// Helper to create a field with field_id metadata.

@@ -23,10 +23,10 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
 use llkv_column_map::store::scan::ScanOptions;
-use llkv_column_map::types::{LogicalFieldId, RowId};
 use llkv_storage::pager::MemPager;
+use llkv_types::{LogicalFieldId, RowId};
 
-use roaring::RoaringTreemap;
+use croaring::Treemap;
 
 const NUM_ROWS_SIMPLE: usize = 1_000_000;
 const NUM_ROWS_FRAGMENTED: u64 = 1_000_000;
@@ -211,7 +211,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
     }
 
     // 2) Delete every 10th row (absolute row index).
-    let rows_to_delete: RoaringTreemap = (0..NUM_ROWS_FRAGMENTED).step_by(10).collect();
+    let rows_to_delete: Treemap = (0..NUM_ROWS_FRAGMENTED).step_by(10).collect();
     let delete_vec: Vec<RowId> = rows_to_delete.iter().collect();
     store
         .delete_rows(&[field_id], &delete_vec)

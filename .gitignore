@@ -2,6 +2,8 @@
 
 out.txt
 
+*.log
+
 # Local Cargo overrides
 .cargo/config.toml
 

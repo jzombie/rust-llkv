@@ -37,9 +37,9 @@ use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::{
     ColumnStore,
     store::debug::{ColumnStoreDebug, discover_all_pks},
-    types::LogicalFieldId,
 };
 use llkv_storage::{pager::MemPager, types::PhysicalKey};
+use llkv_types::ids::LogicalFieldId;
 
 // ---------------- Workload config (small, but shows batching clearly) --------
 

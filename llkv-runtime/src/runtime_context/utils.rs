@@ -11,17 +11,19 @@
 
 use arrow::array::{Array, UInt64Array};
 use arrow::datatypes::{DataType, IntervalUnit};
+use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_column_map::types::LogicalFieldId;
-use llkv_executor::utils::{
-    align_decimal_to_scale, decimal_truthy, parse_date32_literal, truncate_decimal_to_i64,
+use llkv_compute::date::parse_date32_literal;
+use llkv_compute::scalar::decimal::{
+    align_decimal_to_scale, decimal_truthy, truncate_decimal_to_i64,
 };
 use llkv_executor::{ExecutorColumn, ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::{FieldId, RowId};
+use llkv_table::FieldId;
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
+use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
@@ -236,10 +238,10 @@ where
 
         // Gather the column values for visible rows
         let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
-        let row_count = row_ids.len();
+        let row_count = row_ids.cardinality() as usize;
         let mut stream = match table.table.stream_columns(
             vec![logical_field_id],
-            row_ids,
+            &row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
             Ok(stream) => stream,
@@ -319,10 +321,10 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let total_rows = row_ids.len();
+        let total_rows = row_ids.cardinality() as usize;
         let mut stream = match table.table.stream_columns(
             logical_field_ids,
-            row_ids,
+            &row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
             Ok(stream) => stream,
@@ -411,10 +413,10 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let total_rows = row_ids.len();
+        let total_rows = row_ids.cardinality() as usize;
         let mut stream = match table.table.stream_columns(
             logical_field_ids,
-            row_ids,
+            &row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
             Ok(stream) => stream,
@@ -458,7 +460,7 @@ where
     pub(super) fn collect_row_values_for_ids(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: &[RowId],
+        row_ids: &Treemap,
         field_ids: &[FieldId],
     ) -> Result<Vec<Vec<PlanValue>>> {
         if row_ids.is_empty() || field_ids.is_empty() {
@@ -473,7 +475,7 @@ where
 
         let mut stream = match table.table.stream_columns(
             logical_field_ids.clone(),
-            row_ids.to_vec(),
+            row_ids,
             GatherNullPolicy::IncludeNulls,
         ) {
             Ok(stream) => stream,
@@ -481,7 +483,7 @@ where
             Err(e) => return Err(e),
         };
 
-        let mut rows = vec![Vec::with_capacity(field_ids.len()); row_ids.len()];
+        let mut rows = vec![Vec::with_capacity(field_ids.len()); row_ids.cardinality() as usize];
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();
             let base = chunk.row_offset();
@@ -507,9 +509,9 @@ where
     pub(super) fn filter_visible_row_ids(
         &self,
         table: &ExecutorTable<P>,
-        row_ids: Vec<RowId>,
+        row_ids: Treemap,
         snapshot: TransactionSnapshot,
-    ) -> Result<Vec<RowId>> {
+    ) -> Result<Treemap> {
         filter_row_ids_for_snapshot(table.table.as_ref(), row_ids, &self.txn_manager, snapshot)
     }
 

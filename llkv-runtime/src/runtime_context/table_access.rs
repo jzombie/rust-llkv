@@ -9,7 +9,6 @@ use crate::{RuntimeContext, RuntimeTableHandle, canonical_table_name};
 use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
 use llkv_executor::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
     translation,
@@ -21,6 +20,7 @@ use llkv_table::{
     ConstraintKind, FieldId, MultiColumnIndexEntryMeta, RowId, Table, TableConstraintSummaryView,
 };
 use llkv_transaction::{TransactionSnapshot, mvcc};
+use llkv_types::LogicalFieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::{
@@ -106,9 +106,10 @@ where
 
         if logical_fields.is_empty() {
             // Tables without user columns should still return row_id batches.
-            let mut row_id_builder = UInt64Builder::with_capacity(visible_row_ids.len());
-            for row_id in &visible_row_ids {
-                row_id_builder.append_value(*row_id);
+            let mut row_id_builder =
+                UInt64Builder::with_capacity(visible_row_ids.cardinality() as usize);
+            for row_id in visible_row_ids.iter() {
+                row_id_builder.append_value(row_id);
             }
             let arrays: Vec<ArrayRef> = vec![Arc::new(row_id_builder.finish()) as ArrayRef];
             let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
@@ -117,7 +118,7 @@ where
 
         let mut stream = table.table.stream_columns(
             Arc::from(logical_fields),
-            visible_row_ids,
+            &visible_row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 

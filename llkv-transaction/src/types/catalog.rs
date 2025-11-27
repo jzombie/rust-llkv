@@ -1,6 +1,6 @@
 //! Transaction catalog snapshot trait.
 
-use llkv_column_map::types::TableId;
+use llkv_types::TableId;
 
 /// Catalog snapshot interface used by the transaction layer.
 ///

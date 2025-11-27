@@ -1,9 +1,7 @@
-//! Core type definitions for the columnar storage engine.
+//! Identifiers shared across LLKV crates.
 //!
-//! This module defines the fundamental types used to identify and organize data:
-//! - [`LogicalFieldId`]: Namespaced 64-bit identifier for columns
-//! - [`Namespace`]: Categories of data (user columns, system metadata, MVCC tracking)
-//! - Type aliases for table IDs, field IDs, and row IDs
+//! These types live in `llkv-types` so they can be reused without depending on
+//! the storage-specific crates.
 
 // FIXME: Since upgrading to `rustc 1.90.0 (1159e78c4 2025-09-14)`, this seems
 // to be needed to workaround parenthesis errors in `LogicalFieldId`, which
@@ -13,9 +11,14 @@
 
 use modular_bitfield::prelude::*;
 
+#[inline]
+fn rowid_shadow(fid: LogicalFieldId) -> LogicalFieldId {
+    fid.with_namespace(LogicalStorageNamespace::RowIdShadow)
+}
+
 /// Category of data a column contains.
 ///
-/// The `Namespace` enum prevents ID collisions by segregating different types of
+/// The `LogicalStorageNamespace` enum prevents ID collisions by segregating different types of
 /// columns into distinct namespaces. Each namespace can contain up to 2^16 tables,
 /// and each table can have up to 2^32 fields.
 ///
@@ -26,7 +29,7 @@ use modular_bitfield::prelude::*;
 /// components use the other namespaces for internal bookkeeping.
 #[derive(Specifier, Debug, PartialEq, Eq, Clone, Copy)]
 #[bits = 16]
-pub enum Namespace {
+pub enum LogicalStorageNamespace {
     /// User-defined table columns.
     ///
     /// This is the default namespace for regular table columns. When a table is created
@@ -145,7 +148,7 @@ pub struct LogicalFieldId {
     /// Data category (16 bits).
     ///
     /// Determines whether this ID refers to user data, system metadata, or MVCC tracking.
-    pub namespace: Namespace,
+    pub namespace: LogicalStorageNamespace,
 }
 
 impl LogicalFieldId {
@@ -155,7 +158,11 @@ impl LogicalFieldId {
     /// ([`for_user`](Self::for_user), [`for_mvcc_created_by`](Self::for_mvcc_created_by), etc.)
     /// for common cases.
     #[inline]
-    pub fn from_parts(namespace: Namespace, table_id: TableId, field_id: FieldId) -> Self {
+    pub fn from_parts(
+        namespace: LogicalStorageNamespace,
+        table_id: TableId,
+        field_id: FieldId,
+    ) -> Self {
         LogicalFieldId::new()
             .with_namespace(namespace)
             .with_table_id(table_id)
@@ -168,7 +175,7 @@ impl LogicalFieldId {
     /// `UserData` namespace.
     #[inline]
     pub fn for_user(table_id: TableId, field_id: FieldId) -> Self {
-        Self::from_parts(Namespace::UserData, table_id, field_id)
+        Self::from_parts(LogicalStorageNamespace::UserData, table_id, field_id)
     }
 
     /// Create an ID for a user column in table 0.
@@ -185,7 +192,7 @@ impl LogicalFieldId {
     /// each row. The field ID is always `u32::MAX` as a sentinel value.
     #[inline]
     pub fn for_mvcc_created_by(table_id: TableId) -> Self {
-        Self::from_parts(Namespace::TxnCreatedBy, table_id, u32::MAX)
+        Self::from_parts(LogicalStorageNamespace::TxnCreatedBy, table_id, u32::MAX)
     }
 
     /// Create an ID for the MVCC `deleted_by` column of a table.
@@ -195,6 +202,29 @@ impl LogicalFieldId {
     /// as a sentinel value.
     #[inline]
     pub fn for_mvcc_deleted_by(table_id: TableId) -> Self {
-        Self::from_parts(Namespace::TxnDeletedBy, table_id, u32::MAX - 1)
+        Self::from_parts(
+            LogicalStorageNamespace::TxnDeletedBy,
+            table_id,
+            u32::MAX - 1,
+        )
     }
+}
+
+/// Convenience helper for constructing a user-space logical field id.
+#[inline]
+pub fn lfid(table_id: TableId, col_id: FieldId) -> LogicalFieldId {
+    LogicalFieldId::for_user(table_id, col_id)
+}
+
+/// Logical field id for the table's row id shadow column, as a `u64` key.
+#[inline]
+pub fn rid_col(table_id: TableId, col_id: FieldId) -> u64 {
+    let fid = lfid(table_id, col_id);
+    rowid_shadow(fid).into()
+}
+
+/// Logical field id for the reserved table row id column, as a `u64` key.
+#[inline]
+pub fn rid_table(table_id: TableId) -> u64 {
+    lfid(table_id, ROW_ID_FIELD_ID).into()
 }

@@ -4,8 +4,9 @@
 //! llkv-plan data structures, particularly for literal value conversion
 //! and range SELECT parsing.
 
-use llkv_expr::decimal::DecimalValue;
+use llkv_expr::literal::Literal;
 use llkv_result::{Error, Result};
+use llkv_types::decimal::DecimalValue;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     DataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, ObjectName,
@@ -13,149 +14,131 @@ use sqlparser::ast::{
     TypedString, UnaryOperator, Value, ValueWithSpan,
 };
 
-use crate::{PlanValue, date::parse_date32_literal, interval::parse_interval_literal};
+use crate::PlanValue;
+use llkv_compute::date::parse_date32_literal;
+use llkv_compute::interval::parse_interval_literal;
 
-/// Convert a SQL expression to a PlanValue literal.
-///
-/// Supports:
-/// - Literal values (numbers, strings, NULL)
-/// - Unary operators (-, +)
-/// - Nested expressions
-/// - Dictionary/struct literals
-///
-/// # Examples
-///
-/// ```ignore
-/// use llkv_plan::conversion::plan_value_from_sql_expr;
-/// use sqlparser::ast::Expr;
-///
-/// let expr = /* parse SQL expression */;
-/// let value = plan_value_from_sql_expr(&expr)?;
-/// ```
-///
-/// # Errors
-///
-/// Returns an error for:
-/// - Non-literal expressions (column references, function calls, etc.)
-/// - Unsupported operators
-/// - Invalid number parsing
-pub fn plan_value_from_sql_expr(expr: &SqlExpr) -> Result<PlanValue> {
-    match expr {
-        SqlExpr::Value(value) => plan_value_from_sql_value(value),
-        SqlExpr::TypedString(typed) => plan_value_from_typed_string(typed),
-        SqlExpr::Interval(interval) => {
-            let parsed = parse_interval_literal(interval)?;
-            Ok(PlanValue::Interval(parsed))
+impl PlanValue {
+    pub fn from_operator_literal(op_value: &llkv_expr::literal::Literal) -> Option<PlanValue> {
+        match op_value {
+            Literal::Int128(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
+            Literal::Float64(v) => Some(PlanValue::Float(*v)),
+            Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
+            Literal::String(v) => Some(PlanValue::String(v.clone())),
+            _ => None,
         }
-        SqlExpr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr,
-        } => match plan_value_from_sql_expr(expr)? {
-            PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
-            PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
-            PlanValue::Decimal(value) => {
-                let negated = value.raw_value().checked_neg().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "decimal literal overflow when applying unary minus".into(),
-                    )
-                })?;
-                let decimal = DecimalValue::new(negated, value.scale()).map_err(|err| {
-                    Error::InvalidArgumentError(format!("failed to negate decimal literal: {err}"))
-                })?;
-                Ok(PlanValue::Decimal(decimal))
+    }
+
+    pub fn from_literal_for_join(literal: &Literal) -> Option<PlanValue> {
+        match literal {
+            Literal::Int128(v) => i64::try_from(*v).ok().map(PlanValue::Integer),
+            Literal::Float64(v) => Some(PlanValue::Float(*v)),
+            Literal::Boolean(v) => Some(PlanValue::Integer(if *v { 1 } else { 0 })),
+            Literal::String(v) => Some(PlanValue::String(v.clone())),
+            _ => None,
+        }
+    }
+
+    /// Convert a SQL expression to a PlanValue literal.
+    pub fn from_sql_expr(expr: &SqlExpr) -> Result<Self> {
+        match expr {
+            SqlExpr::Value(value) => Self::from_sql_value(value),
+            SqlExpr::TypedString(typed) => Self::from_typed_string(typed),
+            SqlExpr::Interval(interval) => {
+                let parsed = parse_interval_literal(interval)?;
+                Ok(PlanValue::Interval(parsed))
             }
-            PlanValue::Null
-            | PlanValue::String(_)
-            | PlanValue::Struct(_)
-            | PlanValue::Date32(_)
-            | PlanValue::Interval(_) => Err(Error::InvalidArgumentError(
-                "cannot negate non-numeric literal".into(),
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => match Self::from_sql_expr(expr)? {
+                PlanValue::Integer(v) => Ok(PlanValue::Integer(-v)),
+                PlanValue::Float(v) => Ok(PlanValue::Float(-v)),
+                PlanValue::Decimal(value) => {
+                    let negated = value.raw_value().checked_neg().ok_or_else(|| {
+                        Error::InvalidArgumentError(
+                            "decimal literal overflow when applying unary minus".into(),
+                        )
+                    })?;
+                    let decimal = DecimalValue::new(negated, value.scale()).map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "failed to negate decimal literal: {err}"
+                        ))
+                    })?;
+                    Ok(PlanValue::Decimal(decimal))
+                }
+                PlanValue::Null
+                | PlanValue::String(_)
+                | PlanValue::Struct(_)
+                | PlanValue::Date32(_)
+                | PlanValue::Interval(_) => Err(Error::InvalidArgumentError(
+                    "cannot negate non-numeric literal".into(),
+                )),
+            },
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr,
+            } => Self::from_sql_expr(expr),
+            SqlExpr::Nested(inner) => Self::from_sql_expr(inner),
+            SqlExpr::Dictionary(fields) => {
+                let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
+                for field in fields {
+                    let key = field.key.value.clone();
+                    let value = Self::from_sql_expr(&field.value)?;
+                    map.insert(key, value);
+                }
+                Ok(PlanValue::Struct(map))
+            }
+            other => Err(Error::InvalidArgumentError(format!(
+                "unsupported literal expression: {other:?}"
+            ))),
+        }
+    }
+
+    /// Convert a SQL value literal to a PlanValue.
+    pub fn from_sql_value(value: &ValueWithSpan) -> Result<Self> {
+        match &value.value {
+            Value::Null => Ok(PlanValue::Null),
+            Value::Number(text, _) => {
+                if text.contains(['.', 'e', 'E']) {
+                    let parsed = text.parse::<f64>().map_err(|err| {
+                        Error::InvalidArgumentError(format!("invalid float literal: {err}"))
+                    })?;
+                    Ok(PlanValue::Float(parsed))
+                } else {
+                    let parsed = text.parse::<i64>().map_err(|err| {
+                        Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
+                    })?;
+                    Ok(PlanValue::Integer(parsed))
+                }
+            }
+            Value::Boolean(_) => Err(Error::InvalidArgumentError(
+                "BOOLEAN literals are not supported yet".into(),
             )),
-        },
-        SqlExpr::UnaryOp {
-            op: UnaryOperator::Plus,
-            expr,
-        } => plan_value_from_sql_expr(expr),
-        SqlExpr::Nested(inner) => plan_value_from_sql_expr(inner),
-        SqlExpr::Dictionary(fields) => {
-            let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), Default::default());
-            for field in fields {
-                let key = field.key.value.clone();
-                let value = plan_value_from_sql_expr(&field.value)?;
-                map.insert(key, value);
+            other => {
+                if let Some(text) = other.clone().into_string() {
+                    Ok(PlanValue::String(text))
+                } else {
+                    Err(Error::InvalidArgumentError(format!(
+                        "unsupported literal: {other:?}"
+                    )))
+                }
             }
-            Ok(PlanValue::Struct(map))
         }
-        other => Err(Error::InvalidArgumentError(format!(
-            "unsupported literal expression: {other:?}"
-        ))),
     }
-}
 
-fn plan_value_from_typed_string(typed: &TypedString) -> Result<PlanValue> {
-    let text = typed.value.value.clone().into_string().ok_or_else(|| {
-        Error::InvalidArgumentError("typed string literal must be a quoted string".into())
-    })?;
+    /// Convert a typed string literal to a PlanValue.
+    fn from_typed_string(typed: &TypedString) -> Result<Self> {
+        let text = typed.value.value.clone().into_string().ok_or_else(|| {
+            Error::InvalidArgumentError("typed string literal must be a quoted string".into())
+        })?;
 
-    match typed.data_type {
-        DataType::Date => {
-            let days = parse_date32_literal(&text)?;
-            Ok(PlanValue::Date32(days))
-        }
-        _ => Ok(PlanValue::String(text)),
-    }
-}
-
-/// Convert a SQL value literal to a PlanValue.
-///
-/// Handles:
-/// - NULL
-/// - Numbers (integers and floats)
-/// - Strings
-///
-/// # Examples
-///
-/// ```ignore
-/// use llkv_plan::conversion::plan_value_from_sql_value;
-/// use sqlparser::ast::ValueWithSpan;
-///
-/// let value = /* parse SQL value */;
-/// let plan_value = plan_value_from_sql_value(&value)?;
-/// ```
-///
-/// # Errors
-///
-/// Returns an error for:
-/// - Boolean literals (not yet supported)
-/// - Invalid number formats
-/// - Unsupported value types
-pub fn plan_value_from_sql_value(value: &ValueWithSpan) -> Result<PlanValue> {
-    match &value.value {
-        Value::Null => Ok(PlanValue::Null),
-        Value::Number(text, _) => {
-            if text.contains(['.', 'e', 'E']) {
-                let parsed = text.parse::<f64>().map_err(|err| {
-                    Error::InvalidArgumentError(format!("invalid float literal: {err}"))
-                })?;
-                Ok(PlanValue::Float(parsed))
-            } else {
-                let parsed = text.parse::<i64>().map_err(|err| {
-                    Error::InvalidArgumentError(format!("invalid integer literal: {err}"))
-                })?;
-                Ok(PlanValue::Integer(parsed))
+        match typed.data_type {
+            DataType::Date => {
+                let days = parse_date32_literal(&text)?;
+                Ok(PlanValue::Date32(days))
             }
-        }
-        Value::Boolean(_) => Err(Error::InvalidArgumentError(
-            "BOOLEAN literals are not supported yet".into(),
-        )),
-        other => {
-            if let Some(text) = other.clone().into_string() {
-                Ok(PlanValue::String(text))
-            } else {
-                Err(Error::InvalidArgumentError(format!(
-                    "unsupported literal: {other:?}"
-                )))
-            }
+            _ => Ok(PlanValue::String(text)),
         }
     }
 }
@@ -333,7 +316,7 @@ fn build_range_projection_expr(expr: &SqlExpr, spec: &RangeSpec) -> Result<Range
             }
         }
         SqlExpr::Wildcard(_) | SqlExpr::QualifiedWildcard(_, _) => unreachable!(),
-        other => Ok(RangeProjection::Literal(plan_value_from_sql_expr(other)?)),
+        other => Ok(RangeProjection::Literal(PlanValue::from_sql_expr(other)?)),
     }
 }
 
@@ -424,7 +407,7 @@ fn parse_range_spec_from_args(
             }
         };
 
-        let value = plan_value_from_sql_expr(arg_expr)?;
+        let value = PlanValue::from_sql_expr(arg_expr)?;
         match value {
             PlanValue::Integer(v) => Ok(v),
             _ => Err(Error::InvalidArgumentError(
@@ -485,7 +468,7 @@ fn group_by_is_empty(expr: &GroupByExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llkv_expr::literal::IntervalValue;
+    use llkv_types::IntervalValue;
     use sqlparser::ast::{Expr as SqlExpr, SelectItem, SetExpr, Statement, Value, ValueWithSpan};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -500,14 +483,14 @@ mod tests {
     #[test]
     fn test_null_value() {
         let value = value_with_span(Value::Null);
-        assert_eq!(plan_value_from_sql_value(&value).unwrap(), PlanValue::Null);
+        assert_eq!(PlanValue::from_sql_value(&value).unwrap(), PlanValue::Null);
     }
 
     #[test]
     fn test_integer_value() {
         let value = value_with_span(Value::Number("42".to_string(), false));
         assert_eq!(
-            plan_value_from_sql_value(&value).unwrap(),
+            PlanValue::from_sql_value(&value).unwrap(),
             PlanValue::Integer(42)
         );
     }
@@ -520,7 +503,7 @@ mod tests {
             expr: Box::new(SqlExpr::Value(value)),
         };
         assert_eq!(
-            plan_value_from_sql_expr(&expr).unwrap(),
+            PlanValue::from_sql_expr(&expr).unwrap(),
             PlanValue::Integer(-42)
         );
     }
@@ -530,7 +513,7 @@ mod tests {
     fn test_float_value() {
         let value = value_with_span(Value::Number("3.14".to_string(), false));
         assert_eq!(
-            plan_value_from_sql_value(&value).unwrap(),
+            PlanValue::from_sql_value(&value).unwrap(),
             PlanValue::Float(3.14)
         );
     }
@@ -539,7 +522,7 @@ mod tests {
     fn test_string_value() {
         let value = value_with_span(Value::SingleQuotedString("hello".to_string()));
         assert_eq!(
-            plan_value_from_sql_value(&value).unwrap(),
+            PlanValue::from_sql_value(&value).unwrap(),
             PlanValue::String("hello".to_string())
         );
     }
@@ -549,7 +532,7 @@ mod tests {
         let value = value_with_span(Value::Number("100".to_string(), false));
         let expr = SqlExpr::Nested(Box::new(SqlExpr::Value(value)));
         assert_eq!(
-            plan_value_from_sql_expr(&expr).unwrap(),
+            PlanValue::from_sql_expr(&expr).unwrap(),
             PlanValue::Integer(100)
         );
     }
@@ -562,7 +545,7 @@ mod tests {
             expr: Box::new(SqlExpr::Value(value)),
         };
         assert_eq!(
-            plan_value_from_sql_expr(&expr).unwrap(),
+            PlanValue::from_sql_expr(&expr).unwrap(),
             PlanValue::Integer(50)
         );
     }
@@ -584,7 +567,7 @@ mod tests {
         };
 
         assert_eq!(
-            plan_value_from_sql_expr(expr).unwrap(),
+            PlanValue::from_sql_expr(expr).unwrap(),
             PlanValue::Interval(IntervalValue::new(0, 7, 0))
         );
     }
@@ -596,12 +579,12 @@ mod tests {
             op: UnaryOperator::Minus,
             expr: Box::new(SqlExpr::Value(value)),
         };
-        assert!(plan_value_from_sql_expr(&expr).is_err());
+        assert!(PlanValue::from_sql_expr(&expr).is_err());
     }
 
     #[test]
     fn test_boolean_not_supported() {
         let value = value_with_span(Value::Boolean(true));
-        assert!(plan_value_from_sql_value(&value).is_err());
+        assert!(PlanValue::from_sql_value(&value).is_err());
     }
 }

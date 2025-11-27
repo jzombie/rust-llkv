@@ -10,8 +10,8 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 #[test]
 fn scan_builder_sorted_range_u64() {

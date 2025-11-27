@@ -21,8 +21,8 @@ use llkv_column_map::store::scan::{
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 const N_ROWS: usize = 1_000_000;
 const SEED: u64 = 0xC0FF_EEF0_0DD1_5EA5;

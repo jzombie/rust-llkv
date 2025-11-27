@@ -26,8 +26,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::debug::ColumnStoreDebug;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 const N_ROWS: usize = 1_000_000;
 
