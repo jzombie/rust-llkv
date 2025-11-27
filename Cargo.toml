@@ -35,6 +35,7 @@ resolver = "2"
 llkv = { path = "./llkv", version = "0.8.3-alpha" }
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.3-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.8.3-alpha" }
+llkv-compute = { path = "./llkv-compute", version = "0.8.3-alpha" }
 llkv-csv = { path = "./llkv-csv", version = "0.8.3-alpha" }
 llkv-executor = { path = "./llkv-executor", version = "0.8.3-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.8.3-alpha" }
@@ -49,7 +50,6 @@ llkv-table = { path = "./llkv-table", version = "0.8.3-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.3-alpha" }
 llkv-transaction = { path = "./llkv-transaction", version = "0.8.3-alpha" }
 llkv-types = { path = "./llkv-types", version = "0.8.3-alpha" }
-llkv-compute = { path = "./llkv-compute", version = "0.8.3-alpha" }
 simd-r-drive = "0.15.5-alpha"
 simd-r-drive-entry-handle = "0.15.5-alpha"
 
