@@ -12,7 +12,7 @@ pub mod literal;
 pub use canonical::{CanonicalRow, CanonicalScalar};
 pub use decimal::{DecimalError, DecimalValue};
 pub use ids::{
-    FieldId, LogicalFieldId, Namespace, RowId, TableId, ROW_ID_FIELD_ID, lfid, rid_col, rid_table,
+    FieldId, LogicalFieldId, LogicalStorageNamespace, RowId, TableId, ROW_ID_FIELD_ID, lfid, rid_col, rid_table,
 };
 pub use interval::IntervalValue;
 pub use literal::{FromLiteral, Literal, LiteralCastError, LiteralExt};

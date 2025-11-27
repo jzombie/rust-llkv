@@ -11,7 +11,7 @@ use llkv_column_map::store::scan::{
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
 use llkv_storage::pager::MemPager;
-use llkv_types::{LogicalFieldId, Namespace};
+use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
 
 fn seed_anchor_and_target() -> (ColumnStore<MemPager>, LogicalFieldId, LogicalFieldId) {
     let pager = Arc::new(MemPager::new());
@@ -128,7 +128,7 @@ fn sorted_asc_nulls_first_nonpaginate() {
                 offset: 0,
                 include_nulls: true,
                 nulls_first: true,
-                anchor_row_id_field: Some(anchor_fid.with_namespace(Namespace::RowIdShadow)),
+                anchor_row_id_field: Some(anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow)),
             },
             &mut c,
         )
@@ -168,7 +168,7 @@ fn sorted_desc_nulls_last_paginated() {
                 offset: 0,
                 include_nulls: true,
                 nulls_first: false,
-                anchor_row_id_field: Some(anchor_fid.with_namespace(Namespace::RowIdShadow)),
+                anchor_row_id_field: Some(anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow)),
             },
             &mut c,
         )

@@ -54,7 +54,7 @@ use llkv_expr::typed_predicate::{
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::decimal::DecimalValue;
-use llkv_types::{LogicalFieldId, Namespace};
+use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -1052,7 +1052,7 @@ where
                             self.table.table_id()
                         )));
                     }
-                    if lfid.namespace() != Namespace::UserData {
+                    if lfid.namespace() != LogicalStorageNamespace::UserData {
                         return Err(Error::InvalidArgumentError(format!(
                             "Projection {:?} must target user data namespace",
                             lfid
@@ -1088,7 +1088,7 @@ where
                     for field_id in fields_set.iter().copied() {
                         numeric_fields.insert(field_id);
                         let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
-                        if lfid.namespace() != Namespace::UserData {
+                        if lfid.namespace() != LogicalStorageNamespace::UserData {
                             return Err(Error::InvalidArgumentError(format!(
                                 "Computed projection field {:?} must target user data namespace",
                                 lfid
@@ -1478,7 +1478,7 @@ where
                     return Ok(StreamOutcome::Fallback);
                 }
 
-                if lfid.namespace() != Namespace::UserData {
+                if lfid.namespace() != LogicalStorageNamespace::UserData {
                     return Err(Error::InvalidArgumentError(format!(
                         "Computed projection field {:?} must target user data namespace",
                         lfid
