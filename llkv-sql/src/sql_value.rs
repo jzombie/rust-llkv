@@ -276,95 +276,22 @@ impl From<SqlValue> for PlanValue {
 }
 
 fn add_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
-    use llkv_compute::date::add_interval_to_date32;
-
     let lhs_conv = lhs.into_literal()?;
     let rhs_conv = rhs.into_literal()?;
-    match (lhs_conv, rhs_conv) {
-        (Literal::Null, _) | (_, Literal::Null) => Ok(SqlValue::Null),
-        (Literal::Date32(days), Literal::Interval(interval))
-        | (Literal::Interval(interval), Literal::Date32(days)) => {
-            let adjusted = add_interval_to_date32(days, interval)?;
-            Ok(SqlValue::Date32(adjusted))
-        }
-        (Literal::Interval(left), Literal::Interval(right)) => left
-            .checked_add(right)
-            .map(SqlValue::Interval)
-            .ok_or_else(|| Error::InvalidArgumentError("interval addition overflow".into())),
-        _ => Err(Error::InvalidArgumentError(
-            "unsupported literal expression: binary operation".into(),
-        )),
-    }
+    let result = llkv_compute::literal::add_literals(&lhs_conv, &rhs_conv)?;
+    SqlValue::from_literal(&result)
 }
 
 fn subtract_literals(lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
-    use llkv_compute::date::subtract_interval_from_date32;
-
     let lhs_conv = lhs.into_literal()?;
     let rhs_conv = rhs.into_literal()?;
-    match (lhs_conv, rhs_conv) {
-        (Literal::Null, _) | (_, Literal::Null) => Ok(SqlValue::Null),
-        (Literal::Date32(days), Literal::Interval(interval)) => {
-            let adjusted = subtract_interval_from_date32(days, interval)?;
-            Ok(SqlValue::Date32(adjusted))
-        }
-        (Literal::Date32(lhs_days), Literal::Date32(rhs_days)) => {
-            let delta = i64::from(lhs_days) - i64::from(rhs_days);
-            if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
-                return Err(Error::InvalidArgumentError(
-                    "DATE subtraction overflowed day precision".into(),
-                ));
-            }
-            Ok(SqlValue::Interval(IntervalValue::new(0, delta as i32, 0)))
-        }
-        (Literal::Interval(left), Literal::Interval(right)) => left
-            .checked_sub(right)
-            .map(SqlValue::Interval)
-            .ok_or_else(|| Error::InvalidArgumentError("interval subtraction overflow".into())),
-        _ => Err(Error::InvalidArgumentError(
-            "unsupported literal expression: binary operation".into(),
-        )),
-    }
+    let result = llkv_compute::literal::subtract_literals(&lhs_conv, &rhs_conv)?;
+    SqlValue::from_literal(&result)
 }
 
 fn bitshift_literals(op: BinaryOperator, lhs: SqlValue, rhs: SqlValue) -> SqlResult<SqlValue> {
     let lhs_conv = lhs.into_literal()?;
     let rhs_conv = rhs.into_literal()?;
-    if matches!(lhs_conv, Literal::Null) || matches!(rhs_conv, Literal::Null) {
-        return Ok(SqlValue::Null);
-    }
-
-    let lhs_i64 = match lhs_conv {
-        Literal::Int128(i) => i
-            .try_into()
-            .map_err(|_| Error::InvalidArgumentError("bitshift lhs out of range".into()))?,
-        Literal::Float64(f) => f as i64,
-        Literal::Date32(days) => days as i64,
-        _ => {
-            return Err(Error::InvalidArgumentError(
-                "bitwise shift requires numeric operands".into(),
-            ));
-        }
-    };
-
-    let rhs_i64 = match rhs_conv {
-        Literal::Int128(i) => i
-            .try_into()
-            .map_err(|_| Error::InvalidArgumentError("bitshift rhs out of range".into()))?,
-        Literal::Float64(f) => f as i64,
-        Literal::Date32(days) => days as i64,
-        _ => {
-            return Err(Error::InvalidArgumentError(
-                "bitwise shift requires numeric operands".into(),
-            ));
-        }
-    };
-
-    let result = match op {
-        BinaryOperator::PGBitwiseShiftLeft => lhs_i64.wrapping_shl(rhs_i64 as u32),
-        BinaryOperator::PGBitwiseShiftRight => lhs_i64.wrapping_shr(rhs_i64 as u32),
-        _ => unreachable!(),
-    };
-
-    Ok(SqlValue::Int64(result))
+    let result = llkv_compute::literal::bitshift_literals(op, &lhs_conv, &rhs_conv)?;
+    SqlValue::from_literal(&result)
 }

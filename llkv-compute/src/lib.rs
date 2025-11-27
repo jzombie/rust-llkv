@@ -4,6 +4,7 @@ pub mod eval;
 pub mod kernels;
 pub mod projection;
 pub mod rowids;
+pub mod literal;
 pub mod scalar;
 pub mod time;
 
