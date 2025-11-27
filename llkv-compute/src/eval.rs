@@ -890,6 +890,7 @@ impl ScalarEvaluator {
         }
     }
 
+    // TODO: Should Decimal types be included here?
     pub fn is_supported_numeric(dtype: &DataType) -> bool {
         matches!(
             dtype,
@@ -1018,6 +1019,10 @@ fn fold_binary_literals(op: BinaryOp, left: &Literal, right: &Literal) -> Option
 }
 
 fn fold_cast_literal(lit: &Literal, data_type: &DataType) -> Option<Literal> {
+    if matches!(lit, Literal::Null) {
+        // Preserve explicit casts of NULL so the target type is kept.
+        return None;
+    }
     let arr = ScalarEvaluator::literal_to_array(lit);
     let casted = cast::cast(&arr, data_type).ok()?;
     if casted.is_null(0) {

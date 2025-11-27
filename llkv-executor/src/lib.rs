@@ -104,11 +104,13 @@ pub use types::{
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum GroupKeyValue {
     Null,
+    // TODO: Rename to Int64
     Int(i64),
     Bool(bool),
     String(String),
 }
 
+// TODO: Move to llkv-aggregate? (Can Literal type be reused instead?)
 /// Represents the result value from an aggregate computation.
 /// Different aggregates return different types (e.g., AVG returns Float64, COUNT returns Int64).
 #[derive(Clone, Debug, PartialEq)]
@@ -404,7 +406,7 @@ fn plan_values_to_arrow_array(values: &[PlanValue]) -> ExecutorResult<ArrayRef> 
                 .collect::<Result<_, _>>()?;
             Ok(Arc::new(IntervalMonthDayNanoArray::from(interval_values)) as ArrayRef)
         }
-        _ => Ok(new_null_array(&DataType::Null, values.len())),
+        _ => Ok(new_null_array(&DataType::Int64, values.len())),
     }
 }
 
