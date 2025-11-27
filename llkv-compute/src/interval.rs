@@ -110,7 +110,7 @@ fn parse_year_interval(
                 .value
                 .checked_mul(12)
                 .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into()))?;
-            interval_from_components(months, 0, 0)
+            IntervalValue::from_components(months, 0, 0)
         }
         Some(IntervalUnit::Month) => parse_year_to_month(value, leading_precision),
         Some(other) => Err(Error::InvalidArgumentError(format!(
@@ -162,13 +162,13 @@ fn parse_year_to_month(value: &str, leading_precision: Option<u64>) -> Result<In
         .and_then(|base| base.checked_add(months_i64))
         .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into()))?;
     let total_months = total_months * i64::from(sign);
-    interval_from_components(total_months, 0, 0)
+    IntervalValue::from_components(total_months, 0, 0)
 }
 
 fn parse_month_interval(value: &str, leading_precision: Option<u64>) -> Result<IntervalValue> {
     let months = parse_signed_integer(value, "month")?;
     enforce_precision(months.digits_len, leading_precision, "month")?;
-    interval_from_components(months.value, 0, 0)
+    IntervalValue::from_components(months.value, 0, 0)
 }
 
 fn parse_day_interval(
@@ -246,7 +246,7 @@ fn parse_day_interval(
         }
     }
 
-    interval_from_components(0, days.value, nanos)
+    IntervalValue::from_components(0, days.value, nanos)
 }
 
 fn parse_hour_interval(
@@ -260,7 +260,7 @@ fn parse_hour_interval(
             let hours = parse_signed_integer(value, "hour")?;
             enforce_precision(hours.digits_len, leading_precision, "hour")?;
             let nanos = checked_mul(hours.value, NANOS_PER_HOUR, "hour")?;
-            interval_from_components(0, 0, nanos)
+            IntervalValue::from_components(0, 0, nanos)
         }
         Some(IntervalUnit::Minute) => {
             let (hours, minutes) = parse_signed_hh_mm(value)?;
@@ -272,7 +272,7 @@ fn parse_hour_interval(
             }
             let signed_minutes = signed_component(hours.sign, minutes, "minute")?;
             let nanos = compose_time_nanos(hours.value, signed_minutes, 0, 0)?;
-            interval_from_components(0, 0, nanos)
+            IntervalValue::from_components(0, 0, nanos)
         }
         Some(IntervalUnit::Second) => {
             let (hours, minutes, seconds, fraction) =
@@ -288,7 +288,7 @@ fn parse_hour_interval(
             let signed_fraction = apply_sign_i64(hours.sign, fraction);
             let nanos =
                 compose_time_nanos(hours.value, signed_minutes, signed_seconds, signed_fraction)?;
-            interval_from_components(0, 0, nanos)
+            IntervalValue::from_components(0, 0, nanos)
         }
         Some(other) => Err(Error::InvalidArgumentError(format!(
             "unsupported interval field combination: HOUR TO {:?}",
@@ -308,7 +308,7 @@ fn parse_minute_interval(
             let minutes = parse_signed_integer(value, "minute")?;
             enforce_precision(minutes.digits_len, leading_precision, "minute")?;
             let nanos = checked_mul(minutes.value, NANOS_PER_MINUTE, "minute")?;
-            interval_from_components(0, 0, nanos)
+            IntervalValue::from_components(0, 0, nanos)
         }
         Some(IntervalUnit::Second) => {
             let (minutes, seconds, fraction) = parse_signed_mm_ss(value, fractional_precision)?;
@@ -322,7 +322,7 @@ fn parse_minute_interval(
             let signed_seconds = signed_component(minutes.sign, seconds, "second")?;
             let signed_fraction = apply_sign_i64(minutes.sign, fraction);
             let nanos = compose_time_nanos(0, minutes.value, signed_seconds, signed_fraction)?;
-            interval_from_components(0, 0, nanos)
+            IntervalValue::from_components(0, 0, nanos)
         }
         Some(other) => Err(Error::InvalidArgumentError(format!(
             "unsupported interval field combination: MINUTE TO {:?}",
@@ -341,7 +341,7 @@ fn parse_second_interval(
     let total_nanos = checked_mul(seconds.seconds, NANOS_PER_SECOND, "second")?
         .checked_add(seconds.nanos)
         .ok_or_else(|| Error::InvalidArgumentError("interval overflow".into()))?;
-    interval_from_components(0, 0, total_nanos)
+    IntervalValue::from_components(0, 0, total_nanos)
 }
 
 fn parse_unqualified_interval(value: &str) -> Result<IntervalValue> {
@@ -463,7 +463,7 @@ fn parse_unqualified_interval(value: &str) -> Result<IntervalValue> {
         let nanos = nanos
             .try_into()
             .map_err(|_| Error::InvalidArgumentError("interval overflow".into()))?;
-        interval_from_components(months, days, nanos)
+        IntervalValue::from_components(months, days, nanos)
     } else {
         Err(Error::InvalidArgumentError(format!(
             "invalid trailing content '{}' in interval literal",
@@ -696,14 +696,6 @@ fn split_primary_component(value: &str, label: &str) -> Result<(SignedInteger, O
         ));
     }
     Ok((primary_parsed, remainder))
-}
-
-fn interval_from_components(months: i64, days: i64, nanos: i64) -> Result<IntervalValue> {
-    let months = i32::try_from(months)
-        .map_err(|_| Error::InvalidArgumentError("interval months out of range".into()))?;
-    let days = i32::try_from(days)
-        .map_err(|_| Error::InvalidArgumentError("interval days out of range".into()))?;
-    Ok(IntervalValue::new(months, days, nanos))
 }
 
 fn signed_component(sign: i32, magnitude: u64, label: &str) -> Result<i64> {
