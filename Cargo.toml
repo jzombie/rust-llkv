@@ -95,8 +95,7 @@ walkdir = "2.5"
 [workspace.lints.clippy]
 print_stderr = "deny"
 print_stdout = "deny"
+disallowed_methods = "deny"
 
-# TODO: Incorporate as lint config, if possible
-# disallowed-methods = [
-#    "std::boxed::Box::leak",
-# ]
+[workspace.metadata.clippy]
+disallowed-methods = ["std::boxed::Box::leak"]
