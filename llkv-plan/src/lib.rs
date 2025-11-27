@@ -14,7 +14,6 @@
 
 pub mod canonical;
 pub mod conversion;
-pub mod interval;
 pub mod plan_graph;
 pub mod plans;
 pub mod subquery_correlation;
@@ -26,7 +25,7 @@ pub use llkv_types::{CanonicalRow, CanonicalScalar};
 pub use conversion::{
     RangeSelectRows, extract_rows_from_range
 };
-pub use interval::parse_interval_literal;
+pub use llkv_compute::interval::parse_interval_literal;
 pub use llkv_compute::{
     add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
 };

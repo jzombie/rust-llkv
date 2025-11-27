@@ -43,10 +43,7 @@ mod interval;
 mod sql_value;
 use sql_value::SqlValue;
 
-mod ddl_utils;
-pub use ddl_utils::{
-    canonical_table_ident, normalize_table_constraint, order_create_tables_by_foreign_keys,
-};
+pub use llkv_table::ddl::{ObjectNameExt, OrderCreateTablesExt, TableConstraintExt};
 
 pub use sql_types::{SqlTypeFamily, classify_sql_data_type};
 

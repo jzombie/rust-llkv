@@ -35,6 +35,7 @@ pub mod catalog;
 pub mod constants;
 pub mod constraints;
 pub mod ddl;
+// TODO: Please don't separate these
 pub mod diagnostics;
 pub mod gather;
 pub mod metadata;
@@ -68,6 +69,7 @@ pub use constraints::{
     validate_check_constraints, validate_foreign_key_rows, validate_foreign_keys,
 };
 pub use ddl::CatalogDdl;
+pub use ddl::{ObjectNameExt, OrderCreateTablesExt, TableConstraintExt};
 pub use diagnostics::{TablePagerIngestionDiagnostics, TablePagerIngestionSample};
 pub use metadata::MultiColumnUniqueRegistration;
 pub use metadata::{ForeignKeyDescriptor, MetadataManager};

@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod date;
 pub mod eval;
+pub mod interval;
 pub mod kernels;
 pub mod projection;
 pub mod rowids;
