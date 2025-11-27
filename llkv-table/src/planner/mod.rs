@@ -41,11 +41,12 @@ use llkv_compute::analysis::{
     computed_expr_prefers_float, computed_expr_requires_numeric, get_field_dtype,
     scalar_expr_contains_coalesce,
 };
+use llkv_compute::eval::ScalarExprTypeExt;
 use llkv_compute::projection::{
     ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
     synthesize_computed_literal_array,
 };
-use llkv_compute::rowids::{RowIdFilter, compare_option_values, sort_by_primitive};
+use llkv_compute::{RowIdFilter, compare_option_values, sort_row_ids_by_primitive};
 use llkv_compute::scalar::interval::compare_interval_values;
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
@@ -1183,8 +1184,7 @@ where
                                     lfid_dtypes.get(&lfid).cloned()
                                 };
 
-                                let inferred_type =
-                                    NumericKernels::infer_result_type(&info.expr, &mut resolver);
+                                let inferred_type = info.expr.infer_result_type(&mut resolver);
 
                                 if let Some(dtype) = inferred_type {
                                     dtype
@@ -1495,8 +1495,8 @@ where
                         None
                     }
                 };
-                let output_dtype = NumericKernels::infer_result_type(&simplified, &mut resolver)
-                    .unwrap_or(DataType::Float64);
+                let output_dtype =
+                    simplified.infer_result_type(&mut resolver).unwrap_or(DataType::Float64);
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
                     if passthrough_fid != field_id {
@@ -3180,7 +3180,7 @@ where
     {
         let order_data = self.gather_primitive_order_chunks::<T>(row_ids, context)?;
 
-        Ok(sort_by_primitive::<T>(
+        Ok(sort_row_ids_by_primitive::<T>(
             row_ids,
             &order_data.chunks,
             &order_data.positions,

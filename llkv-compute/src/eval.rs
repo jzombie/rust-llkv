@@ -5,12 +5,13 @@ use arrow::array::{Array, ArrayRef, Float64Array, UInt32Array, new_null_array};
 use arrow::compute::kernels::cast;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{concat, is_not_null, take};
-use arrow::datatypes::{DataType, IntervalMonthDayNanoType};
+use arrow::datatypes::{DataType, Field, IntervalMonthDayNanoType};
 use llkv_expr::literal::{Literal, LiteralExt};
-use llkv_types::IntervalValue;
 use llkv_expr::{AggregateCall, BinaryOp, CompareOp, ScalarExpr};
+use llkv_types::IntervalValue;
 use llkv_result::{Error, Result as LlkvResult};
 use rustc_hash::{FxHashMap, FxHashSet};
+use sqlparser::ast::BinaryOperator;
 
 use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
 use crate::kernels::{compute_binary, get_common_type};
@@ -49,6 +50,181 @@ impl VectorizedExpr {
             }
         }
     }
+}
+
+/// Extension methods for type inference on `ScalarExpr`.
+pub trait ScalarExprTypeExt<F> {
+    fn infer_result_type<R>(&self, resolve_type: &mut R) -> Option<DataType>
+    where
+        F: Hash + Eq + Copy,
+        R: FnMut(F) -> Option<DataType>;
+
+    fn infer_result_type_from_arrays(&self, arrays: &NumericArrayMap<F>) -> DataType
+    where
+        F: Hash + Eq + Copy;
+
+    fn contains_interval(&self) -> bool;
+}
+
+impl<F: Hash + Eq + Copy> ScalarExprTypeExt<F> for ScalarExpr<F> {
+    fn infer_result_type<R>(&self, resolve_type: &mut R) -> Option<DataType>
+    where
+        R: FnMut(F) -> Option<DataType>,
+    {
+        match self {
+            ScalarExpr::Literal(lit) => Some(literal_type(lit)),
+            ScalarExpr::Column(fid) => resolve_type(*fid),
+            ScalarExpr::Binary { left, op, right } => {
+                let left_type = left.infer_result_type(resolve_type)?;
+                let right_type = right.infer_result_type(resolve_type)?;
+                Some(binary_result_type(*op, left_type, right_type))
+            }
+            ScalarExpr::Compare { .. } => Some(DataType::Boolean),
+            ScalarExpr::Not(_) => Some(DataType::Boolean),
+            ScalarExpr::IsNull { .. } => Some(DataType::Boolean),
+            ScalarExpr::Aggregate(call) => aggregate_result_type(call, resolve_type),
+            ScalarExpr::GetField { base, field_name } => {
+                let base_type = base.infer_result_type(resolve_type)?;
+                match base_type {
+                    DataType::Struct(fields) => fields
+                        .iter()
+                        .find(|f| f.name() == field_name)
+                        .map(|f| f.data_type().clone()),
+                    _ => None,
+                }
+            }
+            ScalarExpr::Cast { data_type, .. } => Some(data_type.clone()),
+            ScalarExpr::Case {
+                branches,
+                else_expr,
+                ..
+            } => {
+                let mut types = Vec::new();
+                for (_, then_expr) in branches {
+                    if let Some(t) = then_expr.infer_result_type(resolve_type) {
+                        types.push(t);
+                    }
+                }
+                if let Some(else_expr) = else_expr {
+                    if let Some(t) = else_expr.infer_result_type(resolve_type) {
+                        types.push(t);
+                    }
+                } else {
+                    // Implicit ELSE NULL
+                    types.push(DataType::Null);
+                }
+
+                if types.is_empty() {
+                    return None;
+                }
+
+                let mut common = types[0].clone();
+                for t in &types[1..] {
+                    common = get_common_type(&common, t);
+                }
+
+                Some(common)
+            }
+            ScalarExpr::Coalesce(items) => {
+                let mut types = Vec::new();
+                for item in items {
+                    if let Some(t) = item.infer_result_type(resolve_type) {
+                        types.push(t);
+                    }
+                }
+                if types.is_empty() {
+                    return None;
+                }
+                let mut common = types[0].clone();
+                for t in &types[1..] {
+                    common = get_common_type(&common, t);
+                }
+                Some(common)
+            }
+            ScalarExpr::Random => Some(DataType::Float64),
+            ScalarExpr::ScalarSubquery(sub) => Some(sub.data_type.clone()),
+        }
+    }
+
+    fn infer_result_type_from_arrays(&self, arrays: &NumericArrayMap<F>) -> DataType {
+        let mut resolver = |fid| arrays.get(&fid).map(|a| a.data_type().clone());
+        self.infer_result_type(&mut resolver).unwrap_or(DataType::Float64)
+    }
+
+    fn contains_interval(&self) -> bool {
+        match self {
+            ScalarExpr::Literal(Literal::Interval(_)) => true,
+            ScalarExpr::Binary { left, right, .. } => {
+                left.contains_interval() || right.contains_interval()
+            }
+            _ => false,
+        }
+    }
+}
+
+fn literal_type(lit: &Literal) -> DataType {
+    match lit {
+        Literal::Null => DataType::Null,
+        Literal::Boolean(_) => DataType::Boolean,
+        Literal::Int128(_) => DataType::Int64, // Default to Int64 for literals
+        Literal::Float64(_) => DataType::Float64,
+        Literal::Decimal128(d) => DataType::Decimal128(d.precision(), d.scale()),
+        Literal::String(_) => DataType::Utf8,
+        Literal::Date32(_) => DataType::Date32,
+        Literal::Interval(_) => DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+        Literal::Struct(fields) => {
+            let arrow_fields = fields
+                .iter()
+                .map(|(name, lit)| Field::new(name, literal_type(lit), true))
+                .collect();
+            DataType::Struct(arrow_fields)
+        }
+    }
+}
+
+fn aggregate_result_type<F, R>(
+    call: &AggregateCall<F>,
+    resolve_type: &mut R,
+) -> Option<DataType>
+where
+    F: Hash + Eq + Copy,
+    R: FnMut(F) -> Option<DataType>,
+{
+    match call {
+        AggregateCall::CountStar | AggregateCall::Count { .. } | AggregateCall::CountNulls(_) => {
+            Some(DataType::Int64)
+        }
+        AggregateCall::Sum { expr, .. } => {
+            let child = expr.infer_result_type(resolve_type)?;
+            Some(match child {
+                DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
+                DataType::Float32 | DataType::Float64 => DataType::Float64,
+                DataType::UInt64 | DataType::Int64 => child,
+                DataType::UInt32
+                | DataType::UInt16
+                | DataType::UInt8
+                | DataType::Int32
+                | DataType::Int16
+                | DataType::Int8 => DataType::Int64,
+                _ => DataType::Float64,
+            })
+        }
+        AggregateCall::Total { expr, .. } | AggregateCall::Avg { expr, .. } => {
+            let child = expr.infer_result_type(resolve_type)?;
+            Some(match child {
+                DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
+                _ => DataType::Float64,
+            })
+        }
+        AggregateCall::Min(expr) | AggregateCall::Max(expr) => {
+            expr.infer_result_type(resolve_type)
+        }
+        AggregateCall::GroupConcat { .. } => Some(DataType::Utf8),
+    }
+}
+
+fn binary_result_type(_op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
+    get_common_type(&lhs, &rhs)
 }
 
 /// Represents an affine transformation `scale * field + offset`.
@@ -229,98 +405,6 @@ impl ScalarEvaluator {
         }
     }
 
-    /// Infer the numeric kind of an expression using only the kinds of its referenced columns.
-    pub fn infer_result_type<F, R>(expr: &ScalarExpr<F>, resolve_type: &mut R) -> Option<DataType>
-    where
-        F: Hash + Eq + Copy,
-        R: FnMut(F) -> Option<DataType>,
-    {
-        match expr {
-            ScalarExpr::Literal(lit) => Some(Self::literal_type(lit)),
-            ScalarExpr::Column(fid) => resolve_type(*fid),
-            ScalarExpr::Binary { left, op, right } => {
-                let left_type = Self::infer_result_type(left, resolve_type)?;
-                let right_type = Self::infer_result_type(right, resolve_type)?;
-                Some(Self::binary_result_type(*op, left_type, right_type))
-            }
-            ScalarExpr::Compare { .. } => Some(DataType::Boolean),
-            ScalarExpr::Not(_) => Some(DataType::Boolean),
-            ScalarExpr::IsNull { .. } => Some(DataType::Boolean),
-            ScalarExpr::Aggregate(_) => Some(DataType::Float64), // TODO: Fix aggregate types
-            ScalarExpr::GetField { .. } => None,
-            ScalarExpr::Cast { data_type, .. } => Some(data_type.clone()),
-            ScalarExpr::Case {
-                branches,
-                else_expr,
-                ..
-            } => {
-                let mut types = Vec::new();
-                for (_, then_expr) in branches {
-                    if let Some(t) = Self::infer_result_type(then_expr, resolve_type) {
-                        types.push(t);
-                    }
-                }
-                if let Some(else_expr) = else_expr {
-                    if let Some(t) = Self::infer_result_type(else_expr, resolve_type) {
-                        types.push(t);
-                    }
-                } else {
-                    // Implicit ELSE NULL
-                    types.push(DataType::Null);
-                }
-
-                if types.is_empty() {
-                    return None;
-                }
-
-                let mut common = types[0].clone();
-                for t in &types[1..] {
-                    common = get_common_type(&common, t);
-                }
-
-                Some(common)
-            }
-            ScalarExpr::Coalesce(items) => {
-                let mut types = Vec::new();
-                for item in items {
-                    if let Some(t) = Self::infer_result_type(item, resolve_type) {
-                        types.push(t);
-                    }
-                }
-                if types.is_empty() {
-                    return None;
-                }
-                let mut common = types[0].clone();
-                for t in &types[1..] {
-                    common = get_common_type(&common, t);
-                }
-                Some(common)
-            }
-            ScalarExpr::Random => Some(DataType::Float64),
-            ScalarExpr::ScalarSubquery(sub) => Some(sub.data_type.clone()),
-        }
-    }
-
-    fn literal_type(lit: &Literal) -> DataType {
-        match lit {
-            Literal::Null => DataType::Null,
-            Literal::Boolean(_) => DataType::Boolean,
-            Literal::Int128(_) => DataType::Int64, // Default to Int64 for literals
-            Literal::Float64(_) => DataType::Float64,
-            Literal::Decimal128(d) => DataType::Decimal128(d.precision(), d.scale()),
-            Literal::String(_) => DataType::Utf8,
-            Literal::Date32(_) => DataType::Date32,
-            Literal::Interval(_) => {
-                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
-            }
-            Literal::Struct(_) => DataType::Struct(arrow::datatypes::Fields::empty()), // TODO: Infer struct fields
-        }
-    }
-
-    fn binary_result_type(_op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
-        get_common_type(&lhs, &rhs)
-    }
-
     /// Evaluate a scalar expression for the row at `idx` using the provided numeric arrays.
     pub fn evaluate_value<F: Hash + Eq + Copy>(
         expr: &ScalarExpr<F>,
@@ -486,7 +570,7 @@ impl ScalarEvaluator {
         len: usize,
         arrays: &NumericArrayMap<F>,
     ) -> LlkvResult<ArrayRef> {
-        let preferred = Self::infer_result_type_from_arrays(expr, arrays);
+        let preferred = expr.infer_result_type_from_arrays(arrays);
 
         if len == 0 {
             return Ok(new_null_array(&preferred, 0));
@@ -527,7 +611,7 @@ impl ScalarEvaluator {
         arrays: &NumericArrayMap<F>,
         _target_type: DataType,
     ) -> LlkvResult<Option<VectorizedExpr>> {
-        if Self::expr_contains_interval(expr) {
+        if expr.contains_interval() {
             return Ok(None);
         }
         match expr {
@@ -542,8 +626,8 @@ impl ScalarEvaluator {
                 Ok(Some(VectorizedExpr::Scalar(array)))
             }
             ScalarExpr::Binary { left, op, right } => {
-                let left_type = Self::infer_result_type_from_arrays(left, arrays);
-                let right_type = Self::infer_result_type_from_arrays(right, arrays);
+                let left_type = left.infer_result_type_from_arrays(arrays);
+                let right_type = right.infer_result_type_from_arrays(arrays);
 
                 let left_vec = Self::try_evaluate_vectorized(left, len, arrays, left_type)?;
                 let right_vec = Self::try_evaluate_vectorized(right, len, arrays, right_type)?;
@@ -573,7 +657,7 @@ impl ScalarEvaluator {
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {
-                let inner_type = Self::infer_result_type_from_arrays(expr, arrays);
+                let inner_type = expr.infer_result_type_from_arrays(arrays);
                 let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays, inner_type)?;
 
                 match inner_vec {
@@ -595,7 +679,7 @@ impl ScalarEvaluator {
                 let mut types = Vec::with_capacity(items.len());
 
                 for item in items {
-                    let item_type = Self::infer_result_type_from_arrays(item, arrays);
+                    let item_type = item.infer_result_type_from_arrays(arrays);
                     // If any item cannot be vectorized, we cannot vectorize the whole Coalesce
                     let vec_expr = match Self::try_evaluate_vectorized(
                         item,
@@ -671,7 +755,11 @@ impl ScalarEvaluator {
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
-                // TODO: Restore constant folding using ScalarValue
+                if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r) {
+                    if let Some(folded) = fold_binary_literals(*op, ll, rr) {
+                        return ScalarExpr::Literal(folded);
+                    }
+                }
                 ScalarExpr::Binary {
                     left: Box::new(l),
                     op: *op,
@@ -680,6 +768,11 @@ impl ScalarEvaluator {
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
+                if let ScalarExpr::Literal(lit) = &inner {
+                    if let Some(folded) = fold_cast_literal(lit, data_type) {
+                        return ScalarExpr::Literal(folded);
+                    }
+                }
                 ScalarExpr::Cast {
                     expr: Box::new(inner),
                     data_type: data_type.clone(),
@@ -817,26 +910,6 @@ impl ScalarEvaluator {
         )
     }
 
-    // TODO: Move to ScalarExpr impl?
-    fn infer_result_type_from_arrays<F: Hash + Eq + Copy>(
-        expr: &ScalarExpr<F>,
-        arrays: &NumericArrayMap<F>,
-    ) -> DataType {
-        let mut resolver = |fid| arrays.get(&fid).map(|a| a.data_type().clone());
-        Self::infer_result_type(expr, &mut resolver).unwrap_or(DataType::Float64)
-    }
-
-    // TODO: Move to ScalarExpr impl?
-    fn expr_contains_interval<F: Hash + Eq + Copy>(expr: &ScalarExpr<F>) -> bool {
-        match expr {
-            ScalarExpr::Literal(Literal::Interval(_)) => true,
-            ScalarExpr::Binary { left, right, .. } => {
-                Self::expr_contains_interval(left) || Self::expr_contains_interval(right)
-            }
-            _ => false,
-        }
-    }
-
     #[allow(dead_code)]
     fn affine_add<F: Eq + Copy>(
         lhs: AffineState<F>,
@@ -922,5 +995,38 @@ impl ScalarEvaluator {
             scale: lhs.scale / denom,
             offset: lhs.offset / denom,
         })
+    }
+}
+
+fn fold_binary_literals(op: BinaryOp, left: &Literal, right: &Literal) -> Option<Literal> {
+    match op {
+        BinaryOp::BitwiseShiftLeft | BinaryOp::BitwiseShiftRight => {
+            let pg_op = match op {
+                BinaryOp::BitwiseShiftLeft => BinaryOperator::PGBitwiseShiftLeft,
+                BinaryOp::BitwiseShiftRight => BinaryOperator::PGBitwiseShiftRight,
+                _ => unreachable!(),
+            };
+            crate::literal::bitshift_literals(pg_op, left, right).ok()
+        }
+        _ => {
+            let l_arr = ScalarEvaluator::literal_to_array(left);
+            let r_arr = ScalarEvaluator::literal_to_array(right);
+            let result = compute_binary(&l_arr, &r_arr, op).ok()?;
+            if result.is_null(0) {
+                Some(Literal::Null)
+            } else {
+                Literal::from_array_ref(&result, 0).ok()
+            }
+        }
+    }
+}
+
+fn fold_cast_literal(lit: &Literal, data_type: &DataType) -> Option<Literal> {
+    let arr = ScalarEvaluator::literal_to_array(lit);
+    let casted = cast::cast(&arr, data_type).ok()?;
+    if casted.is_null(0) {
+        Some(Literal::Null)
+    } else {
+        Literal::from_array_ref(&casted, 0).ok()
     }
 }
