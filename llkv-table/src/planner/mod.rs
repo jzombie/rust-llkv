@@ -1,6 +1,3 @@
-pub mod plan_graph;
-mod program;
-
 use croaring::Treemap;
 use std::cell::RefCell;
 use std::cmp::{self, Ordering};
@@ -71,15 +68,12 @@ use crate::table::{
 };
 use crate::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 
-use self::plan_graph::{
-    PlanEdge, PlanExpression, PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode,
-    PlanNodeId, PlanOperator,
-};
-use self::program::{
-    DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler, ProgramSet,
-    normalize_predicate,
-};
 use crate::stream::{RowIdSource, RowStream, RowStreamBuilder};
+use llkv_plan::{
+    DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, PlanEdge, PlanExpression,
+    PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode, PlanNodeId, PlanOperator,
+    ProgramCompiler, ProgramSet, normalize_predicate,
+};
 
 // NOTE: Planning and execution currently live together; once the dedicated
 // executor crate stabilizes we can migrate these components into `llkv-plan`.
@@ -2445,9 +2439,10 @@ where
         let mut stack: Vec<RowIdSource> = Vec::new();
         let mut domain_cache: FxHashMap<DomainProgramId, Arc<Treemap>> = FxHashMap::default();
 
-        let mut debug_stack_lens: Vec<usize> = Vec::with_capacity(programs.eval.ops.len());
+        let eval_ops = programs.eval_ops();
+        let mut debug_stack_lens: Vec<usize> = Vec::with_capacity(eval_ops.len());
 
-        for op in &programs.eval.ops {
+        for op in eval_ops {
             match op {
                 EvalOp::PushPredicate(filter) => {
                     stack.push(self.collect_row_ids_for_filter(filter)?);
@@ -2605,8 +2600,8 @@ where
         if stack.len() != 1 {
             tracing::error!(
                 stack_len = stack.len(),
-                op_count = programs.eval.ops.len(),
-                ops = ?programs.eval.ops,
+                op_count = eval_ops.len(),
+                ops = ?eval_ops,
                 stack_lens = ?debug_stack_lens,
                 "predicate program stack imbalance",
             );
@@ -2707,12 +2702,11 @@ where
         }
 
         let program = programs
-            .domains
             .domain(domain_id)
             .ok_or_else(|| Error::Internal(format!("missing domain program {domain_id}")))?;
 
         let mut stack: Vec<Treemap> = Vec::new();
-        for op in &program.ops {
+        for op in program.ops() {
             match op {
                 DomainOp::PushFieldAll(field_id) => {
                     stack.push(self.collect_all_row_ids_for_field(*field_id, all_rows_cache)?);

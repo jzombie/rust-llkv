@@ -91,7 +91,8 @@ pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
 pub use view::{ForeignKeyView, TableConstraintSummaryView, TableView};
 
-pub use planner::plan_graph::{
+// TODO: Don't re-export, and call directly
+pub use llkv_plan::{
     PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,
     PlanGraph, PlanGraphBuilder, PlanGraphError, PlanGraphResult, PlanGraphVersion, PlanInput,
     PlanNode, PlanNodeId, PlanOperator,
