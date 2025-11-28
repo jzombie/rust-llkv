@@ -48,7 +48,7 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         // Views are read-only - reject INSERT operations
-        if self.is_view(table.table.table_id())? {
+        if self.is_view(table.table_id())? {
             return Err(Error::InvalidArgumentError(format!(
                 "cannot modify view '{}'",
                 display_name
@@ -59,7 +59,7 @@ where
         if display_name == "keys" {
             tracing::trace!(
                 "\n[KEYS] INSERT starting - table_id={}, context_pager={:p}",
-                table.table.table_id(),
+                table.table_id(),
                 &*self.pager
             );
             tracing::trace!(
@@ -439,7 +439,7 @@ where
         }
 
         let mut conflicting_row_ids = Vec::new();
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
 
         // Helper: get all visible row IDs
         let anchor_field = table
@@ -616,7 +616,7 @@ where
         }
 
         // Scan existing rows for these columns
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_field_ids: Vec<_> = constraint
             .field_ids
             .iter()

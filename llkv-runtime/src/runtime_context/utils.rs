@@ -203,7 +203,7 @@ where
         field_id: FieldId,
         snapshot: TransactionSnapshot,
     ) -> Result<Vec<PlanValue>> {
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
 
@@ -286,7 +286,7 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
 
@@ -377,7 +377,7 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
 
@@ -467,7 +467,7 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_field_ids: Vec<LogicalFieldId> = field_ids
             .iter()
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
@@ -553,7 +553,7 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let mut logical_fields: Vec<LogicalFieldId> =
             Vec::with_capacity(table.schema.columns.len() + 2);
         logical_fields.push(LogicalFieldId::for_mvcc_created_by(table_id));

@@ -38,7 +38,7 @@ where
         };
 
         // Views are read-only - reject DELETE operations
-        if self.is_view(table.table.table_id())? {
+        if self.is_view(table.table_id())? {
             return Err(Error::InvalidArgumentError(format!(
                 "cannot modify view '{}'",
                 display_name

@@ -34,7 +34,7 @@ where
         };
 
         // Views are read-only - reject TRUNCATE operations
-        if self.is_view(table.table.table_id())? {
+        if self.is_view(table.table_id())? {
             return Err(Error::InvalidArgumentError(format!(
                 "cannot modify view '{}'",
                 display_name
@@ -54,7 +54,7 @@ where
     ) -> Result<RuntimeStatementResult<P>> {
         // Check if this table is referenced by foreign keys (including self-references)
         // TRUNCATE is not allowed on tables with incoming FK references unless CASCADE is specified
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let referencing_fks = self.constraint_service.referencing_foreign_keys(table_id)?;
 
         if !referencing_fks.is_empty() {

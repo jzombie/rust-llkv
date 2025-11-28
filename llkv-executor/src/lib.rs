@@ -98,7 +98,7 @@ pub use translation::{
 };
 pub use types::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
-    ExecutorTableProvider,
+    ExecutorTableProvider, StorageTable, TableStorageAdapter,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -464,7 +464,7 @@ where
         column.name.clone()
     };
     projections.push(ScanProjection::from(StoreProjection::with_alias(
-        LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+        LogicalFieldId::for_user(table.table_id(), column.field_id),
         alias,
     )));
     cache.insert(column.field_id, projection_index);
@@ -1168,7 +1168,7 @@ where
 
             if has_joins && tables_with_handles.len() == 2 {
                 // Use llkv-join for 2-table joins (including LEFT JOIN)
-                use llkv_join::{JoinOptions, TableJoinExt};
+                use llkv_join::JoinOptions;
 
                 let (left_ref, left_table) = &tables_with_handles[0];
                 let (right_ref, right_table) = &tables_with_handles[1];
@@ -1256,16 +1256,17 @@ where
                     }
 
                     let mut result_batches = Vec::new();
-                    left_table.table.join_stream(
-                        &right_table.table,
+                    let mut on_batch = |batch: RecordBatch| {
+                        result_batches.push(batch);
+                    };
+                    left_table.storage().join_stream(
+                        right_table.storage().as_ref(),
                         &join_keys,
                         &JoinOptions {
                             join_type,
                             ..Default::default()
                         },
-                        |batch| {
-                            result_batches.push(batch);
-                        },
+                        &mut on_batch,
                     )?;
 
                     TableCrossProductData {
@@ -2120,7 +2121,7 @@ where
     let mut projections = Vec::with_capacity(table.schema.columns.len());
     for column in &table.schema.columns {
         projections.push(ScanProjection::from(StoreProjection::with_alias(
-            LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+            LogicalFieldId::for_user(table.table_id(), column.field_id),
             column.name.clone(),
         )));
     }
@@ -2129,16 +2130,17 @@ where
     let filter_expr = full_table_scan_filter(filter_field);
 
     let mut batches = Vec::new();
-    table.table.scan_stream(
-        projections,
+    let mut on_batch = |batch| {
+        batches.push(batch);
+    };
+    table.storage().scan_stream(
+        &projections,
         &filter_expr,
         ScanStreamOptions {
             include_nulls: true,
             ..ScanStreamOptions::default()
         },
-        |batch| {
-            batches.push(batch);
-        },
+        &mut on_batch,
     )?;
 
     Ok(batches)
@@ -4244,11 +4246,11 @@ where
         let mut projected_batches: Vec<RecordBatch> = Vec::new();
         let mut scan_error: Option<Error> = None;
 
-        table.table.scan_stream(
-            base_projections.clone(),
+        table.storage().scan_stream(
+            &base_projections,
             &pushdown_filter,
             options,
-            |batch| {
+            &mut |batch| {
                 if scan_error.is_some() {
                     return;
                 }
@@ -5531,7 +5533,7 @@ where
                 let proj_idx = projections.len();
                 spec_to_projection.push(Some(proj_idx));
                 projections.push(ScanProjection::from(StoreProjection::with_alias(
-                    LogicalFieldId::for_user(table.table.table_id(), field_id),
+                    LogicalFieldId::for_user(table.table_id(), field_id),
                     table
                         .schema
                         .column_by_field_id(field_id)
@@ -5550,7 +5552,7 @@ where
                 )
             })?;
             projections.push(ScanProjection::from(StoreProjection::with_alias(
-                LogicalFieldId::for_user(table.table.table_id(), field_id),
+                LogicalFieldId::for_user(table.table_id(), field_id),
                 table
                     .schema
                     .column_by_field_id(field_id)
@@ -5613,14 +5615,14 @@ where
         }
 
         let mut error: Option<Error> = None;
-        match table.table.scan_stream(
-            projections,
+        match table.storage().scan_stream(
+            &projections,
             &filter_expr,
             ScanStreamOptions {
                 row_id_filter: row_filter.clone(),
                 ..options
             },
-            |batch| {
+            &mut |batch| {
                 if error.is_some() {
                     return;
                 }
@@ -6508,7 +6510,7 @@ where
                 )
             })?;
             projections.push(ScanProjection::from(StoreProjection::with_alias(
-                LogicalFieldId::for_user(table.table.table_id(), field_id),
+                LogicalFieldId::for_user(table.table_id(), field_id),
                 table
                     .schema
                     .column_by_field_id(field_id)
@@ -6542,14 +6544,14 @@ where
         }
 
         let mut error: Option<Error> = None;
-        match table.table.scan_stream(
-            projections,
+        match table.storage().scan_stream(
+            &projections,
             &filter_expr,
             ScanStreamOptions {
                 row_id_filter: row_filter.clone(),
                 ..base_options
             },
-            |batch| {
+            &mut |batch| {
                 if error.is_some() {
                     return;
                 }
@@ -11344,7 +11346,7 @@ where
             .unwrap_or(table_ref.table.as_str());
         let qualified_name = format!("{}.{}.{}", table_ref.schema, table_component, column.name);
         projections.push(ScanProjection::from(StoreProjection::with_alias(
-            LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+            LogicalFieldId::for_user(table.table_id(), column.field_id),
             qualified_name.clone(),
         )));
         fields.push(Field::new(
@@ -11406,14 +11408,14 @@ where
     };
 
     let mut raw_batches = Vec::new();
-    table.table.scan_stream(
-        projections,
+    table.storage().scan_stream(
+        &projections,
         &filter_expr,
         ScanStreamOptions {
             include_nulls: true,
             ..ScanStreamOptions::default()
         },
-        |batch| {
+        &mut |batch| {
             raw_batches.push(batch);
         },
     )?;

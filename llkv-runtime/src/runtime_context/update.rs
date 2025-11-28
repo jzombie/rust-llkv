@@ -52,7 +52,7 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         // Views are read-only - reject UPDATE operations
-        if self.is_view(table.table.table_id())? {
+        if self.is_view(table.table_id())? {
             return Err(Error::InvalidArgumentError(format!(
                 "cannot modify view '{}'",
                 display_name
@@ -161,7 +161,7 @@ where
         }
 
         let row_count = row_ids.cardinality();
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
             .columns
@@ -516,7 +516,7 @@ where
         }
 
         let row_count = row_ids.cardinality();
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
             .columns
@@ -810,7 +810,7 @@ where
 
         let row_count = row_ids.cardinality();
         tracing::debug!(
-            table_id = table.table.table_id(),
+            table_id = table.table_id(),
             row_count,
             ?row_ids,
             "update_rows_in_place: rewriting rows",

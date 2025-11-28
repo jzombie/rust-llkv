@@ -9,6 +9,8 @@ use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
+use crate::types::StorageTable;
+
 /// Executor's view of a table, including schema and metadata.
 ///
 /// This wraps the underlying `llkv_table::Table` and provides executor-specific
@@ -19,6 +21,8 @@ where
 {
     /// Underlying physical table from llkv-table
     pub table: Arc<llkv_table::table::Table<P>>,
+    /// Storage adapter used by the executor; initially wraps `table`.
+    pub storage: Arc<dyn StorageTable<P>>,
     /// Executor-level schema with field ID mappings
     pub schema: Arc<ExecutorSchema>,
     /// Next available row ID for inserts
@@ -36,6 +40,16 @@ where
     /// Get a snapshot of multi-column unique constraints.
     pub fn multi_column_uniques(&self) -> Vec<ExecutorMultiColumnUnique> {
         self.multi_column_uniques.read().unwrap().clone()
+    }
+
+    /// Get the storage abstraction for scans/joins.
+    pub fn storage(&self) -> Arc<dyn StorageTable<P>> {
+        Arc::clone(&self.storage)
+    }
+
+    /// Convenience accessor for the table's identifier.
+    pub fn table_id(&self) -> llkv_table::types::TableId {
+        self.storage.table_id()
     }
 
     /// Replace all multi-column unique constraints.

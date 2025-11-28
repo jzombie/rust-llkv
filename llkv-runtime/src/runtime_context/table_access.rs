@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_executor::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
-    translation,
+    TableStorageAdapter, translation,
 };
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
@@ -82,7 +82,7 @@ where
         }
 
         // Scan to get the column data without materializing full columns
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
 
         let mut fields: Vec<Field> = Vec::with_capacity(table.schema.columns.len() + 1);
         let mut logical_fields: Vec<LogicalFieldId> =
@@ -191,7 +191,7 @@ where
                 tracing::trace!(
                     "=== LOOKUP_TABLE '{}' (cached) table_id={} columns={} context_pager={:p} ===",
                     canonical_name,
-                    table.table.table_id(),
+                    table.table_id(),
                     table.schema.columns.len(),
                     &*self.pager
                 );
@@ -435,8 +435,10 @@ where
         // Fallback to 0 for truly empty tables
         let total_rows = table.total_rows().unwrap_or(0);
 
+        let table = Arc::new(table);
         let executor_table = Arc::new(ExecutorTable {
-            table: Arc::new(table),
+            storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table))),
+            table,
             schema: exec_schema,
             next_row_id: AtomicU64::new(next_row_id),
             total_rows: AtomicU64::new(total_rows),
@@ -507,7 +509,7 @@ where
                     tracing::warn!(
                         "[CATALOG] Skipping persisted multi-column UNIQUE {:?} for table_id={} missing field_id {}",
                         entry.index_name,
-                        table.table.table_id(),
+                        table.table_id(),
                         field_id
                     );
                     continue 'outer;
@@ -550,6 +552,7 @@ where
         let uniques = table.multi_column_uniques();
 
         Some(Arc::new(ExecutorTable {
+            storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table.table))),
             table: Arc::clone(&table.table),
             schema,
             next_row_id: AtomicU64::new(next_row_id),

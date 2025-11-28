@@ -44,7 +44,7 @@ where
             return Ok(());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
         let logical_fields: Arc<[LogicalFieldId]> = Arc::from([deleted_lfid]);
 
@@ -146,7 +146,7 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_field_ids: Vec<LogicalFieldId> = field_ids
             .iter()
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
@@ -215,7 +215,7 @@ where
             .collect();
 
         self.constraint_service.validate_insert_foreign_keys(
-            table.table.table_id(),
+            table.table_id(),
             &schema_field_ids,
             column_order,
             rows,
@@ -247,7 +247,7 @@ where
         }
 
         self.constraint_service.validate_update_foreign_keys(
-            table.table.table_id(),
+            table.table_id(),
             row_ids,
             updated_field_ids,
             |request| {
@@ -283,7 +283,7 @@ where
         }
 
         self.constraint_service.validate_delete_foreign_keys(
-            table.table.table_id(),
+            table.table_id(),
             row_ids,
             |request| {
                 self.collect_row_values_for_ids(
