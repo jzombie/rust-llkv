@@ -9,8 +9,8 @@ use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::debug::ColumnStoreDebug;
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 fn seed_small_store() -> ColumnStore<MemPager> {
     let pager = Arc::new(MemPager::new());

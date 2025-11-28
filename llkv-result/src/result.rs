@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::error::Error;
 
 /// Result type alias used throughout LLKV.
 ///

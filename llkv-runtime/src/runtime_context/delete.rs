@@ -6,15 +6,16 @@
 //! - MVCC-based soft deletion
 
 use crate::{RuntimeStatementResult, canonical_table_name};
+use croaring::Treemap;
 use llkv_executor::{ExecutorTable, translation};
 use llkv_expr::Expr as LlkvExpr;
 use llkv_plan::DeletePlan;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::RowId;
 use llkv_transaction::{TransactionSnapshot, mvcc};
 use simd_r_drive_entry_handle::EntryHandle;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::RuntimeContext;
 
@@ -76,7 +77,7 @@ where
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         tracing::trace!(
             table = %display_name,
-            rows = row_ids.len(),
+            rows = row_ids.cardinality(),
             "delete_filtered_rows collected row ids"
         );
         self.apply_delete(table, display_name, canonical_name, row_ids, snapshot, true)
@@ -116,7 +117,7 @@ where
         table: &ExecutorTable<P>,
         display_name: String,
         _canonical_name: String,
-        row_ids: Vec<RowId>,
+        row_ids: Treemap,
         snapshot: TransactionSnapshot,
         enforce_foreign_keys: bool,
     ) -> Result<RuntimeStatementResult<P>> {
@@ -133,19 +134,17 @@ where
 
         self.detect_delete_conflicts(table, &display_name, &row_ids, snapshot)?;
 
-        let removed = row_ids.len();
+        let removed = row_ids.cardinality();
 
         // Build DELETE batch using helper
-        let batch = mvcc::build_delete_batch(row_ids.clone(), snapshot.txn_id)?;
+        let batch = mvcc::build_delete_batch(row_ids, snapshot.txn_id)?;
         table.table.append(&batch)?;
 
-        let removed_u64 = u64::try_from(removed)
-            .map_err(|_| Error::InvalidArgumentError("row count exceeds supported range".into()))?;
-        table.total_rows.fetch_sub(removed_u64, Ordering::SeqCst);
+        table.total_rows.fetch_sub(removed, Ordering::SeqCst);
 
         Ok(RuntimeStatementResult::Delete {
             table_name: display_name,
-            rows_deleted: removed,
+            rows_deleted: removed as usize,
         })
     }
 }

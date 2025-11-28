@@ -26,10 +26,6 @@
 //!   Manages column descriptors, metadata catalogs, and coordinates with the pager
 //!   for persistent storage.
 //!
-//! - **[`LogicalFieldId`](types::LogicalFieldId)**: Namespaced identifier for columns.
-//!   Combines a namespace (user data, row ID shadow, MVCC metadata), table ID, and
-//!   field ID into a single 64-bit value to prevent collisions.
-//!
 //! - **[`ScanBuilder`]**: Builder pattern for constructing column scans with various
 //!   options (filters, ordering, row ID inclusion).
 //!
@@ -447,7 +443,6 @@ pub mod gather;
 pub mod parallel;
 pub mod serialization;
 pub mod store;
-pub mod types;
 
 pub use llkv_result::{Error, Result};
 pub use store::{

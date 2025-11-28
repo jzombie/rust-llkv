@@ -6,14 +6,13 @@
 //! unmodified while still producing a structured manifest the caller can inspect.
 
 use llkv::Error as LlkvError;
-use llkv_expr::decimal::DecimalValue;
 use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue, parse_date32_literal};
 use llkv_sql::{
-    SqlEngine, SqlTypeFamily, canonical_table_ident, classify_sql_data_type,
-    normalize_table_constraint, order_create_tables_by_foreign_keys,
-    tpch::strip_tpch_connect_statements,
+    ObjectNameExt, OrderCreateTablesExt, SqlEngine, SqlTypeFamily, TableConstraintExt,
+    classify_sql_data_type, tpch::strip_tpch_connect_statements,
 };
 use llkv_table::ConstraintEnforcementMode;
+use llkv_types::decimal::DecimalValue;
 use regex::Regex;
 use sqlparser::ast::{
     AlterTableOperation, CreateTable, Ident, ObjectNamePart, Statement, TableConstraint,
@@ -172,13 +171,13 @@ impl TpchToolkit {
         let constraint_map = parse_referential_integrity(&ri_sql)?;
         apply_constraints_to_tables(&mut create_tables, &constraint_map);
 
-        let ordered_tables = order_create_tables_by_foreign_keys(create_tables);
+        let ordered_tables = create_tables.order_by_foreign_keys();
 
         let mut tables_by_name = HashMap::with_capacity(ordered_tables.len());
         let mut creation_order = Vec::with_capacity(ordered_tables.len());
 
         for table in ordered_tables {
-            let table_name = canonical_table_ident(&table.name).ok_or_else(|| {
+            let table_name = table.name.canonical_ident().ok_or_else(|| {
                 TpchError::Parse("CREATE TABLE statement missing canonical name".into())
             })?;
 
@@ -908,7 +907,7 @@ fn parse_referential_integrity(ri_sql: &str) -> Result<HashMap<String, Vec<Table
             name, operations, ..
         } = statement
         {
-            let table_name = canonical_table_ident(&name).unwrap_or_default();
+            let table_name = name.canonical_ident().unwrap_or_default();
             let bucket = constraints.entry(table_name).or_default();
             for op in operations {
                 if let AlterTableOperation::AddConstraint { constraint, .. } = op {
@@ -927,11 +926,11 @@ fn apply_constraints_to_tables(
     constraints: &HashMap<String, Vec<TableConstraint>>,
 ) {
     for table in tables {
-        let table_name = canonical_table_ident(&table.name).unwrap_or_default();
+        let table_name = table.name.canonical_ident().unwrap_or_default();
         if let Some(entries) = constraints.get(&table_name) {
             table
                 .constraints
-                .extend(entries.iter().cloned().map(normalize_table_constraint));
+                .extend(entries.iter().cloned().map(|c| c.normalize()));
         }
     }
 }
@@ -1141,7 +1140,7 @@ fn parse_decimal_literal(raw: &str, target_scale: i8, column_name: &str) -> Resu
     if scale == target_scale {
         Ok(decimal)
     } else {
-        decimal.rescale(target_scale).map_err(|err| {
+        llkv_compute::scalar::decimal::rescale(decimal, target_scale).map_err(|err| {
             TpchError::Parse(format!(
                 "unable to rescale decimal literal '{}' for column {}: {}",
                 raw, column_name, err

@@ -1,6 +1,7 @@
 pub mod plan_graph;
 mod program;
 
+use croaring::Treemap;
 use std::cell::RefCell;
 use std::cmp::{self, Ordering};
 use std::convert::TryFrom;
@@ -9,14 +10,12 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-    IntervalMonthDayNanoArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
-    UInt64Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    StringArray, UInt64Array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
-use arrow_array::types::{Int32Type, Int64Type, IntervalMonthDayNanoType};
-use time::{Date, Month};
+use arrow_array::types::{Int32Type, Int64Type};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
@@ -35,20 +34,28 @@ use llkv_column_map::ScanBuilder;
 use llkv_column_map::scan::{FilterPrimitive, FilterRun, dense_row_runs};
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
-use llkv_column_map::types::{LogicalFieldId, Namespace};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
-use llkv_expr::decimal::DecimalValue;
-use llkv_expr::literal::{FromLiteral, IntervalValue, Literal};
+use llkv_compute::analysis::{
+    computed_expr_prefers_float, computed_expr_requires_numeric, get_field_dtype,
+    scalar_expr_contains_coalesce,
+};
+use llkv_compute::eval::ScalarExprTypeExt;
+use llkv_compute::projection::{
+    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
+    synthesize_computed_literal_array,
+};
+use llkv_compute::scalar::interval::compare_interval_values;
+use llkv_compute::{RowIdFilter, compare_option_values, sort_row_ids_by_primitive};
+use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
 use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
-use llkv_plan::date::{
-    add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
-};
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::decimal::DecimalValue;
+use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -56,9 +63,8 @@ use llkv_storage::pager::Pager;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use crate::reserved::is_information_schema_table;
-use crate::scalar_eval::{
-    NumericArray, NumericArrayMap, NumericKernels, NumericKind, NumericValue,
-};
+use crate::{NumericArrayMap, NumericKernels};
+
 use crate::schema_ext::CachedSchema;
 use crate::table::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions, Table,
@@ -73,7 +79,7 @@ use self::program::{
     DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler, ProgramSet,
     normalize_predicate,
 };
-use crate::stream::{RowStream, RowStreamBuilder};
+use crate::stream::{RowIdSource, RowStream, RowStreamBuilder};
 
 // NOTE: Planning and execution currently live together; once the dedicated
 // executor crate stabilizes we can migrate these components into `llkv-plan`.
@@ -487,11 +493,7 @@ pub(crate) struct ColumnProjectionInfo {
     output_name: String,
 }
 
-#[derive(Clone)]
-pub(crate) struct ComputedProjectionInfo {
-    expr: ScalarExpr<FieldId>,
-    alias: String,
-}
+pub(crate) type ComputedProjectionInfo = ComputedLiteralInfo<FieldId>;
 
 #[derive(Clone)]
 pub(crate) enum ProjectionEval {
@@ -576,7 +578,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     table: &'a Table<P>,
-    row_id_cache: RefCell<Option<Vec<RowId>>>,
+    row_id_cache: RefCell<Option<Treemap>>,
 }
 
 pub(crate) struct TablePlanner<'a, P>
@@ -693,7 +695,7 @@ where
                     project_node.add_projection(PlanExpression::new(format!(
                         "{} := {}",
                         alias,
-                        format_scalar_expr(expr)
+                        expr.format_display()
                     )));
                     project_node
                         .add_field(PlanField::new(alias.clone(), "Float64").with_nullability(true));
@@ -738,16 +740,16 @@ where
         }
     }
 
-    fn table_row_ids(&self) -> LlkvResult<Vec<RowId>> {
-        if let Some(cached) = self.row_id_cache.borrow().as_ref() {
-            return Ok(cached.clone());
+    fn table_row_ids(&self) -> LlkvResult<std::cell::Ref<'_, Treemap>> {
+        if self.row_id_cache.borrow().is_none() {
+            let computed = self.compute_table_row_ids()?;
+            *self.row_id_cache.borrow_mut() = Some(computed);
         }
-        let computed = self.compute_table_row_ids()?;
-        *self.row_id_cache.borrow_mut() = Some(computed.clone());
-        Ok(computed)
+        let borrow = self.row_id_cache.borrow();
+        Ok(std::cell::Ref::map(borrow, |opt| opt.as_ref().unwrap()))
     }
 
-    fn compute_table_row_ids(&self) -> LlkvResult<Vec<RowId>> {
+    fn compute_table_row_ids(&self) -> LlkvResult<Treemap> {
         use llkv_column_map::store::rowid_fid;
 
         let fields = self
@@ -755,7 +757,7 @@ where
             .store()
             .user_field_ids_for_table(self.table.table_id());
         if fields.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
 
         let expected = self
@@ -787,20 +789,19 @@ where
             {
                 Ok(_) => {
                     // Success! We got all row IDs from the shadow column
-                    let mut row_ids = collector.into_inner();
-                    row_ids.sort_unstable();
+                    let row_ids = collector.into_inner();
                     tracing::trace!(
                         "[PERF] Fast path: collected {} row_ids from shadow column for table {}",
-                        row_ids.len(),
+                        row_ids.cardinality(),
                         self.table.table_id()
                     );
-                    if row_ids.len() as u64 == expected {
+                    if row_ids.cardinality() == expected {
                         return Ok(row_ids);
                     }
                     tracing::debug!(
                         "[PERF] Shadow column for table {} returned {} row_ids but expected {}; falling back",
                         self.table.table_id(),
-                        row_ids.len(),
+                        row_ids.cardinality(),
                         expected
                     );
                 }
@@ -827,8 +828,7 @@ where
         // - The shadow column doesn't exist (for whatever reason)
         // - Columns may have different row_id sets (sparse columns)
         // - We need the union of all visible rows
-        let mut seen: FxHashSet<RowId> = FxHashSet::default();
-        let mut collected: Vec<RowId> = Vec::new();
+        let mut collected = Treemap::new();
 
         for lfid in fields.clone() {
             let mut collector = RowIdScanCollector::default();
@@ -839,22 +839,19 @@ where
                 })
                 .run(&mut collector)?;
             let rows = collector.into_inner();
-            for rid in rows {
-                if seen.insert(rid) {
-                    collected.push(rid);
-                }
-            }
-            if expected > 0 && (seen.len() as u64) >= expected {
+            collected.or_inplace(&rows);
+
+            if expected > 0 && collected.cardinality() >= expected {
                 break;
             }
         }
 
-        collected.sort_unstable();
         tracing::trace!(
             "[PERF] Multi-column scan: collected {} row_ids for table {}",
-            collected.len(),
+            collected.cardinality(),
             self.table.table_id()
         );
+
         Ok(collected)
     }
 
@@ -942,7 +939,9 @@ where
 
         let mut process_chunk = |mut chunk: Vec<RowId>| -> LlkvResult<()> {
             if let Some(filter) = options.row_id_filter.as_ref() {
-                chunk = filter.filter(self.table, chunk)?;
+                let bitmap: Treemap = chunk.iter().copied().collect();
+                let filtered = filter.filter(self.table, bitmap)?;
+                chunk = filtered.iter().collect();
             }
             if chunk.is_empty() {
                 return Ok(());
@@ -994,18 +993,23 @@ where
             let row_count = usize::try_from(total_rows).map_err(|_| {
                 Error::InvalidArgumentError("table row count exceeds supported range".into())
             })?;
-            emit_synthetic_null_batch(projection_evals, out_schema, row_count, on_batch)?;
+            let projection_literals = build_projection_literals(projection_evals, out_schema);
+            if let Some(batch) =
+                emit_synthetic_null_batch(&projection_literals, out_schema, row_count)?
+            {
+                on_batch(batch);
+            }
         }
 
         Ok(StreamOutcome::Handled)
     }
 
-    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
+    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Treemap> {
         let all_row_ids = self.table_row_ids()?;
         if all_row_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
-        filter_row_ids_by_operator(&all_row_ids, op)
+        all_row_ids.filter_by_operator(op)
     }
 
     fn execute<'expr, F>(&self, plan: PlannedScan<'expr, P>, mut on_batch: F) -> LlkvResult<()>
@@ -1049,7 +1053,7 @@ where
                             self.table.table_id()
                         )));
                     }
-                    if lfid.namespace() != Namespace::UserData {
+                    if lfid.namespace() != LogicalStorageNamespace::UserData {
                         return Err(Error::InvalidArgumentError(format!(
                             "Projection {:?} must target user data namespace",
                             lfid
@@ -1085,7 +1089,7 @@ where
                     for field_id in fields_set.iter().copied() {
                         numeric_fields.insert(field_id);
                         let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
-                        if lfid.namespace() != Namespace::UserData {
+                        if lfid.namespace() != LogicalStorageNamespace::UserData {
                             return Err(Error::InvalidArgumentError(format!(
                                 "Computed projection field {:?} must target user data namespace",
                                 lfid
@@ -1145,9 +1149,9 @@ where
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     } else {
                         let dtype = match &info.expr {
-                            ScalarExpr::Literal(Literal::Integer(_)) => DataType::Int64,
-                            ScalarExpr::Literal(Literal::Float(_)) => DataType::Float64,
-                            ScalarExpr::Literal(Literal::Decimal(value)) => {
+                            ScalarExpr::Literal(Literal::Int128(_)) => DataType::Int64,
+                            ScalarExpr::Literal(Literal::Float64(_)) => DataType::Float64,
+                            ScalarExpr::Literal(Literal::Decimal128(value)) => {
                                 DataType::Decimal128(value.precision(), value.scale())
                             }
                             ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
@@ -1177,32 +1181,21 @@ where
                             | ScalarExpr::Coalesce(_) => {
                                 let mut resolver = |fid: FieldId| {
                                     let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                                    lfid_dtypes
-                                        .get(&lfid)
-                                        .and_then(NumericKernels::kind_for_data_type)
+                                    lfid_dtypes.get(&lfid).cloned()
                                 };
 
-                                let inferred_kind = NumericKernels::infer_result_kind_from_types(
-                                    &info.expr,
-                                    &mut resolver,
-                                );
+                                let inferred_type = info.expr.infer_result_type(&mut resolver);
 
-                                let result_kind = if let Some(kind) = inferred_kind {
-                                    kind
+                                if let Some(dtype) = inferred_type {
+                                    dtype
                                 } else if computed_expr_prefers_float(
                                     &info.expr,
                                     self.table.table_id(),
                                     &lfid_dtypes,
                                 )? {
-                                    NumericKind::Float
+                                    DataType::Float64
                                 } else {
-                                    NumericKind::Integer
-                                };
-
-                                match result_kind {
-                                    NumericKind::Integer => DataType::Int64,
-                                    NumericKind::Float => DataType::Float64,
-                                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
+                                    DataType::Int64
                                 }
                             }
                             ScalarExpr::Column(fid) => {
@@ -1263,7 +1256,7 @@ where
         }
 
         let fusion_cache = PredicateFusionCache::from_expr(filter_expr.as_ref());
-        let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
+        let mut all_rows_cache: FxHashMap<FieldId, Treemap> = FxHashMap::default();
 
         // Intentionally skip logging the full filter expression here; deeply nested
         // expressions can exceed the default thread stack when rendered recursively.
@@ -1283,7 +1276,7 @@ where
         let is_info_schema = is_information_schema_table(self.table.table_id());
         let is_trivial = is_trivial_filter(filter_expr.as_ref());
 
-        let mut row_ids = if is_trivial {
+        let row_ids_source = if is_trivial {
             use arrow::datatypes::UInt64Type;
             use llkv_expr::typed_predicate::Predicate;
             let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table.table_id());
@@ -1291,13 +1284,19 @@ where
                 "[SCAN_STREAM] MVCC + trivial filter: scanning created_by column for all row IDs"
             );
             // Get all rows where created_by exists (which is all rows that have been written)
-            self.table
+            let rows = self
+                .table
                 .store()
-                .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?
+                .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)?;
+            RowIdSource::Vector(rows)
         } else if is_info_schema {
             let row_ids =
                 self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?;
-            if row_ids.is_empty() {
+            let is_empty = match &row_ids {
+                RowIdSource::Bitmap(b) => b.is_empty(),
+                RowIdSource::Vector(v) => v.is_empty(),
+            };
+            if is_empty {
                 tracing::debug!(
                     "[SCAN_STREAM] information_schema table {}: predicate returned 0 rows",
                     self.table.table_id()
@@ -1308,21 +1307,53 @@ where
             self.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)?
         };
 
+        let row_count = match &row_ids_source {
+            RowIdSource::Bitmap(b) => b.cardinality(),
+            RowIdSource::Vector(v) => v.len() as u64,
+        };
+
         tracing::trace!(
             "[SCAN_STREAM] collected {} row_ids, has_row_filter={}",
-            row_ids.len(),
+            row_count,
             options.row_id_filter.is_some()
         );
-        if let Some(filter) = options.row_id_filter.as_ref() {
-            let before_len = row_ids.len();
-            row_ids = filter.filter(self.table, row_ids)?;
+
+        let final_row_ids: RowIdSource = if let Some(filter) = options.row_id_filter.as_ref() {
+            let bitmap = match row_ids_source {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
+            };
+            let before_len = bitmap.cardinality();
+            let filtered = filter.filter(self.table, bitmap)?;
             tracing::trace!(
                 "[SCAN_STREAM] after MVCC filter: {} -> {} row_ids",
                 before_len,
-                row_ids.len()
+                filtered.cardinality()
             );
-        }
-        if row_ids.is_empty() {
+
+            if let Some(order_spec) = options.order {
+                let sorted = self.sort_row_ids_with_order(&filtered, order_spec)?;
+                RowIdSource::Vector(sorted)
+            } else {
+                RowIdSource::Bitmap(filtered)
+            }
+        } else if let Some(order_spec) = options.order {
+            let bitmap = match row_ids_source {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
+            };
+            let sorted = self.sort_row_ids_with_order(&bitmap, order_spec)?;
+            RowIdSource::Vector(sorted)
+        } else {
+            row_ids_source
+        };
+
+        let is_empty = match &final_row_ids {
+            RowIdSource::Bitmap(b) => b.is_empty(),
+            RowIdSource::Vector(v) => v.is_empty(),
+        };
+
+        if is_empty {
             tracing::trace!(
                 "[SCAN_STREAM] row_ids is empty after filtering, returning early (no synthetic batch)"
             );
@@ -1334,18 +1365,14 @@ where
                 let row_count = usize::try_from(total_rows).map_err(|_| {
                     Error::InvalidArgumentError("table row count exceeds supported range".into())
                 })?;
-                emit_synthetic_null_batch(
-                    &projection_evals,
-                    &out_schema,
-                    row_count,
-                    &mut on_batch,
-                )?;
+                let projection_literals = build_projection_literals(&projection_evals, &out_schema);
+                if let Some(batch) =
+                    emit_synthetic_null_batch(&projection_literals, &out_schema, row_count)?
+                {
+                    on_batch(batch);
+                }
             }
             return Ok(());
-        }
-
-        if let Some(order_spec) = options.order {
-            row_ids = self.sort_row_ids_with_order(row_ids, order_spec)?;
         }
 
         let table_id = self.table.table_id();
@@ -1367,7 +1394,7 @@ where
             Arc::clone(&numeric_fields),
             requires_numeric,
             null_policy,
-            row_ids,
+            final_row_ids,
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -1412,7 +1439,7 @@ where
                     )));
                 }
 
-                if !is_full_range_filter(filter_expr, p.logical_field_id.field_id()) {
+                if !filter_expr.is_full_range_for(&p.logical_field_id.field_id()) {
                     return Ok(StreamOutcome::Fallback);
                 }
 
@@ -1447,11 +1474,11 @@ where
 
                 let field_id = *fields_set.iter().next().unwrap();
                 let lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
-                if !is_full_range_filter(filter_expr, field_id) {
+                if !filter_expr.is_full_range_for(&field_id) {
                     return Ok(StreamOutcome::Fallback);
                 }
 
-                if lfid.namespace() != Namespace::UserData {
+                if lfid.namespace() != LogicalStorageNamespace::UserData {
                     return Err(Error::InvalidArgumentError(format!(
                         "Computed projection field {:?} must target user data namespace",
                         lfid
@@ -1461,24 +1488,16 @@ where
                 let field_alias = alias.clone();
                 let dtype = self.table.store().data_type(lfid)?;
 
-                let column_kind =
-                    NumericKernels::kind_for_data_type(&dtype).unwrap_or(NumericKind::Float);
                 let mut resolver = |fid: FieldId| {
                     if fid == field_id {
-                        Some(column_kind)
+                        Some(dtype.clone())
                     } else {
                         None
                     }
                 };
-                let result_kind =
-                    NumericKernels::infer_result_kind_from_types(&simplified, &mut resolver)
-                        .unwrap_or(NumericKind::Float);
-
-                let output_dtype = match result_kind {
-                    NumericKind::Integer => DataType::Int64,
-                    NumericKind::Float => DataType::Float64,
-                    NumericKind::Decimal => DataType::Float64, // Convert decimal to float for now
-                };
+                let output_dtype = simplified
+                    .infer_result_type(&mut resolver)
+                    .unwrap_or(DataType::Float64);
 
                 if let Some(passthrough_fid) = NumericKernels::passthrough_column(&simplified) {
                     if passthrough_fid != field_id {
@@ -1505,10 +1524,13 @@ where
                             "affine extraction resolved to unexpected field".into(),
                         ));
                     }
-                    if !is_supported_numeric(&dtype) {
+                    if !NumericKernels::is_supported_numeric(&dtype) {
                         return Ok(StreamOutcome::Fallback);
                     }
-                    if matches!(result_kind, NumericKind::Float) {
+                    if matches!(
+                        output_dtype,
+                        DataType::Float16 | DataType::Float32 | DataType::Float64
+                    ) {
                         let schema = Arc::new(Schema::new(vec![Field::new(
                             field_alias.clone(),
                             output_dtype.clone(),
@@ -1551,16 +1573,16 @@ where
         }
     }
 
-    fn collect_row_ids_for_filter(&self, filter: &OwnedFilter) -> LlkvResult<Vec<RowId>> {
+    fn collect_row_ids_for_filter(&self, filter: &OwnedFilter) -> LlkvResult<RowIdSource> {
         if filter.field_id == ROW_ID_FIELD_ID {
             let op = filter.op.to_operator();
             let row_ids = self.collect_row_ids_for_rowid_filter(&op)?;
             tracing::debug!(
                 field = "rowid",
-                row_count = row_ids.len(),
+                row_count = row_ids.cardinality(),
                 "collect_row_ids_for_filter rowid"
             );
-            return Ok(row_ids);
+            return Ok(RowIdSource::Bitmap(row_ids));
         }
 
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), filter.field_id);
@@ -1572,25 +1594,25 @@ where
                 let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
                 tracing::debug!(
                     field = ?filter_lfid,
-                    row_count = non_null.len(),
+                    row_count = non_null.cardinality(),
                     "collect_row_ids_for_filter NOT NULL fast path"
                 );
-                return Ok(non_null);
+                return Ok(RowIdSource::Bitmap(non_null));
             }
             OwnedOperator::IsNull => {
                 let all_row_ids = self.table_row_ids()?;
                 if all_row_ids.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok(RowIdSource::Bitmap(Treemap::new()));
                 }
                 let mut cache = FxHashMap::default();
                 let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
-                let null_ids = difference_sorted(all_row_ids, non_null);
+                let null_ids = all_row_ids.clone() - non_null;
                 tracing::debug!(
                     field = ?filter_lfid,
-                    row_count = null_ids.len(),
+                    row_count = null_ids.cardinality(),
                     "collect_row_ids_for_filter NULL fast path"
                 );
-                return Ok(null_ids);
+                return Ok(RowIdSource::Bitmap(null_ids));
             }
             _ => {}
         }
@@ -1607,7 +1629,7 @@ where
                 row_count = rows.len(),
                 "collect_row_ids_for_filter using dense runs"
             );
-            return Ok(rows);
+            return Ok(RowIdSource::Vector(rows));
         }
 
         let op = filter.op.to_operator();
@@ -1626,11 +1648,11 @@ where
         }?;
         tracing::debug!(
             field = ?filter_lfid,
-            row_count = row_ids.len(),
+            row_count = row_ids.cardinality(),
             "collect_row_ids_for_filter general path"
         );
 
-        Ok(normalize_row_ids(row_ids))
+        Ok(RowIdSource::Bitmap(row_ids))
     }
 
     /// Evaluate a constant-only comparison expression.
@@ -1645,8 +1667,8 @@ where
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
     ) -> LlkvResult<Option<bool>> {
-        let left_lit_opt = evaluate_constant_literal_expr(left)?;
-        let right_lit_opt = evaluate_constant_literal_expr(right)?;
+        let left_lit_opt = NumericKernels::evaluate_constant_literal_expr(left)?;
+        let right_lit_opt = NumericKernels::evaluate_constant_literal_expr(right)?;
 
         let left_lit = match left_lit_opt {
             Some(Literal::Null) | None => return Ok(None),
@@ -1661,24 +1683,24 @@ where
         fn compare_literals(left: &Literal, right: &Literal) -> Option<std::cmp::Ordering> {
             match (left, right) {
                 (Literal::Boolean(l), Literal::Boolean(r)) => l.partial_cmp(r),
-                (Literal::Integer(l), Literal::Integer(r)) => l.partial_cmp(r),
-                (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r),
-                (Literal::Decimal(l), Literal::Decimal(r)) => (*l).compare(*r).ok(),
-                (Literal::Decimal(l), Literal::Integer(r)) => DecimalValue::new(*r, 0)
-                    .ok()
-                    .and_then(|int| (*l).compare(int).ok()),
-                (Literal::Integer(l), Literal::Decimal(r)) => DecimalValue::new(*l, 0)
-                    .ok()
-                    .and_then(|int| int.compare(*r).ok()),
-                (Literal::Decimal(l), Literal::Float(r)) => l.to_f64().partial_cmp(r),
-                (Literal::Float(l), Literal::Decimal(r)) => l.partial_cmp(&r.to_f64()),
+                (Literal::Int128(l), Literal::Int128(r)) => l.partial_cmp(r),
+                (Literal::Float64(l), Literal::Float64(r)) => l.partial_cmp(r),
+                (Literal::Decimal128(l), Literal::Decimal128(r)) => Some(l.cmp(r)),
+                (Literal::Decimal128(l), Literal::Int128(r)) => {
+                    DecimalValue::new(*r, 0).ok().map(|int| l.cmp(&int))
+                }
+                (Literal::Int128(l), Literal::Decimal128(r)) => {
+                    DecimalValue::new(*l, 0).ok().map(|int| int.cmp(r))
+                }
+                (Literal::Decimal128(l), Literal::Float64(r)) => l.to_f64().partial_cmp(r),
+                (Literal::Float64(l), Literal::Decimal128(r)) => l.partial_cmp(&r.to_f64()),
                 (Literal::String(l), Literal::String(r)) => l.partial_cmp(r),
                 (Literal::Date32(l), Literal::Date32(r)) => l.partial_cmp(r),
                 (Literal::Interval(l), Literal::Interval(r)) => {
                     Some(compare_interval_values(*l, *r))
                 }
-                (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r),
-                (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64)),
+                (Literal::Int128(l), Literal::Float64(r)) => (*l as f64).partial_cmp(r),
+                (Literal::Float64(l), Literal::Int128(r)) => l.partial_cmp(&(*r as f64)),
                 _ => None,
             }
         }
@@ -1712,8 +1734,8 @@ where
     /// to return all rows.
     fn collect_all_row_ids(
         &self,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         // Use ROW_ID_FIELD_ID to get all row IDs from the table
         self.collect_all_row_ids_for_field(ROW_ID_FIELD_ID, all_rows_cache)
     }
@@ -1723,8 +1745,8 @@ where
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(left, &mut fields);
         NumericKernels::collect_fields(right, &mut fields);
@@ -1735,7 +1757,7 @@ where
             // Evaluate the constant comparison
             return match Self::evaluate_constant_compare(left, op, right)? {
                 Some(true) => self.collect_all_row_ids(all_rows_cache),
-                Some(false) | None => Ok(Vec::new()),
+                Some(false) | None => Ok(Treemap::new()),
             };
         }
 
@@ -1746,36 +1768,30 @@ where
             scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right);
 
         let domain = if requires_full_scan {
-            let mut seen: FxHashSet<RowId> = FxHashSet::default();
-            let mut union_rows: Vec<RowId> = Vec::new();
+            let mut union_rows = Treemap::new();
             for fid in &ordered_fields {
                 let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
-                for rid in rows {
-                    if seen.insert(rid) {
-                        union_rows.push(rid);
-                    }
-                }
+                union_rows |= rows;
             }
-            union_rows.sort_unstable();
             union_rows
         } else {
-            let mut domain: Option<Vec<RowId>> = None;
+            let mut domain: Option<Treemap> = None;
             for fid in &ordered_fields {
                 let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
                 domain = Some(match domain {
-                    Some(existing) => intersect_sorted(existing, rows),
+                    Some(existing) => existing & rows,
                     None => rows,
                 });
                 if let Some(ref d) = domain
                     && d.is_empty()
                 {
-                    return Ok(Vec::new());
+                    return Ok(Treemap::new());
                 }
             }
             if let Some(ref domain_rows) = domain {
                 tracing::debug!(
                     ?ordered_fields,
-                    domain_len = domain_rows.len(),
+                    domain_len = domain_rows.cardinality(),
                     "collect_row_ids_for_compare domain"
                 );
             } else {
@@ -1790,7 +1806,7 @@ where
         let result = self.evaluate_compare_over_rows(&domain, &ordered_fields, left, op, right)?;
         tracing::debug!(
             ?ordered_fields,
-            result_len = result.len(),
+            result_len = result.cardinality(),
             "collect_row_ids_for_compare result"
         );
         Ok(result)
@@ -1801,27 +1817,32 @@ where
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<(Vec<RowId>, Vec<RowId>)> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<(Treemap, Treemap)> {
         let arrays: NumericArrayMap = FxHashMap::default();
-        let target = NumericKernels::evaluate_value(expr, 0, &arrays)?;
+        let target_array = NumericKernels::evaluate_value(expr, 0, &arrays)?;
 
-        let Some(target_val) = target else {
-            return Ok((Vec::new(), Vec::new()));
-        };
+        if target_array.data_type() == &arrow::datatypes::DataType::Null || target_array.is_null(0)
+        {
+            return Ok((Treemap::new(), Treemap::new()));
+        }
 
         let mut matched = false;
         let mut saw_null = false;
         for value_expr in list {
-            let value = NumericKernels::evaluate_value(value_expr, 0, &arrays)?;
-            match value {
-                Some(v) => {
-                    if NumericKernels::compare(CompareOp::Eq, v, target_val) {
-                        matched = true;
-                        break;
-                    }
+            let value_array = NumericKernels::evaluate_value(value_expr, 0, &arrays)?;
+            if value_array.data_type() == &arrow::datatypes::DataType::Null
+                || value_array.is_null(0)
+            {
+                saw_null = true;
+            } else {
+                let cmp_array =
+                    llkv_compute::compute_compare(&value_array, CompareOp::Eq, &target_array)?;
+                let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                if cmp.value(0) {
+                    matched = true;
+                    break;
                 }
-                None => saw_null = true,
             }
         }
 
@@ -1842,9 +1863,9 @@ where
             }
             Some(false) => {
                 let rows = self.collect_all_row_ids(all_rows_cache)?;
-                Ok((Vec::new(), rows))
+                Ok((Treemap::new(), rows))
             }
-            None => Ok((Vec::new(), Vec::new())),
+            None => Ok((Treemap::new(), Treemap::new())),
         }
     }
 
@@ -1852,24 +1873,25 @@ where
         &self,
         expr: &ScalarExpr<FieldId>,
         negated: bool,
-        _all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
+        _all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
     ) -> LlkvResult<bool> {
         let arrays: NumericArrayMap = FxHashMap::default();
         let value = NumericKernels::evaluate_value(expr, 0, &arrays)?;
-        let is_null = value.is_none();
+        let is_null = value.data_type() == &arrow::datatypes::DataType::Null || value.is_null(0);
         Ok(if negated { !is_null } else { is_null })
     }
 
+    // TODO: Can Rayon be used internally?
     fn evaluate_in_list_over_rows(
         &self,
-        row_ids: &[RowId],
+        row_ids: &Treemap,
         fields: &[FieldId],
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         negated: bool,
-    ) -> LlkvResult<(Vec<RowId>, Vec<RowId>)> {
+    ) -> LlkvResult<(Treemap, Treemap)> {
         if row_ids.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Treemap::new(), Treemap::new()));
         }
 
         let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
@@ -1924,71 +1946,78 @@ where
         let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
         let unique_index_arc = Arc::new(unique_index);
 
-        let mut matched_rows: Vec<RowId> = Vec::with_capacity(row_ids.len());
-        let mut determined_rows: Vec<RowId> = Vec::with_capacity(row_ids.len());
+        let mut matched_rows = Treemap::new();
+        let mut determined_rows = Treemap::new();
 
         let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
             if window.is_empty() {
                 return Ok(());
             }
 
-            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
-                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
-            } else {
-                NumericKernels::prepare_numeric_arrays(
-                    &logical_fields_for_arrays,
-                    columns,
-                    numeric_fields_arc.as_ref(),
-                )?
-            };
-
-            if has_row_id {
-                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
-            }
-
-            for (offset, &row_id) in window.iter().enumerate() {
-                let target = NumericKernels::evaluate_value(expr, offset, &numeric_arrays)?;
-                let Some(target_val) = target else {
-                    continue;
-                };
-
-                let mut matched = false;
-                let mut saw_null = false;
-                for value_expr in list {
-                    let value =
-                        NumericKernels::evaluate_value(value_expr, offset, &numeric_arrays)?;
-                    match value {
-                        Some(v) => {
-                            if NumericKernels::compare(CompareOp::Eq, v, target_val) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                        None => saw_null = true,
+            let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+            if !columns.is_empty() {
+                for (lfid, array) in logical_fields_for_arrays.iter().zip(columns.iter()) {
+                    let fid = lfid.field_id();
+                    if numeric_fields_arc.contains(&fid) {
+                        numeric_arrays.insert(fid, array.clone());
                     }
                 }
+            }
 
-                let outcome = if matched {
-                    Some(!negated)
-                } else if saw_null {
-                    None
-                } else if negated {
-                    Some(true)
+            if has_row_id {
+                let rid_values: Vec<i64> = window.iter().map(|rid| *rid as i64).collect();
+                let array = Int64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
+            }
+
+            let len = window.len();
+            let mut target_array = NumericKernels::evaluate_batch(expr, len, &numeric_arrays)?;
+
+            let mut acc: Option<BooleanArray> = None;
+
+            for value_expr in list {
+                let value_array = NumericKernels::evaluate_batch(value_expr, len, &numeric_arrays)?;
+
+                // Coerce types and update target_array if promoted.
+                let (new_target, new_value) = llkv_compute::kernels::coerce_types(
+                    &target_array,
+                    &value_array,
+                    BinaryOp::Add,
+                )?;
+                target_array = new_target;
+
+                let cmp_array = compute::kernels::cmp::eq(&new_value, &target_array)?;
+
+                match acc {
+                    None => acc = Some(cmp_array),
+                    Some(prev) => acc = Some(compute::or_kleene(&prev, &cmp_array)?),
+                }
+            }
+
+            let mut final_bool = match acc {
+                Some(a) => a,
+                None => {
+                    let mut builder = arrow::array::BooleanBuilder::with_capacity(len);
+                    for _ in 0..len {
+                        builder.append_value(false);
+                    }
+                    builder.finish()
+                }
+            };
+
+            if negated {
+                final_bool = compute::not(&final_bool)?;
+            }
+
+            for (i, &row_id) in window.iter().enumerate() {
+                if final_bool.is_null(i) {
+                    continue;
+                }
+                if final_bool.value(i) {
+                    matched_rows.add(row_id);
+                    determined_rows.add(row_id);
                 } else {
-                    Some(false)
-                };
-
-                match outcome {
-                    Some(true) => {
-                        matched_rows.push(row_id);
-                        determined_rows.push(row_id);
-                    }
-                    Some(false) => {
-                        determined_rows.push(row_id);
-                    }
-                    None => {}
+                    determined_rows.add(row_id);
                 }
             }
 
@@ -2006,7 +2035,7 @@ where
             Arc::clone(&numeric_fields_arc),
             requires_numeric,
             GatherNullPolicy::IncludeNulls,
-            row_ids.to_vec(),
+            row_ids.iter().collect::<Vec<_>>(),
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -2025,8 +2054,8 @@ where
         expr: &ScalarExpr<FieldId>,
         list: &[ScalarExpr<FieldId>],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(expr, &mut fields);
         for value in list {
@@ -2039,25 +2068,26 @@ where
             return Ok(matched);
         }
 
-        let mut domain: Option<Vec<RowId>> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
+        ordered_fields.dedup();
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing & rows,
                 None => rows,
             });
             if let Some(ref d) = domain
                 && d.is_empty()
             {
-                return Ok(Vec::new());
+                return Ok(Treemap::new());
             }
         }
 
         let domain_rows = domain.unwrap_or_default();
         if domain_rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
 
         let (matched, _) =
@@ -2069,8 +2099,8 @@ where
         &self,
         expr: &ScalarExpr<FieldId>,
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         let mut fields = FxHashSet::default();
         NumericKernels::collect_fields(expr, &mut fields);
 
@@ -2079,30 +2109,30 @@ where
             if matches {
                 return self.collect_all_row_ids(all_rows_cache);
             } else {
-                return Ok(Vec::new());
+                return Ok(Treemap::new());
             }
         }
 
         // Build domain from all referenced fields
-        let mut domain: Option<Vec<RowId>> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
         ordered_fields.sort_unstable();
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing & rows,
                 None => rows,
             });
             if let Some(ref d) = domain
                 && d.is_empty()
             {
-                return Ok(Vec::new());
+                return Ok(Treemap::new());
             }
         }
 
         let domain_rows = domain.unwrap_or_default();
         if domain_rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
 
         // Evaluate IS NULL over the domain rows using the same pattern as in_list
@@ -2111,13 +2141,13 @@ where
 
     fn evaluate_is_null_over_rows(
         &self,
-        row_ids: &[RowId],
+        row_ids: &Treemap,
         fields: &[FieldId],
         expr: &ScalarExpr<FieldId>,
         negated: bool,
-    ) -> LlkvResult<Vec<RowId>> {
+    ) -> LlkvResult<Treemap> {
         if row_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
 
         // Follow the exact same pattern as evaluate_in_list_over_rows
@@ -2173,35 +2203,35 @@ where
         let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
         let unique_index_arc = Arc::new(unique_index);
 
-        let mut matched_rows: Vec<RowId> = Vec::with_capacity(row_ids.len());
+        let mut matched_rows = Treemap::new();
 
         let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
             if window.is_empty() {
                 return Ok(());
             }
 
-            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
-                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
-            } else {
-                NumericKernels::prepare_numeric_arrays(
-                    &logical_fields_for_arrays,
-                    columns,
-                    numeric_fields_arc.as_ref(),
-                )?
-            };
+            let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+            if !columns.is_empty() {
+                for (lfid, array) in logical_fields_for_arrays.iter().zip(columns.iter()) {
+                    let fid = lfid.field_id();
+                    if numeric_fields_arc.contains(&fid) {
+                        numeric_arrays.insert(fid, array.clone());
+                    }
+                }
+            }
 
             if has_row_id {
-                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
+                let rid_values: Vec<i64> = window.iter().map(|rid| *rid as i64).collect();
+                let array = Int64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
                 let value = NumericKernels::evaluate_value(expr, offset, &numeric_arrays)?;
-                let is_null = value.is_none();
+                let is_null = value.is_null(0);
                 let matches = if negated { !is_null } else { is_null };
                 if matches {
-                    matched_rows.push(row_id);
+                    matched_rows.add(row_id);
                 }
             }
 
@@ -2219,7 +2249,7 @@ where
             Arc::clone(&numeric_fields_arc),
             requires_numeric,
             GatherNullPolicy::IncludeNulls,
-            row_ids.to_vec(),
+            row_ids.iter().collect::<Vec<_>>(),
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -2235,26 +2265,36 @@ where
 
     fn evaluate_compare_over_rows(
         &self,
-        row_ids: &[RowId],
+        row_ids: &Treemap,
         fields: &[FieldId],
         left: &ScalarExpr<FieldId>,
         op: CompareOp,
         right: &ScalarExpr<FieldId>,
-    ) -> LlkvResult<Vec<RowId>> {
+    ) -> LlkvResult<Treemap> {
         if row_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
-        let mut result: Vec<RowId> = Vec::with_capacity(row_ids.len());
+        let mut result = Treemap::new();
         self.for_each_compare_row(
             row_ids,
             fields,
             left,
             right,
             |row_id, left_val, right_val| {
-                if let (Some(lv), Some(rv)) = (left_val, right_val)
-                    && NumericKernels::compare(op, lv, rv)
+                if left_val.data_type() == &arrow::datatypes::DataType::Null
+                    || right_val.data_type() == &arrow::datatypes::DataType::Null
                 {
-                    result.push(row_id);
+                    return;
+                }
+                #[allow(clippy::collapsible_if)]
+                if !left_val.is_null(0) && !right_val.is_null(0) {
+                    if let Ok(cmp_array) = llkv_compute::compute_compare(&left_val, op, &right_val)
+                    {
+                        let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        if cmp.value(0) {
+                            result.add(row_id);
+                        }
+                    }
                 }
             },
         )?;
@@ -2264,14 +2304,14 @@ where
 
     fn for_each_compare_row<F>(
         &self,
-        row_ids: &[RowId],
+        row_ids: &Treemap,
         fields: &[FieldId],
         left: &ScalarExpr<FieldId>,
         right: &ScalarExpr<FieldId>,
         mut on_row: F,
     ) -> LlkvResult<()>
     where
-        F: FnMut(RowId, Option<NumericValue>, Option<NumericValue>),
+        F: FnMut(RowId, ArrayRef, ArrayRef),
     {
         if row_ids.is_empty() {
             return Ok(());
@@ -2335,20 +2375,20 @@ where
                 return Ok(());
             }
 
-            let mut numeric_arrays: NumericArrayMap = if columns.is_empty() {
-                NumericKernels::prepare_numeric_arrays(&[], &[], numeric_fields_arc.as_ref())?
-            } else {
-                NumericKernels::prepare_numeric_arrays(
-                    &logical_fields_for_arrays,
-                    columns,
-                    numeric_fields_arc.as_ref(),
-                )?
-            };
+            let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+            if !columns.is_empty() {
+                for (lfid, array) in logical_fields_for_arrays.iter().zip(columns.iter()) {
+                    let fid = lfid.field_id();
+                    if numeric_fields_arc.contains(&fid) {
+                        numeric_arrays.insert(fid, array.clone());
+                    }
+                }
+            }
 
             if has_row_id {
-                let rid_values: Vec<f64> = window.iter().map(|rid| *rid as f64).collect();
-                let array = Float64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, NumericArray::from_float(Arc::new(array)));
+                let rid_values: Vec<i64> = window.iter().map(|rid| *rid as i64).collect();
+                let array = Int64Array::from(rid_values);
+                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
             }
 
             for (offset, &row_id) in window.iter().enumerate() {
@@ -2361,10 +2401,11 @@ where
         };
 
         if logical_fields_for_arrays.is_empty() {
+            let row_ids_vec: Vec<RowId> = row_ids.iter().collect();
             let mut start = 0usize;
-            while start < row_ids.len() {
-                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids.len());
-                process_chunk(&row_ids[start..end], &[])?;
+            while start < row_ids_vec.len() {
+                let end = cmp::min(start + STREAM_BATCH_ROWS, row_ids_vec.len());
+                process_chunk(&row_ids_vec[start..end], &[])?;
                 start = end;
             }
             return Ok(());
@@ -2381,7 +2422,7 @@ where
             Arc::clone(&numeric_fields_arc),
             requires_numeric,
             GatherNullPolicy::IncludeNulls,
-            row_ids.to_vec(),
+            row_ids.iter().collect::<Vec<_>>(),
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -2399,10 +2440,10 @@ where
         &self,
         programs: &ProgramSet<'_>,
         fusion_cache: &PredicateFusionCache,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
-        let mut stack: Vec<Vec<RowId>> = Vec::new();
-        let mut domain_cache: FxHashMap<DomainProgramId, Arc<Vec<RowId>>> = FxHashMap::default();
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<RowIdSource> {
+        let mut stack: Vec<RowIdSource> = Vec::new();
+        let mut domain_cache: FxHashMap<DomainProgramId, Arc<Treemap>> = FxHashMap::default();
 
         let mut debug_stack_lens: Vec<usize> = Vec::with_capacity(programs.eval.ops.len());
 
@@ -2414,7 +2455,7 @@ where
                 EvalOp::PushCompare { left, op, right } => {
                     let rows =
                         self.collect_row_ids_for_compare(left, *op, right, all_rows_cache)?;
-                    stack.push(rows);
+                    stack.push(RowIdSource::Bitmap(rows));
                 }
                 EvalOp::PushInList {
                     expr,
@@ -2427,17 +2468,19 @@ where
                         *negated,
                         all_rows_cache,
                     )?;
-                    stack.push(rows);
+                    stack.push(RowIdSource::Bitmap(rows));
                 }
                 EvalOp::PushIsNull { expr, negated } => {
                     let rows = self.collect_row_ids_for_is_null(expr, *negated, all_rows_cache)?;
-                    stack.push(rows);
+                    stack.push(RowIdSource::Bitmap(rows));
                 }
                 EvalOp::PushLiteral(value) => {
                     if *value {
-                        stack.push(self.collect_all_row_ids(all_rows_cache)?);
+                        stack.push(RowIdSource::Bitmap(
+                            self.collect_all_row_ids(all_rows_cache)?,
+                        ));
                     } else {
-                        stack.push(Vec::new());
+                        stack.push(RowIdSource::Bitmap(Treemap::new()));
                     }
                 }
                 EvalOp::FusedAnd { field_id, filters } => {
@@ -2456,14 +2499,34 @@ where
                         let next = stack
                             .pop()
                             .ok_or_else(|| Error::Internal("AND opcode underflow".into()))?;
-                        if acc.is_empty() {
+
+                        let acc_empty = match &acc {
+                            RowIdSource::Bitmap(b) => b.is_empty(),
+                            RowIdSource::Vector(v) => v.is_empty(),
+                        };
+                        if acc_empty {
                             continue;
                         }
-                        if next.is_empty() {
-                            acc.clear();
+
+                        let next_empty = match &next {
+                            RowIdSource::Bitmap(b) => b.is_empty(),
+                            RowIdSource::Vector(v) => v.is_empty(),
+                        };
+                        if next_empty {
+                            acc = RowIdSource::Bitmap(Treemap::new());
                             continue;
                         }
-                        acc = intersect_sorted(acc, next);
+
+                        let mut acc_bitmap = match acc {
+                            RowIdSource::Bitmap(b) => b,
+                            RowIdSource::Vector(v) => Treemap::from_iter(v),
+                        };
+                        let next_bitmap = match next {
+                            RowIdSource::Bitmap(b) => b,
+                            RowIdSource::Vector(v) => Treemap::from_iter(v),
+                        };
+                        acc_bitmap &= next_bitmap;
+                        acc = RowIdSource::Bitmap(acc_bitmap);
                     }
                     stack.push(acc);
                 }
@@ -2478,10 +2541,30 @@ where
                         let next = stack
                             .pop()
                             .ok_or_else(|| Error::Internal("OR opcode underflow".into()))?;
-                        if acc.is_empty() {
+
+                        let acc_empty = match &acc {
+                            RowIdSource::Bitmap(b) => b.is_empty(),
+                            RowIdSource::Vector(v) => v.is_empty(),
+                        };
+                        if acc_empty {
                             acc = next;
-                        } else if !next.is_empty() {
-                            acc = union_sorted(acc, next);
+                        } else {
+                            let next_empty = match &next {
+                                RowIdSource::Bitmap(b) => b.is_empty(),
+                                RowIdSource::Vector(v) => v.is_empty(),
+                            };
+                            if !next_empty {
+                                let mut acc_bitmap = match acc {
+                                    RowIdSource::Bitmap(b) => b,
+                                    RowIdSource::Vector(v) => Treemap::from_iter(v),
+                                };
+                                let next_bitmap = match next {
+                                    RowIdSource::Bitmap(b) => b,
+                                    RowIdSource::Vector(v) => Treemap::from_iter(v),
+                                };
+                                acc_bitmap |= next_bitmap;
+                                acc = RowIdSource::Bitmap(acc_bitmap);
+                            }
                         }
                     }
                     stack.push(acc);
@@ -2496,12 +2579,22 @@ where
                         all_rows_cache,
                         &mut domain_cache,
                     )?;
-                    if matched.is_empty() {
-                        stack.push(domain_rows.as_ref().clone());
+
+                    let matched_empty = match &matched {
+                        RowIdSource::Bitmap(b) => b.is_empty(),
+                        RowIdSource::Vector(v) => v.is_empty(),
+                    };
+
+                    if matched_empty {
+                        stack.push(RowIdSource::Bitmap(domain_rows.as_ref().clone()));
                     } else if domain_rows.is_empty() {
-                        stack.push(Vec::new());
+                        stack.push(RowIdSource::Bitmap(Treemap::new()));
                     } else {
-                        stack.push(difference_sorted_slice(domain_rows.as_ref(), &matched));
+                        let matched_bitmap = match matched {
+                            RowIdSource::Bitmap(b) => b,
+                            RowIdSource::Vector(v) => Treemap::from_iter(v),
+                        };
+                        stack.push(RowIdSource::Bitmap(domain_rows.as_ref() - &matched_bitmap));
                     }
                 }
             }
@@ -2528,9 +2621,9 @@ where
         field_id: FieldId,
         filters: &[OwnedFilter],
         fusion_cache: &PredicateFusionCache,
-    ) -> LlkvResult<Vec<RowId>> {
+    ) -> LlkvResult<RowIdSource> {
         if filters.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RowIdSource::Bitmap(Treemap::new()));
         }
 
         let filter_lfid = LogicalFieldId::for_user(self.table.table_id(), field_id);
@@ -2563,22 +2656,40 @@ where
                     ))),
                 ),
             }?;
-            return Ok(normalize_row_ids(rows));
+            return Ok(RowIdSource::Bitmap(rows));
         }
 
         let mut iter = filters.iter();
         let mut acc =
             self.collect_row_ids_for_filter(iter.next().expect("expected at least one filter"))?;
         for filter in iter {
-            if acc.is_empty() {
+            let acc_empty = match &acc {
+                RowIdSource::Bitmap(b) => b.is_empty(),
+                RowIdSource::Vector(v) => v.is_empty(),
+            };
+            if acc_empty {
                 break;
             }
             let rows = self.collect_row_ids_for_filter(filter)?;
-            if rows.is_empty() {
-                acc.clear();
+            let rows_empty = match &rows {
+                RowIdSource::Bitmap(b) => b.is_empty(),
+                RowIdSource::Vector(v) => v.is_empty(),
+            };
+            if rows_empty {
+                acc = RowIdSource::Bitmap(Treemap::new());
                 break;
             }
-            acc = intersect_sorted(acc, rows);
+
+            let mut acc_bitmap = match acc {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
+            };
+            let rows_bitmap = match rows {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
+            };
+            acc_bitmap &= rows_bitmap;
+            acc = RowIdSource::Bitmap(acc_bitmap);
         }
         Ok(acc)
     }
@@ -2588,9 +2699,9 @@ where
         &self,
         programs: &ProgramSet<'_>,
         domain_id: DomainProgramId,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-        cache: &mut FxHashMap<DomainProgramId, Arc<Vec<RowId>>>,
-    ) -> LlkvResult<Arc<Vec<RowId>>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+        cache: &mut FxHashMap<DomainProgramId, Arc<Treemap>>,
+    ) -> LlkvResult<Arc<Treemap>> {
         if let Some(rows) = cache.get(&domain_id) {
             return Ok(Arc::clone(rows));
         }
@@ -2600,7 +2711,7 @@ where
             .domain(domain_id)
             .ok_or_else(|| Error::Internal(format!("missing domain program {domain_id}")))?;
 
-        let mut stack: Vec<Vec<RowId>> = Vec::new();
+        let mut stack: Vec<Treemap> = Vec::new();
         for op in &program.ops {
             match op {
                 DomainOp::PushFieldAll(field_id) => {
@@ -2644,11 +2755,11 @@ where
                     )?;
                     stack.push(rows);
                 }
-                DomainOp::PushLiteralFalse => stack.push(Vec::new()),
+                DomainOp::PushLiteralFalse => stack.push(Treemap::new()),
                 DomainOp::PushAllRows => stack.push(self.collect_all_row_ids(all_rows_cache)?),
                 DomainOp::Union { child_count } => {
                     if *child_count == 0 {
-                        stack.push(Vec::new());
+                        stack.push(Treemap::new());
                         continue;
                     }
                     let mut acc = stack
@@ -2661,14 +2772,14 @@ where
                         if acc.is_empty() {
                             acc = next;
                         } else if !next.is_empty() {
-                            acc = union_sorted(acc, next);
+                            acc |= next;
                         }
                     }
                     stack.push(acc);
                 }
                 DomainOp::Intersect { child_count } => {
                     if *child_count == 0 {
-                        stack.push(Vec::new());
+                        stack.push(Treemap::new());
                         continue;
                     }
                     let mut acc = stack
@@ -2685,7 +2796,7 @@ where
                             acc.clear();
                             continue;
                         }
-                        acc = intersect_sorted(acc, next);
+                        acc &= next;
                     }
                     stack.push(acc);
                 }
@@ -2707,8 +2818,8 @@ where
         right: &ScalarExpr<FieldId>,
         op: CompareOp,
         fields: &[FieldId],
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if fields.is_empty() {
             // Domain evaluation only cares whether rows might satisfy the predicate.
             // Constant comparisons therefore mark every row as determined (even if
@@ -2717,7 +2828,7 @@ where
             // indicates "unknown", which leaves the domain empty.
             return match Self::evaluate_constant_compare(left, op, right)? {
                 Some(_) => self.collect_all_row_ids(all_rows_cache),
-                None => Ok(Vec::new()),
+                None => Ok(Treemap::new()),
             };
         }
 
@@ -2725,11 +2836,11 @@ where
         ordered_fields.sort_unstable();
         ordered_fields.dedup();
 
-        let mut domain: Option<Vec<RowId>> = None;
+        let mut domain: Option<Treemap> = None;
         for &fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing & rows,
                 None => rows,
             });
             if let Some(ref d) = domain
@@ -2741,18 +2852,18 @@ where
 
         let candidate_rows = domain.unwrap_or_default();
         if candidate_rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
 
-        let mut usable_rows: Vec<RowId> = Vec::new();
+        let mut usable_rows = Treemap::new();
         self.for_each_compare_row(
             &candidate_rows,
             &ordered_fields,
             left,
             right,
             |row_id, left_val, right_val| {
-                if left_val.is_some() && right_val.is_some() {
-                    usable_rows.push(row_id);
+                if !left_val.is_null(0) && !right_val.is_null(0) {
+                    usable_rows.add(row_id);
                 }
             },
         )?;
@@ -2766,15 +2877,15 @@ where
         list: &[ScalarExpr<FieldId>],
         fields: &[FieldId],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if fields.is_empty() {
             let (_, domain_rows) =
                 self.evaluate_constant_in_list(expr, list, negated, all_rows_cache)?;
             return Ok(domain_rows);
         }
 
-        let mut domain: Option<Vec<RowId>> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.to_vec();
         ordered_fields.sort_unstable();
         ordered_fields.dedup();
@@ -2782,7 +2893,7 @@ where
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing & rows,
                 None => rows,
             });
             if let Some(ref d) = domain
@@ -2794,7 +2905,7 @@ where
 
         let candidate_rows = domain.unwrap_or_default();
         if candidate_rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
 
         let (_, determined) =
@@ -2807,19 +2918,19 @@ where
         expr: &ScalarExpr<FieldId>,
         fields: &[FieldId],
         negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if fields.is_empty() {
             // Constant expression: evaluate once
             let is_constant_null = self.evaluate_constant_is_null(expr, negated, all_rows_cache)?;
             if is_constant_null {
                 return self.collect_all_row_ids(all_rows_cache);
             } else {
-                return Ok(Vec::new());
+                return Ok(Treemap::new());
             }
         }
 
-        let mut domain: Option<Vec<RowId>> = None;
+        let mut domain: Option<Treemap> = None;
         let mut ordered_fields: Vec<FieldId> = fields.to_vec();
         ordered_fields.sort_unstable();
         ordered_fields.dedup();
@@ -2827,7 +2938,7 @@ where
         for fid in &ordered_fields {
             let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
             domain = Some(match domain {
-                Some(existing) => intersect_sorted(existing, rows),
+                Some(existing) => existing & rows,
                 None => rows,
             });
             if let Some(ref d) = domain
@@ -2839,7 +2950,7 @@ where
 
         let candidate_rows = domain.unwrap_or_default();
         if candidate_rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Treemap::new());
         }
 
         let determined =
@@ -2849,16 +2960,17 @@ where
 
     fn sort_row_ids_with_order(
         &self,
-        mut row_ids: Vec<RowId>,
+        row_ids: &Treemap,
         order: ScanOrderSpec,
     ) -> LlkvResult<Vec<RowId>> {
-        if row_ids.len() <= 1 {
-            return Ok(row_ids);
+        if row_ids.cardinality() <= 1 {
+            return Ok(row_ids.iter().collect());
         }
 
         let lfid = LogicalFieldId::for_user(self.table.table_id(), order.field_id);
         let store = self.table.store();
         let ascending = matches!(order.direction, ScanOrderDirection::Ascending);
+        let nulls_first = order.nulls_first;
         let schema = self.table.schema()?;
         let cached_schema = CachedSchema::new(Arc::clone(&schema));
         let schema_index = cached_schema
@@ -2894,22 +3006,20 @@ where
         );
 
         match order.transform {
-            ScanOrderTransform::IdentityInt64 => {
-                row_ids = self.sort_row_ids_with_primitive_transform::<Int64Type>(
+            ScanOrderTransform::IdentityInt64 => self
+                .sort_row_ids_with_primitive_transform::<Int64Type>(
                     row_ids,
                     primitive_context,
                     ascending,
                     order.nulls_first,
-                )?;
-            }
-            ScanOrderTransform::IdentityInt32 => {
-                row_ids = self.sort_row_ids_with_primitive_transform::<Int32Type>(
+                ),
+            ScanOrderTransform::IdentityInt32 => self
+                .sort_row_ids_with_primitive_transform::<Int32Type>(
                     row_ids,
                     primitive_context,
                     ascending,
                     order.nulls_first,
-                )?;
-            }
+                ),
             ScanOrderTransform::IdentityUtf8 => {
                 let mut row_stream = RowStreamBuilder::new(
                     store,
@@ -2928,7 +3038,8 @@ where
                 .build()?;
 
                 let mut chunks: Vec<StringArray> = Vec::new();
-                let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+                let mut positions: Vec<(usize, usize)> =
+                    Vec::with_capacity(row_ids.cardinality() as usize);
 
                 while let Some(chunk) = row_stream.next_chunk()? {
                     let batch = chunk.to_record_batch();
@@ -2957,14 +3068,13 @@ where
                     }
                 }
 
-                if positions.len() != row_ids.len() {
+                if positions.len() != row_ids.cardinality() as usize {
                     return Err(Error::Internal(
                         "ORDER BY gather produced inconsistent row counts".into(),
                     ));
                 }
 
-                let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().copied().enumerate().collect();
+                let mut indices: Vec<(usize, RowId)> = row_ids.iter().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let (chunk_a, offset_a) = positions[*ai];
                     let (chunk_b, offset_b) = positions[*bi];
@@ -2980,14 +3090,14 @@ where
                     } else {
                         Some(array_b.value(offset_b))
                     };
-                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
+                    let ord = compare_option_values(left, right, ascending, nulls_first);
                     if ord == Ordering::Equal {
                         arid.cmp(brid)
                     } else {
                         ord
                     }
                 });
-                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+                Ok(indices.into_iter().map(|(_, rid)| rid).collect())
             }
             ScanOrderTransform::CastUtf8ToInteger => {
                 let mut row_stream = RowStreamBuilder::new(
@@ -3006,7 +3116,7 @@ where
                 )
                 .build()?;
 
-                let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.len());
+                let mut keys: Vec<Option<i64>> = Vec::with_capacity(row_ids.cardinality() as usize);
 
                 while let Some(chunk) = row_stream.next_chunk()? {
                     let batch = chunk.to_record_batch();
@@ -3036,14 +3146,13 @@ where
                     }
                 }
 
-                if keys.len() != row_ids.len() {
+                if keys.len() != row_ids.cardinality() as usize {
                     return Err(Error::Internal(
                         "ORDER BY gather produced inconsistent row counts".into(),
                     ));
                 }
 
-                let mut indices: Vec<(usize, RowId)> =
-                    row_ids.iter().copied().enumerate().collect();
+                let mut indices: Vec<(usize, RowId)> = row_ids.iter().enumerate().collect();
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let left = keys[*ai];
                     let right = keys[*bi];
@@ -3054,16 +3163,14 @@ where
                         ord
                     }
                 });
-                row_ids = indices.into_iter().map(|(_, rid)| rid).collect();
+                Ok(indices.into_iter().map(|(_, rid)| rid).collect())
             }
         }
-
-        Ok(row_ids)
     }
 
     fn sort_row_ids_with_primitive_transform<T>(
         &self,
-        row_ids: Vec<RowId>,
+        row_ids: &Treemap,
         context: PrimitiveOrderContext<'_>,
         ascending: bool,
         nulls_first: bool,
@@ -3072,10 +3179,10 @@ where
         T: ArrowPrimitiveType,
         T::Native: Ord,
     {
-        let order_data = self.gather_primitive_order_chunks::<T>(&row_ids, context)?;
+        let order_data = self.gather_primitive_order_chunks::<T>(row_ids, context)?;
 
-        Ok(sort_by_primitive::<T>(
-            &row_ids,
+        Ok(sort_row_ids_by_primitive::<T>(
+            row_ids,
             &order_data.chunks,
             &order_data.positions,
             ascending,
@@ -3085,7 +3192,7 @@ where
 
     fn gather_primitive_order_chunks<T>(
         &self,
-        row_ids: &[RowId],
+        row_ids: &Treemap,
         context: PrimitiveOrderContext<'_>,
     ) -> LlkvResult<PrimitiveOrderData<T>>
     where
@@ -3102,13 +3209,13 @@ where
             Arc::clone(context.numeric_fields),
             false,
             GatherNullPolicy::IncludeNulls,
-            row_ids.to_vec(),
+            row_ids.clone(),
             STREAM_BATCH_ROWS,
         )
         .build()?;
 
         let mut chunks: Vec<PrimitiveArray<T>> = Vec::new();
-        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.len());
+        let mut positions: Vec<(usize, usize)> = Vec::with_capacity(row_ids.cardinality() as usize);
 
         while let Some(chunk) = row_stream.next_chunk()? {
             let batch = chunk.to_record_batch();
@@ -3140,7 +3247,7 @@ where
             }
         }
 
-        if positions.len() != row_ids.len() {
+        if positions.len() != row_ids.cardinality() as usize {
             return Err(Error::Internal(
                 "ORDER BY gather produced inconsistent row counts".into(),
             ));
@@ -3152,8 +3259,8 @@ where
     fn collect_all_row_ids_for_field(
         &self,
         field_id: FieldId,
-        cache: &mut FxHashMap<FieldId, Vec<RowId>>,
-    ) -> LlkvResult<Vec<RowId>> {
+        cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
         if let Some(existing) = cache.get(&field_id) {
             return Ok(existing.clone());
         }
@@ -3166,7 +3273,11 @@ where
             },
         };
 
-        let ids = self.collect_row_ids_for_filter(&filter)?;
+        let ids_source = self.collect_row_ids_for_filter(&filter)?;
+        let ids = match ids_source {
+            RowIdSource::Bitmap(b) => b,
+            RowIdSource::Vector(v) => Treemap::from_iter(v),
+        };
         cache.insert(field_id, ids.clone());
         Ok(ids)
     }
@@ -3175,36 +3286,42 @@ where
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<RowId>>
+    ) -> LlkvResult<Treemap>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
-        self.table.store().filter_row_ids::<T>(field_id, &predicate)
+        let vec = self
+            .table
+            .store()
+            .filter_row_ids::<T>(field_id, &predicate)?;
+        Ok(Treemap::from_iter(vec))
     }
 
     fn collect_matching_row_ids_string<O>(
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<RowId>>
+    ) -> LlkvResult<Treemap>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
         let predicate = build_var_width_predicate(op).map_err(Error::predicate_build)?;
-        self.table
+        let vec = self
+            .table
             .store()
             .filter_row_ids::<llkv_column_map::store::scan::filter::Utf8Filter<O>>(
                 field_id, &predicate,
-            )
+            )?;
+        Ok(Treemap::from_iter(vec))
     }
 
     fn collect_matching_row_ids_string_fused<O>(
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<RowId>>
+    ) -> LlkvResult<Treemap>
     where
         O: OffsetSizeTrait + llkv_column_map::store::scan::filter::StringContainsKernel,
     {
@@ -3221,25 +3338,27 @@ where
             field_id,
             &preds,
         )?;
-        Ok(fused)
+        Ok(Treemap::from_iter(fused))
     }
 
     fn collect_matching_row_ids_bool(
         &self,
         field_id: LogicalFieldId,
         op: &Operator<'_>,
-    ) -> LlkvResult<Vec<RowId>> {
+    ) -> LlkvResult<Treemap> {
         let predicate = build_bool_predicate(op).map_err(Error::predicate_build)?;
-        self.table
+        let vec = self
+            .table
             .store()
-            .filter_row_ids::<arrow::datatypes::BooleanType>(field_id, &predicate)
+            .filter_row_ids::<arrow::datatypes::BooleanType>(field_id, &predicate)?;
+        Ok(Treemap::from_iter(vec))
     }
 
     fn collect_matching_row_ids_bool_fused(
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<RowId>> {
+    ) -> LlkvResult<Treemap> {
         let mut preds: Vec<llkv_expr::typed_predicate::Predicate<bool>> =
             Vec::with_capacity(ops.len());
         for op in ops {
@@ -3251,14 +3370,14 @@ where
             field_id,
             &preds,
         )?;
-        Ok(fused)
+        Ok(Treemap::from_iter(fused))
     }
 
     fn collect_matching_row_ids_fused<T>(
         &self,
         field_id: LogicalFieldId,
         ops: &[Operator<'_>],
-    ) -> LlkvResult<Vec<RowId>>
+    ) -> LlkvResult<Treemap>
     where
         T: FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native> + ArrowPrimitiveType,
         <T as ArrowPrimitiveType>::Native: FromLiteral + Copy + PredicateValue,
@@ -3276,402 +3395,23 @@ where
             field_id,
             &preds,
         )?;
-        Ok(fused)
+        Ok(Treemap::from_iter(fused))
     }
 }
 
 pub(crate) fn collect_row_ids_for_table<'expr, P>(
     table: &Table<P>,
     filter_expr: &Expr<'expr, FieldId>,
-) -> LlkvResult<Vec<RowId>>
+) -> LlkvResult<RowIdSource>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let executor = TableExecutor::new(table);
     let fusion_cache = PredicateFusionCache::from_expr(filter_expr);
-    let mut all_rows_cache: FxHashMap<FieldId, Vec<RowId>> = FxHashMap::default();
+    let mut all_rows_cache: FxHashMap<FieldId, Treemap> = FxHashMap::default();
     let filter_arc = Arc::new(filter_expr.clone());
     let programs = ProgramCompiler::new(filter_arc).compile()?;
     executor.collect_row_ids_for_program(&programs, &fusion_cache, &mut all_rows_cache)
-}
-
-fn computed_expr_requires_numeric(expr: &ScalarExpr<FieldId>) -> bool {
-    match expr {
-        ScalarExpr::Literal(_) => false,
-        ScalarExpr::Column(_) => true,
-        ScalarExpr::Binary { .. } => true,
-        ScalarExpr::Compare { .. } => true,
-        ScalarExpr::Aggregate(_) => false, // Aggregates are computed separately
-        ScalarExpr::GetField { .. } => false, // GetField requires raw arrays, not numeric conversion
-        ScalarExpr::Cast { expr, .. } => computed_expr_requires_numeric(expr),
-        ScalarExpr::Not(expr) => computed_expr_requires_numeric(expr),
-        ScalarExpr::IsNull { expr, .. } => computed_expr_requires_numeric(expr),
-        ScalarExpr::Case { .. } => true,
-        ScalarExpr::Coalesce(items) => items.iter().any(computed_expr_requires_numeric),
-        ScalarExpr::Random => true,
-        ScalarExpr::ScalarSubquery(_) => false,
-    }
-}
-
-fn computed_expr_prefers_float(
-    expr: &ScalarExpr<FieldId>,
-    table_id: TableId,
-    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
-) -> LlkvResult<bool> {
-    match expr {
-        ScalarExpr::Literal(lit) => literal_prefers_float(lit),
-        ScalarExpr::Column(fid) => {
-            let lfid = LogicalFieldId::for_user(table_id, *fid);
-            let dtype = lfid_dtypes
-                .get(&lfid)
-                .ok_or_else(|| Error::Internal("missing dtype for computed column".into()))?;
-            Ok(matches!(
-                NumericKernels::kind_for_data_type(dtype),
-                Some(NumericKind::Float)
-            ))
-        }
-        ScalarExpr::Binary { left, right, .. } => {
-            Ok(
-                computed_expr_prefers_float(left.as_ref(), table_id, lfid_dtypes)?
-                    || computed_expr_prefers_float(right.as_ref(), table_id, lfid_dtypes)?,
-            )
-        }
-        ScalarExpr::Compare { .. } => Ok(false),
-        ScalarExpr::Aggregate(_) => Ok(false),
-        ScalarExpr::GetField { base, field_name } => {
-            let dtype = get_field_dtype(base.as_ref(), field_name, table_id, lfid_dtypes)?;
-            Ok(matches!(
-                NumericKernels::kind_for_data_type(&dtype),
-                Some(NumericKind::Float)
-            ))
-        }
-        ScalarExpr::Cast { expr, data_type } => {
-            if let Some(kind) = NumericKernels::kind_for_data_type(data_type) {
-                Ok(matches!(kind, NumericKind::Float))
-            } else {
-                computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)
-            }
-        }
-        ScalarExpr::Not(expr) => computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes),
-        ScalarExpr::IsNull { expr, .. } => {
-            let _ = computed_expr_prefers_float(expr.as_ref(), table_id, lfid_dtypes)?;
-            Ok(false)
-        }
-        ScalarExpr::Case {
-            operand,
-            branches,
-            else_expr,
-        } => {
-            if let Some(inner) = operand.as_deref()
-                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
-            {
-                return Ok(true);
-            }
-            for (when_expr, then_expr) in branches {
-                if computed_expr_prefers_float(when_expr, table_id, lfid_dtypes)?
-                    || computed_expr_prefers_float(then_expr, table_id, lfid_dtypes)?
-                {
-                    return Ok(true);
-                }
-            }
-            if let Some(inner) = else_expr.as_deref()
-                && computed_expr_prefers_float(inner, table_id, lfid_dtypes)?
-            {
-                return Ok(true);
-            }
-            Ok(false)
-        }
-        ScalarExpr::Coalesce(items) => {
-            for item in items {
-                if computed_expr_prefers_float(item, table_id, lfid_dtypes)? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        ScalarExpr::Random => Ok(true),
-        ScalarExpr::ScalarSubquery(_) => Ok(false),
-    }
-}
-
-fn scalar_expr_contains_coalesce(expr: &ScalarExpr<FieldId>) -> bool {
-    match expr {
-        ScalarExpr::Coalesce(_) => true,
-        ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
-            scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right)
-        }
-        ScalarExpr::Not(expr) => scalar_expr_contains_coalesce(expr),
-        ScalarExpr::IsNull { expr, .. } => scalar_expr_contains_coalesce(expr),
-        ScalarExpr::Cast { expr, .. } => scalar_expr_contains_coalesce(expr),
-        ScalarExpr::Case {
-            operand,
-            branches,
-            else_expr,
-        } => {
-            operand
-                .as_deref()
-                .map(scalar_expr_contains_coalesce)
-                .unwrap_or(false)
-                || branches.iter().any(|(when_expr, then_expr)| {
-                    scalar_expr_contains_coalesce(when_expr)
-                        || scalar_expr_contains_coalesce(then_expr)
-                })
-                || else_expr
-                    .as_deref()
-                    .map(scalar_expr_contains_coalesce)
-                    .unwrap_or(false)
-        }
-        ScalarExpr::GetField { base, .. } => scalar_expr_contains_coalesce(base),
-        ScalarExpr::Aggregate(_)
-        | ScalarExpr::Column(_)
-        | ScalarExpr::Literal(_)
-        | ScalarExpr::Random
-        | ScalarExpr::ScalarSubquery(_) => false,
-    }
-}
-fn literal_prefers_float(literal: &Literal) -> LlkvResult<bool> {
-    match literal {
-        Literal::Float(_) => Ok(true),
-        Literal::Decimal(_) => Ok(true),
-        Literal::Struct(fields) => {
-            for (_, nested) in fields {
-                if literal_prefers_float(nested.as_ref())? {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        }
-        Literal::Integer(_) | Literal::Boolean(_) | Literal::String(_) | Literal::Null => Ok(false),
-        Literal::Date32(_) => Ok(false),
-        Literal::Interval(_) => Ok(false),
-    }
-}
-
-fn get_field_dtype(
-    expr: &ScalarExpr<FieldId>,
-    field_name: &str,
-    table_id: TableId,
-    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
-) -> LlkvResult<DataType> {
-    let base_dtype = match expr {
-        ScalarExpr::Column(fid) => {
-            let lfid = LogicalFieldId::for_user(table_id, *fid);
-            lfid_dtypes
-                .get(&lfid)
-                .cloned()
-                .ok_or_else(|| Error::Internal("missing dtype for column".into()))?
-        }
-        ScalarExpr::GetField {
-            base: inner_base,
-            field_name: inner_field,
-        } => get_field_dtype(inner_base.as_ref(), inner_field, table_id, lfid_dtypes)?,
-        _ => {
-            return Err(Error::InvalidArgumentError(
-                "GetField base must be a column or another GetField".into(),
-            ));
-        }
-    };
-
-    if let DataType::Struct(fields) = base_dtype {
-        fields
-            .iter()
-            .find(|f| f.name() == field_name)
-            .map(|f| f.data_type().clone())
-            .ok_or_else(|| {
-                Error::InvalidArgumentError(format!("Field '{}' not found in struct", field_name))
-            })
-    } else {
-        Err(Error::InvalidArgumentError(
-            "GetField can only be applied to struct types".into(),
-        ))
-    }
-}
-
-fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
-    match literal {
-        Literal::Integer(_) => Ok(DataType::Int64),
-        Literal::Float(_) => Ok(DataType::Float64),
-        Literal::Decimal(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
-        Literal::Boolean(_) => Ok(DataType::Boolean),
-        Literal::String(_) => Ok(DataType::Utf8),
-        Literal::Date32(_) => Ok(DataType::Date32),
-        Literal::Interval(_) => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
-        Literal::Null => Ok(DataType::Null),
-        Literal::Struct(fields) => {
-            let inferred_fields = fields
-                .iter()
-                .map(|(name, nested)| {
-                    let dtype = infer_literal_datatype(nested.as_ref())?;
-                    Ok(Field::new(name.clone(), dtype, true))
-                })
-                .collect::<LlkvResult<Vec<_>>>()?;
-            Ok(DataType::Struct(inferred_fields.into()))
-        }
-    }
-}
-
-#[inline]
-fn interval_value_to_arrow(
-    value: IntervalValue,
-) -> <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native {
-    <IntervalMonthDayNanoType as ArrowPrimitiveType>::Native::new(
-        value.months,
-        value.days,
-        value.nanos,
-    )
-}
-
-#[inline]
-fn compare_interval_values(lhs: IntervalValue, rhs: IntervalValue) -> Ordering {
-    (lhs.months, lhs.days, lhs.nanos).cmp(&(rhs.months, rhs.days, rhs.nanos))
-}
-
-fn synthesize_computed_literal_array(
-    info: &ComputedProjectionInfo,
-    data_type: &DataType,
-    row_count: usize,
-) -> LlkvResult<ArrayRef> {
-    if row_count == 0 {
-        return Ok(new_null_array(data_type, 0));
-    }
-
-    match &info.expr {
-        ScalarExpr::Literal(Literal::Integer(value)) => {
-            let v = i64::try_from(*value).map_err(|_| {
-                Error::InvalidArgumentError(
-                    "integer literal exceeds supported range for INT64 column".into(),
-                )
-            })?;
-            Ok(Arc::new(Int64Array::from(vec![v; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Float(value)) => {
-            Ok(Arc::new(Float64Array::from(vec![*value; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Decimal(value)) => {
-            let iter = std::iter::repeat_n(value.raw_value(), row_count);
-            let array = Decimal128Array::from_iter_values(iter)
-                .with_precision_and_scale(value.precision(), value.scale())
-                .map_err(|err| {
-                    Error::InvalidArgumentError(format!(
-                        "failed to build Decimal128 literal array: {err}"
-                    ))
-                })?;
-            Ok(Arc::new(array) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Boolean(value)) => {
-            Ok(Arc::new(BooleanArray::from(vec![*value; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::String(value)) => {
-            Ok(Arc::new(StringArray::from(vec![value.clone(); row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Date32(value)) => {
-            Ok(Arc::new(Date32Array::from(vec![*value; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Interval(value)) => {
-            let native = interval_value_to_arrow(*value);
-            Ok(Arc::new(IntervalMonthDayNanoArray::from(vec![native; row_count])) as ArrayRef)
-        }
-        ScalarExpr::Literal(Literal::Null) => Ok(new_null_array(data_type, row_count)),
-        ScalarExpr::Literal(Literal::Struct(fields)) => {
-            // Build a struct array from the literal fields
-            use arrow::array::StructArray;
-
-            // Convert each field to an array
-            let mut field_arrays = Vec::new();
-            let mut arrow_fields = Vec::new();
-
-            for (field_name, field_literal) in fields {
-                // Infer the proper data type from the literal
-                let field_dtype = infer_literal_datatype(field_literal.as_ref())?;
-                arrow_fields.push(Field::new(field_name.clone(), field_dtype.clone(), true));
-
-                // Create the array for this field
-                let field_array = match field_literal.as_ref() {
-                    Literal::Integer(v) => {
-                        let int_val = i64::try_from(*v).unwrap_or(0);
-                        Arc::new(Int64Array::from(vec![int_val; row_count])) as ArrayRef
-                    }
-                    Literal::Float(v) => {
-                        Arc::new(Float64Array::from(vec![*v; row_count])) as ArrayRef
-                    }
-                    Literal::Decimal(v) => {
-                        let iter = std::iter::repeat_n(v.raw_value(), row_count);
-                        let array = Decimal128Array::from_iter_values(iter)
-                            .with_precision_and_scale(v.precision(), v.scale())
-                            .map_err(|err| {
-                                Error::InvalidArgumentError(format!(
-                                    "failed to build Decimal128 literal array: {err}"
-                                ))
-                            })?;
-                        Arc::new(array) as ArrayRef
-                    }
-                    Literal::Boolean(v) => {
-                        Arc::new(BooleanArray::from(vec![*v; row_count])) as ArrayRef
-                    }
-                    Literal::String(v) => {
-                        Arc::new(StringArray::from(vec![v.clone(); row_count])) as ArrayRef
-                    }
-                    Literal::Date32(v) => {
-                        Arc::new(Date32Array::from(vec![*v; row_count])) as ArrayRef
-                    }
-                    Literal::Interval(v) => Arc::new(IntervalMonthDayNanoArray::from(vec![
-                        interval_value_to_arrow(*v);
-                        row_count
-                    ])) as ArrayRef,
-                    Literal::Null => new_null_array(&field_dtype, row_count),
-                    Literal::Struct(nested_fields) => {
-                        // Recursively build nested struct
-                        // Create a temporary ComputedProjectionInfo for nested struct
-                        let nested_info = ComputedProjectionInfo {
-                            expr: ScalarExpr::Literal(Literal::Struct(nested_fields.clone())),
-                            alias: field_name.clone(),
-                        };
-                        synthesize_computed_literal_array(&nested_info, &field_dtype, row_count)?
-                    }
-                };
-
-                field_arrays.push(field_array);
-            }
-
-            let struct_array = StructArray::try_new(
-                arrow_fields.into(),
-                field_arrays,
-                None, // No null buffer
-            )
-            .map_err(|e| Error::Internal(format!("failed to create struct array: {}", e)))?;
-
-            Ok(Arc::new(struct_array) as ArrayRef)
-        }
-        ScalarExpr::Cast {
-            expr,
-            data_type: target_type,
-        } => {
-            let inner_dtype = match expr.as_ref() {
-                ScalarExpr::Literal(lit) => infer_literal_datatype(lit)?,
-                ScalarExpr::Cast { data_type, .. } => data_type.clone(),
-                _ => return Ok(new_null_array(data_type, row_count)),
-            };
-
-            let inner_info = ComputedProjectionInfo {
-                expr: expr.as_ref().clone(),
-                alias: info.alias.clone(),
-            };
-            let inner = synthesize_computed_literal_array(&inner_info, &inner_dtype, row_count)?;
-            compute::cast(&inner, target_type)
-                .map_err(|e| Error::InvalidArgumentError(format!("failed to cast literal: {e}")))
-        }
-        ScalarExpr::Column(_)
-        | ScalarExpr::Binary { .. }
-        | ScalarExpr::Compare { .. }
-        | ScalarExpr::Aggregate(_)
-        | ScalarExpr::GetField { .. }
-        | ScalarExpr::Not(_)
-        | ScalarExpr::IsNull { .. }
-        | ScalarExpr::Case { .. }
-        | ScalarExpr::Coalesce(_)
-        | ScalarExpr::Random => Ok(new_null_array(data_type, row_count)),
-        ScalarExpr::ScalarSubquery(_) => Ok(new_null_array(data_type, row_count)),
-    }
 }
 
 fn plan_graph_err(err: PlanGraphError) -> Error {
@@ -3692,420 +3432,8 @@ fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
 }
 
 fn format_expr(expr: &Expr<'_, FieldId>) -> String {
-    use Expr::*;
-
-    // Iterative postorder traversal using work/result stack pattern.
-    // See llkv-plan::traversal module documentation for pattern details.
-    //
-    // This uses a two-pass approach: first collect nodes in postorder, then format them.
-    // This avoids stack overflow on deeply nested expressions (50k+ nodes).
-    let mut traverse_stack = Vec::new();
-    let mut postorder = Vec::new();
-    traverse_stack.push(expr);
-
-    while let Some(node) = traverse_stack.pop() {
-        postorder.push(node);
-        match node {
-            And(children) | Or(children) => {
-                for child in children {
-                    traverse_stack.push(child);
-                }
-            }
-            Not(inner) => traverse_stack.push(inner),
-            Pred(_) | Compare { .. } | InList { .. } | IsNull { .. } | Literal(_) | Exists(_) => {}
-        }
-    }
-
-    let mut result_stack: Vec<String> = Vec::new();
-    for node in postorder.into_iter().rev() {
-        match node {
-            And(children) => {
-                if children.is_empty() {
-                    result_stack.push("TRUE".to_string());
-                } else {
-                    let mut parts = Vec::with_capacity(children.len());
-                    for _ in 0..children.len() {
-                        parts.push(result_stack.pop().unwrap_or_default());
-                    }
-                    parts.reverse();
-                    result_stack.push(parts.join(" AND "));
-                }
-            }
-            Or(children) => {
-                if children.is_empty() {
-                    result_stack.push("FALSE".to_string());
-                } else {
-                    let mut parts = Vec::with_capacity(children.len());
-                    for _ in 0..children.len() {
-                        parts.push(result_stack.pop().unwrap_or_default());
-                    }
-                    parts.reverse();
-                    result_stack.push(parts.join(" OR "));
-                }
-            }
-            Not(_) => {
-                let inner = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("NOT ({inner})"));
-            }
-            Pred(filter) => {
-                result_stack.push(format_filter(filter));
-            }
-            Compare { left, op, right } => {
-                result_stack.push(format!(
-                    "{} {} {}",
-                    format_scalar_expr(left),
-                    format_compare_op(*op),
-                    format_scalar_expr(right)
-                ));
-            }
-            InList {
-                expr,
-                list,
-                negated,
-            } => {
-                let expr_str = format_scalar_expr(expr);
-                let mut parts = Vec::with_capacity(list.len());
-                for value in list {
-                    parts.push(format_scalar_expr(value));
-                }
-                let keyword = if *negated { "NOT IN" } else { "IN" };
-                result_stack.push(format!("{} {} ({})", expr_str, keyword, parts.join(", ")));
-            }
-            IsNull { expr, negated } => {
-                let expr_str = format_scalar_expr(expr);
-                let keyword = if *negated { "IS NOT NULL" } else { "IS NULL" };
-                result_stack.push(format!("{} {}", expr_str, keyword));
-            }
-            Literal(value) => {
-                result_stack.push(if *value {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
-                });
-            }
-            Exists(_) => {
-                result_stack.push("EXISTS(...)".to_string());
-            }
-        }
-    }
-
-    result_stack.pop().unwrap_or_default()
+    expr.format_display()
 }
-
-fn format_filter(filter: &Filter<'_, FieldId>) -> String {
-    format!("field#{} {}", filter.field_id, format_operator(&filter.op))
-}
-
-fn format_operator(op: &Operator<'_>) -> String {
-    match op {
-        Operator::Equals(lit) => format!("= {}", format_literal(lit)),
-        Operator::Range { lower, upper } => format!(
-            "IN {} .. {}",
-            format_range_bound_lower(lower),
-            format_range_bound_upper(upper)
-        ),
-        Operator::GreaterThan(lit) => format!("> {}", format_literal(lit)),
-        Operator::GreaterThanOrEquals(lit) => format!(">= {}", format_literal(lit)),
-        Operator::LessThan(lit) => format!("< {}", format_literal(lit)),
-        Operator::LessThanOrEquals(lit) => format!("<= {}", format_literal(lit)),
-        Operator::In(values) => {
-            let rendered: Vec<String> = values.iter().map(format_literal).collect();
-            format!("IN {{{}}}", rendered.join(", "))
-        }
-        Operator::StartsWith {
-            pattern,
-            case_sensitive,
-        } => format_pattern_op("STARTS WITH", pattern, *case_sensitive),
-        Operator::EndsWith {
-            pattern,
-            case_sensitive,
-        } => format_pattern_op("ENDS WITH", pattern, *case_sensitive),
-        Operator::Contains {
-            pattern,
-            case_sensitive,
-        } => format_pattern_op("CONTAINS", pattern, *case_sensitive),
-        Operator::IsNull => "IS NULL".to_string(),
-        Operator::IsNotNull => "IS NOT NULL".to_string(),
-    }
-}
-
-fn format_pattern_op(op_name: &str, pattern: &str, case_sensitive: bool) -> String {
-    let mut rendered = format!("{} \"{}\"", op_name, escape_string(pattern));
-    if !case_sensitive {
-        rendered.push_str(" (case-insensitive)");
-    }
-    rendered
-}
-
-fn format_range_bound_lower(bound: &Bound<Literal>) -> String {
-    match bound {
-        Bound::Unbounded => "-inf".to_string(),
-        Bound::Included(lit) => format!("[{}", format_literal(lit)),
-        Bound::Excluded(lit) => format!("({}", format_literal(lit)),
-    }
-}
-
-fn format_range_bound_upper(bound: &Bound<Literal>) -> String {
-    match bound {
-        Bound::Unbounded => "+inf".to_string(),
-        Bound::Included(lit) => format!("{}]", format_literal(lit)),
-        Bound::Excluded(lit) => format!("{})", format_literal(lit)),
-    }
-}
-
-fn format_scalar_expr(expr: &ScalarExpr<FieldId>) -> String {
-    use ScalarExpr::*;
-
-    // Iterative postorder traversal using work/result stack pattern.
-    // See llkv-plan::traversal module documentation for pattern details.
-    //
-    // This uses a two-pass approach: first collect nodes in postorder, then format them.
-    // This avoids stack overflow on deeply nested expressions (50k+ nodes).
-    let mut traverse_stack = Vec::new();
-    let mut postorder = Vec::new();
-    traverse_stack.push(expr);
-
-    while let Some(node) = traverse_stack.pop() {
-        postorder.push(node);
-        match node {
-            Binary { left, right, .. } => {
-                traverse_stack.push(left);
-                traverse_stack.push(right);
-            }
-            Compare { left, right, .. } => {
-                traverse_stack.push(left);
-                traverse_stack.push(right);
-            }
-            GetField { base, .. } => traverse_stack.push(base),
-            Cast { expr, .. } => traverse_stack.push(expr),
-            Not(expr) => traverse_stack.push(expr),
-            ScalarExpr::IsNull { expr, .. } => traverse_stack.push(expr),
-            Case {
-                operand,
-                branches,
-                else_expr,
-            } => {
-                if let Some(inner) = else_expr.as_deref() {
-                    traverse_stack.push(inner);
-                }
-                for (when_expr, then_expr) in branches.iter().rev() {
-                    traverse_stack.push(then_expr);
-                    traverse_stack.push(when_expr);
-                }
-                if let Some(inner) = operand.as_deref() {
-                    traverse_stack.push(inner);
-                }
-            }
-            Coalesce(items) => {
-                for item in items {
-                    traverse_stack.push(item);
-                }
-            }
-            Column(_) | Literal(_) | Aggregate(_) | ScalarExpr::Random => {}
-            ScalarExpr::ScalarSubquery(_) => {}
-        }
-    }
-
-    let mut result_stack: Vec<String> = Vec::new();
-    for node in postorder.into_iter().rev() {
-        match node {
-            Column(fid) => result_stack.push(format!("col#{}", fid)),
-            Literal(lit) => result_stack.push(format_literal(lit)),
-            Aggregate(agg) => result_stack.push(format!("AGG({:?})", agg)),
-            GetField { field_name, .. } => {
-                let base = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("{base}.{field_name}"));
-            }
-            Cast { data_type, .. } => {
-                let value = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("CAST({value} AS {data_type:?})"));
-            }
-            Binary { op, .. } => {
-                let right = result_stack.pop().unwrap_or_default();
-                let left = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("({} {} {})", left, format_binary_op(*op), right));
-            }
-            Compare { op, .. } => {
-                let right = result_stack.pop().unwrap_or_default();
-                let left = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("({} {} {})", left, format_compare_op(*op), right));
-            }
-            Not(_) => {
-                let operand = result_stack.pop().unwrap_or_default();
-                result_stack.push(format!("(NOT {})", operand));
-            }
-            ScalarExpr::IsNull { negated, .. } => {
-                let operand = result_stack.pop().unwrap_or_default();
-                if *negated {
-                    result_stack.push(format!("({operand} IS NOT NULL)"));
-                } else {
-                    result_stack.push(format!("({operand} IS NULL)"));
-                }
-            }
-            Case {
-                operand,
-                branches,
-                else_expr,
-            } => {
-                let else_str = if else_expr.is_some() {
-                    Some(result_stack.pop().unwrap_or_default())
-                } else {
-                    None
-                };
-                let mut branch_pairs = Vec::with_capacity(branches.len());
-                for _ in 0..branches.len() {
-                    let then_str = result_stack.pop().unwrap_or_default();
-                    let when_str = result_stack.pop().unwrap_or_default();
-                    branch_pairs.push((when_str, then_str));
-                }
-                branch_pairs.reverse();
-                let operand_str = if operand.is_some() {
-                    Some(result_stack.pop().unwrap_or_default())
-                } else {
-                    None
-                };
-
-                let mut parts = Vec::new();
-                if let Some(op_str) = operand_str {
-                    parts.push(format!("CASE {op_str}"));
-                } else {
-                    parts.push("CASE".to_string());
-                }
-                for (when_str, then_str) in branch_pairs {
-                    parts.push(format!("WHEN {when_str} THEN {then_str}"));
-                }
-                if let Some(else_str) = else_str {
-                    parts.push(format!("ELSE {else_str}"));
-                }
-                parts.push("END".to_string());
-                result_stack.push(parts.join(" "));
-            }
-            Coalesce(items) => {
-                let mut args = Vec::with_capacity(items.len());
-                for _ in 0..items.len() {
-                    args.push(result_stack.pop().unwrap_or_default());
-                }
-                args.reverse();
-                result_stack.push(format!("COALESCE({})", args.join(", ")));
-            }
-            ScalarExpr::Random => {
-                result_stack.push("RANDOM()".to_string());
-            }
-            ScalarExpr::ScalarSubquery(sub) => {
-                result_stack.push(format!("(SCALAR_SUBQUERY#{})", sub.id.0));
-            }
-        }
-    }
-
-    result_stack.pop().unwrap_or_default()
-}
-
-fn format_binary_op(op: BinaryOp) -> &'static str {
-    match op {
-        BinaryOp::Add => "+",
-        BinaryOp::Subtract => "-",
-        BinaryOp::Multiply => "*",
-        BinaryOp::Divide => "/",
-        BinaryOp::Modulo => "%",
-        BinaryOp::And => "AND",
-        BinaryOp::Or => "OR",
-        BinaryOp::BitwiseShiftLeft => "<<",
-        BinaryOp::BitwiseShiftRight => ">>",
-    }
-}
-
-fn format_compare_op(op: CompareOp) -> &'static str {
-    match op {
-        CompareOp::Eq => "=",
-        CompareOp::NotEq => "!=",
-        CompareOp::Lt => "<",
-        CompareOp::LtEq => "<=",
-        CompareOp::Gt => ">",
-        CompareOp::GtEq => ">=",
-    }
-}
-
-fn format_literal(lit: &Literal) -> String {
-    match lit {
-        Literal::Integer(i) => i.to_string(),
-        Literal::Float(f) => f.to_string(),
-        Literal::Decimal(d) => d.to_string(),
-        Literal::Boolean(b) => b.to_string(),
-        Literal::String(s) => format!("\"{}\"", escape_string(s)),
-        Literal::Date32(days) => format!("DATE '{}'", format_date32(*days)),
-        Literal::Interval(interval) => format!(
-            "INTERVAL {{ months: {}, days: {}, nanos: {} }}",
-            interval.months, interval.days, interval.nanos
-        ),
-        Literal::Null => "NULL".to_string(),
-        Literal::Struct(fields) => {
-            let field_strs: Vec<_> = fields
-                .iter()
-                .map(|(name, lit)| format!("{}: {}", name, format_literal(lit)))
-                .collect();
-            format!("{{{}}}", field_strs.join(", "))
-        }
-    }
-}
-
-fn format_date32(days: i32) -> String {
-    let julian = match epoch_julian_day().checked_add(days) {
-        Some(value) => value,
-        None => return days.to_string(),
-    };
-
-    match Date::from_julian_day(julian) {
-        Ok(date) => {
-            let (year, month, day) = date.to_calendar_date();
-            let month_number = month as u8;
-            format!("{:04}-{:02}-{:02}", year, month_number, day)
-        }
-        Err(_) => days.to_string(),
-    }
-}
-
-fn epoch_julian_day() -> i32 {
-    Date::from_calendar_date(1970, Month::January, 1)
-        .expect("1970-01-01 is a valid date")
-        .to_julian_day()
-}
-
-fn escape_string(value: &str) -> String {
-    value.chars().flat_map(|c| c.escape_default()).collect()
-}
-
-fn compare_option_values<T: Ord>(
-    left: Option<T>,
-    right: Option<T>,
-    ascending: bool,
-    nulls_first: bool,
-) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => {
-            if nulls_first {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (Some(_), None) => {
-            if nulls_first {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (Some(a), Some(b)) => {
-            if ascending {
-                a.cmp(&b)
-            } else {
-                b.cmp(&a)
-            }
-        }
-    }
-}
-
 struct PrimitiveOrderContext<'a> {
     out_schema: &'a Arc<Schema>,
     logical_fields: &'a Arc<Vec<LogicalFieldId>>,
@@ -4141,58 +3469,6 @@ where
 {
     chunks: Vec<PrimitiveArray<T>>,
     positions: Vec<(usize, usize)>,
-}
-
-/// Sorts row ids by the values stored in `chunks`, preserving stable ordering for ties.
-fn sort_by_primitive<T>(
-    row_ids: &[RowId],
-    chunks: &[PrimitiveArray<T>],
-    positions: &[(usize, usize)],
-    ascending: bool,
-    nulls_first: bool,
-) -> Vec<RowId>
-where
-    T: ArrowPrimitiveType,
-    T::Native: Ord,
-{
-    let mut indices: Vec<(usize, RowId)> = row_ids.iter().copied().enumerate().collect();
-    indices.sort_by(|(ai, arid), (bi, brid)| {
-        let (chunk_a, offset_a) = positions[*ai];
-        let (chunk_b, offset_b) = positions[*bi];
-        let array_a = &chunks[chunk_a];
-        let array_b = &chunks[chunk_b];
-        let left = if array_a.is_null(offset_a) {
-            None
-        } else {
-            Some(array_a.value(offset_a))
-        };
-        let right = if array_b.is_null(offset_b) {
-            None
-        } else {
-            Some(array_b.value(offset_b))
-        };
-        let ord = compare_option_values(left, right, ascending, nulls_first);
-        if ord == Ordering::Equal {
-            arid.cmp(brid)
-        } else {
-            ord
-        }
-    });
-    indices.into_iter().map(|(_, rid)| rid).collect()
-}
-
-fn is_full_range_filter(expr: &Expr<'_, FieldId>, expected_field: FieldId) -> bool {
-    matches!(
-        expr,
-        Expr::Pred(Filter {
-            field_id,
-            op:
-                Operator::Range {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-        }) if *field_id == expected_field
-    )
 }
 
 struct SingleColumnStreamVisitor<'a, F>
@@ -4295,16 +3571,10 @@ where
             return;
         }
 
-        let lfids = [self.lfid];
-        let arrays = vec![array.clone()];
-        let numeric_arrays =
-            match NumericKernels::prepare_numeric_arrays(&lfids, &arrays, &self.numeric_fields) {
-                Ok(map) => map,
-                Err(err) => {
-                    self.error = Some(err);
-                    return;
-                }
-            };
+        let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
+        if self.numeric_fields.contains(&self.lfid.field_id()) {
+            numeric_arrays.insert(self.lfid.field_id(), array.clone());
+        }
 
         let len = array.len();
         let evaluated = match NumericKernels::evaluate_batch(&self.expr, len, &numeric_arrays) {
@@ -4535,13 +3805,13 @@ where
 
 #[derive(Default)]
 struct RowIdScanCollector {
-    row_ids: Vec<RowId>,
+    row_ids: Treemap,
 }
 
 impl RowIdScanCollector {
     fn extend_from_array(&mut self, row_ids: &UInt64Array) {
         for idx in 0..row_ids.len() {
-            self.row_ids.push(row_ids.value(idx));
+            self.row_ids.add(row_ids.value(idx));
         }
     }
 
@@ -4551,11 +3821,11 @@ impl RowIdScanCollector {
         }
         let end = (start + len).min(row_ids.len());
         for idx in start..end {
-            self.row_ids.push(row_ids.value(idx));
+            self.row_ids.add(row_ids.value(idx));
         }
     }
 
-    fn into_inner(self) -> Vec<RowId> {
+    fn into_inner(self) -> Treemap {
         self.row_ids
     }
 }
@@ -4697,12 +3967,6 @@ where
     }
 }
 
-fn normalize_row_ids(mut row_ids: Vec<RowId>) -> Vec<RowId> {
-    row_ids.sort_unstable();
-    row_ids.dedup();
-    row_ids
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_row_window<P>(
     store: &llkv_column_map::store::ColumnStore<P>,
@@ -4728,11 +3992,7 @@ where
     let mut gathered_batch: Option<RecordBatch> = None;
     let (batch_len, numeric_arrays) = if unique_lfids.is_empty() {
         let numeric_arrays = if requires_numeric {
-            Some(NumericKernels::prepare_numeric_arrays(
-                &[],
-                &[],
-                numeric_fields,
-            )?)
+            Some(FxHashMap::default())
         } else {
             None
         };
@@ -4752,11 +4012,14 @@ where
         }
         let batch_len = batch.num_rows();
         let numeric_arrays = if requires_numeric {
-            Some(NumericKernels::prepare_numeric_arrays(
-                unique_lfids,
-                batch.columns(),
-                numeric_fields,
-            )?)
+            let mut map: NumericArrayMap = FxHashMap::default();
+            for (lfid, array) in unique_lfids.iter().zip(batch.columns().iter()) {
+                let fid = lfid.field_id();
+                if numeric_fields.contains(&fid) {
+                    map.insert(fid, array.clone());
+                }
+            }
+            Some(map)
         } else {
             None
         };
@@ -4877,258 +4140,23 @@ where
     Ok(Some(batch))
 }
 
-fn emit_synthetic_null_batch<F>(
+fn build_projection_literals(
     projection_evals: &[ProjectionEval],
     out_schema: &Arc<Schema>,
-    row_count: usize,
-    on_batch: &mut F,
-) -> LlkvResult<()>
-where
-    F: FnMut(RecordBatch),
-{
-    if row_count == 0 {
-        return Ok(());
-    }
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-    for (idx, eval) in projection_evals.iter().enumerate() {
-        let array = match eval {
-            ProjectionEval::Column(info) => new_null_array(&info.data_type, row_count),
-            ProjectionEval::Computed(info) => synthesize_computed_literal_array(
-                info,
-                out_schema.field(idx).data_type(),
-                row_count,
-            )?,
-        };
-        columns.push(array);
-    }
-
-    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns)?;
-    on_batch(batch);
-    Ok(())
-}
-
-fn literal_to_u64(lit: &Literal) -> LlkvResult<u64> {
-    u64::from_literal(lit)
-        .map_err(|err| Error::InvalidArgumentError(format!("rowid literal cast failed: {err}")))
-}
-
-fn lower_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
-    Ok(match bound {
-        Bound::Unbounded => 0,
-        Bound::Included(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid < value)
-        }
-        Bound::Excluded(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid <= value)
-        }
-    })
-}
-
-fn upper_bound_index(row_ids: &[RowId], bound: &Bound<Literal>) -> LlkvResult<usize> {
-    Ok(match bound {
-        Bound::Unbounded => row_ids.len(),
-        Bound::Included(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid <= value)
-        }
-        Bound::Excluded(lit) => {
-            let value = literal_to_u64(lit)?;
-            row_ids.partition_point(|&rid| rid < value)
-        }
-    })
-}
-
-fn filter_row_ids_by_operator(row_ids: &[RowId], op: &Operator<'_>) -> LlkvResult<Vec<RowId>> {
-    use Operator::*;
-
-    match op {
-        Equals(lit) => {
-            let value = literal_to_u64(lit)?;
-            match row_ids.binary_search(&value) {
-                Ok(idx) => Ok(vec![row_ids[idx]]),
-                Err(_) => Ok(Vec::new()),
-            }
-        }
-        GreaterThan(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid <= value);
-            Ok(row_ids[idx..].to_vec())
-        }
-        GreaterThanOrEquals(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid < value);
-            Ok(row_ids[idx..].to_vec())
-        }
-        LessThan(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid < value);
-            Ok(row_ids[..idx].to_vec())
-        }
-        LessThanOrEquals(lit) => {
-            let value = literal_to_u64(lit)?;
-            let idx = row_ids.partition_point(|&rid| rid <= value);
-            Ok(row_ids[..idx].to_vec())
-        }
-        Range { lower, upper } => {
-            let start = lower_bound_index(row_ids, lower)?;
-            let end = upper_bound_index(row_ids, upper)?;
-            if start >= end {
-                Ok(Vec::new())
-            } else {
-                Ok(row_ids[start..end].to_vec())
-            }
-        }
-        In(literals) => {
-            if literals.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut targets = FxHashSet::default();
-            for lit in *literals {
-                targets.insert(literal_to_u64(lit)?);
-            }
-            if targets.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut matches = Vec::with_capacity(targets.len());
-            for &rid in row_ids {
-                if targets.remove(&rid) {
-                    matches.push(rid);
-                    if targets.is_empty() {
-                        break;
-                    }
-                }
-            }
-            Ok(matches)
-        }
-        StartsWith { .. } | EndsWith { .. } | Contains { .. } => Err(Error::InvalidArgumentError(
-            "rowid predicates do not support string pattern matching".into(),
-        )),
-        IsNull | IsNotNull => Err(Error::InvalidArgumentError(
-            "rowid predicates do not support null checks".into(),
-        )),
-    }
-}
-
-fn intersect_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
-    let mut result = Vec::with_capacity(left.len().min(right.len()));
-    let mut i = 0;
-    let mut j = 0;
-    while i < left.len() && j < right.len() {
-        let lv = left[i];
-        let rv = right[j];
-        if lv == rv {
-            result.push(lv);
-            i += 1;
-            j += 1;
-        } else if lv < rv {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    result
-}
-
-fn union_sorted(left: Vec<RowId>, right: Vec<RowId>) -> Vec<RowId> {
-    if left.is_empty() {
-        return right;
-    }
-    if right.is_empty() {
-        return left;
-    }
-
-    let mut result = Vec::with_capacity(left.len() + right.len());
-    let mut i = 0;
-    let mut j = 0;
-    while i < left.len() && j < right.len() {
-        let lv = left[i];
-        let rv = right[j];
-        if lv == rv {
-            result.push(lv);
-            i += 1;
-            j += 1;
-        } else if lv < rv {
-            result.push(lv);
-            i += 1;
-        } else {
-            result.push(rv);
-            j += 1;
-        }
-    }
-
-    while i < left.len() {
-        result.push(left[i]);
-        i += 1;
-    }
-    while j < right.len() {
-        result.push(right[j]);
-        j += 1;
-    }
-
-    result.dedup();
-    result
-}
-
-fn difference_sorted(base: Vec<RowId>, subtract: Vec<RowId>) -> Vec<RowId> {
-    if base.is_empty() || subtract.is_empty() {
-        return base;
-    }
-
-    let mut result = Vec::with_capacity(base.len());
-    let mut i = 0;
-    let mut j = 0;
-    while i < base.len() && j < subtract.len() {
-        let bv = base[i];
-        let sv = subtract[j];
-        if bv == sv {
-            i += 1;
-            j += 1;
-        } else if bv < sv {
-            result.push(bv);
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    while i < base.len() {
-        result.push(base[i]);
-        i += 1;
-    }
-    result
-}
-
-fn difference_sorted_slice(base: &[RowId], subtract: &[RowId]) -> Vec<RowId> {
-    if base.is_empty() {
-        return Vec::new();
-    }
-    if subtract.is_empty() {
-        return base.to_vec();
-    }
-
-    let mut result = Vec::with_capacity(base.len());
-    let mut i = 0;
-    let mut j = 0;
-    while i < base.len() && j < subtract.len() {
-        let bv = base[i];
-        let sv = subtract[j];
-        if bv == sv {
-            i += 1;
-            j += 1;
-        } else if bv < sv {
-            result.push(bv);
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    while i < base.len() {
-        result.push(base[i]);
-        i += 1;
-    }
-    result
+) -> Vec<ProjectionLiteral<FieldId>> {
+    projection_evals
+        .iter()
+        .enumerate()
+        .map(|(idx, eval)| match eval {
+            ProjectionEval::Column(_) => ProjectionLiteral::Column {
+                data_type: out_schema.field(idx).data_type().clone(),
+            },
+            ProjectionEval::Computed(info) => ProjectionLiteral::Computed {
+                info: info.clone(),
+                data_type: out_schema.field(idx).data_type().clone(),
+            },
+        })
+        .collect()
 }
 
 fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
@@ -5142,147 +4170,6 @@ fn expand_filter_runs(runs: &[FilterRun]) -> Vec<RowId> {
         }
     }
     row_ids
-}
-
-fn evaluate_constant_literal_expr(expr: &ScalarExpr<FieldId>) -> LlkvResult<Option<Literal>> {
-    let simplified = NumericKernels::simplify(expr);
-
-    if let Some(literal) = evaluate_constant_literal_non_numeric(&simplified)? {
-        return Ok(Some(literal));
-    }
-
-    if let ScalarExpr::Literal(lit) = &simplified {
-        return Ok(Some(lit.clone()));
-    }
-
-    let arrays = NumericArrayMap::default();
-    match NumericKernels::evaluate_value(&simplified, 0, &arrays)? {
-        Some(NumericValue::Integer(v)) => Ok(Some(Literal::Integer(v as i128))),
-        Some(NumericValue::Float(v)) => Ok(Some(Literal::Float(v))),
-        Some(NumericValue::Decimal(d)) => Ok(Some(Literal::Decimal(d))),
-        None => Ok(None),
-    }
-}
-
-fn evaluate_constant_literal_non_numeric(
-    expr: &ScalarExpr<FieldId>,
-) -> LlkvResult<Option<Literal>> {
-    match expr {
-        ScalarExpr::Literal(lit) => Ok(Some(lit.clone())),
-        ScalarExpr::Cast {
-            expr,
-            data_type: DataType::Date32,
-        } => {
-            let inner = evaluate_constant_literal_non_numeric(expr)?;
-            match inner {
-                Some(Literal::Null) => Ok(Some(Literal::Null)),
-                Some(Literal::String(text)) => {
-                    let days = parse_date32_literal(&text)?;
-                    Ok(Some(Literal::Date32(days)))
-                }
-                Some(Literal::Date32(days)) => Ok(Some(Literal::Date32(days))),
-                Some(other) => Err(Error::InvalidArgumentError(format!(
-                    "cannot cast literal of type {} to DATE",
-                    literal_type_name(&other)
-                ))),
-                None => Ok(None),
-            }
-        }
-        ScalarExpr::Cast { .. } => Ok(None),
-        ScalarExpr::Binary { left, op, right } => {
-            let left_lit = match evaluate_constant_literal_non_numeric(left)? {
-                Some(lit) => lit,
-                None => return Ok(None),
-            };
-            let right_lit = match evaluate_constant_literal_non_numeric(right)? {
-                Some(lit) => lit,
-                None => return Ok(None),
-            };
-
-            if matches!(left_lit, Literal::Null) || matches!(right_lit, Literal::Null) {
-                return Ok(Some(Literal::Null));
-            }
-
-            match op {
-                BinaryOp::Add => match (&left_lit, &right_lit) {
-                    (Literal::Date32(days), Literal::Interval(interval))
-                    | (Literal::Interval(interval), Literal::Date32(days)) => {
-                        let adjusted = add_interval_to_date32(*days, *interval)?;
-                        Ok(Some(Literal::Date32(adjusted)))
-                    }
-                    (Literal::Interval(left), Literal::Interval(right)) => {
-                        let sum = left.checked_add(*right).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "interval addition overflow during constant folding".into(),
-                            )
-                        })?;
-                        Ok(Some(Literal::Interval(sum)))
-                    }
-                    _ => Ok(None),
-                },
-                BinaryOp::Subtract => match (&left_lit, &right_lit) {
-                    (Literal::Date32(days), Literal::Interval(interval)) => {
-                        let adjusted = subtract_interval_from_date32(*days, *interval)?;
-                        Ok(Some(Literal::Date32(adjusted)))
-                    }
-                    (Literal::Interval(left), Literal::Interval(right)) => {
-                        let diff = left.checked_sub(*right).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "interval subtraction overflow during constant folding".into(),
-                            )
-                        })?;
-                        Ok(Some(Literal::Interval(diff)))
-                    }
-                    (Literal::Date32(lhs), Literal::Date32(rhs)) => {
-                        let delta = i64::from(*lhs) - i64::from(*rhs);
-                        if delta < i64::from(i32::MIN) || delta > i64::from(i32::MAX) {
-                            return Err(Error::InvalidArgumentError(
-                                "DATE subtraction overflowed day precision".into(),
-                            ));
-                        }
-                        Ok(Some(Literal::Interval(IntervalValue::new(
-                            0,
-                            delta as i32,
-                            0,
-                        ))))
-                    }
-                    _ => Ok(None),
-                },
-                _ => Ok(None),
-            }
-        }
-        _ => Ok(None),
-    }
-}
-
-fn literal_type_name(literal: &Literal) -> &'static str {
-    match literal {
-        Literal::Null => "NULL",
-        Literal::Integer(_) => "INTEGER",
-        Literal::Float(_) => "FLOAT",
-        Literal::Decimal(_) => "DECIMAL",
-        Literal::String(_) => "STRING",
-        Literal::Boolean(_) => "BOOLEAN",
-        Literal::Date32(_) => "DATE",
-        Literal::Struct(_) => "STRUCT",
-        Literal::Interval(_) => "INTERVAL",
-    }
-}
-
-fn is_supported_numeric(dtype: &DataType) -> bool {
-    matches!(
-        dtype,
-        DataType::UInt64
-            | DataType::UInt32
-            | DataType::UInt16
-            | DataType::UInt8
-            | DataType::Int64
-            | DataType::Int32
-            | DataType::Int16
-            | DataType::Int8
-            | DataType::Float64
-            | DataType::Float32
-    )
 }
 
 // Ensure macro_rules! definitions above are considered used by the compiler.

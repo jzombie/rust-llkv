@@ -5,12 +5,12 @@
 
 use crate::codecs::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::store::indexing::IndexKind;
-use crate::types::LogicalFieldId;
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, BatchPut, GetResult, Pager},
     types::PhysicalKey,
 };
+use llkv_types::ids::LogicalFieldId;
 use std::mem;
 use std::sync::Arc;
 

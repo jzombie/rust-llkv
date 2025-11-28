@@ -5,9 +5,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
+use llkv_types::LogicalFieldId;
 
 #[test]
 fn test_total_rows_before_after_append_and_delete() {

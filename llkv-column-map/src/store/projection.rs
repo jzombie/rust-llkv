@@ -23,7 +23,6 @@ use crate::gather::{
 };
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, RowId};
 use arrow::array::{ArrayRef, OffsetSizeTrait, new_empty_array};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -32,6 +31,7 @@ use llkv_storage::{
     pager::{BatchGet, GetResult, Pager},
     types::PhysicalKey,
 };
+use llkv_types::ids::{LogicalFieldId, RowId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::borrow::Cow;

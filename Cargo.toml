@@ -1,34 +1,61 @@
 [workspace.package]
 authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
-version = "0.8.2-alpha"
+version = "0.8.3-alpha"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
+[workspace]
+members = [
+    "llkv",
+    "llkv-aggregate",
+    "llkv-column-map",
+    "llkv-compute",
+    "llkv-csv",
+    "llkv-executor",
+    "llkv-expr",
+    "llkv-join",
+    "llkv-plan",
+    "llkv-result",
+    "llkv-runtime",
+    "llkv-slt-tester",
+    "llkv-sql",
+    "llkv-storage",
+    "llkv-table",
+    "llkv-test-utils",
+    "llkv-tpch",
+    "llkv-transaction",
+    "llkv-types",
+    "demos/llkv-sql-pong-demo",
+]
+resolver = "2"
+
 [workspace.dependencies]
-llkv = { path = "./llkv", version = "0.8.2-alpha" }
-llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.2-alpha" }
-llkv-column-map = { path = "./llkv-column-map", version = "0.8.2-alpha" }
-llkv-csv = { path = "./llkv-csv", version = "0.8.2-alpha" }
-llkv-executor = { path = "./llkv-executor", version = "0.8.2-alpha" }
-llkv-expr = { path = "./llkv-expr", version = "0.8.2-alpha" }
-llkv-join = { path = "./llkv-join", version = "0.8.2-alpha" }
-llkv-plan = { path = "./llkv-plan", version = "0.8.2-alpha" }
-llkv-result = { path = "./llkv-result", version = "0.8.2-alpha" }
-llkv-runtime = { path = "./llkv-runtime", version = "0.8.2-alpha" }
-llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.2-alpha" }
-llkv-sql = { path = "./llkv-sql", version = "0.8.2-alpha" }
-llkv-storage = { path = "./llkv-storage", version = "0.8.2-alpha" }
-llkv-table = { path = "./llkv-table", version = "0.8.2-alpha" }
-llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.2-alpha" }
-llkv-transaction = { path = "./llkv-transaction", version = "0.8.2-alpha" }
+llkv = { path = "./llkv", version = "0.8.3-alpha" }
+llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.3-alpha" }
+llkv-column-map = { path = "./llkv-column-map", version = "0.8.3-alpha" }
+llkv-compute = { path = "./llkv-compute", version = "0.8.3-alpha" }
+llkv-csv = { path = "./llkv-csv", version = "0.8.3-alpha" }
+llkv-executor = { path = "./llkv-executor", version = "0.8.3-alpha" }
+llkv-expr = { path = "./llkv-expr", version = "0.8.3-alpha" }
+llkv-join = { path = "./llkv-join", version = "0.8.3-alpha" }
+llkv-plan = { path = "./llkv-plan", version = "0.8.3-alpha" }
+llkv-result = { path = "./llkv-result", version = "0.8.3-alpha" }
+llkv-runtime = { path = "./llkv-runtime", version = "0.8.3-alpha" }
+llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.3-alpha" }
+llkv-sql = { path = "./llkv-sql", version = "0.8.3-alpha" }
+llkv-storage = { path = "./llkv-storage", version = "0.8.3-alpha" }
+llkv-table = { path = "./llkv-table", version = "0.8.3-alpha" }
+llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.3-alpha" }
+llkv-transaction = { path = "./llkv-transaction", version = "0.8.3-alpha" }
+llkv-types = { path = "./llkv-types", version = "0.8.3-alpha" }
 simd-r-drive = "0.15.5-alpha"
 simd-r-drive-entry-handle = "0.15.5-alpha"
 
 # Vendor crates
-# Note: A subset of these crates are used only for debug builds or examples;
-# they're listed here to keep workspace versions consistent.
+# Note: A subset of these crates are used only for debug builds or examples.
+# They're listed here to keep workspace versions consistent.
 arrow = { version = "57.0.0", default-features = false, features = ["prettyprint", "ipc"] }
 arrow-array = { version = "57.0.0", default-features = false }
 arrow-ord = { version = "57.0.0", default-features = false }
@@ -36,8 +63,9 @@ arrow-schema = { version = "57.0.0", default-features = false }
 arrow-buffer = { version = "57.0.0", default-features = false }
 async-trait = "0.1.89"
 bitcode = "0.6.7"
-clap = { version = "4.5.18", features = ["derive"] }
+clap = { version = "4.5.53", features = ["derive"] }
 criterion = "0.7.0"
+croaring = "2.5.1"
 crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
 indoc = "2.0.7"
@@ -48,7 +76,6 @@ num_enum = "0.7.5"
 rand = "0.9.1"
 rayon = "1.10.0"
 regex = "1.12.2"
-roaring = "0.11.2"
 rust_decimal = "1.39.0"
 sqlparser = "0.59.0"
 tempfile = "3.23.0"
@@ -65,29 +92,10 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 walkdir = "2.5"
 
-[workspace]
-members = [
-    "llkv",
-    "llkv-aggregate",
-    "llkv-column-map",
-    "llkv-csv",
-    "llkv-runtime",
-    "llkv-executor",
-    "llkv-expr",
-    "llkv-join",
-    "llkv-plan",
-    "llkv-result",
-    "llkv-slt-tester",
-    "llkv-sql",
-    "llkv-storage",
-    "llkv-table",
-    "llkv-test-utils",
-    "llkv-tpch",
-    "llkv-transaction",
-    "demos/llkv-sql-pong-demo"
-]
-resolver = "2"
-
 [workspace.lints.clippy]
 print_stderr = "deny"
 print_stdout = "deny"
+disallowed_methods = "deny"
+
+[workspace.metadata.clippy]
+disallowed-methods = ["std::boxed::Box::leak"]

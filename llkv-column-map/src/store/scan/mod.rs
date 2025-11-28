@@ -19,12 +19,12 @@ use arrow::compute;
 use super::ColumnStore;
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
-use crate::types::{LogicalFieldId, Namespace};
 use llkv_result::{Error, Result};
 use llkv_storage::{
     pager::{BatchGet, GetResult, Pager},
     types::PhysicalKey,
 };
+use llkv_types::ids::{LogicalFieldId, LogicalStorageNamespace};
 use simd_r_drive_entry_handle::EntryHandle;
 
 pub mod builder;
@@ -190,7 +190,7 @@ where
         let paginate = opts.offset > 0 || opts.limit.is_some();
         if !opts.sorted {
             if opts.with_row_ids {
-                let row_fid = field_id.with_namespace(Namespace::RowIdShadow);
+                let row_fid = field_id.with_namespace(LogicalStorageNamespace::RowIdShadow);
                 let catalog = self.catalog.read().unwrap();
                 if opts.include_nulls {
                     let anchor_fid = opts.anchor_row_id_field.unwrap_or(row_fid);
@@ -251,7 +251,7 @@ where
         }
 
         if opts.with_row_ids {
-            let row_fid = field_id.with_namespace(Namespace::RowIdShadow);
+            let row_fid = field_id.with_namespace(LogicalStorageNamespace::RowIdShadow);
             // Prepare value metas and blobs
             let catalog = self.catalog.read().unwrap();
             let descriptor_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;

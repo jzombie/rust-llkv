@@ -6,8 +6,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy, ROW_ID_COLUMN_NAME};
-use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 #[test]
 fn drop_nulls_policy_removes_null_rows() {

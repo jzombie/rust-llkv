@@ -11,9 +11,7 @@ use std::ops::Bound;
 use arrow::datatypes::ArrowPrimitiveType;
 
 use crate::expr::Operator;
-use crate::literal::{
-    FromLiteral, Literal, LiteralCastError, bound_to_native, literal_to_native, literal_to_string,
-};
+use crate::literal::{FromLiteral, Literal, LiteralCastError, LiteralExt};
 
 /// Value that can participate in typed predicate evaluation.
 pub trait PredicateValue: Clone {
@@ -260,29 +258,36 @@ where
 {
     match op {
         Operator::Equals(lit) => Ok(Predicate::Equals(
-            literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<T::Native>()
+                .map_err(PredicateBuildError::from)?,
         )),
         Operator::GreaterThan(lit) => Ok(Predicate::GreaterThan(
-            literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<T::Native>()
+                .map_err(PredicateBuildError::from)?,
         )),
         Operator::GreaterThanOrEquals(lit) => Ok(Predicate::GreaterThanOrEquals(
-            literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<T::Native>()
+                .map_err(PredicateBuildError::from)?,
         )),
         Operator::LessThan(lit) => Ok(Predicate::LessThan(
-            literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<T::Native>()
+                .map_err(PredicateBuildError::from)?,
         )),
         Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
-            literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<T::Native>()
+                .map_err(PredicateBuildError::from)?,
         )),
         Operator::Range { lower, upper } => {
-            let lb = match bound_to_native::<T>(lower).map_err(PredicateBuildError::from)? {
-                Bound::Unbounded => None,
-                other => Some(other),
-            };
-            let ub = match bound_to_native::<T>(upper).map_err(PredicateBuildError::from)? {
-                Bound::Unbounded => None,
-                other => Some(other),
-            };
+            let lb =
+                match Literal::bound_to_native::<T>(lower).map_err(PredicateBuildError::from)? {
+                    Bound::Unbounded => None,
+                    other => Some(other),
+                };
+            let ub =
+                match Literal::bound_to_native::<T>(upper).map_err(PredicateBuildError::from)? {
+                    Bound::Unbounded => None,
+                    other => Some(other),
+                };
 
             if lb.is_none() && ub.is_none() {
                 Ok(Predicate::All)
@@ -296,8 +301,10 @@ where
         Operator::In(values) => {
             let mut natives = Vec::with_capacity(values.len());
             for lit in *values {
-                natives
-                    .push(literal_to_native::<T::Native>(lit).map_err(PredicateBuildError::from)?);
+                natives.push(
+                    lit.to_native::<T::Native>()
+                        .map_err(PredicateBuildError::from)?,
+                );
             }
             Ok(Predicate::In(natives))
         }
@@ -311,10 +318,10 @@ fn parse_bool_bound(bound: &Bound<Literal>) -> Result<Option<Bound<bool>>, Predi
     Ok(match bound {
         Bound::Unbounded => None,
         Bound::Included(lit) => Some(Bound::Included(
-            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<bool>().map_err(PredicateBuildError::from)?,
         )),
         Bound::Excluded(lit) => Some(Bound::Excluded(
-            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<bool>().map_err(PredicateBuildError::from)?,
         )),
     })
 }
@@ -329,19 +336,19 @@ fn parse_bool_bound(bound: &Bound<Literal>) -> Result<Option<Bound<bool>>, Predi
 pub fn build_bool_predicate(op: &Operator<'_>) -> Result<Predicate<bool>, PredicateBuildError> {
     match op {
         Operator::Equals(lit) => Ok(Predicate::Equals(
-            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<bool>().map_err(PredicateBuildError::from)?,
         )),
         Operator::GreaterThan(lit) => Ok(Predicate::GreaterThan(
-            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<bool>().map_err(PredicateBuildError::from)?,
         )),
         Operator::GreaterThanOrEquals(lit) => Ok(Predicate::GreaterThanOrEquals(
-            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<bool>().map_err(PredicateBuildError::from)?,
         )),
         Operator::LessThan(lit) => Ok(Predicate::LessThan(
-            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<bool>().map_err(PredicateBuildError::from)?,
         )),
         Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
-            literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?,
+            lit.to_native::<bool>().map_err(PredicateBuildError::from)?,
         )),
         Operator::Range { lower, upper } => {
             let lb = parse_bool_bound(lower)?;
@@ -358,7 +365,7 @@ pub fn build_bool_predicate(op: &Operator<'_>) -> Result<Predicate<bool>, Predic
         Operator::In(values) => {
             let mut natives = Vec::with_capacity(values.len());
             for lit in *values {
-                natives.push(literal_to_native::<bool>(lit).map_err(PredicateBuildError::from)?);
+                natives.push(lit.to_native::<bool>().map_err(PredicateBuildError::from)?);
             }
             Ok(Predicate::In(natives))
         }
@@ -373,10 +380,12 @@ fn parse_string_bound(
 ) -> Result<Option<Bound<String>>, PredicateBuildError> {
     match bound {
         Bound::Unbounded => Ok(None),
-        Bound::Included(lit) => literal_to_string(lit)
+        Bound::Included(lit) => lit
+            .to_string_owned()
             .map(|s| Some(Bound::Included(s)))
             .map_err(PredicateBuildError::from),
-        Bound::Excluded(lit) => literal_to_string(lit)
+        Bound::Excluded(lit) => lit
+            .to_string_owned()
             .map(|s| Some(Bound::Excluded(s)))
             .map_err(PredicateBuildError::from),
     }
@@ -394,19 +403,19 @@ pub fn build_var_width_predicate(
 ) -> Result<Predicate<String>, PredicateBuildError> {
     match op {
         Operator::Equals(lit) => Ok(Predicate::Equals(
-            literal_to_string(lit).map_err(PredicateBuildError::from)?,
+            lit.to_string_owned().map_err(PredicateBuildError::from)?,
         )),
         Operator::GreaterThan(lit) => Ok(Predicate::GreaterThan(
-            literal_to_string(lit).map_err(PredicateBuildError::from)?,
+            lit.to_string_owned().map_err(PredicateBuildError::from)?,
         )),
         Operator::GreaterThanOrEquals(lit) => Ok(Predicate::GreaterThanOrEquals(
-            literal_to_string(lit).map_err(PredicateBuildError::from)?,
+            lit.to_string_owned().map_err(PredicateBuildError::from)?,
         )),
         Operator::LessThan(lit) => Ok(Predicate::LessThan(
-            literal_to_string(lit).map_err(PredicateBuildError::from)?,
+            lit.to_string_owned().map_err(PredicateBuildError::from)?,
         )),
         Operator::LessThanOrEquals(lit) => Ok(Predicate::LessThanOrEquals(
-            literal_to_string(lit).map_err(PredicateBuildError::from)?,
+            lit.to_string_owned().map_err(PredicateBuildError::from)?,
         )),
         Operator::Range { lower, upper } => {
             let lb = parse_string_bound(lower)?;
@@ -423,7 +432,7 @@ pub fn build_var_width_predicate(
         Operator::In(values) => {
             let mut out = Vec::with_capacity(values.len());
             for lit in *values {
-                out.push(literal_to_string(lit).map_err(PredicateBuildError::from)?);
+                out.push(lit.to_string_owned().map_err(PredicateBuildError::from)?);
             }
             Ok(Predicate::In(out))
         }

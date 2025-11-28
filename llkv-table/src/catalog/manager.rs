@@ -14,6 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::IndexKind;
+use llkv_compute::time::current_time_micros;
 use llkv_plan::{DropIndexPlan, ForeignKeySpec, PlanColumnSpec};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -389,7 +390,8 @@ where
                 | DataType::Utf8
                 | DataType::Date32
                 | DataType::Boolean
-                | DataType::Struct(_) => field.data_type().clone(),
+                | DataType::Struct(_)
+                | DataType::Decimal128(_, _) => field.data_type().clone(),
                 other => {
                     return Err(Error::InvalidArgumentError(format!(
                         "unsupported column type in CTAS result: {other:?}"
@@ -485,7 +487,7 @@ where
         table_id: TableId,
         column_field_ids: &[FieldId],
     ) -> LlkvResult<()> {
-        use llkv_column_map::types::LogicalFieldId;
+        use llkv_types::LogicalFieldId;
 
         self.metadata
             .prepare_table_drop(table_id, column_field_ids)?;
@@ -672,8 +674,9 @@ where
         })?;
 
         // Remove column from the column store
-        use llkv_column_map::types::{LogicalFieldId, Namespace};
-        let logical_field_id = LogicalFieldId::from_parts(Namespace::UserData, table_id, col_id);
+        use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
+        let logical_field_id =
+            LogicalFieldId::from_parts(LogicalStorageNamespace::UserData, table_id, col_id);
         self.store.remove_column(logical_field_id)?;
 
         // Delete from catalog
@@ -1381,7 +1384,7 @@ where
     fn sorted_user_fields(
         &self,
         table_id: TableId,
-    ) -> (Vec<llkv_column_map::types::LogicalFieldId>, Vec<FieldId>) {
+    ) -> (Vec<llkv_types::LogicalFieldId>, Vec<FieldId>) {
         let mut logical_fields = self.store.user_field_ids_for_table(table_id);
         logical_fields.sort_by_key(|lfid| lfid.field_id());
         let field_ids = logical_fields
@@ -1456,15 +1459,6 @@ fn field_id_for_index(idx: usize) -> LlkvResult<FieldId> {
             idx + 1
         ))
     })
-}
-
-// TODO: Dedupe (another instance exists in llkv-executor)
-#[allow(clippy::unnecessary_wraps)]
-fn current_time_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_micros() as u64)
-        .unwrap_or(0)
 }
 
 /// Parse a SQL type string (e.g., "INTEGER") back into a DataType.

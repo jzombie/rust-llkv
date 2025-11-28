@@ -1,24 +1,26 @@
+use croaring::Treemap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use crate::planner::{TablePlanner, collect_row_ids_for_table};
 use crate::stream::ColumnStream;
-use crate::types::TableId;
+use crate::stream::RowIdSource;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
+use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{GatherNullPolicy, IndexKind, Projection, ROW_ID_COLUMN_NAME};
-use llkv_column_map::{ColumnStore, types::LogicalFieldId};
 use llkv_storage::pager::{MemPager, Pager};
+use llkv_types::ids::{LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
-use crate::types::{FieldId, RowId};
+use crate::types::FieldId;
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 
@@ -63,7 +65,7 @@ where
     /// # Errors
     ///
     /// Returns an error if visibility metadata cannot be loaded or is corrupted.
-    fn filter(&self, table: &Table<P>, row_ids: Vec<RowId>) -> LlkvResult<Vec<RowId>>;
+    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> LlkvResult<Treemap>;
 }
 
 /// Options for configuring table scans.
@@ -631,8 +633,12 @@ where
         TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
     }
 
-    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Vec<RowId>> {
-        collect_row_ids_for_table(self, filter_expr)
+    pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Treemap> {
+        let source = collect_row_ids_for_table(self, filter_expr)?;
+        Ok(match source {
+            RowIdSource::Bitmap(b) => b,
+            RowIdSource::Vector(v) => Treemap::from_iter(v),
+        })
     }
 
     #[inline]
@@ -726,18 +732,21 @@ where
     }
 
     /// Create a streaming view over the provided row IDs for the specified logical fields.
-    pub fn stream_columns(
-        &self,
+    pub fn stream_columns<'table, 'a>(
+        &'table self,
         logical_fields: impl Into<Arc<[LogicalFieldId]>>,
-        row_ids: Vec<RowId>,
+        row_ids: impl crate::stream::RowIdStreamSource<'a>,
         policy: GatherNullPolicy,
-    ) -> LlkvResult<ColumnStream<'_, P>> {
+    ) -> LlkvResult<ColumnStream<'table, 'a, P>> {
+        let total_rows = row_ids.count() as usize;
+        let iter = row_ids.into_iter_source();
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
         let ctx = self.store.prepare_gather_context(logical_fields.as_ref())?;
         Ok(ColumnStream::new(
             &self.store,
             ctx,
-            row_ids,
+            iter,
+            total_rows,
             STREAM_BATCH_ROWS,
             policy,
             logical_fields,
@@ -1618,7 +1627,7 @@ mod tests {
         ]));
 
         let batch = RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![
                 Arc::new(UInt64Array::from(vec![5, 6])),
                 Arc::new(UInt64Array::from(vec![500, 600])),

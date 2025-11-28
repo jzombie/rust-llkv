@@ -1,3 +1,4 @@
 //! Re-export interval literal parsing for SQL consumers.
 
-pub use llkv_plan::interval::parse_interval_literal;
+// TODO: Remove, and use direct
+pub use llkv_compute::interval::parse_interval_literal;

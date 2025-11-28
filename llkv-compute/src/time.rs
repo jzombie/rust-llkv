@@ -1,4 +1,4 @@
-//! Time utility functions for the executor.
+//! Time utility functions.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

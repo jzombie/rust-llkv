@@ -50,8 +50,8 @@ use rand::{SeedableRng, rngs::StdRng};
 
 use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::store::{ColumnStore, IndexKind};
-use llkv_column_map::types::LogicalFieldId;
 use llkv_storage::pager::MemPager;
+use llkv_types::LogicalFieldId;
 
 const N_ROWS: usize = 1_000_000;
 // 64-bit seed (previous literal overflowed u64)

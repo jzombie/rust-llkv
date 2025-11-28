@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
 use llkv_column_map::store::Projection;
-use llkv_column_map::types::LogicalFieldId;
 use llkv_csv::{CsvReadOptions, append_csv_into_table, append_csv_into_table_with_mapping};
 use llkv_storage::pager::MemPager;
 use llkv_table::expr::{Expr, Filter, Operator};
 use llkv_table::table::ScanStreamOptions;
 use llkv_table::{Table, types::FieldId};
+use llkv_types::LogicalFieldId;
 use tempfile::NamedTempFile;
 
 use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};

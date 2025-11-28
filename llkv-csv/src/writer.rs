@@ -11,9 +11,9 @@ use std::path::Path;
 
 use arrow::csv::WriterBuilder;
 use llkv_column_map::store::Projection;
-use llkv_column_map::types::LogicalFieldId;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
+use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_table::expr::{Expr, Filter, Operator};

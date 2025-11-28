@@ -3,9 +3,10 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::Schema;
+use croaring::Treemap;
 use llkv_column_map::store::{ColumnStore, GatherNullPolicy, MultiGatherContext};
-use llkv_column_map::types::LogicalFieldId;
 use llkv_result::Result as LlkvResult;
+use llkv_types::LogicalFieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
@@ -14,6 +15,23 @@ use llkv_storage::pager::Pager;
 use crate::types::{FieldId, RowId, TableId};
 
 use crate::planner::{ProjectionEval, materialize_row_window};
+
+pub enum RowIdSource {
+    Bitmap(Treemap),
+    Vector(Vec<RowId>),
+}
+
+impl From<Treemap> for RowIdSource {
+    fn from(bitmap: Treemap) -> Self {
+        RowIdSource::Bitmap(bitmap)
+    }
+}
+
+impl From<Vec<RowId>> for RowIdSource {
+    fn from(vector: Vec<RowId>) -> Self {
+        RowIdSource::Vector(vector)
+    }
+}
 
 #[allow(dead_code)]
 pub(crate) trait ColumnSliceSet<'a> {
@@ -90,7 +108,7 @@ where
     numeric_fields: Arc<FxHashSet<FieldId>>,
     requires_numeric: bool,
     null_policy: GatherNullPolicy,
-    row_ids: Vec<RowId>,
+    row_ids: RowIdSource,
     chunk_size: usize,
     gather_ctx: Option<MultiGatherContext>,
 }
@@ -111,7 +129,7 @@ where
         numeric_fields: Arc<FxHashSet<FieldId>>,
         requires_numeric: bool,
         null_policy: GatherNullPolicy,
-        row_ids: Vec<RowId>,
+        row_ids: impl Into<RowIdSource>,
         chunk_size: usize,
     ) -> Self {
         Self {
@@ -125,7 +143,7 @@ where
             numeric_fields,
             requires_numeric,
             null_policy,
-            row_ids,
+            row_ids: row_ids.into(),
             chunk_size,
             gather_ctx: None,
         }
@@ -161,19 +179,30 @@ where
             Some(store.prepare_gather_context(unique_lfids.as_ref())?)
         };
 
-        let chunk_ranges = if row_ids.is_empty() {
+        let (row_id_array, total_rows) = match row_ids {
+            RowIdSource::Bitmap(bitmap) => {
+                let len = bitmap.cardinality();
+                let array = Arc::new(UInt64Array::from_iter_values(bitmap.iter()));
+                (array, len as usize)
+            }
+            RowIdSource::Vector(vector) => {
+                let len = vector.len();
+                let array = Arc::new(UInt64Array::from(vector));
+                (array, len)
+            }
+        };
+
+        let chunk_ranges = if total_rows == 0 {
             Vec::new()
         } else {
-            (0..row_ids.len())
+            (0..total_rows)
                 .step_by(chunk_size.max(1))
                 .map(|start| {
-                    let end = (start + chunk_size).min(row_ids.len());
+                    let end = (start + chunk_size).min(total_rows);
                     (start, end)
                 })
                 .collect()
         };
-
-        let row_id_array = Arc::new(UInt64Array::from(row_ids));
 
         Ok(TableRowStream {
             store,
