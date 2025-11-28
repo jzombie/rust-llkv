@@ -12,7 +12,6 @@ publish.workspace = true
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
 croaring.workspace = true
-llkv-column-map = { workspace = true }
 llkv-expr = { workspace = true }
 llkv-result = { workspace = true }
 llkv-types = { workspace = true }

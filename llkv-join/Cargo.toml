@@ -27,7 +27,6 @@ tracing.workspace = true
 criterion.workspace = true
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
-tempfile.workspace = true
 
 [[bench]]
 name = "join_bench"
