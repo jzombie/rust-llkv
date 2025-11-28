@@ -23,3 +23,9 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-udeps.ignore]
+# List dependency names to ignore for this package
+normal = []
+development = ["llkv-test-utils"]
+build = []
