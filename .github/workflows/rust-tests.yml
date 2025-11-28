@@ -1,9 +1,9 @@
 name: rust-tests
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_run:
+    workflows: ["rust-lint"]
+    types: [completed]
   workflow_dispatch:
 
 # Ensure only one run per branch/PR at a time. If new commits are pushed,
@@ -13,14 +13,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    uses: ./.github/workflows/rust-lint.yml
-    secrets: inherit
-
   test_matrix:
     name: test (OS=${{ matrix.os }}, Features=${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    needs: lint
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
     strategy:
       fail-fast: false
@@ -91,7 +87,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     needs: test_matrix
-    if: ${{ always() }}
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
     steps:
       - name: Evaluate matrix results
         run: |
