@@ -109,8 +109,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo binstall --no-confirm --no-symlinks --force cargo-deny cargo-audit \
-            || cargo install --locked --force cargo-deny cargo-audit
+          cargo binstall --no-confirm --no-symlinks --force cargo-deny cargo-audit cargo-sort \
+            || cargo install --locked --force cargo-deny cargo-audit cargo-sort
+
+      # Ensure all Cargo.toml files are sorted
+      - name: Check Cargo manifest sorting
+        run: cargo sort --workspace --check
 
       # Check formatting across the entire workspace
       - name: Check formatting
