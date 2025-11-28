@@ -46,7 +46,14 @@ jobs:
             ${{ runner.os }}-udeps-
 
       - name: Install cargo-udeps
-        run: cargo install cargo-udeps --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-udeps >/dev/null 2>&1; then
+            cargo install cargo-udeps --locked
+          else
+            echo "cargo-udeps already installed; skipping"
+          fi
 
       - name: Check unused dependencies
         run: cargo udeps --workspace --all-targets --all-features
