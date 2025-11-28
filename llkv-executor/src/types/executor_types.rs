@@ -1,20 +1,20 @@
 //! Executor table, schema, and column types.
 
 use arrow::datatypes::DataType;
+use croaring::Treemap;
 use llkv_plan::PlanValue;
 use llkv_storage::pager::Pager;
 use llkv_table::types::FieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
-use croaring::Treemap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use crate::types::StorageTable;
+use llkv_column_map::store::GatherNullPolicy;
 use llkv_expr::Expr;
 use llkv_table::stream::{ColumnStream, RowIdStreamSource};
 use llkv_types::LogicalFieldId;
-use llkv_column_map::store::GatherNullPolicy;
 
 /// Executor's view of a table, including schema and metadata.
 ///

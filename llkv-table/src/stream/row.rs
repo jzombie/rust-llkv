@@ -14,7 +14,7 @@ use llkv_storage::pager::Pager;
 
 use crate::types::{FieldId, RowId, TableId};
 
-use crate::planner::{ProjectionEval, materialize_row_window};
+use crate::scan_engine::{ProjectionEval, materialize_row_window};
 
 pub enum RowIdSource {
     Bitmap(Treemap),

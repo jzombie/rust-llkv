@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use crate::planner::{TablePlanner, collect_row_ids_for_table};
+use crate::scan_engine::{TablePlanner, collect_row_ids_for_table};
 use crate::stream::ColumnStream;
 use crate::stream::RowIdSource;
 

@@ -623,11 +623,8 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let mut stream = table.stream_columns(
-            logical_field_ids,
-            row_ids,
-            GatherNullPolicy::IncludeNulls,
-        )?;
+        let mut stream =
+            table.stream_columns(logical_field_ids, row_ids, GatherNullPolicy::IncludeNulls)?;
 
         while let Some(chunk) = stream.next_batch()? {
             let batch = chunk.batch();

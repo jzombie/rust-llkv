@@ -2952,6 +2952,7 @@ where
         Ok(determined)
     }
 
+    // TODO: Move to llkv-compute?
     fn sort_row_ids_with_order(
         &self,
         row_ids: &Treemap,
@@ -3162,6 +3163,7 @@ where
         }
     }
 
+    // TODO: Move to llkv-compute?
     fn sort_row_ids_with_primitive_transform<T>(
         &self,
         row_ids: &Treemap,

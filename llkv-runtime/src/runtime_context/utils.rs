@@ -322,15 +322,13 @@ where
             .collect();
 
         let total_rows = row_ids.cardinality() as usize;
-        let mut stream = match table.stream_columns(
-            logical_field_ids,
-            &row_ids,
-            GatherNullPolicy::IncludeNulls,
-        ) {
-            Ok(stream) => stream,
-            Err(Error::NotFound) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+        let mut stream =
+            match table.stream_columns(logical_field_ids, &row_ids, GatherNullPolicy::IncludeNulls)
+            {
+                Ok(stream) => stream,
+                Err(Error::NotFound) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
         while let Some(chunk) = stream.next_batch()? {
@@ -414,15 +412,13 @@ where
             .collect();
 
         let total_rows = row_ids.cardinality() as usize;
-        let mut stream = match table.stream_columns(
-            logical_field_ids,
-            &row_ids,
-            GatherNullPolicy::IncludeNulls,
-        ) {
-            Ok(stream) => stream,
-            Err(Error::NotFound) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+        let mut stream =
+            match table.stream_columns(logical_field_ids, &row_ids, GatherNullPolicy::IncludeNulls)
+            {
+                Ok(stream) => stream,
+                Err(Error::NotFound) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
         while let Some(chunk) = stream.next_batch()? {

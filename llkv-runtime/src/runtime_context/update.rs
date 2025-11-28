@@ -173,11 +173,8 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
 
         {
-            let mut stream = table.stream_columns(
-                logical_fields,
-                &row_ids,
-                GatherNullPolicy::IncludeNulls,
-            )?;
+            let mut stream =
+                table.stream_columns(logical_fields, &row_ids, GatherNullPolicy::IncludeNulls)?;
 
             while let Some(chunk) = stream.next_batch()? {
                 let batch = chunk.batch();
@@ -528,11 +525,8 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
 
         {
-            let mut stream = table.stream_columns(
-                logical_fields,
-                &row_ids,
-                GatherNullPolicy::IncludeNulls,
-            )?;
+            let mut stream =
+                table.stream_columns(logical_fields, &row_ids, GatherNullPolicy::IncludeNulls)?;
 
             while let Some(chunk) = stream.next_batch()? {
                 let batch = chunk.batch();
