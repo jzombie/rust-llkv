@@ -11,6 +11,12 @@ keywords = ["testing", "utilities", "development"]
 categories = ["development-tools::testing"]
 readme = "README.md"
 
+[package.metadata.cargo-udeps.ignore]
+# List dependency names to ignore for this package
+normal = []
+development = ["llkv-test-utils"]
+build = []
+
 [features]
 # When enabled, tracing will be auto-initialized at test-binary startup via ctor.
 auto-init = ["ctor"]

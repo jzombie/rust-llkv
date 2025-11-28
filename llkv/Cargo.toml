@@ -11,16 +11,22 @@ keywords = ["database", "sql", "arrow", "columnar", "mvcc"]
 categories = ["database-implementations"]
 readme = "README.md"
 
+[package.metadata.cargo-udeps.ignore]
+# List dependency names to ignore for this package
+normal = []
+development = ["llkv-test-utils"]
+build = []
+
 [features]
 simd-r-drive-support = ["llkv-storage/simd-r-drive-support"]
 
 [dependencies]
-llkv-sql = { workspace = true }
-llkv-storage = { workspace = true }
 arrow = { workspace = true }
+llkv-result = { workspace = true }
 llkv-runtime = { workspace = true }
 llkv-slt-tester = { workspace = true }
-llkv-result = { workspace = true }
+llkv-sql = { workspace = true }
+llkv-storage = { workspace = true }
 
 [dev-dependencies]
 llkv-storage = { workspace = true, features = ["simd-r-drive-support"] }

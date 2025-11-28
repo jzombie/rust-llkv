@@ -11,12 +11,17 @@ keywords = ["database", "aggregate", "arrow", "sql", "query"]
 categories = ["database-implementations"]
 readme = "README.md"
 
+[package.metadata.cargo-udeps.ignore]
+# List dependency names to ignore for this package
+normal = []
+development = ["llkv-test-utils"]
+build = []
+
 [dependencies]
 arrow = { workspace = true, default-features = false }
-llkv-column-map.workspace = true
 llkv-compute.workspace = true
-llkv-result.workspace = true
 llkv-plan.workspace = true
+llkv-result.workspace = true
 llkv-types.workspace = true
 rustc-hash.workspace = true
 

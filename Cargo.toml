@@ -1,13 +1,7 @@
-[workspace.package]
-authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
-version = "0.8.3-alpha"
-edition = "2024"
-license = "Apache-2.0"
-repository = "https://github.com/jzombie/rust-llkv"
-publish = true
 
 [workspace]
 members = [
+    "demos/llkv-sql-pong-demo",
     "llkv",
     "llkv-aggregate",
     "llkv-column-map",
@@ -27,11 +21,35 @@ members = [
     "llkv-tpch",
     "llkv-transaction",
     "llkv-types",
-    "demos/llkv-sql-pong-demo",
 ]
 resolver = "2"
 
+[workspace.package]
+authors = ["Jeremy Harris <jeremy.harris@zenosmosis.com>"]
+version = "0.8.3-alpha"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/jzombie/rust-llkv"
+publish = true
+
 [workspace.dependencies]
+# Note: A subset of these crates are used only for debug builds or examples.
+# They're listed here to keep workspace versions consistent.
+arrow = { version = "57.0.0", default-features = false, features = ["prettyprint", "ipc"] }
+arrow-array = { version = "57.0.0", default-features = false }
+arrow-buffer = { version = "57.0.0", default-features = false }
+arrow-ord = { version = "57.0.0", default-features = false }
+arrow-schema = { version = "57.0.0", default-features = false }
+async-trait = "0.1.89"
+bitcode = "0.6.7"
+clap = { version = "4.5.53", features = ["derive"] }
+criterion = "0.7.0"
+croaring = "2.5.1"
+crossbeam-channel = "0.5.15"
+crossterm = "0.29.0"
+indoc = "2.0.7"
+libtest-mimic = "0.8"
+line-ending = "1.5.1"
 llkv = { path = "./llkv", version = "0.8.3-alpha" }
 llkv-aggregate = { path = "./llkv-aggregate", version = "0.8.3-alpha" }
 llkv-column-map = { path = "./llkv-column-map", version = "0.8.3-alpha" }
@@ -50,41 +68,22 @@ llkv-table = { path = "./llkv-table", version = "0.8.3-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.3-alpha" }
 llkv-transaction = { path = "./llkv-transaction", version = "0.8.3-alpha" }
 llkv-types = { path = "./llkv-types", version = "0.8.3-alpha" }
-simd-r-drive = "0.15.5-alpha"
-simd-r-drive-entry-handle = "0.15.5-alpha"
-
-# Vendor crates
-# Note: A subset of these crates are used only for debug builds or examples.
-# They're listed here to keep workspace versions consistent.
-arrow = { version = "57.0.0", default-features = false, features = ["prettyprint", "ipc"] }
-arrow-array = { version = "57.0.0", default-features = false }
-arrow-ord = { version = "57.0.0", default-features = false }
-arrow-schema = { version = "57.0.0", default-features = false }
-arrow-buffer = { version = "57.0.0", default-features = false }
-async-trait = "0.1.89"
-bitcode = "0.6.7"
-clap = { version = "4.5.53", features = ["derive"] }
-criterion = "0.7.0"
-croaring = "2.5.1"
-crossbeam-channel = "0.5.15"
-crossterm = "0.29.0"
-indoc = "2.0.7"
-libtest-mimic = "0.8"
-line-ending = "1.5.1"
 modular-bitfield = "0.13.0"
 num_enum = "0.7.5"
 rand = "0.9.1"
 rayon = "1.10.0"
 regex = "1.12.2"
-rust_decimal = "1.39.0"
-sqlparser = "0.59.0"
-tempfile = "3.23.0"
-thiserror = "2.0.17"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
+rust_decimal = "1.39.0"
 rustc-hash = "2.1.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+simd-r-drive = "0.15.5-alpha"
+simd-r-drive-entry-handle = "0.15.5-alpha"
 sqllogictest = "0.28.4"
+sqlparser = "0.59.0"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 tpchgen = "2.0.1"

@@ -675,15 +675,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1605,7 +1596,6 @@ name = "llkv-aggregate"
 version = "0.8.3-alpha"
 dependencies = [
  "arrow",
- "llkv-column-map",
  "llkv-compute",
  "llkv-plan",
  "llkv-result",
@@ -1643,7 +1633,6 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "croaring",
- "llkv-column-map",
  "llkv-expr",
  "llkv-result",
  "llkv-test-utils",
@@ -1724,7 +1713,6 @@ dependencies = [
  "llkv-types",
  "rustc-hash",
  "simd-r-drive-entry-handle",
- "tempfile",
  "tracing",
 ]
 
@@ -1865,7 +1853,6 @@ dependencies = [
  "bitcode",
  "criterion",
  "croaring",
- "crossbeam-channel",
  "llkv-column-map",
  "llkv-compute",
  "llkv-expr",

@@ -11,13 +11,18 @@ keywords = ["database", "table", "columnar", "arrow", "storage"]
 categories = ["database-implementations", "data-structures"]
 readme = "README.md"
 
+[package.metadata.cargo-udeps.ignore]
+# List dependency names to ignore for this package
+normal = []
+development = ["llkv-test-utils"]
+build = []
+
 [dependencies]
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 bitcode.workspace = true
 croaring.workspace = true
-crossbeam-channel.workspace = true
 llkv-column-map.workspace = true
 llkv-compute.workspace = true
 llkv-expr.workspace = true
@@ -30,8 +35,8 @@ rayon.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle = { workspace = true, features = ["arrow"] }
 sqlparser.workspace = true
-tracing.workspace = true
 time.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
