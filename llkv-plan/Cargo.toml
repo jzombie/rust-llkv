@@ -11,11 +11,17 @@ keywords = ["database", "planner", "query", "sql", "optimizer"]
 categories = ["database-implementations"]
 readme = "README.md"
 
+[package.metadata.cargo-udeps.ignore]
+# List dependency names to ignore for this package
+normal = []
+development = ["llkv-test-utils"]
+build = []
+
 [dependencies]
 arrow = { workspace = true, default-features = false }
+llkv-compute.workspace = true
 llkv-expr.workspace = true
 llkv-result.workspace = true
-llkv-compute.workspace = true
 llkv-types.workspace = true
 regex.workspace = true
 rustc-hash.workspace = true
@@ -30,9 +36,3 @@ llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-udeps.ignore]
-# List dependency names to ignore for this package
-normal = []
-development = ["llkv-test-utils"]
-build = []
