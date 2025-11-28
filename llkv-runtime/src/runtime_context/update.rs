@@ -173,7 +173,7 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
 
         {
-            let mut stream = table.table.stream_columns(
+            let mut stream = table.stream_columns(
                 logical_fields,
                 &row_ids,
                 GatherNullPolicy::IncludeNulls,
@@ -303,7 +303,7 @@ where
                 .first_field_id()
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
-            let all_ids = table.table.filter_row_ids(&filter_expr)?;
+            let all_ids = table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
 
@@ -528,7 +528,7 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
 
         {
-            let mut stream = table.table.stream_columns(
+            let mut stream = table.stream_columns(
                 logical_fields,
                 &row_ids,
                 GatherNullPolicy::IncludeNulls,
@@ -649,7 +649,7 @@ where
                 .first_field_id()
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
-            let all_ids = table.table.filter_row_ids(&filter_expr)?;
+            let all_ids = table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
 
@@ -933,7 +933,7 @@ where
         expressions: &[ScalarExpr<FieldId>],
         snapshot: TransactionSnapshot,
     ) -> Result<(Treemap, Vec<Vec<PlanValue>>)> {
-        let row_ids = table.table.filter_row_ids(filter_expr)?;
+        let row_ids = table.filter_row_ids(filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
             return Ok((Treemap::new(), vec![Vec::new(); expressions.len()]));

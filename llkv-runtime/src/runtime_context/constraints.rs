@@ -59,7 +59,7 @@ where
             }
         }
 
-        let mut stream = table.table.stream_columns(
+        let mut stream = table.stream_columns(
             Arc::clone(&logical_fields),
             row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -129,7 +129,7 @@ where
 
         let anchor_field = field_ids[0];
         let filter_expr = translation::expression::full_table_scan_filter(anchor_field);
-        let raw_row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let raw_row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -152,7 +152,7 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             logical_field_ids.clone(),
             &visible_row_ids,
             GatherNullPolicy::IncludeNulls,

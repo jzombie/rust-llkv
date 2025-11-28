@@ -5,6 +5,7 @@
 //! responsibilities into the executor.
 
 use arrow::array::RecordBatch;
+use croaring::Treemap;
 use llkv_expr::Expr;
 use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
 use llkv_result::{Error, Result as LlkvResult};
@@ -31,6 +32,9 @@ where
         options: ScanStreamOptions<P>,
         on_batch: &mut dyn FnMut(RecordBatch),
     ) -> LlkvResult<()>;
+
+    /// Collect row ids matching a predicate.
+    fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<Treemap>;
 
     /// Perform a join against another storage table.
     fn join_stream(
@@ -84,6 +88,10 @@ where
     ) -> LlkvResult<()> {
         self.table
             .scan_stream(projections, filter_expr, options, on_batch)
+    }
+
+    fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<Treemap> {
+        self.table.filter_row_ids(filter_expr)
     }
 
     fn join_stream(

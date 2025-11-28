@@ -1667,6 +1667,7 @@ version = "0.8.3-alpha"
 dependencies = [
  "arrow",
  "arrow-buffer",
+ "croaring",
  "llkv-aggregate",
  "llkv-column-map",
  "llkv-compute",

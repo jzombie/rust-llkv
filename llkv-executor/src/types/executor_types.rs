@@ -6,10 +6,15 @@ use llkv_storage::pager::Pager;
 use llkv_table::types::FieldId;
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
+use croaring::Treemap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 
 use crate::types::StorageTable;
+use llkv_expr::Expr;
+use llkv_table::stream::{ColumnStream, RowIdStreamSource};
+use llkv_types::LogicalFieldId;
+use llkv_column_map::store::GatherNullPolicy;
 
 /// Executor's view of a table, including schema and metadata.
 ///
@@ -50,6 +55,24 @@ where
     /// Convenience accessor for the table's identifier.
     pub fn table_id(&self) -> llkv_table::types::TableId {
         self.storage.table_id()
+    }
+
+    /// Collect row ids matching a predicate using the storage abstraction.
+    pub fn filter_row_ids<'expr>(
+        &self,
+        filter_expr: &Expr<'expr, FieldId>,
+    ) -> llkv_result::Result<Treemap> {
+        self.storage.filter_row_ids(filter_expr)
+    }
+
+    /// Stream specific columns for a set of row ids using the storage abstraction.
+    pub fn stream_columns<'table, 'a>(
+        &'table self,
+        logical_fields: impl Into<Arc<[LogicalFieldId]>>,
+        row_ids: impl RowIdStreamSource<'a>,
+        policy: GatherNullPolicy,
+    ) -> llkv_result::Result<ColumnStream<'table, 'a, P>> {
+        self.table.stream_columns(logical_fields, row_ids, policy)
     }
 
     /// Replace all multi-column unique constraints.

@@ -71,7 +71,7 @@ where
         };
 
         // First, get the row_ids that match the filter
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = table.filter_row_ids(&filter_expr)?;
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -116,7 +116,7 @@ where
             return Ok(vec![batch]);
         }
 
-        let mut stream = table.table.stream_columns(
+        let mut stream = table.stream_columns(
             Arc::from(logical_fields),
             &visible_row_ids,
             GatherNullPolicy::IncludeNulls,

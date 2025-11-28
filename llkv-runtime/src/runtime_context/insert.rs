@@ -455,7 +455,7 @@ where
         };
         let filter_expr = Expr::Pred(match_all_filter);
 
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -493,7 +493,7 @@ where
 
                 // Scan existing rows for this column
                 let logical_field_id = LogicalFieldId::for_user(table_id, unique_col.field_id);
-                let mut stream = table.table.stream_columns(
+                let mut stream = table.stream_columns(
                     vec![logical_field_id],
                     &row_ids,
                     GatherNullPolicy::IncludeNulls,
@@ -623,7 +623,7 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let mut stream = table.table.stream_columns(
+        let mut stream = table.stream_columns(
             logical_field_ids,
             row_ids,
             GatherNullPolicy::IncludeNulls,

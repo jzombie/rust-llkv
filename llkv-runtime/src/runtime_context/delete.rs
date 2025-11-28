@@ -73,7 +73,7 @@ where
                 name
             ))
         })?;
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         tracing::trace!(
             table = %display_name,
@@ -103,7 +103,7 @@ where
             Error::InvalidArgumentError("DELETE requires a table with at least one column".into())
         })?;
         let filter_expr = translation::expression::full_table_scan_filter(anchor_field);
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         self.apply_delete(table, display_name, canonical_name, row_ids, snapshot, true)
     }

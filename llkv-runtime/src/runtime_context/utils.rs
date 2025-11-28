@@ -218,7 +218,7 @@ where
         let filter_expr = Expr::Pred(match_all_filter);
 
         // Get all matching row_ids first
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -239,7 +239,7 @@ where
         // Gather the column values for visible rows
         let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
         let row_count = row_ids.cardinality() as usize;
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             vec![logical_field_id],
             &row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -299,7 +299,7 @@ where
         };
         let filter_expr = Expr::Pred(match_all_filter);
 
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -322,7 +322,7 @@ where
             .collect();
 
         let total_rows = row_ids.cardinality() as usize;
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             logical_field_ids,
             &row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -390,7 +390,7 @@ where
         };
         let filter_expr = Expr::Pred(match_all_filter);
 
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -414,7 +414,7 @@ where
             .collect();
 
         let total_rows = row_ids.cardinality() as usize;
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             logical_field_ids,
             &row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -473,7 +473,7 @@ where
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             logical_field_ids.clone(),
             row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -548,7 +548,7 @@ where
         };
         let filter_expr = translation::expression::full_table_scan_filter(first_field_id);
 
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = table.filter_row_ids(&filter_expr)?;
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -563,7 +563,7 @@ where
         }
 
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
-        let mut stream = table.table.stream_columns(
+        let mut stream = table.stream_columns(
             Arc::clone(&logical_fields),
             row_ids,
             GatherNullPolicy::IncludeNulls,
