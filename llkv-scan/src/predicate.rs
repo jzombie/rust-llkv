@@ -10,6 +10,7 @@ use llkv_compute::kernels;
 use llkv_compute::program::{
     DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramSet,
 };
+use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::{FieldId, LogicalFieldId};
@@ -520,6 +521,10 @@ where
                 op: _op,
                 fields,
             } => {
+                if scalar_expr_constant_null(left)? || scalar_expr_constant_null(right)? {
+                    stack.push(Treemap::new());
+                    continue;
+                }
                 let rows = collect_compare_domain_rows(
                     storage,
                     left,
@@ -531,11 +536,15 @@ where
                 stack.push(rows);
             }
             DomainOp::PushInListDomain {
-                expr: _expr,
-                list: _list,
+                expr,
+                list,
                 fields,
                 negated: _negated,
             } => {
+                if scalar_expr_constant_null(expr)? || list_all_constant_null(list)? {
+                    stack.push(Treemap::new());
+                    continue;
+                }
                 let mut ordered_fields: Vec<FieldId> = fields.to_vec();
                 ordered_fields.sort_unstable();
                 ordered_fields.dedup();
@@ -628,4 +637,31 @@ where
         });
     }
     Ok(domain.unwrap_or_default())
+}
+
+fn scalar_expr_constant_null(expr: &ScalarExpr<FieldId>) -> LlkvResult<bool> {
+    let mut fields = FxHashSet::default();
+    ScalarEvaluator::collect_fields(expr, &mut fields);
+    if !fields.is_empty() {
+        return Ok(false);
+    }
+
+    match ScalarEvaluator::evaluate_constant_literal_expr(expr)? {
+        Some(Literal::Null) | None => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+fn list_all_constant_null(list: &[ScalarExpr<FieldId>]) -> LlkvResult<bool> {
+    if list.is_empty() {
+        return Ok(false);
+    }
+
+    for item in list {
+        if !scalar_expr_constant_null(item)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
