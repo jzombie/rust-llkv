@@ -69,9 +69,9 @@ use std::cell::RefCell;
 // ============================================================================
 
 pub mod insert;
+pub mod scan;
 pub mod translation;
 pub mod types;
-pub mod scan;
 
 // ============================================================================
 // Type Aliases and Re-exports

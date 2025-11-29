@@ -10,7 +10,10 @@ use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::{FieldId, LogicalFieldId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::row_stream::{ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream, RowStreamBuilder};
+use crate::row_stream::{
+    ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream,
+    RowStreamBuilder,
+};
 use crate::{ScanProjection, ScanStorage, ScanStreamOptions};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_storage::pager::Pager;
@@ -85,7 +88,9 @@ where
                     let lfid = LogicalFieldId::for_user(table_id, fid);
                     let dtype = storage.field_data_type(lfid)?;
                     lfid_dtypes.entry(lfid).or_insert_with(|| dtype.clone());
-                    if let std::collections::hash_map::Entry::Vacant(entry) = unique_index.entry(lfid) {
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        unique_index.entry(lfid)
+                    {
                         entry.insert(unique_lfids.len());
                         unique_lfids.push(lfid);
                     }

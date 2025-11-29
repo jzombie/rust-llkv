@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use crate::scan_engine::{TablePlanner, collect_row_ids_for_table};
+use crate::scan_engine::{TableExecutor, TablePlanner, collect_row_ids_for_table};
 use crate::stream::ColumnStream;
 use crate::stream::RowIdSource;
 
@@ -20,19 +20,18 @@ use llkv_storage::pager::{MemPager, Pager};
 use llkv_types::ids::{LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
+use crate::ROW_ID_FIELD_ID;
 use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::{Expr, Filter, Operator, ScalarExpr};
+use llkv_result::{Error, Result as LlkvResult};
 use llkv_scan::{
-    execute::execute_scan,
     ScanOrderDirection as SharedScanOrderDirection, ScanOrderSpec as SharedScanOrderSpec,
     ScanOrderTransform as SharedScanOrderTransform, ScanProjection as SharedScanProjection,
-    ScanStorage, ScanStreamOptions as SharedScanStreamOptions,
+    ScanStorage, ScanStreamOptions as SharedScanStreamOptions, execute::execute_scan,
 };
-use llkv_result::{Error, Result as LlkvResult};
 use std::ops::Bound;
-use crate::ROW_ID_FIELD_ID;
 
 /// Cached information about which system columns exist in the table schema.
 /// This avoids repeated string comparisons in hot paths like append().
@@ -653,10 +652,22 @@ where
                 row_id_filter: None,
             };
             let mut cb = on_batch;
-            execute_scan(self, self.table_id, &shared_projections, filter_expr, shared_options, &mut cb)?;
+            execute_scan(
+                self,
+                self.table_id,
+                &shared_projections,
+                filter_expr,
+                shared_options,
+                &mut cb,
+            )?;
             Ok(())
         } else {
-            TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
+            TablePlanner::new(self).scan_stream_with_exprs(
+                projections,
+                filter_expr,
+                options,
+                on_batch,
+            )
         }
     }
 
@@ -871,6 +882,30 @@ where
 
     fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<Treemap> {
         Table::filter_row_ids(self, filter_expr)
+    }
+
+    fn filter_leaf(&self, filter: &llkv_compute::program::OwnedFilter) -> LlkvResult<Treemap> {
+        let executor = TableExecutor::new(self);
+        let source = executor.collect_row_ids_for_filter(filter)?;
+        Ok(match source {
+            RowIdSource::Bitmap(b) => b,
+            RowIdSource::Vector(v) => Treemap::from_iter(v),
+        })
+    }
+
+    fn filter_fused(
+        &self,
+        field_id: FieldId,
+        filters: &[llkv_compute::program::OwnedFilter],
+        cache: &llkv_compute::analysis::PredicateFusionCache,
+    ) -> LlkvResult<RowIdSource> {
+        let executor = TableExecutor::new(self);
+        executor.collect_fused_predicates(field_id, filters, cache)
+    }
+
+    fn all_row_ids(&self) -> LlkvResult<Treemap> {
+        let executor = TableExecutor::new(self);
+        Ok(executor.table_row_ids()?.clone())
     }
 
     fn stream_row_ids(

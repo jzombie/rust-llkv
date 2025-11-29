@@ -10,9 +10,11 @@ use llkv_table::table::Table as LlkvTable;
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use llkv_storage::pager::Pager;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
-use llkv_scan::{ScanProjection, ScanStorage, ScanStreamOptions};
+use llkv_compute::analysis::PredicateFusionCache;
+use llkv_compute::program::OwnedFilter;
+use llkv_scan::{RowIdSource, ScanProjection, ScanStorage, ScanStreamOptions};
+use llkv_storage::pager::Pager;
 
 impl<P> ScanStorage<P> for crate::types::TableStorageAdapter<P>
 where
@@ -23,10 +25,7 @@ where
     }
 
     fn field_data_type(&self, fid: LogicalFieldId) -> ExecutorResult<arrow::datatypes::DataType> {
-        self.table()
-            .store()
-            .data_type(fid)
-            .map_err(Error::from)
+        self.table().store().data_type(fid).map_err(Error::from)
     }
 
     fn total_rows(&self) -> ExecutorResult<u64> {
@@ -57,7 +56,28 @@ where
     }
 
     fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> ExecutorResult<Treemap> {
-        self.table().filter_row_ids(filter_expr).map_err(Error::from)
+        self.table()
+            .filter_row_ids(filter_expr)
+            .map_err(Error::from)
+    }
+
+    fn all_row_ids(&self) -> ExecutorResult<Treemap> {
+        self.table().all_row_ids().map_err(Error::from)
+    }
+
+    fn filter_leaf(&self, filter: &OwnedFilter) -> ExecutorResult<Treemap> {
+        self.table().filter_leaf(filter).map_err(Error::from)
+    }
+
+    fn filter_fused(
+        &self,
+        field_id: FieldId,
+        filters: &[OwnedFilter],
+        cache: &PredicateFusionCache,
+    ) -> ExecutorResult<RowIdSource> {
+        self.table()
+            .filter_fused(field_id, filters, cache)
+            .map_err(Error::from)
     }
 
     fn stream_row_ids(
@@ -104,7 +124,9 @@ fn to_table_order(order: llkv_scan::ScanOrderSpec) -> table_types::ScanOrderSpec
         field_id: order.field_id,
         direction: match order.direction {
             llkv_scan::ScanOrderDirection::Ascending => table_types::ScanOrderDirection::Ascending,
-            llkv_scan::ScanOrderDirection::Descending => table_types::ScanOrderDirection::Descending,
+            llkv_scan::ScanOrderDirection::Descending => {
+                table_types::ScanOrderDirection::Descending
+            }
         },
         nulls_first: order.nulls_first,
         transform: match order.transform {

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
+use croaring::Treemap;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext, Projection};
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::Result as LlkvResult;
@@ -15,7 +16,6 @@ use llkv_storage::pager::{MemPager, Pager};
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
-use croaring::Treemap;
 pub mod row_stream;
 pub use row_stream::{
     ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowChunk, RowIdSource, RowStream,
@@ -23,6 +23,7 @@ pub use row_stream::{
 };
 
 pub mod execute;
+pub mod predicate;
 
 /// Sort direction for scan ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +146,7 @@ where
     fn table_id(&self) -> TableId;
     fn field_data_type(&self, fid: LogicalFieldId) -> LlkvResult<DataType>;
     fn total_rows(&self) -> LlkvResult<u64>;
+    fn all_row_ids(&self) -> LlkvResult<croaring::Treemap>;
     fn prepare_gather_context(
         &self,
         logical_fields: &[LogicalFieldId],
@@ -156,7 +158,25 @@ where
         null_policy: GatherNullPolicy,
         ctx: Option<&mut MultiGatherContext>,
     ) -> LlkvResult<RecordBatch>;
-    fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<croaring::Treemap>;
+    fn filter_row_ids<'expr>(
+        &self,
+        filter_expr: &Expr<'expr, FieldId>,
+    ) -> LlkvResult<croaring::Treemap>;
+
+    /// Evaluate a leaf predicate (single column filter) against the storage.
+    fn filter_leaf(
+        &self,
+        filter: &llkv_compute::program::OwnedFilter,
+    ) -> LlkvResult<croaring::Treemap>;
+
+    /// Evaluate fused predicates against a single column.
+    fn filter_fused(
+        &self,
+        field_id: FieldId,
+        filters: &[llkv_compute::program::OwnedFilter],
+        cache: &llkv_compute::analysis::PredicateFusionCache,
+    ) -> LlkvResult<RowIdSource>;
+
     fn stream_row_ids(
         &self,
         chunk_size: usize,

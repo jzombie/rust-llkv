@@ -8,7 +8,7 @@ use croaring::Treemap;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_compute::analysis::computed_expr_requires_numeric;
 use llkv_compute::eval::{NumericArrayMap as ComputeNumericArrayMap, ScalarEvaluator};
-use llkv_compute::projection::{synthesize_computed_literal_array, ComputedLiteralInfo};
+use llkv_compute::projection::{ComputedLiteralInfo, synthesize_computed_literal_array};
 use llkv_expr::ScalarExpr;
 use llkv_result::Result as LlkvResult;
 use llkv_types::{FieldId, LogicalFieldId, RowId, TableId};
@@ -489,8 +489,7 @@ where
                                 )?,
                                 _ => {
                                     return Err(llkv_result::Error::InvalidArgumentError(
-                                        "GetField base must be a column or another GetField"
-                                            .into(),
+                                        "GetField base must be a column or another GetField".into(),
                                     ));
                                 }
                             };

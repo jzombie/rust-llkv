@@ -38,9 +38,7 @@ pub fn build_table_scan_plan(
 
     let scan_node_id = PlanNodeId::new(1);
     let mut scan_node = PlanNode::new(scan_node_id, PlanOperator::TableScan);
-    scan_node
-        .metadata
-        .insert("table_id", table_id.to_string());
+    scan_node.metadata.insert("table_id", table_id.to_string());
     scan_node
         .metadata
         .insert("projection_count", projections.len().to_string());
@@ -89,8 +87,7 @@ pub fn build_table_scan_plan(
                     expr.format_display()
                 )));
                 project_node.add_field(
-                    PlanField::new(alias.clone(), format!("{data_type:?}"))
-                        .with_nullability(true),
+                    PlanField::new(alias.clone(), format!("{data_type:?}")).with_nullability(true),
                 );
             }
         }

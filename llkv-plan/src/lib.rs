@@ -16,10 +16,10 @@ pub mod canonical;
 pub mod conversion;
 pub mod plan_graph;
 pub mod plans;
-pub mod program;
+// pub mod program; // Moved to llkv-compute
 pub mod subquery_correlation;
-pub mod traversal;
 pub mod table_scan;
+pub mod traversal;
 pub mod validation;
 
 pub use canonical::canonical_scalar_from_plan_value;
@@ -31,13 +31,14 @@ pub use llkv_compute::{
 pub use llkv_types::{CanonicalRow, CanonicalScalar};
 pub use plan_graph::*;
 pub use plans::*;
-pub use program::{
+// pub mod program; // Moved to llkv-compute
+pub use llkv_compute::program::{
     DomainOp, DomainProgram, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler,
     ProgramSet, normalize_predicate,
 };
-pub use table_scan::{build_table_scan_plan, TableScanProjectionSpec};
 pub use subquery_correlation::{
     SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,
     SubqueryCorrelatedTracker, subquery_correlated_placeholder,
 };
+pub use table_scan::{TableScanProjectionSpec, build_table_scan_plan};
 pub use traversal::{TransformFrame, Traversable, traverse_postorder};
