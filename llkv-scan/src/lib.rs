@@ -94,7 +94,6 @@ impl From<&ScanProjection> for ScanProjection {
 }
 
 /// Options for configuring table scans.
-#[derive(Clone)]
 pub struct ScanStreamOptions<P = MemPager>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -102,6 +101,19 @@ where
     pub include_nulls: bool,
     pub order: Option<ScanOrderSpec>,
     pub row_id_filter: Option<Arc<dyn RowIdFilter<P>>>,
+}
+
+impl<P> Clone for ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            include_nulls: self.include_nulls,
+            order: self.order,
+            row_id_filter: self.row_id_filter.clone(),
+        }
+    }
 }
 
 impl<P> Default for ScanStreamOptions<P>

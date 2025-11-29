@@ -1,11 +1,8 @@
-use std::sync::Arc;
-
 use arrow::array::RecordBatch;
 use croaring::Treemap;
 use llkv_expr::Expr;
 use llkv_plan::{PlanGraph, ProgramSet};
 use llkv_result::{Error, Result as ExecutorResult};
-use llkv_table::table as table_types;
 use llkv_table::table::Table as LlkvTable;
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -109,78 +106,6 @@ where
     }
 }
 
-fn to_table_projection(proj: &ScanProjection) -> table_types::ScanProjection {
-    match proj {
-        ScanProjection::Column(p) => table_types::ScanProjection::Column(p.clone()),
-        ScanProjection::Computed { expr, alias } => table_types::ScanProjection::Computed {
-            expr: expr.clone(),
-            alias: alias.clone(),
-        },
-    }
-}
-
-fn to_table_order(order: llkv_scan::ScanOrderSpec) -> table_types::ScanOrderSpec {
-    table_types::ScanOrderSpec {
-        field_id: order.field_id,
-        direction: match order.direction {
-            llkv_scan::ScanOrderDirection::Ascending => table_types::ScanOrderDirection::Ascending,
-            llkv_scan::ScanOrderDirection::Descending => {
-                table_types::ScanOrderDirection::Descending
-            }
-        },
-        nulls_first: order.nulls_first,
-        transform: match order.transform {
-            llkv_scan::ScanOrderTransform::IdentityInt64 => {
-                table_types::ScanOrderTransform::IdentityInt64
-            }
-            llkv_scan::ScanOrderTransform::IdentityInt32 => {
-                table_types::ScanOrderTransform::IdentityInt32
-            }
-            llkv_scan::ScanOrderTransform::IdentityUtf8 => {
-                table_types::ScanOrderTransform::IdentityUtf8
-            }
-            llkv_scan::ScanOrderTransform::CastUtf8ToInteger => {
-                table_types::ScanOrderTransform::CastUtf8ToInteger
-            }
-        },
-    }
-}
-
-fn to_table_options<P>(options: ScanStreamOptions<P>) -> table_types::ScanStreamOptions<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    table_types::ScanStreamOptions {
-        include_nulls: options.include_nulls,
-        order: options.order.map(to_table_order),
-        row_id_filter: options
-            .row_id_filter
-            .map(|f| std::sync::Arc::new(ScanRowIdFilterShim { inner: f }) as _),
-    }
-}
-
-struct ScanRowIdFilterShim<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    inner: std::sync::Arc<dyn llkv_scan::RowIdFilter<P>>,
-}
-
-impl<P> table_types::RowIdFilter<P> for ScanRowIdFilterShim<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn filter(
-        &self,
-        table: &llkv_table::table::Table<P>,
-        row_ids: Treemap,
-    ) -> llkv_result::Result<Treemap> {
-        self.inner
-            .filter(table.table_id(), table, row_ids)
-            .map_err(llkv_result::Error::from)
-    }
-}
-
 /// Thin wrapper capturing what the executor needs to run a scan.
 pub struct ScanExecutor<'a, P, S>
 where
@@ -230,11 +155,8 @@ where
                 )
             })?;
 
-        let table_projections: Vec<table_types::ScanProjection> =
-            projections.iter().map(to_table_projection).collect();
-        let table_options = to_table_options(options);
         table
-            .scan_stream_with_exprs(&table_projections, filter_expr, table_options, on_batch)
+            .scan_stream_with_exprs(projections, filter_expr, options, on_batch)
             .map_err(Error::from)
     }
 }

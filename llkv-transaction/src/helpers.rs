@@ -9,9 +9,9 @@ use llkv_column_map::store::GatherNullPolicy;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::MvccColumnBuilder;
-use llkv_table::table::RowIdFilter;
+use llkv_table::table::{RowIdFilter, ScanStorage};
 use llkv_table::{FieldId, RowId, Table};
-use llkv_types::LogicalFieldId;
+use llkv_types::{LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -280,7 +280,17 @@ impl<P> RowIdFilter<P> for MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> Result<Treemap> {
+    fn filter(
+        &self,
+        table_id: TableId,
+        storage: &dyn ScanStorage<P>,
+        row_ids: Treemap,
+    ) -> Result<Treemap> {
+        let table = storage
+            .as_any()
+            .downcast_ref::<Table<P>>()
+            .ok_or_else(|| Error::Internal("RowIdFilter requires table storage".into()))?;
+        debug_assert_eq!(table.table_id(), table_id);
         tracing::trace!(
             "[MVCC_FILTER] filter() called with row_ids {:?}, snapshot txn={}, snapshot_id={}",
             row_ids,

@@ -1,6 +1,5 @@
 use croaring::Treemap;
 use std::cmp;
-use std::fmt;
 use std::mem;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -41,8 +40,11 @@ use llkv_expr::typed_predicate::{
 };
 use llkv_expr::{Expr, Operator};
 use llkv_result::{Error, Result as LlkvResult};
-pub use llkv_scan::{ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection};
-use llkv_scan::{ScanStorage, execute::execute_scan};
+use llkv_scan::execute::execute_scan;
+pub use llkv_scan::{
+    RowIdFilter, ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
+    ScanStorage, ScanStreamOptions,
+};
 use rustc_hash::FxHashMap;
 use std::ops::Bound;
 
@@ -65,97 +67,6 @@ where
     /// Cache of MVCC column presence. Initialized lazily on first schema() call.
     /// None means not yet initialized.
     mvcc_cache: RwLock<Option<MvccColumnCache>>,
-}
-
-/// Filter row IDs before they are materialized into batches.
-///
-/// This trait allows implementations to enforce transaction visibility (MVCC),
-/// access control, or other row-level filtering policies. The filter is applied
-/// after column-level predicates but before data is gathered into Arrow batches.
-///
-/// # Example Use Case
-///
-/// MVCC implementations use this to hide rows that were:
-/// - Created after the transaction's snapshot timestamp
-/// - Deleted before the transaction's snapshot timestamp
-pub trait RowIdFilter<P>: Send + Sync
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    /// Filter a list of row IDs, returning only those that should be visible.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if visibility metadata cannot be loaded or is corrupted.
-    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> LlkvResult<Treemap>;
-}
-
-/// Options for configuring table scans.
-///
-/// These options control how rows are filtered, ordered, and materialized during
-/// scan operations.
-pub struct ScanStreamOptions<P = MemPager>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    /// Whether to include rows where all projected columns are null.
-    ///
-    /// When `false` (default), rows with all-null projections are dropped before
-    /// batches are yielded. This is useful for sparse data where many rows may not
-    /// have values for the selected columns.
-    pub include_nulls: bool,
-    /// Optional ordering to apply to results.
-    ///
-    /// If specified, row IDs are sorted according to this specification before
-    /// data is gathered into batches.
-    pub order: Option<ScanOrderSpec>,
-    /// Optional filter for row-level visibility (e.g., MVCC).
-    ///
-    /// Applied after column-level predicates but before data is materialized.
-    /// Used to enforce transaction isolation.
-    pub row_id_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
-}
-
-impl<P> fmt::Debug for ScanStreamOptions<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ScanStreamOptions")
-            .field("include_nulls", &self.include_nulls)
-            .field("order", &self.order)
-            .field(
-                "row_id_filter",
-                &self.row_id_filter.as_ref().map(|_| "<RowIdFilter>"),
-            )
-            .finish()
-    }
-}
-
-impl<P> Clone for ScanStreamOptions<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn clone(&self) -> Self {
-        Self {
-            include_nulls: self.include_nulls,
-            order: self.order,
-            row_id_filter: self.row_id_filter.clone(),
-        }
-    }
-}
-
-impl<P> Default for ScanStreamOptions<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn default() -> Self {
-        Self {
-            include_nulls: false,
-            order: None,
-            row_id_filter: None,
-        }
-    }
 }
 
 impl<P> Table<P>
@@ -564,14 +475,13 @@ where
     where
         F: FnMut(RecordBatch),
     {
-        let shared_options = to_shared_scan_options(options);
         let mut cb = on_batch;
         execute_scan(
             self,
             self.table_id,
             projections,
             filter_expr,
-            shared_options,
+            options,
             &mut cb,
         )
     }
@@ -1424,44 +1334,6 @@ where
             Err(Error::NotFound) => Ok(None),
             Err(err) => Err(err),
         }
-    }
-}
-
-fn to_shared_scan_options<P>(options: ScanStreamOptions<P>) -> llkv_scan::ScanStreamOptions<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    llkv_scan::ScanStreamOptions {
-        include_nulls: options.include_nulls,
-        order: options.order,
-        row_id_filter: options
-            .row_id_filter
-            .map(|inner| Arc::new(TableRowIdFilterShim { inner }) as _),
-    }
-}
-
-struct TableRowIdFilterShim<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    inner: Arc<dyn RowIdFilter<P>>,
-}
-
-impl<P> llkv_scan::RowIdFilter<P> for TableRowIdFilterShim<P>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn filter(
-        &self,
-        _table_id: TableId,
-        storage: &dyn ScanStorage<P>,
-        row_ids: Treemap,
-    ) -> LlkvResult<Treemap> {
-        let table = storage
-            .as_any()
-            .downcast_ref::<Table<P>>()
-            .ok_or_else(|| Error::Internal("RowIdFilter requires table storage".into()))?;
-        self.inner.filter(table, row_ids)
     }
 }
 
