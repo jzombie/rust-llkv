@@ -11,7 +11,7 @@ use arrow::array::{
     StringArray, UInt64Array,
 };
 use arrow::compute;
-use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 use arrow_array::types::{Int32Type, Int64Type};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,16 +35,14 @@ use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
 use llkv_compute::analysis::{
-    PredicateFusionCache, computed_expr_prefers_float, computed_expr_requires_numeric,
-    computed_expr_result_type, get_field_dtype, scalar_expr_contains_coalesce,
+    PredicateFusionCache, computed_expr_requires_numeric, scalar_expr_contains_coalesce,
 };
 use llkv_compute::eval::ScalarExprTypeExt;
 use llkv_compute::projection::{
-    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, infer_literal_datatype,
-    synthesize_computed_literal_array,
+    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, synthesize_computed_literal_array,
 };
 use llkv_compute::scalar::interval::compare_interval_values;
-use llkv_compute::{RowIdFilter, compare_option_values, sort_row_ids_by_primitive};
+use llkv_compute::{RowIdFilter, sort_row_ids_by_primitive};
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
@@ -1081,85 +1079,11 @@ where
                         })?;
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     } else {
-                        let dtype = match &info.expr {
-                            ScalarExpr::Literal(Literal::Int128(_)) => DataType::Int64,
-                            ScalarExpr::Literal(Literal::Float64(_)) => DataType::Float64,
-                            ScalarExpr::Literal(Literal::Decimal128(value)) => {
-                                DataType::Decimal128(value.precision(), value.scale())
-                            }
-                            ScalarExpr::Literal(Literal::Boolean(_)) => DataType::Boolean,
-                            ScalarExpr::Literal(Literal::String(_)) => DataType::Utf8,
-                            ScalarExpr::Literal(Literal::Date32(_)) => DataType::Date32,
-                            ScalarExpr::Literal(Literal::Interval(_)) => {
-                                DataType::Interval(IntervalUnit::MonthDayNano)
-                            }
-                            ScalarExpr::Literal(Literal::Null) => DataType::Null,
-                            ScalarExpr::Literal(Literal::Struct(fields)) => {
-                                // Infer struct type from the literal fields
-                                let struct_fields = fields
-                                    .iter()
-                                    .map(|(name, lit)| {
-                                        let field_dtype = infer_literal_datatype(lit.as_ref())?;
-                                        Ok(Field::new(name.clone(), field_dtype, true))
-                                    })
-                                    .collect::<LlkvResult<Vec<_>>>()?;
-                                DataType::Struct(struct_fields.into())
-                            }
-                            ScalarExpr::Cast { data_type, .. } => data_type.clone(),
-                            ScalarExpr::Not(_) => DataType::Int64,
-                            ScalarExpr::IsNull { .. } => DataType::Int64,
-                            ScalarExpr::Binary { .. }
-                            | ScalarExpr::Compare { .. }
-                            | ScalarExpr::Case { .. }
-                            | ScalarExpr::Coalesce(_) => {
-                                let inferred_type = computed_expr_result_type(
-                                    &info.expr,
-                                    self.table.table_id(),
-                                    &lfid_dtypes,
-                                )?;
-
-                                if let Some(dtype) = inferred_type {
-                                    dtype
-                                } else if computed_expr_prefers_float(
-                                    &info.expr,
-                                    self.table.table_id(),
-                                    &lfid_dtypes,
-                                )? {
-                                    DataType::Float64
-                                } else {
-                                    DataType::Int64
-                                }
-                            }
-                            ScalarExpr::Column(fid) => {
-                                let lfid = LogicalFieldId::for_user(self.table.table_id(), *fid);
-                                lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
-                                    Error::Internal("missing dtype for computed column".into())
-                                })?
-                            }
-                            ScalarExpr::Aggregate(_) => {
-                                // Aggregates in computed columns return Int64.
-                                // TODO: Fix: This is a simplification - ideally we'd determine type from the aggregate
-                                // NOTE: This assumes SUM-like semantics; extend once planner
-                                // carries precise aggregate signatures.
-                                DataType::Int64
-                            }
-                            ScalarExpr::GetField { base, field_name } => get_field_dtype(
-                                base,
-                                field_name,
-                                self.table.table_id(),
-                                &lfid_dtypes,
-                            )?,
-                            ScalarExpr::Random => {
-                                // RANDOM() returns a float64 value
-                                DataType::Float64
-                            }
-                            ScalarExpr::ScalarSubquery(_) => {
-                                // Scalar subqueries will be resolved at execution time
-                                // For now, assume they can be null and return a generic type
-                                // TODO: Infer type from subquery plan
-                                DataType::Utf8
-                            }
-                        };
+                        let dtype = llkv_compute::projection::infer_computed_dtype(
+                            &info.expr,
+                            self.table.table_id(),
+                            &lfid_dtypes,
+                        )?;
                         schema_fields.push(Field::new(info.alias.clone(), dtype, true));
                     }
                 }
@@ -3023,7 +2947,12 @@ where
                     } else {
                         Some(array_b.value(offset_b))
                     };
-                    let ord = compare_option_values(left, right, ascending, nulls_first);
+                    let ord = llkv_compute::compare::compare_option_values(
+                        left,
+                        right,
+                        ascending,
+                        nulls_first,
+                    );
                     if ord == Ordering::Equal {
                         arid.cmp(brid)
                     } else {
@@ -3089,7 +3018,12 @@ where
                 indices.sort_by(|(ai, arid), (bi, brid)| {
                     let left = keys[*ai];
                     let right = keys[*bi];
-                    let ord = compare_option_values(left, right, ascending, order.nulls_first);
+                    let ord = llkv_compute::compare::compare_option_values(
+                        left,
+                        right,
+                        ascending,
+                        order.nulls_first,
+                    );
                     if ord == Ordering::Equal {
                         arid.cmp(brid)
                     } else {
