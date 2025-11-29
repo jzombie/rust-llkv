@@ -217,7 +217,16 @@ where
         field_id,
         op: OwnedOperator::IsNotNull,
     };
-    let rows = storage.filter_leaf(&filter)?;
+    let mut rows = storage.filter_leaf(&filter)?;
+
+    let null_filter = OwnedFilter {
+        field_id,
+        op: OwnedOperator::IsNull,
+    };
+    if let Ok(null_rows) = storage.filter_leaf(&null_filter) {
+        rows |= null_rows;
+    }
+
     all_rows_cache.insert(field_id, rows.clone());
     Ok(rows)
 }
@@ -349,42 +358,8 @@ where
         return Ok(Treemap::new());
     }
 
-    let mut result = Treemap::new();
-    let logical_fields: Vec<LogicalFieldId> = ordered_fields
-        .iter()
-        .map(|&fid| LogicalFieldId::for_user(storage.table_id(), fid))
-        .collect();
-
-    let mut ctx = storage.prepare_gather_context(&logical_fields)?;
-
-    let domain_vec: Vec<u64> = domain.iter().collect();
-    for chunk in domain_vec.chunks(CHUNK_SIZE) {
-        let batch = storage.gather_row_window_with_context(
-            &logical_fields,
-            chunk,
-            GatherNullPolicy::IncludeNulls,
-            Some(&mut ctx),
-        )?;
-
-        let mut arrays: NumericArrayMap = FxHashMap::default();
-        for (i, fid) in ordered_fields.iter().enumerate() {
-            arrays.insert(*fid, batch.column(i).clone());
-        }
-
-        let left_val = ScalarEvaluator::evaluate_batch(left, chunk.len(), &arrays)?;
-        let right_val = ScalarEvaluator::evaluate_batch(right, chunk.len(), &arrays)?;
-
-        if let Ok(cmp_array) = compute_compare(&left_val, op, &right_val) {
-            let cmp = cmp_array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            for (i, valid) in cmp.iter().enumerate() {
-                if valid.unwrap_or(false) {
-                    result.add(chunk[i]);
-                }
-            }
-        }
-    }
-
-    Ok(result)
+    let (matched, _) = evaluate_compare_rows(storage, &ordered_fields, &domain, left, op, right)?;
+    Ok(matched)
 }
 
 fn collect_row_ids_for_in_list<P, S>(
@@ -405,10 +380,14 @@ where
     }
 
     if fields.is_empty() {
-        return match evaluate_constant_in_list(expr, list, negated)? {
-            Some(true) => collect_all_row_ids(storage, all_rows_cache),
-            _ => Ok(Treemap::new()),
-        };
+        let (matched, _) = evaluate_constant_in_list(
+            storage,
+            expr,
+            list,
+            negated,
+            all_rows_cache,
+        )?;
+        return Ok(matched);
     }
 
     let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
@@ -428,15 +407,43 @@ where
         return Ok(Treemap::new());
     }
 
-    let mut result = Treemap::new();
+    let (matched, _) = evaluate_in_list_over_rows(
+        storage,
+        &domain,
+        &ordered_fields,
+        expr,
+        list,
+        negated,
+    )?;
+    Ok(matched)
+}
+
+fn evaluate_in_list_over_rows<P, S>(
+    storage: &S,
+    domain_rows: &Treemap,
+    ordered_fields: &[FieldId],
+    expr: &ScalarExpr<FieldId>,
+    list: &[ScalarExpr<FieldId>],
+    negated: bool,
+) -> LlkvResult<(Treemap, Treemap)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P>,
+{
+    if domain_rows.is_empty() {
+        return Ok((Treemap::new(), Treemap::new()));
+    }
+
     let logical_fields: Vec<LogicalFieldId> = ordered_fields
         .iter()
         .map(|&fid| LogicalFieldId::for_user(storage.table_id(), fid))
         .collect();
 
     let mut ctx = storage.prepare_gather_context(&logical_fields)?;
+    let mut matched = Treemap::new();
+    let mut determined = Treemap::new();
 
-    let domain_vec: Vec<u64> = domain.iter().collect();
+    let domain_vec: Vec<u64> = domain_rows.iter().collect();
     for chunk in domain_vec.chunks(CHUNK_SIZE) {
         let batch = storage.gather_row_window_with_context(
             &logical_fields,
@@ -484,13 +491,78 @@ where
             if final_bool.is_null(idx) {
                 continue;
             }
+            determined.add(*row_id);
             if final_bool.value(idx) {
-                result.add(*row_id);
+                matched.add(*row_id);
             }
         }
     }
 
-    Ok(result)
+    Ok((matched, determined))
+}
+
+fn evaluate_compare_rows<P, S>(
+    storage: &S,
+    ordered_fields: &[FieldId],
+    domain_rows: &Treemap,
+    left: &ScalarExpr<FieldId>,
+    op: CompareOp,
+    right: &ScalarExpr<FieldId>,
+) -> LlkvResult<(Treemap, Treemap)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P>,
+{
+    if domain_rows.is_empty() {
+        return Ok((Treemap::new(), Treemap::new()));
+    }
+
+    let logical_fields: Vec<LogicalFieldId> = ordered_fields
+        .iter()
+        .map(|&fid| LogicalFieldId::for_user(storage.table_id(), fid))
+        .collect();
+
+    let mut ctx = storage.prepare_gather_context(&logical_fields)?;
+    let mut matched = Treemap::new();
+    let mut determined = Treemap::new();
+
+    let domain_vec: Vec<u64> = domain_rows.iter().collect();
+    for chunk in domain_vec.chunks(CHUNK_SIZE) {
+        let batch = storage.gather_row_window_with_context(
+            &logical_fields,
+            chunk,
+            GatherNullPolicy::IncludeNulls,
+            Some(&mut ctx),
+        )?;
+
+        let mut arrays: NumericArrayMap = FxHashMap::default();
+        for (i, fid) in ordered_fields.iter().enumerate() {
+            arrays.insert(*fid, batch.column(i).clone());
+        }
+
+        let left_vals = ScalarEvaluator::evaluate_batch(left, chunk.len(), &arrays)?;
+        let right_vals = ScalarEvaluator::evaluate_batch(right, chunk.len(), &arrays)?;
+
+        let cmp_array = compute_compare(&left_vals, op, &right_vals)?;
+        let cmp = cmp_array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| Error::Internal("compare kernel did not return booleans".into()))?;
+
+        for (idx, row_id) in chunk.iter().enumerate() {
+            if !left_vals.is_null(idx) && !right_vals.is_null(idx) {
+                determined.add(*row_id);
+            }
+            if cmp.is_null(idx) {
+                continue;
+            }
+            if cmp.value(idx) {
+                matched.add(*row_id);
+            }
+        }
+    }
+
+    Ok((matched, determined))
 }
 
 fn evaluate_domain_program<P, S>(
@@ -525,7 +597,7 @@ where
             DomainOp::PushCompareDomain {
                 left,
                 right,
-                op: _op,
+                op,
                 fields,
             } => {
                 if scalar_expr_constant_null(left)? || scalar_expr_constant_null(right)? {
@@ -536,7 +608,7 @@ where
                     storage,
                     left,
                     right,
-                    *_op,
+                    *op,
                     fields,
                     all_rows_cache,
                 )?;
@@ -546,30 +618,21 @@ where
                 expr,
                 list,
                 fields,
-                negated: _negated,
+                negated,
             } => {
                 if scalar_expr_constant_null(expr)? || list_all_constant_null(list)? {
                     stack.push(Treemap::new());
                     continue;
                 }
-                let mut ordered_fields: Vec<FieldId> = fields.to_vec();
-                ordered_fields.sort_unstable();
-                ordered_fields.dedup();
-
-                if ordered_fields.is_empty() {
-                    stack.push(collect_all_row_ids(storage, all_rows_cache)?);
-                    continue;
-                }
-
-                let mut domain: Option<Treemap> = None;
-                for &fid in &ordered_fields {
-                    let rows = collect_all_row_ids_for_field(storage, fid, all_rows_cache)?;
-                    domain = Some(match domain {
-                        Some(existing) => existing & rows,
-                        None => rows,
-                    });
-                }
-                stack.push(domain.unwrap_or_default());
+                let rows = collect_in_list_domain_rows(
+                    storage,
+                    expr,
+                    list,
+                    *negated,
+                    fields,
+                    all_rows_cache,
+                )?;
+                stack.push(rows);
             }
             DomainOp::Union { child_count } => {
                 let mut acc = stack.pop().unwrap();
@@ -627,9 +690,9 @@ where
 
 fn collect_compare_domain_rows<P, S>(
     storage: &S,
-    _left: &ScalarExpr<FieldId>,
-    _right: &ScalarExpr<FieldId>,
-    _op: CompareOp,
+    left: &ScalarExpr<FieldId>,
+    right: &ScalarExpr<FieldId>,
+    op: CompareOp,
     fields: &[FieldId],
     all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
 ) -> LlkvResult<Treemap>
@@ -638,7 +701,10 @@ where
     S: ScanStorage<P>,
 {
     if fields.is_empty() {
-        return collect_all_row_ids(storage, all_rows_cache);
+        return match evaluate_constant_compare(left, op, right)? {
+            Some(_) => collect_all_row_ids(storage, all_rows_cache),
+            None => Ok(Treemap::new()),
+        };
     }
 
     let mut ordered_fields: Vec<FieldId> = fields.to_vec();
@@ -653,7 +719,71 @@ where
             None => rows,
         });
     }
-    Ok(domain.unwrap_or_default())
+    let domain_rows = domain.unwrap_or_default();
+    if domain_rows.is_empty() {
+        return Ok(Treemap::new());
+    }
+
+    let (_, determined) = evaluate_compare_rows(
+        storage,
+        &ordered_fields,
+        &domain_rows,
+        left,
+        op,
+        right,
+    )?;
+    Ok(determined)
+}
+
+fn collect_in_list_domain_rows<P, S>(
+    storage: &S,
+    expr: &ScalarExpr<FieldId>,
+    list: &[ScalarExpr<FieldId>],
+    negated: bool,
+    fields: &[FieldId],
+    all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+) -> LlkvResult<Treemap>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P>,
+{
+    if fields.is_empty() {
+        let (_, determined) = evaluate_constant_in_list(
+            storage,
+            expr,
+            list,
+            negated,
+            all_rows_cache,
+        )?;
+        return Ok(determined);
+    }
+
+    let mut ordered_fields: Vec<FieldId> = fields.to_vec();
+    ordered_fields.sort_unstable();
+    ordered_fields.dedup();
+
+    let mut domain: Option<Treemap> = None;
+    for &fid in &ordered_fields {
+        let rows = collect_all_row_ids_for_field(storage, fid, all_rows_cache)?;
+        domain = Some(match domain {
+            Some(existing) => existing & rows,
+            None => rows,
+        });
+    }
+    let domain_rows = domain.unwrap_or_default();
+    if domain_rows.is_empty() {
+        return Ok(Treemap::new());
+    }
+
+    let (_, determined) = evaluate_in_list_over_rows(
+        storage,
+        &domain_rows,
+        &ordered_fields,
+        expr,
+        list,
+        negated,
+    )?;
+    Ok(determined)
 }
 
 fn scalar_expr_constant_null(expr: &ScalarExpr<FieldId>) -> LlkvResult<bool> {
@@ -705,16 +835,22 @@ fn evaluate_constant_compare(
     }
 }
 
-fn evaluate_constant_in_list(
+fn evaluate_constant_in_list<P, S>(
+    storage: &S,
     expr: &ScalarExpr<FieldId>,
     list: &[ScalarExpr<FieldId>],
     negated: bool,
-) -> LlkvResult<Option<bool>> {
+    all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+) -> LlkvResult<(Treemap, Treemap)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P>,
+{
     let arrays: NumericArrayMap = FxHashMap::default();
     let mut target_array = ScalarEvaluator::evaluate_value(expr, 0, &arrays)?;
 
     if target_array.data_type() == &DataType::Null || target_array.is_null(0) {
-        return Ok(None);
+        return Ok((Treemap::new(), Treemap::new()));
     }
 
     let mut matched = false;
@@ -727,7 +863,8 @@ fn evaluate_constant_in_list(
             continue;
         }
 
-        let (new_target, new_value) = kernels::coerce_types(&target_array, &value_array, BinaryOp::Add)?;
+        let (new_target, new_value) =
+            kernels::coerce_types(&target_array, &value_array, BinaryOp::Add)?;
         target_array = new_target;
         let cmp_array = arrow::compute::kernels::cmp::eq(&new_value, &target_array)?;
         let bool_array = cmp_array
@@ -741,6 +878,7 @@ fn evaluate_constant_in_list(
         }
     }
 
+    let rows = collect_all_row_ids(storage, all_rows_cache)?;
     let outcome = if matched {
         Some(!negated)
     } else if saw_null {
@@ -751,5 +889,9 @@ fn evaluate_constant_in_list(
         Some(false)
     };
 
-    Ok(outcome)
+    match outcome {
+        Some(true) => Ok((rows.clone(), rows)),
+        Some(false) => Ok((Treemap::new(), rows)),
+        None => Ok((Treemap::new(), Treemap::new())),
+    }
 }
