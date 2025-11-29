@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, BooleanBuilder};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Array};
 use arrow::compute;
+use arrow::datatypes::DataType;
 use croaring::Treemap;
-use llkv_compute::analysis::PredicateFusionCache;
+use llkv_compute::analysis::{PredicateFusionCache, scalar_expr_contains_coalesce};
 use llkv_compute::compute_compare;
 use llkv_compute::eval::ScalarEvaluator;
 use llkv_compute::kernels;
@@ -14,7 +14,7 @@ use llkv_compute::program::{
 use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
-use llkv_types::{FieldId, LogicalFieldId};
+use llkv_types::{FieldId, LogicalFieldId, ROW_ID_FIELD_ID};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::row_stream::RowIdSource;
@@ -191,13 +191,19 @@ where
 
 fn collect_all_row_ids<P, S>(
     storage: &S,
-    _all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
+    all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
 ) -> LlkvResult<Treemap>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
-    storage.all_row_ids()
+    if let Some(rows) = all_rows_cache.get(&ROW_ID_FIELD_ID) {
+        return Ok(rows.clone());
+    }
+
+    let rows = storage.all_row_ids()?;
+    all_rows_cache.insert(ROW_ID_FIELD_ID, rows.clone());
+    Ok(rows)
 }
 
 fn collect_all_row_ids_for_field<P, S>(
@@ -211,6 +217,12 @@ where
 {
     if let Some(rows) = all_rows_cache.get(&field_id) {
         return Ok(rows.clone());
+    }
+
+    if field_id == ROW_ID_FIELD_ID {
+        let rows = collect_all_row_ids(storage, all_rows_cache)?;
+        all_rows_cache.insert(field_id, rows.clone());
+        return Ok(rows);
     }
 
     let filter = OwnedFilter {
@@ -256,6 +268,7 @@ where
 
     let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
     ordered_fields.sort_unstable();
+    ordered_fields.dedup();
 
     let domain = if ordered_fields.is_empty() {
         let arrays: NumericArrayMap = FxHashMap::default();
@@ -338,21 +351,34 @@ where
 
     let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
     ordered_fields.sort_unstable();
+    ordered_fields.dedup();
 
-    let mut domain: Option<Treemap> = None;
-    for fid in &ordered_fields {
-        let rows = collect_all_row_ids_for_field(storage, *fid, all_rows_cache)?;
-        domain = Some(match domain {
-            Some(existing) => existing & rows,
-            None => rows,
-        });
-        if let Some(ref d) = domain {
-            if d.is_empty() {
-                return Ok(Treemap::new());
+    let requires_full_scan =
+        scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right);
+
+    let domain = if requires_full_scan {
+        let mut union_rows = Treemap::new();
+        for fid in &ordered_fields {
+            let rows = collect_all_row_ids_for_field(storage, *fid, all_rows_cache)?;
+            union_rows |= rows;
+        }
+        union_rows
+    } else {
+        let mut domain: Option<Treemap> = None;
+        for fid in &ordered_fields {
+            let rows = collect_all_row_ids_for_field(storage, *fid, all_rows_cache)?;
+            domain = Some(match domain {
+                Some(existing) => existing & rows,
+                None => rows,
+            });
+            if let Some(ref d) = domain {
+                if d.is_empty() {
+                    return Ok(Treemap::new());
+                }
             }
         }
-    }
-    let domain = domain.unwrap_or_default();
+        domain.unwrap_or_default()
+    };
 
     if domain.is_empty() {
         return Ok(Treemap::new());
@@ -380,13 +406,7 @@ where
     }
 
     if fields.is_empty() {
-        let (matched, _) = evaluate_constant_in_list(
-            storage,
-            expr,
-            list,
-            negated,
-            all_rows_cache,
-        )?;
+        let (matched, _) = evaluate_constant_in_list(storage, expr, list, negated, all_rows_cache)?;
         return Ok(matched);
     }
 
@@ -407,14 +427,8 @@ where
         return Ok(Treemap::new());
     }
 
-    let (matched, _) = evaluate_in_list_over_rows(
-        storage,
-        &domain,
-        &ordered_fields,
-        expr,
-        list,
-        negated,
-    )?;
+    let (matched, _) =
+        evaluate_in_list_over_rows(storage, &domain, &ordered_fields, expr, list, negated)?;
     Ok(matched)
 }
 
@@ -434,7 +448,15 @@ where
         return Ok((Treemap::new(), Treemap::new()));
     }
 
-    let logical_fields: Vec<LogicalFieldId> = ordered_fields
+    let has_row_id = ordered_fields.iter().any(|fid| *fid == ROW_ID_FIELD_ID);
+
+    let physical_fields: Vec<FieldId> = ordered_fields
+        .iter()
+        .copied()
+        .filter(|fid| *fid != ROW_ID_FIELD_ID)
+        .collect();
+
+    let logical_fields: Vec<LogicalFieldId> = physical_fields
         .iter()
         .map(|&fid| LogicalFieldId::for_user(storage.table_id(), fid))
         .collect();
@@ -453,8 +475,14 @@ where
         )?;
 
         let mut arrays: NumericArrayMap = FxHashMap::default();
-        for (i, fid) in ordered_fields.iter().enumerate() {
+        for (i, fid) in physical_fields.iter().enumerate() {
             arrays.insert(*fid, batch.column(i).clone());
+        }
+
+        if has_row_id {
+            let rid_values: Vec<i64> = chunk.iter().map(|row_id| *row_id as i64).collect();
+            let rid_array: ArrayRef = Arc::new(Int64Array::from(rid_values));
+            arrays.insert(ROW_ID_FIELD_ID, rid_array);
         }
 
         let mut target_array = ScalarEvaluator::evaluate_batch(expr, chunk.len(), &arrays)?;
@@ -517,7 +545,15 @@ where
         return Ok((Treemap::new(), Treemap::new()));
     }
 
-    let logical_fields: Vec<LogicalFieldId> = ordered_fields
+    let has_row_id = ordered_fields.iter().any(|fid| *fid == ROW_ID_FIELD_ID);
+
+    let physical_fields: Vec<FieldId> = ordered_fields
+        .iter()
+        .copied()
+        .filter(|fid| *fid != ROW_ID_FIELD_ID)
+        .collect();
+
+    let logical_fields: Vec<LogicalFieldId> = physical_fields
         .iter()
         .map(|&fid| LogicalFieldId::for_user(storage.table_id(), fid))
         .collect();
@@ -536,8 +572,14 @@ where
         )?;
 
         let mut arrays: NumericArrayMap = FxHashMap::default();
-        for (i, fid) in ordered_fields.iter().enumerate() {
+        for (i, fid) in physical_fields.iter().enumerate() {
             arrays.insert(*fid, batch.column(i).clone());
+        }
+
+        if has_row_id {
+            let rid_values: Vec<i64> = chunk.iter().map(|row_id| *row_id as i64).collect();
+            let rid_array: ArrayRef = Arc::new(Int64Array::from(rid_values));
+            arrays.insert(ROW_ID_FIELD_ID, rid_array);
         }
 
         let left_vals = ScalarEvaluator::evaluate_batch(left, chunk.len(), &arrays)?;
@@ -604,14 +646,8 @@ where
                     stack.push(Treemap::new());
                     continue;
                 }
-                let rows = collect_compare_domain_rows(
-                    storage,
-                    left,
-                    right,
-                    *op,
-                    fields,
-                    all_rows_cache,
-                )?;
+                let rows =
+                    collect_compare_domain_rows(storage, left, right, *op, fields, all_rows_cache)?;
                 stack.push(rows);
             }
             DomainOp::PushInListDomain {
@@ -724,14 +760,8 @@ where
         return Ok(Treemap::new());
     }
 
-    let (_, determined) = evaluate_compare_rows(
-        storage,
-        &ordered_fields,
-        &domain_rows,
-        left,
-        op,
-        right,
-    )?;
+    let (_, determined) =
+        evaluate_compare_rows(storage, &ordered_fields, &domain_rows, left, op, right)?;
     Ok(determined)
 }
 
@@ -748,13 +778,8 @@ where
     S: ScanStorage<P>,
 {
     if fields.is_empty() {
-        let (_, determined) = evaluate_constant_in_list(
-            storage,
-            expr,
-            list,
-            negated,
-            all_rows_cache,
-        )?;
+        let (_, determined) =
+            evaluate_constant_in_list(storage, expr, list, negated, all_rows_cache)?;
         return Ok(determined);
     }
 
@@ -775,14 +800,8 @@ where
         return Ok(Treemap::new());
     }
 
-    let (_, determined) = evaluate_in_list_over_rows(
-        storage,
-        &domain_rows,
-        &ordered_fields,
-        expr,
-        list,
-        negated,
-    )?;
+    let (_, determined) =
+        evaluate_in_list_over_rows(storage, &domain_rows, &ordered_fields, expr, list, negated)?;
     Ok(determined)
 }
 

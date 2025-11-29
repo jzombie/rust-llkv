@@ -8,12 +8,11 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    StringArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Int64Array, Int64Builder, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, StringArray, UInt64Array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
-use arrow_array::types::{Int32Type, Int64Type};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamOutcome {
@@ -63,7 +62,10 @@ use crate::reserved::is_information_schema_table;
 use crate::{NumericArrayMap, NumericKernels};
 
 use crate::schema_ext::CachedSchema;
-use crate::table::{ScanOrderDirection, ScanOrderSpec, ScanProjection, ScanStreamOptions, Table};
+use crate::table::{
+    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions,
+    Table,
+};
 // use llkv_scan::{ScanOrderDirection, ScanOrderSpec};
 
 use arrow::datatypes::BooleanType;
@@ -1688,8 +1690,59 @@ where
 
         let array = batch.column(0);
 
+        let order_values: ArrayRef = match order_spec.transform {
+            ScanOrderTransform::IdentityInt64 => {
+                if array.data_type() != &DataType::Int64 {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY expected INT64 column for IdentityInt64 transform".into(),
+                    ));
+                }
+                Arc::clone(array)
+            }
+            ScanOrderTransform::IdentityInt32 => {
+                if array.data_type() != &DataType::Int32 {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY expected INT32 column for IdentityInt32 transform".into(),
+                    ));
+                }
+                Arc::clone(array)
+            }
+            ScanOrderTransform::IdentityUtf8 => {
+                if array.data_type() != &DataType::Utf8 {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY expected UTF8 column for IdentityUtf8 transform".into(),
+                    ));
+                }
+                Arc::clone(array)
+            }
+            ScanOrderTransform::CastUtf8ToInteger => {
+                if array.data_type() != &DataType::Utf8 {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY CAST expects a UTF8 column".into(),
+                    ));
+                }
+                let strings = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "ORDER BY CAST failed to downcast UTF8 column".into(),
+                    )
+                })?;
+                let mut builder = Int64Builder::with_capacity(strings.len());
+                for idx in 0..strings.len() {
+                    if strings.is_null(idx) {
+                        builder.append_null();
+                    } else {
+                        match strings.value(idx).parse::<i64>() {
+                            Ok(value) => builder.append_value(value),
+                            Err(_) => builder.append_null(),
+                        }
+                    }
+                }
+                Arc::new(builder.finish()) as ArrayRef
+            }
+        };
+
         let sorted_indices = arrow::compute::sort_to_indices(
-            array,
+            &order_values,
             Some(arrow::compute::SortOptions {
                 descending: matches!(direction, ScanOrderDirection::Descending),
                 nulls_first,
