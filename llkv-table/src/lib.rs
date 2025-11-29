@@ -41,7 +41,6 @@ pub mod gather;
 pub mod metadata;
 pub mod reserved;
 pub mod resolvers;
-mod scan_engine;
 pub mod schema_ext;
 mod sys_catalog;
 pub mod view;

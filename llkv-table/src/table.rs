@@ -1,20 +1,27 @@
 use croaring::Treemap;
+use std::cmp;
 use std::fmt;
+use std::mem;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use crate::scan_engine::{TableExecutor, TablePlanner, collect_row_ids_for_table};
 use crate::stream::ColumnStream;
 use crate::stream::RowIdSource;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, UInt64Type};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use llkv_column_map::ColumnStore;
 use llkv_column_map::store::{
-    GatherNullPolicy, IndexKind, MultiGatherContext, Projection, ROW_ID_COLUMN_NAME,
+    GatherNullPolicy, IndexKind, MultiGatherContext, ROW_ID_COLUMN_NAME,
+};
+use llkv_column_map::store::scan::filter::{FilterDispatch, FilterPrimitive, Utf8Filter};
+use llkv_column_map::store::scan::ScanOptions;
+use llkv_column_map::ScanBuilder;
+use llkv_column_map::{
+    llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
 use llkv_storage::pager::{MemPager, Pager};
 use llkv_types::ids::{LogicalFieldId, TableId};
@@ -23,13 +30,21 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::ROW_ID_FIELD_ID;
 use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
-use crate::types::FieldId;
-use llkv_expr::{Expr, Filter, Operator, ScalarExpr};
+use crate::types::{FieldId, RowId};
+use llkv_compute::analysis::PredicateFusionCache;
+use llkv_compute::program::{OwnedFilter, OwnedOperator, ProgramCompiler};
+use llkv_compute::rowid::RowIdFilter as RowIdBitmapFilter;
+use llkv_expr::literal::FromLiteral;
+use llkv_expr::typed_predicate::{
+    Predicate, PredicateValue, build_bool_predicate, build_fixed_width_predicate,
+    build_var_width_predicate,
+};
+use llkv_expr::{Expr, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_scan::{
-    ScanStorage, ScanStreamOptions as SharedScanStreamOptions, execute::execute_scan,
+    ScanStorage, execute::execute_scan,
 };
-
+use rustc_hash::FxHashMap;
 pub use llkv_scan::{
     ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
 };
@@ -553,55 +568,20 @@ where
     where
         F: FnMut(RecordBatch),
     {
-        if options.order.is_none()
-            && options.row_id_filter.is_none()
-            && !crate::reserved::is_information_schema_table(self.table_id)
-        {
-            // Use shared scan executor for the simple path.
-            let shared_options = SharedScanStreamOptions {
-                include_nulls: options.include_nulls,
-                order: options.order,
-                row_id_filter: None,
-            };
-            let mut cb = on_batch;
-            execute_scan(
-                self,
-                self.table_id,
-                projections,
-                filter_expr,
-                shared_options,
-                &mut cb,
-            )?;
-            Ok(())
-        } else {
-            TablePlanner::new(self).scan_stream_with_exprs(
-                projections,
-                filter_expr,
-                options,
-                on_batch,
-            )
-        }
-    }
-
-    // TODO: Remove
-    /// Temporary bridge: accept shared scan projections/options and dispatch to the
-    /// existing scan engine. This eases migration toward `llkv-scan`.
-    pub fn scan_stream_shared<'a, F>(
-        &self,
-        projections: &[ScanProjection],
-        filter_expr: &Expr<'a, FieldId>,
-        options: SharedScanStreamOptions<P>,
-        on_batch: F,
-    ) -> LlkvResult<()>
-    where
-        F: FnMut(RecordBatch),
-    {
-        let local_options = shared_to_local_options(options);
-        self.scan_stream_with_exprs(projections, filter_expr, local_options, on_batch)
+        let shared_options = to_shared_scan_options(options);
+        let mut cb = on_batch;
+        execute_scan(
+            self,
+            self.table_id,
+            projections,
+            filter_expr,
+            shared_options,
+            &mut cb,
+        )
     }
 
     pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Treemap> {
-        let source = collect_row_ids_for_table(self, filter_expr)?;
+        let source = self.collect_row_ids_for_table(filter_expr)?;
         Ok(match source {
             RowIdSource::Bitmap(b) => b,
             RowIdSource::Vector(v) => Treemap::from_iter(v),
@@ -756,6 +736,276 @@ where
     }
 }
 
+macro_rules! impl_row_id_ignore_chunk {
+    (
+        $_base:ident,
+        $chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk(&mut self, _values: &$array_ty) {}
+    };
+}
+
+macro_rules! impl_row_id_ignore_sorted_run {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run(&mut self, _values: &$array_ty, _start: usize, _len: usize) {}
+    };
+}
+
+macro_rules! impl_row_id_collect_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(&mut self, _: &$array_ty, row_ids: &UInt64Array) {
+            self.extend_from_array(row_ids);
+        }
+    };
+}
+
+macro_rules! impl_row_id_collect_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _: &$array_ty,
+            row_ids: &UInt64Array,
+            start: usize,
+            len: usize,
+        ) {
+            self.extend_from_slice(row_ids, start, len);
+        }
+    };
+}
+
+macro_rules! impl_row_id_stream_chunk_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $chunk_with_rids:ident,
+        $_run:ident,
+        $_run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $chunk_with_rids(&mut self, _: &$array_ty, row_ids: &UInt64Array) {
+            self.extend_from_array(row_ids);
+        }
+    };
+}
+
+macro_rules! impl_row_id_stream_sorted_run_with_rids {
+    (
+        $_base:ident,
+        $_chunk:ident,
+        $_chunk_with_rids:ident,
+        $_run:ident,
+        $run_with_rids:ident,
+        $array_ty:ty,
+        $_arrow_ty:ty,
+        $_dtype:expr,
+        $_native_ty:ty,
+        $_cast:expr
+    ) => {
+        fn $run_with_rids(
+            &mut self,
+            _: &$array_ty,
+            row_ids: &UInt64Array,
+            start: usize,
+            len: usize,
+        ) {
+            self.extend_from_slice(row_ids, start, len);
+        }
+    };
+}
+
+#[derive(Default)]
+struct RowIdScanCollector {
+    row_ids: Treemap,
+}
+
+impl RowIdScanCollector {
+    fn extend_from_array(&mut self, row_ids: &UInt64Array) {
+        for idx in 0..row_ids.len() {
+            self.row_ids.add(row_ids.value(idx));
+        }
+    }
+
+    fn extend_from_slice(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = (start + len).min(row_ids.len());
+        for idx in start..end {
+            self.row_ids.add(row_ids.value(idx));
+        }
+    }
+
+    fn into_inner(self) -> Treemap {
+        self.row_ids
+    }
+}
+
+impl llkv_column_map::scan::PrimitiveVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_chunk);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_chunk);
+    llkv_for_each_arrow_string!(impl_row_id_ignore_chunk);
+}
+
+impl llkv_column_map::scan::PrimitiveSortedVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_sorted_run);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_sorted_run);
+    llkv_for_each_arrow_string!(impl_row_id_ignore_sorted_run);
+}
+
+impl llkv_column_map::scan::PrimitiveWithRowIdsVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_collect_chunk_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_collect_chunk_with_rids);
+    llkv_for_each_arrow_string!(impl_row_id_collect_chunk_with_rids);
+}
+
+impl llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdScanCollector {
+    llkv_for_each_arrow_numeric!(impl_row_id_collect_sorted_run_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_collect_sorted_run_with_rids);
+    llkv_for_each_arrow_string!(impl_row_id_collect_sorted_run_with_rids);
+
+    fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        self.extend_from_slice(row_ids, start, len);
+    }
+}
+
+struct RowIdChunkEmitter<'a> {
+    chunk_size: usize,
+    buffer: Vec<RowId>,
+    on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+    error: Option<Error>,
+}
+
+impl<'a> RowIdChunkEmitter<'a> {
+    fn new(
+        chunk_size: usize,
+        on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+    ) -> Self {
+        let chunk_size = cmp::max(1, chunk_size);
+        Self {
+            chunk_size,
+            buffer: Vec::with_capacity(chunk_size),
+            on_chunk,
+            error: None,
+        }
+    }
+
+    fn extend_from_array(&mut self, row_ids: &UInt64Array) {
+        if self.error.is_some() {
+            return;
+        }
+        for idx in 0..row_ids.len() {
+            self.push(row_ids.value(idx));
+        }
+    }
+
+    fn extend_from_slice(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        if self.error.is_some() || len == 0 {
+            return;
+        }
+        let end = (start + len).min(row_ids.len());
+        for idx in start..end {
+            self.push(row_ids.value(idx));
+        }
+    }
+
+    fn push(&mut self, value: RowId) {
+        if self.error.is_some() {
+            return;
+        }
+        self.buffer.push(value);
+        if self.buffer.len() >= self.chunk_size {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.error.is_some() || self.buffer.is_empty() {
+            return;
+        }
+        let chunk = mem::take(&mut self.buffer);
+        if let Err(err) = (self.on_chunk)(chunk) {
+            self.error = Some(err);
+        }
+    }
+
+    fn finish(mut self) -> LlkvResult<()> {
+        self.flush();
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'a> llkv_column_map::scan::PrimitiveVisitor for RowIdChunkEmitter<'a> {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_chunk);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_chunk);
+}
+
+impl<'a> llkv_column_map::scan::PrimitiveSortedVisitor for RowIdChunkEmitter<'a> {
+    llkv_for_each_arrow_numeric!(impl_row_id_ignore_sorted_run);
+    llkv_for_each_arrow_boolean!(impl_row_id_ignore_sorted_run);
+}
+
+impl<'a> llkv_column_map::scan::PrimitiveWithRowIdsVisitor for RowIdChunkEmitter<'a> {
+    llkv_for_each_arrow_numeric!(impl_row_id_stream_chunk_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_stream_chunk_with_rids);
+}
+
+impl<'a> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdChunkEmitter<'a> {
+    llkv_for_each_arrow_numeric!(impl_row_id_stream_sorted_run_with_rids);
+    llkv_for_each_arrow_boolean!(impl_row_id_stream_sorted_run_with_rids);
+
+    fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        self.extend_from_slice(row_ids, start, len);
+    }
+}
+
 impl<P> ScanStorage<P> for Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -794,9 +1044,8 @@ where
         Table::filter_row_ids(self, filter_expr)
     }
 
-    fn filter_leaf(&self, filter: &llkv_compute::program::OwnedFilter) -> LlkvResult<Treemap> {
-        let executor = TableExecutor::new(self);
-        let source = executor.collect_row_ids_for_filter(filter)?;
+    fn filter_leaf(&self, filter: &OwnedFilter) -> LlkvResult<Treemap> {
+        let source = self.collect_row_ids_for_filter(filter)?;
         Ok(match source {
             RowIdSource::Bitmap(b) => b,
             RowIdSource::Vector(v) => Treemap::from_iter(v),
@@ -806,16 +1055,14 @@ where
     fn filter_fused(
         &self,
         field_id: FieldId,
-        filters: &[llkv_compute::program::OwnedFilter],
-        cache: &llkv_compute::analysis::PredicateFusionCache,
+        filters: &[OwnedFilter],
+        cache: &PredicateFusionCache,
     ) -> LlkvResult<RowIdSource> {
-        let executor = TableExecutor::new(self);
-        executor.collect_fused_predicates(field_id, filters, cache)
+        self.collect_fused_predicates(field_id, filters, cache)
     }
 
     fn all_row_ids(&self) -> LlkvResult<Treemap> {
-        let executor = TableExecutor::new(self);
-        Ok(executor.table_row_ids()?.clone())
+        self.compute_table_row_ids()
     }
 
     fn stream_row_ids(
@@ -823,20 +1070,7 @@ where
         chunk_size: usize,
         on_chunk: &mut dyn FnMut(Vec<u64>) -> LlkvResult<()>,
     ) -> LlkvResult<()> {
-        let ids = self.filter_row_ids(&Expr::Pred(Filter {
-            field_id: ROW_ID_FIELD_ID,
-            op: Operator::Range {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-        }))?;
-        let mut buffer = Vec::new();
-        for chunk in ids.iter().collect::<Vec<_>>().chunks(chunk_size.max(1)) {
-            buffer.clear();
-            buffer.extend_from_slice(chunk);
-            on_chunk(buffer.clone())?;
-        }
-        Ok(())
+        self.stream_table_row_ids(chunk_size, on_chunk)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -844,34 +1078,395 @@ where
     }
 }
 
-fn shared_to_local_options<P>(options: SharedScanStreamOptions<P>) -> ScanStreamOptions<P>
+impl<P> Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    ScanStreamOptions {
+    fn collect_row_ids_for_table<'expr>(
+        &self,
+        filter_expr: &Expr<'expr, FieldId>,
+    ) -> LlkvResult<RowIdSource> {
+        let fusion_cache = PredicateFusionCache::from_expr(filter_expr);
+        let mut all_rows_cache: FxHashMap<FieldId, Treemap> = FxHashMap::default();
+        let filter_arc = Arc::new(filter_expr.clone());
+        let programs = ProgramCompiler::new(filter_arc).compile()?;
+        llkv_scan::predicate::collect_row_ids_for_program(
+            self,
+            &programs,
+            &fusion_cache,
+            &mut all_rows_cache,
+        )
+    }
+
+    fn collect_row_ids_for_filter(&self, filter: &OwnedFilter) -> LlkvResult<RowIdSource> {
+        if filter.field_id == ROW_ID_FIELD_ID {
+            let op = filter.op.to_operator();
+            let row_ids = self.collect_row_ids_for_rowid_filter(&op)?;
+            return Ok(RowIdSource::Bitmap(row_ids));
+        }
+
+        let filter_lfid = LogicalFieldId::for_user(self.table_id, filter.field_id);
+        let dtype = self.store.data_type(filter_lfid)?;
+
+        match &filter.op {
+            OwnedOperator::IsNotNull => {
+                let mut cache = FxHashMap::default();
+                let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                return Ok(RowIdSource::Bitmap(non_null));
+            }
+            OwnedOperator::IsNull => {
+                let all_row_ids = self.compute_table_row_ids()?;
+                if all_row_ids.is_empty() {
+                    return Ok(RowIdSource::Bitmap(Treemap::new()));
+                }
+                let mut cache = FxHashMap::default();
+                let non_null =
+                    self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                let null_ids = all_row_ids - non_null;
+                return Ok(RowIdSource::Bitmap(null_ids));
+            }
+            _ => {}
+        }
+
+        if let OwnedOperator::Range {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        } = &filter.op
+        {
+            let all_rows = self.compute_table_row_ids()?;
+            return Ok(RowIdSource::Bitmap(all_rows));
+        }
+
+        let op = filter.op.to_operator();
+        let row_ids = match &dtype {
+            DataType::Utf8 => self.collect_matching_row_ids_string::<i32>(filter_lfid, &op),
+            DataType::LargeUtf8 => self.collect_matching_row_ids_string::<i64>(filter_lfid, &op),
+            DataType::Boolean => self.collect_matching_row_ids_bool(filter_lfid, &op),
+            other => llkv_column_map::with_integer_arrow_type!(
+                other.clone(),
+                |ArrowTy| self.collect_matching_row_ids::<ArrowTy>(filter_lfid, &op),
+                Err(Error::Internal(format!(
+                    "Filtering on type {:?} is not supported",
+                    other
+                )))
+            ),
+        }?;
+
+        Ok(RowIdSource::Bitmap(row_ids))
+    }
+
+    fn collect_fused_predicates(
+        &self,
+        _field_id: FieldId,
+        filters: &[OwnedFilter],
+        _cache: &PredicateFusionCache,
+    ) -> LlkvResult<RowIdSource> {
+        let mut result: Option<Treemap> = None;
+
+        for filter in filters {
+            let rows = match self.collect_row_ids_for_filter(filter)? {
+                RowIdSource::Bitmap(b) => b,
+                RowIdSource::Vector(v) => Treemap::from_iter(v),
+            };
+
+            result = Some(match result {
+                Some(acc) => acc & rows,
+                None => rows,
+            });
+
+            if let Some(ref r) = result {
+                if r.is_empty() {
+                    return Ok(RowIdSource::Bitmap(Treemap::new()));
+                }
+            }
+        }
+
+        Ok(RowIdSource::Bitmap(result.unwrap_or_default()))
+    }
+
+    fn collect_all_row_ids_for_field(
+        &self,
+        field_id: FieldId,
+        cache: &mut FxHashMap<FieldId, Treemap>,
+    ) -> LlkvResult<Treemap> {
+        if let Some(rows) = cache.get(&field_id) {
+            return Ok(rows.clone());
+        }
+
+        let lfid = LogicalFieldId::for_user(self.table_id, field_id);
+        let mut collector = RowIdScanCollector::default();
+        ScanBuilder::new(self.store(), lfid)
+            .options(ScanOptions {
+                with_row_ids: true,
+                ..Default::default()
+            })
+            .run(&mut collector)?;
+
+        let rows = collector.into_inner();
+        cache.insert(field_id, rows.clone());
+        Ok(rows)
+    }
+
+    fn collect_matching_row_ids<T>(
+        &self,
+        lfid: LogicalFieldId,
+        op: &Operator,
+    ) -> LlkvResult<Treemap>
+    where
+        T: ArrowPrimitiveType
+            + FilterPrimitive<Native = <T as ArrowPrimitiveType>::Native>
+            + FilterDispatch<Value = <T as ArrowPrimitiveType>::Native>,
+        <T as ArrowPrimitiveType>::Native: PartialOrd + Copy + FromLiteral + PredicateValue,
+    {
+        let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
+        let row_ids =
+            <T as FilterPrimitive>::run_nullable_filter(self.store(), lfid, |v| match v {
+                Some(val) => predicate.matches(PredicateValue::borrowed(&val)),
+                None => false,
+            })
+            .map_err(Error::from)?;
+        Ok(Treemap::from_iter(row_ids))
+    }
+
+    fn collect_matching_row_ids_string<O>(
+        &self,
+        lfid: LogicalFieldId,
+        op: &Operator,
+    ) -> LlkvResult<Treemap>
+    where
+        O: OffsetSizeTrait + llkv_column_map::store::scan::StringContainsKernel,
+    {
+        let predicate = build_var_width_predicate(op).map_err(Error::predicate_build)?;
+        let row_ids = Utf8Filter::<O>::run_filter(self.store(), lfid, &predicate)
+            .map_err(Error::from)?;
+        Ok(Treemap::from_iter(row_ids))
+    }
+
+    fn collect_matching_row_ids_bool(
+        &self,
+        lfid: LogicalFieldId,
+        op: &Operator,
+    ) -> LlkvResult<Treemap> {
+        let predicate = build_bool_predicate(op).map_err(Error::predicate_build)?;
+
+        let row_ids = arrow::datatypes::BooleanType::run_nullable_filter(
+            self.store(),
+            lfid,
+            |val: Option<bool>| match val {
+                Some(v) => predicate.matches(&v),
+                None => false,
+            },
+        )
+        .map_err(Error::from)?;
+        Ok(Treemap::from_iter(row_ids))
+    }
+
+    fn collect_row_ids_for_rowid_filter(&self, op: &Operator<'_>) -> LlkvResult<Treemap> {
+        let all_row_ids = self.compute_table_row_ids()?;
+        if all_row_ids.is_empty() {
+            return Ok(Treemap::new());
+        }
+        RowIdBitmapFilter::filter_by_operator(&all_row_ids, op)
+    }
+
+    fn compute_table_row_ids(&self) -> LlkvResult<Treemap> {
+        use llkv_column_map::store::rowid_fid;
+
+        if let Some(rows) = self.collect_row_ids_from_mvcc()? {
+            return Ok(rows);
+        }
+
+        let fields = self.store.user_field_ids_for_table(self.table_id);
+        if fields.is_empty() {
+            return Ok(Treemap::new());
+        }
+
+        let expected = self.store.total_rows_for_table(self.table_id).unwrap_or_default();
+
+        if expected > 0
+            && let Some(&first_field) = fields.first()
+        {
+            let rid_shadow = rowid_fid(first_field);
+            let mut collector = RowIdScanCollector::default();
+
+            match ScanBuilder::new(self.store(), rid_shadow)
+                .options(ScanOptions {
+                    with_row_ids: true,
+                    ..Default::default()
+                })
+                .run(&mut collector)
+            {
+                Ok(_) => {
+                    let row_ids = collector.into_inner();
+                    if row_ids.cardinality() == expected {
+                        return Ok(row_ids);
+                    }
+                }
+                Err(llkv_result::Error::NotFound) => {}
+                Err(_) => {}
+            }
+        }
+
+        let mut collected = Treemap::new();
+
+        for lfid in fields.clone() {
+            let mut collector = RowIdScanCollector::default();
+            ScanBuilder::new(self.store(), lfid)
+                .options(ScanOptions {
+                    with_row_ids: true,
+                    ..Default::default()
+                })
+                .run(&mut collector)?;
+            let rows = collector.into_inner();
+            collected.or_inplace(&rows);
+
+            if expected > 0 && collected.cardinality() >= expected {
+                break;
+            }
+        }
+
+        Ok(collected)
+    }
+
+    fn collect_row_ids_from_mvcc(&self) -> LlkvResult<Option<Treemap>> {
+        let Some(rows) = self.fetch_mvcc_row_ids()? else {
+            return Ok(None);
+        };
+        Ok(Some(Treemap::from_iter(rows)))
+    }
+
+    fn stream_table_row_ids(
+        &self,
+        chunk_size: usize,
+        on_chunk: &mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+    ) -> LlkvResult<()> {
+        use llkv_column_map::store::rowid_fid;
+
+        if self.try_stream_row_ids_from_mvcc(chunk_size, on_chunk)? {
+            return Ok(());
+        }
+
+        let fields = self.store.user_field_ids_for_table(self.table_id);
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        let Some(&first_field) = fields.first() else {
+            return Ok(());
+        };
+
+        let rid_shadow = rowid_fid(first_field);
+        let mut emitter = RowIdChunkEmitter::new(chunk_size, on_chunk);
+        let scan_result = ScanBuilder::new(self.store(), rid_shadow)
+            .options(ScanOptions {
+                with_row_ids: true,
+                ..Default::default()
+            })
+            .run(&mut emitter);
+
+        match scan_result {
+            Ok(()) => emitter.finish(),
+            Err(Error::NotFound) => {
+                let _ = emitter.finish();
+                let all_rows = self.compute_table_row_ids()?;
+                if all_rows.is_empty() {
+                    return Ok(());
+                }
+
+                let chunk_cap = cmp::max(1, chunk_size);
+                let mut chunk = Vec::with_capacity(chunk_cap);
+                for row_id in all_rows.iter() {
+                    chunk.push(row_id);
+                    if chunk.len() >= chunk_cap {
+                        (on_chunk)(mem::take(&mut chunk))?;
+                    }
+                }
+                if !chunk.is_empty() {
+                    (on_chunk)(mem::take(&mut chunk))?;
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let _ = emitter.finish();
+                Err(err)
+            }
+        }
+    }
+
+    fn try_stream_row_ids_from_mvcc(
+        &self,
+        chunk_size: usize,
+        on_chunk: &mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+    ) -> LlkvResult<bool> {
+        let Some(rows) = self.fetch_mvcc_row_ids()? else {
+            return Ok(false);
+        };
+        if rows.is_empty() {
+            return Ok(true);
+        }
+
+        let chunk_cap = chunk_size.max(1);
+        let mut chunk = Vec::with_capacity(chunk_cap);
+        for row_id in rows {
+            chunk.push(row_id);
+            if chunk.len() >= chunk_cap {
+                (on_chunk)(mem::take(&mut chunk))?;
+            }
+        }
+        if !chunk.is_empty() {
+            (on_chunk)(chunk)?;
+        }
+        Ok(true)
+    }
+
+    fn fetch_mvcc_row_ids(&self) -> LlkvResult<Option<Vec<RowId>>> {
+        let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table_id);
+        match self
+            .store
+            .filter_row_ids::<UInt64Type>(created_lfid, &Predicate::All)
+        {
+            Ok(rows) => Ok(Some(rows)),
+            Err(Error::NotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+fn to_shared_scan_options<P>(options: ScanStreamOptions<P>) -> llkv_scan::ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    llkv_scan::ScanStreamOptions {
         include_nulls: options.include_nulls,
         order: options.order,
         row_id_filter: options
             .row_id_filter
-            .map(|f| std::sync::Arc::new(SharedRowIdFilterShim { inner: f }) as _),
+            .map(|inner| Arc::new(TableRowIdFilterShim { inner }) as _),
     }
 }
 
-struct SharedRowIdFilterShim<P>
+struct TableRowIdFilterShim<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    inner: std::sync::Arc<dyn llkv_scan::RowIdFilter<P>>,
+    inner: Arc<dyn RowIdFilter<P>>,
 }
 
-impl<P> RowIdFilter<P> for SharedRowIdFilterShim<P>
+impl<P> llkv_scan::RowIdFilter<P> for TableRowIdFilterShim<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> LlkvResult<Treemap> {
-        self.inner
-            .filter(table.table_id, table, row_ids)
-            .map_err(Error::from)
+    fn filter(
+        &self,
+        _table_id: TableId,
+        storage: &dyn ScanStorage<P>,
+        row_ids: Treemap,
+    ) -> LlkvResult<Treemap> {
+        let table = storage
+            .as_any()
+            .downcast_ref::<Table<P>>()
+            .ok_or_else(|| Error::Internal("RowIdFilter requires table storage".into()))?;
+        self.inner.filter(table, row_ids)
     }
 }
 
@@ -889,7 +1484,7 @@ mod tests {
     use arrow::compute::{cast, max, min, sum, unary};
     use arrow::datatypes::DataType;
     use llkv_column_map::ColumnStore;
-    use llkv_column_map::store::GatherNullPolicy;
+    use llkv_column_map::store::{GatherNullPolicy, Projection};
     use llkv_expr::{BinaryOp, CompareOp, Filter, Operator, ScalarExpr};
     use std::collections::HashMap;
     use std::ops::Bound;

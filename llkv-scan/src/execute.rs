@@ -1,11 +1,15 @@
+use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
+use croaring::Treemap;
 use llkv_compute::analysis::computed_expr_requires_numeric;
 use llkv_compute::eval::ScalarEvaluator;
-use llkv_compute::projection::infer_computed_dtype;
-use llkv_expr::Expr;
+use llkv_compute::projection::{
+    ProjectionLiteral, emit_synthetic_null_batch, infer_computed_dtype,
+};
+use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::{FieldId, LogicalFieldId};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -14,14 +18,12 @@ use crate::row_stream::{
     ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream,
     RowStreamBuilder,
 };
-use crate::{ScanProjection, ScanStorage, ScanStreamOptions};
+use crate::{ordering::sort_row_ids_with_order, ScanProjection, ScanStorage, ScanStreamOptions};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-/// Execute a table scan using the shared scan machinery. Supports basic scans
-/// without ordering or custom row-id filters; callers should handle those
-/// features separately for now.
+/// Execute a table scan using the shared scan machinery.
 pub fn execute_scan<'expr, P, S, F>(
     storage: &S,
     table_id: llkv_types::TableId,
@@ -35,25 +37,11 @@ where
     S: ScanStorage<P>,
     F: FnMut(RecordBatch),
 {
-    if options.order.is_some() || options.row_id_filter.is_some() {
-        return Err(Error::InvalidArgumentError(
-            "execute_scan does not yet support order or row_id_filter".into(),
-        ));
-    }
-
     if projections.is_empty() {
         return Err(Error::InvalidArgumentError(
             "scan requires at least one projection".into(),
         ));
     }
-
-    // Collect row ids via storage filter.
-    let row_ids = storage.filter_row_ids(filter_expr)?;
-    let row_source = if row_ids.is_empty() {
-        RowIdSource::Bitmap(row_ids)
-    } else {
-        RowIdSource::Bitmap(row_ids)
-    };
 
     // Determine projection evaluation plan and output schema.
     let mut projection_evals = Vec::with_capacity(projections.len());
@@ -151,6 +139,55 @@ where
     }
     let out_schema = Arc::new(Schema::new(schema_fields));
 
+    let ScanStreamOptions {
+        include_nulls: _,
+        order,
+        row_id_filter,
+    } = options;
+
+    let mut row_source = RowIdSource::Bitmap(storage.filter_row_ids(filter_expr)?);
+
+    if row_id_filter.is_some() || order.is_some() {
+        let mut bitmap = match row_source {
+            RowIdSource::Bitmap(b) => b,
+            RowIdSource::Vector(v) => Treemap::from_iter(v),
+        };
+
+        if let Some(filter) = row_id_filter.as_ref() {
+            bitmap = filter.filter(table_id, storage, bitmap)?;
+        }
+
+        row_source = if let Some(order_spec) = order {
+            let sorted = sort_row_ids_with_order(storage, &bitmap, order_spec)?;
+            RowIdSource::Vector(sorted)
+        } else {
+            RowIdSource::Bitmap(bitmap)
+        };
+    }
+
+    let is_empty = match &row_source {
+        RowIdSource::Bitmap(b) => b.is_empty(),
+        RowIdSource::Vector(v) => v.is_empty(),
+    };
+
+    if is_empty {
+        if row_id_filter.is_none() && is_trivial_filter(filter_expr) {
+            let total_rows = storage.total_rows()?;
+            let row_count = usize::try_from(total_rows).map_err(|_| {
+                Error::InvalidArgumentError(
+                    "table row count exceeds supported range for synthetic batch".into(),
+                )
+            })?;
+            let projection_literals = build_projection_literals(&projection_evals, &out_schema);
+            if let Some(batch) =
+                emit_synthetic_null_batch(&projection_literals, &out_schema, row_count)?
+            {
+                on_batch(batch);
+            }
+        }
+        return Ok(());
+    }
+
     let mut row_stream = RowStreamBuilder::new(
         storage,
         table_id,
@@ -177,4 +214,36 @@ where
     }
 
     Ok(())
+}
+
+fn build_projection_literals(
+    projection_evals: &[ProjectionEval],
+    out_schema: &Arc<Schema>,
+) -> Vec<ProjectionLiteral<FieldId>> {
+    projection_evals
+        .iter()
+        .enumerate()
+        .map(|(idx, eval)| match eval {
+            ProjectionEval::Column(_) => ProjectionLiteral::Column {
+                data_type: out_schema.field(idx).data_type().clone(),
+            },
+            ProjectionEval::Computed(info) => ProjectionLiteral::Computed {
+                info: info.clone(),
+                data_type: out_schema.field(idx).data_type().clone(),
+            },
+        })
+        .collect()
+}
+
+fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
+    matches!(
+        expr,
+        Expr::Pred(Filter {
+            op: Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            ..
+        })
+    )
 }
