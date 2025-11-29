@@ -22,6 +22,8 @@ pub use row_stream::{
     RowStreamBuilder, materialize_row_window,
 };
 
+pub mod execute;
+
 /// Sort direction for scan ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanOrderDirection {

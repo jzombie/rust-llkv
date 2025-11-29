@@ -2,21 +2,17 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use croaring::Treemap;
-use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_expr::Expr;
 use llkv_plan::{PlanGraph, ProgramSet};
 use llkv_result::{Error, Result as ExecutorResult};
-use llkv_table::constants::STREAM_BATCH_ROWS;
 use llkv_table::table as table_types;
+use llkv_table::table::Table as LlkvTable;
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_storage::pager::Pager;
-use llkv_scan::{
-    ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream,
-    RowStreamBuilder, ScanProjection, ScanStorage, ScanStreamOptions,
-};
-use rustc_hash::{FxHashMap, FxHashSet};
+use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
+use llkv_scan::{ScanProjection, ScanStorage, ScanStreamOptions};
 
 impl<P> ScanStorage<P> for crate::types::TableStorageAdapter<P>
 where
@@ -202,180 +198,21 @@ where
     where
         F: FnMut(RecordBatch),
     {
-        // Features still routed through llkv-table's scan_stream for correctness.
-        if options.order.is_some() || options.row_id_filter.is_some() {
-            if let Some(adapter) = self.storage.as_any().downcast_ref::<crate::types::TableStorageAdapter<P>>() {
-                let table_projections: Vec<table_types::ScanProjection> =
-                    projections.iter().map(to_table_projection).collect();
-                let table_options = to_table_options(options);
-                return adapter
-                    .table()
-                    .scan_stream_with_exprs(&table_projections, filter_expr, table_options, on_batch)
-                    .map_err(Error::from);
-            }
-            return Err(Error::InvalidArgumentError(
-                "order or row_id_filter requires table-backed storage".into(),
-            ));
-        }
+        let table = self
+            .storage
+            .as_any()
+            .downcast_ref::<LlkvTable<P>>()
+            .ok_or_else(|| {
+                Error::InvalidArgumentError(
+                    "scan executor requires table-backed storage for now".into(),
+                )
+            })?;
 
-        if projections.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "scan requires at least one projection".into(),
-            ));
-        }
-
-        // Collect row ids via storage filter.
-        let row_ids = self.storage.filter_row_ids(filter_expr)?;
-        let row_source = if row_ids.is_empty() {
-            RowIdSource::Bitmap(row_ids)
-        } else {
-            RowIdSource::Bitmap(row_ids)
-        };
-
-        // Determine projection evaluation plan and output schema.
-        let mut projection_evals = Vec::with_capacity(projections.len());
-        let mut unique_index = FxHashMap::default();
-        let mut unique_lfids = Vec::new();
-        let mut numeric_fields = FxHashSet::default();
-        let mut lfid_dtypes = FxHashMap::default();
-
-        for proj in projections {
-            match proj {
-                ScanProjection::Column(p) => {
-                    let lfid = p.logical_field_id;
-                    let dtype = self.storage.field_data_type(lfid)?;
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        unique_index.entry(lfid)
-                    {
-                        entry.insert(unique_lfids.len());
-                        unique_lfids.push(lfid);
-                    }
-                    let fallback = lfid.field_id().to_string();
-                    let output_name = p.alias.clone().unwrap_or(fallback);
-                    projection_evals.push(ProjectionEval::Column(
-                        ColumnProjectionInfo {
-                            logical_field_id: lfid,
-                            data_type: dtype,
-                            output_name,
-                        },
-                    ));
-                }
-                ScanProjection::Computed { expr, alias } => {
-                    let simplified = llkv_table::NumericKernels::simplify(expr);
-                    let mut fields_set: FxHashSet<llkv_table::types::FieldId> =
-                        FxHashSet::default();
-                    llkv_table::NumericKernels::collect_fields(&simplified, &mut fields_set);
-                    for fid in fields_set.iter().copied() {
-                        numeric_fields.insert(fid);
-                        let lfid = LogicalFieldId::for_user(self.table_id(), fid);
-                        let dtype = self.storage.field_data_type(lfid)?;
-                        lfid_dtypes.entry(lfid).or_insert_with(|| dtype.clone());
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            unique_index.entry(lfid)
-                        {
-                            entry.insert(unique_lfids.len());
-                            unique_lfids.push(lfid);
-                        }
-                    }
-                    projection_evals.push(ProjectionEval::Computed(
-                        ComputedProjectionInfo {
-                            expr: simplified,
-                            alias: alias.clone(),
-                        },
-                    ));
-                }
-            }
-        }
-
-        let passthrough_fields: Vec<Option<llkv_table::types::FieldId>> = projection_evals
-            .iter()
-            .map(|eval| match eval {
-                ProjectionEval::Computed(info) => {
-                    llkv_table::NumericKernels::passthrough_column(&info.expr)
-                }
-                _ => None,
-            })
-            .collect();
-
-        let null_policy = if options.include_nulls {
-            GatherNullPolicy::IncludeNulls
-        } else {
-            GatherNullPolicy::DropNulls
-        };
-
-        let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
-            matches!(
-                eval,
-                ProjectionEval::Computed(info)
-                if passthrough_fields[idx].is_none()
-                    && llkv_compute::analysis::computed_expr_requires_numeric(&info.expr)
-            )
-        });
-
-        let mut schema_fields: Vec<arrow::datatypes::Field> =
-            Vec::with_capacity(projection_evals.len());
-        for (idx, eval) in projection_evals.iter().enumerate() {
-            match eval {
-                ProjectionEval::Column(info) => schema_fields.push(
-                    arrow::datatypes::Field::new(
-                        info.output_name.clone(),
-                        info.data_type.clone(),
-                        true,
-                    ),
-                ),
-                ProjectionEval::Computed(info) => {
-                    if let Some(fid) = passthrough_fields[idx] {
-                        let lfid = LogicalFieldId::for_user(self.table_id(), fid);
-                        let dtype = lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {
-                            Error::Internal("missing dtype for passthrough".into())
-                        })?;
-                        schema_fields.push(arrow::datatypes::Field::new(
-                            info.alias.clone(),
-                            dtype,
-                            true,
-                        ));
-                    } else {
-                        let dtype = llkv_compute::projection::infer_computed_dtype(
-                            &info.expr,
-                            self.table_id(),
-                            &lfid_dtypes,
-                        )?;
-                        schema_fields.push(arrow::datatypes::Field::new(
-                            info.alias.clone(),
-                            dtype,
-                            true,
-                        ));
-                    }
-                }
-            }
-        }
-        let out_schema = Arc::new(arrow::datatypes::Schema::new(schema_fields));
-
-        let mut row_stream = RowStreamBuilder::new(
-            self.storage,
-            self.table_id(),
-            Arc::clone(&out_schema),
-            Arc::new(unique_lfids),
-            Arc::new(projection_evals),
-            Arc::new(passthrough_fields),
-            Arc::new(unique_index),
-            Arc::new(numeric_fields),
-            requires_numeric,
-            null_policy,
-            row_source,
-            STREAM_BATCH_ROWS,
-        )
-        .build()?;
-
-        let expected_columns = row_stream.schema().fields().len();
-        while let Some(chunk) = row_stream.next_chunk()? {
-            let batch = chunk.to_record_batch();
-            debug_assert_eq!(batch.num_columns(), expected_columns);
-            if batch.num_rows() > 0 {
-                on_batch(batch);
-            }
-        }
-
-        Ok(())
+        let table_projections: Vec<table_types::ScanProjection> =
+            projections.iter().map(to_table_projection).collect();
+        let table_options = to_table_options(options);
+        table
+            .scan_stream_with_exprs(&table_projections, filter_expr, table_options, on_batch)
+            .map_err(Error::from)
     }
 }

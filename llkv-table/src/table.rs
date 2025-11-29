@@ -24,7 +24,12 @@ use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
 use llkv_expr::{Expr, Filter, Operator, ScalarExpr};
-use llkv_scan::{ScanOrderDirection as SharedScanOrderDirection, ScanOrderSpec as SharedScanOrderSpec, ScanOrderTransform as SharedScanOrderTransform, ScanProjection as SharedScanProjection, ScanStorage, ScanStreamOptions as SharedScanStreamOptions};
+use llkv_scan::{
+    execute::execute_scan,
+    ScanOrderDirection as SharedScanOrderDirection, ScanOrderSpec as SharedScanOrderSpec,
+    ScanOrderTransform as SharedScanOrderTransform, ScanProjection as SharedScanProjection,
+    ScanStorage, ScanStreamOptions as SharedScanStreamOptions,
+};
 use llkv_result::{Error, Result as LlkvResult};
 use std::ops::Bound;
 use crate::ROW_ID_FIELD_ID;
@@ -635,7 +640,24 @@ where
     where
         F: FnMut(RecordBatch),
     {
-        TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
+        if options.order.is_none()
+            && options.row_id_filter.is_none()
+            && !crate::reserved::is_information_schema_table(self.table_id)
+        {
+            // Use shared scan executor for the simple path.
+            let shared_projections: Vec<SharedScanProjection> =
+                projections.iter().map(local_to_shared_projection).collect();
+            let shared_options = SharedScanStreamOptions {
+                include_nulls: options.include_nulls,
+                order: options.order.map(local_to_shared_order),
+                row_id_filter: None,
+            };
+            let mut cb = on_batch;
+            execute_scan(self, self.table_id, &shared_projections, filter_expr, shared_options, &mut cb)?;
+            Ok(())
+        } else {
+            TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
+        }
     }
 
     // TODO: Remove
@@ -848,7 +870,7 @@ where
     }
 
     fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<Treemap> {
-        self.filter_row_ids(filter_expr)
+        Table::filter_row_ids(self, filter_expr)
     }
 
     fn stream_row_ids(
@@ -2284,5 +2306,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(vals.into_iter().flatten().collect::<Vec<_>>(), vec![300]);
+    }
+}
+
+fn local_to_shared_projection(proj: &ScanProjection) -> SharedScanProjection {
+    match proj {
+        ScanProjection::Column(p) => SharedScanProjection::Column(p.clone()),
+        ScanProjection::Computed { expr, alias } => SharedScanProjection::Computed {
+            expr: expr.clone(),
+            alias: alias.clone(),
+        },
+    }
+}
+
+fn local_to_shared_order(order: ScanOrderSpec) -> SharedScanOrderSpec {
+    SharedScanOrderSpec {
+        field_id: order.field_id,
+        direction: match order.direction {
+            ScanOrderDirection::Ascending => SharedScanOrderDirection::Ascending,
+            ScanOrderDirection::Descending => SharedScanOrderDirection::Descending,
+        },
+        nulls_first: order.nulls_first,
+        transform: match order.transform {
+            ScanOrderTransform::IdentityInt64 => SharedScanOrderTransform::IdentityInt64,
+            ScanOrderTransform::IdentityInt32 => SharedScanOrderTransform::IdentityInt32,
+            ScanOrderTransform::IdentityUtf8 => SharedScanOrderTransform::IdentityUtf8,
+            ScanOrderTransform::CastUtf8ToInteger => SharedScanOrderTransform::CastUtf8ToInteger,
+        },
     }
 }

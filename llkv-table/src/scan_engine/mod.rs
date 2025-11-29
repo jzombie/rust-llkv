@@ -67,7 +67,11 @@ use crate::table::{
 };
 use crate::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 
-use crate::stream::{RowIdSource, RowStream, RowStreamBuilder};
+use crate::stream::RowIdSource;
+use llkv_scan::row_stream::{
+    ColumnProjectionInfo as SharedColumnProjectionInfo, ComputedProjectionInfo as SharedComputedProjectionInfo,
+    ProjectionEval as SharedProjectionEval, RowStream as SharedRowStream, RowStreamBuilder as SharedRowStreamBuilder,
+};
 use llkv_plan::{
     DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, PlanGraph, PlanGraphError,
     ProgramCompiler, ProgramSet, TableScanProjectionSpec, build_table_scan_plan,
@@ -811,6 +815,7 @@ where
 
         let unique_lfids_arc = Arc::new(unique_lfids.to_vec());
         let projection_evals_arc = Arc::new(projection_evals.to_vec());
+        let shared_projection_evals_arc = to_shared_projection_evals(&projection_evals_arc);
         let passthrough_fields_arc = Arc::new(passthrough_fields.to_vec());
         let unique_index_arc = Arc::new(unique_index.clone());
         let numeric_fields_arc = Arc::new(numeric_fields.clone());
@@ -827,18 +832,18 @@ where
                 return Ok(());
             }
 
-            let mut builder = RowStreamBuilder::new(
-                store,
+            let mut builder = SharedRowStreamBuilder::new(
+                self.table,
                 table_id,
                 Arc::clone(out_schema),
                 Arc::clone(&unique_lfids_arc),
-                Arc::clone(&projection_evals_arc),
+                Arc::clone(&shared_projection_evals_arc),
                 Arc::clone(&passthrough_fields_arc),
                 Arc::clone(&unique_index_arc),
                 Arc::clone(&numeric_fields_arc),
                 requires_numeric,
                 null_policy,
-                chunk,
+                llkv_scan::row_stream::RowIdSource::Vector(chunk),
                 STREAM_BATCH_ROWS,
             );
 
@@ -1181,25 +1186,26 @@ where
         }
 
         let table_id = self.table.table_id();
-        let store = self.table.store();
         let unique_lfids = Arc::new(unique_lfids);
         let projection_evals = Arc::new(projection_evals);
         let passthrough_fields = Arc::new(passthrough_fields);
         let unique_index = Arc::new(unique_index);
         let numeric_fields = Arc::new(numeric_fields);
 
-        let mut row_stream = RowStreamBuilder::new(
-            store,
+        let shared_projection_evals = to_shared_projection_evals(&projection_evals);
+        let shared_row_ids = to_shared_row_ids(final_row_ids);
+        let mut row_stream = SharedRowStreamBuilder::new(
+            self.table,
             table_id,
             Arc::clone(&out_schema),
             Arc::clone(&unique_lfids),
-            Arc::clone(&projection_evals),
+            Arc::clone(&shared_projection_evals),
             Arc::clone(&passthrough_fields),
             Arc::clone(&unique_index),
             Arc::clone(&numeric_fields),
             requires_numeric,
             null_policy,
-            final_row_ids,
+            shared_row_ids,
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -1829,18 +1835,20 @@ where
             Ok(())
         };
 
-        let mut row_stream = RowStreamBuilder::new(
-            store,
+        let shared_projection_evals = to_shared_projection_evals(&projection_evals_arc);
+        let shared_row_ids = llkv_scan::row_stream::RowIdSource::Vector(row_ids.iter().collect());
+        let mut row_stream = SharedRowStreamBuilder::new(
+            self.table,
             self.table.table_id(),
             Arc::clone(&out_schema),
             Arc::clone(&unique_lfids_arc),
-            Arc::clone(&projection_evals_arc),
+            Arc::clone(&shared_projection_evals),
             Arc::clone(&passthrough_fields_arc),
             Arc::clone(&unique_index_arc),
             Arc::clone(&numeric_fields_arc),
             requires_numeric,
             GatherNullPolicy::IncludeNulls,
-            row_ids.iter().collect::<Vec<_>>(),
+            shared_row_ids,
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -2043,18 +2051,19 @@ where
             Ok(())
         };
 
-        let mut row_stream = RowStreamBuilder::new(
-            store,
+        let shared_projection_evals = to_shared_projection_evals(&projection_evals_arc);
+        let mut row_stream = SharedRowStreamBuilder::new(
+            self.table,
             self.table.table_id(),
             Arc::clone(&out_schema),
             Arc::clone(&unique_lfids_arc),
-            Arc::clone(&projection_evals_arc),
+            Arc::clone(&shared_projection_evals),
             Arc::clone(&passthrough_fields_arc),
             Arc::clone(&unique_index_arc),
             Arc::clone(&numeric_fields_arc),
             requires_numeric,
             GatherNullPolicy::IncludeNulls,
-            row_ids.iter().collect::<Vec<_>>(),
+            llkv_scan::row_stream::RowIdSource::Vector(row_ids.iter().collect()),
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -2216,18 +2225,19 @@ where
             return Ok(());
         }
 
-        let mut row_stream = RowStreamBuilder::new(
-            store,
+        let shared_projection_evals = to_shared_projection_evals(&projection_evals_arc);
+        let mut row_stream = SharedRowStreamBuilder::new(
+            self.table,
             table_id,
             Arc::clone(&out_schema),
             Arc::clone(&unique_lfids_arc),
-            Arc::clone(&projection_evals_arc),
+            Arc::clone(&shared_projection_evals),
             Arc::clone(&passthrough_fields_arc),
             Arc::clone(&unique_index_arc),
             Arc::clone(&numeric_fields_arc),
             requires_numeric,
             GatherNullPolicy::IncludeNulls,
-            row_ids.iter().collect::<Vec<_>>(),
+            llkv_scan::row_stream::RowIdSource::Vector(row_ids.iter().collect()),
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -2827,18 +2837,19 @@ where
                     order.nulls_first,
                 ),
             ScanOrderTransform::IdentityUtf8 => {
-                let mut row_stream = RowStreamBuilder::new(
-                    store,
+                let shared_projection_evals = to_shared_projection_evals(&projection_evals_arc);
+                let mut row_stream = SharedRowStreamBuilder::new(
+                    self.table,
                     self.table.table_id(),
                     Arc::clone(&out_schema),
                     Arc::clone(&logical_fields_arc),
-                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&shared_projection_evals),
                     Arc::clone(&passthrough_fields_arc),
                     Arc::clone(&unique_index_arc),
                     Arc::clone(&numeric_fields_arc),
                     false,
                     GatherNullPolicy::IncludeNulls,
-                    row_ids.clone(),
+                    to_shared_row_ids(RowIdSource::Bitmap(row_ids.clone())),
                     STREAM_BATCH_ROWS,
                 )
                 .build()?;
@@ -2911,18 +2922,19 @@ where
                 Ok(indices.into_iter().map(|(_, rid)| rid).collect())
             }
             ScanOrderTransform::CastUtf8ToInteger => {
-                let mut row_stream = RowStreamBuilder::new(
-                    store,
+                let shared_projection_evals = to_shared_projection_evals(&projection_evals_arc);
+                let mut row_stream = SharedRowStreamBuilder::new(
+                    self.table,
                     self.table.table_id(),
                     Arc::clone(&out_schema),
                     Arc::clone(&logical_fields_arc),
-                    Arc::clone(&projection_evals_arc),
+                    Arc::clone(&shared_projection_evals),
                     Arc::clone(&passthrough_fields_arc),
                     Arc::clone(&unique_index_arc),
                     Arc::clone(&numeric_fields_arc),
                     false,
                     GatherNullPolicy::IncludeNulls,
-                    row_ids.clone(),
+                    to_shared_row_ids(RowIdSource::Bitmap(row_ids.clone())),
                     STREAM_BATCH_ROWS,
                 )
                 .build()?;
@@ -3015,18 +3027,18 @@ where
     where
         T: ArrowPrimitiveType,
     {
-        let mut row_stream = RowStreamBuilder::new(
-            self.table.store(),
+        let mut row_stream = SharedRowStreamBuilder::new(
+            self.table,
             self.table.table_id(),
             Arc::clone(context.out_schema),
             Arc::clone(context.logical_fields),
-            Arc::clone(context.projection_evals),
+            to_shared_projection_evals(context.projection_evals.as_ref()),
             Arc::clone(context.passthrough_fields),
             Arc::clone(context.unique_index),
             Arc::clone(context.numeric_fields),
             false,
             GatherNullPolicy::IncludeNulls,
-            row_ids.clone(),
+            to_shared_row_ids(RowIdSource::Bitmap(row_ids.clone())),
             STREAM_BATCH_ROWS,
         )
         .build()?;
@@ -3250,6 +3262,38 @@ fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
 
 fn format_expr(expr: &Expr<'_, FieldId>) -> String {
     expr.format_display()
+}
+
+fn to_shared_projection_evals(
+    evals: &[ProjectionEval],
+) -> Arc<Vec<SharedProjectionEval>> {
+    Arc::new(
+        evals
+            .iter()
+            .map(|e| match e {
+                ProjectionEval::Column(info) => {
+                    SharedProjectionEval::Column(SharedColumnProjectionInfo {
+                        logical_field_id: info.logical_field_id,
+                        data_type: info.data_type.clone(),
+                        output_name: info.output_name.clone(),
+                    })
+                }
+                ProjectionEval::Computed(info) => {
+                    SharedProjectionEval::Computed(SharedComputedProjectionInfo {
+                        expr: info.expr.clone(),
+                        alias: info.alias.clone(),
+                    })
+                }
+            })
+            .collect(),
+    )
+}
+
+fn to_shared_row_ids(row_ids: RowIdSource) -> llkv_scan::row_stream::RowIdSource {
+    match row_ids {
+        RowIdSource::Bitmap(b) => llkv_scan::row_stream::RowIdSource::Bitmap(b),
+        RowIdSource::Vector(v) => llkv_scan::row_stream::RowIdSource::Vector(v),
+    }
 }
 struct PrimitiveOrderContext<'a> {
     out_schema: &'a Arc<Schema>,
@@ -3782,176 +3826,6 @@ where
     fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
         self.extend_from_slice(row_ids, start, len);
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn materialize_row_window<P>(
-    store: &llkv_column_map::store::ColumnStore<P>,
-    table_id: TableId,
-    unique_lfids: &[LogicalFieldId],
-    projection_evals: &[ProjectionEval],
-    passthrough_fields: &[Option<FieldId>],
-    unique_index: &FxHashMap<LogicalFieldId, usize>,
-    numeric_fields: &FxHashSet<FieldId>,
-    requires_numeric: bool,
-    null_policy: GatherNullPolicy,
-    out_schema: &Arc<Schema>,
-    window: &[RowId],
-    mut gather_ctx: Option<&mut MultiGatherContext>,
-) -> LlkvResult<Option<RecordBatch>>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    if window.is_empty() {
-        return Ok(None);
-    }
-
-    let mut gathered_batch: Option<RecordBatch> = None;
-    let (batch_len, numeric_arrays) = if unique_lfids.is_empty() {
-        let numeric_arrays = if requires_numeric {
-            Some(FxHashMap::default())
-        } else {
-            None
-        };
-        (window.len(), numeric_arrays)
-    } else {
-        let batch = store.gather_row_window_with_context(
-            unique_lfids,
-            window,
-            null_policy,
-            gather_ctx.as_deref_mut(),
-        )?;
-        if batch.num_rows() == 0 {
-            return Ok(None);
-        }
-        let batch_len = batch.num_rows();
-        let numeric_arrays = if requires_numeric {
-            let mut map: NumericArrayMap = FxHashMap::default();
-            for (lfid, array) in unique_lfids.iter().zip(batch.columns().iter()) {
-                let fid = lfid.field_id();
-                if numeric_fields.contains(&fid) {
-                    map.insert(fid, array.clone());
-                }
-            }
-            Some(map)
-        } else {
-            None
-        };
-        gathered_batch = Some(batch);
-        (batch_len, numeric_arrays)
-    };
-
-    if batch_len == 0 {
-        return Ok(None);
-    }
-
-    let gathered_columns: &[ArrayRef] = if let Some(batch) = gathered_batch.as_ref() {
-        batch.columns()
-    } else {
-        &[]
-    };
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
-    for (idx, eval) in projection_evals.iter().enumerate() {
-        match eval {
-            ProjectionEval::Column(info) => {
-                let arr_idx = *unique_index
-                    .get(&info.logical_field_id)
-                    .expect("logical field id missing from index");
-                columns.push(Arc::clone(&gathered_columns[arr_idx]));
-            }
-            ProjectionEval::Computed(info) => {
-                if let Some(fid) = passthrough_fields[idx] {
-                    let lfid = LogicalFieldId::for_user(table_id, fid);
-                    let arr_idx = *unique_index
-                        .get(&lfid)
-                        .expect("passthrough field missing from index");
-                    columns.push(Arc::clone(&gathered_columns[arr_idx]));
-                    continue;
-                }
-
-                let array: ArrayRef = match &info.expr {
-                    ScalarExpr::Literal(_) => synthesize_computed_literal_array(
-                        info,
-                        out_schema.field(idx).data_type(),
-                        batch_len,
-                    )?,
-                    ScalarExpr::Cast { .. } if !computed_expr_requires_numeric(&info.expr) => {
-                        synthesize_computed_literal_array(
-                            info,
-                            out_schema.field(idx).data_type(),
-                            batch_len,
-                        )?
-                    }
-                    ScalarExpr::GetField { base, field_name } => {
-                        fn eval_get_field(
-                            expr: &ScalarExpr<FieldId>,
-                            field_name: &str,
-                            gathered_columns: &[ArrayRef],
-                            unique_index: &FxHashMap<LogicalFieldId, usize>,
-                            table_id: TableId,
-                        ) -> LlkvResult<ArrayRef> {
-                            let base_array = match expr {
-                                ScalarExpr::Column(fid) => {
-                                    let lfid = LogicalFieldId::for_user(table_id, *fid);
-                                    let arr_idx = *unique_index.get(&lfid).ok_or_else(|| {
-                                        Error::Internal("field missing from unique arrays".into())
-                                    })?;
-                                    Arc::clone(&gathered_columns[arr_idx])
-                                }
-                                ScalarExpr::GetField {
-                                    base: inner_base,
-                                    field_name: inner_field,
-                                } => eval_get_field(
-                                    inner_base,
-                                    inner_field,
-                                    gathered_columns,
-                                    unique_index,
-                                    table_id,
-                                )?,
-                                _ => {
-                                    return Err(Error::InvalidArgumentError(
-                                        "GetField base must be a column or another GetField".into(),
-                                    ));
-                                }
-                            };
-
-                            let struct_array = base_array
-                                .as_any()
-                                .downcast_ref::<arrow::array::StructArray>()
-                                .ok_or_else(|| {
-                                    Error::InvalidArgumentError(
-                                        "GetField can only be applied to struct types".into(),
-                                    )
-                                })?;
-
-                            struct_array
-                                .column_by_name(field_name)
-                                .ok_or_else(|| {
-                                    Error::InvalidArgumentError(format!(
-                                        "Field '{}' not found in struct",
-                                        field_name
-                                    ))
-                                })
-                                .map(Arc::clone)
-                        }
-
-                        eval_get_field(base, field_name, gathered_columns, unique_index, table_id)?
-                    }
-                    _ => {
-                        let numeric_arrays = numeric_arrays
-                            .as_ref()
-                            .expect("numeric arrays should exist for computed projection");
-                        NumericKernels::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
-                    }
-                };
-                columns.push(array);
-            }
-        }
-    }
-
-    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns)?;
-    Ok(Some(batch))
 }
 
 fn build_projection_literals(
