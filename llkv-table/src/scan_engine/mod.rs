@@ -8,8 +8,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int64Array, Int64Builder, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StringArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    UInt64Array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
@@ -83,6 +83,7 @@ use llkv_scan::row_stream::{
     ComputedProjectionInfo as SharedComputedProjectionInfo, ProjectionEval as SharedProjectionEval,
     RowStream as SharedRowStream, RowStreamBuilder as SharedRowStreamBuilder,
 };
+use llkv_scan::sort_row_ids_with_order;
 
 // NOTE: Planning and execution currently live together; once the dedicated
 // executor crate stabilizes we can migrate these components into `llkv-plan`.
@@ -1146,7 +1147,7 @@ where
             );
 
             if let Some(order_spec) = options.order {
-                let sorted = self.sort_row_ids_with_order(&filtered, order_spec)?;
+                let sorted = sort_row_ids_with_order(self.table, &filtered, order_spec)?;
                 RowIdSource::Vector(sorted)
             } else {
                 RowIdSource::Bitmap(filtered)
@@ -1156,7 +1157,7 @@ where
                 RowIdSource::Bitmap(b) => b,
                 RowIdSource::Vector(v) => Treemap::from_iter(v),
             };
-            let sorted = self.sort_row_ids_with_order(&bitmap, order_spec)?;
+            let sorted = sort_row_ids_with_order(self.table, &bitmap, order_spec)?;
             RowIdSource::Vector(sorted)
         } else {
             row_ids_source
@@ -1662,101 +1663,6 @@ where
         }
 
         Ok(RowIdSource::Bitmap(result.unwrap_or_default()))
-    }
-
-    fn sort_row_ids_with_order(
-        &self,
-        row_ids: &Treemap,
-        order_spec: ScanOrderSpec,
-    ) -> LlkvResult<Vec<RowId>> {
-        let lfid = LogicalFieldId::for_user(self.table.table_id(), order_spec.field_id);
-        let direction = order_spec.direction;
-        let nulls_first = order_spec.nulls_first;
-
-        let _dtype = self.table.store().data_type(lfid)?;
-
-        let row_ids_vec: Vec<u64> = row_ids.iter().collect();
-        if row_ids_vec.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let mut ctx = self.table.store().prepare_gather_context(&[lfid])?;
-        let batch = self.table.store().gather_row_window_with_context(
-            &[lfid],
-            &row_ids_vec,
-            GatherNullPolicy::IncludeNulls,
-            Some(&mut ctx),
-        )?;
-
-        let array = batch.column(0);
-
-        let order_values: ArrayRef = match order_spec.transform {
-            ScanOrderTransform::IdentityInt64 => {
-                if array.data_type() != &DataType::Int64 {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY expected INT64 column for IdentityInt64 transform".into(),
-                    ));
-                }
-                Arc::clone(array)
-            }
-            ScanOrderTransform::IdentityInt32 => {
-                if array.data_type() != &DataType::Int32 {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY expected INT32 column for IdentityInt32 transform".into(),
-                    ));
-                }
-                Arc::clone(array)
-            }
-            ScanOrderTransform::IdentityUtf8 => {
-                if array.data_type() != &DataType::Utf8 {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY expected UTF8 column for IdentityUtf8 transform".into(),
-                    ));
-                }
-                Arc::clone(array)
-            }
-            ScanOrderTransform::CastUtf8ToInteger => {
-                if array.data_type() != &DataType::Utf8 {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY CAST expects a UTF8 column".into(),
-                    ));
-                }
-                let strings = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "ORDER BY CAST failed to downcast UTF8 column".into(),
-                    )
-                })?;
-                let mut builder = Int64Builder::with_capacity(strings.len());
-                for idx in 0..strings.len() {
-                    if strings.is_null(idx) {
-                        builder.append_null();
-                    } else {
-                        match strings.value(idx).parse::<i64>() {
-                            Ok(value) => builder.append_value(value),
-                            Err(_) => builder.append_null(),
-                        }
-                    }
-                }
-                Arc::new(builder.finish()) as ArrayRef
-            }
-        };
-
-        let sorted_indices = arrow::compute::sort_to_indices(
-            &order_values,
-            Some(arrow::compute::SortOptions {
-                descending: matches!(direction, ScanOrderDirection::Descending),
-                nulls_first,
-            }),
-            None,
-        )?;
-
-        let sorted_row_ids: Vec<RowId> = sorted_indices
-            .values()
-            .iter()
-            .map(|&idx| row_ids_vec[idx as usize])
-            .collect();
-
-        Ok(sorted_row_ids)
     }
 
     fn evaluate_constant_in_list(

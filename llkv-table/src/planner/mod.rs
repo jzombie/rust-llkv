@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    StringArray, UInt64Array,
+    UInt64Array,
 };
 use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, IntervalUnit, Schema};
@@ -74,6 +74,7 @@ use llkv_plan::{
     PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode, PlanNodeId, PlanOperator,
     ProgramCompiler, ProgramSet, normalize_predicate,
 };
+use llkv_scan::sort_row_ids_with_order;
 
 // NOTE: Planning and execution currently live together; once the dedicated
 // executor crate stabilizes we can migrate these components into `llkv-plan`.
@@ -1326,7 +1327,7 @@ where
             );
 
             if let Some(order_spec) = options.order {
-                let sorted = self.sort_row_ids_with_order(&filtered, order_spec)?;
+                let sorted = sort_row_ids_with_order(self.table, &filtered, order_spec)?;
                 RowIdSource::Vector(sorted)
             } else {
                 RowIdSource::Bitmap(filtered)
@@ -1336,7 +1337,7 @@ where
                 RowIdSource::Bitmap(b) => b,
                 RowIdSource::Vector(v) => Treemap::from_iter(v),
             };
-            let sorted = self.sort_row_ids_with_order(&bitmap, order_spec)?;
+            let sorted = sort_row_ids_with_order(self.table, &bitmap, order_spec)?;
             RowIdSource::Vector(sorted)
         } else {
             row_ids_source

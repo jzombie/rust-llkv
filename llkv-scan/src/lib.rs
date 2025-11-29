@@ -24,6 +24,8 @@ pub use row_stream::{
 
 pub mod execute;
 pub mod predicate;
+pub mod ordering;
+pub use ordering::sort_row_ids_with_order;
 
 /// Sort direction for scan ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +84,12 @@ impl From<Projection> for ScanProjection {
 impl From<&Projection> for ScanProjection {
     fn from(value: &Projection) -> Self {
         ScanProjection::Column(value.clone())
+    }
+}
+
+impl From<&ScanProjection> for ScanProjection {
+    fn from(value: &ScanProjection) -> Self {
+        value.clone()
     }
 }
 

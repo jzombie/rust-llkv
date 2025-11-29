@@ -27,9 +27,11 @@ use crate::types::FieldId;
 use llkv_expr::{Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_scan::{
-    ScanOrderDirection as SharedScanOrderDirection, ScanOrderSpec as SharedScanOrderSpec,
-    ScanOrderTransform as SharedScanOrderTransform, ScanProjection as SharedScanProjection,
     ScanStorage, ScanStreamOptions as SharedScanStreamOptions, execute::execute_scan,
+};
+
+pub use llkv_scan::{
+    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
 };
 use std::ops::Bound;
 
@@ -142,94 +144,6 @@ where
             order: None,
             row_id_filter: None,
         }
-    }
-}
-
-/// Specification for ordering scan results.
-///
-/// Defines how to sort rows based on a single column's values.
-#[derive(Clone, Copy, Debug)]
-pub struct ScanOrderSpec {
-    /// The field to sort by.
-    pub field_id: FieldId,
-    /// Sort direction (ascending or descending).
-    pub direction: ScanOrderDirection,
-    /// Whether null values appear first or last.
-    pub nulls_first: bool,
-    /// Optional transformation to apply before sorting.
-    pub transform: ScanOrderTransform,
-}
-
-/// Sort direction for scan ordering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanOrderDirection {
-    /// Sort from smallest to largest.
-    Ascending,
-    /// Sort from largest to smallest.
-    Descending,
-}
-
-/// Value transformation to apply before sorting.
-///
-/// Used to enable sorting on columns that need type coercion or conversion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanOrderTransform {
-    /// Sort 64-bit integers as-is.
-    IdentityInt64,
-    /// Sort 32-bit integers as-is.
-    IdentityInt32,
-    /// Sort strings lexicographically.
-    IdentityUtf8,
-    /// Parse strings as integers, then sort numerically.
-    CastUtf8ToInteger,
-}
-
-/// A column or computed expression to include in scan results.
-///
-/// Scans can project either stored columns or expressions computed from them.
-#[derive(Clone, Debug)]
-pub enum ScanProjection {
-    /// Project a stored column directly.
-    Column(Projection),
-    /// Compute a value from an expression and return it with an alias.
-    Computed {
-        /// The expression to evaluate (can reference column field IDs).
-        expr: ScalarExpr<FieldId>,
-        /// The name to give the computed column in results.
-        alias: String,
-    },
-}
-
-impl ScanProjection {
-    /// Create a projection for a stored column.
-    pub fn column<P: Into<Projection>>(proj: P) -> Self {
-        Self::Column(proj.into())
-    }
-
-    /// Create a projection for a computed expression.
-    pub fn computed<S: Into<String>>(expr: ScalarExpr<FieldId>, alias: S) -> Self {
-        Self::Computed {
-            expr,
-            alias: alias.into(),
-        }
-    }
-}
-
-impl From<Projection> for ScanProjection {
-    fn from(value: Projection) -> Self {
-        ScanProjection::Column(value)
-    }
-}
-
-impl From<&Projection> for ScanProjection {
-    fn from(value: &Projection) -> Self {
-        ScanProjection::Column(value.clone())
-    }
-}
-
-impl From<&ScanProjection> for ScanProjection {
-    fn from(value: &ScanProjection) -> Self {
-        value.clone()
     }
 }
 
@@ -644,18 +558,16 @@ where
             && !crate::reserved::is_information_schema_table(self.table_id)
         {
             // Use shared scan executor for the simple path.
-            let shared_projections: Vec<SharedScanProjection> =
-                projections.iter().map(local_to_shared_projection).collect();
             let shared_options = SharedScanStreamOptions {
                 include_nulls: options.include_nulls,
-                order: options.order.map(local_to_shared_order),
+                order: options.order,
                 row_id_filter: None,
             };
             let mut cb = on_batch;
             execute_scan(
                 self,
                 self.table_id,
-                &shared_projections,
+                projections,
                 filter_expr,
                 shared_options,
                 &mut cb,
@@ -676,7 +588,7 @@ where
     /// existing scan engine. This eases migration toward `llkv-scan`.
     pub fn scan_stream_shared<'a, F>(
         &self,
-        projections: &[SharedScanProjection],
+        projections: &[ScanProjection],
         filter_expr: &Expr<'a, FieldId>,
         options: SharedScanStreamOptions<P>,
         on_batch: F,
@@ -684,10 +596,8 @@ where
     where
         F: FnMut(RecordBatch),
     {
-        let local_projections: Vec<ScanProjection> =
-            projections.iter().map(shared_to_local_projection).collect();
         let local_options = shared_to_local_options(options);
-        self.scan_stream_with_exprs(&local_projections, filter_expr, local_options, on_batch)
+        self.scan_stream_with_exprs(projections, filter_expr, local_options, on_batch)
     }
 
     pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Treemap> {
@@ -934,40 +844,13 @@ where
     }
 }
 
-fn shared_to_local_projection(proj: &SharedScanProjection) -> ScanProjection {
-    match proj {
-        SharedScanProjection::Column(p) => ScanProjection::Column(p.clone()),
-        SharedScanProjection::Computed { expr, alias } => ScanProjection::Computed {
-            expr: expr.clone(),
-            alias: alias.clone(),
-        },
-    }
-}
-
-fn shared_to_local_order(order: SharedScanOrderSpec) -> ScanOrderSpec {
-    ScanOrderSpec {
-        field_id: order.field_id,
-        direction: match order.direction {
-            SharedScanOrderDirection::Ascending => ScanOrderDirection::Ascending,
-            SharedScanOrderDirection::Descending => ScanOrderDirection::Descending,
-        },
-        nulls_first: order.nulls_first,
-        transform: match order.transform {
-            SharedScanOrderTransform::IdentityInt64 => ScanOrderTransform::IdentityInt64,
-            SharedScanOrderTransform::IdentityInt32 => ScanOrderTransform::IdentityInt32,
-            SharedScanOrderTransform::IdentityUtf8 => ScanOrderTransform::IdentityUtf8,
-            SharedScanOrderTransform::CastUtf8ToInteger => ScanOrderTransform::CastUtf8ToInteger,
-        },
-    }
-}
-
 fn shared_to_local_options<P>(options: SharedScanStreamOptions<P>) -> ScanStreamOptions<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     ScanStreamOptions {
         include_nulls: options.include_nulls,
-        order: options.order.map(shared_to_local_order),
+        order: options.order,
         row_id_filter: options
             .row_id_filter
             .map(|f| std::sync::Arc::new(SharedRowIdFilterShim { inner: f }) as _),
@@ -2341,32 +2224,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(vals.into_iter().flatten().collect::<Vec<_>>(), vec![300]);
-    }
-}
-
-fn local_to_shared_projection(proj: &ScanProjection) -> SharedScanProjection {
-    match proj {
-        ScanProjection::Column(p) => SharedScanProjection::Column(p.clone()),
-        ScanProjection::Computed { expr, alias } => SharedScanProjection::Computed {
-            expr: expr.clone(),
-            alias: alias.clone(),
-        },
-    }
-}
-
-fn local_to_shared_order(order: ScanOrderSpec) -> SharedScanOrderSpec {
-    SharedScanOrderSpec {
-        field_id: order.field_id,
-        direction: match order.direction {
-            ScanOrderDirection::Ascending => SharedScanOrderDirection::Ascending,
-            ScanOrderDirection::Descending => SharedScanOrderDirection::Descending,
-        },
-        nulls_first: order.nulls_first,
-        transform: match order.transform {
-            ScanOrderTransform::IdentityInt64 => SharedScanOrderTransform::IdentityInt64,
-            ScanOrderTransform::IdentityInt32 => SharedScanOrderTransform::IdentityInt32,
-            ScanOrderTransform::IdentityUtf8 => SharedScanOrderTransform::IdentityUtf8,
-            ScanOrderTransform::CastUtf8ToInteger => SharedScanOrderTransform::CastUtf8ToInteger,
-        },
     }
 }
