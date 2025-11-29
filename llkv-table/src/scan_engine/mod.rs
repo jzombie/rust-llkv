@@ -11,7 +11,6 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Int64Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
     UInt64Array,
 };
-use arrow::compute;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,25 +29,22 @@ impl StreamOutcome {
 use llkv_column_map::ScanBuilder;
 use llkv_column_map::scan::{FilterRun, dense_row_runs};
 use llkv_column_map::store::scan::ScanOptions;
-use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
+use llkv_column_map::store::GatherNullPolicy;
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
-use llkv_compute::analysis::{
-    PredicateFusionCache, computed_expr_requires_numeric, scalar_expr_contains_coalesce,
-};
+use llkv_compute::analysis::{PredicateFusionCache, computed_expr_requires_numeric};
 use llkv_compute::eval::ScalarExprTypeExt;
 use llkv_compute::projection::{
     ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch,
-    synthesize_computed_literal_array,
 };
 use llkv_compute::scalar::interval::compare_interval_values;
-use llkv_compute::{RowIdFilter, sort_row_ids_by_primitive};
+use llkv_compute::RowIdFilter;
 use llkv_expr::literal::{FromLiteral, Literal};
 use llkv_expr::typed_predicate::{
     PredicateValue, build_bool_predicate, build_fixed_width_predicate, build_var_width_predicate,
 };
-use llkv_expr::{BinaryOp, CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::decimal::DecimalValue;
 use llkv_types::{LogicalFieldId, LogicalStorageNamespace};
@@ -62,10 +58,7 @@ use crate::reserved::is_information_schema_table;
 use crate::{NumericArrayMap, NumericKernels};
 
 use crate::schema_ext::CachedSchema;
-use crate::table::{
-    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection, ScanStreamOptions,
-    Table,
-};
+use crate::table::{ScanProjection, ScanStreamOptions, Table};
 // use llkv_scan::{ScanOrderDirection, ScanOrderSpec};
 
 use arrow::datatypes::BooleanType;
@@ -1734,223 +1727,6 @@ where
         Ok(if negated { !is_null } else { is_null })
     }
 
-    // TODO: Can Rayon be used internally?
-    fn evaluate_in_list_over_rows(
-        &self,
-        row_ids: &Treemap,
-        fields: &[FieldId],
-        expr: &ScalarExpr<FieldId>,
-        list: &[ScalarExpr<FieldId>],
-        negated: bool,
-    ) -> LlkvResult<(Treemap, Treemap)> {
-        if row_ids.is_empty() {
-            return Ok((Treemap::new(), Treemap::new()));
-        }
-
-        let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
-        let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
-
-        let table_id = self.table.table_id();
-        let store = self.table.store();
-
-        let physical_fields: Vec<FieldId> = fields
-            .iter()
-            .copied()
-            .filter(|fid| *fid != ROW_ID_FIELD_ID)
-            .collect();
-
-        let schema = self.table.schema()?;
-        let cached_schema = CachedSchema::new(Arc::clone(&schema));
-
-        let mut projection_evals: Vec<ProjectionEval> = Vec::with_capacity(physical_fields.len());
-        let mut output_fields: Vec<Field> = Vec::with_capacity(physical_fields.len());
-        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
-
-        for (idx, field_id) in physical_fields.iter().copied().enumerate() {
-            let schema_idx = cached_schema.index_of_field_id(field_id).ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "field_id {} missing from table schema",
-                    field_id
-                ))
-            })?;
-            let field = schema.field(schema_idx).clone();
-            let lfid = LogicalFieldId::for_user(table_id, field_id);
-            projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
-                logical_field_id: lfid,
-                data_type: field.data_type().clone(),
-                output_name: field.name().to_string(),
-            }));
-            output_fields.push(field);
-            unique_index.insert(lfid, idx);
-        }
-
-        let logical_fields: Vec<LogicalFieldId> = physical_fields
-            .iter()
-            .map(|&fid| LogicalFieldId::for_user(table_id, fid))
-            .collect();
-        let logical_fields_for_arrays = logical_fields.clone();
-
-        let requires_numeric = !numeric_fields.is_empty();
-        let numeric_fields_arc = Arc::new(numeric_fields);
-
-        let out_schema = Arc::new(Schema::new(output_fields));
-        let unique_lfids_arc = Arc::new(logical_fields.clone());
-        let projection_evals_arc = Arc::new(projection_evals);
-        let passthrough_fields_arc = Arc::new(vec![None; projection_evals_arc.len()]);
-        let unique_index_arc = Arc::new(unique_index);
-
-        let mut matched_rows = Treemap::new();
-        let mut determined_rows = Treemap::new();
-
-        let mut process_chunk = |window: &[RowId], columns: &[ArrayRef]| -> LlkvResult<()> {
-            if window.is_empty() {
-                return Ok(());
-            }
-
-            let mut numeric_arrays: NumericArrayMap = FxHashMap::default();
-            if !columns.is_empty() {
-                for (lfid, array) in logical_fields_for_arrays.iter().zip(columns.iter()) {
-                    let fid = lfid.field_id();
-                    if numeric_fields_arc.contains(&fid) {
-                        numeric_arrays.insert(fid, array.clone());
-                    }
-                }
-            }
-
-            if has_row_id {
-                let rid_values: Vec<i64> = window.iter().map(|rid| *rid as i64).collect();
-                let array = Int64Array::from(rid_values);
-                numeric_arrays.insert(ROW_ID_FIELD_ID, Arc::new(array));
-            }
-
-            let len = window.len();
-            let mut target_array = NumericKernels::evaluate_batch(expr, len, &numeric_arrays)?;
-
-            let mut acc: Option<BooleanArray> = None;
-
-            for value_expr in list {
-                let value_array = NumericKernels::evaluate_batch(value_expr, len, &numeric_arrays)?;
-
-                // Coerce types and update target_array if promoted.
-                let (new_target, new_value) = llkv_compute::kernels::coerce_types(
-                    &target_array,
-                    &value_array,
-                    BinaryOp::Add,
-                )?;
-                target_array = new_target;
-
-                let cmp_array = compute::kernels::cmp::eq(&new_value, &target_array)?;
-
-                match acc {
-                    None => acc = Some(cmp_array),
-                    Some(prev) => acc = Some(compute::or_kleene(&prev, &cmp_array)?),
-                }
-            }
-
-            let mut final_bool = match acc {
-                Some(a) => a,
-                None => {
-                    let mut builder = arrow::array::BooleanBuilder::with_capacity(len);
-                    for _ in 0..len {
-                        builder.append_value(false);
-                    }
-                    builder.finish()
-                }
-            };
-
-            if negated {
-                final_bool = compute::not(&final_bool)?;
-            }
-
-            for (i, &row_id) in window.iter().enumerate() {
-                if final_bool.is_null(i) {
-                    continue;
-                }
-                if final_bool.value(i) {
-                    matched_rows.add(row_id);
-                    determined_rows.add(row_id);
-                } else {
-                    determined_rows.add(row_id);
-                }
-            }
-
-            Ok(())
-        };
-
-        let shared_projection_evals = to_shared_projection_evals(&projection_evals_arc);
-        let shared_row_ids = llkv_scan::row_stream::RowIdSource::Vector(row_ids.iter().collect());
-        let mut row_stream = SharedRowStreamBuilder::new(
-            self.table,
-            self.table.table_id(),
-            Arc::clone(&out_schema),
-            Arc::clone(&unique_lfids_arc),
-            Arc::clone(&shared_projection_evals),
-            Arc::clone(&passthrough_fields_arc),
-            Arc::clone(&unique_index_arc),
-            Arc::clone(&numeric_fields_arc),
-            requires_numeric,
-            GatherNullPolicy::IncludeNulls,
-            shared_row_ids,
-            STREAM_BATCH_ROWS,
-        )
-        .build()?;
-
-        while let Some(chunk) = row_stream.next_chunk()? {
-            let window = chunk.row_ids.values();
-            let batch = chunk.to_record_batch();
-            process_chunk(window, batch.columns())?;
-        }
-
-        Ok((matched_rows, determined_rows))
-    }
-
-    fn collect_row_ids_for_in_list(
-        &self,
-        expr: &ScalarExpr<FieldId>,
-        list: &[ScalarExpr<FieldId>],
-        negated: bool,
-        all_rows_cache: &mut FxHashMap<FieldId, Treemap>,
-    ) -> LlkvResult<Treemap> {
-        let mut fields = FxHashSet::default();
-        NumericKernels::collect_fields(expr, &mut fields);
-        for value in list {
-            NumericKernels::collect_fields(value, &mut fields);
-        }
-
-        if fields.is_empty() {
-            let (matched, _) =
-                self.evaluate_constant_in_list(expr, list, negated, all_rows_cache)?;
-            return Ok(matched);
-        }
-
-        // Build domain from all referenced fields
-        let mut domain: Option<Treemap> = None;
-        let mut ordered_fields: Vec<FieldId> = fields.iter().cloned().collect();
-        ordered_fields.sort_unstable();
-        ordered_fields.dedup();
-        for fid in &ordered_fields {
-            let rows = self.collect_all_row_ids_for_field(*fid, all_rows_cache)?;
-            domain = Some(match domain {
-                Some(existing) => existing & rows,
-                None => rows,
-            });
-            if let Some(ref d) = domain
-                && d.is_empty()
-            {
-                return Ok(Treemap::new());
-            }
-        }
-
-        let domain_rows = domain.unwrap_or_default();
-        if domain_rows.is_empty() {
-            return Ok(Treemap::new());
-        }
-
-        let (matched, _) =
-            self.evaluate_in_list_over_rows(&domain_rows, &ordered_fields, expr, list, negated)?;
-        Ok(matched)
-    }
-
     fn collect_row_ids_for_is_null(
         &self,
         expr: &ScalarExpr<FieldId>,
@@ -2006,12 +1782,12 @@ where
             return Ok(Treemap::new());
         }
 
-        // Follow the exact same pattern as evaluate_in_list_over_rows
+        // Mirrors llkv_scan::predicate::evaluate_in_list_over_rows until the scan engine
+        // migrates fully to the shared predicate path
         let mut numeric_fields: FxHashSet<FieldId> = fields.iter().copied().collect();
         let has_row_id = numeric_fields.remove(&ROW_ID_FIELD_ID);
 
         let table_id = self.table.table_id();
-        let store = self.table.store();
 
         let physical_fields: Vec<FieldId> = fields
             .iter()
