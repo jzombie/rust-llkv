@@ -1,6 +1,7 @@
+use crate::eval::ScalarExprTypeExt;
 use arrow::datatypes::DataType;
-use llkv_expr::ScalarExpr;
 use llkv_expr::literal::Literal;
+use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use rustc_hash::FxHashMap;
@@ -199,5 +200,76 @@ pub fn get_field_dtype(
         Err(Error::InvalidArgumentError(
             "GetField can only be applied to struct types".into(),
         ))
+    }
+}
+
+/// Infer the result type for a scalar expression given table-level field dtypes.
+pub fn computed_expr_result_type(
+    expr: &ScalarExpr<FieldId>,
+    table_id: TableId,
+    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
+) -> LlkvResult<Option<DataType>> {
+    let mut resolver = |fid: FieldId| {
+        let lfid = LogicalFieldId::for_user(table_id, fid);
+        lfid_dtypes.get(&lfid).cloned()
+    };
+    Ok(expr.infer_result_type(&mut resolver))
+}
+
+#[derive(Default, Clone, Copy)]
+struct FieldPredicateStats {
+    total: usize,
+    contains: usize,
+}
+
+/// Lightweight cache used to decide when to fuse predicates for a field.
+#[derive(Default)]
+pub struct PredicateFusionCache {
+    per_field: FxHashMap<FieldId, FieldPredicateStats>,
+}
+
+impl PredicateFusionCache {
+    pub fn from_expr(expr: &Expr<'_, FieldId>) -> Self {
+        let mut cache = Self::default();
+        cache.record_expr(expr);
+        cache
+    }
+
+    fn record_expr(&mut self, expr: &Expr<'_, FieldId>) {
+        let mut stack = vec![expr];
+
+        while let Some(node) = stack.pop() {
+            match node {
+                Expr::Pred(filter) => {
+                    let entry = self.per_field.entry(filter.field_id).or_default();
+                    entry.total += 1;
+                    if matches!(filter.op, llkv_expr::Operator::Contains { .. }) {
+                        entry.contains += 1;
+                    }
+                }
+                Expr::And(children) | Expr::Or(children) => {
+                    for child in children {
+                        stack.push(child);
+                    }
+                }
+                Expr::Not(inner) => stack.push(inner),
+                Expr::Compare { .. }
+                | Expr::InList { .. }
+                | Expr::IsNull { .. }
+                | Expr::Literal(_)
+                | Expr::Exists(_) => {}
+            }
+        }
+    }
+
+    pub fn should_fuse(&self, field_id: FieldId, dtype: &DataType) -> bool {
+        let Some(stats) = self.per_field.get(&field_id) else {
+            return false;
+        };
+
+        match dtype {
+            DataType::Utf8 | DataType::LargeUtf8 => stats.contains >= 1 && stats.total >= 2,
+            _ => stats.total >= 2,
+        }
     }
 }

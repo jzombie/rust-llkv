@@ -35,8 +35,8 @@ use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
 use llkv_compute::analysis::{
-    computed_expr_prefers_float, computed_expr_requires_numeric, get_field_dtype,
-    scalar_expr_contains_coalesce,
+    PredicateFusionCache, computed_expr_prefers_float, computed_expr_requires_numeric,
+    computed_expr_result_type, get_field_dtype, scalar_expr_contains_coalesce,
 };
 use llkv_compute::eval::ScalarExprTypeExt;
 use llkv_compute::projection::{
@@ -504,67 +504,6 @@ where
     options: ScanStreamOptions<P>,
     plan_graph: PlanGraph,
     programs: ProgramSet<'expr>,
-}
-
-#[derive(Default, Clone, Copy)]
-struct FieldPredicateStats {
-    total: usize,
-    contains: usize,
-}
-
-#[derive(Default)]
-struct PredicateFusionCache {
-    per_field: FxHashMap<FieldId, FieldPredicateStats>,
-}
-
-impl PredicateFusionCache {
-    fn from_expr(expr: &Expr<'_, FieldId>) -> Self {
-        let mut cache = Self::default();
-        cache.record_expr(expr);
-        cache
-    }
-
-    fn record_expr(&mut self, expr: &Expr<'_, FieldId>) {
-        // Iterative traversal using work stack pattern.
-        // See llkv-plan::traversal module documentation for pattern details.
-        //
-        // This avoids stack overflow on deeply nested expressions (50k+ nodes).
-        let mut stack = vec![expr];
-
-        while let Some(node) = stack.pop() {
-            match node {
-                Expr::Pred(filter) => {
-                    let entry = self.per_field.entry(filter.field_id).or_default();
-                    entry.total += 1;
-                    if matches!(filter.op, Operator::Contains { .. }) {
-                        entry.contains += 1;
-                    }
-                }
-                Expr::And(children) | Expr::Or(children) => {
-                    for child in children {
-                        stack.push(child);
-                    }
-                }
-                Expr::Not(inner) => stack.push(inner),
-                Expr::Compare { .. } => {}
-                Expr::InList { .. } => {}
-                Expr::IsNull { .. } => {}
-                Expr::Literal(_) => {}
-                Expr::Exists(_) => {}
-            }
-        }
-    }
-
-    fn should_fuse(&self, field_id: FieldId, dtype: &DataType) -> bool {
-        let Some(stats) = self.per_field.get(&field_id) else {
-            return false;
-        };
-
-        match dtype {
-            DataType::Utf8 | DataType::LargeUtf8 => stats.contains >= 1 && stats.total >= 2,
-            _ => stats.total >= 2,
-        }
-    }
 }
 
 pub(crate) struct TableExecutor<'a, P>
@@ -1173,12 +1112,11 @@ where
                             | ScalarExpr::Compare { .. }
                             | ScalarExpr::Case { .. }
                             | ScalarExpr::Coalesce(_) => {
-                                let mut resolver = |fid: FieldId| {
-                                    let lfid = LogicalFieldId::for_user(self.table.table_id(), fid);
-                                    lfid_dtypes.get(&lfid).cloned()
-                                };
-
-                                let inferred_type = info.expr.infer_result_type(&mut resolver);
+                                let inferred_type = computed_expr_result_type(
+                                    &info.expr,
+                                    self.table.table_id(),
+                                    &lfid_dtypes,
+                                )?;
 
                                 if let Some(dtype) = inferred_type {
                                     dtype
