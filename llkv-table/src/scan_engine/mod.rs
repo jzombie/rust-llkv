@@ -39,7 +39,8 @@ use llkv_compute::analysis::{
 };
 use llkv_compute::eval::ScalarExprTypeExt;
 use llkv_compute::projection::{
-    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch, synthesize_computed_literal_array,
+    ComputedLiteralInfo, ProjectionLiteral, emit_synthetic_null_batch,
+    synthesize_computed_literal_array,
 };
 use llkv_compute::scalar::interval::compare_interval_values;
 use llkv_compute::{RowIdFilter, sort_row_ids_by_primitive};
@@ -3866,15 +3867,12 @@ where
         };
         (window.len(), numeric_arrays)
     } else {
-        let mut local_ctx;
-        let ctx = match gather_ctx.as_mut() {
-            Some(ctx) => ctx,
-            None => {
-                local_ctx = store.prepare_gather_context(unique_lfids)?;
-                &mut local_ctx
-            }
-        };
-        let batch = store.gather_rows_with_reusable_context(ctx, window, null_policy)?;
+        let batch = store.gather_row_window_with_context(
+            unique_lfids,
+            window,
+            null_policy,
+            gather_ctx.as_deref_mut(),
+        )?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }

@@ -822,6 +822,30 @@ where
         )
     }
 
+    /// Gather a row window into a `RecordBatch`, reusing or creating a gather context.
+    pub fn gather_row_window_with_context(
+        &self,
+        logical_fields: &[LogicalFieldId],
+        row_ids: &[u64],
+        null_policy: GatherNullPolicy,
+        ctx: Option<&mut MultiGatherContext>,
+    ) -> Result<RecordBatch> {
+        if logical_fields.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+        }
+
+        let mut local_ctx;
+        let ctx_ref = match ctx {
+            Some(existing) => existing,
+            None => {
+                local_ctx = self.prepare_gather_context(logical_fields)?;
+                &mut local_ctx
+            }
+        };
+
+        self.gather_rows_with_reusable_context(ctx_ref, row_ids, null_policy)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gather_rows_single_shot_bool(
         row_index: &FxHashMap<u64, usize>,
