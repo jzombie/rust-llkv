@@ -710,9 +710,6 @@ where
                 }
                 stack.push(domain.unwrap_or_default());
             }
-            DomainOp::PushLiteralFalse => {
-                stack.push(Treemap::new());
-            }
             DomainOp::PushAllRows => {
                 stack.push(collect_all_row_ids(storage, all_rows_cache)?);
             }

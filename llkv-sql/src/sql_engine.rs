@@ -12290,7 +12290,11 @@ mod tests {
         let filter_plan = plan.filter.expect("expected filter predicate");
         match &filter_plan.predicate {
             llkv_expr::expr::Expr::Or(children) => {
-                assert_eq!(children.len(), 2, "NOT BETWEEN should expand to two comparisons");
+                assert_eq!(
+                    children.len(),
+                    2,
+                    "NOT BETWEEN should expand to two comparisons"
+                );
             }
             other => panic!("unexpected filter shape: {other:?}"),
         }
@@ -12310,7 +12314,11 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("count column as int64");
         assert_eq!(array.len(), 1, "expected scalar aggregate result");
-        assert_eq!(array.value(0), 3, "SQLite and engine should agree on row count");
+        assert_eq!(
+            array.value(0),
+            3,
+            "SQLite and engine should agree on row count"
+        );
     }
 
     #[test]
@@ -12495,6 +12503,54 @@ mod tests {
             total_rows, 0,
             "expected double NOT BETWEEN to filter all rows"
         );
+    }
+
+    #[test]
+    fn not_with_empty_in_list_complements_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab(pk INTEGER PRIMARY KEY, col0 INTEGER)")
+            .expect("create tab");
+        engine
+            .execute("INSERT INTO tab VALUES (0, 1), (1, 2), (2, 3)")
+            .expect("seed rows");
+
+        let batches = engine
+            .sql(
+                "SELECT COUNT(*) AS cnt FROM tab WHERE NOT (col0 = 999 AND col0 IN (SELECT col0 FROM tab WHERE 0 = 1))",
+            )
+            .expect("run NOT query with empty IN list");
+
+        assert_eq!(batches.len(), 1, "expected single aggregate batch");
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column as int64");
+        assert_eq!(counts.value(0), 3, "NOT should match every row");
+
+        let batches = engine
+            .sql(
+                "SELECT pk FROM tab WHERE NOT (col0 = 999 AND col0 IN (SELECT col0 FROM tab WHERE 0 = 1)) ORDER BY pk",
+            )
+            .expect("fetch rows from NOT query");
+        let expected: Vec<i64> = vec![0, 1, 2];
+        let mut actual = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("pk column as int64");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    actual.push(column.value(idx));
+                }
+            }
+        }
+        assert_eq!(actual, expected, "NOT should preserve all primary keys");
     }
 
     #[test]

@@ -8,18 +8,18 @@ use std::sync::RwLock;
 use crate::stream::ColumnStream;
 use crate::stream::RowIdSource;
 
-use arrow::array::{Array, ArrayRef, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, UInt64Type};
 use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use llkv_column_map::ColumnStore;
-use llkv_column_map::store::{
-    GatherNullPolicy, IndexKind, MultiGatherContext, ROW_ID_COLUMN_NAME,
-};
-use llkv_column_map::store::scan::filter::{FilterDispatch, FilterPrimitive, Utf8Filter};
-use llkv_column_map::store::scan::ScanOptions;
 use llkv_column_map::ScanBuilder;
+use llkv_column_map::store::scan::ScanOptions;
+use llkv_column_map::store::scan::filter::{FilterDispatch, FilterPrimitive, Utf8Filter};
+use llkv_column_map::store::{GatherNullPolicy, IndexKind, MultiGatherContext, ROW_ID_COLUMN_NAME};
 use llkv_column_map::{
     llkv_for_each_arrow_boolean, llkv_for_each_arrow_numeric, llkv_for_each_arrow_string,
 };
@@ -41,13 +41,9 @@ use llkv_expr::typed_predicate::{
 };
 use llkv_expr::{Expr, Operator};
 use llkv_result::{Error, Result as LlkvResult};
-use llkv_scan::{
-    ScanStorage, execute::execute_scan,
-};
+pub use llkv_scan::{ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection};
+use llkv_scan::{ScanStorage, execute::execute_scan};
 use rustc_hash::FxHashMap;
-pub use llkv_scan::{
-    ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
-};
 use std::ops::Bound;
 
 /// Cached information about which system columns exist in the table schema.
@@ -921,10 +917,7 @@ struct RowIdChunkEmitter<'a> {
 }
 
 impl<'a> RowIdChunkEmitter<'a> {
-    fn new(
-        chunk_size: usize,
-        on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
-    ) -> Self {
+    fn new(chunk_size: usize, on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>) -> Self {
         let chunk_size = cmp::max(1, chunk_size);
         Self {
             chunk_size,
@@ -1120,8 +1113,7 @@ where
                     return Ok(RowIdSource::Bitmap(Treemap::new()));
                 }
                 let mut cache = FxHashMap::default();
-                let non_null =
-                    self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
+                let non_null = self.collect_all_row_ids_for_field(filter.field_id, &mut cache)?;
                 let null_ids = all_row_ids - non_null;
                 return Ok(RowIdSource::Bitmap(null_ids));
             }
@@ -1237,8 +1229,8 @@ where
         O: OffsetSizeTrait + llkv_column_map::store::scan::StringContainsKernel,
     {
         let predicate = build_var_width_predicate(op).map_err(Error::predicate_build)?;
-        let row_ids = Utf8Filter::<O>::run_filter(self.store(), lfid, &predicate)
-            .map_err(Error::from)?;
+        let row_ids =
+            Utf8Filter::<O>::run_filter(self.store(), lfid, &predicate).map_err(Error::from)?;
         Ok(Treemap::from_iter(row_ids))
     }
 
@@ -1281,7 +1273,10 @@ where
             return Ok(Treemap::new());
         }
 
-        let expected = self.store.total_rows_for_table(self.table_id).unwrap_or_default();
+        let expected = self
+            .store
+            .total_rows_for_table(self.table_id)
+            .unwrap_or_default();
 
         if expected > 0
             && let Some(&first_field) = fields.first()

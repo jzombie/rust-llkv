@@ -23,8 +23,8 @@ pub use row_stream::{
 };
 
 pub mod execute;
-pub mod predicate;
 pub mod ordering;
+pub mod predicate;
 pub use ordering::sort_row_ids_with_order;
 
 /// Sort direction for scan ordering.

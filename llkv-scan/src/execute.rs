@@ -18,7 +18,7 @@ use crate::row_stream::{
     ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream,
     RowStreamBuilder,
 };
-use crate::{ordering::sort_row_ids_with_order, ScanProjection, ScanStorage, ScanStreamOptions};
+use crate::{ScanProjection, ScanStorage, ScanStreamOptions, ordering::sort_row_ids_with_order};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;

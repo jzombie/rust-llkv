@@ -233,7 +233,6 @@ pub enum DomainOp {
         fields: Vec<FieldId>,
         negated: bool,
     },
-    PushLiteralFalse,
     PushAllRows,
     Union {
         child_count: usize,
@@ -494,12 +493,9 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                         negated: *negated,
                     });
                 }
-                Expr::Literal(value) => {
-                    if *value {
-                        ops.push(DomainOp::PushAllRows);
-                    } else {
-                        ops.push(DomainOp::PushLiteralFalse);
-                    }
+                Expr::Literal(_) => {
+                    // Boolean literals are defined for every row regardless of value.
+                    ops.push(DomainOp::PushAllRows);
                 }
                 Expr::And(children) => {
                     if children.len() > 1 {

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Builder, StringArray};
-use arrow_array::Array;
 use arrow::datatypes::DataType;
+use arrow_array::Array;
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_result::{Error, Result as LlkvResult};
@@ -74,9 +74,14 @@ where
                     "ORDER BY CAST expects a UTF8 column".into(),
                 ));
             }
-            let strings = array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                Error::InvalidArgumentError("ORDER BY CAST failed to downcast UTF8 column".into())
-            })?;
+            let strings = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(
+                        "ORDER BY CAST failed to downcast UTF8 column".into(),
+                    )
+                })?;
             let mut builder = Int64Builder::with_capacity(strings.len());
             for idx in 0..strings.len() {
                 if strings.is_null(idx) {
