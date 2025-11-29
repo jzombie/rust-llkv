@@ -19,6 +19,7 @@ pub mod plans;
 pub mod program;
 pub mod subquery_correlation;
 pub mod traversal;
+pub mod table_scan;
 pub mod validation;
 
 pub use canonical::canonical_scalar_from_plan_value;
@@ -34,6 +35,7 @@ pub use program::{
     DomainOp, DomainProgram, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler,
     ProgramSet, normalize_predicate,
 };
+pub use table_scan::{build_table_scan_plan, TableScanProjectionSpec};
 pub use subquery_correlation::{
     SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,
     SubqueryCorrelatedTracker, subquery_correlated_placeholder,

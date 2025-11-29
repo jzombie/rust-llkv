@@ -66,7 +66,7 @@ where
         Self { table }
     }
 
-    fn table(&self) -> &Table<P> {
+    pub(crate) fn table(&self) -> &Table<P> {
         &self.table
     }
 }

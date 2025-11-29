@@ -69,9 +69,9 @@ use crate::types::{FieldId, ROW_ID_FIELD_ID, RowId, TableId};
 
 use crate::stream::{RowIdSource, RowStream, RowStreamBuilder};
 use llkv_plan::{
-    DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, PlanEdge, PlanExpression,
-    PlanField, PlanGraph, PlanGraphBuilder, PlanGraphError, PlanNode, PlanNodeId, PlanOperator,
-    ProgramCompiler, ProgramSet, normalize_predicate,
+    DomainOp, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, PlanGraph, PlanGraphError,
+    ProgramCompiler, ProgramSet, TableScanProjectionSpec, build_table_scan_plan,
+    normalize_predicate,
 };
 
 // NOTE: Planning and execution currently live together; once the dedicated
@@ -578,86 +578,34 @@ where
         filter_expr: &Expr<'_, FieldId>,
         options: ScanStreamOptions<P>,
     ) -> LlkvResult<PlanGraph> {
-        let mut builder = PlanGraphBuilder::new();
-
-        let scan_node_id = PlanNodeId::new(1);
-        let mut scan_node = PlanNode::new(scan_node_id, PlanOperator::TableScan);
-        scan_node
-            .metadata
-            .insert("table_id", self.table.table_id().to_string());
-        scan_node
-            .metadata
-            .insert("projection_count", projections.len().to_string());
-        builder.add_node(scan_node).map_err(plan_graph_err)?;
-        builder.add_root(scan_node_id).map_err(plan_graph_err)?;
-
-        let mut next_node = 2u32;
-        let mut parent = scan_node_id;
-
-        if !is_trivial_filter(filter_expr) {
-            let filter_node_id = PlanNodeId::new(next_node);
-            next_node += 1;
-            let mut filter_node = PlanNode::new(filter_node_id, PlanOperator::Filter);
-            filter_node.add_predicate(PlanExpression::new(format_expr(filter_expr)));
-            builder.add_node(filter_node).map_err(plan_graph_err)?;
-            builder
-                .add_edge(PlanEdge::new(parent, filter_node_id))
-                .map_err(plan_graph_err)?;
-            parent = filter_node_id;
-        }
-
-        let project_node_id = PlanNodeId::new(next_node);
-        next_node += 1;
-        let mut project_node = PlanNode::new(project_node_id, PlanOperator::Project);
-
-        for projection in projections {
-            match projection {
+        let specs: Vec<TableScanProjectionSpec> = projections
+            .iter()
+            .map(|projection| match projection {
                 ScanProjection::Column(proj) => {
-                    let alias = proj
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| proj.logical_field_id.field_id().to_string());
                     let dtype = self.table.store().data_type(proj.logical_field_id)?;
-                    project_node.add_projection(PlanExpression::new(format!("column({})", alias)));
-                    project_node.add_field(
-                        PlanField::new(alias.clone(), format!("{dtype:?}")).with_nullability(true),
-                    );
+                    Ok(TableScanProjectionSpec::Column {
+                        logical_field_id: proj.logical_field_id,
+                        data_type: dtype,
+                        alias: proj.alias.clone(),
+                    })
                 }
-                ScanProjection::Computed { expr, alias } => {
-                    project_node.add_projection(PlanExpression::new(format!(
-                        "{} := {}",
-                        alias,
-                        expr.format_display()
-                    )));
-                    project_node
-                        .add_field(PlanField::new(alias.clone(), "Float64").with_nullability(true));
-                }
-            }
-        }
+                ScanProjection::Computed { expr, alias } => Ok(
+                    TableScanProjectionSpec::Computed {
+                        expr: expr.clone(),
+                        alias: alias.clone(),
+                        data_type: DataType::Float64,
+                    },
+                ),
+            })
+            .collect::<LlkvResult<_>>()?;
 
-        builder.add_node(project_node).map_err(plan_graph_err)?;
-        builder
-            .add_edge(PlanEdge::new(parent, project_node_id))
-            .map_err(plan_graph_err)?;
-        parent = project_node_id;
-
-        let output_node_id = PlanNodeId::new(next_node);
-        let mut output_node = PlanNode::new(output_node_id, PlanOperator::Output);
-        output_node
-            .metadata
-            .insert("include_nulls", options.include_nulls.to_string());
-        builder.add_node(output_node).map_err(plan_graph_err)?;
-        builder
-            .add_edge(PlanEdge::new(parent, output_node_id))
-            .map_err(plan_graph_err)?;
-
-        let annotations = builder.annotations_mut();
-        annotations.description = Some("table.scan_stream".to_string());
-        annotations
-            .properties
-            .insert("table_id".to_string(), self.table.table_id().to_string());
-
-        builder.finish().map_err(plan_graph_err)
+        build_table_scan_plan(
+            self.table.table_id(),
+            &specs,
+            filter_expr,
+            options.include_nulls,
+        )
+        .map_err(plan_graph_err)
     }
 }
 
