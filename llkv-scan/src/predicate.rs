@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, BooleanBuilder};
+use arrow::datatypes::DataType;
 use arrow::compute;
 use croaring::Treemap;
 use llkv_compute::analysis::PredicateFusionCache;
@@ -250,7 +251,7 @@ where
     let domain = if ordered_fields.is_empty() {
         let arrays: NumericArrayMap = FxHashMap::default();
         let value = ScalarEvaluator::evaluate_value(expr, 0, &arrays)?;
-        let is_null = value.is_null(0);
+        let is_null = value.data_type() == &DataType::Null || value.is_null(0);
         if (is_null && !negated) || (!is_null && negated) {
             return collect_all_row_ids(storage, all_rows_cache);
         } else {
@@ -320,7 +321,10 @@ where
     ScalarEvaluator::collect_fields(right, &mut fields);
 
     if fields.is_empty() {
-        return Ok(Treemap::new());
+        return match evaluate_constant_compare(left, op, right)? {
+            Some(true) => collect_all_row_ids(storage, all_rows_cache),
+            _ => Ok(Treemap::new()),
+        };
     }
 
     let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
@@ -401,7 +405,10 @@ where
     }
 
     if fields.is_empty() {
-        return Ok(Treemap::new());
+        return match evaluate_constant_in_list(expr, list, negated)? {
+            Some(true) => collect_all_row_ids(storage, all_rows_cache),
+            _ => Ok(Treemap::new()),
+        };
     }
 
     let mut ordered_fields: Vec<FieldId> = fields.into_iter().collect();
@@ -549,6 +556,11 @@ where
                 ordered_fields.sort_unstable();
                 ordered_fields.dedup();
 
+                if ordered_fields.is_empty() {
+                    stack.push(collect_all_row_ids(storage, all_rows_cache)?);
+                    continue;
+                }
+
                 let mut domain: Option<Treemap> = None;
                 for &fid in &ordered_fields {
                     let rows = collect_all_row_ids_for_field(storage, fid, all_rows_cache)?;
@@ -583,6 +595,11 @@ where
                 let mut ordered_fields: Vec<FieldId> = fields.to_vec();
                 ordered_fields.sort_unstable();
                 ordered_fields.dedup();
+
+                if ordered_fields.is_empty() {
+                    stack.push(collect_all_row_ids(storage, all_rows_cache)?);
+                    continue;
+                }
 
                 let mut domain: Option<Treemap> = None;
                 for &fid in &ordered_fields {
@@ -621,7 +638,7 @@ where
     S: ScanStorage<P>,
 {
     if fields.is_empty() {
-        return Ok(Treemap::new());
+        return collect_all_row_ids(storage, all_rows_cache);
     }
 
     let mut ordered_fields: Vec<FieldId> = fields.to_vec();
@@ -664,4 +681,75 @@ fn list_all_constant_null(list: &[ScalarExpr<FieldId>]) -> LlkvResult<bool> {
     }
 
     Ok(true)
+}
+
+fn evaluate_constant_compare(
+    left: &ScalarExpr<FieldId>,
+    op: CompareOp,
+    right: &ScalarExpr<FieldId>,
+) -> LlkvResult<Option<bool>> {
+    let arrays: NumericArrayMap = FxHashMap::default();
+    let left_value = ScalarEvaluator::evaluate_value(left, 0, &arrays)?;
+    let right_value = ScalarEvaluator::evaluate_value(right, 0, &arrays)?;
+
+    let cmp_array = compute_compare(&left_value, op, &right_value)?;
+    let bool_array = cmp_array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| Error::Internal("compare kernel did not return bools".into()))?;
+
+    if bool_array.is_null(0) {
+        Ok(None)
+    } else {
+        Ok(Some(bool_array.value(0)))
+    }
+}
+
+fn evaluate_constant_in_list(
+    expr: &ScalarExpr<FieldId>,
+    list: &[ScalarExpr<FieldId>],
+    negated: bool,
+) -> LlkvResult<Option<bool>> {
+    let arrays: NumericArrayMap = FxHashMap::default();
+    let mut target_array = ScalarEvaluator::evaluate_value(expr, 0, &arrays)?;
+
+    if target_array.data_type() == &DataType::Null || target_array.is_null(0) {
+        return Ok(None);
+    }
+
+    let mut matched = false;
+    let mut saw_null = false;
+
+    for value_expr in list {
+        let value_array = ScalarEvaluator::evaluate_value(value_expr, 0, &arrays)?;
+        if value_array.data_type() == &DataType::Null || value_array.is_null(0) {
+            saw_null = true;
+            continue;
+        }
+
+        let (new_target, new_value) = kernels::coerce_types(&target_array, &value_array, BinaryOp::Add)?;
+        target_array = new_target;
+        let cmp_array = arrow::compute::kernels::cmp::eq(&new_value, &target_array)?;
+        let bool_array = cmp_array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| Error::Internal("in-list compare did not return bools".into()))?;
+
+        if bool_array.value(0) {
+            matched = true;
+            break;
+        }
+    }
+
+    let outcome = if matched {
+        Some(!negated)
+    } else if saw_null {
+        None
+    } else if negated {
+        Some(true)
+    } else {
+        Some(false)
+    };
+
+    Ok(outcome)
 }
