@@ -143,6 +143,7 @@ where
         include_nulls: _,
         order,
         row_id_filter,
+        include_row_ids,
     } = options;
 
     let mut row_source = RowIdSource::Bitmap(storage.filter_row_ids(filter_expr)?);
@@ -201,6 +202,7 @@ where
         null_policy,
         row_source,
         1024,
+        include_row_ids,
     )
     .build()?;
 

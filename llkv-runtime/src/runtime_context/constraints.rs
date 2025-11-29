@@ -44,6 +44,14 @@ where
             return Ok(());
         }
 
+        if !self
+            .txn_manager
+            .has_other_active_transactions(snapshot.txn_id)
+        {
+            // No concurrent transactions hold locks, so conflict detection can be skipped.
+            return Ok(());
+        }
+
         let table_id = table.table_id();
         let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
         let logical_fields: Arc<[LogicalFieldId]> = Arc::from([deleted_lfid]);
@@ -67,7 +75,10 @@ where
 
         while let Some(chunk) = stream.next_chunk()? {
             let batch = chunk.record_batch();
-            let window = chunk.row_ids.values();
+            let row_ids = chunk
+                .row_ids
+                .expect("constraint scans require row ids for MVCC filtering");
+            let window = row_ids.values();
             let deleted_column = batch
                 .column(0)
                 .as_any()

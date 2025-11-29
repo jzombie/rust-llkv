@@ -102,6 +102,7 @@ where
     pub include_nulls: bool,
     pub order: Option<ScanOrderSpec>,
     pub row_id_filter: Option<Arc<dyn RowIdFilter<P>>>,
+    pub include_row_ids: bool,
 }
 
 impl<P> Clone for ScanStreamOptions<P>
@@ -113,6 +114,7 @@ where
             include_nulls: self.include_nulls,
             order: self.order,
             row_id_filter: self.row_id_filter.clone(),
+            include_row_ids: self.include_row_ids,
         }
     }
 }
@@ -126,6 +128,7 @@ where
             include_nulls: false,
             order: None,
             row_id_filter: None,
+            include_row_ids: true,
         }
     }
 }
@@ -142,6 +145,7 @@ where
                 "row_id_filter",
                 &self.row_id_filter.as_ref().map(|_| "<RowIdFilter>"),
             )
+            .field("include_row_ids", &self.include_row_ids)
             .finish()
     }
 }

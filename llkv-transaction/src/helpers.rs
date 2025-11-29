@@ -177,7 +177,10 @@ where
 
     while let Some(chunk) = stream.next_chunk()? {
         let batch = chunk.record_batch();
-        let window = chunk.row_ids.values();
+        let row_ids = chunk
+            .row_ids
+            .expect("transaction filtering requires row ids");
+        let window = row_ids.values();
 
         if batch.num_columns() < 2 {
             tracing::debug!(

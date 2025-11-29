@@ -505,13 +505,16 @@ where
                         continue;
                     }
                     let array = batch.column(0);
+                    let row_ids = chunk
+                        .row_ids
+                        .expect("unique constraint scans require row ids");
 
                     for local_idx in 0..batch.num_rows() {
                         if let Ok(existing_value) =
                             llkv_plan::plan_value_from_array(array, local_idx)
                             && new_values.contains(&existing_value)
                         {
-                            let rid = chunk.row_ids.value(local_idx);
+                            let rid = row_ids.value(local_idx);
                             if !conflicting_row_ids.contains(&rid) {
                                 conflicting_row_ids.push(rid);
                             }
@@ -632,6 +635,9 @@ where
             }
 
             let num_rows = batch.num_rows();
+            let row_ids = chunk
+                .row_ids
+                .expect("multi-column unique scans require row ids");
 
             for local_idx in 0..num_rows {
                 let mut existing_value = Vec::new();
@@ -649,7 +655,7 @@ where
                 }
 
                 if has_all_values && new_values.contains(&existing_value) {
-                    let rid = chunk.row_ids.value(local_idx);
+                    let rid = row_ids.value(local_idx);
                     if !conflicting_row_ids.contains(&rid) {
                         conflicting_row_ids.push(rid);
                     }

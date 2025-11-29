@@ -128,7 +128,9 @@ where
             let batch = chunk.record_batch();
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
 
-            let row_ids = chunk.row_ids;
+            let row_ids = chunk
+                .row_ids
+                .expect("table access requires row ids when streaming");
             let mut row_id_builder = UInt64Builder::with_capacity(row_ids.len());
             for idx in 0..row_ids.len() {
                 row_id_builder.append_value(row_ids.value(idx));

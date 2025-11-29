@@ -640,6 +640,7 @@ where
             policy,
             row_source,
             STREAM_BATCH_ROWS,
+            true,
         )
         .build()
     }
@@ -2263,6 +2264,7 @@ mod tests {
                     include_nulls: true,
                     order: None,
                     row_id_filter: None,
+                    include_row_ids: true,
                 },
                 |b| {
                     let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

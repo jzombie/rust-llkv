@@ -2139,6 +2139,7 @@ where
         &filter_expr,
         ScanStreamOptions {
             include_nulls: true,
+            include_row_ids: true,
             ..ScanStreamOptions::default()
         },
         &mut on_batch,
@@ -4070,6 +4071,7 @@ where
                 include_nulls: true,
                 order: Some(order_spec),
                 row_id_filter: row_filter.clone(),
+                include_row_ids: true,
             }
         } else {
             if row_filter.is_some() {
@@ -4079,6 +4081,7 @@ where
                 include_nulls: true,
                 order: None,
                 row_id_filter: row_filter.clone(),
+                include_row_ids: true,
             }
         };
 
@@ -4231,6 +4234,7 @@ where
             include_nulls: true,
             order: None,
             row_id_filter: row_filter.clone(),
+            include_row_ids: true,
         };
 
         let subquery_lookup: FxHashMap<llkv_expr::SubqueryId, &llkv_plan::FilterSubquery> =
@@ -4493,6 +4497,7 @@ where
             include_nulls: true,
             order: None,
             row_id_filter: row_filter.clone(),
+            include_row_ids: true,
         };
 
         let execution = SelectExecution::new_projection(
@@ -5566,6 +5571,7 @@ where
             include_nulls: true,
             order: None,
             row_id_filter: row_filter.clone(),
+            include_row_ids: true,
         };
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
@@ -6524,6 +6530,7 @@ where
             include_nulls: true,
             order: None,
             row_id_filter: None,
+            include_row_ids: true,
         };
 
         let count_star_override: Option<i64> = None;

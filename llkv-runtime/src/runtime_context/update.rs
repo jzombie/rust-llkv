@@ -957,6 +957,7 @@ where
             include_nulls: true,
             order: None,
             row_id_filter: Some(row_filter),
+            include_row_ids: true,
         };
 
         table

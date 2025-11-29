@@ -85,7 +85,7 @@ impl<'a> ColumnSliceSet<'a> for ColumnSlices<'a> {
 }
 
 pub struct RowChunk<'a, C> {
-    pub row_ids: &'a UInt64Array,
+    pub row_ids: Option<&'a UInt64Array>,
     pub columns: C,
     pub visibility: Option<&'a BooleanBuffer>,
     record_batch: &'a RecordBatch,
@@ -98,6 +98,10 @@ impl<'a, C> RowChunk<'a, C> {
 
     pub fn to_record_batch(&self) -> RecordBatch {
         self.record_batch.clone()
+    }
+
+    pub fn row_ids(&self) -> Option<&'a UInt64Array> {
+        self.row_ids
     }
 }
 
@@ -145,6 +149,7 @@ where
     chunk_size: usize,
     gather_ctx: Option<MultiGatherContext>,
     phantom: PhantomData<P>,
+    include_row_ids: bool,
 }
 
 impl<'storage, P, S> RowStreamBuilder<'storage, P, S>
@@ -166,6 +171,7 @@ where
         null_policy: GatherNullPolicy,
         row_ids: impl Into<RowIdSource>,
         chunk_size: usize,
+        include_row_ids: bool,
     ) -> Self {
         Self {
             storage,
@@ -182,6 +188,7 @@ where
             chunk_size,
             gather_ctx: None,
             phantom: PhantomData,
+            include_row_ids,
         }
     }
 
@@ -205,6 +212,7 @@ where
             row_ids,
             chunk_size,
             mut gather_ctx,
+            include_row_ids,
             ..
         } = self;
 
@@ -259,6 +267,7 @@ where
             current_batch: None,
             current_row_ids: None,
             phantom: PhantomData,
+            emit_row_ids: include_row_ids,
         })
     }
 }
@@ -285,6 +294,7 @@ where
     current_batch: Option<RecordBatch>,
     current_row_ids: Option<ArrayRef>,
     phantom: PhantomData<P>,
+    emit_row_ids: bool,
 }
 
 impl<'storage, P, S> RowStream for ScanRowStream<'storage, P, S>
@@ -341,15 +351,17 @@ where
                 continue;
             }
 
-            let row_id_slice = self.row_ids.slice(start, end - start);
-            self.current_row_ids = Some(Arc::new(row_id_slice) as ArrayRef);
+            let row_ids_ref = if self.emit_row_ids {
+                let row_id_slice = self.row_ids.slice(start, end - start);
+                self.current_row_ids = Some(Arc::new(row_id_slice) as ArrayRef);
+                self.current_row_ids
+                    .as_ref()
+                    .and_then(|arr| arr.as_any().downcast_ref::<UInt64Array>())
+            } else {
+                self.current_row_ids = None;
+                None
+            };
             self.current_batch = Some(batch);
-
-            let row_ids_ref = self
-                .current_row_ids
-                .as_ref()
-                .and_then(|arr| arr.as_any().downcast_ref::<UInt64Array>())
-                .expect("row id slice must be UInt64Array");
 
             let batch_ref = self.current_batch.as_ref().expect("batch must be present");
             let columns = batch_ref.columns();

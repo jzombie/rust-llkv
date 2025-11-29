@@ -361,6 +361,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             include_nulls: false,
             order: None,
             row_id_filter: None,
+            include_row_ids: true,
         };
 
         let mut total_rows = 0;
