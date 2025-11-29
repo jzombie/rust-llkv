@@ -36,6 +36,24 @@ impl From<Vec<RowId>> for RowIdSource {
     }
 }
 
+impl From<&Treemap> for RowIdSource {
+    fn from(bitmap: &Treemap) -> Self {
+        RowIdSource::Vector(bitmap.iter().collect())
+    }
+}
+
+impl From<&[RowId]> for RowIdSource {
+    fn from(slice: &[RowId]) -> Self {
+        RowIdSource::Vector(slice.to_vec())
+    }
+}
+
+impl From<&Vec<RowId>> for RowIdSource {
+    fn from(vec: &Vec<RowId>) -> Self {
+        RowIdSource::Vector(vec.clone())
+    }
+}
+
 pub trait ColumnSliceSet<'a> {
     fn len(&self) -> usize;
     fn column(&self, idx: usize) -> &'a ArrayRef;

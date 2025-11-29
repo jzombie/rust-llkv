@@ -10,7 +10,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::MvccColumnBuilder;
 use llkv_table::table::{RowIdFilter, ScanStorage};
-use llkv_table::{FieldId, RowId, Table};
+use llkv_table::{FieldId, RowId, RowStream, Table};
 use llkv_types::{LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::marker::PhantomData;
@@ -175,17 +175,17 @@ where
 
     let mut visible = Treemap::new();
 
-    while let Some(chunk) = stream.next_batch()? {
-        let batch = chunk.batch();
-        let window = chunk.row_ids();
+    while let Some(chunk) = stream.next_chunk()? {
+        let batch = chunk.record_batch();
+        let window = chunk.row_ids.values();
 
         if batch.num_columns() < 2 {
             tracing::debug!(
                 "[FILTER_ROWS] version_batch has < 2 columns for table_id={}, returning window rows unfiltered",
                 table_id
             );
-            for rid in window {
-                visible.add(*rid);
+            for &rid in window {
+                visible.add(rid);
             }
             continue;
         }
@@ -198,8 +198,8 @@ where
                 "[FILTER_ROWS] Failed to downcast MVCC columns for table_id={}, returning window rows unfiltered",
                 table_id
             );
-            for rid in window {
-                visible.add(*rid);
+            for &rid in window {
+                visible.add(rid);
             }
             continue;
         }
@@ -207,7 +207,7 @@ where
         let created_column = created_column.unwrap();
         let deleted_column = deleted_column.unwrap();
 
-        for (idx, row_id) in window.iter().enumerate() {
+        for (idx, row_id) in window.iter().copied().enumerate() {
             let created_by = if created_column.is_null(idx) {
                 TXN_ID_AUTO_COMMIT
             } else {
@@ -236,7 +236,7 @@ where
                 is_visible
             );
             if is_visible {
-                visible.add(*row_id);
+                visible.add(row_id);
             }
         }
     }

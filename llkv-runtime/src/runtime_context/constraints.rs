@@ -15,7 +15,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::{
     ConstraintColumnInfo, FieldId, InsertColumnConstraint, InsertMultiColumnUnique,
-    InsertUniqueColumn, RowId,
+    InsertUniqueColumn, RowId, RowStream,
 };
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
 use llkv_types::LogicalFieldId;
@@ -65,9 +65,9 @@ where
             GatherNullPolicy::IncludeNulls,
         )?;
 
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let window = chunk.row_ids();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let window = chunk.row_ids.values();
             let deleted_column = batch
                 .column(0)
                 .as_any()
@@ -78,7 +78,7 @@ where
                     )
                 })?;
 
-            for (idx, row_id) in window.iter().enumerate() {
+            for (idx, row_id) in window.iter().copied().enumerate() {
                 let deleted_by: TxnId = if deleted_column.is_null(idx) {
                     TXN_ID_NONE
                 } else {
@@ -100,7 +100,7 @@ where
                     row_id,
                     deleted_by,
                     status,
-                    snapshot.txn_id
+                    snapshot.txn_id,
                 );
 
                 return Err(Error::TransactionContextError(format!(
@@ -164,9 +164,10 @@ where
 
         let mut rows =
             vec![Vec::with_capacity(field_ids.len()); visible_row_ids.cardinality() as usize];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -178,6 +179,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(visible_row_ids.iter().zip(rows).collect())

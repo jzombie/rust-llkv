@@ -18,7 +18,7 @@ use llkv_executor::{
 use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::ConstraintEnforcementMode;
+use llkv_table::{ConstraintEnforcementMode, RowStream};
 use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use llkv_types::{LogicalFieldId, RowId};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -499,20 +499,19 @@ where
                     GatherNullPolicy::IncludeNulls,
                 )?;
 
-                while let Some(chunk) = stream.next_batch()? {
-                    let batch = chunk.batch();
+                while let Some(chunk) = stream.next_chunk()? {
+                    let batch = chunk.record_batch();
                     if batch.num_columns() == 0 {
                         continue;
                     }
                     let array = batch.column(0);
-                    let _base_idx = chunk.row_offset();
 
                     for local_idx in 0..batch.num_rows() {
                         if let Ok(existing_value) =
                             llkv_plan::plan_value_from_array(array, local_idx)
                             && new_values.contains(&existing_value)
                         {
-                            let rid = chunk.row_ids()[local_idx];
+                            let rid = chunk.row_ids.value(local_idx);
                             if !conflicting_row_ids.contains(&rid) {
                                 conflicting_row_ids.push(rid);
                             }
@@ -626,8 +625,8 @@ where
         let mut stream =
             table.stream_columns(logical_field_ids, row_ids, GatherNullPolicy::IncludeNulls)?;
 
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
@@ -650,7 +649,7 @@ where
                 }
 
                 if has_all_values && new_values.contains(&existing_value) {
-                    let rid = chunk.row_ids()[local_idx];
+                    let rid = chunk.row_ids.value(local_idx);
                     if !conflicting_row_ids.contains(&rid) {
                         conflicting_row_ids.push(rid);
                     }

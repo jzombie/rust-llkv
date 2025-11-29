@@ -51,8 +51,6 @@ pub mod expr {
 pub mod table;
 pub mod types;
 
-pub mod stream;
-
 pub use catalog::{CatalogManager, CreateTableResult, FieldResolver, TableCatalogSnapshot};
 pub use catalog::{SingleColumnIndexDescriptor, SingleColumnIndexRegistration};
 pub use constraints::{
@@ -79,7 +77,6 @@ pub use reserved::{
     is_information_schema_table,
 };
 pub use resolvers::{canonical_table_name, resolve_table_name};
-pub use stream::{ColumnStream, ColumnStreamBatch};
 pub type NumericArrayMap = llkv_compute::eval::NumericArrayMap<FieldId>;
 pub use sys_catalog::{
     ColMeta, CustomTypeMeta, MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
@@ -89,6 +86,8 @@ pub use sys_catalog::{
 pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
 pub use view::{ForeignKeyView, TableConstraintSummaryView, TableView};
+
+pub use llkv_scan::row_stream::RowStream;
 
 // TODO: Don't re-export, and call directly
 pub use llkv_plan::{

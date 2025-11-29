@@ -17,7 +17,8 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
 use llkv_table::{
-    ConstraintKind, FieldId, MultiColumnIndexEntryMeta, RowId, Table, TableConstraintSummaryView,
+    ConstraintKind, FieldId, MultiColumnIndexEntryMeta, RowId, RowStream, Table,
+    TableConstraintSummaryView,
 };
 use llkv_transaction::{TransactionSnapshot, mvcc};
 use llkv_types::LogicalFieldId;
@@ -123,17 +124,18 @@ where
         )?;
 
         let mut batches = Vec::new();
-        while let Some(chunk) = stream.next_batch()? {
-            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(chunk.batch().num_columns() + 1);
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
 
-            let mut row_id_builder = UInt64Builder::with_capacity(chunk.len());
-            for row_id in chunk.row_ids() {
-                row_id_builder.append_value(*row_id);
+            let row_ids = chunk.row_ids;
+            let mut row_id_builder = UInt64Builder::with_capacity(row_ids.len());
+            for idx in 0..row_ids.len() {
+                row_id_builder.append_value(row_ids.value(idx));
             }
             arrays.push(Arc::new(row_id_builder.finish()) as ArrayRef);
 
-            let chunk_batch = chunk.into_batch();
-            for column_array in chunk_batch.columns() {
+            for column_array in batch.columns() {
                 arrays.push(column_array.clone());
             }
 

@@ -13,7 +13,6 @@ use std::sync::{Arc, RwLock};
 use crate::types::StorageTable;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_expr::Expr;
-use llkv_table::stream::{ColumnStream, RowIdStreamSource};
 use llkv_types::LogicalFieldId;
 
 /// Executor's view of a table, including schema and metadata.
@@ -69,9 +68,9 @@ where
     pub fn stream_columns<'table, 'a>(
         &'table self,
         logical_fields: impl Into<Arc<[LogicalFieldId]>>,
-        row_ids: impl RowIdStreamSource<'a>,
+        row_ids: impl Into<llkv_scan::row_stream::RowIdSource>,
         policy: GatherNullPolicy,
-    ) -> llkv_result::Result<ColumnStream<'table, 'a, P>> {
+    ) -> llkv_result::Result<llkv_table::table::TableScanStream<'table, P>> {
         self.table.stream_columns(logical_fields, row_ids, policy)
     }
 

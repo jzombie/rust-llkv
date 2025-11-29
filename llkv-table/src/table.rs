@@ -4,9 +4,6 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use crate::stream::ColumnStream;
-use crate::stream::RowIdSource;
-
 use arrow::array::{
     Array, ArrayRef, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
@@ -41,11 +38,14 @@ use llkv_expr::typed_predicate::{
 use llkv_expr::{Expr, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_scan::execute::execute_scan;
+use llkv_scan::row_stream::{
+    ColumnProjectionInfo, ProjectionEval, RowIdSource, RowStreamBuilder, ScanRowStream,
+};
 pub use llkv_scan::{
     RowIdFilter, ScanOrderDirection, ScanOrderSpec, ScanOrderTransform, ScanProjection,
     ScanStorage, ScanStreamOptions,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::Bound;
 
 /// Cached information about which system columns exist in the table schema.
@@ -68,6 +68,8 @@ where
     /// None means not yet initialized.
     mvcc_cache: RwLock<Option<MvccColumnCache>>,
 }
+
+pub type TableScanStream<'table, P> = ScanRowStream<'table, P, Table<P>>;
 
 impl<P> Table<P>
 where
@@ -585,25 +587,61 @@ where
     }
 
     /// Create a streaming view over the provided row IDs for the specified logical fields.
-    pub fn stream_columns<'table, 'a>(
+    pub fn stream_columns<'table>(
         &'table self,
         logical_fields: impl Into<Arc<[LogicalFieldId]>>,
-        row_ids: impl crate::stream::RowIdStreamSource<'a>,
+        row_ids: impl Into<RowIdSource>,
         policy: GatherNullPolicy,
-    ) -> LlkvResult<ColumnStream<'table, 'a, P>> {
-        let total_rows = row_ids.count() as usize;
-        let iter = row_ids.into_iter_source();
+    ) -> LlkvResult<TableScanStream<'table, P>> {
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
-        let ctx = self.store.prepare_gather_context(logical_fields.as_ref())?;
-        Ok(ColumnStream::new(
-            &self.store,
-            ctx,
-            iter,
-            total_rows,
-            STREAM_BATCH_ROWS,
+        let mut projection_evals = Vec::with_capacity(logical_fields.len());
+        let mut schema_fields = Vec::with_capacity(logical_fields.len());
+        let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
+        let mut unique_lfids: Vec<LogicalFieldId> = Vec::new();
+
+        for &lfid in logical_fields.iter() {
+            let dtype = self.store.data_type(lfid)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = unique_index.entry(lfid) {
+                entry.insert(unique_lfids.len());
+                unique_lfids.push(lfid);
+            }
+
+            let field_name = self
+                .catalog()
+                .get_cols_meta(self.table_id, &[lfid.field_id()])
+                .into_iter()
+                .flatten()
+                .next()
+                .and_then(|meta| meta.name)
+                .unwrap_or_else(|| format!("col_{}", lfid.field_id()));
+
+            projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                logical_field_id: lfid,
+                data_type: dtype.clone(),
+                output_name: field_name.clone(),
+            }));
+            schema_fields.push(Field::new(field_name, dtype, true));
+        }
+
+        let schema = Arc::new(Schema::new(schema_fields));
+        let passthrough_fields = vec![None; projection_evals.len()];
+        let row_source = row_ids.into();
+
+        RowStreamBuilder::new(
+            self,
+            self.table_id,
+            Arc::clone(&schema),
+            Arc::new(unique_lfids),
+            Arc::new(projection_evals),
+            Arc::new(passthrough_fields),
+            Arc::new(unique_index),
+            Arc::new(FxHashSet::default()),
+            false,
             policy,
-            logical_fields,
-        ))
+            row_source,
+            STREAM_BATCH_ROWS,
+        )
+        .build()
     }
 
     pub fn store(&self) -> &ColumnStore<P> {

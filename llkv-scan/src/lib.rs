@@ -21,6 +21,7 @@ pub use row_stream::{
     ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowChunk, RowIdSource, RowStream,
     RowStreamBuilder, materialize_row_window,
 };
+pub use row_stream::ScanRowStream;
 
 pub mod execute;
 pub mod ordering;

@@ -20,7 +20,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
-use llkv_table::{ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key};
+use llkv_table::{ConstraintEnforcementMode, FieldId, RowStream, UniqueKey, build_composite_unique_key};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use llkv_types::LogicalFieldId;
 use rustc_hash::FxHashMap;
@@ -176,9 +176,10 @@ where
             let mut stream =
                 table.stream_columns(logical_fields, &row_ids, GatherNullPolicy::IncludeNulls)?;
 
-            while let Some(chunk) = stream.next_batch()? {
-                let batch = chunk.batch();
-                let base = chunk.row_offset();
+            let mut emitted = 0usize;
+            while let Some(chunk) = stream.next_chunk()? {
+                let batch = chunk.record_batch();
+                let base = emitted;
                 let local_len = batch.num_rows();
                 for col_idx in 0..batch.num_columns() {
                     let array = batch.column(col_idx);
@@ -186,7 +187,7 @@ where
                         let target_index = base + local_idx;
                         debug_assert!(
                             target_index < new_rows.len(),
-                            "column stream produced out-of-range row index"
+                            "row stream produced out-of-range row index"
                         );
                         if let Some(row) = new_rows.get_mut(target_index) {
                             let value = llkv_plan::plan_value_from_array(array, local_idx)?;
@@ -194,6 +195,7 @@ where
                         }
                     }
                 }
+                emitted += local_len;
             }
         }
         debug_assert!(
@@ -528,9 +530,10 @@ where
             let mut stream =
                 table.stream_columns(logical_fields, &row_ids, GatherNullPolicy::IncludeNulls)?;
 
-            while let Some(chunk) = stream.next_batch()? {
-                let batch = chunk.batch();
-                let base = chunk.row_offset();
+            let mut emitted = 0usize;
+            while let Some(chunk) = stream.next_chunk()? {
+                let batch = chunk.record_batch();
+                let base = emitted;
                 let local_len = batch.num_rows();
                 for col_idx in 0..batch.num_columns() {
                     let array = batch.column(col_idx);
@@ -538,7 +541,7 @@ where
                         let target_index = base + local_idx;
                         debug_assert!(
                             target_index < new_rows.len(),
-                            "column stream produced out-of-range row index"
+                            "row stream produced out-of-range row index"
                         );
                         if let Some(row) = new_rows.get_mut(target_index) {
                             let value = llkv_plan::plan_value_from_array(array, local_idx)?;
@@ -546,6 +549,7 @@ where
                         }
                     }
                 }
+                emitted += local_len;
             }
         }
         debug_assert!(

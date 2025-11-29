@@ -21,7 +21,7 @@ use llkv_executor::{ExecutorColumn, ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::FieldId;
+use llkv_table::{FieldId, RowStream};
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
 use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -253,8 +253,8 @@ where
         // NOTE: Values are accumulated eagerly; revisit when `llkv-plan` supports
         // incremental parameter binding.
         let mut values = Vec::with_capacity(row_count);
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
@@ -331,13 +331,14 @@ where
             };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
 
-            let base = chunk.row_offset();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -355,6 +356,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(rows)
@@ -421,13 +423,14 @@ where
             };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
 
-            let base = chunk.row_offset();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -445,6 +448,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(rows)
@@ -480,9 +484,10 @@ where
         };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); row_ids.cardinality() as usize];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -494,6 +499,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(rows)
@@ -566,8 +572,8 @@ where
         )?;
 
         let mut rows = Vec::new();
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() < table.schema.columns.len() + 2 {
                 continue;
             }
