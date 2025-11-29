@@ -7,6 +7,7 @@ members = [
     "llkv-column-map",
     "llkv-compute",
     "llkv-csv",
+    "llkv-scan",
     "llkv-executor",
     "llkv-expr",
     "llkv-join",
@@ -63,6 +64,7 @@ llkv-result = { path = "./llkv-result", version = "0.8.3-alpha" }
 llkv-runtime = { path = "./llkv-runtime", version = "0.8.3-alpha" }
 llkv-slt-tester = { path = "./llkv-slt-tester", version = "0.8.3-alpha" }
 llkv-sql = { path = "./llkv-sql", version = "0.8.3-alpha" }
+llkv-scan = { path = "./llkv-scan", version = "0.8.3-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.8.3-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.8.3-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.3-alpha" }

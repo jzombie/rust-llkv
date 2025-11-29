@@ -6,16 +6,18 @@ use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::Schema;
 use croaring::Treemap;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
+use llkv_compute::analysis::computed_expr_requires_numeric;
+use llkv_compute::eval::{NumericArrayMap as ComputeNumericArrayMap, ScalarEvaluator};
+use llkv_compute::projection::{synthesize_computed_literal_array, ComputedLiteralInfo};
 use llkv_expr::ScalarExpr;
 use llkv_result::Result as LlkvResult;
-use llkv_types::{LogicalFieldId, RowId, TableId};
+use llkv_types::{FieldId, LogicalFieldId, RowId, TableId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::scan::ScanStorage;
+use crate::ScanStorage;
 
-use llkv_table::{NumericArrayMap, NumericKernels};
-use llkv_storage::pager::Pager;
+pub type NumericArrayMap = ComputeNumericArrayMap<FieldId>;
 
 pub enum RowIdSource {
     Bitmap(Treemap),
@@ -34,13 +36,13 @@ impl From<Vec<RowId>> for RowIdSource {
     }
 }
 
-pub(crate) trait ColumnSliceSet<'a> {
+pub trait ColumnSliceSet<'a> {
     fn len(&self) -> usize;
     fn column(&self, idx: usize) -> &'a ArrayRef;
     fn columns(&self) -> &'a [ArrayRef];
 }
 
-pub(crate) struct ColumnSlices<'a> {
+pub struct ColumnSlices<'a> {
     columns: &'a [ArrayRef],
 }
 
@@ -64,7 +66,7 @@ impl<'a> ColumnSliceSet<'a> for ColumnSlices<'a> {
     }
 }
 
-pub(crate) struct RowChunk<'a, C> {
+pub struct RowChunk<'a, C> {
     pub row_ids: &'a UInt64Array,
     pub columns: C,
     pub visibility: Option<&'a BooleanBuffer>,
@@ -81,7 +83,7 @@ impl<'a, C> RowChunk<'a, C> {
     }
 }
 
-pub(crate) trait RowStream {
+pub trait RowStream {
     type Columns<'a>: ColumnSliceSet<'a>
     where
         Self: 'a;
@@ -92,23 +94,23 @@ pub(crate) trait RowStream {
 }
 
 #[derive(Clone)]
-pub(crate) struct ColumnProjectionInfo {
+pub struct ColumnProjectionInfo {
     pub logical_field_id: LogicalFieldId,
     pub data_type: arrow::datatypes::DataType,
     pub output_name: String,
 }
 
-pub(crate) type ComputedProjectionInfo = llkv_compute::projection::ComputedLiteralInfo<llkv_table::types::FieldId>;
+pub type ComputedProjectionInfo = ComputedLiteralInfo<FieldId>;
 
 #[derive(Clone)]
-pub(crate) enum ProjectionEval {
+pub enum ProjectionEval {
     Column(ColumnProjectionInfo),
     Computed(ComputedProjectionInfo),
 }
 
-pub(crate) struct RowStreamBuilder<'storage, P, S>
+pub struct RowStreamBuilder<'storage, P, S>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     storage: &'storage S,
@@ -116,9 +118,9 @@ where
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
     projection_evals: Arc<Vec<ProjectionEval>>,
-    passthrough_fields: Arc<Vec<Option<llkv_table::types::FieldId>>>,
+    passthrough_fields: Arc<Vec<Option<FieldId>>>,
     unique_index: Arc<FxHashMap<LogicalFieldId, usize>>,
-    numeric_fields: Arc<FxHashSet<llkv_table::types::FieldId>>,
+    numeric_fields: Arc<FxHashSet<FieldId>>,
     requires_numeric: bool,
     null_policy: GatherNullPolicy,
     row_ids: RowIdSource,
@@ -129,7 +131,7 @@ where
 
 impl<'storage, P, S> RowStreamBuilder<'storage, P, S>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     #[allow(clippy::too_many_arguments)]
@@ -139,9 +141,9 @@ where
         schema: Arc<Schema>,
         unique_lfids: Arc<Vec<LogicalFieldId>>,
         projection_evals: Arc<Vec<ProjectionEval>>,
-        passthrough_fields: Arc<Vec<Option<llkv_table::types::FieldId>>>,
+        passthrough_fields: Arc<Vec<Option<FieldId>>>,
         unique_index: Arc<FxHashMap<LogicalFieldId, usize>>,
-        numeric_fields: Arc<FxHashSet<llkv_table::types::FieldId>>,
+        numeric_fields: Arc<FxHashSet<FieldId>>,
         requires_numeric: bool,
         null_policy: GatherNullPolicy,
         row_ids: impl Into<RowIdSource>,
@@ -243,9 +245,9 @@ where
     }
 }
 
-pub(crate) struct ScanRowStream<'storage, P, S>
+pub struct ScanRowStream<'storage, P, S>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     storage: &'storage S,
@@ -253,9 +255,9 @@ where
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
     projection_evals: Arc<Vec<ProjectionEval>>,
-    passthrough_fields: Arc<Vec<Option<llkv_table::types::FieldId>>>,
+    passthrough_fields: Arc<Vec<Option<FieldId>>>,
     unique_index: Arc<FxHashMap<LogicalFieldId, usize>>,
-    numeric_fields: Arc<FxHashSet<llkv_table::types::FieldId>>,
+    numeric_fields: Arc<FxHashSet<FieldId>>,
     requires_numeric: bool,
     null_policy: GatherNullPolicy,
     row_ids: Arc<UInt64Array>,
@@ -269,7 +271,7 @@ where
 
 impl<'storage, P, S> RowStream for ScanRowStream<'storage, P, S>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     type Columns<'a>
@@ -349,7 +351,7 @@ where
 
 impl<'storage, P, S> ScanRowStream<'storage, P, S>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     pub fn into_gather_context(self) -> Option<MultiGatherContext> {
@@ -358,14 +360,14 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn materialize_row_window<P, S>(
+pub fn materialize_row_window<P, S>(
     storage: &S,
     table_id: TableId,
     unique_lfids: &[LogicalFieldId],
     projection_evals: &[ProjectionEval],
-    passthrough_fields: &[Option<llkv_table::types::FieldId>],
+    passthrough_fields: &[Option<FieldId>],
     unique_index: &FxHashMap<LogicalFieldId, usize>,
-    numeric_fields: &FxHashSet<llkv_table::types::FieldId>,
+    numeric_fields: &FxHashSet<FieldId>,
     requires_numeric: bool,
     null_policy: GatherNullPolicy,
     out_schema: &Arc<Schema>,
@@ -373,7 +375,7 @@ pub(crate) fn materialize_row_window<P, S>(
     mut gather_ctx: Option<&mut MultiGatherContext>,
 ) -> LlkvResult<Option<RecordBatch>>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     if window.is_empty() {
@@ -445,15 +447,13 @@ where
                 }
 
                 let array: ArrayRef = match &info.expr {
-                    ScalarExpr::Literal(_) => llkv_compute::projection::synthesize_computed_literal_array(
+                    ScalarExpr::Literal(_) => synthesize_computed_literal_array(
                         info,
                         out_schema.field(idx).data_type(),
                         batch_len,
                     )?,
-                    ScalarExpr::Cast { .. }
-                        if !llkv_compute::analysis::computed_expr_requires_numeric(&info.expr) =>
-                    {
-                        llkv_compute::projection::synthesize_computed_literal_array(
+                    ScalarExpr::Cast { .. } if !computed_expr_requires_numeric(&info.expr) => {
+                        synthesize_computed_literal_array(
                             info,
                             out_schema.field(idx).data_type(),
                             batch_len,
@@ -461,7 +461,7 @@ where
                     }
                     ScalarExpr::GetField { base, field_name } => {
                         fn eval_get_field(
-                            expr: &ScalarExpr<llkv_table::types::FieldId>,
+                            expr: &ScalarExpr<FieldId>,
                             field_name: &str,
                             gathered_columns: &[ArrayRef],
                             unique_index: &FxHashMap<LogicalFieldId, usize>,
@@ -521,7 +521,7 @@ where
                         let numeric_arrays = numeric_arrays
                             .as_ref()
                             .expect("numeric arrays should exist for computed projection");
-                        NumericKernels::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
+                        ScalarEvaluator::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
                     }
                 };
                 columns.push(array);

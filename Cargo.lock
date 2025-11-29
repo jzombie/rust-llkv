@@ -1675,6 +1675,7 @@ dependencies = [
  "llkv-join",
  "llkv-plan",
  "llkv-result",
+ "llkv-scan",
  "llkv-storage",
  "llkv-table",
  "llkv-test-utils",
@@ -1770,6 +1771,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-scan"
+version = "0.8.3-alpha"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "croaring",
+ "llkv-column-map",
+ "llkv-compute",
+ "llkv-expr",
+ "llkv-result",
+ "llkv-storage",
+ "llkv-types",
+ "rustc-hash",
+ "simd-r-drive-entry-handle",
+]
+
+[[package]]
 name = "llkv-slt-tester"
 version = "0.8.3-alpha"
 dependencies = [
@@ -1859,6 +1878,7 @@ dependencies = [
  "llkv-expr",
  "llkv-plan",
  "llkv-result",
+ "llkv-scan",
  "llkv-storage",
  "llkv-test-utils",
  "llkv-types",

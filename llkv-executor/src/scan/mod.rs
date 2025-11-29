@@ -1,5 +1,3 @@
-mod row_stream;
-
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -9,43 +7,16 @@ use llkv_expr::Expr;
 use llkv_plan::{PlanGraph, ProgramSet};
 use llkv_result::{Error, Result as ExecutorResult};
 use llkv_table::constants::STREAM_BATCH_ROWS;
-use llkv_table::table::{ScanProjection, ScanStreamOptions};
+use llkv_table::table as table_types;
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_storage::pager::Pager;
-use row_stream::{RowIdSource, RowStream, RowStreamBuilder};
+use llkv_scan::{
+    ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream,
+    RowStreamBuilder, ScanProjection, ScanStorage, ScanStreamOptions,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
-
-
-/// Capabilities the scan executor needs from storage, kept minimal to avoid
-/// leaking execution details into the storage crate.
-pub trait ScanStorage<P>: Send + Sync
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    fn table_id(&self) -> TableId;
-    fn field_data_type(&self, fid: LogicalFieldId) -> ExecutorResult<arrow::datatypes::DataType>;
-    fn total_rows(&self) -> ExecutorResult<u64>;
-    fn prepare_gather_context(
-        &self,
-        logical_fields: &[LogicalFieldId],
-    ) -> ExecutorResult<MultiGatherContext>;
-    fn gather_row_window_with_context(
-        &self,
-        logical_fields: &[LogicalFieldId],
-        row_ids: &[u64],
-        null_policy: GatherNullPolicy,
-        ctx: Option<&mut MultiGatherContext>,
-    ) -> ExecutorResult<RecordBatch>;
-    fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> ExecutorResult<Treemap>;
-    fn stream_row_ids(
-        &self,
-        chunk_size: usize,
-        on_chunk: &mut dyn FnMut(Vec<u64>) -> ExecutorResult<()>,
-    ) -> ExecutorResult<()>;
-    fn as_any(&self) -> &dyn std::any::Any;
-}
 
 impl<P> ScanStorage<P> for crate::types::TableStorageAdapter<P>
 where
@@ -122,6 +93,76 @@ where
     }
 }
 
+fn to_table_projection(proj: &ScanProjection) -> table_types::ScanProjection {
+    match proj {
+        ScanProjection::Column(p) => table_types::ScanProjection::Column(p.clone()),
+        ScanProjection::Computed { expr, alias } => table_types::ScanProjection::Computed {
+            expr: expr.clone(),
+            alias: alias.clone(),
+        },
+    }
+}
+
+fn to_table_order(order: llkv_scan::ScanOrderSpec) -> table_types::ScanOrderSpec {
+    table_types::ScanOrderSpec {
+        field_id: order.field_id,
+        direction: match order.direction {
+            llkv_scan::ScanOrderDirection::Ascending => table_types::ScanOrderDirection::Ascending,
+            llkv_scan::ScanOrderDirection::Descending => table_types::ScanOrderDirection::Descending,
+        },
+        nulls_first: order.nulls_first,
+        transform: match order.transform {
+            llkv_scan::ScanOrderTransform::IdentityInt64 => {
+                table_types::ScanOrderTransform::IdentityInt64
+            }
+            llkv_scan::ScanOrderTransform::IdentityInt32 => {
+                table_types::ScanOrderTransform::IdentityInt32
+            }
+            llkv_scan::ScanOrderTransform::IdentityUtf8 => {
+                table_types::ScanOrderTransform::IdentityUtf8
+            }
+            llkv_scan::ScanOrderTransform::CastUtf8ToInteger => {
+                table_types::ScanOrderTransform::CastUtf8ToInteger
+            }
+        },
+    }
+}
+
+fn to_table_options<P>(options: ScanStreamOptions<P>) -> table_types::ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    table_types::ScanStreamOptions {
+        include_nulls: options.include_nulls,
+        order: options.order.map(to_table_order),
+        row_id_filter: options
+            .row_id_filter
+            .map(|f| std::sync::Arc::new(ScanRowIdFilterShim { inner: f }) as _),
+    }
+}
+
+struct ScanRowIdFilterShim<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    inner: std::sync::Arc<dyn llkv_scan::RowIdFilter<P>>,
+}
+
+impl<P> table_types::RowIdFilter<P> for ScanRowIdFilterShim<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn filter(
+        &self,
+        table: &llkv_table::table::Table<P>,
+        row_ids: Treemap,
+    ) -> llkv_result::Result<Treemap> {
+        self.inner
+            .filter(table.table_id(), table, row_ids)
+            .map_err(llkv_result::Error::from)
+    }
+}
+
 /// Thin wrapper capturing what the executor needs to run a scan.
 pub struct ScanExecutor<'a, P, S>
 where
@@ -164,9 +205,12 @@ where
         // Features still routed through llkv-table's scan_stream for correctness.
         if options.order.is_some() || options.row_id_filter.is_some() {
             if let Some(adapter) = self.storage.as_any().downcast_ref::<crate::types::TableStorageAdapter<P>>() {
+                let table_projections: Vec<table_types::ScanProjection> =
+                    projections.iter().map(to_table_projection).collect();
+                let table_options = to_table_options(options);
                 return adapter
                     .table()
-                    .scan_stream_with_exprs(projections, filter_expr, options, on_batch)
+                    .scan_stream_with_exprs(&table_projections, filter_expr, table_options, on_batch)
                     .map_err(Error::from);
             }
             return Err(Error::InvalidArgumentError(
@@ -208,8 +252,8 @@ where
                     }
                     let fallback = lfid.field_id().to_string();
                     let output_name = p.alias.clone().unwrap_or(fallback);
-                    projection_evals.push(row_stream::ProjectionEval::Column(
-                        row_stream::ColumnProjectionInfo {
+                    projection_evals.push(ProjectionEval::Column(
+                        ColumnProjectionInfo {
                             logical_field_id: lfid,
                             data_type: dtype,
                             output_name,
@@ -233,8 +277,8 @@ where
                             unique_lfids.push(lfid);
                         }
                     }
-                    projection_evals.push(row_stream::ProjectionEval::Computed(
-                        row_stream::ComputedProjectionInfo {
+                    projection_evals.push(ProjectionEval::Computed(
+                        ComputedProjectionInfo {
                             expr: simplified,
                             alias: alias.clone(),
                         },
@@ -246,7 +290,7 @@ where
         let passthrough_fields: Vec<Option<llkv_table::types::FieldId>> = projection_evals
             .iter()
             .map(|eval| match eval {
-                row_stream::ProjectionEval::Computed(info) => {
+                ProjectionEval::Computed(info) => {
                     llkv_table::NumericKernels::passthrough_column(&info.expr)
                 }
                 _ => None,
@@ -262,7 +306,7 @@ where
         let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
             matches!(
                 eval,
-                row_stream::ProjectionEval::Computed(info)
+                ProjectionEval::Computed(info)
                 if passthrough_fields[idx].is_none()
                     && llkv_compute::analysis::computed_expr_requires_numeric(&info.expr)
             )
@@ -272,14 +316,14 @@ where
             Vec::with_capacity(projection_evals.len());
         for (idx, eval) in projection_evals.iter().enumerate() {
             match eval {
-                row_stream::ProjectionEval::Column(info) => schema_fields.push(
+                ProjectionEval::Column(info) => schema_fields.push(
                     arrow::datatypes::Field::new(
                         info.output_name.clone(),
                         info.data_type.clone(),
                         true,
                     ),
                 ),
-                row_stream::ProjectionEval::Computed(info) => {
+                ProjectionEval::Computed(info) => {
                     if let Some(fid) = passthrough_fields[idx] {
                         let lfid = LogicalFieldId::for_user(self.table_id(), fid);
                         let dtype = lfid_dtypes.get(&lfid).cloned().ok_or_else(|| {

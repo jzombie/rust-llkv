@@ -13,7 +13,9 @@ use std::collections::HashMap;
 
 use crate::constants::STREAM_BATCH_ROWS;
 use llkv_column_map::ColumnStore;
-use llkv_column_map::store::{GatherNullPolicy, IndexKind, Projection, ROW_ID_COLUMN_NAME};
+use llkv_column_map::store::{
+    GatherNullPolicy, IndexKind, MultiGatherContext, Projection, ROW_ID_COLUMN_NAME,
+};
 use llkv_storage::pager::{MemPager, Pager};
 use llkv_types::ids::{LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -21,8 +23,11 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::reserved::is_reserved_table_id;
 use crate::sys_catalog::{ColMeta, SysCatalog, TableMeta};
 use crate::types::FieldId;
-use llkv_expr::{Expr, ScalarExpr};
+use llkv_expr::{Expr, Filter, Operator, ScalarExpr};
+use llkv_scan::{ScanOrderDirection as SharedScanOrderDirection, ScanOrderSpec as SharedScanOrderSpec, ScanOrderTransform as SharedScanOrderTransform, ScanProjection as SharedScanProjection, ScanStorage, ScanStreamOptions as SharedScanStreamOptions};
 use llkv_result::{Error, Result as LlkvResult};
+use std::ops::Bound;
+use crate::ROW_ID_FIELD_ID;
 
 /// Cached information about which system columns exist in the table schema.
 /// This avoids repeated string comparisons in hot paths like append().
@@ -633,6 +638,25 @@ where
         TablePlanner::new(self).scan_stream_with_exprs(projections, filter_expr, options, on_batch)
     }
 
+    // TODO: Remove
+    /// Temporary bridge: accept shared scan projections/options and dispatch to the
+    /// existing scan engine. This eases migration toward `llkv-scan`.
+    pub fn scan_stream_shared<'a, F>(
+        &self,
+        projections: &[SharedScanProjection],
+        filter_expr: &Expr<'a, FieldId>,
+        options: SharedScanStreamOptions<P>,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(RecordBatch),
+    {
+        let local_projections: Vec<ScanProjection> =
+            projections.iter().map(shared_to_local_projection).collect();
+        let local_options = shared_to_local_options(options);
+        self.scan_stream_with_exprs(&local_projections, filter_expr, local_options, on_batch)
+    }
+
     pub fn filter_row_ids<'a>(&self, filter_expr: &Expr<'a, FieldId>) -> LlkvResult<Treemap> {
         let source = collect_row_ids_for_table(self, filter_expr)?;
         Ok(match source {
@@ -786,6 +810,128 @@ where
                 self.store.total_rows_for_table(self.table_id)
             }
         }
+    }
+}
+
+impl<P> ScanStorage<P> for Table<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn table_id(&self) -> TableId {
+        self.table_id
+    }
+
+    fn field_data_type(&self, fid: LogicalFieldId) -> LlkvResult<DataType> {
+        self.store.data_type(fid)
+    }
+
+    fn total_rows(&self) -> LlkvResult<u64> {
+        Table::total_rows(self)
+    }
+
+    fn prepare_gather_context(
+        &self,
+        logical_fields: &[LogicalFieldId],
+    ) -> LlkvResult<MultiGatherContext> {
+        self.store.prepare_gather_context(logical_fields)
+    }
+
+    fn gather_row_window_with_context(
+        &self,
+        logical_fields: &[LogicalFieldId],
+        row_ids: &[u64],
+        null_policy: GatherNullPolicy,
+        ctx: Option<&mut MultiGatherContext>,
+    ) -> LlkvResult<RecordBatch> {
+        self.store
+            .gather_row_window_with_context(logical_fields, row_ids, null_policy, ctx)
+    }
+
+    fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<Treemap> {
+        self.filter_row_ids(filter_expr)
+    }
+
+    fn stream_row_ids(
+        &self,
+        chunk_size: usize,
+        on_chunk: &mut dyn FnMut(Vec<u64>) -> LlkvResult<()>,
+    ) -> LlkvResult<()> {
+        let ids = self.filter_row_ids(&Expr::Pred(Filter {
+            field_id: ROW_ID_FIELD_ID,
+            op: Operator::Range {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+        }))?;
+        let mut buffer = Vec::new();
+        for chunk in ids.iter().collect::<Vec<_>>().chunks(chunk_size.max(1)) {
+            buffer.clear();
+            buffer.extend_from_slice(chunk);
+            on_chunk(buffer.clone())?;
+        }
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn shared_to_local_projection(proj: &SharedScanProjection) -> ScanProjection {
+    match proj {
+        SharedScanProjection::Column(p) => ScanProjection::Column(p.clone()),
+        SharedScanProjection::Computed { expr, alias } => ScanProjection::Computed {
+            expr: expr.clone(),
+            alias: alias.clone(),
+        },
+    }
+}
+
+fn shared_to_local_order(order: SharedScanOrderSpec) -> ScanOrderSpec {
+    ScanOrderSpec {
+        field_id: order.field_id,
+        direction: match order.direction {
+            SharedScanOrderDirection::Ascending => ScanOrderDirection::Ascending,
+            SharedScanOrderDirection::Descending => ScanOrderDirection::Descending,
+        },
+        nulls_first: order.nulls_first,
+        transform: match order.transform {
+            SharedScanOrderTransform::IdentityInt64 => ScanOrderTransform::IdentityInt64,
+            SharedScanOrderTransform::IdentityInt32 => ScanOrderTransform::IdentityInt32,
+            SharedScanOrderTransform::IdentityUtf8 => ScanOrderTransform::IdentityUtf8,
+            SharedScanOrderTransform::CastUtf8ToInteger => ScanOrderTransform::CastUtf8ToInteger,
+        },
+    }
+}
+
+fn shared_to_local_options<P>(options: SharedScanStreamOptions<P>) -> ScanStreamOptions<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    ScanStreamOptions {
+        include_nulls: options.include_nulls,
+        order: options.order.map(shared_to_local_order),
+        row_id_filter: options
+            .row_id_filter
+            .map(|f| std::sync::Arc::new(SharedRowIdFilterShim { inner: f }) as _),
+    }
+}
+
+struct SharedRowIdFilterShim<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    inner: std::sync::Arc<dyn llkv_scan::RowIdFilter<P>>,
+}
+
+impl<P> RowIdFilter<P> for SharedRowIdFilterShim<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> LlkvResult<Treemap> {
+        self.inner
+            .filter(table.table_id, table, row_ids)
+            .map_err(Error::from)
     }
 }
 

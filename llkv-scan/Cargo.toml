@@ -1,0 +1,29 @@
+[package]
+name = "llkv-scan"
+description = "Shared scan interfaces and streaming helpers for LLKV."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-schema.workspace = true
+arrow-array.workspace = true
+llkv-column-map.workspace = true
+llkv-compute.workspace = true
+llkv-expr.workspace = true
+llkv-result.workspace = true
+llkv-storage.workspace = true
+llkv-types.workspace = true
+rustc-hash.workspace = true
+simd-r-drive-entry-handle.workspace = true
+croaring.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true
