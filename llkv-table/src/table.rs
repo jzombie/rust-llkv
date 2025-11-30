@@ -1579,6 +1579,24 @@ mod tests {
     }
 
     #[test]
+    fn row_id_chunk_emitter_reverses_sorted_runs() {
+        let array = UInt64Array::from(vec![10_u64, 20, 30, 40, 50]);
+        let mut emitted: Vec<RowId> = Vec::new();
+
+        {
+            let mut on_chunk = |chunk: Vec<RowId>| -> LlkvResult<()> {
+                emitted.extend(chunk);
+                Ok(())
+            };
+            let mut emitter = RowIdChunkEmitter::new(2, true, &mut on_chunk);
+            emitter.extend_sorted_run(&array, 0, array.len());
+            emitter.finish().unwrap();
+        }
+
+        assert_eq!(emitted, vec![50, 40, 30, 20, 10]);
+    }
+
+    #[test]
     fn table_new_rejects_reserved_table_id() {
         let result = Table::from_id(CATALOG_TABLE_ID, Arc::new(MemPager::default()));
         assert!(matches!(
