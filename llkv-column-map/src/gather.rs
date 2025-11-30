@@ -279,7 +279,6 @@ impl<'a> RowLocator<'a> {
     }
 }
 
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_rows_from_chunks_string<O>(
     row_ids: &[u64],

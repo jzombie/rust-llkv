@@ -22,8 +22,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Field, Float32Type, Float64Type,
-    Int16Type, Int32Type, Int64Type, Int8Type, Schema, UInt16Type, UInt32Type, UInt64Type,
-    UInt8Type,
+    Int8Type, Int16Type, Int32Type, Int64Type, Schema, UInt8Type, UInt16Type, UInt32Type,
+    UInt64Type,
 };
 use arrow::record_batch::RecordBatch;
 use llkv_result::{Error, Result};
@@ -97,12 +97,36 @@ impl GatherNullPolicy {
 /// Keeps cached chunk blobs and row indexes so repeated projection passes avoid redundant pager
 /// reads.
 enum ColumnOutputBuilder {
-    Utf8(GenericStringBuilder<i32>),
-    LargeUtf8(GenericStringBuilder<i64>),
-    Binary(GenericBinaryBuilder<i32>),
-    LargeBinary(GenericBinaryBuilder<i64>),
-    Boolean(BooleanBuilder),
-    Decimal128(Decimal128Builder),
+    Utf8 {
+        builder: GenericStringBuilder<i32>,
+        len_capacity: usize,
+        value_capacity: usize,
+    },
+    LargeUtf8 {
+        builder: GenericStringBuilder<i64>,
+        len_capacity: usize,
+        value_capacity: usize,
+    },
+    Binary {
+        builder: GenericBinaryBuilder<i32>,
+        len_capacity: usize,
+        value_capacity: usize,
+    },
+    LargeBinary {
+        builder: GenericBinaryBuilder<i64>,
+        len_capacity: usize,
+        value_capacity: usize,
+    },
+    Boolean {
+        builder: BooleanBuilder,
+        len_capacity: usize,
+    },
+    Decimal128 {
+        builder: Decimal128Builder,
+        len_capacity: usize,
+        precision: u8,
+        scale: i8,
+    },
     Primitive(PrimitiveBuilderKind),
     Passthrough,
 }
@@ -111,18 +135,43 @@ impl ColumnOutputBuilder {
     fn from_dtype(dtype: &DataType) -> Result<Self> {
         use DataType::*;
         let builder = match dtype {
-            Utf8 => ColumnOutputBuilder::Utf8(GenericStringBuilder::<i32>::new()),
-            LargeUtf8 => ColumnOutputBuilder::LargeUtf8(GenericStringBuilder::<i64>::new()),
-            Binary => ColumnOutputBuilder::Binary(GenericBinaryBuilder::<i32>::new()),
-            LargeBinary => ColumnOutputBuilder::LargeBinary(GenericBinaryBuilder::<i64>::new()),
-            Boolean => ColumnOutputBuilder::Boolean(BooleanBuilder::new()),
-            Decimal128(precision, scale) => ColumnOutputBuilder::Decimal128(
-                Decimal128Builder::new()
+            Utf8 => ColumnOutputBuilder::Utf8 {
+                builder: GenericStringBuilder::<i32>::new(),
+                len_capacity: 0,
+                value_capacity: 0,
+            },
+            LargeUtf8 => ColumnOutputBuilder::LargeUtf8 {
+                builder: GenericStringBuilder::<i64>::new(),
+                len_capacity: 0,
+                value_capacity: 0,
+            },
+            Binary => ColumnOutputBuilder::Binary {
+                builder: GenericBinaryBuilder::<i32>::new(),
+                len_capacity: 0,
+                value_capacity: 0,
+            },
+            LargeBinary => ColumnOutputBuilder::LargeBinary {
+                builder: GenericBinaryBuilder::<i64>::new(),
+                len_capacity: 0,
+                value_capacity: 0,
+            },
+            Boolean => ColumnOutputBuilder::Boolean {
+                builder: BooleanBuilder::new(),
+                len_capacity: 0,
+            },
+            Decimal128(precision, scale) => {
+                let builder = Decimal128Builder::new()
                     .with_precision_and_scale(*precision, *scale)
-                    .map_err(|e| Error::Internal(format!(
-                        "invalid Decimal128 precision/scale: {e}"
-                    )))?,
-            ),
+                    .map_err(|e| {
+                        Error::Internal(format!("invalid Decimal128 precision/scale: {e}"))
+                    })?;
+                ColumnOutputBuilder::Decimal128 {
+                    builder,
+                    len_capacity: 0,
+                    precision: *precision,
+                    scale: *scale,
+                }
+            }
             Struct(_) => ColumnOutputBuilder::Passthrough,
             other => {
                 if let Some(kind) = PrimitiveBuilderKind::for_type(other) {
@@ -136,43 +185,276 @@ impl ColumnOutputBuilder {
         };
         Ok(builder)
     }
+
+    fn reserve_for_len(&mut self, len: usize, value_bytes_hint: usize) {
+        match self {
+            ColumnOutputBuilder::Utf8 {
+                builder,
+                len_capacity,
+                value_capacity,
+            } => {
+                ensure_string_capacity(builder, len_capacity, value_capacity, len, value_bytes_hint)
+            }
+            ColumnOutputBuilder::LargeUtf8 {
+                builder,
+                len_capacity,
+                value_capacity,
+            } => {
+                ensure_string_capacity(builder, len_capacity, value_capacity, len, value_bytes_hint)
+            }
+            ColumnOutputBuilder::Binary {
+                builder,
+                len_capacity,
+                value_capacity,
+            } => {
+                ensure_binary_capacity(builder, len_capacity, value_capacity, len, value_bytes_hint)
+            }
+            ColumnOutputBuilder::LargeBinary {
+                builder,
+                len_capacity,
+                value_capacity,
+            } => {
+                ensure_binary_capacity(builder, len_capacity, value_capacity, len, value_bytes_hint)
+            }
+            ColumnOutputBuilder::Boolean {
+                builder,
+                len_capacity,
+            } => ensure_boolean_capacity(builder, len_capacity, len),
+            ColumnOutputBuilder::Decimal128 {
+                builder,
+                len_capacity,
+                precision,
+                scale,
+            } => ensure_decimal_capacity(builder, len_capacity, len, *precision, *scale),
+            ColumnOutputBuilder::Primitive(kind) => {
+                kind.reserve_for_len(len);
+            }
+            ColumnOutputBuilder::Passthrough => {}
+        }
+    }
 }
 
 enum PrimitiveBuilderKind {
-    UInt64(PrimitiveBuilder<UInt64Type>),
-    UInt32(PrimitiveBuilder<UInt32Type>),
-    UInt16(PrimitiveBuilder<UInt16Type>),
-    UInt8(PrimitiveBuilder<UInt8Type>),
-    Int64(PrimitiveBuilder<Int64Type>),
-    Int32(PrimitiveBuilder<Int32Type>),
-    Int16(PrimitiveBuilder<Int16Type>),
-    Int8(PrimitiveBuilder<Int8Type>),
-    Float64(PrimitiveBuilder<Float64Type>),
-    Float32(PrimitiveBuilder<Float32Type>),
-    Date64(PrimitiveBuilder<Date64Type>),
-    Date32(PrimitiveBuilder<Date32Type>),
+    UInt64 {
+        builder: PrimitiveBuilder<UInt64Type>,
+        len_capacity: usize,
+    },
+    UInt32 {
+        builder: PrimitiveBuilder<UInt32Type>,
+        len_capacity: usize,
+    },
+    UInt16 {
+        builder: PrimitiveBuilder<UInt16Type>,
+        len_capacity: usize,
+    },
+    UInt8 {
+        builder: PrimitiveBuilder<UInt8Type>,
+        len_capacity: usize,
+    },
+    Int64 {
+        builder: PrimitiveBuilder<Int64Type>,
+        len_capacity: usize,
+    },
+    Int32 {
+        builder: PrimitiveBuilder<Int32Type>,
+        len_capacity: usize,
+    },
+    Int16 {
+        builder: PrimitiveBuilder<Int16Type>,
+        len_capacity: usize,
+    },
+    Int8 {
+        builder: PrimitiveBuilder<Int8Type>,
+        len_capacity: usize,
+    },
+    Float64 {
+        builder: PrimitiveBuilder<Float64Type>,
+        len_capacity: usize,
+    },
+    Float32 {
+        builder: PrimitiveBuilder<Float32Type>,
+        len_capacity: usize,
+    },
+    Date64 {
+        builder: PrimitiveBuilder<Date64Type>,
+        len_capacity: usize,
+    },
+    Date32 {
+        builder: PrimitiveBuilder<Date32Type>,
+        len_capacity: usize,
+    },
 }
 
 impl PrimitiveBuilderKind {
     fn for_type(dtype: &DataType) -> Option<Self> {
         use DataType::*;
         Some(match dtype {
-            UInt64 => PrimitiveBuilderKind::UInt64(PrimitiveBuilder::<UInt64Type>::new()),
-            UInt32 => PrimitiveBuilderKind::UInt32(PrimitiveBuilder::<UInt32Type>::new()),
-            UInt16 => PrimitiveBuilderKind::UInt16(PrimitiveBuilder::<UInt16Type>::new()),
-            UInt8 => PrimitiveBuilderKind::UInt8(PrimitiveBuilder::<UInt8Type>::new()),
-            Int64 => PrimitiveBuilderKind::Int64(PrimitiveBuilder::<Int64Type>::new()),
-            Int32 => PrimitiveBuilderKind::Int32(PrimitiveBuilder::<Int32Type>::new()),
-            Int16 => PrimitiveBuilderKind::Int16(PrimitiveBuilder::<Int16Type>::new()),
-            Int8 => PrimitiveBuilderKind::Int8(PrimitiveBuilder::<Int8Type>::new()),
-            Float64 => PrimitiveBuilderKind::Float64(PrimitiveBuilder::<Float64Type>::new()),
-            Float32 => PrimitiveBuilderKind::Float32(PrimitiveBuilder::<Float32Type>::new()),
-            Date64 => PrimitiveBuilderKind::Date64(PrimitiveBuilder::<Date64Type>::new()),
-            Date32 => PrimitiveBuilderKind::Date32(PrimitiveBuilder::<Date32Type>::new()),
+            UInt64 => PrimitiveBuilderKind::UInt64 {
+                builder: PrimitiveBuilder::<UInt64Type>::new(),
+                len_capacity: 0,
+            },
+            UInt32 => PrimitiveBuilderKind::UInt32 {
+                builder: PrimitiveBuilder::<UInt32Type>::new(),
+                len_capacity: 0,
+            },
+            UInt16 => PrimitiveBuilderKind::UInt16 {
+                builder: PrimitiveBuilder::<UInt16Type>::new(),
+                len_capacity: 0,
+            },
+            UInt8 => PrimitiveBuilderKind::UInt8 {
+                builder: PrimitiveBuilder::<UInt8Type>::new(),
+                len_capacity: 0,
+            },
+            Int64 => PrimitiveBuilderKind::Int64 {
+                builder: PrimitiveBuilder::<Int64Type>::new(),
+                len_capacity: 0,
+            },
+            Int32 => PrimitiveBuilderKind::Int32 {
+                builder: PrimitiveBuilder::<Int32Type>::new(),
+                len_capacity: 0,
+            },
+            Int16 => PrimitiveBuilderKind::Int16 {
+                builder: PrimitiveBuilder::<Int16Type>::new(),
+                len_capacity: 0,
+            },
+            Int8 => PrimitiveBuilderKind::Int8 {
+                builder: PrimitiveBuilder::<Int8Type>::new(),
+                len_capacity: 0,
+            },
+            Float64 => PrimitiveBuilderKind::Float64 {
+                builder: PrimitiveBuilder::<Float64Type>::new(),
+                len_capacity: 0,
+            },
+            Float32 => PrimitiveBuilderKind::Float32 {
+                builder: PrimitiveBuilder::<Float32Type>::new(),
+                len_capacity: 0,
+            },
+            Date64 => PrimitiveBuilderKind::Date64 {
+                builder: PrimitiveBuilder::<Date64Type>::new(),
+                len_capacity: 0,
+            },
+            Date32 => PrimitiveBuilderKind::Date32 {
+                builder: PrimitiveBuilder::<Date32Type>::new(),
+                len_capacity: 0,
+            },
             _ => return None,
         })
     }
 
+    fn reserve_for_len(&mut self, len: usize) {
+        match self {
+            PrimitiveBuilderKind::UInt64 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::UInt32 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::UInt16 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::UInt8 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Int64 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Int32 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Int16 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Int8 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Float64 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Float32 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Date64 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+            PrimitiveBuilderKind::Date32 {
+                builder,
+                len_capacity,
+            } => ensure_primitive_capacity(builder, len_capacity, len),
+        }
+    }
+}
+
+fn ensure_string_capacity<O: OffsetSizeTrait>(
+    builder: &mut GenericStringBuilder<O>,
+    len_capacity: &mut usize,
+    value_capacity: &mut usize,
+    len: usize,
+    value_bytes_hint: usize,
+) {
+    let required_values = value_bytes_hint.max(len);
+    if *len_capacity < len || *value_capacity < required_values {
+        *builder = GenericStringBuilder::<O>::with_capacity(len, required_values);
+        *len_capacity = len;
+        *value_capacity = required_values;
+    }
+}
+
+fn ensure_binary_capacity<O: OffsetSizeTrait>(
+    builder: &mut GenericBinaryBuilder<O>,
+    len_capacity: &mut usize,
+    value_capacity: &mut usize,
+    len: usize,
+    value_bytes_hint: usize,
+) {
+    let required_values = value_bytes_hint.max(len);
+    if *len_capacity < len || *value_capacity < required_values {
+        *builder = GenericBinaryBuilder::<O>::with_capacity(len, required_values);
+        *len_capacity = len;
+        *value_capacity = required_values;
+    }
+}
+
+fn ensure_boolean_capacity(builder: &mut BooleanBuilder, len_capacity: &mut usize, len: usize) {
+    if *len_capacity < len {
+        *builder = BooleanBuilder::with_capacity(len);
+        *len_capacity = len;
+    }
+}
+
+fn ensure_decimal_capacity(
+    builder: &mut Decimal128Builder,
+    len_capacity: &mut usize,
+    len: usize,
+    precision: u8,
+    scale: i8,
+) {
+    if *len_capacity < len {
+        *builder = Decimal128Builder::with_capacity(len)
+            .with_data_type(DataType::Decimal128(precision, scale));
+        *len_capacity = len;
+    }
+}
+
+fn ensure_primitive_capacity<T: ArrowPrimitiveType>(
+    builder: &mut PrimitiveBuilder<T>,
+    len_capacity: &mut usize,
+    len: usize,
+) {
+    if *len_capacity < len {
+        *builder = PrimitiveBuilder::<T>::with_capacity(len);
+        *len_capacity = len;
+    }
 }
 
 pub struct MultiGatherContext {
@@ -330,6 +612,22 @@ struct FieldPlan {
     value_metas: Vec<ChunkMetadata>,
     row_metas: Vec<ChunkMetadata>,
     candidate_indices: Vec<usize>,
+    avg_value_bytes_per_row: f64,
+}
+
+impl FieldPlan {
+    fn value_bytes_hint(&self, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        if self.avg_value_bytes_per_row <= 0.0 {
+            // Fallback to at least reserving space for one byte per value so builders grow monotonically.
+            len
+        } else {
+            let estimated = (self.avg_value_bytes_per_row * len as f64).ceil() as usize;
+            estimated.max(len)
+        }
+    }
 }
 
 impl<P> ColumnStore<P>
@@ -418,15 +716,32 @@ where
                 ));
             }
 
+            let avg_value_bytes_per_row = Self::average_value_bytes_per_row(&value_metas);
+
             plans.push(FieldPlan {
                 dtype: dtype.clone(),
                 value_metas,
                 row_metas,
                 candidate_indices: Vec::new(),
+                avg_value_bytes_per_row,
             });
         }
 
         MultiGatherContext::new(field_infos, plans)
+    }
+
+    fn average_value_bytes_per_row(metas: &[ChunkMetadata]) -> f64 {
+        let mut total_rows = 0u64;
+        let mut total_bytes = 0u64;
+        for meta in metas {
+            total_rows += meta.row_count;
+            total_bytes += meta.serialized_bytes;
+        }
+        if total_rows == 0 {
+            0.0
+        } else {
+            total_bytes as f64 / total_rows as f64
+        }
     }
 
     /// Gathers rows while reusing chunk caches and scratch buffers stored in the context.
@@ -570,85 +885,18 @@ where
 
             let allow_missing = policy.allow_missing();
             let mut builders = ctx.take_builders();
+            for (plan, builder) in ctx.plans().iter().zip(builders.iter_mut()) {
+                let value_bytes_hint = plan.value_bytes_hint(len);
+                builder.reserve_for_len(len, value_bytes_hint);
+            }
 
             let outputs = {
                 let chunk_arrays = ctx.chunk_cache();
                 let mut column_outputs = Vec::with_capacity(ctx.plans().len());
                 for (plan, builder) in ctx.plans().iter().zip(builders.iter_mut()) {
                     let array = match builder {
-                    ColumnOutputBuilder::Utf8(builder) => Self::gather_rows_from_chunks_string::<i32>(
-                        row_ids,
-                        row_locator,
-                        len,
-                        &plan.candidate_indices,
-                        plan,
-                        chunk_arrays,
-                        &mut row_scratch,
-                        allow_missing,
-                        builder,
-                    ),
-                    ColumnOutputBuilder::LargeUtf8(builder) => {
-                        Self::gather_rows_from_chunks_string::<i64>(
-                            row_ids,
-                            row_locator,
-                            len,
-                            &plan.candidate_indices,
-                            plan,
-                            chunk_arrays,
-                            &mut row_scratch,
-                            allow_missing,
-                            builder,
-                        )
-                    }
-                    ColumnOutputBuilder::Binary(builder) => Self::gather_rows_from_chunks_binary::<i32>(
-                        row_ids,
-                        row_locator,
-                        len,
-                        &plan.candidate_indices,
-                        plan,
-                        chunk_arrays,
-                        &mut row_scratch,
-                        allow_missing,
-                        builder,
-                    ),
-                    ColumnOutputBuilder::LargeBinary(builder) => {
-                        Self::gather_rows_from_chunks_binary::<i64>(
-                            row_ids,
-                            row_locator,
-                            len,
-                            &plan.candidate_indices,
-                            plan,
-                            chunk_arrays,
-                            &mut row_scratch,
-                            allow_missing,
-                            builder,
-                        )
-                    }
-                    ColumnOutputBuilder::Boolean(builder) => Self::gather_rows_from_chunks_bool(
-                        row_ids,
-                        row_locator,
-                        len,
-                        &plan.candidate_indices,
-                        plan,
-                        chunk_arrays,
-                        &mut row_scratch,
-                        allow_missing,
-                        builder,
-                    ),
-                    ColumnOutputBuilder::Decimal128(builder) => Self::gather_rows_from_chunks_decimal128(
-                        row_ids,
-                        row_locator,
-                        len,
-                        &plan.candidate_indices,
-                        plan,
-                        chunk_arrays,
-                        &mut row_scratch,
-                        allow_missing,
-                        builder,
-                    ),
-                    ColumnOutputBuilder::Primitive(kind) => match kind {
-                        PrimitiveBuilderKind::UInt64(builder) => {
-                            Self::gather_rows_from_chunks::<UInt64Type>(
+                        ColumnOutputBuilder::Utf8 { builder, .. } => {
+                            Self::gather_rows_from_chunks_string::<i32>(
                                 row_ids,
                                 row_locator,
                                 len,
@@ -660,8 +908,8 @@ where
                                 builder,
                             )
                         }
-                        PrimitiveBuilderKind::UInt32(builder) => {
-                            Self::gather_rows_from_chunks::<UInt32Type>(
+                        ColumnOutputBuilder::LargeUtf8 { builder, .. } => {
+                            Self::gather_rows_from_chunks_string::<i64>(
                                 row_ids,
                                 row_locator,
                                 len,
@@ -673,8 +921,8 @@ where
                                 builder,
                             )
                         }
-                        PrimitiveBuilderKind::UInt16(builder) => {
-                            Self::gather_rows_from_chunks::<UInt16Type>(
+                        ColumnOutputBuilder::Binary { builder, .. } => {
+                            Self::gather_rows_from_chunks_binary::<i32>(
                                 row_ids,
                                 row_locator,
                                 len,
@@ -686,8 +934,8 @@ where
                                 builder,
                             )
                         }
-                        PrimitiveBuilderKind::UInt8(builder) => {
-                            Self::gather_rows_from_chunks::<UInt8Type>(
+                        ColumnOutputBuilder::LargeBinary { builder, .. } => {
+                            Self::gather_rows_from_chunks_binary::<i64>(
                                 row_ids,
                                 row_locator,
                                 len,
@@ -699,8 +947,8 @@ where
                                 builder,
                             )
                         }
-                        PrimitiveBuilderKind::Int64(builder) => {
-                            Self::gather_rows_from_chunks::<Int64Type>(
+                        ColumnOutputBuilder::Boolean { builder, .. } => {
+                            Self::gather_rows_from_chunks_bool(
                                 row_ids,
                                 row_locator,
                                 len,
@@ -712,8 +960,8 @@ where
                                 builder,
                             )
                         }
-                        PrimitiveBuilderKind::Int32(builder) => {
-                            Self::gather_rows_from_chunks::<Int32Type>(
+                        ColumnOutputBuilder::Decimal128 { builder, .. } => {
+                            Self::gather_rows_from_chunks_decimal128(
                                 row_ids,
                                 row_locator,
                                 len,
@@ -725,9 +973,166 @@ where
                                 builder,
                             )
                         }
-                        PrimitiveBuilderKind::Int16(builder) => {
-                            Self::gather_rows_from_chunks::<Int16Type>(
-                                row_ids,
+                        ColumnOutputBuilder::Primitive(kind) => match kind {
+                            PrimitiveBuilderKind::UInt64 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<UInt64Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::UInt32 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<UInt32Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::UInt16 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<UInt16Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::UInt8 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<UInt8Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Int64 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Int64Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Int32 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Int32Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Int16 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Int16Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Int8 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Int8Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Float64 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Float64Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Float32 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Float32Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Date64 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Date64Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                            PrimitiveBuilderKind::Date32 { builder, .. } => {
+                                Self::gather_rows_from_chunks::<Date32Type>(
+                                    row_ids,
+                                    row_locator,
+                                    len,
+                                    &plan.candidate_indices,
+                                    plan,
+                                    chunk_arrays,
+                                    &mut row_scratch,
+                                    allow_missing,
+                                    builder,
+                                )
+                            }
+                        },
+                        ColumnOutputBuilder::Passthrough => match &plan.dtype {
+                            DataType::Struct(_) => Self::gather_rows_from_chunks_struct(
                                 row_locator,
                                 len,
                                 &plan.candidate_indices,
@@ -735,90 +1140,12 @@ where
                                 chunk_arrays,
                                 &mut row_scratch,
                                 allow_missing,
-                                builder,
-                            )
-                        }
-                        PrimitiveBuilderKind::Int8(builder) => {
-                            Self::gather_rows_from_chunks::<Int8Type>(
-                                row_ids,
-                                row_locator,
-                                len,
-                                &plan.candidate_indices,
-                                plan,
-                                chunk_arrays,
-                                &mut row_scratch,
-                                allow_missing,
-                                builder,
-                            )
-                        }
-                        PrimitiveBuilderKind::Float64(builder) => {
-                            Self::gather_rows_from_chunks::<Float64Type>(
-                                row_ids,
-                                row_locator,
-                                len,
-                                &plan.candidate_indices,
-                                plan,
-                                chunk_arrays,
-                                &mut row_scratch,
-                                allow_missing,
-                                builder,
-                            )
-                        }
-                        PrimitiveBuilderKind::Float32(builder) => {
-                            Self::gather_rows_from_chunks::<Float32Type>(
-                                row_ids,
-                                row_locator,
-                                len,
-                                &plan.candidate_indices,
-                                plan,
-                                chunk_arrays,
-                                &mut row_scratch,
-                                allow_missing,
-                                builder,
-                            )
-                        }
-                        PrimitiveBuilderKind::Date64(builder) => {
-                            Self::gather_rows_from_chunks::<Date64Type>(
-                                row_ids,
-                                row_locator,
-                                len,
-                                &plan.candidate_indices,
-                                plan,
-                                chunk_arrays,
-                                &mut row_scratch,
-                                allow_missing,
-                                builder,
-                            )
-                        }
-                        PrimitiveBuilderKind::Date32(builder) => {
-                            Self::gather_rows_from_chunks::<Date32Type>(
-                                row_ids,
-                                row_locator,
-                                len,
-                                &plan.candidate_indices,
-                                plan,
-                                chunk_arrays,
-                                &mut row_scratch,
-                                allow_missing,
-                                builder,
-                            )
-                        }
-                    },
-                    ColumnOutputBuilder::Passthrough => match &plan.dtype {
-                        DataType::Struct(_) => Self::gather_rows_from_chunks_struct(
-                            row_locator,
-                            len,
-                            &plan.candidate_indices,
-                            plan,
-                            chunk_arrays,
-                            &mut row_scratch,
-                            allow_missing,
-                            &plan.dtype,
-                        ),
-                        other => Err(Error::Internal(format!(
-                            "gather_rows_multi: unsupported dtype {other:?}"
-                        ))),
-                    },
+                                &plan.dtype,
+                            ),
+                            other => Err(Error::Internal(format!(
+                                "gather_rows_multi: unsupported dtype {other:?}"
+                            ))),
+                        },
                     }?;
                     column_outputs.push(array);
                 }
@@ -943,7 +1270,6 @@ where
             builder,
         )
     }
-
 
     #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and avoids intermediate structs.
     fn gather_rows_from_chunks_binary<O>(

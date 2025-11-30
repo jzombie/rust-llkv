@@ -31,3 +31,6 @@ out.txt
 temp/
 
 vendor/
+
+# Temp
+*-PLAN.md
