@@ -128,7 +128,7 @@ where
             include_nulls: false,
             order: None,
             row_id_filter: None,
-            include_row_ids: true,
+            include_row_ids: false,
         }
     }
 }

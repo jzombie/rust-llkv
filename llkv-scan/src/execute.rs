@@ -11,17 +11,19 @@ use llkv_compute::projection::{
 };
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
-use llkv_types::{FieldId, LogicalFieldId};
+use llkv_types::{FieldId, LogicalFieldId, RowId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::row_stream::{
     ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream,
-    RowStreamBuilder,
+    RowStreamBuilder, materialize_row_window,
 };
 use crate::{ScanProjection, ScanStorage, ScanStreamOptions, ordering::sort_row_ids_with_order};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
+
+const ROW_STREAM_CHUNK_SIZE: usize = 1024;
 
 /// Execute a table scan using the shared scan machinery.
 pub fn execute_scan<'expr, P, S, F>(
@@ -146,6 +148,28 @@ where
         include_row_ids,
     } = options;
 
+    let can_stream_full_table = !include_row_ids
+        && row_id_filter.is_none()
+        && order.is_none()
+        && is_trivial_filter(filter_expr);
+
+    if can_stream_full_table {
+        stream_full_table_scan(
+            storage,
+            table_id,
+            &projection_evals,
+            &passthrough_fields,
+            &unique_index,
+            &unique_lfids,
+            &numeric_fields,
+            requires_numeric,
+            null_policy,
+            &out_schema,
+            on_batch,
+        )?;
+        return Ok(());
+    }
+
     let mut row_source = RowIdSource::Bitmap(storage.filter_row_ids(filter_expr)?);
 
     if row_id_filter.is_some() || order.is_some() {
@@ -189,19 +213,25 @@ where
         return Ok(());
     }
 
+    let projection_evals = Arc::new(projection_evals);
+    let passthrough_fields = Arc::new(passthrough_fields);
+    let unique_index = Arc::new(unique_index);
+    let unique_lfids = Arc::new(unique_lfids);
+    let numeric_fields = Arc::new(numeric_fields);
+
     let mut row_stream = RowStreamBuilder::new(
         storage,
         table_id,
         Arc::clone(&out_schema),
-        Arc::new(unique_lfids),
-        Arc::new(projection_evals),
-        Arc::new(passthrough_fields),
-        Arc::new(unique_index),
-        Arc::new(numeric_fields),
+        Arc::clone(&unique_lfids),
+        Arc::clone(&projection_evals),
+        Arc::clone(&passthrough_fields),
+        Arc::clone(&unique_index),
+        Arc::clone(&numeric_fields),
         requires_numeric,
         null_policy,
         row_source,
-        1024,
+        ROW_STREAM_CHUNK_SIZE,
         include_row_ids,
     )
     .build()?;
@@ -211,6 +241,78 @@ where
         let batch = chunk.to_record_batch();
         debug_assert_eq!(batch.num_columns(), expected_columns);
         if batch.num_rows() > 0 {
+            on_batch(batch);
+        }
+    }
+
+    Ok(())
+}
+
+fn stream_full_table_scan<P, S, F>(
+    storage: &S,
+    table_id: llkv_types::TableId,
+    projection_evals: &[ProjectionEval],
+    passthrough_fields: &[Option<FieldId>],
+    unique_index: &FxHashMap<LogicalFieldId, usize>,
+    unique_lfids: &[LogicalFieldId],
+    numeric_fields: &FxHashSet<FieldId>,
+    requires_numeric: bool,
+    null_policy: GatherNullPolicy,
+    out_schema: &Arc<Schema>,
+    on_batch: &mut F,
+) -> LlkvResult<()>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P>,
+    F: FnMut(RecordBatch),
+{
+    let mut gather_ctx = if unique_lfids.is_empty() {
+        None
+    } else {
+        Some(storage.prepare_gather_context(unique_lfids)?)
+    };
+
+    let mut emitted_rows = false;
+    let mut process_chunk = |chunk: Vec<RowId>| -> LlkvResult<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(batch) = materialize_row_window(
+            storage,
+            table_id,
+            unique_lfids,
+            projection_evals,
+            passthrough_fields,
+            unique_index,
+            numeric_fields,
+            requires_numeric,
+            null_policy,
+            out_schema,
+            chunk.as_slice(),
+            gather_ctx.as_mut(),
+        )? {
+            if batch.num_rows() > 0 {
+                emitted_rows = true;
+                on_batch(batch);
+            }
+        }
+
+        Ok(())
+    };
+
+    storage.stream_row_ids(ROW_STREAM_CHUNK_SIZE, &mut process_chunk)?;
+
+    if !emitted_rows {
+        let total_rows = storage.total_rows()?;
+        let row_count = usize::try_from(total_rows).map_err(|_| {
+            Error::InvalidArgumentError(
+                "table row count exceeds supported range for synthetic batch".into(),
+            )
+        })?;
+        let projection_literals = build_projection_literals(projection_evals, out_schema);
+        if let Some(batch) = emit_synthetic_null_batch(&projection_literals, out_schema, row_count)?
+        {
             on_batch(batch);
         }
     }
