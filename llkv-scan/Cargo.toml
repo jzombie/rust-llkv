@@ -1,6 +1,6 @@
 [package]
 name = "llkv-scan"
-description = "Shared scan interfaces and streaming helpers for LLKV."
+description = "Shared scan interfaces and streaming helpers for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
