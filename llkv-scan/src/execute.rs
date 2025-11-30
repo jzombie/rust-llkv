@@ -339,6 +339,7 @@ fn build_projection_literals(
         .collect()
 }
 
+// TODO: Dedupe (another version resides in llkv-scan)
 fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
     matches!(
         expr,

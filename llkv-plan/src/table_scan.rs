@@ -114,6 +114,7 @@ pub fn build_table_scan_plan(
     builder.finish()
 }
 
+// TODO: Dedupe (another version resides in llkv-scan)
 fn is_trivial_filter(filter_expr: &Expr<'_, FieldId>) -> bool {
     matches!(
         filter_expr,
