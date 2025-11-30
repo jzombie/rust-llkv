@@ -5,36 +5,47 @@ use std::sync::Arc;
 
 use llkv_expr::{CompareOp, Expr, Filter, Operator, ScalarExpr, literal::Literal};
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::FieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::types::FieldId;
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct ExprKey(*const ());
+struct ExprKey(*const ());
 
 impl ExprKey {
     #[inline]
-    pub(crate) fn new(expr: &Expr<'_, FieldId>) -> Self {
+    fn new(expr: &Expr<'_, FieldId>) -> Self {
         Self(expr as *const _ as *const ())
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ProgramSet<'expr> {
-    pub(crate) eval: EvalProgram,
-    pub(crate) domains: DomainRegistry,
+pub struct ProgramSet<'expr> {
+    eval: EvalProgram,
+    domains: DomainRegistry,
     _root_expr: Arc<Expr<'expr, FieldId>>,
 }
 
-impl<'expr> ProgramSet<'expr> {}
+impl<'expr> ProgramSet<'expr> {
+    pub fn eval_ops(&self) -> &[EvalOp] {
+        &self.eval.ops
+    }
+
+    pub fn domain(&self, id: DomainProgramId) -> Option<&DomainProgram> {
+        self.domains.domain(id)
+    }
+
+    pub fn root_domain(&self) -> Option<DomainProgramId> {
+        self.domains.root
+    }
+}
 
 #[derive(Debug, Default)]
-pub(crate) struct EvalProgram {
-    pub(crate) ops: Vec<EvalOp>,
+struct EvalProgram {
+    ops: Vec<EvalOp>,
 }
 
 #[derive(Debug)]
-pub(crate) enum EvalOp {
+pub enum EvalOp {
     PushPredicate(OwnedFilter),
     PushCompare {
         left: ScalarExpr<FieldId>,
@@ -67,13 +78,13 @@ pub(crate) enum EvalOp {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct OwnedFilter {
-    pub(crate) field_id: FieldId,
-    pub(crate) op: OwnedOperator,
+pub struct OwnedFilter {
+    pub field_id: FieldId,
+    pub op: OwnedOperator,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum OwnedOperator {
+pub enum OwnedOperator {
     Equals(Literal),
     Range {
         lower: Bound<Literal>,
@@ -101,7 +112,7 @@ pub(crate) enum OwnedOperator {
 }
 
 impl OwnedOperator {
-    pub(crate) fn to_operator(&self) -> Operator<'_> {
+    pub fn to_operator(&self) -> Operator<'_> {
         match self {
             Self::Equals(lit) => Operator::Equals(lit.clone()),
             Self::Range { lower, upper } => Operator::Range {
@@ -139,8 +150,6 @@ impl OwnedOperator {
         }
     }
 }
-
-impl OwnedFilter {}
 
 impl<'a> From<&'a Operator<'a>> for OwnedOperator {
     fn from(op: &'a Operator<'a>) -> Self {
@@ -191,40 +200,21 @@ impl<'a> From<&'a Filter<'a, FieldId>> for OwnedFilter {
     }
 }
 
-pub(crate) type DomainProgramId = u32;
+pub type DomainProgramId = u32;
 
 #[derive(Debug, Default)]
-pub(crate) struct DomainRegistry {
-    programs: Vec<DomainProgram>,
-    index: FxHashMap<ExprKey, DomainProgramId>,
-    root: Option<DomainProgramId>,
+pub struct DomainProgram {
+    ops: Vec<DomainOp>,
 }
 
-impl DomainRegistry {
-    pub(crate) fn domain(&self, id: DomainProgramId) -> Option<&DomainProgram> {
-        self.programs.get(id as usize)
+impl DomainProgram {
+    pub fn ops(&self) -> &[DomainOp] {
+        &self.ops
     }
-
-    fn ensure(&mut self, expr: &Expr<'_, FieldId>) -> DomainProgramId {
-        let key = ExprKey::new(expr);
-        if let Some(existing) = self.index.get(&key) {
-            return *existing;
-        }
-        let id = self.programs.len() as DomainProgramId;
-        let program = compile_domain(expr);
-        self.programs.push(program);
-        self.index.insert(key, id);
-        id
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct DomainProgram {
-    pub(crate) ops: Vec<DomainOp>,
 }
 
 #[derive(Debug)]
-pub(crate) enum DomainOp {
+pub enum DomainOp {
     PushFieldAll(FieldId),
     PushCompareDomain {
         left: ScalarExpr<FieldId>,
@@ -243,7 +233,6 @@ pub(crate) enum DomainOp {
         fields: Vec<FieldId>,
         negated: bool,
     },
-    PushLiteralFalse,
     PushAllRows,
     Union {
         child_count: usize,
@@ -253,17 +242,42 @@ pub(crate) enum DomainOp {
     },
 }
 
+#[derive(Debug, Default)]
+struct DomainRegistry {
+    programs: Vec<DomainProgram>,
+    index: FxHashMap<ExprKey, DomainProgramId>,
+    root: Option<DomainProgramId>,
+}
+
+impl DomainRegistry {
+    fn domain(&self, id: DomainProgramId) -> Option<&DomainProgram> {
+        self.programs.get(id as usize)
+    }
+
+    fn ensure(&mut self, expr: &Expr<'_, FieldId>) -> DomainProgramId {
+        let key = ExprKey::new(expr);
+        if let Some(existing) = self.index.get(&key) {
+            return *existing;
+        }
+        let id = self.programs.len() as DomainProgramId;
+        let program = compile_domain(expr);
+        self.programs.push(program);
+        self.index.insert(key, id);
+        id
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct ProgramCompiler<'expr> {
+pub struct ProgramCompiler<'expr> {
     root: Arc<Expr<'expr, FieldId>>,
 }
 
 impl<'expr> ProgramCompiler<'expr> {
-    pub(crate) fn new(root: Arc<Expr<'expr, FieldId>>) -> Self {
+    pub fn new(root: Arc<Expr<'expr, FieldId>>) -> Self {
         Self { root }
     }
 
-    pub(crate) fn compile(self) -> LlkvResult<ProgramSet<'expr>> {
+    pub fn compile(self) -> LlkvResult<ProgramSet<'expr>> {
         let ProgramCompiler { root } = self;
         let mut domains = DomainRegistry::default();
         let eval_ops = {
@@ -283,7 +297,7 @@ impl<'expr> ProgramCompiler<'expr> {
     }
 }
 
-pub(crate) fn normalize_predicate<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
+pub fn normalize_predicate<'expr>(expr: Expr<'expr, FieldId>) -> Expr<'expr, FieldId> {
     llkv_expr::normalization::normalize_predicate(expr)
 }
 
@@ -479,12 +493,9 @@ fn compile_domain(expr: &Expr<'_, FieldId>) -> DomainProgram {
                         negated: *negated,
                     });
                 }
-                Expr::Literal(value) => {
-                    if *value {
-                        ops.push(DomainOp::PushAllRows);
-                    } else {
-                        ops.push(DomainOp::PushLiteralFalse);
-                    }
+                Expr::Literal(_) => {
+                    // Boolean literals are defined for every row regardless of value.
+                    ops.push(DomainOp::PushAllRows);
                 }
                 Expr::And(children) => {
                     if children.len() > 1 {

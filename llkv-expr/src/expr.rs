@@ -101,6 +101,25 @@ impl<'a, F> Expr<'a, F> {
             }) if field_id == expected_field
         )
     }
+
+    /// Returns true when the expression cannot filter out any rows.
+    ///
+    /// Used by scan planners/executors to skip extra work when the caller
+    /// effectively requested "no filter".
+    pub fn is_trivially_true(&self) -> bool {
+        match self {
+            Expr::Pred(Filter {
+                op:
+                    Operator::Range {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                ..
+            }) => true,
+            Expr::Literal(value) => *value,
+            _ => false,
+        }
+    }
 }
 
 /// Arithmetic scalar expression that can reference multiple fields.

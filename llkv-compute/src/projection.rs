@@ -11,6 +11,8 @@ use arrow::record_batch::RecordBatch;
 use llkv_expr::ScalarExpr;
 use llkv_expr::literal::Literal;
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::{FieldId, LogicalFieldId, TableId};
+use rustc_hash::FxHashMap;
 
 use crate::scalar::interval::interval_value_to_arrow;
 
@@ -228,6 +230,41 @@ pub fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
                 })
                 .collect::<LlkvResult<Vec<_>>>()?;
             Ok(DataType::Struct(inferred_fields.into()))
+        }
+    }
+}
+
+/// Infer the output datatype for a computed scalar expression using known field dtypes.
+pub fn infer_computed_dtype(
+    expr: &ScalarExpr<FieldId>,
+    table_id: TableId,
+    lfid_dtypes: &FxHashMap<LogicalFieldId, DataType>,
+) -> LlkvResult<DataType> {
+    match expr {
+        ScalarExpr::Literal(lit) => infer_literal_datatype(lit),
+        ScalarExpr::Cast { data_type, .. } => Ok(data_type.clone()),
+        ScalarExpr::Column(fid) => {
+            let lfid = LogicalFieldId::for_user(table_id, *fid);
+            lfid_dtypes
+                .get(&lfid)
+                .cloned()
+                .ok_or_else(|| Error::Internal("missing dtype for computed column".into()))
+        }
+        ScalarExpr::Aggregate(_) => Ok(DataType::Int64), // TODO: refine with aggregate signatures
+        ScalarExpr::GetField { base, field_name } => {
+            crate::analysis::get_field_dtype(base.as_ref(), field_name, table_id, lfid_dtypes)
+        }
+        _ => {
+            if let Some(dtype) =
+                crate::analysis::computed_expr_result_type(expr, table_id, lfid_dtypes)?
+            {
+                return Ok(dtype);
+            }
+            if crate::analysis::computed_expr_prefers_float(expr, table_id, lfid_dtypes)? {
+                Ok(DataType::Float64)
+            } else {
+                Ok(DataType::Int64)
+            }
         }
     }
 }

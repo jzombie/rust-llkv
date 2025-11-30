@@ -34,7 +34,7 @@ where
         };
 
         // Views are read-only - reject TRUNCATE operations
-        if self.is_view(table.table.table_id())? {
+        if self.is_view(table.table_id())? {
             return Err(Error::InvalidArgumentError(format!(
                 "cannot modify view '{}'",
                 display_name
@@ -54,7 +54,7 @@ where
     ) -> Result<RuntimeStatementResult<P>> {
         // Check if this table is referenced by foreign keys (including self-references)
         // TRUNCATE is not allowed on tables with incoming FK references unless CASCADE is specified
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let referencing_fks = self.constraint_service.referencing_foreign_keys(table_id)?;
 
         if !referencing_fks.is_empty() {
@@ -76,7 +76,7 @@ where
             Error::InvalidArgumentError("TRUNCATE requires a table with at least one column".into())
         })?;
         let filter_expr = translation::expression::full_table_scan_filter(anchor_field);
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
 
         // TRUNCATE always enforces foreign key checks (cannot truncate if other tables reference this one)

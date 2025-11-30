@@ -95,7 +95,7 @@ For persistent databases, enable the `simd-r-drive-support` feature and use a fi
 
 ```toml
 [dependencies]
-llkv = { version = "0.8.3-alpha", features = ["simd-r-drive-support"] }
+llkv = { version = "0.8.4-alpha", features = ["simd-r-drive-support"] }
 ```
 
 ```rust

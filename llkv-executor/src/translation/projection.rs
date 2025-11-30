@@ -18,7 +18,7 @@ where
         .iter()
         .map(|column| {
             ScanProjection::from(StoreProjection::with_alias(
-                LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+                LogicalFieldId::for_user(table.table_id(), column.field_id),
                 column.name.clone(),
             ))
         })
@@ -47,7 +47,7 @@ where
                     let col_name_lower = col.name.to_ascii_lowercase();
                     if !exclude_lower.contains(&col_name_lower) {
                         result.push(ScanProjection::from(StoreProjection::with_alias(
-                            LogicalFieldId::for_user(table.table.table_id(), col.field_id),
+                            LogicalFieldId::for_user(table.table_id(), col.field_id),
                             col.name.clone(),
                         )));
                     }
@@ -62,7 +62,7 @@ where
                 })?;
                 let alias = alias.clone().unwrap_or_else(|| column.name.clone());
                 result.push(ScanProjection::from(StoreProjection::with_alias(
-                    LogicalFieldId::for_user(table.table.table_id(), column.field_id),
+                    LogicalFieldId::for_user(table.table_id(), column.field_id),
                     alias,
                 )));
             }

@@ -1,6 +1,7 @@
 //! Executor table, schema, and column types.
 
 use arrow::datatypes::DataType;
+use croaring::Treemap;
 use llkv_plan::PlanValue;
 use llkv_storage::pager::Pager;
 use llkv_table::types::FieldId;
@@ -8,6 +9,11 @@ use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
+
+use crate::types::StorageTable;
+use llkv_column_map::store::GatherNullPolicy;
+use llkv_expr::Expr;
+use llkv_types::LogicalFieldId;
 
 /// Executor's view of a table, including schema and metadata.
 ///
@@ -19,6 +25,8 @@ where
 {
     /// Underlying physical table from llkv-table
     pub table: Arc<llkv_table::table::Table<P>>,
+    /// Storage adapter used by the executor; initially wraps `table`.
+    pub storage: Arc<dyn StorageTable<P>>,
     /// Executor-level schema with field ID mappings
     pub schema: Arc<ExecutorSchema>,
     /// Next available row ID for inserts
@@ -36,6 +44,34 @@ where
     /// Get a snapshot of multi-column unique constraints.
     pub fn multi_column_uniques(&self) -> Vec<ExecutorMultiColumnUnique> {
         self.multi_column_uniques.read().unwrap().clone()
+    }
+
+    /// Get the storage abstraction for scans/joins.
+    pub fn storage(&self) -> Arc<dyn StorageTable<P>> {
+        Arc::clone(&self.storage)
+    }
+
+    /// Convenience accessor for the table's identifier.
+    pub fn table_id(&self) -> llkv_table::types::TableId {
+        self.storage.table_id()
+    }
+
+    /// Collect row ids matching a predicate using the storage abstraction.
+    pub fn filter_row_ids<'expr>(
+        &self,
+        filter_expr: &Expr<'expr, FieldId>,
+    ) -> llkv_result::Result<Treemap> {
+        self.storage.filter_row_ids(filter_expr)
+    }
+
+    /// Stream specific columns for a set of row ids using the storage abstraction.
+    pub fn stream_columns<'table>(
+        &'table self,
+        logical_fields: impl Into<Arc<[LogicalFieldId]>>,
+        row_ids: impl Into<llkv_scan::row_stream::RowIdSource>,
+        policy: GatherNullPolicy,
+    ) -> llkv_result::Result<llkv_table::table::TableScanStream<'table, P>> {
+        self.table.stream_columns(logical_fields, row_ids, policy)
     }
 
     /// Replace all multi-column unique constraints.

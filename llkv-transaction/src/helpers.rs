@@ -9,9 +9,9 @@ use llkv_column_map::store::GatherNullPolicy;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::catalog::MvccColumnBuilder;
-use llkv_table::table::RowIdFilter;
-use llkv_table::{FieldId, RowId, Table};
-use llkv_types::LogicalFieldId;
+use llkv_table::table::{RowIdFilter, ScanStorage};
+use llkv_table::{FieldId, RowId, RowStream, Table};
+use llkv_types::{LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -175,17 +175,20 @@ where
 
     let mut visible = Treemap::new();
 
-    while let Some(chunk) = stream.next_batch()? {
-        let batch = chunk.batch();
-        let window = chunk.row_ids();
+    while let Some(chunk) = stream.next_chunk()? {
+        let batch = chunk.record_batch();
+        let row_ids = chunk
+            .row_ids
+            .expect("transaction filtering requires row ids");
+        let window = row_ids.values();
 
         if batch.num_columns() < 2 {
             tracing::debug!(
                 "[FILTER_ROWS] version_batch has < 2 columns for table_id={}, returning window rows unfiltered",
                 table_id
             );
-            for rid in window {
-                visible.add(*rid);
+            for &rid in window {
+                visible.add(rid);
             }
             continue;
         }
@@ -198,8 +201,8 @@ where
                 "[FILTER_ROWS] Failed to downcast MVCC columns for table_id={}, returning window rows unfiltered",
                 table_id
             );
-            for rid in window {
-                visible.add(*rid);
+            for &rid in window {
+                visible.add(rid);
             }
             continue;
         }
@@ -207,7 +210,7 @@ where
         let created_column = created_column.unwrap();
         let deleted_column = deleted_column.unwrap();
 
-        for (idx, row_id) in window.iter().enumerate() {
+        for (idx, row_id) in window.iter().copied().enumerate() {
             let created_by = if created_column.is_null(idx) {
                 TXN_ID_AUTO_COMMIT
             } else {
@@ -236,7 +239,7 @@ where
                 is_visible
             );
             if is_visible {
-                visible.add(*row_id);
+                visible.add(row_id);
             }
         }
     }
@@ -280,7 +283,17 @@ impl<P> RowIdFilter<P> for MvccRowIdFilter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn filter(&self, table: &Table<P>, row_ids: Treemap) -> Result<Treemap> {
+    fn filter(
+        &self,
+        table_id: TableId,
+        storage: &dyn ScanStorage<P>,
+        row_ids: Treemap,
+    ) -> Result<Treemap> {
+        let table = storage
+            .as_any()
+            .downcast_ref::<Table<P>>()
+            .ok_or_else(|| Error::Internal("RowIdFilter requires table storage".into()))?;
+        debug_assert_eq!(table.table_id(), table_id);
         tracing::trace!(
             "[MVCC_FILTER] filter() called with row_ids {:?}, snapshot txn={}, snapshot_id={}",
             row_ids,

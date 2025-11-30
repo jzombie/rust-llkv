@@ -11,13 +11,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_executor::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
-    translation,
+    TableStorageAdapter, translation,
 };
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
 use llkv_table::{
-    ConstraintKind, FieldId, MultiColumnIndexEntryMeta, RowId, Table, TableConstraintSummaryView,
+    ConstraintKind, FieldId, MultiColumnIndexEntryMeta, RowId, RowStream, Table,
+    TableConstraintSummaryView,
 };
 use llkv_transaction::{TransactionSnapshot, mvcc};
 use llkv_types::LogicalFieldId;
@@ -71,7 +72,7 @@ where
         };
 
         // First, get the row_ids that match the filter
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = table.filter_row_ids(&filter_expr)?;
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -82,7 +83,7 @@ where
         }
 
         // Scan to get the column data without materializing full columns
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
 
         let mut fields: Vec<Field> = Vec::with_capacity(table.schema.columns.len() + 1);
         let mut logical_fields: Vec<LogicalFieldId> =
@@ -116,24 +117,27 @@ where
             return Ok(vec![batch]);
         }
 
-        let mut stream = table.table.stream_columns(
+        let mut stream = table.stream_columns(
             Arc::from(logical_fields),
             &visible_row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 
         let mut batches = Vec::new();
-        while let Some(chunk) = stream.next_batch()? {
-            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(chunk.batch().num_columns() + 1);
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns() + 1);
 
-            let mut row_id_builder = UInt64Builder::with_capacity(chunk.len());
-            for row_id in chunk.row_ids() {
-                row_id_builder.append_value(*row_id);
+            let row_ids = chunk
+                .row_ids
+                .expect("table access requires row ids when streaming");
+            let mut row_id_builder = UInt64Builder::with_capacity(row_ids.len());
+            for idx in 0..row_ids.len() {
+                row_id_builder.append_value(row_ids.value(idx));
             }
             arrays.push(Arc::new(row_id_builder.finish()) as ArrayRef);
 
-            let chunk_batch = chunk.into_batch();
-            for column_array in chunk_batch.columns() {
+            for column_array in batch.columns() {
                 arrays.push(column_array.clone());
             }
 
@@ -191,7 +195,7 @@ where
                 tracing::trace!(
                     "=== LOOKUP_TABLE '{}' (cached) table_id={} columns={} context_pager={:p} ===",
                     canonical_name,
-                    table.table.table_id(),
+                    table.table_id(),
                     table.schema.columns.len(),
                     &*self.pager
                 );
@@ -435,8 +439,10 @@ where
         // Fallback to 0 for truly empty tables
         let total_rows = table.total_rows().unwrap_or(0);
 
+        let table = Arc::new(table);
         let executor_table = Arc::new(ExecutorTable {
-            table: Arc::new(table),
+            storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table))),
+            table,
             schema: exec_schema,
             next_row_id: AtomicU64::new(next_row_id),
             total_rows: AtomicU64::new(total_rows),
@@ -507,7 +513,7 @@ where
                     tracing::warn!(
                         "[CATALOG] Skipping persisted multi-column UNIQUE {:?} for table_id={} missing field_id {}",
                         entry.index_name,
-                        table.table.table_id(),
+                        table.table_id(),
                         field_id
                     );
                     continue 'outer;
@@ -550,6 +556,7 @@ where
         let uniques = table.multi_column_uniques();
 
         Some(Arc::new(ExecutorTable {
+            storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table.table))),
             table: Arc::clone(&table.table),
             schema,
             next_row_id: AtomicU64::new(next_row_id),

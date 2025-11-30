@@ -39,7 +39,6 @@ pub mod ddl;
 pub mod diagnostics;
 pub mod gather;
 pub mod metadata;
-mod planner;
 pub mod reserved;
 pub mod resolvers;
 pub mod schema_ext;
@@ -51,8 +50,6 @@ pub mod expr {
 
 pub mod table;
 pub mod types;
-
-pub mod stream;
 
 pub use catalog::{CatalogManager, CreateTableResult, FieldResolver, TableCatalogSnapshot};
 pub use catalog::{SingleColumnIndexDescriptor, SingleColumnIndexRegistration};
@@ -80,7 +77,6 @@ pub use reserved::{
     is_information_schema_table,
 };
 pub use resolvers::{canonical_table_name, resolve_table_name};
-pub use stream::{ColumnStream, ColumnStreamBatch};
 pub type NumericArrayMap = llkv_compute::eval::NumericArrayMap<FieldId>;
 pub use sys_catalog::{
     ColMeta, CustomTypeMeta, MultiColumnIndexEntryMeta, SingleColumnIndexEntryMeta, SysCatalog,
@@ -91,7 +87,10 @@ pub use table::Table;
 pub use types::{FieldId, ROW_ID_FIELD_ID, RowId, TableColumn, TableId};
 pub use view::{ForeignKeyView, TableConstraintSummaryView, TableView};
 
-pub use planner::plan_graph::{
+pub use llkv_scan::row_stream::RowStream;
+
+// TODO: Don't re-export, and call directly
+pub use llkv_plan::{
     PLAN_GRAPH_VERSION, PlanAnnotations, PlanEdge, PlanEdgeMetadata, PlanExpression, PlanField,
     PlanGraph, PlanGraphBuilder, PlanGraphError, PlanGraphResult, PlanGraphVersion, PlanInput,
     PlanNode, PlanNodeId, PlanOperator,
