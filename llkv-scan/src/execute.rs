@@ -1,4 +1,3 @@
-use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -9,7 +8,7 @@ use llkv_compute::eval::ScalarEvaluator;
 use llkv_compute::projection::{
     ProjectionLiteral, emit_synthetic_null_batch, infer_computed_dtype,
 };
-use llkv_expr::{Expr, Filter, Operator};
+use llkv_expr::Expr;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::{FieldId, LogicalFieldId, RowId};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -151,7 +150,7 @@ where
     let can_stream_full_table = !include_row_ids
         && row_id_filter.is_none()
         && order.is_none()
-        && is_trivial_filter(filter_expr);
+        && filter_expr.is_trivially_true();
 
     if can_stream_full_table {
         stream_full_table_scan(
@@ -196,7 +195,7 @@ where
     };
 
     if is_empty {
-        if row_id_filter.is_none() && is_trivial_filter(filter_expr) {
+        if row_id_filter.is_none() && filter_expr.is_trivially_true() {
             let total_rows = storage.total_rows()?;
             let row_count = usize::try_from(total_rows).map_err(|_| {
                 Error::InvalidArgumentError(
@@ -337,18 +336,4 @@ fn build_projection_literals(
             },
         })
         .collect()
-}
-
-// TODO: Dedupe (another version resides in llkv-scan)
-fn is_trivial_filter(expr: &Expr<'_, FieldId>) -> bool {
-    matches!(
-        expr,
-        Expr::Pred(Filter {
-            op: Operator::Range {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-            ..
-        })
-    )
 }

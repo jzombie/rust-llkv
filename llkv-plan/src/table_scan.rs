@@ -1,7 +1,6 @@
 use arrow::datatypes::DataType;
-use std::ops::Bound;
 
-use llkv_expr::{Expr, Filter, Operator, ScalarExpr};
+use llkv_expr::{Expr, ScalarExpr};
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 
 use crate::{
@@ -48,11 +47,11 @@ pub fn build_table_scan_plan(
     let mut next_node = 2u32;
     let mut parent = scan_node_id;
 
-    if !is_trivial_filter(filter_expr) {
+    if !filter_expr.is_trivially_true() {
         let filter_node_id = PlanNodeId::new(next_node);
         next_node += 1;
         let mut filter_node = PlanNode::new(filter_node_id, PlanOperator::Filter);
-        filter_node.add_predicate(PlanExpression::new(format_expr(filter_expr)));
+        filter_node.add_predicate(PlanExpression::new(filter_expr.format_display()));
         builder.add_node(filter_node)?;
         builder.add_edge(PlanEdge::new(parent, filter_node_id))?;
         parent = filter_node_id;
@@ -112,22 +111,4 @@ pub fn build_table_scan_plan(
         .insert("table_id".to_string(), table_id.to_string());
 
     builder.finish()
-}
-
-// TODO: Dedupe (another version resides in llkv-scan)
-fn is_trivial_filter(filter_expr: &Expr<'_, FieldId>) -> bool {
-    matches!(
-        filter_expr,
-        Expr::Pred(Filter {
-            op: Operator::Range {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-            ..
-        })
-    ) || matches!(filter_expr, Expr::Literal(_))
-}
-
-fn format_expr(filter_expr: &Expr<'_, FieldId>) -> String {
-    filter_expr.format_display()
 }
