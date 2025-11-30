@@ -1140,10 +1140,10 @@ where
                 None => rows,
             });
 
-            if let Some(ref r) = result {
-                if r.is_empty() {
-                    return Ok(RowIdSource::Bitmap(Treemap::new()));
-                }
+            if let Some(ref r) = result
+                && r.is_empty()
+            {
+                return Ok(RowIdSource::Bitmap(Treemap::new()));
             }
         }
 
@@ -1189,8 +1189,7 @@ where
             <T as FilterPrimitive>::run_nullable_filter(self.store(), lfid, |v| match v {
                 Some(val) => predicate.matches(PredicateValue::borrowed(&val)),
                 None => false,
-            })
-            .map_err(Error::from)?;
+            })?;
         Ok(Treemap::from_iter(row_ids))
     }
 
@@ -1203,8 +1202,7 @@ where
         O: OffsetSizeTrait + llkv_column_map::store::scan::StringContainsKernel,
     {
         let predicate = build_var_width_predicate(op).map_err(Error::predicate_build)?;
-        let row_ids =
-            Utf8Filter::<O>::run_filter(self.store(), lfid, &predicate).map_err(Error::from)?;
+        let row_ids = Utf8Filter::<O>::run_filter(self.store(), lfid, &predicate)?;
         Ok(Treemap::from_iter(row_ids))
     }
 
@@ -1222,8 +1220,7 @@ where
                 Some(v) => predicate.matches(&v),
                 None => false,
             },
-        )
-        .map_err(Error::from)?;
+        )?;
         Ok(Treemap::from_iter(row_ids))
     }
 
@@ -1263,10 +1260,10 @@ where
 
         let mut ordered: Vec<u64> = Vec::new();
 
-        if let Ok(total_rows) = self.total_rows() {
-            if let Ok(cap) = usize::try_from(total_rows) {
-                ordered.reserve(cap);
-            }
+        if let Ok(total_rows) = self.total_rows()
+            && let Ok(cap) = usize::try_from(total_rows)
+        {
+            ordered.reserve(cap);
         }
 
         let mut on_chunk = |chunk: Vec<RowId>| -> LlkvResult<()> {
@@ -1274,11 +1271,8 @@ where
             Ok(())
         };
         let reverse_sorted_runs = matches!(order_spec.direction, ScanOrderDirection::Descending);
-        let mut emitter = RowIdChunkEmitter::new(
-            STREAM_BATCH_ROWS,
-            reverse_sorted_runs,
-            &mut on_chunk,
-        );
+        let mut emitter =
+            RowIdChunkEmitter::new(STREAM_BATCH_ROWS, reverse_sorted_runs, &mut on_chunk);
         let options = ScanOptions {
             sorted: true,
             reverse: matches!(order_spec.direction, ScanOrderDirection::Descending),

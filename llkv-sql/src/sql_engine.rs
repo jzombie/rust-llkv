@@ -8745,10 +8745,7 @@ fn strip_sql_expr_nesting(expr: &SqlExpr) -> &SqlExpr {
     }
 }
 
-fn normalize_between_operand<'expr>(
-    operand: &'expr SqlExpr,
-    negated: bool,
-) -> (bool, &'expr SqlExpr) {
+fn normalize_between_operand(operand: &SqlExpr, negated: bool) -> (bool, &SqlExpr) {
     let mut effective_negated = negated;
     let mut current = operand;
     loop {
@@ -8766,7 +8763,7 @@ fn normalize_between_operand<'expr>(
     }
 }
 
-fn peel_not_chain<'expr>(expr: &'expr SqlExpr) -> (usize, &'expr SqlExpr) {
+fn peel_not_chain(expr: &SqlExpr) -> (usize, &SqlExpr) {
     let mut count = 0;
     let mut current = expr;
     loop {

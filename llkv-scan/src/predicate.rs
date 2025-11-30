@@ -371,10 +371,10 @@ where
                 Some(existing) => existing & rows,
                 None => rows,
             });
-            if let Some(ref d) = domain {
-                if d.is_empty() {
-                    return Ok(Treemap::new());
-                }
+            if let Some(ref d) = domain
+                && d.is_empty()
+            {
+                return Ok(Treemap::new());
             }
         }
         domain.unwrap_or_default()
@@ -448,7 +448,7 @@ where
         return Ok((Treemap::new(), Treemap::new()));
     }
 
-    let has_row_id = ordered_fields.iter().any(|fid| *fid == ROW_ID_FIELD_ID);
+    let has_row_id = ordered_fields.contains(&ROW_ID_FIELD_ID);
 
     let physical_fields: Vec<FieldId> = ordered_fields
         .iter()
@@ -545,7 +545,7 @@ where
         return Ok((Treemap::new(), Treemap::new()));
     }
 
-    let has_row_id = ordered_fields.iter().any(|fid| *fid == ROW_ID_FIELD_ID);
+    let has_row_id = ordered_fields.contains(&ROW_ID_FIELD_ID);
 
     let physical_fields: Vec<FieldId> = ordered_fields
         .iter()

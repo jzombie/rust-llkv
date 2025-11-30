@@ -65,7 +65,7 @@ where
     }
 
     /// Stream specific columns for a set of row ids using the storage abstraction.
-    pub fn stream_columns<'table, 'a>(
+    pub fn stream_columns<'table>(
         &'table self,
         logical_fields: impl Into<Arc<[LogicalFieldId]>>,
         row_ids: impl Into<llkv_scan::row_stream::RowIdSource>,

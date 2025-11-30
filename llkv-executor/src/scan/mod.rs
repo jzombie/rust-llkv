@@ -22,21 +22,18 @@ where
     }
 
     fn field_data_type(&self, fid: LogicalFieldId) -> ExecutorResult<arrow::datatypes::DataType> {
-        self.table().store().data_type(fid).map_err(Error::from)
+        self.table().store().data_type(fid)
     }
 
     fn total_rows(&self) -> ExecutorResult<u64> {
-        self.table().total_rows().map_err(Error::from)
+        self.table().total_rows()
     }
 
     fn prepare_gather_context(
         &self,
         logical_fields: &[LogicalFieldId],
     ) -> ExecutorResult<MultiGatherContext> {
-        self.table()
-            .store()
-            .prepare_gather_context(logical_fields)
-            .map_err(Error::from)
+        self.table().store().prepare_gather_context(logical_fields)
     }
 
     fn gather_row_window_with_context(
@@ -46,20 +43,20 @@ where
         null_policy: GatherNullPolicy,
         ctx: Option<&mut MultiGatherContext>,
     ) -> ExecutorResult<RecordBatch> {
-        self.table()
-            .store()
-            .gather_row_window_with_context(logical_fields, row_ids, null_policy, ctx)
-            .map_err(Error::from)
+        self.table().store().gather_row_window_with_context(
+            logical_fields,
+            row_ids,
+            null_policy,
+            ctx,
+        )
     }
 
     fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> ExecutorResult<Treemap> {
-        self.table()
-            .filter_row_ids(filter_expr)
-            .map_err(Error::from)
+        self.table().filter_row_ids(filter_expr)
     }
 
     fn all_row_ids(&self) -> ExecutorResult<Treemap> {
-        self.table().all_row_ids().map_err(Error::from)
+        self.table().all_row_ids()
     }
 
     fn sorted_row_ids_full_table(
@@ -68,11 +65,10 @@ where
     ) -> ExecutorResult<Option<Vec<u64>>> {
         use llkv_scan::ScanStorage;
         <LlkvTable<P> as ScanStorage<P>>::sorted_row_ids_full_table(self.table(), order_spec)
-            .map_err(Error::from)
     }
 
     fn filter_leaf(&self, filter: &OwnedFilter) -> ExecutorResult<Treemap> {
-        self.table().filter_leaf(filter).map_err(Error::from)
+        self.table().filter_leaf(filter)
     }
 
     fn filter_fused(
@@ -81,9 +77,7 @@ where
         filters: &[OwnedFilter],
         cache: &PredicateFusionCache,
     ) -> ExecutorResult<RowIdSource> {
-        self.table()
-            .filter_fused(field_id, filters, cache)
-            .map_err(Error::from)
+        self.table().filter_fused(field_id, filters, cache)
     }
 
     fn stream_row_ids(
@@ -164,8 +158,6 @@ where
                 )
             })?;
 
-        table
-            .scan_stream_with_exprs(projections, filter_expr, options, on_batch)
-            .map_err(Error::from)
+        table.scan_stream_with_exprs(projections, filter_expr, options, on_batch)
     }
 }

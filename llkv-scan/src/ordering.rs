@@ -35,10 +35,9 @@ where
         ScanOrderTransform::IdentityInt64
             | ScanOrderTransform::IdentityInt32
             | ScanOrderTransform::IdentityUtf8
-    ) {
-        if let Some(sorted) = try_full_table_sorted_scan(storage, row_ids, order_spec)? {
-            return Ok(sorted);
-        }
+    ) && let Some(sorted) = try_full_table_sorted_scan(storage, row_ids, order_spec)?
+    {
+        return Ok(sorted);
     }
 
     arrow_sort_row_ids(storage, row_ids, order_spec, lfid)

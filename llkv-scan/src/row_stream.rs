@@ -56,6 +56,7 @@ impl From<&Vec<RowId>> for RowIdSource {
 
 pub trait ColumnSliceSet<'a> {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
     fn column(&self, idx: usize) -> &'a ArrayRef;
     fn columns(&self) -> &'a [ArrayRef];
 }
@@ -73,6 +74,10 @@ impl<'a> ColumnSlices<'a> {
 impl<'a> ColumnSliceSet<'a> for ColumnSlices<'a> {
     fn len(&self) -> usize {
         self.columns.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty()
     }
 
     fn column(&self, idx: usize) -> &'a ArrayRef {
@@ -402,7 +407,7 @@ pub fn materialize_row_window<P, S>(
     null_policy: GatherNullPolicy,
     out_schema: &Arc<Schema>,
     window: &[RowId],
-    mut gather_ctx: Option<&mut MultiGatherContext>,
+    gather_ctx: Option<&mut MultiGatherContext>,
 ) -> LlkvResult<Option<RecordBatch>>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
@@ -425,7 +430,7 @@ where
             unique_lfids,
             window,
             null_policy,
-            gather_ctx.as_deref_mut(),
+            gather_ctx,
         )?;
         if batch.num_rows() == 0 {
             return Ok(None);
