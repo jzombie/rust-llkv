@@ -62,6 +62,15 @@ where
         self.table().all_row_ids().map_err(Error::from)
     }
 
+    fn sorted_row_ids_full_table(
+        &self,
+        order_spec: llkv_scan::ScanOrderSpec,
+    ) -> ExecutorResult<Option<Vec<u64>>> {
+        use llkv_scan::ScanStorage;
+        <LlkvTable<P> as ScanStorage<P>>::sorted_row_ids_full_table(self.table(), order_spec)
+            .map_err(Error::from)
+    }
+
     fn filter_leaf(&self, filter: &OwnedFilter) -> ExecutorResult<Treemap> {
         self.table().filter_leaf(filter).map_err(Error::from)
     }

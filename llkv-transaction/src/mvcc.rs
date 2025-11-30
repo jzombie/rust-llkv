@@ -399,7 +399,6 @@ impl RowVersion {
             }
         }
     }
-
 }
 
 /// Transaction metadata captured when a transaction begins.

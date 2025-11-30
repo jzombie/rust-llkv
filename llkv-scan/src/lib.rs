@@ -17,11 +17,11 @@ use llkv_types::{FieldId, LogicalFieldId, TableId};
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 pub mod row_stream;
+pub use row_stream::ScanRowStream;
 pub use row_stream::{
     ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowChunk, RowIdSource, RowStream,
     RowStreamBuilder, materialize_row_window,
 };
-pub use row_stream::ScanRowStream;
 
 pub mod execute;
 pub mod ordering;
@@ -201,6 +201,13 @@ where
         filters: &[llkv_compute::program::OwnedFilter],
         cache: &llkv_compute::analysis::PredicateFusionCache,
     ) -> LlkvResult<RowIdSource>;
+
+    /// Optionally return row IDs ordered by a column's sorted permutation when
+    /// the caller is scanning the entire table without additional filtering.
+    ///
+    /// Implementations should return `Ok(None)` when the storage backend cannot
+    /// satisfy the request for the given [`ScanOrderSpec`].
+    fn sorted_row_ids_full_table(&self, order_spec: ScanOrderSpec) -> LlkvResult<Option<Vec<u64>>>;
 
     fn stream_row_ids(
         &self,

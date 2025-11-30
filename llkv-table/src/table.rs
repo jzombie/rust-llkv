@@ -798,7 +798,7 @@ macro_rules! impl_row_id_stream_sorted_run_with_rids {
             start: usize,
             len: usize,
         ) {
-            self.extend_from_slice(row_ids, start, len);
+            self.extend_sorted_run(row_ids, start, len);
         }
     };
 }
@@ -861,16 +861,22 @@ impl llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdScanCollec
 struct RowIdChunkEmitter<'a> {
     chunk_size: usize,
     buffer: Vec<RowId>,
+    reverse_sorted_runs: bool,
     on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
     error: Option<Error>,
 }
 
 impl<'a> RowIdChunkEmitter<'a> {
-    fn new(chunk_size: usize, on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>) -> Self {
+    fn new(
+        chunk_size: usize,
+        reverse_sorted_runs: bool,
+        on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+    ) -> Self {
         let chunk_size = cmp::max(1, chunk_size);
         Self {
             chunk_size,
             buffer: Vec::with_capacity(chunk_size),
+            reverse_sorted_runs,
             on_chunk,
             error: None,
         }
@@ -892,6 +898,21 @@ impl<'a> RowIdChunkEmitter<'a> {
         let end = (start + len).min(row_ids.len());
         for idx in start..end {
             self.push(row_ids.value(idx));
+        }
+    }
+
+    fn extend_sorted_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
+        if self.reverse_sorted_runs {
+            if self.error.is_some() || len == 0 {
+                return;
+            }
+            let mut idx = (start + len).min(row_ids.len());
+            while idx > start {
+                idx -= 1;
+                self.push(row_ids.value(idx));
+            }
+        } else {
+            self.extend_from_slice(row_ids, start, len);
         }
     }
 
@@ -944,7 +965,7 @@ impl<'a> llkv_column_map::scan::PrimitiveSortedWithRowIdsVisitor for RowIdChunkE
     llkv_for_each_arrow_boolean!(impl_row_id_stream_sorted_run_with_rids);
 
     fn null_run(&mut self, row_ids: &UInt64Array, start: usize, len: usize) {
-        self.extend_from_slice(row_ids, start, len);
+        self.extend_sorted_run(row_ids, start, len);
     }
 }
 
@@ -1005,6 +1026,10 @@ where
 
     fn all_row_ids(&self) -> LlkvResult<Treemap> {
         self.compute_table_row_ids()
+    }
+
+    fn sorted_row_ids_full_table(&self, order_spec: ScanOrderSpec) -> LlkvResult<Option<Vec<u64>>> {
+        self.collect_full_table_sorted_row_ids(order_spec)
     }
 
     fn stream_row_ids(
@@ -1210,6 +1235,81 @@ where
         RowIdBitmapFilter::filter_by_operator(&all_row_ids, op)
     }
 
+    fn collect_full_table_sorted_row_ids(
+        &self,
+        order_spec: ScanOrderSpec,
+    ) -> LlkvResult<Option<Vec<u64>>> {
+        use llkv_column_map::store::rowid_fid;
+
+        if !matches!(
+            order_spec.transform,
+            ScanOrderTransform::IdentityInt64
+                | ScanOrderTransform::IdentityInt32
+                | ScanOrderTransform::IdentityUtf8
+        ) {
+            return Ok(None);
+        }
+
+        let lfid = LogicalFieldId::for_user(self.table_id, order_spec.field_id);
+        let dtype = match self.store.data_type(lfid) {
+            Ok(dt) => dt,
+            Err(Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        if !Self::order_transform_matches_dtype(order_spec.transform, &dtype) {
+            return Ok(None);
+        }
+
+        let mut ordered: Vec<u64> = Vec::new();
+
+        if let Ok(total_rows) = self.total_rows() {
+            if let Ok(cap) = usize::try_from(total_rows) {
+                ordered.reserve(cap);
+            }
+        }
+
+        let mut on_chunk = |chunk: Vec<RowId>| -> LlkvResult<()> {
+            ordered.extend(chunk);
+            Ok(())
+        };
+        let reverse_sorted_runs = matches!(order_spec.direction, ScanOrderDirection::Descending);
+        let mut emitter = RowIdChunkEmitter::new(
+            STREAM_BATCH_ROWS,
+            reverse_sorted_runs,
+            &mut on_chunk,
+        );
+        let options = ScanOptions {
+            sorted: true,
+            reverse: matches!(order_spec.direction, ScanOrderDirection::Descending),
+            with_row_ids: true,
+            include_nulls: true,
+            nulls_first: order_spec.nulls_first,
+            anchor_row_id_field: Some(rowid_fid(lfid)),
+            ..Default::default()
+        };
+
+        match ScanBuilder::new(self.store(), lfid)
+            .options(options)
+            .run(&mut emitter)
+        {
+            Ok(()) => emitter.finish()?,
+            Err(Error::NotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+
+        Ok(Some(ordered))
+    }
+
+    fn order_transform_matches_dtype(transform: ScanOrderTransform, dtype: &DataType) -> bool {
+        match transform {
+            ScanOrderTransform::IdentityInt64 => matches!(dtype, DataType::Int64),
+            ScanOrderTransform::IdentityInt32 => matches!(dtype, DataType::Int32),
+            ScanOrderTransform::IdentityUtf8 => matches!(dtype, DataType::Utf8),
+            ScanOrderTransform::CastUtf8ToInteger => false,
+        }
+    }
+
     fn compute_table_row_ids(&self) -> LlkvResult<Treemap> {
         use llkv_column_map::store::rowid_fid;
 
@@ -1300,7 +1400,7 @@ where
         };
 
         let rid_shadow = rowid_fid(first_field);
-        let mut emitter = RowIdChunkEmitter::new(chunk_size, on_chunk);
+        let mut emitter = RowIdChunkEmitter::new(chunk_size, false, on_chunk);
         let scan_result = ScanBuilder::new(self.store(), rid_shadow)
             .options(ScanOptions {
                 with_row_ids: true,

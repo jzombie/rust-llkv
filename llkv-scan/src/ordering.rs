@@ -1,3 +1,4 @@
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Builder, StringArray};
@@ -23,15 +24,37 @@ where
     S: ScanStorage<P>,
 {
     let lfid = LogicalFieldId::for_user(storage.table_id(), order_spec.field_id);
-    let direction = order_spec.direction;
-    let nulls_first = order_spec.nulls_first;
 
     storage.field_data_type(lfid)?;
-
-    let row_ids_vec: Vec<u64> = row_ids.iter().collect();
-    if row_ids_vec.is_empty() {
+    if row_ids.is_empty() {
         return Ok(vec![]);
     }
+
+    if matches!(
+        order_spec.transform,
+        ScanOrderTransform::IdentityInt64
+            | ScanOrderTransform::IdentityInt32
+            | ScanOrderTransform::IdentityUtf8
+    ) {
+        if let Some(sorted) = try_full_table_sorted_scan(storage, row_ids, order_spec)? {
+            return Ok(sorted);
+        }
+    }
+
+    arrow_sort_row_ids(storage, row_ids, order_spec, lfid)
+}
+
+fn arrow_sort_row_ids<P, S>(
+    storage: &S,
+    row_ids: &Treemap,
+    order_spec: ScanOrderSpec,
+    lfid: LogicalFieldId,
+) -> LlkvResult<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P>,
+{
+    let row_ids_vec: Vec<u64> = row_ids.iter().collect();
 
     let mut ctx = storage.prepare_gather_context(&[lfid])?;
     let batch = storage.gather_row_window_with_context(
@@ -100,8 +123,8 @@ where
     let sorted_indices = arrow::compute::sort_to_indices(
         &order_values,
         Some(arrow::compute::SortOptions {
-            descending: matches!(direction, ScanOrderDirection::Descending),
-            nulls_first,
+            descending: matches!(order_spec.direction, ScanOrderDirection::Descending),
+            nulls_first: order_spec.nulls_first,
         }),
         None,
     )?;
@@ -113,4 +136,36 @@ where
         .collect();
 
     Ok(sorted_row_ids)
+}
+
+fn try_full_table_sorted_scan<P, S>(
+    storage: &S,
+    row_ids: &Treemap,
+    order_spec: ScanOrderSpec,
+) -> LlkvResult<Option<Vec<u64>>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P>,
+{
+    let total_rows = storage.total_rows()?;
+    if row_ids.cardinality() != total_rows {
+        return Ok(None);
+    }
+
+    let all_rows = storage.all_row_ids()?;
+    if row_ids.iter().ne(all_rows.iter()) {
+        return Ok(None);
+    }
+
+    match storage.sorted_row_ids_full_table(order_spec)? {
+        Some(sorted) => {
+            let len = u64::try_from(sorted.len()).unwrap_or(u64::MAX);
+            if len == total_rows {
+                Ok(Some(sorted))
+            } else {
+                Ok(None)
+            }
+        }
+        None => Ok(None),
+    }
 }
