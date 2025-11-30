@@ -24,6 +24,17 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 const ROW_STREAM_CHUNK_SIZE: usize = 1024;
 
+struct FullTableStreamPlan<'a> {
+    projection_evals: &'a [ProjectionEval],
+    passthrough_fields: &'a [Option<FieldId>],
+    unique_index: &'a FxHashMap<LogicalFieldId, usize>,
+    unique_lfids: &'a [LogicalFieldId],
+    numeric_fields: &'a FxHashSet<FieldId>,
+    requires_numeric: bool,
+    null_policy: GatherNullPolicy,
+    out_schema: Arc<Schema>,
+}
+
 /// Execute a table scan using the shared scan machinery.
 pub fn execute_scan<'expr, P, S, F>(
     storage: &S,
@@ -153,19 +164,17 @@ where
         && filter_expr.is_trivially_true();
 
     if can_stream_full_table {
-        stream_full_table_scan(
-            storage,
-            table_id,
-            &projection_evals,
-            &passthrough_fields,
-            &unique_index,
-            &unique_lfids,
-            &numeric_fields,
+        let plan = FullTableStreamPlan {
+            projection_evals: &projection_evals,
+            passthrough_fields: &passthrough_fields,
+            unique_index: &unique_index,
+            unique_lfids: &unique_lfids,
+            numeric_fields: &numeric_fields,
             requires_numeric,
             null_policy,
-            &out_schema,
-            on_batch,
-        )?;
+            out_schema: Arc::clone(&out_schema),
+        };
+        stream_full_table_scan(storage, table_id, plan, on_batch)?;
         return Ok(());
     }
 
@@ -250,14 +259,7 @@ where
 fn stream_full_table_scan<P, S, F>(
     storage: &S,
     table_id: llkv_types::TableId,
-    projection_evals: &[ProjectionEval],
-    passthrough_fields: &[Option<FieldId>],
-    unique_index: &FxHashMap<LogicalFieldId, usize>,
-    unique_lfids: &[LogicalFieldId],
-    numeric_fields: &FxHashSet<FieldId>,
-    requires_numeric: bool,
-    null_policy: GatherNullPolicy,
-    out_schema: &Arc<Schema>,
+    plan: FullTableStreamPlan<'_>,
     on_batch: &mut F,
 ) -> LlkvResult<()>
 where
@@ -265,10 +267,10 @@ where
     S: ScanStorage<P>,
     F: FnMut(RecordBatch),
 {
-    let mut gather_ctx = if unique_lfids.is_empty() {
+    let mut gather_ctx = if plan.unique_lfids.is_empty() {
         None
     } else {
-        Some(storage.prepare_gather_context(unique_lfids)?)
+        Some(storage.prepare_gather_context(plan.unique_lfids)?)
     };
 
     let mut emitted_rows = false;
@@ -280,21 +282,21 @@ where
         if let Some(batch) = materialize_row_window(
             storage,
             table_id,
-            unique_lfids,
-            projection_evals,
-            passthrough_fields,
-            unique_index,
-            numeric_fields,
-            requires_numeric,
-            null_policy,
-            out_schema,
+            plan.unique_lfids,
+            plan.projection_evals,
+            plan.passthrough_fields,
+            plan.unique_index,
+            plan.numeric_fields,
+            plan.requires_numeric,
+            plan.null_policy,
+            &plan.out_schema,
             chunk.as_slice(),
             gather_ctx.as_mut(),
-        )? {
-            if batch.num_rows() > 0 {
-                emitted_rows = true;
-                on_batch(batch);
-            }
+        )?
+        .filter(|batch| batch.num_rows() > 0)
+        {
+            emitted_rows = true;
+            on_batch(batch);
         }
 
         Ok(())
@@ -309,8 +311,10 @@ where
                 "table row count exceeds supported range for synthetic batch".into(),
             )
         })?;
-        let projection_literals = build_projection_literals(projection_evals, out_schema);
-        if let Some(batch) = emit_synthetic_null_batch(&projection_literals, out_schema, row_count)?
+        let projection_literals =
+            build_projection_literals(plan.projection_evals, &plan.out_schema);
+        if let Some(batch) =
+            emit_synthetic_null_batch(&projection_literals, &plan.out_schema, row_count)?
         {
             on_batch(batch);
         }
