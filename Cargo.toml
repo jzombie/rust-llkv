@@ -34,8 +34,8 @@ repository = "https://github.com/jzombie/rust-llkv"
 publish = true
 
 [workspace.dependencies]
-# Note: A subset of these crates are used only for debug builds or examples.
-# They're listed here to keep workspace versions consistent.
+# Some crates are only used in debug builds or examples, but are listed
+# here to keep versions consistent across the workspace.
 arrow = { version = "57.0.0", default-features = false, features = ["prettyprint", "ipc"] }
 arrow-array = { version = "57.0.0", default-features = false }
 arrow-buffer = { version = "57.0.0", default-features = false }
