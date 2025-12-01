@@ -64,11 +64,11 @@ fn crud_statements_update_pager_counters() {
     let select_after = stats.snapshot();
     let select_delta = select_after.delta_since(&select_before);
     assert_eq!(
-        select_delta.physical_gets, 40,
+        select_delta.physical_gets, 36,
         "unexpected select get count: {select_delta:?}"
     );
     assert_eq!(
-        select_delta.get_batches, 26,
+        select_delta.get_batches, 23,
         "unexpected select get batches: {select_delta:?}"
     );
 
@@ -87,11 +87,11 @@ fn crud_statements_update_pager_counters() {
         "unexpected delete put batches: {delete_delta:?}"
     );
     assert_eq!(
-        delete_delta.physical_gets, 54,
+        delete_delta.physical_gets, 46,
         "unexpected delete get count: {delete_delta:?}"
     );
     assert_eq!(
-        delete_delta.get_batches, 38,
+        delete_delta.get_batches, 32,
         "unexpected delete get batches: {delete_delta:?}"
     );
 
