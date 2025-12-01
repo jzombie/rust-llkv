@@ -100,3 +100,7 @@ disallowed_methods = "deny"
 
 [workspace.metadata.clippy]
 disallowed-methods = ["std::boxed::Box::leak"]
+
+[profile.samply]
+inherits = "release"
+debug = true

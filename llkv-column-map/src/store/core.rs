@@ -21,6 +21,7 @@ use llkv_types::ids::{LogicalFieldId, RowId, TableId};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Columnar storage engine for managing Arrow-based data.
@@ -62,6 +63,8 @@ pub struct ColumnStore<P: Pager> {
     cfg: ColumnStoreConfig,
     dtype_cache: DTypeCache<P>,
     index_manager: IndexManager<P>,
+    pub(crate) ctx_pool: Arc<GatherContextPool>,
+    append_epoch: Arc<AtomicU64>,
 }
 
 impl<P> Clone for ColumnStore<P>
@@ -75,6 +78,8 @@ where
             cfg: self.cfg.clone(),
             dtype_cache: self.dtype_cache.clone(),
             index_manager: self.index_manager.clone(),
+            ctx_pool: Arc::clone(&self.ctx_pool),
+            append_epoch: Arc::clone(&self.append_epoch),
         }
     }
 }
@@ -113,12 +118,19 @@ where
             cfg,
             dtype_cache: DTypeCache::new(Arc::clone(&pager), Arc::clone(&arc_catalog)),
             index_manager,
+            ctx_pool: Arc::new(GatherContextPool::new()),
+            append_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
     /// Return heuristics that guide upstream writers when sizing batches.
     pub fn write_hints(&self) -> ColumnStoreWriteHints {
         ColumnStoreWriteHints::from_config(&self.cfg)
+    }
+
+    #[inline]
+    pub(crate) fn current_epoch(&self) -> u64 {
+        self.append_epoch.load(Ordering::Acquire)
     }
 
     /// Creates and persists an index for a column.
@@ -1095,6 +1107,7 @@ where
         // in a single atomic operation.
         if !all_puts.is_empty() {
             self.pager.batch_put(&all_puts)?;
+            self.append_epoch.fetch_add(1, Ordering::Release);
         }
         tracing::trace!("ColumnStore::append END - success");
         Ok(())

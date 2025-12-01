@@ -35,7 +35,7 @@ use llkv_types::ids::{LogicalFieldId, RowId};
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatherNullPolicy {
@@ -466,6 +466,7 @@ pub struct MultiGatherContext {
     chunk_keys: Vec<PhysicalKey>,
     builders: Vec<ColumnOutputBuilder>,
     cached_schema: Option<(Vec<bool>, Arc<Schema>)>,
+    epoch: u64,
 }
 
 impl MultiGatherContext {
@@ -484,7 +485,48 @@ impl MultiGatherContext {
             plans,
             builders,
             cached_schema: None,
+            epoch: 0,
         })
+    }
+
+    fn update_field_infos_and_plans(
+        &mut self,
+        field_infos: Vec<(LogicalFieldId, DataType)>,
+        plans: Vec<FieldPlan>,
+    ) -> Result<()> {
+        if self.field_infos != field_infos {
+            let mut rebuilt = Vec::with_capacity(field_infos.len());
+            for (_, dtype) in &field_infos {
+                rebuilt.push(ColumnOutputBuilder::from_dtype(dtype)?);
+            }
+            self.builders = rebuilt;
+            self.cached_schema = None;
+        }
+        self.field_infos = field_infos;
+        self.plans = plans;
+        Ok(())
+    }
+
+    fn matches_field_ids(&self, field_ids: &[LogicalFieldId]) -> bool {
+        if self.field_infos.len() != field_ids.len() {
+            return false;
+        }
+        self.field_infos
+            .iter()
+            .zip(field_ids.iter())
+            .all(|((fid, _), target)| fid == target)
+    }
+
+    fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn reset_for_pool(&mut self) {
+        self.chunk_cache.clear();
     }
 
     #[inline]
@@ -606,6 +648,76 @@ impl MultiGatherContext {
     }
 }
 
+pub(crate) struct GatherContextPool {
+    inner: Mutex<FxHashMap<Vec<LogicalFieldId>, Vec<MultiGatherContext>>>,
+    max_per_key: usize,
+}
+
+impl GatherContextPool {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(FxHashMap::default()),
+            max_per_key: 4,
+        }
+    }
+
+    pub fn acquire<F>(
+        &self,
+        field_ids: &[LogicalFieldId],
+        factory: F,
+    ) -> Result<GatherContextGuard<'_>>
+    where
+        F: FnOnce() -> Result<MultiGatherContext>,
+    {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(bucket) = guard.get_mut(field_ids) {
+            if let Some(ctx) = bucket.pop() {
+                drop(guard);
+                return Ok(GatherContextGuard {
+                    key: field_ids.to_vec(),
+                    ctx: Some(ctx),
+                    pool: self,
+                });
+            }
+        }
+        drop(guard);
+
+        let ctx = factory()?;
+        Ok(GatherContextGuard {
+            key: field_ids.to_vec(),
+            ctx: Some(ctx),
+            pool: self,
+        })
+    }
+}
+
+pub(crate) struct GatherContextGuard<'a> {
+    key: Vec<LogicalFieldId>,
+    ctx: Option<MultiGatherContext>,
+    pool: &'a GatherContextPool,
+}
+
+impl<'a> GatherContextGuard<'a> {
+    pub fn ctx_mut(&mut self) -> &mut MultiGatherContext {
+        self.ctx
+            .as_mut()
+            .expect("gather context guard missing context")
+    }
+}
+
+impl<'a> Drop for GatherContextGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(mut ctx) = self.ctx.take() {
+            ctx.reset_for_pool();
+            let mut guard = self.pool.inner.lock().unwrap();
+            let bucket = guard.entry(self.key.clone()).or_default();
+            if bucket.len() < self.pool.max_per_key {
+                bucket.push(ctx);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct FieldPlan {
     dtype: DataType,
@@ -659,21 +771,35 @@ where
         policy: GatherNullPolicy,
         expected_schema: Option<Arc<Schema>>,
     ) -> Result<RecordBatch> {
-        let mut ctx = self.prepare_gather_context(field_ids)?;
-        self.gather_rows_with_reusable_context_impl(&mut ctx, row_ids, policy, expected_schema)
+        let mut guard = self
+            .ctx_pool
+            .acquire(field_ids, || self.prepare_gather_context(field_ids))?;
+        let ctx = guard.ctx_mut();
+        self.ensure_context_ready(ctx, field_ids)?;
+        self.gather_rows_with_reusable_context_impl(ctx, row_ids, policy, expected_schema)
     }
 
     pub fn prepare_gather_context(
         &self,
         field_ids: &[LogicalFieldId],
     ) -> Result<MultiGatherContext> {
+        let (field_infos, plans) = self.build_field_infos_and_plans(field_ids)?;
+        let mut ctx = MultiGatherContext::new(field_infos, plans)?;
+        ctx.set_epoch(self.current_epoch());
+        Ok(ctx)
+    }
+
+    fn build_field_infos_and_plans(
+        &self,
+        field_ids: &[LogicalFieldId],
+    ) -> Result<(Vec<(LogicalFieldId, DataType)>, Vec<FieldPlan>)> {
         let mut field_infos = Vec::with_capacity(field_ids.len());
         for &fid in field_ids {
             field_infos.push((fid, self.data_type(fid)?));
         }
 
         if field_infos.is_empty() {
-            return MultiGatherContext::new(Vec::new(), Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let catalog = self.catalog.read().unwrap();
@@ -727,7 +853,44 @@ where
             });
         }
 
-        MultiGatherContext::new(field_infos, plans)
+        Ok((field_infos, plans))
+    }
+
+    fn ensure_context_ready(
+        &self,
+        ctx: &mut MultiGatherContext,
+        field_ids: &[LogicalFieldId],
+    ) -> Result<()> {
+        self.ensure_context_ready_impl(ctx, Some(field_ids))
+    }
+
+    fn ensure_context_ready_from_context(&self, ctx: &mut MultiGatherContext) -> Result<()> {
+        self.ensure_context_ready_impl(ctx, None)
+    }
+
+    fn ensure_context_ready_impl(
+        &self,
+        ctx: &mut MultiGatherContext,
+        maybe_fields: Option<&[LogicalFieldId]>,
+    ) -> Result<()> {
+        let current_epoch = self.current_epoch();
+        let needs_field_refresh = if let Some(field_ids) = maybe_fields {
+            !ctx.matches_field_ids(field_ids)
+        } else {
+            false
+        };
+        let needs_epoch_refresh = ctx.epoch() != current_epoch;
+        if needs_field_refresh || needs_epoch_refresh {
+            let owned_fields: Vec<LogicalFieldId> = if let Some(field_ids) = maybe_fields {
+                field_ids.to_vec()
+            } else {
+                ctx.field_infos().iter().map(|(fid, _)| *fid).collect()
+            };
+            let (field_infos, plans) = self.build_field_infos_and_plans(&owned_fields)?;
+            ctx.update_field_infos_and_plans(field_infos, plans)?;
+            ctx.set_epoch(current_epoch);
+        }
+        Ok(())
     }
 
     fn average_value_bytes_per_row(metas: &[ChunkMetadata]) -> f64 {
@@ -754,6 +917,7 @@ where
         row_ids: &[u64],
         policy: GatherNullPolicy,
     ) -> Result<RecordBatch> {
+        self.ensure_context_ready_from_context(ctx)?;
         self.gather_rows_with_reusable_context_impl(ctx, row_ids, policy, None)
     }
 
@@ -1239,7 +1403,8 @@ where
             }
         };
 
-        self.gather_rows_with_reusable_context(ctx_ref, row_ids, null_policy)
+        self.ensure_context_ready(ctx_ref, logical_fields)?;
+        self.gather_rows_with_reusable_context_impl(ctx_ref, row_ids, null_policy, None)
     }
 
     #[allow(clippy::too_many_arguments)] // NOTE: Signature mirrors shared helper and avoids intermediate structs.
