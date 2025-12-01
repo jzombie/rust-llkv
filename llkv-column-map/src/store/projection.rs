@@ -655,6 +655,7 @@ pub(crate) struct GatherContextPool {
 
 impl GatherContextPool {
     pub fn new() -> Self {
+        // TODO: Expose max_per_key as a tunable so operators can trade memory footprint for hot-set reuse.
         Self {
             inner: Mutex::new(FxHashMap::default()),
             max_per_key: 4,
