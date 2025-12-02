@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod compare;
 pub mod date;
 pub mod eval;
+pub mod fast_numeric;
 pub mod interval;
 pub mod kernels;
 pub mod literal;

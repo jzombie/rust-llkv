@@ -81,10 +81,6 @@ pub fn infer_computed_data_type(
             let left_type = infer_computed_data_type(schema, left)?;
             let right_type = infer_computed_data_type(schema, right)?;
 
-            if matches!(left_type, DataType::Float64) || matches!(right_type, DataType::Float64) {
-                return Ok(DataType::Float64);
-            }
-
             match (left_type, right_type) {
                 (DataType::Decimal128(_, s1), DataType::Decimal128(_, s2)) => {
                     let scale = match op {
@@ -104,7 +100,7 @@ pub fn infer_computed_data_type(
                     };
                     Ok(DataType::Decimal128(38, scale))
                 }
-                _ => Ok(DataType::Int64),
+                (l, r) => Ok(llkv_compute::kernels::common_type_for_op(&l, &r, *op)),
             }
         }
         ScalarExpr::Not(_) => Ok(DataType::Int64),
