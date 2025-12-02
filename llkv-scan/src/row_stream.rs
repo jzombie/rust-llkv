@@ -242,6 +242,13 @@ where
             }
         };
 
+        let columns_buf = Vec::with_capacity(projection_evals.len());
+        let numeric_arrays_cache = if requires_numeric {
+            Some(FxHashMap::default())
+        } else {
+            None
+        };
+
         let chunk_ranges = if total_rows == 0 {
             Vec::new()
         } else {
@@ -271,6 +278,8 @@ where
             gather_ctx,
             current_batch: None,
             current_row_ids: None,
+            columns_buf,
+            numeric_arrays_cache,
             phantom: PhantomData,
             emit_row_ids: include_row_ids,
         })
@@ -298,6 +307,8 @@ where
     gather_ctx: Option<MultiGatherContext>,
     current_batch: Option<RecordBatch>,
     current_row_ids: Option<ArrayRef>,
+    columns_buf: Vec<ArrayRef>,
+    numeric_arrays_cache: Option<NumericArrayMap>,
     phantom: PhantomData<P>,
     emit_row_ids: bool,
 }
@@ -333,6 +344,7 @@ where
             let null_policy = self.null_policy;
             let schema = Arc::clone(&self.schema);
 
+            let numeric_cache = self.numeric_arrays_cache.as_mut().map(|m| m);
             let batch_opt = materialize_row_window(
                 self.storage,
                 self.table_id,
@@ -346,6 +358,8 @@ where
                 &schema,
                 window,
                 self.gather_ctx.as_mut(),
+                numeric_cache,
+                &mut self.columns_buf,
             )?;
 
             let Some(batch) = batch_opt else {
@@ -408,6 +422,8 @@ pub fn materialize_row_window<P, S>(
     out_schema: &Arc<Schema>,
     window: &[RowId],
     gather_ctx: Option<&mut MultiGatherContext>,
+    numeric_cache: Option<&mut NumericArrayMap>,
+    columns: &mut Vec<ArrayRef>,
 ) -> LlkvResult<Option<RecordBatch>>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
@@ -418,13 +434,14 @@ where
     }
 
     let mut gathered_batch: Option<RecordBatch> = None;
-    let (batch_len, numeric_arrays) = if unique_lfids.is_empty() {
-        let numeric_arrays = if requires_numeric {
-            Some(FxHashMap::default())
-        } else {
-            None
-        };
-        (window.len(), numeric_arrays)
+    let mut numeric_arrays_holder: Option<&mut NumericArrayMap> = None;
+    let batch_len = if unique_lfids.is_empty() {
+        if requires_numeric {
+            let map = numeric_cache.expect("numeric cache missing for computed projections");
+            map.clear();
+            numeric_arrays_holder = Some(map);
+        }
+        window.len()
     } else {
         let batch = storage.gather_row_window_with_context(
             unique_lfids,
@@ -436,20 +453,19 @@ where
             return Ok(None);
         }
         let batch_len = batch.num_rows();
-        let numeric_arrays = if requires_numeric {
-            let mut map: NumericArrayMap = FxHashMap::default();
+        if requires_numeric {
+            let map = numeric_cache.expect("numeric cache missing for computed projections");
+            map.clear();
             for (lfid, array) in unique_lfids.iter().zip(batch.columns().iter()) {
                 let fid = lfid.field_id();
                 if numeric_fields.contains(&fid) {
                     map.insert(fid, array.clone());
                 }
             }
-            Some(map)
-        } else {
-            None
-        };
+            numeric_arrays_holder = Some(map);
+        }
         gathered_batch = Some(batch);
-        (batch_len, numeric_arrays)
+        batch_len
     };
 
     if batch_len == 0 {
@@ -462,7 +478,8 @@ where
         &[]
     };
 
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection_evals.len());
+    columns.clear();
+    columns.reserve(projection_evals.len());
     for (idx, eval) in projection_evals.iter().enumerate() {
         match eval {
             ProjectionEval::Column(info) => {
@@ -552,7 +569,7 @@ where
                         eval_get_field(base, field_name, gathered_columns, unique_index, table_id)?
                     }
                     _ => {
-                        let numeric_arrays = numeric_arrays
+                        let numeric_arrays = numeric_arrays_holder
                             .as_ref()
                             .expect("numeric arrays should exist for computed projection");
                         ScalarEvaluator::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
@@ -563,6 +580,6 @@ where
         }
     }
 
-    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns)?;
+    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns.clone())?;
     Ok(Some(batch))
 }

@@ -14,15 +14,20 @@ use llkv_types::{FieldId, LogicalFieldId, RowId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::row_stream::{
-    ColumnProjectionInfo, ComputedProjectionInfo, ProjectionEval, RowIdSource, RowStream,
-    RowStreamBuilder, materialize_row_window,
+    ColumnProjectionInfo, ComputedProjectionInfo, NumericArrayMap, ProjectionEval, RowIdSource,
+    RowStream, RowStreamBuilder, materialize_row_window,
 };
 use crate::{ScanProjection, ScanStorage, ScanStreamOptions, ordering::sort_row_ids_with_order};
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-const ROW_STREAM_CHUNK_SIZE: usize = 1024;
+/// Streaming chunk size for row materialization.
+///
+/// The benches spend most of their time in compute once allocations are pooled,
+/// so larger chunks help amortize planner and gather overhead. 16K keeps the
+/// batches cache-friendly while letting arithmetic kernels stay vectorized.
+const ROW_STREAM_CHUNK_SIZE: usize = 16_384;
 
 struct FullTableStreamPlan<'a> {
     projection_evals: &'a [ProjectionEval],
@@ -273,6 +278,13 @@ where
         Some(storage.prepare_gather_context(plan.unique_lfids)?)
     };
 
+    let mut columns_buf = Vec::with_capacity(plan.projection_evals.len());
+    let mut numeric_cache = if plan.requires_numeric {
+        Some(NumericArrayMap::default())
+    } else {
+        None
+    };
+
     let mut emitted_rows = false;
     let mut process_chunk = |chunk: &[RowId]| -> LlkvResult<()> {
         if chunk.is_empty() {
@@ -292,6 +304,8 @@ where
             &plan.out_schema,
             chunk,
             gather_ctx.as_mut(),
+            numeric_cache.as_mut().map(|m| m),
+            &mut columns_buf,
         )?
         .filter(|batch| batch.num_rows() > 0)
         {
