@@ -11,6 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::Instant,
 };
 
 use arrow::{
@@ -179,21 +180,32 @@ pub fn run_qualification(
             options.stream_number(),
             &stream_parameters,
         )?;
+        let exec_start = Instant::now();
         let actual_rows = execute_query(engine, &rendered, kinds)?;
+        let exec_elapsed = exec_start.elapsed();
 
-        print!("comparing... ");
+        print!("({:.2}s) comparing... ", exec_elapsed.as_secs_f64());
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
+        let compare_start = Instant::now();
         let diff = diff_rows(&expected_rows, &actual_rows, kinds);
+        let compare_elapsed = compare_start.elapsed();
 
         let status = if diff.missing.is_empty() && diff.extra.is_empty() {
-            println!("PASS ({} rows)", actual_rows.len());
+            println!(
+                "PASS ({} rows) [exec {:.2}s | compare {:.2}s]",
+                actual_rows.len(),
+                exec_elapsed.as_secs_f64(),
+                compare_elapsed.as_secs_f64()
+            );
             QualificationStatus::Pass
         } else {
             println!(
-                "FAIL (expected {}, actual {})",
+                "FAIL (expected {}, actual {}) [exec {:.2}s | compare {:.2}s]",
                 expected_rows.len(),
-                actual_rows.len()
+                actual_rows.len(),
+                exec_elapsed.as_secs_f64(),
+                compare_elapsed.as_secs_f64()
             );
             QualificationStatus::Fail
         };
