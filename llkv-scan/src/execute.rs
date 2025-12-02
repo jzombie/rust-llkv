@@ -14,8 +14,8 @@ use llkv_types::{FieldId, LogicalFieldId, RowId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::row_stream::{
-    ColumnProjectionInfo, ComputedProjectionInfo, NumericArrayMap, ProjectionEval, RowIdSource,
-    RowStream, RowStreamBuilder, materialize_row_window,
+    ColumnProjectionInfo, ComputedProjectionInfo, NumericArrayMap, ProjectionEval, ProjectionPlan,
+    RowIdSource, RowStream, RowStreamBuilder, materialize_row_window,
 };
 use crate::{ScanProjection, ScanStorage, ScanStreamOptions, ordering::sort_row_ids_with_order};
 use llkv_column_map::store::GatherNullPolicy;
@@ -31,13 +31,13 @@ const ROW_STREAM_CHUNK_SIZE: usize = 16_384;
 
 struct FullTableStreamPlan<'a> {
     projection_evals: &'a [ProjectionEval],
-    passthrough_fields: &'a [Option<FieldId>],
     unique_index: &'a FxHashMap<LogicalFieldId, usize>,
     unique_lfids: &'a [LogicalFieldId],
     numeric_fields: &'a FxHashSet<FieldId>,
     requires_numeric: bool,
     null_policy: GatherNullPolicy,
     out_schema: Arc<Schema>,
+    projection_plan: Vec<crate::row_stream::ProjectionPlan>,
 }
 
 /// Execute a table scan using the shared scan machinery.
@@ -116,6 +116,32 @@ where
         })
         .collect();
 
+    let mut projection_plan = Vec::with_capacity(projection_evals.len());
+    for (idx, eval) in projection_evals.iter().enumerate() {
+        match eval {
+            ProjectionEval::Column(info) => {
+                let arr_idx = *unique_index
+                    .get(&info.logical_field_id)
+                    .expect("logical field id missing from index");
+                projection_plan.push(ProjectionPlan::Column {
+                    source_idx: arr_idx,
+                });
+            }
+            ProjectionEval::Computed(_) => {
+                let passthrough_idx = passthrough_fields[idx].as_ref().map(|fid| {
+                    let lfid = LogicalFieldId::for_user(table_id, *fid);
+                    *unique_index
+                        .get(&lfid)
+                        .expect("passthrough field missing from index")
+                });
+                projection_plan.push(ProjectionPlan::Computed {
+                    eval_idx: idx,
+                    passthrough_idx,
+                });
+            }
+        }
+    }
+
     let null_policy = if options.include_nulls {
         GatherNullPolicy::IncludeNulls
     } else {
@@ -171,13 +197,13 @@ where
     if can_stream_full_table {
         let plan = FullTableStreamPlan {
             projection_evals: &projection_evals,
-            passthrough_fields: &passthrough_fields,
             unique_index: &unique_index,
             unique_lfids: &unique_lfids,
             numeric_fields: &numeric_fields,
             requires_numeric,
             null_policy,
             out_schema: Arc::clone(&out_schema),
+            projection_plan: projection_plan.clone(),
         };
         stream_full_table_scan(storage, table_id, plan, on_batch)?;
         return Ok(());
@@ -296,7 +322,7 @@ where
             table_id,
             plan.unique_lfids,
             plan.projection_evals,
-            plan.passthrough_fields,
+            &plan.projection_plan,
             plan.unique_index,
             plan.numeric_fields,
             plan.requires_numeric,

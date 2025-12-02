@@ -135,6 +135,17 @@ pub enum ProjectionEval {
     Computed(ComputedProjectionInfo),
 }
 
+#[derive(Clone)]
+pub enum ProjectionPlan {
+    Column {
+        source_idx: usize,
+    },
+    Computed {
+        eval_idx: usize,
+        passthrough_idx: Option<usize>,
+    },
+}
+
 pub struct RowStreamBuilder<'storage, P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
@@ -145,7 +156,7 @@ where
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
     projection_evals: Arc<Vec<ProjectionEval>>,
-    passthrough_fields: Arc<Vec<Option<FieldId>>>,
+    _passthrough_fields: Arc<Vec<Option<FieldId>>>,
     unique_index: Arc<FxHashMap<LogicalFieldId, usize>>,
     numeric_fields: Arc<FxHashSet<FieldId>>,
     requires_numeric: bool,
@@ -184,7 +195,7 @@ where
             schema,
             unique_lfids,
             projection_evals,
-            passthrough_fields,
+            _passthrough_fields: passthrough_fields,
             unique_index,
             numeric_fields,
             requires_numeric,
@@ -209,7 +220,7 @@ where
             schema,
             unique_lfids,
             projection_evals,
-            passthrough_fields,
+            _passthrough_fields: passthrough_fields,
             unique_index,
             numeric_fields,
             requires_numeric,
@@ -249,6 +260,32 @@ where
             None
         };
 
+        let mut projection_plan = Vec::with_capacity(projection_evals.len());
+        for (idx, eval) in projection_evals.iter().enumerate() {
+            match eval {
+                ProjectionEval::Column(info) => {
+                    let arr_idx = *unique_index
+                        .get(&info.logical_field_id)
+                        .expect("logical field id missing from index");
+                    projection_plan.push(ProjectionPlan::Column {
+                        source_idx: arr_idx,
+                    });
+                }
+                ProjectionEval::Computed(_) => {
+                    let passthrough_idx = passthrough_fields[idx].as_ref().map(|fid| {
+                        let lfid = LogicalFieldId::for_user(table_id, *fid);
+                        *unique_index
+                            .get(&lfid)
+                            .expect("passthrough field missing from index")
+                    });
+                    projection_plan.push(ProjectionPlan::Computed {
+                        eval_idx: idx,
+                        passthrough_idx,
+                    });
+                }
+            }
+        }
+
         let chunk_ranges = if total_rows == 0 {
             Vec::new()
         } else {
@@ -267,7 +304,7 @@ where
             schema,
             unique_lfids,
             projection_evals,
-            passthrough_fields,
+            _passthrough_fields: passthrough_fields,
             unique_index,
             numeric_fields,
             requires_numeric,
@@ -282,6 +319,7 @@ where
             numeric_arrays_cache,
             phantom: PhantomData,
             emit_row_ids: include_row_ids,
+            projection_plan,
         })
     }
 }
@@ -296,7 +334,7 @@ where
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
     projection_evals: Arc<Vec<ProjectionEval>>,
-    passthrough_fields: Arc<Vec<Option<FieldId>>>,
+    _passthrough_fields: Arc<Vec<Option<FieldId>>>,
     unique_index: Arc<FxHashMap<LogicalFieldId, usize>>,
     numeric_fields: Arc<FxHashSet<FieldId>>,
     requires_numeric: bool,
@@ -311,6 +349,7 @@ where
     numeric_arrays_cache: Option<NumericArrayMap>,
     phantom: PhantomData<P>,
     emit_row_ids: bool,
+    projection_plan: Vec<ProjectionPlan>,
 }
 
 impl<'storage, P, S> RowStream for ScanRowStream<'storage, P, S>
@@ -337,12 +376,12 @@ where
 
             let unique_lfids = Arc::clone(&self.unique_lfids);
             let projection_evals = Arc::clone(&self.projection_evals);
-            let passthrough_fields = Arc::clone(&self.passthrough_fields);
             let unique_index = Arc::clone(&self.unique_index);
             let numeric_fields = Arc::clone(&self.numeric_fields);
             let requires_numeric = self.requires_numeric;
             let null_policy = self.null_policy;
             let schema = Arc::clone(&self.schema);
+            let projection_plan = self.projection_plan.clone();
 
             let numeric_cache = self.numeric_arrays_cache.as_mut().map(|m| m);
             let batch_opt = materialize_row_window(
@@ -350,7 +389,7 @@ where
                 self.table_id,
                 unique_lfids.as_ref(),
                 projection_evals.as_ref(),
-                passthrough_fields.as_ref(),
+                &projection_plan,
                 unique_index.as_ref(),
                 numeric_fields.as_ref(),
                 requires_numeric,
@@ -414,7 +453,7 @@ pub fn materialize_row_window<P, S>(
     table_id: TableId,
     unique_lfids: &[LogicalFieldId],
     projection_evals: &[ProjectionEval],
-    passthrough_fields: &[Option<FieldId>],
+    projection_plan: &[ProjectionPlan],
     unique_index: &FxHashMap<LogicalFieldId, usize>,
     numeric_fields: &FxHashSet<FieldId>,
     requires_numeric: bool,
@@ -480,24 +519,23 @@ where
 
     columns.clear();
     columns.reserve(projection_evals.len());
-    for (idx, eval) in projection_evals.iter().enumerate() {
-        match eval {
-            ProjectionEval::Column(info) => {
-                let arr_idx = *unique_index
-                    .get(&info.logical_field_id)
-                    .expect("logical field id missing from index");
-                columns.push(Arc::clone(&gathered_columns[arr_idx]));
+    for (idx, plan) in projection_plan.iter().enumerate() {
+        match plan {
+            ProjectionPlan::Column { source_idx } => {
+                columns.push(Arc::clone(&gathered_columns[*source_idx]));
             }
-            ProjectionEval::Computed(info) => {
-                if let Some(fid) = passthrough_fields[idx] {
-                    let lfid = LogicalFieldId::for_user(table_id, fid);
-                    let arr_idx = *unique_index
-                        .get(&lfid)
-                        .expect("passthrough field missing from index");
-                    columns.push(Arc::clone(&gathered_columns[arr_idx]));
+            ProjectionPlan::Computed {
+                eval_idx,
+                passthrough_idx,
+            } => {
+                if let Some(arr_idx) = passthrough_idx {
+                    columns.push(Arc::clone(&gathered_columns[*arr_idx]));
                     continue;
                 }
-
+                let info = match &projection_evals[*eval_idx] {
+                    ProjectionEval::Computed(info) => info,
+                    ProjectionEval::Column(_) => unreachable!("plan mismatch"),
+                };
                 let array: ArrayRef = match &info.expr {
                     ScalarExpr::Literal(_) => synthesize_computed_literal_array(
                         info,
