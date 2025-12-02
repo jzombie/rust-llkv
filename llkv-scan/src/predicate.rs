@@ -338,6 +338,10 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
+    if let Some(filter) = simple_compare_filter(left, op, right) {
+        return storage.filter_leaf(&filter);
+    }
+
     let mut fields = FxHashSet::default();
     ScalarEvaluator::collect_fields(left, &mut fields);
     ScalarEvaluator::collect_fields(right, &mut fields);
@@ -910,4 +914,46 @@ where
         Some(false) => Ok((Treemap::new(), rows)),
         None => Ok((Treemap::new(), Treemap::new())),
     }
+}
+
+fn simple_compare_filter(
+    left: &ScalarExpr<FieldId>,
+    op: CompareOp,
+    right: &ScalarExpr<FieldId>,
+) -> Option<OwnedFilter> {
+    match (left, right) {
+        (ScalarExpr::Column(field_id), ScalarExpr::Literal(lit)) => {
+            compare_op_to_owned(*field_id, op, lit)
+        }
+        (ScalarExpr::Literal(lit), ScalarExpr::Column(field_id)) => {
+            let flipped = match op {
+                CompareOp::Eq => Some(CompareOp::Eq),
+                CompareOp::NotEq => None,
+                CompareOp::Lt => Some(CompareOp::Gt),
+                CompareOp::LtEq => Some(CompareOp::GtEq),
+                CompareOp::Gt => Some(CompareOp::Lt),
+                CompareOp::GtEq => Some(CompareOp::LtEq),
+            }?;
+            compare_op_to_owned(*field_id, flipped, lit)
+        }
+        _ => None,
+    }
+}
+
+fn compare_op_to_owned(field_id: FieldId, op: CompareOp, literal: &Literal) -> Option<OwnedFilter> {
+    if matches!(literal, Literal::Null) {
+        // Null comparisons propagate null, so fall back to row-wise evaluation.
+        return None;
+    }
+
+    let op = match op {
+        CompareOp::Eq => OwnedOperator::Equals(literal.clone()),
+        CompareOp::NotEq => return None,
+        CompareOp::Lt => OwnedOperator::LessThan(literal.clone()),
+        CompareOp::LtEq => OwnedOperator::LessThanOrEquals(literal.clone()),
+        CompareOp::Gt => OwnedOperator::GreaterThan(literal.clone()),
+        CompareOp::GtEq => OwnedOperator::GreaterThanOrEquals(literal.clone()),
+    };
+
+    Some(OwnedFilter { field_id, op })
 }
