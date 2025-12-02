@@ -13,7 +13,7 @@ use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext, Projection};
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::{MemPager, Pager};
-use llkv_types::{FieldId, LogicalFieldId, TableId};
+use llkv_types::{FieldId, LogicalFieldId, RowId, TableId};
 use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 pub mod row_stream;
@@ -212,7 +212,7 @@ where
     fn stream_row_ids(
         &self,
         chunk_size: usize,
-        on_chunk: &mut dyn FnMut(Vec<u64>) -> LlkvResult<()>,
+        on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     ) -> LlkvResult<()>;
     fn as_any(&self) -> &dyn std::any::Any;
 }

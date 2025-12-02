@@ -4,7 +4,7 @@ use llkv_expr::Expr;
 use llkv_plan::{PlanGraph, ProgramSet};
 use llkv_result::{Error, Result as ExecutorResult};
 use llkv_table::table::Table as LlkvTable;
-use llkv_types::{FieldId, LogicalFieldId, TableId};
+use llkv_types::{FieldId, LogicalFieldId, RowId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
@@ -83,7 +83,7 @@ where
     fn stream_row_ids(
         &self,
         chunk_size: usize,
-        on_chunk: &mut dyn FnMut(Vec<u64>) -> ExecutorResult<()>,
+        on_chunk: &mut dyn FnMut(&[RowId]) -> ExecutorResult<()>,
     ) -> ExecutorResult<()> {
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
@@ -95,11 +95,9 @@ where
                 upper: Bound::Unbounded,
             },
         }))?;
-        let mut buffer = Vec::new();
-        for chunk in ids.iter().collect::<Vec<_>>().chunks(chunk_size.max(1)) {
-            buffer.clear();
-            buffer.extend_from_slice(chunk);
-            on_chunk(buffer.clone())?;
+        let rows: Vec<u64> = ids.iter().collect();
+        for chunk in rows.chunks(chunk_size.max(1)) {
+            on_chunk(chunk)?;
         }
         Ok(())
     }

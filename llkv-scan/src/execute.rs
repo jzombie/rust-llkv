@@ -274,7 +274,7 @@ where
     };
 
     let mut emitted_rows = false;
-    let mut process_chunk = |chunk: Vec<RowId>| -> LlkvResult<()> {
+    let mut process_chunk = |chunk: &[RowId]| -> LlkvResult<()> {
         if chunk.is_empty() {
             return Ok(());
         }
@@ -290,7 +290,7 @@ where
             plan.requires_numeric,
             plan.null_policy,
             &plan.out_schema,
-            chunk.as_slice(),
+            chunk,
             gather_ctx.as_mut(),
         )?
         .filter(|batch| batch.num_rows() > 0)

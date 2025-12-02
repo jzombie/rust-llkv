@@ -1,6 +1,5 @@
 use croaring::Treemap;
 use std::cmp;
-use std::mem;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -862,7 +861,7 @@ struct RowIdChunkEmitter<'a> {
     chunk_size: usize,
     buffer: Vec<RowId>,
     reverse_sorted_runs: bool,
-    on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+    on_chunk: &'a mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     error: Option<Error>,
 }
 
@@ -870,7 +869,7 @@ impl<'a> RowIdChunkEmitter<'a> {
     fn new(
         chunk_size: usize,
         reverse_sorted_runs: bool,
-        on_chunk: &'a mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+        on_chunk: &'a mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     ) -> Self {
         let chunk_size = cmp::max(1, chunk_size);
         Self {
@@ -930,9 +929,10 @@ impl<'a> RowIdChunkEmitter<'a> {
         if self.error.is_some() || self.buffer.is_empty() {
             return;
         }
-        let chunk = mem::take(&mut self.buffer);
-        if let Err(err) = (self.on_chunk)(chunk) {
+        if let Err(err) = (self.on_chunk)(self.buffer.as_slice()) {
             self.error = Some(err);
+        } else {
+            self.buffer.clear();
         }
     }
 
@@ -1035,7 +1035,7 @@ where
     fn stream_row_ids(
         &self,
         chunk_size: usize,
-        on_chunk: &mut dyn FnMut(Vec<u64>) -> LlkvResult<()>,
+        on_chunk: &mut dyn FnMut(&[u64]) -> LlkvResult<()>,
     ) -> LlkvResult<()> {
         self.stream_table_row_ids(chunk_size, on_chunk)
     }
@@ -1266,8 +1266,8 @@ where
             ordered.reserve(cap);
         }
 
-        let mut on_chunk = |chunk: Vec<RowId>| -> LlkvResult<()> {
-            ordered.extend(chunk);
+        let mut on_chunk = |chunk: &[RowId]| -> LlkvResult<()> {
+            ordered.extend_from_slice(chunk);
             Ok(())
         };
         let reverse_sorted_runs = matches!(order_spec.direction, ScanOrderDirection::Descending);
@@ -1376,7 +1376,7 @@ where
     fn stream_table_row_ids(
         &self,
         chunk_size: usize,
-        on_chunk: &mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+        on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     ) -> LlkvResult<()> {
         use llkv_column_map::store::rowid_fid;
 
@@ -1416,11 +1416,12 @@ where
                 for row_id in all_rows.iter() {
                     chunk.push(row_id);
                     if chunk.len() >= chunk_cap {
-                        (on_chunk)(mem::take(&mut chunk))?;
+                        (on_chunk)(chunk.as_slice())?;
+                        chunk.clear();
                     }
                 }
                 if !chunk.is_empty() {
-                    (on_chunk)(mem::take(&mut chunk))?;
+                    (on_chunk)(chunk.as_slice())?;
                 }
                 Ok(())
             }
@@ -1434,7 +1435,7 @@ where
     fn try_stream_row_ids_from_mvcc(
         &self,
         chunk_size: usize,
-        on_chunk: &mut dyn FnMut(Vec<RowId>) -> LlkvResult<()>,
+        on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     ) -> LlkvResult<bool> {
         let Some(rows) = self.fetch_mvcc_row_ids()? else {
             return Ok(false);
@@ -1448,11 +1449,12 @@ where
         for row_id in rows {
             chunk.push(row_id);
             if chunk.len() >= chunk_cap {
-                (on_chunk)(mem::take(&mut chunk))?;
+                (on_chunk)(chunk.as_slice())?;
+                chunk.clear();
             }
         }
         if !chunk.is_empty() {
-            (on_chunk)(chunk)?;
+            (on_chunk)(chunk.as_slice())?;
         }
         Ok(true)
     }
@@ -1578,8 +1580,8 @@ mod tests {
         let mut emitted: Vec<RowId> = Vec::new();
 
         {
-            let mut on_chunk = |chunk: Vec<RowId>| -> LlkvResult<()> {
-                emitted.extend(chunk);
+            let mut on_chunk = |chunk: &[RowId]| -> LlkvResult<()> {
+                emitted.extend_from_slice(chunk);
                 Ok(())
             };
             let mut emitter = RowIdChunkEmitter::new(2, true, &mut on_chunk);
