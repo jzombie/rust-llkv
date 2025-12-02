@@ -25,9 +25,9 @@ use simd_r_drive_entry_handle::EntryHandle;
 /// Streaming chunk size for row materialization.
 ///
 /// The benches spend most of their time in compute once allocations are pooled,
-/// so larger chunks help amortize planner and gather overhead. 16K keeps the
-/// batches cache-friendly while letting arithmetic kernels stay vectorized.
-const ROW_STREAM_CHUNK_SIZE: usize = 16_384;
+/// so larger chunks help amortize planner and gather overhead. 64K keeps the
+/// batches cache-friendly on modern caches while reducing per-chunk setup costs.
+const ROW_STREAM_CHUNK_SIZE: usize = 65_536;
 
 struct FullTableStreamPlan<'a> {
     projection_evals: &'a [ProjectionEval],
