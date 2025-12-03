@@ -287,6 +287,9 @@ where
     where
         P: Pager<Blob = EntryHandle> + Send + Sync,
     {
+        if matches!(predicate, Predicate::All) {
+            return T::run_all(store, field_id);
+        }
         let predicate = predicate.clone();
         T::run_filter(store, field_id, move |value| {
             predicate.matches(<T::Native as PredicateValue>::borrowed(&value))
@@ -681,6 +684,87 @@ impl_filter_visitor!(
     date64_chunk_with_rids
 );
 impl_filter_visitor!(
+    arrow::datatypes::Date32Type,
+    Date32Array,
+    date32_chunk_with_rids
+);
+
+pub(crate) struct RowIdAllVisitor<T> {
+    row_ids: Vec<u64>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> RowIdAllVisitor<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            row_ids: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn into_row_ids(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl<T> PrimitiveVisitor for RowIdAllVisitor<T> {}
+impl<T> PrimitiveSortedVisitor for RowIdAllVisitor<T> {}
+impl<T> PrimitiveSortedWithRowIdsVisitor for RowIdAllVisitor<T> {}
+
+macro_rules! impl_rowid_all_visitor {
+    ($ty:ty, $arr:ty, $method:ident) => {
+        impl PrimitiveWithRowIdsVisitor for RowIdAllVisitor<$ty> {
+            fn $method(&mut self, values: &$arr, row_ids: &UInt64Array) {
+                if values.null_count() == 0 {
+                    self.row_ids.extend_from_slice(row_ids.values());
+                } else {
+                    for i in 0..values.len() {
+                        if values.is_valid(i) {
+                            self.row_ids.push(row_ids.value(i));
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_rowid_all_visitor!(
+    arrow::datatypes::UInt64Type,
+    UInt64Array,
+    u64_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::UInt32Type,
+    UInt32Array,
+    u32_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::UInt16Type,
+    UInt16Array,
+    u16_chunk_with_rids
+);
+impl_rowid_all_visitor!(arrow::datatypes::UInt8Type, UInt8Array, u8_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
+impl_rowid_all_visitor!(
+    arrow::datatypes::Float64Type,
+    Float64Array,
+    f64_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::Float32Type,
+    Float32Array,
+    f32_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::Date64Type,
+    Date64Array,
+    date64_chunk_with_rids
+);
+impl_rowid_all_visitor!(
     arrow::datatypes::Date32Type,
     Date32Array,
     date32_chunk_with_rids
@@ -1241,6 +1325,40 @@ where
     }
 }
 
+pub(crate) struct BoolRowIdAllVisitor {
+    row_ids: Vec<u64>,
+}
+
+impl BoolRowIdAllVisitor {
+    fn new() -> Self {
+        Self {
+            row_ids: Vec::new(),
+        }
+    }
+
+    fn into_row_ids(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl PrimitiveVisitor for BoolRowIdAllVisitor {}
+impl PrimitiveSortedVisitor for BoolRowIdAllVisitor {}
+impl PrimitiveSortedWithRowIdsVisitor for BoolRowIdAllVisitor {}
+
+impl PrimitiveWithRowIdsVisitor for BoolRowIdAllVisitor {
+    fn bool_chunk_with_rids(&mut self, values: &BooleanArray, row_ids: &UInt64Array) {
+        if values.null_count() == 0 {
+            self.row_ids.extend_from_slice(row_ids.values());
+        } else {
+            for i in 0..values.len() {
+                if values.is_valid(i) {
+                    self.row_ids.push(row_ids.value(i));
+                }
+            }
+        }
+    }
+}
+
 pub trait FilterPrimitive {
     type Native;
     fn run_filter_with_result<P, F>(
@@ -1269,6 +1387,10 @@ pub trait FilterPrimitive {
     where
         P: Pager<Blob = EntryHandle> + Send + Sync,
         F: FnMut(Self::Native) -> bool;
+
+    fn run_all<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync;
 }
 
 macro_rules! impl_filter_primitive {
@@ -1310,6 +1432,13 @@ macro_rules! impl_filter_primitive {
                 F: FnMut(Self::Native) -> bool,
             {
                 run_filter_for::<P, $ty, F>(store, field_id, predicate)
+            }
+
+            fn run_all<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+            where
+                P: Pager<Blob = EntryHandle> + Send + Sync,
+            {
+                run_all_for::<P, $ty>(store, field_id)
             }
         }
     };
@@ -1365,6 +1494,13 @@ impl FilterPrimitive for arrow::datatypes::BooleanType {
         F: FnMut(Self::Native) -> bool,
     {
         run_filter_for_bool(store, field_id, predicate)
+    }
+
+    fn run_all<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        run_all_for_bool(store, field_id)
     }
 }
 
@@ -1484,6 +1620,25 @@ where
     Ok(visitor.into_row_ids())
 }
 
+pub(crate) fn run_all_for<P, T>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    T: ArrowPrimitiveType,
+    RowIdAllVisitor<T>: PrimitiveVisitor
+        + PrimitiveSortedVisitor
+        + PrimitiveSortedWithRowIdsVisitor
+        + PrimitiveWithRowIdsVisitor,
+{
+    let mut visitor = RowIdAllVisitor::<T>::new();
+    ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .run(&mut visitor)?;
+    Ok(visitor.into_row_ids())
+}
+
 pub(crate) fn run_nullable_filter_for<P, T, F>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
@@ -1536,6 +1691,17 @@ where
     F: FnMut(bool) -> bool,
 {
     let mut visitor = BoolRowIdFilterVisitor::new(predicate);
+    ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .run(&mut visitor)?;
+    Ok(visitor.into_row_ids())
+}
+
+fn run_all_for_bool<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut visitor = BoolRowIdAllVisitor::new();
     ScanBuilder::new(store, field_id)
         .with_row_ids(rowid_fid(field_id))
         .run(&mut visitor)?;
