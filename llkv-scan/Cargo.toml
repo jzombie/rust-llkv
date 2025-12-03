@@ -24,6 +24,7 @@ llkv-storage.workspace = true
 llkv-types.workspace = true
 rustc-hash.workspace = true
 simd-r-drive-entry-handle.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true

@@ -1713,6 +1713,7 @@ dependencies = [
  "llkv-table",
  "llkv-test-utils",
  "llkv-types",
+ "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",
  "tracing",
@@ -1784,6 +1785,7 @@ dependencies = [
  "llkv-result",
  "llkv-storage",
  "llkv-types",
+ "rayon",
  "rustc-hash",
  "simd-r-drive-entry-handle",
 ]

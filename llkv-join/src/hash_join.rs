@@ -37,6 +37,7 @@ use arrow::datatypes::{DataType, Schema};
 use llkv_column_map::gather::{
     gather_indices, gather_indices_from_batches, gather_optional_indices_from_batches,
 };
+use llkv_column_map::parallel::with_thread_pool;
 use llkv_column_map::store::Projection;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
@@ -45,11 +46,15 @@ use llkv_table::schema_ext::CachedSchema;
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::FieldId;
 use llkv_types::LogicalFieldId;
-use rustc_hash::FxHashMap;
+use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
+use std::env;
 use std::hash::{Hash, Hasher};
 use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 
 /// A hash key representing join column values for a single row.
 #[derive(Debug, Clone, Eq)]
@@ -225,64 +230,105 @@ where
     if !left_projections.is_empty() {
         let filter_expr = build_all_rows_filter(&left_projections)?;
 
+        // Collect probe batches so we can process them in parallel and then emit
+        // results in the original batch order. Further split large batches into
+        // row windows to ensure we have enough parallel work even if the scanner
+        // only yields a small number of batches.
+        let mut probe_batches = Vec::new();
         left.scan_stream(
             &left_projections,
             &filter_expr,
             ScanStreamOptions::default(),
-            |probe_batch| {
-                let result = match options.join_type {
-                    JoinType::Inner => process_inner_probe(
-                        &probe_batch,
-                        &probe_key_indices,
-                        &hash_table,
-                        &build_batches,
-                        &output_schema,
-                        keys,
-                        batch_size,
-                        &mut on_batch,
-                    ),
-                    JoinType::Left => process_left_probe(
-                        &probe_batch,
-                        &probe_key_indices,
-                        &hash_table,
-                        &build_batches,
-                        &output_schema,
-                        keys,
-                        batch_size,
-                        &mut on_batch,
-                    ),
-                    JoinType::Semi => process_semi_probe(
-                        &probe_batch,
-                        &probe_key_indices,
-                        &hash_table,
-                        &output_schema,
-                        keys,
-                        batch_size,
-                        &mut on_batch,
-                    ),
-                    JoinType::Anti => process_anti_probe(
-                        &probe_batch,
-                        &probe_key_indices,
-                        &hash_table,
-                        &output_schema,
-                        keys,
-                        batch_size,
-                        &mut on_batch,
-                    ),
-                    _ => {
-                        tracing::debug!(
-                            join_type = ?options.join_type,
-                            "Hash join does not yet support this join type; skipping batch processing"
-                        );
-                        Ok(())
-                    }
-                };
+            |probe_batch| probe_batches.push(probe_batch.clone()),
+        )?;
 
-                if let Err(err) = result {
-                    tracing::debug!(error = %err, "Hash join batch processing failed");
-                }
+        let mut probe_tasks = Vec::new();
+        for (batch_idx, probe_batch) in probe_batches.into_iter().enumerate() {
+            let rows = probe_batch.num_rows();
+            if rows == 0 {
+                continue;
+            }
+            let mut start = 0;
+            while start < rows {
+                let len = (start + batch_size).min(rows) - start;
+                let slice = probe_batch.slice(start, len);
+                probe_tasks.push(((batch_idx, start), slice));
+                start += len;
+            }
+        }
+
+        let total_probe_rows: usize = probe_tasks.iter().map(|(_, b)| b.num_rows()).sum();
+        let task_count = probe_tasks.len();
+
+        let mut parallel_results: Vec<((usize, usize), Vec<RecordBatch>)> = with_thread_pool(
+            || {
+                probe_tasks
+                .into_par_iter()
+                .map(|(key, probe_batch)| -> LlkvResult<_> {
+                    let mut local_batches = Vec::new();
+                    let result = match options.join_type {
+                        JoinType::Inner => process_inner_probe(
+                            &probe_batch,
+                            &probe_key_indices,
+                            &hash_table,
+                            &build_batches,
+                            &output_schema,
+                            keys,
+                            batch_size,
+                            &mut |batch| local_batches.push(batch),
+                        ),
+                        JoinType::Left => process_left_probe(
+                            &probe_batch,
+                            &probe_key_indices,
+                            &hash_table,
+                            &build_batches,
+                            &output_schema,
+                            keys,
+                            batch_size,
+                            &mut |batch| local_batches.push(batch),
+                        ),
+                        JoinType::Semi => process_semi_probe(
+                            &probe_batch,
+                            &probe_key_indices,
+                            &hash_table,
+                            &output_schema,
+                            keys,
+                            batch_size,
+                            &mut |batch| local_batches.push(batch),
+                        ),
+                        JoinType::Anti => process_anti_probe(
+                            &probe_batch,
+                            &probe_key_indices,
+                            &hash_table,
+                            &output_schema,
+                            keys,
+                            batch_size,
+                            &mut |batch| local_batches.push(batch),
+                        ),
+                        _ => {
+                            tracing::debug!(
+                                join_type = ?options.join_type,
+                                "Hash join does not yet support this join type; skipping batch processing"
+                            );
+                            Ok(())
+                        }
+                    };
+
+                    result?;
+                    Ok((key, local_batches))
+                })
+                .collect::<LlkvResult<Vec<_>>>()
             },
         )?;
+
+        
+        // Preserve batch order for deterministic output.
+        parallel_results.sort_by_key(|(key, _)| *key);
+        for (_, batches) in parallel_results {
+            for batch in batches {
+                on_batch(batch);
+            }
+        }
     }
 
     // For Right/Full joins, also emit unmatched build side rows

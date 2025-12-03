@@ -48,6 +48,17 @@ fn pool() -> &'static ThreadPool {
     POOL.get_or_init(build_pool)
 }
 
+fn log_pool_size_once() {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| {
+        let count = pool().current_num_threads();
+        tracing::debug!(
+            "[llkv-column-map] Rayon pool initialized with {count} threads (LLKV_MAX_THREADS={})",
+            env::var(ENV_MAX_THREADS).unwrap_or_else(|_| "<unset>".into())
+        );
+    });
+}
+
 /// Execute the provided closure within the shared Rayon thread pool.
 ///
 /// This helper ensures all parallel work within the crate shares the same
@@ -66,6 +77,7 @@ where
     F: FnOnce() -> R + Send,
     R: Send,
 {
+    log_pool_size_once();
     pool().install(f)
 }
 
