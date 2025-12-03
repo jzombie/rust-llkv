@@ -15,12 +15,12 @@ use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::{FieldId, LogicalFieldId, ROW_ID_FIELD_ID};
+use llkv_threading::with_thread_pool;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::row_stream::RowIdSource;
 use crate::{NumericArrayMap, ScanStorage};
-use llkv_column_map::parallel::with_thread_pool;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;

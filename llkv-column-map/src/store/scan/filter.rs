@@ -9,7 +9,6 @@ use arrow::array::{
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::error::Result as ArrowResult;
 
-use crate::parallel;
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
@@ -24,6 +23,7 @@ use super::{
 };
 use crate::store::ColumnStore;
 use llkv_storage::pager::{BatchGet, GetResult, Pager};
+use llkv_threading::with_thread_pool;
 
 use rayon::prelude::*;
 
@@ -375,7 +375,7 @@ where
 
         let (value_metas, row_metas) = string_chunk_metadata(store, field_id)?;
 
-        let chunk_results: Vec<Result<Vec<u64>>> = parallel::with_thread_pool(|| {
+        let chunk_results: Vec<Result<Vec<RowId>>> = with_thread_pool(|| {
             value_metas
                 .par_iter()
                 .zip(row_metas.par_iter())

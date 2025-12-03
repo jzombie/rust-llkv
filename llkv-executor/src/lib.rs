@@ -52,6 +52,7 @@ use llkv_table::table::{
 use llkv_table::types::FieldId;
 use llkv_table::{NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
 use llkv_types::LogicalFieldId;
+use llkv_threading::with_thread_pool;
 use llkv_types::decimal::DecimalValue;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -893,7 +894,7 @@ where
         // Execute each uncached correlated subquery in parallel on the shared Rayon pool.
         if !pending_bindings.is_empty() {
             let job_results: Vec<ExecutorResult<Literal>> =
-                llkv_column_map::parallel::with_thread_pool(|| {
+                with_thread_pool(|| {
                     pending_bindings
                         .par_iter()
                         .map(|bindings| {
@@ -1023,7 +1024,7 @@ where
         // Execute each uncached correlated subquery in parallel on the shared Rayon pool.
         if !pending_bindings.is_empty() {
             let job_results: Vec<ExecutorResult<Literal>> =
-                llkv_column_map::parallel::with_thread_pool(|| {
+                with_thread_pool(|| {
                     pending_bindings
                         .par_iter()
                         .map(|bindings| {
@@ -12469,7 +12470,7 @@ fn normalize_join_column(array: &ArrayRef) -> ExecutorResult<ArrayRef> {
 ///
 /// # Performance
 ///
-/// Scales with available CPU cores via `llkv_column_map::parallel::with_thread_pool()`.
+/// Scales with available CPU cores via `llkv_threading::with_thread_pool()`.
 /// Respects `LLKV_MAX_THREADS` environment variable for thread pool sizing.
 fn build_join_match_indices(
     left_batches: &[RecordBatch],
@@ -12480,7 +12481,7 @@ fn build_join_match_indices(
 
     // Parallelize hash table build phase across batches
     // Each thread builds a local hash table for its batch(es), then we merge them
-    let hash_table: JoinHashTable = llkv_column_map::parallel::with_thread_pool(|| {
+    let hash_table: JoinHashTable = with_thread_pool(|| {
         let local_tables: Vec<ExecutorResult<JoinHashTable>> = right_batches
             .par_iter()
             .enumerate()
@@ -12543,7 +12544,7 @@ fn build_join_match_indices(
     // Parallelize probe phase across left batches
     // Each thread probes its batch(es) against the shared hash table
     let matches: Vec<ExecutorResult<JoinMatchPairs>> =
-        llkv_column_map::parallel::with_thread_pool(|| {
+        with_thread_pool(|| {
             left_batches
                 .par_iter()
                 .enumerate()
@@ -12616,7 +12617,7 @@ fn build_left_join_match_indices(
     let right_key_indices: Vec<usize> = join_keys.iter().map(|(_, right)| *right).collect();
 
     // Build hash table from right batches
-    let hash_table: JoinHashTable = llkv_column_map::parallel::with_thread_pool(|| {
+    let hash_table: JoinHashTable = with_thread_pool(|| {
         let local_tables: Vec<JoinHashTable> = right_batches
             .par_iter()
             .enumerate()
@@ -12655,7 +12656,7 @@ fn build_left_join_match_indices(
     let left_key_indices: Vec<usize> = join_keys.iter().map(|(left, _)| *left).collect();
 
     // Probe phase: process ALL left rows, recording matches or None
-    let matches: Vec<LeftJoinMatchPairs> = llkv_column_map::parallel::with_thread_pool(|| {
+    let matches: Vec<LeftJoinMatchPairs> = with_thread_pool(|| {
         left_batches
             .par_iter()
             .enumerate()
@@ -13149,7 +13150,7 @@ fn cross_join_table_batches(
 
     // Parallelize cross join batch generation using nested parallel iteration
     // This is safe because cross_join_pair is pure and each batch pair is independent
-    let output_batches: Vec<RecordBatch> = llkv_column_map::parallel::with_thread_pool(|| {
+    let output_batches: Vec<RecordBatch> = with_thread_pool(|| {
         left_batches
             .par_iter()
             .filter(|left_batch| left_batch.num_rows() > 0)

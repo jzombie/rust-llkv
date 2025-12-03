@@ -26,6 +26,7 @@ llkv-expr.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
 llkv-types.workspace = true
+llkv-threading.workspace = true
 num_enum.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
