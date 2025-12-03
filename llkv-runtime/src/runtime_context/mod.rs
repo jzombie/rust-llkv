@@ -1026,7 +1026,7 @@ where
             });
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
 
         if plan.unique {
             // For unique multi-column indexes, validate uniqueness and register

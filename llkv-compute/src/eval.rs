@@ -14,6 +14,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast::BinaryOperator;
 
 use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
+use crate::fast_numeric::NumericFastPath;
 use crate::kernels::{compute_binary, get_common_type};
 
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
@@ -219,8 +220,8 @@ where
     }
 }
 
-fn binary_result_type(_op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
-    get_common_type(&lhs, &rhs)
+fn binary_result_type(op: BinaryOp, lhs: DataType, rhs: DataType) -> DataType {
+    crate::kernels::common_type_for_op(&lhs, &rhs, op)
 }
 
 /// Represents an affine transformation `scale * field + offset`.
@@ -570,6 +571,17 @@ impl ScalarEvaluator {
 
         if len == 0 {
             return Ok(new_null_array(&preferred, 0));
+        }
+
+        if let Some(fast_path) = NumericFastPath::compile(expr, arrays, &preferred) {
+            let fast_result = fast_path.execute(len, arrays)?;
+            if fast_result.data_type() != &preferred {
+                let casted = cast::cast(&fast_result, &preferred).map_err(|e| {
+                    Error::Internal(format!("Failed to cast fast path result: {}", e))
+                })?;
+                return Ok(casted);
+            }
+            return Ok(fast_result);
         }
 
         if let Some(vectorized) =

@@ -8,22 +8,20 @@ use std::mem;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, Decimal128Builder, GenericBinaryArray,
-    GenericBinaryBuilder, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
-    PrimitiveArray, PrimitiveBuilder, RecordBatch, StringViewArray, StringViewBuilder, StructArray,
-    UInt32Array, UInt64Array, new_empty_array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, Decimal128Array, Decimal128Builder,
+    GenericBinaryArray, GenericBinaryBuilder, GenericStringArray, GenericStringBuilder,
+    OffsetSizeTrait, PrimitiveArray, PrimitiveBuilder, RecordBatch, StructArray, UInt32Array,
+    UInt64Array, new_empty_array,
 };
 use arrow::compute::{self, take};
 use arrow::datatypes::{ArrowPrimitiveType, DataType};
 
-use crate::serialization::deserialize_array;
 use crate::store::descriptor::ChunkMetadata;
 use crate::{Error, Result};
 use llkv_result::Result as LlkvResult;
 use llkv_storage::types::PhysicalKey;
 use llkv_types::ids::RowId;
 use rustc_hash::FxHashMap;
-use simd_r_drive_entry_handle::EntryHandle;
 
 /// Gather rows from a single [`RecordBatch`] according to the provided indices.
 ///
@@ -281,512 +279,6 @@ impl<'a> RowLocator<'a> {
     }
 }
 
-pub(crate) fn gather_rows_single_shot_string<O>(
-    row_index: &FxHashMap<u64, usize>,
-    len: usize,
-    value_metas: &[ChunkMetadata],
-    row_metas: &[ChunkMetadata],
-    candidate_indices: &[usize],
-    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
-    allow_missing: bool,
-) -> Result<ArrayRef>
-where
-    O: OffsetSizeTrait,
-{
-    if len == 0 {
-        let mut builder = GenericStringBuilder::<O>::new();
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
-    }
-
-    let mut values: Vec<Option<String>> = vec![None; len];
-    let mut found: Vec<bool> = vec![false; len];
-
-    for &idx in candidate_indices {
-        let value_chunk = chunk_blobs
-            .remove(&value_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-        let row_chunk = chunk_blobs
-            .remove(&row_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-
-        let value_any = deserialize_array(value_chunk)?;
-        let value_arr = value_any
-            .as_any()
-            .downcast_ref::<GenericStringArray<O>>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
-        let row_any = deserialize_array(row_chunk)?;
-        let row_arr = row_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
-
-        for i in 0..row_arr.len() {
-            if !row_arr.is_valid(i) {
-                continue;
-            }
-            let row_id = row_arr.value(i);
-            if let Some(&out_idx) = row_index.get(&row_id) {
-                found[out_idx] = true;
-                if value_arr.is_null(i) {
-                    values[out_idx] = None;
-                } else {
-                    values[out_idx] = Some(value_arr.value(i).to_owned());
-                }
-            }
-        }
-    }
-
-    if !allow_missing {
-        if found.iter().any(|f| !*f) {
-            return Err(Error::Internal(
-                "gather_rows_multi: one or more requested row IDs were not found".into(),
-            ));
-        }
-    } else {
-        for (idx, was_found) in found.iter().enumerate() {
-            if !*was_found {
-                values[idx] = None;
-            }
-        }
-    }
-
-    let total_bytes: usize = values
-        .iter()
-        .filter_map(|v| v.as_ref().map(|s| s.len()))
-        .sum();
-
-    let mut builder = GenericStringBuilder::<O>::with_capacity(len, total_bytes);
-    for value in values {
-        match value {
-            Some(s) => builder.append_value(&s),
-            None => builder.append_null(),
-        }
-    }
-
-    Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
-pub(crate) fn gather_rows_single_shot_string_view(
-    row_index: &FxHashMap<u64, usize>,
-    len: usize,
-    value_metas: &[ChunkMetadata],
-    row_metas: &[ChunkMetadata],
-    candidate_indices: &[usize],
-    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
-    allow_missing: bool,
-) -> Result<ArrayRef> {
-    if len == 0 {
-        let mut builder = StringViewBuilder::new();
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
-    }
-
-    let mut values: Vec<Option<String>> = vec![None; len];
-    let mut found: Vec<bool> = vec![false; len];
-
-    for &idx in candidate_indices {
-        let value_chunk = chunk_blobs
-            .remove(&value_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-        let row_chunk = chunk_blobs
-            .remove(&row_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-
-        let value_any = deserialize_array(value_chunk)?;
-        let value_arr = value_any
-            .as_any()
-            .downcast_ref::<StringViewArray>()
-            .ok_or_else(|| {
-                Error::Internal(
-                    "gather_rows_multi: dtype mismatch (expected StringViewArray)".into(),
-                )
-            })?;
-        let row_any = deserialize_array(row_chunk)?;
-        let row_arr = row_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
-
-        for i in 0..row_arr.len() {
-            if !row_arr.is_valid(i) {
-                continue;
-            }
-            let row_id = row_arr.value(i);
-            if let Some(&out_idx) = row_index.get(&row_id) {
-                found[out_idx] = true;
-                if value_arr.is_null(i) {
-                    values[out_idx] = None;
-                } else {
-                    values[out_idx] = Some(value_arr.value(i).to_string());
-                }
-            }
-        }
-    }
-
-    if !allow_missing {
-        if found.iter().any(|f| !*f) {
-            return Err(Error::Internal(
-                "gather_rows_multi: one or more requested row IDs were not found".into(),
-            ));
-        }
-    } else {
-        for (idx, was_found) in found.iter().enumerate() {
-            if !*was_found {
-                values[idx] = None;
-            }
-        }
-    }
-
-    let mut builder = StringViewBuilder::with_capacity(len);
-    for v in values {
-        if let Some(s) = v {
-            builder.append_value(s);
-        } else {
-            builder.append_null();
-        }
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
-pub(crate) fn gather_rows_single_shot_bool(
-    row_index: &FxHashMap<u64, usize>,
-    len: usize,
-    value_metas: &[ChunkMetadata],
-    row_metas: &[ChunkMetadata],
-    candidate_indices: &[usize],
-    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
-    allow_missing: bool,
-) -> Result<ArrayRef> {
-    if len == 0 {
-        let empty = BooleanArray::from(Vec::<bool>::new());
-        return Ok(Arc::new(empty) as ArrayRef);
-    }
-
-    let mut values: Vec<Option<bool>> = vec![None; len];
-    let mut found: Vec<bool> = vec![false; len];
-
-    for &idx in candidate_indices {
-        let value_chunk = chunk_blobs
-            .remove(&value_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-        let row_chunk = chunk_blobs
-            .remove(&row_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-
-        let value_any = deserialize_array(value_chunk)?;
-        let value_arr = value_any
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
-        let row_any = deserialize_array(row_chunk)?;
-        let row_arr = row_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
-
-        for i in 0..row_arr.len() {
-            if !row_arr.is_valid(i) {
-                continue;
-            }
-            let row_id = row_arr.value(i);
-            if let Some(&out_idx) = row_index.get(&row_id) {
-                found[out_idx] = true;
-                if value_arr.is_null(i) {
-                    values[out_idx] = None;
-                } else {
-                    values[out_idx] = Some(value_arr.value(i));
-                }
-            }
-        }
-    }
-
-    if !allow_missing && found.iter().any(|f| !*f) {
-        return Err(Error::Internal(
-            "gather_rows_multi: one or more requested row IDs were not found".into(),
-        ));
-    }
-
-    let array = BooleanArray::from(values);
-    Ok(Arc::new(array) as ArrayRef)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gather_rows_single_shot_struct(
-    row_index: &FxHashMap<u64, usize>,
-    len: usize,
-    value_metas: &[ChunkMetadata],
-    row_metas: &[ChunkMetadata],
-    candidate_indices: &[usize],
-    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
-    allow_missing: bool,
-    dtype: &DataType,
-) -> Result<ArrayRef> {
-    if len == 0 {
-        if let DataType::Struct(fields) = dtype {
-            let empty_columns: Vec<ArrayRef> = fields
-                .iter()
-                .map(|f| new_empty_array(f.data_type()))
-                .collect();
-            let empty = StructArray::try_new(fields.clone(), empty_columns, None)
-                .map_err(|e| Error::Internal(format!("failed to create empty struct: {e}")))?;
-            return Ok(Arc::new(empty) as ArrayRef);
-        }
-        return Err(Error::Internal("expected Struct dtype".into()));
-    }
-
-    let mut all_structs = Vec::new();
-    let mut all_row_ids = Vec::new();
-
-    for &idx in candidate_indices {
-        let value_chunk = chunk_blobs
-            .remove(&value_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-        let row_chunk = chunk_blobs
-            .remove(&row_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-
-        let value_any = deserialize_array(value_chunk)?;
-        let value_arr = value_any
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| Error::Internal("gather_rows_struct: dtype mismatch".into()))?;
-
-        let row_any = deserialize_array(row_chunk)?;
-        let row_arr = row_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_struct: row_id downcast".into()))?;
-
-        all_structs.push(value_arr.clone());
-        all_row_ids.push(row_arr.clone());
-    }
-
-    let mut row_to_chunk_pos: FxHashMap<u64, (usize, usize)> = FxHashMap::default();
-    for (chunk_idx, row_arr) in all_row_ids.iter().enumerate() {
-        for i in 0..row_arr.len() {
-            if row_arr.is_valid(i) {
-                let row_id = row_arr.value(i);
-                row_to_chunk_pos.insert(row_id, (chunk_idx, i));
-            }
-        }
-    }
-
-    let mut take_indices = vec![None; len];
-    let mut found = vec![false; len];
-
-    for (row_id, &out_idx) in row_index {
-        if let Some(&(chunk_idx, pos)) = row_to_chunk_pos.get(row_id) {
-            found[out_idx] = true;
-            take_indices[out_idx] = Some((chunk_idx, pos));
-        }
-    }
-
-    if !allow_missing && found.iter().any(|f| !*f) {
-        return Err(Error::Internal(
-            "gather_rows_struct: one or more requested row IDs were not found".into(),
-        ));
-    }
-
-    let concat_refs: Vec<&dyn Array> = all_structs.iter().map(|a| a as &dyn Array).collect();
-    let concatenated = compute::concat(&concat_refs)?;
-    let concat_struct = concatenated
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| Error::Internal("concat result not a struct".into()))?;
-
-    let mut cumulative_offsets = vec![0];
-    for arr in &all_structs {
-        cumulative_offsets.push(cumulative_offsets.last().unwrap() + arr.len());
-    }
-
-    let mut global_indices = Vec::with_capacity(len);
-    for opt_chunk_pos in take_indices {
-        if let Some((chunk_idx, pos)) = opt_chunk_pos {
-            let global_idx = cumulative_offsets[chunk_idx] + pos;
-            global_indices.push(Some(global_idx as u64));
-        } else {
-            global_indices.push(None);
-        }
-    }
-
-    let indices = UInt64Array::from(global_indices);
-    let result = compute::take(concat_struct, &indices, None)?;
-
-    Ok(result)
-}
-
-pub(crate) fn gather_rows_single_shot<T>(
-    row_index: &FxHashMap<u64, usize>,
-    len: usize,
-    value_metas: &[ChunkMetadata],
-    row_metas: &[ChunkMetadata],
-    candidate_indices: &[usize],
-    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
-    allow_missing: bool,
-) -> Result<ArrayRef>
-where
-    T: ArrowPrimitiveType,
-{
-    if len == 0 {
-        let empty = PrimitiveBuilder::<T>::new().finish();
-        return Ok(Arc::new(empty) as ArrayRef);
-    }
-
-    let mut values: Vec<Option<T::Native>> = vec![None; len];
-    let mut found: Vec<bool> = vec![false; len];
-
-    for &idx in candidate_indices {
-        let value_chunk = chunk_blobs
-            .remove(&value_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-        let row_chunk = chunk_blobs
-            .remove(&row_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-
-        let value_any = deserialize_array(value_chunk)?;
-        let value_arr = value_any
-            .as_any()
-            .downcast_ref::<PrimitiveArray<T>>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
-        let row_any = deserialize_array(row_chunk)?;
-        let row_arr = row_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
-
-        for i in 0..row_arr.len() {
-            if !row_arr.is_valid(i) {
-                continue;
-            }
-            let row_id = row_arr.value(i);
-            if let Some(&out_idx) = row_index.get(&row_id) {
-                found[out_idx] = true;
-                if value_arr.is_null(i) {
-                    values[out_idx] = None;
-                } else {
-                    values[out_idx] = Some(value_arr.value(i));
-                }
-            }
-        }
-    }
-
-    if !allow_missing {
-        if found.iter().any(|f| !*f) {
-            return Err(Error::Internal(
-                "gather_rows_multi: one or more requested row IDs were not found".into(),
-            ));
-        }
-    } else {
-        for (idx, was_found) in found.iter().enumerate() {
-            if !*was_found {
-                values[idx] = None;
-            }
-        }
-    }
-
-    let array = PrimitiveArray::<T>::from_iter(values);
-    Ok(Arc::new(array) as ArrayRef)
-}
-
-/// Gather rows for Decimal128, preserving precision and scale from the schema.
-///
-/// This is a specialized version of `gather_rows_single_shot` that handles
-/// Decimal128 types. Unlike the generic primitive gather, we need to preserve
-/// the exact precision and scale metadata from the schema's DataType.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gather_rows_single_shot_decimal128(
-    row_index: &FxHashMap<u64, usize>,
-    len: usize,
-    value_metas: &[ChunkMetadata],
-    row_metas: &[ChunkMetadata],
-    candidate_indices: &[usize],
-    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
-    allow_missing: bool,
-    dtype: &DataType,
-) -> Result<ArrayRef> {
-    let (precision, scale) = match dtype {
-        DataType::Decimal128(p, s) => (*p, *s),
-        _ => {
-            return Err(Error::Internal(
-                "gather_rows_single_shot_decimal128: expected Decimal128 dtype".into(),
-            ));
-        }
-    };
-
-    if len == 0 {
-        let empty = Decimal128Builder::new()
-            .with_precision_and_scale(precision, scale)
-            .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?
-            .finish();
-        return Ok(Arc::new(empty) as ArrayRef);
-    }
-
-    let mut values: Vec<Option<i128>> = vec![None; len];
-    let mut found: Vec<bool> = vec![false; len];
-
-    for &idx in candidate_indices {
-        let value_chunk = chunk_blobs
-            .remove(&value_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-        let row_chunk = chunk_blobs
-            .remove(&row_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-
-        let value_any = deserialize_array(value_chunk)?;
-        let value_arr = value_any
-            .as_any()
-            .downcast_ref::<Decimal128Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
-        let row_any = deserialize_array(row_chunk)?;
-        let row_arr = row_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
-
-        for i in 0..row_arr.len() {
-            if !row_arr.is_valid(i) {
-                continue;
-            }
-            let row_id = row_arr.value(i);
-            if let Some(&out_idx) = row_index.get(&row_id) {
-                found[out_idx] = true;
-                if value_arr.is_null(i) {
-                    values[out_idx] = None;
-                } else {
-                    values[out_idx] = Some(value_arr.value(i));
-                }
-            }
-        }
-    }
-
-    if !allow_missing {
-        if found.iter().any(|f| !*f) {
-            return Err(Error::Internal(
-                "gather_rows_multi: one or more requested row IDs were not found".into(),
-            ));
-        }
-    } else {
-        for (idx, was_found) in found.iter().enumerate() {
-            if !*was_found {
-                values[idx] = None;
-            }
-        }
-    }
-
-    let mut builder = Decimal128Builder::new()
-        .with_precision_and_scale(precision, scale)
-        .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?;
-
-    for value in values {
-        match value {
-            Some(v) => builder.append_value(v),
-            None => builder.append_null(),
-        }
-    }
-
-    let array = builder.finish();
-    Ok(Arc::new(array) as ArrayRef)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_rows_from_chunks_string<O>(
     row_ids: &[u64],
@@ -798,13 +290,14 @@ pub(crate) fn gather_rows_from_chunks_string<O>(
     chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
     row_scratch: &mut [Option<(usize, usize)>],
     allow_missing: bool,
+    builder: &mut GenericStringBuilder<O>,
 ) -> Result<ArrayRef>
 where
     O: OffsetSizeTrait,
 {
     if len == 0 {
-        let mut builder = GenericStringBuilder::<O>::new();
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
+        let array = builder.finish();
+        return Ok(Arc::new(array) as ArrayRef);
     }
 
     if candidate_indices.len() == 1 {
@@ -873,24 +366,14 @@ where
         }
     }
 
-    let mut total_bytes = 0usize;
     for row_scratch_item in row_scratch.iter().take(len) {
-        if let Some((chunk_idx, value_idx)) = row_scratch_item {
-            let slot = *chunk_lookup
-                .get(chunk_idx)
-                .ok_or_else(|| Error::Internal("gather_rows_multi: chunk lookup missing".into()))?;
-            let (_, value_arr, _) = candidates[slot];
-            if !value_arr.is_null(*value_idx) {
-                total_bytes += value_arr.value(*value_idx).len();
-            }
-        } else if !allow_missing {
+        if row_scratch_item.is_none() && !allow_missing {
             return Err(Error::Internal(
                 "gather_rows_multi: one or more requested row IDs were not found".into(),
             ));
         }
     }
 
-    let mut builder = GenericStringBuilder::<O>::with_capacity(len, total_bytes);
     for row_scratch_item in row_scratch.iter().take(len) {
         match row_scratch_item {
             Some((chunk_idx, value_idx)) => {
@@ -919,91 +402,6 @@ where
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub(crate) fn gather_rows_single_shot_binary<O>(
-    row_index: &FxHashMap<u64, usize>,
-    len: usize,
-    value_metas: &[ChunkMetadata],
-    row_metas: &[ChunkMetadata],
-    candidate_indices: &[usize],
-    chunk_blobs: &mut FxHashMap<PhysicalKey, EntryHandle>,
-    allow_missing: bool,
-) -> Result<ArrayRef>
-where
-    O: OffsetSizeTrait,
-{
-    if len == 0 {
-        let mut builder = GenericBinaryBuilder::<O>::new();
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
-    }
-
-    let mut values: Vec<Option<Vec<u8>>> = vec![None; len];
-    let mut found: Vec<bool> = vec![false; len];
-
-    for &idx in candidate_indices {
-        let value_chunk = chunk_blobs
-            .remove(&value_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-        let row_chunk = chunk_blobs
-            .remove(&row_metas[idx].chunk_pk)
-            .ok_or(Error::NotFound)?;
-
-        let value_any = deserialize_array(value_chunk)?;
-        let value_arr = value_any
-            .as_any()
-            .downcast_ref::<GenericBinaryArray<O>>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: dtype mismatch".into()))?;
-        let row_any = deserialize_array(row_chunk)?;
-        let row_arr = row_any
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| Error::Internal("gather_rows_multi: row_id downcast".into()))?;
-
-        for i in 0..row_arr.len() {
-            if !row_arr.is_valid(i) {
-                continue;
-            }
-            let row_id = row_arr.value(i);
-            if let Some(&out_idx) = row_index.get(&row_id) {
-                found[out_idx] = true;
-                if value_arr.is_null(i) {
-                    values[out_idx] = None;
-                } else {
-                    values[out_idx] = Some(value_arr.value(i).to_vec());
-                }
-            }
-        }
-    }
-
-    if !allow_missing {
-        if found.iter().any(|f| !*f) {
-            return Err(Error::Internal(
-                "gather_rows_multi: one or more requested row IDs were not found".into(),
-            ));
-        }
-    } else {
-        for (idx, was_found) in found.iter().enumerate() {
-            if !*was_found {
-                values[idx] = None;
-            }
-        }
-    }
-
-    let total_bytes: usize = values
-        .iter()
-        .filter_map(|v| v.as_ref().map(|b| b.len()))
-        .sum();
-
-    let mut builder = GenericBinaryBuilder::<O>::with_capacity(len, total_bytes);
-    for value in values {
-        match value {
-            Some(bytes) => builder.append_value(&bytes),
-            None => builder.append_null(),
-        }
-    }
-
-    Ok(Arc::new(builder.finish()) as ArrayRef)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gather_rows_from_chunks_binary<O>(
     row_ids: &[u64],
@@ -1015,13 +413,14 @@ pub(crate) fn gather_rows_from_chunks_binary<O>(
     chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
     row_scratch: &mut [Option<(usize, usize)>],
     allow_missing: bool,
+    builder: &mut GenericBinaryBuilder<O>,
 ) -> Result<ArrayRef>
 where
     O: OffsetSizeTrait,
 {
     if len == 0 {
-        let mut builder = GenericBinaryBuilder::<O>::new();
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
+        let array = builder.finish();
+        return Ok(Arc::new(array) as ArrayRef);
     }
 
     if candidate_indices.len() == 1 {
@@ -1090,24 +489,14 @@ where
         }
     }
 
-    let mut total_bytes = 0usize;
     for row_scratch_item in row_scratch.iter().take(len) {
-        if let Some((chunk_idx, value_idx)) = row_scratch_item {
-            let slot = *chunk_lookup
-                .get(chunk_idx)
-                .ok_or_else(|| Error::Internal("gather_rows_multi: chunk lookup missing".into()))?;
-            let (_, value_arr, _) = candidates[slot];
-            if !value_arr.is_null(*value_idx) {
-                total_bytes += value_arr.value(*value_idx).len();
-            }
-        } else if !allow_missing {
+        if row_scratch_item.is_none() && !allow_missing {
             return Err(Error::Internal(
                 "gather_rows_multi: one or more requested row IDs were not found".into(),
             ));
         }
     }
 
-    let mut builder = GenericBinaryBuilder::<O>::with_capacity(len, total_bytes);
     for row_scratch_item in row_scratch.iter().take(len) {
         match row_scratch_item {
             Some((chunk_idx, value_idx)) => {
@@ -1147,10 +536,11 @@ pub(crate) fn gather_rows_from_chunks_bool(
     chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
     row_scratch: &mut [Option<(usize, usize)>],
     allow_missing: bool,
+    builder: &mut BooleanBuilder,
 ) -> Result<ArrayRef> {
     if len == 0 {
-        let empty = BooleanArray::from(Vec::<bool>::new());
-        return Ok(Arc::new(empty) as ArrayRef);
+        let array = builder.finish();
+        return Ok(Arc::new(array) as ArrayRef);
     }
 
     if candidate_indices.len() == 1 {
@@ -1219,32 +609,32 @@ pub(crate) fn gather_rows_from_chunks_bool(
         }
     }
 
-    if !allow_missing {
-        for slot in row_scratch.iter().take(len) {
-            if slot.is_none() {
-                return Err(Error::Internal(
-                    "gather_rows_multi: one or more requested row IDs were not found".into(),
-                ));
+    for row_scratch_item in row_scratch.iter().take(len) {
+        match row_scratch_item {
+            Some((chunk_idx, value_idx)) => {
+                let slot = *chunk_lookup.get(chunk_idx).ok_or_else(|| {
+                    Error::Internal("gather_rows_multi: chunk lookup missing".into())
+                })?;
+                let (_, value_arr, _) = &candidates[slot];
+                if value_arr.is_null(*value_idx) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(value_arr.value(*value_idx));
+                }
+            }
+            None => {
+                if allow_missing {
+                    builder.append_null();
+                } else {
+                    return Err(Error::Internal(
+                        "gather_rows_multi: one or more requested row IDs were not found".into(),
+                    ));
+                }
             }
         }
     }
 
-    let mut values: Vec<Option<bool>> = vec![None; len];
-    for (out_idx, row_scratch_item) in row_scratch.iter().take(len).enumerate() {
-        if let Some((chunk_idx, value_idx)) = row_scratch_item
-            && let Some(&slot) = chunk_lookup.get(chunk_idx)
-        {
-            let (_idx, value_arr, _) = &candidates[slot];
-            if value_arr.is_null(*value_idx) {
-                values[out_idx] = None;
-            } else {
-                values[out_idx] = Some(value_arr.value(*value_idx));
-            }
-        }
-    }
-
-    let array = BooleanArray::from(values);
-    Ok(Arc::new(array) as ArrayRef)
+    Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1381,12 +771,14 @@ pub(crate) fn gather_rows_from_chunks<T>(
     chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
     row_scratch: &mut [Option<(usize, usize)>],
     allow_missing: bool,
+    builder: &mut PrimitiveBuilder<T>,
 ) -> Result<ArrayRef>
 where
     T: ArrowPrimitiveType,
 {
     if len == 0 {
-        return Ok(Arc::new(PrimitiveBuilder::<T>::new().finish()) as ArrayRef);
+        let array = builder.finish();
+        return Ok(Arc::new(array) as ArrayRef);
     }
 
     if candidate_indices.len() == 1 {
@@ -1465,7 +857,6 @@ where
         }
     }
 
-    let mut builder = PrimitiveBuilder::<T>::with_capacity(len);
     for row_scratch_item in row_scratch.iter().take(len) {
         if let Some((chunk_idx, value_idx)) = *row_scratch_item {
             if let Some(&slot) = chunk_lookup.get(&chunk_idx) {
@@ -1502,23 +893,11 @@ pub(crate) fn gather_rows_from_chunks_decimal128(
     chunk_arrays: &FxHashMap<PhysicalKey, ArrayRef>,
     row_scratch: &mut [Option<(usize, usize)>],
     allow_missing: bool,
-    dtype: &DataType,
+    builder: &mut Decimal128Builder,
 ) -> Result<ArrayRef> {
-    let (precision, scale) = match dtype {
-        DataType::Decimal128(p, s) => (*p, *s),
-        _ => {
-            return Err(Error::Internal(
-                "gather_rows_from_chunks_decimal128: expected Decimal128 dtype".into(),
-            ));
-        }
-    };
-
     if len == 0 {
-        let empty = Decimal128Builder::new()
-            .with_precision_and_scale(precision, scale)
-            .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?
-            .finish();
-        return Ok(Arc::new(empty) as ArrayRef);
+        let array = builder.finish();
+        return Ok(Arc::new(array) as ArrayRef);
     }
 
     if candidate_indices.len() == 1 {
@@ -1596,10 +975,6 @@ pub(crate) fn gather_rows_from_chunks_decimal128(
             }
         }
     }
-
-    let mut builder = Decimal128Builder::new()
-        .with_precision_and_scale(precision, scale)
-        .map_err(|e| Error::Internal(format!("invalid Decimal128 precision/scale: {}", e)))?;
 
     for row_scratch_item in row_scratch.iter().take(len) {
         if let Some((chunk_idx, value_idx)) = *row_scratch_item {

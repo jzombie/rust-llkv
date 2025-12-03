@@ -11,7 +11,9 @@ use crate::{
 };
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use llkv_executor::{ExecutorColumn, ExecutorSchema, ExecutorTable, current_time_micros};
+use llkv_executor::{
+    ExecutorColumn, ExecutorSchema, ExecutorTable, TableStorageAdapter, current_time_micros,
+};
 use llkv_plan::{
     CreateTablePlan, ForeignKeySpec, IntoPlanColumnSpec, MultiColumnUniqueSpec, PlanColumnSpec,
 };
@@ -126,6 +128,7 @@ where
             lookup: column_lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
+            storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table))),
             table: Arc::clone(&table),
             schema,
             next_row_id: AtomicU64::new(0),
@@ -193,7 +196,7 @@ where
                     Ok(ForeignKeyTableInfo {
                         display_name: display,
                         canonical_name: canonical,
-                        table_id: referenced_table.table.table_id(),
+                        table_id: referenced_table.table_id(),
                         columns,
                         multi_column_uniques,
                     })
@@ -326,6 +329,7 @@ where
             lookup: column_lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
+            storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table))),
             table: Arc::clone(&table),
             schema: schema_arc,
             next_row_id: AtomicU64::new(0),

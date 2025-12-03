@@ -177,21 +177,24 @@ pub fn get_common_type(lhs_type: &DataType, rhs_type: &DataType) -> DataType {
     }
 }
 
+/// Common type for a binary operator.
+pub fn common_type_for_op(lhs_type: &DataType, rhs_type: &DataType, _op: BinaryOp) -> DataType {
+    get_common_type(lhs_type, rhs_type)
+}
+
 pub fn coerce_types(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
-    _op: BinaryOp,
+    op: BinaryOp,
 ) -> Result<(ArrayRef, ArrayRef), Error> {
     let lhs_type = lhs.data_type();
     let rhs_type = rhs.data_type();
 
-    if lhs_type == rhs_type {
+    let target_type = common_type_for_op(lhs_type, rhs_type, op);
+
+    if lhs_type == rhs_type && lhs_type == &target_type {
         return Ok((lhs.clone(), rhs.clone()));
     }
-
-    // Simple coercion rules
-    // TODO: Implement full type coercion matrix (like DataFusion)
-    let target_type = get_common_type(lhs_type, rhs_type);
 
     let lhs_casted = cast(lhs, &target_type).map_err(|e| Error::Internal(e.to_string()))?;
     let rhs_casted = cast(rhs, &target_type).map_err(|e| Error::Internal(e.to_string()))?;

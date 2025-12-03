@@ -8745,6 +8745,42 @@ fn strip_sql_expr_nesting(expr: &SqlExpr) -> &SqlExpr {
     }
 }
 
+fn normalize_between_operand(operand: &SqlExpr, negated: bool) -> (bool, &SqlExpr) {
+    let mut effective_negated = negated;
+    let mut current = operand;
+    loop {
+        current = strip_sql_expr_nesting(current);
+        match current {
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            } => {
+                effective_negated = !effective_negated;
+                current = expr;
+            }
+            _ => return (effective_negated, current),
+        }
+    }
+}
+
+fn peel_not_chain(expr: &SqlExpr) -> (usize, &SqlExpr) {
+    let mut count = 0;
+    let mut current = expr;
+    loop {
+        current = strip_sql_expr_nesting(current);
+        match current {
+            SqlExpr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            } => {
+                count += 1;
+                current = expr;
+            }
+            _ => return (count, current),
+        }
+    }
+}
+
 struct BetweenBounds<'a> {
     lower: &'a SqlExpr,
     upper: &'a SqlExpr,
@@ -9087,25 +9123,31 @@ fn translate_condition_with_context(
                     op: UnaryOperator::Not,
                     expr: inner,
                 } => {
-                    let inner_stripped = strip_sql_expr_nesting(inner);
+                    let (nested_not_count, core_expr) = peel_not_chain(inner);
+                    let total_not_count = nested_not_count + 1;
                     if let SqlExpr::Between {
                         expr: between_expr,
-                        negated: inner_negated,
+                        negated,
                         low,
                         high,
-                    } = inner_stripped
+                    } = core_expr
                     {
-                        let negated_mode = !*inner_negated;
+                        let mut negated_mode = *negated;
+                        if total_not_count % 2 == 1 {
+                            negated_mode = !negated_mode;
+                        }
+                        let (effective_negated, normalized_expr) =
+                            normalize_between_operand(between_expr, negated_mode);
                         let between_expr_result = translate_between_expr(
                             engine,
                             resolver,
                             context.clone(),
-                            between_expr,
+                            normalized_expr,
                             BetweenBounds {
                                 lower: low,
                                 upper: high,
                             },
-                            negated_mode,
+                            effective_negated,
                             outer_scopes,
                             scalar_subqueries,
                             correlated_tracker.reborrow(),
@@ -9116,8 +9158,10 @@ fn translate_condition_with_context(
                     // Note: Do not short-circuit NOT on NULL comparisons.
                     // NULL comparisons evaluate to NULL, and NOT NULL should also be NULL,
                     // not FALSE. Let the normal evaluation handle NULL propagation.
-                    work_stack.push(ConditionFrame::Exit(ConditionExitContext::Not));
-                    work_stack.push(ConditionFrame::Enter(inner));
+                    for _ in 0..total_not_count {
+                        work_stack.push(ConditionFrame::Exit(ConditionExitContext::Not));
+                    }
+                    work_stack.push(ConditionFrame::Enter(core_expr));
                 }
                 SqlExpr::Nested(inner) => {
                     work_stack.push(ConditionFrame::Exit(ConditionExitContext::Nested));
@@ -9243,16 +9287,18 @@ fn translate_condition_with_context(
                     low,
                     high,
                 } => {
+                    let (effective_negated, normalized_expr) =
+                        normalize_between_operand(between_expr, *negated);
                     let between_expr_result = translate_between_expr(
                         engine,
                         resolver,
                         context.clone(),
-                        between_expr,
+                        normalized_expr,
                         BetweenBounds {
                             lower: low,
                             upper: high,
                         },
-                        *negated,
+                        effective_negated,
                         outer_scopes,
                         scalar_subqueries,
                         correlated_tracker.reborrow(),
@@ -9887,12 +9933,14 @@ fn translate_scalar_internal(
                     low,
                     high,
                 } => {
+                    let (effective_negated, normalized_expr) =
+                        normalize_between_operand(between_expr, *negated);
                     work_stack.push(ScalarFrame::Exit(ScalarExitContext::Between {
-                        negated: *negated,
+                        negated: effective_negated,
                     }));
                     work_stack.push(ScalarFrame::Enter(high));
                     work_stack.push(ScalarFrame::Enter(low));
-                    work_stack.push(ScalarFrame::Enter(between_expr));
+                    work_stack.push(ScalarFrame::Enter(normalized_expr));
                 }
                 SqlExpr::Function(func) => {
                     if let Some(agg_call) = try_parse_aggregate_function(
@@ -12209,6 +12257,68 @@ mod tests {
     }
 
     #[test]
+    fn not_between_leading_not_matches_sqlite_behavior() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab0(col1 INTEGER)")
+            .expect("create tab0");
+        engine
+            .execute("INSERT INTO tab0 VALUES (10), (20), (30)")
+            .expect("seed tab0");
+
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::SQLiteDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = SQLiteDialect {};
+        let mut statements = Parser::parse_sql(
+            &dialect,
+            "SELECT COUNT ( * ) FROM tab0 WHERE NOT ( NOT ( 41 + + 79 ) NOT BETWEEN NULL AND col1 )",
+        )
+        .expect("parse NOT BETWEEN query");
+        let Statement::Query(query_ast) = statements.pop().expect("statement") else {
+            panic!("expected SELECT query");
+        };
+        let plan = engine
+            .build_select_plan(*query_ast)
+            .expect("build select plan");
+        let filter_plan = plan.filter.expect("expected filter predicate");
+        match &filter_plan.predicate {
+            llkv_expr::expr::Expr::Or(children) => {
+                assert_eq!(
+                    children.len(),
+                    2,
+                    "NOT BETWEEN should expand to two comparisons"
+                );
+            }
+            other => panic!("unexpected filter shape: {other:?}"),
+        }
+
+        let batches = engine
+            .sql(
+                "SELECT COUNT ( * ) FROM tab0 WHERE NOT ( NOT ( 41 + + 79 ) NOT BETWEEN NULL AND col1 )",
+            )
+            .expect("run NOT BETWEEN query with nested NOT tokens");
+
+        assert_eq!(batches.len(), 1, "expected single result batch");
+        let batch = &batches[0];
+        assert_eq!(batch.num_columns(), 1, "expected single column result");
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column as int64");
+        assert_eq!(array.len(), 1, "expected scalar aggregate result");
+        assert_eq!(
+            array.value(0),
+            3,
+            "SQLite and engine should agree on row count"
+        );
+    }
+
+    #[test]
     fn not_chain_precedence_matches_sqlite_behavior() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
@@ -12390,6 +12500,54 @@ mod tests {
             total_rows, 0,
             "expected double NOT BETWEEN to filter all rows"
         );
+    }
+
+    #[test]
+    fn not_with_empty_in_list_complements_all_rows() {
+        let pager = Arc::new(MemPager::default());
+        let engine = SqlEngine::new(pager);
+
+        engine
+            .execute("CREATE TABLE tab(pk INTEGER PRIMARY KEY, col0 INTEGER)")
+            .expect("create tab");
+        engine
+            .execute("INSERT INTO tab VALUES (0, 1), (1, 2), (2, 3)")
+            .expect("seed rows");
+
+        let batches = engine
+            .sql(
+                "SELECT COUNT(*) AS cnt FROM tab WHERE NOT (col0 = 999 AND col0 IN (SELECT col0 FROM tab WHERE 0 = 1))",
+            )
+            .expect("run NOT query with empty IN list");
+
+        assert_eq!(batches.len(), 1, "expected single aggregate batch");
+        let counts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column as int64");
+        assert_eq!(counts.value(0), 3, "NOT should match every row");
+
+        let batches = engine
+            .sql(
+                "SELECT pk FROM tab WHERE NOT (col0 = 999 AND col0 IN (SELECT col0 FROM tab WHERE 0 = 1)) ORDER BY pk",
+            )
+            .expect("fetch rows from NOT query");
+        let expected: Vec<i64> = vec![0, 1, 2];
+        let mut actual = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("pk column as int64");
+            for idx in 0..column.len() {
+                if !column.is_null(idx) {
+                    actual.push(column.value(idx));
+                }
+            }
+        }
+        assert_eq!(actual, expected, "NOT should preserve all primary keys");
     }
 
     #[test]

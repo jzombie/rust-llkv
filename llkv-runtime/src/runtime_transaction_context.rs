@@ -233,7 +233,7 @@ where
         }
 
         let table = ctx.lookup_table(table_name)?;
-        Ok(table.table.table_id())
+        Ok(table.table_id())
     }
 
     fn catalog_snapshot(&self) -> Self::Snapshot {

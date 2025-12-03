@@ -21,7 +21,7 @@ use llkv_executor::{ExecutorColumn, ExecutorTable, translation};
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::FieldId;
+use llkv_table::{FieldId, RowStream};
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
 use llkv_types::LogicalFieldId;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -203,7 +203,7 @@ where
         field_id: FieldId,
         snapshot: TransactionSnapshot,
     ) -> Result<Vec<PlanValue>> {
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
 
@@ -218,7 +218,7 @@ where
         let filter_expr = Expr::Pred(match_all_filter);
 
         // Get all matching row_ids first
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -239,7 +239,7 @@ where
         // Gather the column values for visible rows
         let logical_field_id = LogicalFieldId::for_user(table_id, field_id);
         let row_count = row_ids.cardinality() as usize;
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             vec![logical_field_id],
             &row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -253,8 +253,8 @@ where
         // NOTE: Values are accumulated eagerly; revisit when `llkv-plan` supports
         // incremental parameter binding.
         let mut values = Vec::with_capacity(row_count);
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
@@ -286,7 +286,7 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
 
@@ -299,7 +299,7 @@ where
         };
         let filter_expr = Expr::Pred(match_all_filter);
 
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -322,24 +322,23 @@ where
             .collect();
 
         let total_rows = row_ids.cardinality() as usize;
-        let mut stream = match table.table.stream_columns(
-            logical_field_ids,
-            &row_ids,
-            GatherNullPolicy::IncludeNulls,
-        ) {
-            Ok(stream) => stream,
-            Err(Error::NotFound) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+        let mut stream =
+            match table.stream_columns(logical_field_ids, &row_ids, GatherNullPolicy::IncludeNulls)
+            {
+                Ok(stream) => stream,
+                Err(Error::NotFound) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
 
-            let base = chunk.row_offset();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -357,6 +356,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(rows)
@@ -377,7 +377,7 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         use llkv_expr::{Expr, Filter, Operator};
         use std::ops::Bound;
 
@@ -390,7 +390,7 @@ where
         };
         let filter_expr = Expr::Pred(match_all_filter);
 
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -414,24 +414,23 @@ where
             .collect();
 
         let total_rows = row_ids.cardinality() as usize;
-        let mut stream = match table.table.stream_columns(
-            logical_field_ids,
-            &row_ids,
-            GatherNullPolicy::IncludeNulls,
-        ) {
-            Ok(stream) => stream,
-            Err(Error::NotFound) => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
+        let mut stream =
+            match table.stream_columns(logical_field_ids, &row_ids, GatherNullPolicy::IncludeNulls)
+            {
+                Ok(stream) => stream,
+                Err(Error::NotFound) => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); total_rows];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
 
-            let base = chunk.row_offset();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -449,6 +448,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(rows)
@@ -467,13 +467,13 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_field_ids: Vec<LogicalFieldId> = field_ids
             .iter()
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             logical_field_ids.clone(),
             row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -484,9 +484,10 @@ where
         };
 
         let mut rows = vec![Vec::with_capacity(field_ids.len()); row_ids.cardinality() as usize];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -498,6 +499,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(rows)
@@ -548,12 +550,12 @@ where
         };
         let filter_expr = translation::expression::full_table_scan_filter(first_field_id);
 
-        let row_ids = table.table.filter_row_ids(&filter_expr)?;
+        let row_ids = table.filter_row_ids(&filter_expr)?;
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let mut logical_fields: Vec<LogicalFieldId> =
             Vec::with_capacity(table.schema.columns.len() + 2);
         logical_fields.push(LogicalFieldId::for_mvcc_created_by(table_id));
@@ -563,15 +565,15 @@ where
         }
 
         let logical_fields: Arc<[LogicalFieldId]> = logical_fields.into();
-        let mut stream = table.table.stream_columns(
+        let mut stream = table.stream_columns(
             Arc::clone(&logical_fields),
             row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 
         let mut rows = Vec::new();
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() < table.schema.columns.len() + 2 {
                 continue;
             }

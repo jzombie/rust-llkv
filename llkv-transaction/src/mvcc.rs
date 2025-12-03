@@ -200,6 +200,18 @@ impl TxnIdManager {
         }
     }
 
+    /// Returns true if any transaction other than `txn_id` is currently active.
+    pub fn has_other_active_transactions(&self, txn_id: TxnId) -> bool {
+        let guard = self
+            .inner
+            .statuses
+            .lock()
+            .expect("txn status lock poisoned");
+        guard
+            .iter()
+            .any(|(&other_id, status)| other_id != txn_id && status.is_active())
+    }
+
     /// Mark a transaction as aborted.
     pub fn mark_aborted(&self, txn_id: TxnId) {
         let mut guard = self

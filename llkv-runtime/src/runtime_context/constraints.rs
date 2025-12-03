@@ -15,7 +15,7 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::{
     ConstraintColumnInfo, FieldId, InsertColumnConstraint, InsertMultiColumnUnique,
-    InsertUniqueColumn, RowId,
+    InsertUniqueColumn, RowId, RowStream,
 };
 use llkv_transaction::{TransactionSnapshot, TxnId, filter_row_ids_for_snapshot};
 use llkv_types::LogicalFieldId;
@@ -44,7 +44,15 @@ where
             return Ok(());
         }
 
-        let table_id = table.table.table_id();
+        if !self
+            .txn_manager
+            .has_other_active_transactions(snapshot.txn_id)
+        {
+            // No concurrent transactions hold locks, so conflict detection can be skipped.
+            return Ok(());
+        }
+
+        let table_id = table.table_id();
         let deleted_lfid = LogicalFieldId::for_mvcc_deleted_by(table_id);
         let logical_fields: Arc<[LogicalFieldId]> = Arc::from([deleted_lfid]);
 
@@ -59,15 +67,18 @@ where
             }
         }
 
-        let mut stream = table.table.stream_columns(
+        let mut stream = table.stream_columns(
             Arc::clone(&logical_fields),
             row_ids,
             GatherNullPolicy::IncludeNulls,
         )?;
 
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let window = chunk.row_ids();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let row_ids = chunk
+                .row_ids
+                .expect("constraint scans require row ids for MVCC filtering");
+            let window = row_ids.values();
             let deleted_column = batch
                 .column(0)
                 .as_any()
@@ -78,7 +89,7 @@ where
                     )
                 })?;
 
-            for (idx, row_id) in window.iter().enumerate() {
+            for (idx, row_id) in window.iter().copied().enumerate() {
                 let deleted_by: TxnId = if deleted_column.is_null(idx) {
                     TXN_ID_NONE
                 } else {
@@ -100,7 +111,7 @@ where
                     row_id,
                     deleted_by,
                     status,
-                    snapshot.txn_id
+                    snapshot.txn_id,
                 );
 
                 return Err(Error::TransactionContextError(format!(
@@ -129,7 +140,7 @@ where
 
         let anchor_field = field_ids[0];
         let filter_expr = translation::expression::full_table_scan_filter(anchor_field);
-        let raw_row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let raw_row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -146,13 +157,13 @@ where
             return Ok(Vec::new());
         }
 
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_field_ids: Vec<LogicalFieldId> = field_ids
             .iter()
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let mut stream = match table.table.stream_columns(
+        let mut stream = match table.stream_columns(
             logical_field_ids.clone(),
             &visible_row_ids,
             GatherNullPolicy::IncludeNulls,
@@ -164,9 +175,10 @@ where
 
         let mut rows =
             vec![Vec::with_capacity(field_ids.len()); visible_row_ids.cardinality() as usize];
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
-            let base = chunk.row_offset();
+        let mut emitted = 0usize;
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
+            let base = emitted;
             let local_len = batch.num_rows();
             for col_idx in 0..batch.num_columns() {
                 let array = batch.column(col_idx);
@@ -178,6 +190,7 @@ where
                     }
                 }
             }
+            emitted += local_len;
         }
 
         Ok(visible_row_ids.iter().zip(rows).collect())
@@ -215,7 +228,7 @@ where
             .collect();
 
         self.constraint_service.validate_insert_foreign_keys(
-            table.table.table_id(),
+            table.table_id(),
             &schema_field_ids,
             column_order,
             rows,
@@ -247,7 +260,7 @@ where
         }
 
         self.constraint_service.validate_update_foreign_keys(
-            table.table.table_id(),
+            table.table_id(),
             row_ids,
             updated_field_ids,
             |request| {
@@ -283,7 +296,7 @@ where
         }
 
         self.constraint_service.validate_delete_foreign_keys(
-            table.table.table_id(),
+            table.table_id(),
             row_ids,
             |request| {
                 self.collect_row_values_for_ids(

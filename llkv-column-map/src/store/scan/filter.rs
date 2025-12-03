@@ -9,7 +9,6 @@ use arrow::array::{
 use arrow::datatypes::ArrowPrimitiveType;
 use arrow::error::Result as ArrowResult;
 
-use crate::parallel;
 use crate::serialization::deserialize_array;
 use crate::store::descriptor::{ChunkMetadata, ColumnDescriptor, DescriptorIterator};
 use crate::store::rowid_fid;
@@ -24,6 +23,7 @@ use super::{
 };
 use crate::store::ColumnStore;
 use llkv_storage::pager::{BatchGet, GetResult, Pager};
+use llkv_threading::with_thread_pool;
 
 use rayon::prelude::*;
 
@@ -287,6 +287,9 @@ where
     where
         P: Pager<Blob = EntryHandle> + Send + Sync,
     {
+        if matches!(predicate, Predicate::All) {
+            return T::run_all(store, field_id);
+        }
         let predicate = predicate.clone();
         T::run_filter(store, field_id, move |value| {
             predicate.matches(<T::Native as PredicateValue>::borrowed(&value))
@@ -375,7 +378,7 @@ where
 
         let (value_metas, row_metas) = string_chunk_metadata(store, field_id)?;
 
-        let chunk_results: Vec<Result<Vec<u64>>> = parallel::with_thread_pool(|| {
+        let chunk_results: Vec<Result<Vec<RowId>>> = with_thread_pool(|| {
             value_metas
                 .par_iter()
                 .zip(row_metas.par_iter())
@@ -686,6 +689,87 @@ impl_filter_visitor!(
     date32_chunk_with_rids
 );
 
+pub(crate) struct RowIdAllVisitor<T> {
+    row_ids: Vec<u64>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> RowIdAllVisitor<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            row_ids: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn into_row_ids(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl<T> PrimitiveVisitor for RowIdAllVisitor<T> {}
+impl<T> PrimitiveSortedVisitor for RowIdAllVisitor<T> {}
+impl<T> PrimitiveSortedWithRowIdsVisitor for RowIdAllVisitor<T> {}
+
+macro_rules! impl_rowid_all_visitor {
+    ($ty:ty, $arr:ty, $method:ident) => {
+        impl PrimitiveWithRowIdsVisitor for RowIdAllVisitor<$ty> {
+            fn $method(&mut self, values: &$arr, row_ids: &UInt64Array) {
+                if values.null_count() == 0 {
+                    self.row_ids.extend_from_slice(row_ids.values());
+                } else {
+                    for i in 0..values.len() {
+                        if values.is_valid(i) {
+                            self.row_ids.push(row_ids.value(i));
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_rowid_all_visitor!(
+    arrow::datatypes::UInt64Type,
+    UInt64Array,
+    u64_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::UInt32Type,
+    UInt32Array,
+    u32_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::UInt16Type,
+    UInt16Array,
+    u16_chunk_with_rids
+);
+impl_rowid_all_visitor!(arrow::datatypes::UInt8Type, UInt8Array, u8_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
+impl_rowid_all_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
+impl_rowid_all_visitor!(
+    arrow::datatypes::Float64Type,
+    Float64Array,
+    f64_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::Float32Type,
+    Float32Array,
+    f32_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::Date64Type,
+    Date64Array,
+    date64_chunk_with_rids
+);
+impl_rowid_all_visitor!(
+    arrow::datatypes::Date32Type,
+    Date32Array,
+    date32_chunk_with_rids
+);
+
 pub(crate) struct RowIdFilterVisitor<T: ArrowPrimitiveType, F: FnMut(T::Native) -> bool> {
     predicate: F,
     row_ids: Vec<u64>,
@@ -801,6 +885,114 @@ impl_rowid_filter_visitor!(
     date64_chunk_with_rids
 );
 impl_rowid_filter_visitor!(
+    arrow::datatypes::Date32Type,
+    Date32Array,
+    date32_chunk_with_rids
+);
+
+pub(crate) struct RowIdNullableFilterVisitor<
+    T: ArrowPrimitiveType,
+    F: FnMut(Option<T::Native>) -> bool,
+> {
+    predicate: F,
+    row_ids: Vec<u64>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: ArrowPrimitiveType, F: FnMut(Option<T::Native>) -> bool> RowIdNullableFilterVisitor<T, F> {
+    pub(crate) fn new(predicate: F) -> Self {
+        Self {
+            predicate,
+            row_ids: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub(crate) fn into_row_ids(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl<T: ArrowPrimitiveType, F: FnMut(Option<T::Native>) -> bool> PrimitiveVisitor
+    for RowIdNullableFilterVisitor<T, F>
+{
+}
+
+impl<T: ArrowPrimitiveType, F: FnMut(Option<T::Native>) -> bool> PrimitiveSortedVisitor
+    for RowIdNullableFilterVisitor<T, F>
+{
+}
+
+impl<T: ArrowPrimitiveType, F: FnMut(Option<T::Native>) -> bool> PrimitiveSortedWithRowIdsVisitor
+    for RowIdNullableFilterVisitor<T, F>
+{
+}
+
+macro_rules! impl_rowid_nullable_filter_visitor {
+    ($ty:ty, $arr:ty, $method:ident) => {
+        impl<F> PrimitiveWithRowIdsVisitor for RowIdNullableFilterVisitor<$ty, F>
+        where
+            F: FnMut(Option<<$ty as ArrowPrimitiveType>::Native>) -> bool,
+        {
+            fn $method(&mut self, values: &$arr, row_ids: &UInt64Array) {
+                let len = values.len();
+                debug_assert_eq!(len, row_ids.len());
+                debug_assert_eq!(row_ids.null_count(), 0);
+                self.row_ids.reserve(len);
+
+                for i in 0..len {
+                    let val = if values.is_valid(i) {
+                        Some(unsafe { values.value_unchecked(i) })
+                    } else {
+                        None
+                    };
+                    let predicate = &mut self.predicate;
+                    if predicate(val) {
+                        let row_id = unsafe { row_ids.value_unchecked(i) };
+                        self.row_ids.push(row_id);
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_rowid_nullable_filter_visitor!(
+    arrow::datatypes::UInt64Type,
+    UInt64Array,
+    u64_chunk_with_rids
+);
+impl_rowid_nullable_filter_visitor!(
+    arrow::datatypes::UInt32Type,
+    UInt32Array,
+    u32_chunk_with_rids
+);
+impl_rowid_nullable_filter_visitor!(
+    arrow::datatypes::UInt16Type,
+    UInt16Array,
+    u16_chunk_with_rids
+);
+impl_rowid_nullable_filter_visitor!(arrow::datatypes::UInt8Type, UInt8Array, u8_chunk_with_rids);
+impl_rowid_nullable_filter_visitor!(arrow::datatypes::Int64Type, Int64Array, i64_chunk_with_rids);
+impl_rowid_nullable_filter_visitor!(arrow::datatypes::Int32Type, Int32Array, i32_chunk_with_rids);
+impl_rowid_nullable_filter_visitor!(arrow::datatypes::Int16Type, Int16Array, i16_chunk_with_rids);
+impl_rowid_nullable_filter_visitor!(arrow::datatypes::Int8Type, Int8Array, i8_chunk_with_rids);
+impl_rowid_nullable_filter_visitor!(
+    arrow::datatypes::Float64Type,
+    Float64Array,
+    f64_chunk_with_rids
+);
+impl_rowid_nullable_filter_visitor!(
+    arrow::datatypes::Float32Type,
+    Float32Array,
+    f32_chunk_with_rids
+);
+impl_rowid_nullable_filter_visitor!(
+    arrow::datatypes::Date64Type,
+    Date64Array,
+    date64_chunk_with_rids
+);
+impl_rowid_nullable_filter_visitor!(
     arrow::datatypes::Date32Type,
     Date32Array,
     date32_chunk_with_rids
@@ -1049,6 +1241,124 @@ where
     }
 }
 
+pub(crate) struct BoolRowIdNullableFilterVisitor<F>
+where
+    F: FnMut(Option<bool>) -> bool,
+{
+    predicate: F,
+    row_ids: Vec<u64>,
+}
+
+impl<F> BoolRowIdNullableFilterVisitor<F>
+where
+    F: FnMut(Option<bool>) -> bool,
+{
+    fn new(predicate: F) -> Self {
+        Self {
+            predicate,
+            row_ids: Vec::new(),
+        }
+    }
+
+    fn into_row_ids(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl<F> PrimitiveVisitor for BoolRowIdNullableFilterVisitor<F> where F: FnMut(Option<bool>) -> bool {}
+
+impl<F> PrimitiveSortedVisitor for BoolRowIdNullableFilterVisitor<F> where
+    F: FnMut(Option<bool>) -> bool
+{
+}
+
+impl<F> PrimitiveWithRowIdsVisitor for BoolRowIdNullableFilterVisitor<F>
+where
+    F: FnMut(Option<bool>) -> bool,
+{
+    fn bool_chunk_with_rids(&mut self, values: &BooleanArray, row_ids: &UInt64Array) {
+        let len = values.len();
+        debug_assert_eq!(len, row_ids.len());
+        debug_assert_eq!(row_ids.null_count(), 0);
+        self.row_ids.reserve(len);
+
+        for i in 0..len {
+            let val = if values.is_valid(i) {
+                Some(unsafe { values.value_unchecked(i) })
+            } else {
+                None
+            };
+            let predicate = &mut self.predicate;
+            if predicate(val) {
+                let row_id = unsafe { row_ids.value_unchecked(i) };
+                self.row_ids.push(row_id);
+            }
+        }
+    }
+}
+
+impl<F> PrimitiveSortedWithRowIdsVisitor for BoolRowIdNullableFilterVisitor<F>
+where
+    F: FnMut(Option<bool>) -> bool,
+{
+    fn bool_run_with_rids(
+        &mut self,
+        values: &BooleanArray,
+        row_ids: &UInt64Array,
+        start: usize,
+        len: usize,
+    ) {
+        let end = start + len;
+        self.row_ids.reserve(len);
+        for idx in start..end {
+            let val = if values.is_valid(idx) {
+                Some(unsafe { values.value_unchecked(idx) })
+            } else {
+                None
+            };
+            let predicate = &mut self.predicate;
+            if predicate(val) {
+                let row_id = unsafe { row_ids.value_unchecked(idx) };
+                self.row_ids.push(row_id);
+            }
+        }
+    }
+}
+
+pub(crate) struct BoolRowIdAllVisitor {
+    row_ids: Vec<u64>,
+}
+
+impl BoolRowIdAllVisitor {
+    fn new() -> Self {
+        Self {
+            row_ids: Vec::new(),
+        }
+    }
+
+    fn into_row_ids(self) -> Vec<u64> {
+        self.row_ids
+    }
+}
+
+impl PrimitiveVisitor for BoolRowIdAllVisitor {}
+impl PrimitiveSortedVisitor for BoolRowIdAllVisitor {}
+impl PrimitiveSortedWithRowIdsVisitor for BoolRowIdAllVisitor {}
+
+impl PrimitiveWithRowIdsVisitor for BoolRowIdAllVisitor {
+    fn bool_chunk_with_rids(&mut self, values: &BooleanArray, row_ids: &UInt64Array) {
+        if values.null_count() == 0 {
+            self.row_ids.extend_from_slice(row_ids.values());
+        } else {
+            for i in 0..values.len() {
+                if values.is_valid(i) {
+                    self.row_ids.push(row_ids.value(i));
+                }
+            }
+        }
+    }
+}
+
 pub trait FilterPrimitive {
     type Native;
     fn run_filter_with_result<P, F>(
@@ -1060,6 +1370,15 @@ pub trait FilterPrimitive {
         P: Pager<Blob = EntryHandle> + Send + Sync,
         F: FnMut(Self::Native) -> bool;
 
+    fn run_nullable_filter<P, F>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicate: F,
+    ) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+        F: FnMut(Option<Self::Native>) -> bool;
+
     fn run_filter<P, F>(
         store: &ColumnStore<P>,
         field_id: LogicalFieldId,
@@ -1068,6 +1387,10 @@ pub trait FilterPrimitive {
     where
         P: Pager<Blob = EntryHandle> + Send + Sync,
         F: FnMut(Self::Native) -> bool;
+
+    fn run_all<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync;
 }
 
 macro_rules! impl_filter_primitive {
@@ -1087,6 +1410,18 @@ macro_rules! impl_filter_primitive {
                 run_filter_for_with_result::<P, $ty, F>(store, field_id, predicate)
             }
 
+            fn run_nullable_filter<P, F>(
+                store: &ColumnStore<P>,
+                field_id: LogicalFieldId,
+                predicate: F,
+            ) -> Result<Vec<u64>>
+            where
+                P: Pager<Blob = EntryHandle> + Send + Sync,
+                F: FnMut(Option<Self::Native>) -> bool,
+            {
+                run_nullable_filter_for::<P, $ty, F>(store, field_id, predicate)
+            }
+
             fn run_filter<P, F>(
                 store: &ColumnStore<P>,
                 field_id: LogicalFieldId,
@@ -1097,6 +1432,13 @@ macro_rules! impl_filter_primitive {
                 F: FnMut(Self::Native) -> bool,
             {
                 run_filter_for::<P, $ty, F>(store, field_id, predicate)
+            }
+
+            fn run_all<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+            where
+                P: Pager<Blob = EntryHandle> + Send + Sync,
+            {
+                run_all_for::<P, $ty>(store, field_id)
             }
         }
     };
@@ -1130,6 +1472,18 @@ impl FilterPrimitive for arrow::datatypes::BooleanType {
         run_filter_for_bool_with_result(store, field_id, predicate)
     }
 
+    fn run_nullable_filter<P, F>(
+        store: &ColumnStore<P>,
+        field_id: LogicalFieldId,
+        predicate: F,
+    ) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+        F: FnMut(Option<Self::Native>) -> bool,
+    {
+        run_nullable_filter_for_bool(store, field_id, predicate)
+    }
+
     fn run_filter<P, F>(
         store: &ColumnStore<P>,
         field_id: LogicalFieldId,
@@ -1140,6 +1494,13 @@ impl FilterPrimitive for arrow::datatypes::BooleanType {
         F: FnMut(Self::Native) -> bool,
     {
         run_filter_for_bool(store, field_id, predicate)
+    }
+
+    fn run_all<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+    where
+        P: Pager<Blob = EntryHandle> + Send + Sync,
+    {
+        run_all_for_bool(store, field_id)
     }
 }
 
@@ -1259,6 +1620,46 @@ where
     Ok(visitor.into_row_ids())
 }
 
+pub(crate) fn run_all_for<P, T>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    T: ArrowPrimitiveType,
+    RowIdAllVisitor<T>: PrimitiveVisitor
+        + PrimitiveSortedVisitor
+        + PrimitiveSortedWithRowIdsVisitor
+        + PrimitiveWithRowIdsVisitor,
+{
+    let mut visitor = RowIdAllVisitor::<T>::new();
+    ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .run(&mut visitor)?;
+    Ok(visitor.into_row_ids())
+}
+
+pub(crate) fn run_nullable_filter_for<P, T, F>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    predicate: F,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    T: ArrowPrimitiveType,
+    F: FnMut(Option<T::Native>) -> bool,
+    RowIdNullableFilterVisitor<T, F>: PrimitiveVisitor
+        + PrimitiveSortedVisitor
+        + PrimitiveSortedWithRowIdsVisitor
+        + PrimitiveWithRowIdsVisitor,
+{
+    let mut visitor = RowIdNullableFilterVisitor::<T, F>::new(predicate);
+    ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .run(&mut visitor)?;
+    Ok(visitor.into_row_ids())
+}
+
 // TODO: Can this be replaced by `run_filter_for_with_result`?
 // NOTE: Boolean filters have specialized visitors; this helper mirrors the
 // non-boolean path while preserving legacy result structures.
@@ -1290,6 +1691,33 @@ where
     F: FnMut(bool) -> bool,
 {
     let mut visitor = BoolRowIdFilterVisitor::new(predicate);
+    ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .run(&mut visitor)?;
+    Ok(visitor.into_row_ids())
+}
+
+fn run_all_for_bool<P>(store: &ColumnStore<P>, field_id: LogicalFieldId) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut visitor = BoolRowIdAllVisitor::new();
+    ScanBuilder::new(store, field_id)
+        .with_row_ids(rowid_fid(field_id))
+        .run(&mut visitor)?;
+    Ok(visitor.into_row_ids())
+}
+
+fn run_nullable_filter_for_bool<P, F>(
+    store: &ColumnStore<P>,
+    field_id: LogicalFieldId,
+    predicate: F,
+) -> Result<Vec<u64>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(Option<bool>) -> bool,
+{
+    let mut visitor = BoolRowIdNullableFilterVisitor::new(predicate);
     ScanBuilder::new(store, field_id)
         .with_row_ids(rowid_fid(field_id))
         .run(&mut visitor)?;

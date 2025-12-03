@@ -20,7 +20,9 @@ use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::table::ScanProjection;
 use llkv_table::table::ScanStreamOptions;
-use llkv_table::{ConstraintEnforcementMode, FieldId, UniqueKey, build_composite_unique_key};
+use llkv_table::{
+    ConstraintEnforcementMode, FieldId, RowStream, UniqueKey, build_composite_unique_key,
+};
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use llkv_types::LogicalFieldId;
 use rustc_hash::FxHashMap;
@@ -52,7 +54,7 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         // Views are read-only - reject UPDATE operations
-        if self.is_view(table.table.table_id())? {
+        if self.is_view(table.table_id())? {
             return Err(Error::InvalidArgumentError(format!(
                 "cannot modify view '{}'",
                 display_name
@@ -161,7 +163,7 @@ where
         }
 
         let row_count = row_ids.cardinality();
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
             .columns
@@ -173,15 +175,13 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
 
         {
-            let mut stream = table.table.stream_columns(
-                logical_fields,
-                &row_ids,
-                GatherNullPolicy::IncludeNulls,
-            )?;
+            let mut stream =
+                table.stream_columns(logical_fields, &row_ids, GatherNullPolicy::IncludeNulls)?;
 
-            while let Some(chunk) = stream.next_batch()? {
-                let batch = chunk.batch();
-                let base = chunk.row_offset();
+            let mut emitted = 0usize;
+            while let Some(chunk) = stream.next_chunk()? {
+                let batch = chunk.record_batch();
+                let base = emitted;
                 let local_len = batch.num_rows();
                 for col_idx in 0..batch.num_columns() {
                     let array = batch.column(col_idx);
@@ -189,7 +189,7 @@ where
                         let target_index = base + local_idx;
                         debug_assert!(
                             target_index < new_rows.len(),
-                            "column stream produced out-of-range row index"
+                            "row stream produced out-of-range row index"
                         );
                         if let Some(row) = new_rows.get_mut(target_index) {
                             let value = llkv_plan::plan_value_from_array(array, local_idx)?;
@@ -197,6 +197,7 @@ where
                         }
                     }
                 }
+                emitted += local_len;
             }
         }
         debug_assert!(
@@ -303,7 +304,7 @@ where
                 .first_field_id()
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
-            let all_ids = table.table.filter_row_ids(&filter_expr)?;
+            let all_ids = table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
 
@@ -516,7 +517,7 @@ where
         }
 
         let row_count = row_ids.cardinality();
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_fields: Vec<LogicalFieldId> = table
             .schema
             .columns
@@ -528,15 +529,13 @@ where
             vec![Vec::with_capacity(table.schema.columns.len()); row_count as usize];
 
         {
-            let mut stream = table.table.stream_columns(
-                logical_fields,
-                &row_ids,
-                GatherNullPolicy::IncludeNulls,
-            )?;
+            let mut stream =
+                table.stream_columns(logical_fields, &row_ids, GatherNullPolicy::IncludeNulls)?;
 
-            while let Some(chunk) = stream.next_batch()? {
-                let batch = chunk.batch();
-                let base = chunk.row_offset();
+            let mut emitted = 0usize;
+            while let Some(chunk) = stream.next_chunk()? {
+                let batch = chunk.record_batch();
+                let base = emitted;
                 let local_len = batch.num_rows();
                 for col_idx in 0..batch.num_columns() {
                     let array = batch.column(col_idx);
@@ -544,7 +543,7 @@ where
                         let target_index = base + local_idx;
                         debug_assert!(
                             target_index < new_rows.len(),
-                            "column stream produced out-of-range row index"
+                            "row stream produced out-of-range row index"
                         );
                         if let Some(row) = new_rows.get_mut(target_index) {
                             let value = llkv_plan::plan_value_from_array(array, local_idx)?;
@@ -552,6 +551,7 @@ where
                         }
                     }
                 }
+                emitted += local_len;
             }
         }
         debug_assert!(
@@ -649,7 +649,7 @@ where
                 .first_field_id()
                 .ok_or_else(|| Error::Internal("table has no columns for validation".into()))?;
             let filter_expr = translation::expression::full_table_scan_filter(first_field);
-            let all_ids = table.table.filter_row_ids(&filter_expr)?;
+            let all_ids = table.filter_row_ids(&filter_expr)?;
             filter_row_ids_for_snapshot(table.table.as_ref(), all_ids, &self.txn_manager, snapshot)?
         };
 
@@ -810,7 +810,7 @@ where
 
         let row_count = row_ids.cardinality();
         tracing::debug!(
-            table_id = table.table.table_id(),
+            table_id = table.table_id(),
             row_count,
             ?row_ids,
             "update_rows_in_place: rewriting rows",
@@ -933,7 +933,7 @@ where
         expressions: &[ScalarExpr<FieldId>],
         snapshot: TransactionSnapshot,
     ) -> Result<(Treemap, Vec<Vec<PlanValue>>)> {
-        let row_ids = table.table.filter_row_ids(filter_expr)?;
+        let row_ids = table.filter_row_ids(filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         if row_ids.is_empty() {
             return Ok((Treemap::new(), vec![Vec::new(); expressions.len()]));
@@ -959,6 +959,7 @@ where
             include_nulls: true,
             order: None,
             row_id_filter: Some(row_filter),
+            include_row_ids: true,
         };
 
         table

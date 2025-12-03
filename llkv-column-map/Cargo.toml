@@ -25,6 +25,7 @@ croaring.workspace = true
 llkv-expr.workspace = true
 llkv-result.workspace = true
 llkv-storage.workspace = true
+llkv-threading.workspace = true
 llkv-types.workspace = true
 num_enum.workspace = true
 rayon.workspace = true

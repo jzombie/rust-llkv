@@ -20,6 +20,7 @@ build = []
 [dependencies]
 arrow = { workspace = true, default-features = false }
 arrow-buffer.workspace = true
+croaring.workspace = true
 llkv-aggregate.workspace = true
 llkv-column-map.workspace = true
 llkv-compute.workspace = true
@@ -27,8 +28,10 @@ llkv-expr.workspace = true
 llkv-join.workspace = true
 llkv-plan.workspace = true
 llkv-result.workspace = true
+llkv-scan.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
+llkv-threading.workspace = true
 llkv-types.workspace = true
 rand.workspace = true
 rayon.workspace = true

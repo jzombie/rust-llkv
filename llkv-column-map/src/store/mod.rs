@@ -46,6 +46,7 @@ pub mod scan;
 pub use scan::*;
 
 mod projection;
+pub(crate) use projection::GatherContextPool;
 pub use projection::{GatherNullPolicy, MultiGatherContext, Projection};
 
 mod slicing;

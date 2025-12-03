@@ -18,7 +18,7 @@ use llkv_executor::{
 use llkv_plan::{InsertConflictAction, InsertPlan, InsertSource, PlanValue};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
-use llkv_table::ConstraintEnforcementMode;
+use llkv_table::{ConstraintEnforcementMode, RowStream};
 use llkv_transaction::{TransactionSnapshot, filter_row_ids_for_snapshot, mvcc};
 use llkv_types::{LogicalFieldId, RowId};
 use simd_r_drive_entry_handle::EntryHandle;
@@ -48,7 +48,7 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         // Views are read-only - reject INSERT operations
-        if self.is_view(table.table.table_id())? {
+        if self.is_view(table.table_id())? {
             return Err(Error::InvalidArgumentError(format!(
                 "cannot modify view '{}'",
                 display_name
@@ -59,7 +59,7 @@ where
         if display_name == "keys" {
             tracing::trace!(
                 "\n[KEYS] INSERT starting - table_id={}, context_pager={:p}",
-                table.table.table_id(),
+                table.table_id(),
                 &*self.pager
             );
             tracing::trace!(
@@ -439,7 +439,7 @@ where
         }
 
         let mut conflicting_row_ids = Vec::new();
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
 
         // Helper: get all visible row IDs
         let anchor_field = table
@@ -455,7 +455,7 @@ where
         };
         let filter_expr = Expr::Pred(match_all_filter);
 
-        let row_ids = match table.table.filter_row_ids(&filter_expr) {
+        let row_ids = match table.filter_row_ids(&filter_expr) {
             Ok(ids) => ids,
             Err(Error::NotFound) => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -493,26 +493,28 @@ where
 
                 // Scan existing rows for this column
                 let logical_field_id = LogicalFieldId::for_user(table_id, unique_col.field_id);
-                let mut stream = table.table.stream_columns(
+                let mut stream = table.stream_columns(
                     vec![logical_field_id],
                     &row_ids,
                     GatherNullPolicy::IncludeNulls,
                 )?;
 
-                while let Some(chunk) = stream.next_batch()? {
-                    let batch = chunk.batch();
+                while let Some(chunk) = stream.next_chunk()? {
+                    let batch = chunk.record_batch();
                     if batch.num_columns() == 0 {
                         continue;
                     }
                     let array = batch.column(0);
-                    let _base_idx = chunk.row_offset();
+                    let row_ids = chunk
+                        .row_ids
+                        .expect("unique constraint scans require row ids");
 
                     for local_idx in 0..batch.num_rows() {
                         if let Ok(existing_value) =
                             llkv_plan::plan_value_from_array(array, local_idx)
                             && new_values.contains(&existing_value)
                         {
-                            let rid = chunk.row_ids()[local_idx];
+                            let rid = row_ids.value(local_idx);
                             if !conflicting_row_ids.contains(&rid) {
                                 conflicting_row_ids.push(rid);
                             }
@@ -616,26 +618,26 @@ where
         }
 
         // Scan existing rows for these columns
-        let table_id = table.table.table_id();
+        let table_id = table.table_id();
         let logical_field_ids: Vec<_> = constraint
             .field_ids
             .iter()
             .map(|&fid| LogicalFieldId::for_user(table_id, fid))
             .collect();
 
-        let mut stream = table.table.stream_columns(
-            logical_field_ids,
-            row_ids,
-            GatherNullPolicy::IncludeNulls,
-        )?;
+        let mut stream =
+            table.stream_columns(logical_field_ids, row_ids, GatherNullPolicy::IncludeNulls)?;
 
-        while let Some(chunk) = stream.next_batch()? {
-            let batch = chunk.batch();
+        while let Some(chunk) = stream.next_chunk()? {
+            let batch = chunk.record_batch();
             if batch.num_columns() == 0 {
                 continue;
             }
 
             let num_rows = batch.num_rows();
+            let row_ids = chunk
+                .row_ids
+                .expect("multi-column unique scans require row ids");
 
             for local_idx in 0..num_rows {
                 let mut existing_value = Vec::new();
@@ -653,7 +655,7 @@ where
                 }
 
                 if has_all_values && new_values.contains(&existing_value) {
-                    let rid = chunk.row_ids()[local_idx];
+                    let rid = row_ids.value(local_idx);
                     if !conflicting_row_ids.contains(&rid) {
                         conflicting_row_ids.push(rid);
                     }

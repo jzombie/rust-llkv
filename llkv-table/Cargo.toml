@@ -28,6 +28,7 @@ llkv-compute.workspace = true
 llkv-expr.workspace = true
 llkv-plan.workspace = true
 llkv-result.workspace = true
+llkv-scan.workspace = true
 llkv-storage.workspace = true
 llkv-types.workspace = true
 rand.workspace = true
