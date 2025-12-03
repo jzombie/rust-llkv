@@ -51,8 +51,8 @@ use llkv_table::table::{
 };
 use llkv_table::types::FieldId;
 use llkv_table::{NumericArrayMap, NumericKernels, ROW_ID_FIELD_ID};
-use llkv_types::LogicalFieldId;
 use llkv_threading::with_thread_pool;
+use llkv_types::LogicalFieldId;
 use llkv_types::decimal::DecimalValue;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -893,15 +893,12 @@ where
 
         // Execute each uncached correlated subquery in parallel on the shared Rayon pool.
         if !pending_bindings.is_empty() {
-            let job_results: Vec<ExecutorResult<Literal>> =
-                with_thread_pool(|| {
-                    pending_bindings
-                        .par_iter()
-                        .map(|bindings| {
-                            self.evaluate_scalar_subquery_with_bindings(subquery, bindings)
-                        })
-                        .collect()
-                });
+            let job_results: Vec<ExecutorResult<Literal>> = with_thread_pool(|| {
+                pending_bindings
+                    .par_iter()
+                    .map(|bindings| self.evaluate_scalar_subquery_with_bindings(subquery, bindings))
+                    .collect()
+            });
 
             for ((slot_idx, cache_key), result) in pending_slots
                 .into_iter()
@@ -1023,15 +1020,12 @@ where
 
         // Execute each uncached correlated subquery in parallel on the shared Rayon pool.
         if !pending_bindings.is_empty() {
-            let job_results: Vec<ExecutorResult<Literal>> =
-                with_thread_pool(|| {
-                    pending_bindings
-                        .par_iter()
-                        .map(|bindings| {
-                            self.evaluate_scalar_subquery_with_bindings(subquery, bindings)
-                        })
-                        .collect()
-                });
+            let job_results: Vec<ExecutorResult<Literal>> = with_thread_pool(|| {
+                pending_bindings
+                    .par_iter()
+                    .map(|bindings| self.evaluate_scalar_subquery_with_bindings(subquery, bindings))
+                    .collect()
+            });
 
             for ((slot_idx, cache_key), result) in pending_slots
                 .into_iter()
@@ -12543,49 +12537,47 @@ fn build_join_match_indices(
 
     // Parallelize probe phase across left batches
     // Each thread probes its batch(es) against the shared hash table
-    let matches: Vec<ExecutorResult<JoinMatchPairs>> =
-        with_thread_pool(|| {
-            left_batches
-                .par_iter()
-                .enumerate()
-                .map(|(batch_idx, batch)| {
-                    let mut local_left_matches: JoinMatchIndices = Vec::new();
-                    let mut local_right_matches: JoinMatchIndices = Vec::new();
+    let matches: Vec<ExecutorResult<JoinMatchPairs>> = with_thread_pool(|| {
+        left_batches
+            .par_iter()
+            .enumerate()
+            .map(|(batch_idx, batch)| {
+                let mut local_left_matches: JoinMatchIndices = Vec::new();
+                let mut local_right_matches: JoinMatchIndices = Vec::new();
 
-                    let columns: Vec<ArrayRef> = left_key_indices
-                        .iter()
-                        .map(|&idx| normalize_join_column(batch.column(idx)))
-                        .collect::<ExecutorResult<Vec<_>>>()?;
+                let columns: Vec<ArrayRef> = left_key_indices
+                    .iter()
+                    .map(|&idx| normalize_join_column(batch.column(idx)))
+                    .collect::<ExecutorResult<Vec<_>>>()?;
 
-                    let sort_fields: Vec<SortField> = columns
-                        .iter()
-                        .map(|c| SortField::new(c.data_type().clone()))
-                        .collect();
+                let sort_fields: Vec<SortField> = columns
+                    .iter()
+                    .map(|c| SortField::new(c.data_type().clone()))
+                    .collect();
 
-                    let converter = RowConverter::new(sort_fields).map_err(|e| {
-                        Error::Internal(format!("failed to create RowConverter: {e}"))
-                    })?;
-                    let rows = converter.convert_columns(&columns).map_err(|e| {
-                        Error::Internal(format!("failed to convert columns to rows: {e}"))
-                    })?;
+                let converter = RowConverter::new(sort_fields)
+                    .map_err(|e| Error::Internal(format!("failed to create RowConverter: {e}")))?;
+                let rows = converter.convert_columns(&columns).map_err(|e| {
+                    Error::Internal(format!("failed to convert columns to rows: {e}"))
+                })?;
 
-                    for (row_idx, row) in rows.iter().enumerate() {
-                        if columns.iter().any(|c| c.is_null(row_idx)) {
-                            continue;
-                        }
-
-                        if let Some(positions) = hash_table.get(row.as_ref()) {
-                            for &(r_batch_idx, r_row_idx) in positions {
-                                local_left_matches.push((batch_idx, row_idx));
-                                local_right_matches.push((r_batch_idx, r_row_idx));
-                            }
-                        }
+                for (row_idx, row) in rows.iter().enumerate() {
+                    if columns.iter().any(|c| c.is_null(row_idx)) {
+                        continue;
                     }
 
-                    Ok((local_left_matches, local_right_matches))
-                })
-                .collect()
-        });
+                    if let Some(positions) = hash_table.get(row.as_ref()) {
+                        for &(r_batch_idx, r_row_idx) in positions {
+                            local_left_matches.push((batch_idx, row_idx));
+                            local_right_matches.push((r_batch_idx, r_row_idx));
+                        }
+                    }
+                }
+
+                Ok((local_left_matches, local_right_matches))
+            })
+            .collect()
+    });
 
     // Merge all match results
     let mut left_matches: JoinMatchIndices = Vec::new();

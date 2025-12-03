@@ -14,8 +14,8 @@ use llkv_compute::program::{
 use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
-use llkv_types::{FieldId, LogicalFieldId, ROW_ID_FIELD_ID};
 use llkv_threading::with_thread_pool;
+use llkv_types::{FieldId, LogicalFieldId, ROW_ID_FIELD_ID};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
