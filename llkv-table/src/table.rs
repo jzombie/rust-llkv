@@ -885,8 +885,42 @@ impl<'a> RowIdChunkEmitter<'a> {
         if self.error.is_some() {
             return;
         }
-        for idx in 0..row_ids.len() {
-            self.push(row_ids.value(idx));
+
+        // Optimization: If buffer is empty, pass slices directly to avoid copy
+        if self.buffer.is_empty() {
+            let values = row_ids.values();
+            let mut offset = 0;
+            while offset < values.len() {
+                let remaining = values.len() - offset;
+                if remaining >= self.chunk_size {
+                    if let Err(err) = (self.on_chunk)(&values[offset..offset + self.chunk_size]) {
+                        self.error = Some(err);
+                        return;
+                    }
+                    offset += self.chunk_size;
+                } else {
+                    // Buffer the remainder
+                    self.buffer.extend_from_slice(&values[offset..]);
+                    break;
+                }
+            }
+            return;
+        }
+
+        let values = row_ids.values();
+        let mut offset = 0;
+        while offset < values.len() {
+            let remaining = self.chunk_size - self.buffer.len();
+            let available = values.len() - offset;
+            let count = remaining.min(available);
+
+            self.buffer
+                .extend_from_slice(&values[offset..offset + count]);
+            offset += count;
+
+            if self.buffer.len() >= self.chunk_size {
+                self.flush();
+            }
         }
     }
 
@@ -895,8 +929,21 @@ impl<'a> RowIdChunkEmitter<'a> {
             return;
         }
         let end = (start + len).min(row_ids.len());
-        for idx in start..end {
-            self.push(row_ids.value(idx));
+        let values = &row_ids.values()[start..end];
+
+        let mut offset = 0;
+        while offset < values.len() {
+            let remaining = self.chunk_size - self.buffer.len();
+            let available = values.len() - offset;
+            let count = remaining.min(available);
+
+            self.buffer
+                .extend_from_slice(&values[offset..offset + count]);
+            offset += count;
+
+            if self.buffer.len() >= self.chunk_size {
+                self.flush();
+            }
         }
     }
 
@@ -1437,26 +1484,24 @@ where
         chunk_size: usize,
         on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     ) -> LlkvResult<bool> {
-        let Some(rows) = self.fetch_mvcc_row_ids()? else {
-            return Ok(false);
-        };
-        if rows.is_empty() {
-            return Ok(true);
-        }
+        let created_lfid = LogicalFieldId::for_mvcc_created_by(self.table_id);
+        let mut emitter = RowIdChunkEmitter::new(chunk_size, false, on_chunk);
 
-        let chunk_cap = chunk_size.max(1);
-        let mut chunk = Vec::with_capacity(chunk_cap);
-        for row_id in rows {
-            chunk.push(row_id);
-            if chunk.len() >= chunk_cap {
-                (on_chunk)(chunk.as_slice())?;
-                chunk.clear();
+        let scan_result = ScanBuilder::new(self.store(), created_lfid)
+            .options(ScanOptions {
+                with_row_ids: true,
+                ..Default::default()
+            })
+            .run(&mut emitter);
+
+        match scan_result {
+            Ok(()) => {
+                emitter.finish()?;
+                Ok(true)
             }
+            Err(Error::NotFound) => Ok(false),
+            Err(err) => Err(err),
         }
-        if !chunk.is_empty() {
-            (on_chunk)(chunk.as_slice())?;
-        }
-        Ok(true)
     }
 
     fn fetch_mvcc_row_ids(&self) -> LlkvResult<Option<Vec<RowId>>> {
