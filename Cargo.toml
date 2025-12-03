@@ -45,7 +45,7 @@ arrow-schema = { version = "57.0.0", default-features = false }
 async-trait = "0.1.89"
 bitcode = "0.6.7"
 clap = { version = "4.5.53", features = ["derive"] }
-criterion = "0.7.0"
+criterion = "0.8.0"
 croaring = "2.5.1"
 crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
