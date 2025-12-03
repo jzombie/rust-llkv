@@ -383,7 +383,7 @@ where
             let schema = Arc::clone(&self.schema);
             let projection_plan = self.projection_plan.clone();
 
-            let numeric_cache = self.numeric_arrays_cache.as_mut().map(|m| m);
+            let numeric_cache = self.numeric_arrays_cache.as_mut();
             let batch_opt = materialize_row_window(
                 self.storage,
                 self.table_id,

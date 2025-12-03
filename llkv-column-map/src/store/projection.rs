@@ -458,8 +458,8 @@ fn ensure_primitive_capacity<T: ArrowPrimitiveType>(
 }
 
 pub struct MultiGatherContext {
-    field_infos: Vec<(LogicalFieldId, DataType)>,
-    plans: Vec<FieldPlan>,
+    field_infos: FieldInfos,
+    plans: FieldPlans,
     chunk_cache: FxHashMap<PhysicalKey, ArrayRef>,
     row_index: FxHashMap<u64, usize>,
     row_scratch: Vec<Option<(usize, usize)>>,
@@ -470,7 +470,7 @@ pub struct MultiGatherContext {
 }
 
 impl MultiGatherContext {
-    fn new(field_infos: Vec<(LogicalFieldId, DataType)>, plans: Vec<FieldPlan>) -> Result<Self> {
+    fn new(field_infos: FieldInfos, plans: FieldPlans) -> Result<Self> {
         let mut builders = Vec::with_capacity(field_infos.len());
         for (_, dtype) in &field_infos {
             builders.push(ColumnOutputBuilder::from_dtype(dtype)?);
@@ -491,8 +491,8 @@ impl MultiGatherContext {
 
     fn update_field_infos_and_plans(
         &mut self,
-        field_infos: Vec<(LogicalFieldId, DataType)>,
-        plans: Vec<FieldPlan>,
+        field_infos: FieldInfos,
+        plans: FieldPlans,
     ) -> Result<()> {
         if self.field_infos != field_infos {
             let mut rebuilt = Vec::with_capacity(field_infos.len());
@@ -592,10 +592,10 @@ impl MultiGatherContext {
     }
 
     fn schema_for_nullability(&mut self, nullability: &[bool]) -> Arc<Schema> {
-        if let Some((cached_flags, schema)) = &self.cached_schema {
-            if cached_flags == nullability {
-                return Arc::clone(schema);
-            }
+        if let Some((cached_flags, schema)) = &self.cached_schema
+            && cached_flags == nullability
+        {
+            return Arc::clone(schema);
         }
 
         let mut fields = Vec::with_capacity(self.field_infos.len());
@@ -671,15 +671,15 @@ impl GatherContextPool {
         F: FnOnce() -> Result<MultiGatherContext>,
     {
         let mut guard = self.inner.lock().unwrap();
-        if let Some(bucket) = guard.get_mut(field_ids) {
-            if let Some(ctx) = bucket.pop() {
-                drop(guard);
-                return Ok(GatherContextGuard {
-                    key: field_ids.to_vec(),
-                    ctx: Some(ctx),
-                    pool: self,
-                });
-            }
+        if let Some(bucket) = guard.get_mut(field_ids)
+            && let Some(ctx) = bucket.pop()
+        {
+            drop(guard);
+            return Ok(GatherContextGuard {
+                key: field_ids.to_vec(),
+                ctx: Some(ctx),
+                pool: self,
+            });
         }
         drop(guard);
 
@@ -727,6 +727,10 @@ struct FieldPlan {
     candidate_indices: Vec<usize>,
     avg_value_bytes_per_row: f64,
 }
+
+type FieldInfos = Vec<(LogicalFieldId, DataType)>;
+type FieldPlans = Vec<FieldPlan>;
+type FieldInfosAndPlans = (FieldInfos, FieldPlans);
 
 impl FieldPlan {
     fn value_bytes_hint(&self, len: usize) -> usize {
@@ -793,7 +797,7 @@ where
     fn build_field_infos_and_plans(
         &self,
         field_ids: &[LogicalFieldId],
-    ) -> Result<(Vec<(LogicalFieldId, DataType)>, Vec<FieldPlan>)> {
+    ) -> Result<FieldInfosAndPlans> {
         let mut field_infos = Vec::with_capacity(field_ids.len());
         for &fid in field_ids {
             field_infos.push((fid, self.data_type(fid)?));

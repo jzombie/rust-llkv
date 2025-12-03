@@ -1,7 +1,4 @@
-use std::env;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, BooleanBuilder, Int64Array};
 use arrow::compute;
@@ -30,7 +27,6 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 // Chunk size for predicate evaluation. Smaller chunks create more parallel tasks.
 const CHUNK_SIZE: usize = 4096;
-
 
 /// Evaluate a compiled predicate program against storage to produce RowIdSource.
 pub fn collect_row_ids_for_program<'expr, P, S>(

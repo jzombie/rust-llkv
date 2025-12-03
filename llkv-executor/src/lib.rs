@@ -11632,19 +11632,19 @@ fn filter_batches_by_literal(
             let indices = UInt32Array::from(keep_rows);
             let mut filtered_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
             for col_idx in 0..batch.num_columns() {
-                let filtered = take(batch.column(col_idx).as_ref(), &indices, None).map_err(
-                    |err| Error::Internal(format!("failed to apply literal filter: {err}")),
-                )?;
+                let filtered =
+                    take(batch.column(col_idx).as_ref(), &indices, None).map_err(|err| {
+                        Error::Internal(format!("failed to apply literal filter: {err}"))
+                    })?;
                 filtered_columns.push(filtered);
             }
 
-            let filtered_batch = RecordBatch::try_new(batch.schema(), filtered_columns).map_err(
-                |err| {
+            let filtered_batch =
+                RecordBatch::try_new(batch.schema(), filtered_columns).map_err(|err| {
                     Error::Internal(format!(
                         "failed to rebuild batch after literal filter: {err}"
                     ))
-                },
-            )?;
+                })?;
             Ok(Some(filtered_batch))
         })
         .collect::<ExecutorResult<Vec<Option<RecordBatch>>>>()?
@@ -11706,9 +11706,8 @@ fn filter_batches_by_in_list(
             }
 
             // Use Arrow's filter kernel for vectorized filtering
-            let filtered_batch = arrow::compute::filter_record_batch(batch, &mask).map_err(|err| {
-                Error::Internal(format!("failed to apply IN list filter: {err}"))
-            })?;
+            let filtered_batch = arrow::compute::filter_record_batch(batch, &mask)
+                .map_err(|err| Error::Internal(format!("failed to apply IN list filter: {err}")))?;
 
             Ok(Some(filtered_batch))
         })

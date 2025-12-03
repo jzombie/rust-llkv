@@ -330,7 +330,7 @@ where
             &plan.out_schema,
             chunk,
             gather_ctx.as_mut(),
-            numeric_cache.as_mut().map(|m| m),
+            numeric_cache.as_mut(),
             &mut columns_buf,
         )?
         .filter(|batch| batch.num_rows() > 0)

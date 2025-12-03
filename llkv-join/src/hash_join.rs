@@ -47,14 +47,11 @@ use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::FieldId;
 use llkv_types::LogicalFieldId;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
-use std::env;
 use std::hash::{Hash, Hasher};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::thread;
 
 /// A hash key representing join column values for a single row.
 #[derive(Debug, Clone, Eq)]
@@ -257,9 +254,6 @@ where
             }
         }
 
-        let total_probe_rows: usize = probe_tasks.iter().map(|(_, b)| b.num_rows()).sum();
-        let task_count = probe_tasks.len();
-
         let mut parallel_results: Vec<((usize, usize), Vec<RecordBatch>)> = with_thread_pool(
             || {
                 probe_tasks
@@ -321,7 +315,6 @@ where
             },
         )?;
 
-        
         // Preserve batch order for deterministic output.
         parallel_results.sort_by_key(|(key, _)| *key);
         for (_, batches) in parallel_results {
