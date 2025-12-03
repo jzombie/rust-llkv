@@ -1,0 +1,16 @@
+[package]
+name = "llkv-threading"
+description = "Thread pooling utilities for the LLKV toolkit."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rayon.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

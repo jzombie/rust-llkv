@@ -19,6 +19,7 @@ members = [
     "llkv-storage",
     "llkv-table",
     "llkv-test-utils",
+    "llkv-threading",
     "llkv-tpch",
     "llkv-transaction",
     "llkv-types",
@@ -68,6 +69,7 @@ llkv-sql = { path = "./llkv-sql", version = "0.8.4-alpha" }
 llkv-storage = { path = "./llkv-storage", version = "0.8.4-alpha" }
 llkv-table = { path = "./llkv-table", version = "0.8.4-alpha" }
 llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.4-alpha" }
+llkv-threading = { path = "./llkv-threading", version = "0.8.4-alpha" }
 llkv-transaction = { path = "./llkv-transaction", version = "0.8.4-alpha" }
 llkv-types = { path = "./llkv-types", version = "0.8.4-alpha" }
 modular-bitfield = "0.13.0"

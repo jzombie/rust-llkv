@@ -14,16 +14,19 @@ use llkv_compute::program::{
 use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, CompareOp, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_threading::with_thread_pool;
 use llkv_types::{FieldId, LogicalFieldId, ROW_ID_FIELD_ID};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::row_stream::RowIdSource;
 use crate::{NumericArrayMap, ScanStorage};
-use llkv_column_map::store::GatherNullPolicy;
+use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-const CHUNK_SIZE: usize = 8192;
+// Chunk size for predicate evaluation. Smaller chunks create more parallel tasks.
+const CHUNK_SIZE: usize = 4096;
 
 /// Evaluate a compiled predicate program against storage to produce RowIdSource.
 pub fn collect_row_ids_for_program<'expr, P, S>(
@@ -338,6 +341,10 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
+    if let Some(filter) = simple_compare_filter(left, op, right) {
+        return storage.filter_leaf(&filter);
+    }
+
     let mut fields = FxHashSet::default();
     ScalarEvaluator::collect_fields(left, &mut fields);
     ScalarEvaluator::collect_fields(right, &mut fields);
@@ -461,72 +468,95 @@ where
         .map(|&fid| LogicalFieldId::for_user(storage.table_id(), fid))
         .collect();
 
-    let mut ctx = storage.prepare_gather_context(&logical_fields)?;
-    let mut matched = Treemap::new();
-    let mut determined = Treemap::new();
-
     let domain_vec: Vec<u64> = domain_rows.iter().collect();
-    for chunk in domain_vec.chunks(CHUNK_SIZE) {
-        let batch = storage.gather_row_window_with_context(
-            &logical_fields,
-            chunk,
-            GatherNullPolicy::IncludeNulls,
-            Some(&mut ctx),
-        )?;
+    let (local_matched, local_determined, _): (Treemap, Treemap, Option<MultiGatherContext>) =
+        with_thread_pool(|| {
+            domain_vec
+                .par_chunks(CHUNK_SIZE)
+                .try_fold(
+                    || (Treemap::new(), Treemap::new(), None),
+                    |(mut matched, mut determined, mut ctx), chunk| -> LlkvResult<_> {
+                        if ctx.is_none() {
+                            ctx = Some(storage.prepare_gather_context(&logical_fields)?);
+                        }
+                        let batch = storage.gather_row_window_with_context(
+                            &logical_fields,
+                            chunk,
+                            GatherNullPolicy::IncludeNulls,
+                            ctx.as_mut(),
+                        )?;
 
-        let mut arrays: NumericArrayMap = FxHashMap::default();
-        for (i, fid) in physical_fields.iter().enumerate() {
-            arrays.insert(*fid, batch.column(i).clone());
-        }
+                        let mut arrays: NumericArrayMap = FxHashMap::default();
+                        for (i, fid) in physical_fields.iter().enumerate() {
+                            arrays.insert(*fid, batch.column(i).clone());
+                        }
 
-        if has_row_id {
-            let rid_values: Vec<i64> = chunk.iter().map(|row_id| *row_id as i64).collect();
-            let rid_array: ArrayRef = Arc::new(Int64Array::from(rid_values));
-            arrays.insert(ROW_ID_FIELD_ID, rid_array);
-        }
+                        if has_row_id {
+                            let rid_values: Vec<i64> =
+                                chunk.iter().map(|row_id| *row_id as i64).collect();
+                            let rid_array: ArrayRef = Arc::new(Int64Array::from(rid_values));
+                            arrays.insert(ROW_ID_FIELD_ID, rid_array);
+                        }
 
-        let mut target_array = ScalarEvaluator::evaluate_batch(expr, chunk.len(), &arrays)?;
-        let mut acc: Option<BooleanArray> = None;
+                        let mut target_array =
+                            ScalarEvaluator::evaluate_batch(expr, chunk.len(), &arrays)?;
+                        let mut acc: Option<BooleanArray> = None;
 
-        for item in list {
-            let value_array = ScalarEvaluator::evaluate_batch(item, chunk.len(), &arrays)?;
-            let (new_target, new_value) =
-                kernels::coerce_types(&target_array, &value_array, BinaryOp::Add)?;
-            target_array = new_target;
-            let eq_array = arrow::compute::kernels::cmp::eq(&new_value, &target_array)?;
-            acc = match acc {
-                Some(prev) => Some(compute::or_kleene(&prev, &eq_array)?),
-                None => Some(eq_array),
-            };
-        }
+                        for item in list {
+                            let value_array =
+                                ScalarEvaluator::evaluate_batch(item, chunk.len(), &arrays)?;
+                            let (new_target, new_value) =
+                                kernels::coerce_types(&target_array, &value_array, BinaryOp::Add)?;
+                            target_array = new_target;
+                            let eq_array =
+                                arrow::compute::kernels::cmp::eq(&new_value, &target_array)?;
+                            acc = match acc {
+                                Some(prev) => Some(compute::or_kleene(&prev, &eq_array)?),
+                                None => Some(eq_array),
+                            };
+                        }
 
-        let mut final_bool = match acc {
-            Some(arr) => arr,
-            None => {
-                let mut builder = BooleanBuilder::with_capacity(chunk.len());
-                for _ in 0..chunk.len() {
-                    builder.append_value(false);
-                }
-                builder.finish()
-            }
-        };
+                        let mut final_bool = match acc {
+                            Some(arr) => arr,
+                            None => {
+                                let mut builder = BooleanBuilder::with_capacity(chunk.len());
+                                for _ in 0..chunk.len() {
+                                    builder.append_value(false);
+                                }
+                                builder.finish()
+                            }
+                        };
 
-        if negated {
-            final_bool = compute::not(&final_bool)?;
-        }
+                        if negated {
+                            final_bool = compute::not(&final_bool)?;
+                        }
 
-        for (idx, row_id) in chunk.iter().enumerate() {
-            if final_bool.is_null(idx) {
-                continue;
-            }
-            determined.add(*row_id);
-            if final_bool.value(idx) {
-                matched.add(*row_id);
-            }
-        }
-    }
+                        for (idx, row_id) in chunk.iter().enumerate() {
+                            if final_bool.is_null(idx) {
+                                continue;
+                            }
+                            determined.add(*row_id);
+                            if final_bool.value(idx) {
+                                matched.add(*row_id);
+                            }
+                        }
 
-    Ok((matched, determined))
+                        Ok((matched, determined, ctx))
+                    },
+                )
+                .try_reduce(
+                    || (Treemap::new(), Treemap::new(), None),
+                    |a, b| {
+                        let (mut am, mut ad, actx) = a;
+                        let (bm, bd, _bctx) = b;
+                        am |= bm;
+                        ad |= bd;
+                        Ok((am, ad, actx))
+                    },
+                )
+        })?;
+
+    Ok((local_matched, local_determined))
 }
 
 fn evaluate_compare_rows<P, S>(
@@ -558,51 +588,76 @@ where
         .map(|&fid| LogicalFieldId::for_user(storage.table_id(), fid))
         .collect();
 
-    let mut ctx = storage.prepare_gather_context(&logical_fields)?;
-    let mut matched = Treemap::new();
-    let mut determined = Treemap::new();
-
     let domain_vec: Vec<u64> = domain_rows.iter().collect();
-    for chunk in domain_vec.chunks(CHUNK_SIZE) {
-        let batch = storage.gather_row_window_with_context(
-            &logical_fields,
-            chunk,
-            GatherNullPolicy::IncludeNulls,
-            Some(&mut ctx),
-        )?;
+    let (matched, determined, _): (Treemap, Treemap, Option<MultiGatherContext>) =
+        with_thread_pool(|| {
+            domain_vec
+                .par_chunks(CHUNK_SIZE)
+                .try_fold(
+                    || (Treemap::new(), Treemap::new(), None),
+                    |(mut matched, mut determined, mut ctx), chunk| -> LlkvResult<_> {
+                        if ctx.is_none() {
+                            ctx = Some(storage.prepare_gather_context(&logical_fields)?);
+                        }
 
-        let mut arrays: NumericArrayMap = FxHashMap::default();
-        for (i, fid) in physical_fields.iter().enumerate() {
-            arrays.insert(*fid, batch.column(i).clone());
-        }
+                        let batch = storage.gather_row_window_with_context(
+                            &logical_fields,
+                            chunk,
+                            GatherNullPolicy::IncludeNulls,
+                            ctx.as_mut(),
+                        )?;
 
-        if has_row_id {
-            let rid_values: Vec<i64> = chunk.iter().map(|row_id| *row_id as i64).collect();
-            let rid_array: ArrayRef = Arc::new(Int64Array::from(rid_values));
-            arrays.insert(ROW_ID_FIELD_ID, rid_array);
-        }
+                        let mut arrays: NumericArrayMap = FxHashMap::default();
+                        for (i, fid) in physical_fields.iter().enumerate() {
+                            arrays.insert(*fid, batch.column(i).clone());
+                        }
 
-        let left_vals = ScalarEvaluator::evaluate_batch(left, chunk.len(), &arrays)?;
-        let right_vals = ScalarEvaluator::evaluate_batch(right, chunk.len(), &arrays)?;
+                        if has_row_id {
+                            let rid_values: Vec<i64> =
+                                chunk.iter().map(|row_id| *row_id as i64).collect();
+                            let rid_array: ArrayRef = Arc::new(Int64Array::from(rid_values));
+                            arrays.insert(ROW_ID_FIELD_ID, rid_array);
+                        }
 
-        let cmp_array = compute_compare(&left_vals, op, &right_vals)?;
-        let cmp = cmp_array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| Error::Internal("compare kernel did not return booleans".into()))?;
+                        let left_vals =
+                            ScalarEvaluator::evaluate_batch(left, chunk.len(), &arrays)?;
+                        let right_vals =
+                            ScalarEvaluator::evaluate_batch(right, chunk.len(), &arrays)?;
 
-        for (idx, row_id) in chunk.iter().enumerate() {
-            if !left_vals.is_null(idx) && !right_vals.is_null(idx) {
-                determined.add(*row_id);
-            }
-            if cmp.is_null(idx) {
-                continue;
-            }
-            if cmp.value(idx) {
-                matched.add(*row_id);
-            }
-        }
-    }
+                        let cmp_array = compute_compare(&left_vals, op, &right_vals)?;
+                        let cmp = cmp_array
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .ok_or_else(|| {
+                                Error::Internal("compare kernel did not return booleans".into())
+                            })?;
+
+                        for (idx, row_id) in chunk.iter().enumerate() {
+                            if !left_vals.is_null(idx) && !right_vals.is_null(idx) {
+                                determined.add(*row_id);
+                            }
+                            if cmp.is_null(idx) {
+                                continue;
+                            }
+                            if cmp.value(idx) {
+                                matched.add(*row_id);
+                            }
+                        }
+
+                        Ok((matched, determined, ctx))
+                    },
+                )
+                .try_reduce(
+                    || (Treemap::new(), Treemap::new(), None),
+                    |a, b| {
+                        let (mut am, mut ad, actx) = a;
+                        let (bm, bd, _bctx) = b;
+                        am |= bm;
+                        ad |= bd;
+                        Ok((am, ad, actx))
+                    },
+                )
+        })?;
 
     Ok((matched, determined))
 }
@@ -910,4 +965,46 @@ where
         Some(false) => Ok((Treemap::new(), rows)),
         None => Ok((Treemap::new(), Treemap::new())),
     }
+}
+
+fn simple_compare_filter(
+    left: &ScalarExpr<FieldId>,
+    op: CompareOp,
+    right: &ScalarExpr<FieldId>,
+) -> Option<OwnedFilter> {
+    match (left, right) {
+        (ScalarExpr::Column(field_id), ScalarExpr::Literal(lit)) => {
+            compare_op_to_owned(*field_id, op, lit)
+        }
+        (ScalarExpr::Literal(lit), ScalarExpr::Column(field_id)) => {
+            let flipped = match op {
+                CompareOp::Eq => Some(CompareOp::Eq),
+                CompareOp::NotEq => None,
+                CompareOp::Lt => Some(CompareOp::Gt),
+                CompareOp::LtEq => Some(CompareOp::GtEq),
+                CompareOp::Gt => Some(CompareOp::Lt),
+                CompareOp::GtEq => Some(CompareOp::LtEq),
+            }?;
+            compare_op_to_owned(*field_id, flipped, lit)
+        }
+        _ => None,
+    }
+}
+
+fn compare_op_to_owned(field_id: FieldId, op: CompareOp, literal: &Literal) -> Option<OwnedFilter> {
+    if matches!(literal, Literal::Null) {
+        // Null comparisons propagate null, so fall back to row-wise evaluation.
+        return None;
+    }
+
+    let op = match op {
+        CompareOp::Eq => OwnedOperator::Equals(literal.clone()),
+        CompareOp::NotEq => return None,
+        CompareOp::Lt => OwnedOperator::LessThan(literal.clone()),
+        CompareOp::LtEq => OwnedOperator::LessThanOrEquals(literal.clone()),
+        CompareOp::Gt => OwnedOperator::GreaterThan(literal.clone()),
+        CompareOp::GtEq => OwnedOperator::GreaterThanOrEquals(literal.clone()),
+    };
+
+    Some(OwnedFilter { field_id, op })
 }

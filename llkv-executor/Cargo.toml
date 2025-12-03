@@ -31,6 +31,7 @@ llkv-result.workspace = true
 llkv-scan.workspace = true
 llkv-storage.workspace = true
 llkv-table.workspace = true
+llkv-threading.workspace = true
 llkv-types.workspace = true
 rand.workspace = true
 rayon.workspace = true
