@@ -1,10 +1,13 @@
-use arrow::array::{Array, ArrayRef, Scalar, new_null_array};
+use arrow::array::{Array, ArrayRef, Date32Array, IntervalMonthDayNanoArray, Scalar, new_null_array};
 use arrow::compute::kernels::cmp;
 use arrow::compute::{cast, kernels::numeric, nullif};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, IntervalMonthDayNanoType};
 use llkv_expr::expr::{BinaryOp, CompareOp};
 use llkv_result::Error;
+use llkv_types::IntervalValue;
 use std::sync::Arc;
+
+use crate::date::{add_interval_to_date32, subtract_interval_from_date32};
 
 fn numeric_priority(dt: &DataType) -> Option<Numeric> {
     match dt {
@@ -39,7 +42,63 @@ fn coerce_decimals(lhs: (u8, i8), rhs: (u8, i8)) -> DataType {
     DataType::Decimal128(precision, scale)
 }
 
+fn compute_date_interval_op(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+    op: BinaryOp,
+) -> Result<Option<ArrayRef>, Error> {
+    let (date_arr, interval_arr, swap) = match (lhs.data_type(), rhs.data_type()) {
+        (DataType::Date32, DataType::Interval(_)) => (lhs, rhs, false),
+        (DataType::Interval(_), DataType::Date32) => (rhs, lhs, true),
+        _ => return Ok(None),
+    };
+
+    let dates = date_arr.as_any().downcast_ref::<Date32Array>().unwrap();
+    let intervals = interval_arr
+        .as_any()
+        .downcast_ref::<IntervalMonthDayNanoArray>()
+        .unwrap();
+
+    let len = dates.len();
+    let mut result_builder = arrow::array::Date32Builder::with_capacity(len);
+
+    for i in 0..len {
+        if dates.is_null(i) || intervals.is_null(i) {
+            result_builder.append_null();
+            continue;
+        }
+
+        let date_val = dates.value(i);
+        let interval_val = intervals.value(i);
+        let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(interval_val);
+        let interval = IntervalValue::new(months, days, nanos);
+
+        let res = match op {
+            BinaryOp::Add => add_interval_to_date32(date_val, interval),
+            BinaryOp::Subtract => {
+                if swap {
+                    return Err(Error::Internal("Cannot subtract Date from Interval".into()));
+                } else {
+                    subtract_interval_from_date32(date_val, interval)
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        match res {
+            Ok(val) => result_builder.append_value(val),
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(Some(Arc::new(result_builder.finish())))
+}
+
 pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<ArrayRef, Error> {
+    if let Some(result) = compute_date_interval_op(lhs, rhs, op)? {
+        return Ok(result);
+    }
+
     // Coerce inputs to common type
     let (lhs_arr, rhs_arr) = coerce_types(lhs, rhs, op)?;
 
@@ -138,6 +197,9 @@ pub fn get_common_type(lhs_type: &DataType, rhs_type: &DataType) -> DataType {
             | DataType::UInt64 => coerce_decimals((*p, *s), (38u8, 0)),
             _ => DataType::Float64,
         },
+        (DataType::Date32, DataType::Interval(_)) | (DataType::Interval(_), DataType::Date32) => {
+            DataType::Date32
+        }
         _ => match (numeric_priority(lhs_type), numeric_priority(rhs_type)) {
             (Some(Numeric::F64), _) | (_, Some(Numeric::F64)) => DataType::Float64,
             (Some(Numeric::F32), _) | (_, Some(Numeric::F32)) => DataType::Float64,
