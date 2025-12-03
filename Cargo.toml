@@ -37,7 +37,7 @@ publish = true
 [workspace.dependencies]
 # Some crates are only used in debug builds or examples, but are listed
 # here to keep versions consistent across the workspace.
-arrow = { version = "57.0.0", default-features = false, features = ["prettyprint", "ipc"] }
+arrow = { version = "57.1.0", default-features = false, features = ["prettyprint", "ipc"] }
 arrow-array = { version = "57.0.0", default-features = false }
 arrow-buffer = { version = "57.1.0", default-features = false }
 arrow-ord = { version = "57.0.0", default-features = false }
