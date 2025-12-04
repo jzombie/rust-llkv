@@ -453,7 +453,7 @@ where
             || self.ir.f64_r.is_some()
             || self.ir.f32_r.is_some()
             || self.ir.bool_r.is_some();
-        
+
         // Pass ranges to options so the store can use them for pruning
         self.opts.ranges = self.ir;
 

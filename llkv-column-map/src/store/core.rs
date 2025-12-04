@@ -1988,7 +1988,7 @@ where
                 let db = by_pk.get(&metas[k].chunk_pk).ok_or(Error::NotFound)?;
                 data_parts.push(deserialize_array(db.clone())?);
                 let rb = by_pk.get(&metas_rid[k].chunk_pk).ok_or(Error::NotFound)?;
-                                              rid_parts.push(deserialize_array(rb.clone())?);
+                rid_parts.push(deserialize_array(rb.clone())?);
             }
             let merged_data = concat_many(data_parts.iter().collect())?;
             let merged_rid_any = concat_many(rid_parts.iter().collect())?;

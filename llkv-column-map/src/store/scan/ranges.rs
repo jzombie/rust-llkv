@@ -40,5 +40,3 @@ pub(crate) fn upper_idx_by<T: Ord>(
     }
     lo
 }
-
-

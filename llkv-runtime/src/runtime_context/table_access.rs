@@ -10,8 +10,7 @@ use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_executor::{
-    ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorTable,
-    TableStorageAdapter,
+    ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorTable, TableStorageAdapter,
 };
 use llkv_plan::schema::{PlanColumn as ExecutorColumn, PlanSchema as ExecutorSchema};
 use llkv_plan::translation;

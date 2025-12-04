@@ -5,11 +5,11 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-pub mod scan;
-pub mod table;
-pub mod ranges;
 pub mod projection;
+pub mod ranges;
+pub mod scan;
 pub mod sort;
+pub mod table;
 
 /// A physical plan represents an executable query plan.
 ///

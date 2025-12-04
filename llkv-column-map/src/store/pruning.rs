@@ -3,8 +3,8 @@
 //! This module contains structures and functions for pruning chunks based on
 //! metadata statistics (min/max values) and query predicates.
 
-use std::ops::Bound;
 use arrow::array::ArrayRef;
+use std::ops::Bound;
 
 /// Statistics for a chunk of data, used for pruning.
 #[derive(Debug, Clone, Copy)]
@@ -100,100 +100,100 @@ impl IntRanges {
         // Note: We check specific type ranges below. If a specific type range is set,
         // we assume the chunk min/max are of that type (cast to u64).
 
-        if let Some((lb, ub)) = self.u64_r {
-            if !check_overlap(lb, ub, chunk_min, chunk_max) {
-                return false;
-            }
+        if let Some((lb, ub)) = self.u64_r
+            && !check_overlap(lb, ub, chunk_min, chunk_max)
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.i64_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.i64_r
+            && !check_overlap(
                 map_bound(lb, i64_to_u64_sortable),
                 map_bound(ub, i64_to_u64_sortable),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.u32_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.u32_r
+            && !check_overlap(
                 map_bound(lb, |v| v as u64),
                 map_bound(ub, |v| v as u64),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.i32_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.i32_r
+            && !check_overlap(
                 map_bound(lb, i32_to_u64_sortable),
                 map_bound(ub, i32_to_u64_sortable),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.u16_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.u16_r
+            && !check_overlap(
                 map_bound(lb, |v| v as u64),
                 map_bound(ub, |v| v as u64),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.i16_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.i16_r
+            && !check_overlap(
                 map_bound(lb, i16_to_u64_sortable),
                 map_bound(ub, i16_to_u64_sortable),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.u8_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.u8_r
+            && !check_overlap(
                 map_bound(lb, |v| v as u64),
                 map_bound(ub, |v| v as u64),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.i8_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.i8_r
+            && !check_overlap(
                 map_bound(lb, i8_to_u64_sortable),
                 map_bound(ub, i8_to_u64_sortable),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.f64_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.f64_r
+            && !check_overlap(
                 map_bound(lb, f64_to_u64_sortable),
                 map_bound(ub, f64_to_u64_sortable),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-        if let Some((lb, ub)) = self.f32_r {
-            if !check_overlap(
+        if let Some((lb, ub)) = self.f32_r
+            && !check_overlap(
                 map_bound(lb, f32_to_u64_sortable),
                 map_bound(ub, f32_to_u64_sortable),
                 chunk_min,
                 chunk_max,
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
 
         true

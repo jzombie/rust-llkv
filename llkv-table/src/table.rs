@@ -1234,11 +1234,15 @@ where
         <T as ArrowPrimitiveType>::Native: PartialOrd + Copy + FromLiteral + PredicateValue,
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
-        let row_ids =
-            <T as FilterPrimitive>::run_nullable_filter(self.store(), lfid, Default::default(), |v| match v {
+        let row_ids = <T as FilterPrimitive>::run_nullable_filter(
+            self.store(),
+            lfid,
+            Default::default(),
+            |v| match v {
                 Some(val) => predicate.matches(PredicateValue::borrowed(&val)),
                 None => false,
-            })?;
+            },
+        )?;
         Ok(Treemap::from_iter(row_ids))
     }
 

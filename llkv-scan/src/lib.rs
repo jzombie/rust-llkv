@@ -118,7 +118,7 @@ where
             order: self.order,
             row_id_filter: self.row_id_filter.clone(),
             include_row_ids: self.include_row_ids,
-            ranges: self.ranges.clone(),
+            ranges: self.ranges,
             driving_column: self.driving_column,
         }
     }

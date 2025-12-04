@@ -2,16 +2,6 @@
 //!
 //! This crate provides the query execution layer that sits between the query planner
 //! (`llkv-plan`) and the storage layer (`llkv-table`, `llkv-column-map`).
-//!
-//! # Module Organization
-//!
-//! - [`translation`]: Expression and projection translation utilities
-//! - [`types`]: Core type definitions (tables, schemas, columns)  
-//! - [`insert`]: INSERT operation support (value coercion)
-//!
-//! The [`QueryExecutor`] and [`SelectExecution`] implementations are defined inline
-//! in this module for now, but should be extracted to a dedicated `query` module
-//! in a future refactoring.
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal128Builder,
@@ -73,8 +63,8 @@ pub mod insert;
 pub mod scan;
 pub mod types;
 
-use llkv_plan::planner::PhysicalPlanner;
 use crate::types::provider::TableProviderAdapter;
+use llkv_plan::planner::PhysicalPlanner;
 
 // ============================================================================
 // Type Aliases and Re-exports
@@ -83,8 +73,6 @@ use crate::types::provider::TableProviderAdapter;
 /// Result type for executor operations.
 pub type ExecutorResult<T> = Result<T, Error>;
 
-use llkv_plan::translation::schema::infer_computed_data_type;
-use llkv_plan::translation::expression;
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -96,6 +84,8 @@ use llkv_compute::scalar::interval::{
     compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
 };
 pub use llkv_compute::time::current_time_micros;
+use llkv_plan::translation::expression;
+use llkv_plan::translation::schema::infer_computed_data_type;
 pub use llkv_plan::translation::{
     build_projected_columns, build_wildcard_projections, full_table_scan_filter,
     resolve_field_id_from_schema, schema_for_projections, translate_predicate,
@@ -4085,148 +4075,18 @@ where
         }
 
         // Try to use PhysicalPlanner
-        let adapter = Arc::new(TableProviderAdapter::new(self.provider.clone())) as Arc<dyn llkv_plan::physical::table::TableProvider<P>>;
+        let adapter = Arc::new(TableProviderAdapter::new(self.provider.clone()))
+            as Arc<dyn llkv_plan::physical::table::TableProvider<P>>;
         let planner = PhysicalPlanner::new(adapter);
-        match planner.create_physical_plan(&plan, row_filter.clone()) {
-            Ok(physical_plan) => {
-                return Ok(SelectExecution::from_physical_plan(
-                    display_name,
-                    physical_plan,
-                    plan.distinct,
-                    Vec::new(), // PhysicalPlanner handles sorting
-                ));
-            }
-            Err(e) => {
-                return Err(Error::Internal(format!("Physical planner failed: {}", e)));
-            }
-        }
-
-        /*
-        let table_ref = table.as_ref();
-        let constant_filter = plan
-            .filter
-            .as_ref()
-            .and_then(|filter| evaluate_constant_predicate(&filter.predicate));
-        let projections = if plan.projections.is_empty() {
-            build_wildcard_projections(table_ref)
-        } else {
-            build_projected_columns(table_ref, &plan.projections)?
+        return match planner.create_physical_plan(&plan, row_filter.clone()) {
+            Ok(physical_plan) => Ok(SelectExecution::from_physical_plan(
+                display_name,
+                physical_plan,
+                plan.distinct,
+                Vec::new(), // PhysicalPlanner handles sorting
+            )),
+            Err(e) => Err(Error::Internal(format!("Physical planner failed: {}", e))),
         };
-        let schema = schema_for_projections(table_ref, &projections)?;
-
-        if let Some(result) = constant_filter {
-            match result {
-                Some(true) => {
-                    // Treat as full table scan by clearing the filter below.
-                }
-                Some(false) | None => {
-                    let batch = RecordBatch::new_empty(Arc::clone(&schema));
-                    return Ok(SelectExecution::new_single_batch(
-                        display_name,
-                        schema,
-                        batch,
-                    ));
-                }
-            }
-        }
-
-        let (mut filter_expr, mut full_table_scan) = match &plan.filter {
-            Some(filter_wrapper) => (
-                expression::translate_predicate(
-                    filter_wrapper.predicate.clone(),
-                    table_ref.schema.as_ref(),
-                    |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
-                )?,
-                false,
-            ),
-            None => {
-                let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
-                    Error::InvalidArgumentError(
-                        "table has no columns; cannot perform wildcard scan".into(),
-                    )
-                })?;
-                (
-                    expression::full_table_scan_filter(field_id),
-                    true,
-                )
-            }
-        };
-
-        if matches!(constant_filter, Some(Some(true))) {
-            let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
-                Error::InvalidArgumentError(
-                    "table has no columns; cannot perform wildcard scan".into(),
-                )
-            })?;
-            filter_expr = expression::full_table_scan_filter(field_id);
-            full_table_scan = true;
-        }
-
-        let expanded_order = expand_order_targets(&plan.order_by, &projections)?;
-
-        let mut physical_order: Option<ScanOrderSpec> = None;
-
-        if let Some(first) = expanded_order.first() {
-            match &first.target {
-                OrderTarget::Column(name) => {
-                    if table_ref.schema.column_by_name(name).is_some() {
-                        physical_order = Some(resolve_scan_order(table_ref, &projections, first)?);
-                    }
-                }
-                OrderTarget::Index(position) => match projections.get(*position) {
-                    Some(ScanProjection::Column(_)) => {
-                        physical_order = Some(resolve_scan_order(table_ref, &projections, first)?);
-                    }
-                    Some(ScanProjection::Computed { .. }) => {}
-                    None => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "ORDER BY position {} is out of range",
-                            position + 1
-                        )));
-                    }
-                },
-                OrderTarget::All => {}
-            }
-        }
-
-        let options = if let Some(order_spec) = physical_order {
-            if row_filter.is_some() {
-                tracing::debug!("Applying MVCC row filter with ORDER BY");
-            }
-            ScanStreamOptions {
-                include_nulls: true,
-                order: Some(order_spec),
-                row_id_filter: row_filter.clone(),
-                include_row_ids: true,
-                ranges: None,
-                driving_column: None,
-            }
-        } else {
-            if row_filter.is_some() {
-                tracing::debug!("Applying MVCC row filter");
-            }
-            ScanStreamOptions {
-                include_nulls: true,
-                order: None,
-                row_id_filter: row_filter.clone(),
-                include_row_ids: true,
-                ranges: None,
-                driving_column: None,
-            }
-        };
-
-        Ok(SelectExecution::new_projection(
-            display_name,
-            schema,
-            table,
-            projections,
-            filter_expr,
-            options,
-            full_table_scan,
-            expanded_order,
-            plan.distinct,
-        ))
-        */
     }
 
     fn execute_projection_with_subqueries(
@@ -4253,7 +4113,11 @@ where
             )
         } else {
             (
-                build_projected_columns(&table_ref.schema, table_ref.table_id(), &plan.projections)?,
+                build_projected_columns(
+                    &table_ref.schema,
+                    table_ref.table_id(),
+                    &plan.projections,
+                )?,
                 plan.projections.clone(),
             )
         };
@@ -6299,37 +6163,38 @@ where
                     }
                 }
                 AggregateCall::Sum { expr, distinct } => {
-                    let (projection_index, data_type, field_id) =
-                        if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "unknown column '{}' in aggregate",
-                                    col_name
-                                ))
-                            })?;
-                            let projection_index = get_or_insert_column_projection(
-                                &mut projections,
-                                &mut column_projection_cache,
-                                table_ref,
-                                col,
-                            );
-                            let data_type = col.data_type.clone();
-                            (projection_index, data_type, col.field_id)
-                        } else {
-                            let (projection_index, inferred_type) = ensure_computed_projection(
-                                expr,
-                                table_ref,
-                                &mut projections,
-                                &mut computed_projection_cache,
-                                &mut computed_alias_counter,
-                            )?;
-                            let field_id = u32::try_from(projection_index).map_err(|_| {
-                                Error::InvalidArgumentError(
-                                    "aggregate projection index exceeds supported range".into(),
-                                )
-                            })?;
-                            (projection_index, inferred_type, field_id)
-                        };
+                    let (projection_index, data_type, field_id) = if let Some(col_name) =
+                        try_extract_simple_column(expr)
+                    {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        let data_type = col.data_type.clone();
+                        (projection_index, data_type, col.field_id)
+                    } else {
+                        let (projection_index, inferred_type) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        (projection_index, inferred_type, field_id)
+                    };
                     let normalized_type = Self::validate_aggregate_type(
                         Some(data_type.clone()),
                         "SUM",
@@ -6346,37 +6211,38 @@ where
                     spec_to_projection.push(Some(projection_index));
                 }
                 AggregateCall::Total { expr, distinct } => {
-                    let (projection_index, data_type, field_id) =
-                        if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "unknown column '{}' in aggregate",
-                                    col_name
-                                ))
-                            })?;
-                            let projection_index = get_or_insert_column_projection(
-                                &mut projections,
-                                &mut column_projection_cache,
-                                table_ref,
-                                col,
-                            );
-                            let data_type = col.data_type.clone();
-                            (projection_index, data_type, col.field_id)
-                        } else {
-                            let (projection_index, inferred_type) = ensure_computed_projection(
-                                expr,
-                                table_ref,
-                                &mut projections,
-                                &mut computed_projection_cache,
-                                &mut computed_alias_counter,
-                            )?;
-                            let field_id = u32::try_from(projection_index).map_err(|_| {
-                                Error::InvalidArgumentError(
-                                    "aggregate projection index exceeds supported range".into(),
-                                )
-                            })?;
-                            (projection_index, inferred_type, field_id)
-                        };
+                    let (projection_index, data_type, field_id) = if let Some(col_name) =
+                        try_extract_simple_column(expr)
+                    {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        let data_type = col.data_type.clone();
+                        (projection_index, data_type, col.field_id)
+                    } else {
+                        let (projection_index, inferred_type) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        (projection_index, inferred_type, field_id)
+                    };
                     let normalized_type = Self::validate_aggregate_type(
                         Some(data_type.clone()),
                         "TOTAL",
@@ -6393,42 +6259,43 @@ where
                     spec_to_projection.push(Some(projection_index));
                 }
                 AggregateCall::Avg { expr, distinct } => {
-                    let (projection_index, data_type, field_id) =
-                        if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "unknown column '{}' in aggregate",
-                                    col_name
-                                ))
-                            })?;
-                            let projection_index = get_or_insert_column_projection(
-                                &mut projections,
-                                &mut column_projection_cache,
-                                table_ref,
-                                col,
-                            );
-                            let data_type = col.data_type.clone();
-                            (projection_index, data_type, col.field_id)
-                        } else {
-                            let (projection_index, inferred_type) = ensure_computed_projection(
-                                expr,
-                                table_ref,
-                                &mut projections,
-                                &mut computed_projection_cache,
-                                &mut computed_alias_counter,
-                            )?;
-                            tracing::debug!(
-                                "AVG aggregate expr={:?} inferred_type={:?}",
-                                expr,
-                                inferred_type
-                            );
-                            let field_id = u32::try_from(projection_index).map_err(|_| {
-                                Error::InvalidArgumentError(
-                                    "aggregate projection index exceeds supported range".into(),
-                                )
-                            })?;
-                            (projection_index, inferred_type, field_id)
-                        };
+                    let (projection_index, data_type, field_id) = if let Some(col_name) =
+                        try_extract_simple_column(expr)
+                    {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        let data_type = col.data_type.clone();
+                        (projection_index, data_type, col.field_id)
+                    } else {
+                        let (projection_index, inferred_type) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        tracing::debug!(
+                            "AVG aggregate expr={:?} inferred_type={:?}",
+                            expr,
+                            inferred_type
+                        );
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        (projection_index, inferred_type, field_id)
+                    };
                     let normalized_type = Self::validate_aggregate_type(
                         Some(data_type.clone()),
                         "AVG",
@@ -6445,37 +6312,38 @@ where
                     spec_to_projection.push(Some(projection_index));
                 }
                 AggregateCall::Min(expr) => {
-                    let (projection_index, data_type, field_id) =
-                        if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "unknown column '{}' in aggregate",
-                                    col_name
-                                ))
-                            })?;
-                            let projection_index = get_or_insert_column_projection(
-                                &mut projections,
-                                &mut column_projection_cache,
-                                table_ref,
-                                col,
-                            );
-                            let data_type = col.data_type.clone();
-                            (projection_index, data_type, col.field_id)
-                        } else {
-                            let (projection_index, inferred_type) = ensure_computed_projection(
-                                expr,
-                                table_ref,
-                                &mut projections,
-                                &mut computed_projection_cache,
-                                &mut computed_alias_counter,
-                            )?;
-                            let field_id = u32::try_from(projection_index).map_err(|_| {
-                                Error::InvalidArgumentError(
-                                    "aggregate projection index exceeds supported range".into(),
-                                )
-                            })?;
-                            (projection_index, inferred_type, field_id)
-                        };
+                    let (projection_index, data_type, field_id) = if let Some(col_name) =
+                        try_extract_simple_column(expr)
+                    {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        let data_type = col.data_type.clone();
+                        (projection_index, data_type, col.field_id)
+                    } else {
+                        let (projection_index, inferred_type) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        (projection_index, inferred_type, field_id)
+                    };
                     let normalized_type = Self::validate_aggregate_type(
                         Some(data_type.clone()),
                         "MIN",
@@ -6491,37 +6359,38 @@ where
                     spec_to_projection.push(Some(projection_index));
                 }
                 AggregateCall::Max(expr) => {
-                    let (projection_index, data_type, field_id) =
-                        if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
-                                Error::InvalidArgumentError(format!(
-                                    "unknown column '{}' in aggregate",
-                                    col_name
-                                ))
-                            })?;
-                            let projection_index = get_or_insert_column_projection(
-                                &mut projections,
-                                &mut column_projection_cache,
-                                table_ref,
-                                col,
-                            );
-                            let data_type = col.data_type.clone();
-                            (projection_index, data_type, col.field_id)
-                        } else {
-                            let (projection_index, inferred_type) = ensure_computed_projection(
-                                expr,
-                                table_ref,
-                                &mut projections,
-                                &mut computed_projection_cache,
-                                &mut computed_alias_counter,
-                            )?;
-                            let field_id = u32::try_from(projection_index).map_err(|_| {
-                                Error::InvalidArgumentError(
-                                    "aggregate projection index exceeds supported range".into(),
-                                )
-                            })?;
-                            (projection_index, inferred_type, field_id)
-                        };
+                    let (projection_index, data_type, field_id) = if let Some(col_name) =
+                        try_extract_simple_column(expr)
+                    {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
+                            Error::InvalidArgumentError(format!(
+                                "unknown column '{}' in aggregate",
+                                col_name
+                            ))
+                        })?;
+                        let projection_index = get_or_insert_column_projection(
+                            &mut projections,
+                            &mut column_projection_cache,
+                            table_ref,
+                            col,
+                        );
+                        let data_type = col.data_type.clone();
+                        (projection_index, data_type, col.field_id)
+                    } else {
+                        let (projection_index, inferred_type) = ensure_computed_projection(
+                            expr,
+                            table_ref,
+                            &mut projections,
+                            &mut computed_projection_cache,
+                            &mut computed_alias_counter,
+                        )?;
+                        let field_id = u32::try_from(projection_index).map_err(|_| {
+                            Error::InvalidArgumentError(
+                                "aggregate projection index exceeds supported range".into(),
+                            )
+                        })?;
+                        (projection_index, inferred_type, field_id)
+                    };
                     let normalized_type = Self::validate_aggregate_type(
                         Some(data_type.clone()),
                         "MAX",
@@ -6632,11 +6501,11 @@ where
         }
 
         let filter_expr = match filter {
-            Some(expr) => expression::translate_predicate(
-                expr.clone(),
-                table_ref.schema.as_ref(),
-                |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
-            )?,
+            Some(expr) => {
+                expression::translate_predicate(expr.clone(), table_ref.schema.as_ref(), |name| {
+                    Error::InvalidArgumentError(format!("unknown column '{}'", name))
+                })?
+            }
             None => {
                 let field_id = table_ref.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(
@@ -8512,7 +8381,10 @@ impl CrossProductExpressionContext {
         }
 
         Ok(Self {
-            schema: Arc::new(ExecutorSchema { columns, name_to_index: lookup }),
+            schema: Arc::new(ExecutorSchema {
+                columns,
+                name_to_index: lookup,
+            }),
             field_id_to_index,
             numeric_cache: FxHashMap::default(),
             column_cache: FxHashMap::default(),
@@ -8527,7 +8399,9 @@ impl CrossProductExpressionContext {
     }
 
     fn field_id_for_column(&self, name: &str) -> Option<FieldId> {
-        self.schema.column_by_name(name).map(|column| column.field_id)
+        self.schema
+            .column_by_name(name)
+            .map(|column| column.field_id)
     }
 
     fn reset(&mut self) {
@@ -10931,6 +10805,7 @@ where
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum SelectStream<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -11011,7 +10886,11 @@ where
         Self {
             table_name,
             schema,
-            stream: SelectStream::PhysicalPlan { plan, distinct, order_by },
+            stream: SelectStream::PhysicalPlan {
+                plan,
+                distinct,
+                order_by,
+            },
             limit: None,
             offset: None,
         }
@@ -11201,20 +11080,24 @@ where
                 }
                 Ok(())
             }
-            SelectStream::PhysicalPlan { plan, distinct, order_by } => {
+            SelectStream::PhysicalPlan {
+                plan,
+                distinct,
+                order_by,
+            } => {
                 let mut distinct_state = if distinct {
                     Some(DistinctState::default())
                 } else {
                     None
                 };
-                
+
                 let needs_post_sort = !order_by.is_empty();
                 let mut buffered_batches: Vec<RecordBatch> = Vec::new();
 
-                let iterator = plan.execute().map_err(|e| Error::Internal(e))?;
+                let iterator = plan.execute().map_err(Error::Internal)?;
                 for batch_result in iterator {
-                    let mut batch = batch_result.map_err(|e| Error::Internal(e))?;
-                    
+                    let mut batch = batch_result.map_err(Error::Internal)?;
+
                     if let Some(state) = distinct_state.as_mut() {
                         match distinct_filter_batch(batch, state) {
                             Ok(Some(filtered)) => {
@@ -11386,6 +11269,7 @@ fn expand_order_targets(
     Ok(expanded)
 }
 
+#[allow(dead_code)]
 fn resolve_scan_order<P>(
     table: &ExecutorTable<P>,
     projections: &[ScanProjection],

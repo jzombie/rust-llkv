@@ -1,8 +1,8 @@
 use crate::plans::PlanResult;
+use crate::plans::SelectProjection;
 use crate::schema::PlanSchema;
 use crate::translation::expression::translate_scalar;
 use llkv_column_map::store::Projection as StoreProjection;
-use crate::plans::SelectProjection;
 use llkv_scan::ScanProjection;
 use llkv_types::LogicalFieldId;
 use llkv_types::ids::TableId;

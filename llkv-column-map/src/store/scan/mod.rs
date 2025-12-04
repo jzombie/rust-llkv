@@ -213,7 +213,6 @@ where
                             field_id,
                             row_fid,
                             anchor_fid,
-                            opts.nulls_first,
                             opts.ranges,
                             &mut pv,
                         );
@@ -224,7 +223,6 @@ where
                             field_id,
                             row_fid,
                             anchor_fid,
-                            opts.nulls_first,
                             opts.ranges,
                             visitor,
                         );
@@ -317,7 +315,10 @@ where
                     return Err(Error::NotFound);
                 }
 
-                if opts.ranges.matches(meta_val.min_val_u64, meta_val.max_val_u64) {
+                if opts
+                    .ranges
+                    .matches(meta_val.min_val_u64, meta_val.max_val_u64)
+                {
                     metas_val.push(meta_val);
                     metas_rid.push(meta_rid);
                 }

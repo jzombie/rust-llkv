@@ -350,7 +350,6 @@ pub fn unsorted_with_row_ids_and_nulls_visit<P: Pager<Blob = EntryHandle>>(
     value_fid: LogicalFieldId,
     rowid_fid: LogicalFieldId,
     anchor_rowid_fid: LogicalFieldId,
-    _nulls_first: bool, // Anchor order interleave; nulls_first ignored for unsorted
     ranges: crate::store::scan::ranges::IntRanges,
     visitor: &mut dyn PrimitiveWithRowIdsAndNullsVisitor,
 ) -> Result<()> {

@@ -18,7 +18,7 @@ use rand::{SeedableRng, rngs::StdRng};
 
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
+    PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions, ranges::IntRanges,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_storage::pager::MemPager;
@@ -112,6 +112,7 @@ fn bench_scan_builder(c: &mut Criterion) {
                         include_nulls: false,
                         nulls_first: false,
                         anchor_row_id_field: None,
+                        ranges: IntRanges::default(),
                     })
                     .run(&mut v)
                     .unwrap();
@@ -154,6 +155,7 @@ fn bench_scan_builder(c: &mut Criterion) {
                         include_nulls: false,
                         nulls_first: false,
                         anchor_row_id_field: None,
+                        ranges: IntRanges::default(),
                     })
                     .with_range::<u64, _>(100_000..=900_000)
                     .run(&mut v)
@@ -204,6 +206,7 @@ fn bench_scan_builder(c: &mut Criterion) {
                         include_nulls: false,
                         nulls_first: false,
                         anchor_row_id_field: None,
+                        ranges: IntRanges::default(),
                     })
                     .with_range::<u64, _>(100_000..=900_000)
                     .run(&mut v)

@@ -349,7 +349,12 @@ where
         Ok(())
     };
 
-    storage.stream_row_ids(ROW_STREAM_CHUNK_SIZE, plan.ranges, plan.driving_column, &mut process_chunk)?;
+    storage.stream_row_ids(
+        ROW_STREAM_CHUNK_SIZE,
+        plan.ranges,
+        plan.driving_column,
+        &mut process_chunk,
+    )?;
 
     if !emitted_rows {
         let total_rows = storage.total_rows()?;

@@ -1,6 +1,6 @@
+use crate::plans::PlanValue;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use llkv_types::FieldId;
-use crate::plans::PlanValue;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -35,7 +35,9 @@ impl PlanSchema {
     }
 
     pub fn column_by_name(&self, name: &str) -> Option<&PlanColumn> {
-        self.name_to_index.get(&name.to_ascii_lowercase()).map(|&i| &self.columns[i])
+        self.name_to_index
+            .get(&name.to_ascii_lowercase())
+            .map(|&i| &self.columns[i])
     }
 
     pub fn column_by_field_id(&self, field_id: FieldId) -> Option<&PlanColumn> {
@@ -47,9 +49,11 @@ impl PlanSchema {
     }
 
     pub fn to_arrow_schema(&self) -> SchemaRef {
-        let fields: Vec<Field> = self.columns.iter().map(|c| {
-            Field::new(&c.name, c.data_type.clone(), c.is_nullable)
-        }).collect();
+        let fields: Vec<Field> = self
+            .columns
+            .iter()
+            .map(|c| Field::new(&c.name, c.data_type.clone(), c.is_nullable))
+            .collect();
         Arc::new(Schema::new(fields))
     }
 }

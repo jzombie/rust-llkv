@@ -1621,7 +1621,9 @@ where
     // Prune chunks that don't overlap with the requested ranges
     let (metas_val, metas_rid) = if opts.with_row_ids {
         if metas_val.len() != metas_rid.len() {
-            return Err(Error::Internal("chunk count mismatch before pruning".into()));
+            return Err(Error::Internal(
+                "chunk count mismatch before pruning".into(),
+            ));
         }
         let mut new_val = Vec::with_capacity(metas_val.len());
         let mut new_rid = Vec::with_capacity(metas_rid.len());

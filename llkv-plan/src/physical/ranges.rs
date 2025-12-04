@@ -1,11 +1,14 @@
-use llkv_expr::expr::{Expr, Filter, Operator};
 use arrow::datatypes::DataType;
-use llkv_column_map::store::scan::ranges::IntRanges;
 use llkv_column_map::store::RangeKey;
+use llkv_column_map::store::scan::ranges::IntRanges;
+use llkv_expr::expr::{Expr, Filter, Operator};
 use std::ops::Bound;
-use llkv_expr::literal::Literal;
 
-pub fn extract_ranges(expr: &Expr<'static, String>, target_col_name: &str, target_type: &DataType) -> Option<IntRanges> {
+pub fn extract_ranges(
+    expr: &Expr<'static, String>,
+    target_col_name: &str,
+    target_type: &DataType,
+) -> Option<IntRanges> {
     match expr {
         Expr::Pred(Filter { field_id, op }) if field_id == target_col_name => {
             let mut ranges = IntRanges::default();
@@ -25,27 +28,28 @@ pub fn extract_ranges(expr: &Expr<'static, String>, target_col_name: &str, targe
             }
         }
         Expr::And(exprs) => {
-             let mut combined_ranges: Option<IntRanges> = None;
-             for e in exprs {
-                 let r = extract_ranges(e, target_col_name, target_type);
-                 match (combined_ranges, r) {
-                     (Some(cr), Some(_nr)) => {
-                         // TODO: Implement intersection
-                         combined_ranges = Some(cr);
-                     }
-                     (None, Some(nr)) => combined_ranges = Some(nr),
-                     (Some(cr), None) => combined_ranges = Some(cr),
-                     (None, None) => {}
-                 }
-             }
-             combined_ranges
+            let mut combined_ranges: Option<IntRanges> = None;
+            for e in exprs {
+                let r = extract_ranges(e, target_col_name, target_type);
+                match (combined_ranges, r) {
+                    (Some(cr), Some(_nr)) => {
+                        // TODO: Implement intersection
+                        combined_ranges = Some(cr);
+                    }
+                    (None, Some(nr)) => combined_ranges = Some(nr),
+                    (Some(cr), None) => combined_ranges = Some(cr),
+                    (None, None) => {}
+                }
+            }
+            combined_ranges
         }
         _ => None,
     }
 }
 
 fn map_bound<T, U, F>(bound: &Bound<T>, f: F) -> Option<Bound<U>>
-where F: Fn(&T) -> Option<U>
+where
+    F: Fn(&T) -> Option<U>,
 {
     match bound {
         Bound::Included(v) => f(v).map(Bound::Included),

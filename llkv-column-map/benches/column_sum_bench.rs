@@ -22,7 +22,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::ColumnStore;
-use llkv_column_map::store::scan::ScanOptions;
+use llkv_column_map::store::scan::{ScanOptions, ranges::IntRanges};
 use llkv_storage::pager::MemPager;
 use llkv_types::{LogicalFieldId, RowId};
 
@@ -101,6 +101,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
                         include_nulls: false,
                         nulls_first: false,
                         anchor_row_id_field: None,
+                        ranges: IntRanges::default(),
                     },
                     &mut v,
                 )
@@ -166,6 +167,7 @@ fn bench_column_store_sum(c: &mut Criterion) {
                         include_nulls: false,
                         nulls_first: false,
                         anchor_row_id_field: None,
+                        ranges: IntRanges::default(),
                     },
                     &mut v,
                 )
@@ -268,6 +270,7 @@ fn bench_fragmented_deletes_and_updates(c: &mut Criterion) {
                         include_nulls: false,
                         nulls_first: false,
                         anchor_row_id_field: None,
+                        ranges: IntRanges::default(),
                     },
                     &mut v,
                 )

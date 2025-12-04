@@ -1,14 +1,12 @@
 //! Executor table, schema, and column types.
 
-use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use croaring::Treemap;
 use llkv_plan::PlanValue;
-use llkv_plan::schema::{PlanSchema, PlanColumn};
 use llkv_plan::physical::table::ExecutionTable;
+use llkv_plan::schema::{PlanColumn, PlanSchema};
 use llkv_storage::pager::Pager;
 use llkv_table::types::FieldId;
-use rustc_hash::FxHashMap;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::any::Any;
 use std::fmt;
@@ -18,8 +16,8 @@ use std::sync::{Arc, RwLock};
 use crate::types::StorageTable;
 use llkv_column_map::store::GatherNullPolicy;
 use llkv_expr::Expr;
-use llkv_types::LogicalFieldId;
 use llkv_scan::{ScanProjection, ScanStreamOptions};
+use llkv_types::LogicalFieldId;
 
 /// Executor's view of a table, including schema and metadata.
 ///
@@ -116,7 +114,9 @@ where
         options: ScanStreamOptions<P>,
         callback: &mut dyn FnMut(RecordBatch),
     ) -> Result<(), String> {
-        self.table.scan_stream(projections, predicate, options, callback).map_err(|e| e.to_string())
+        self.table
+            .scan_stream(projections, predicate, options, callback)
+            .map_err(|e| e.to_string())
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -57,8 +57,16 @@ impl ChunkMetadata {
         let min_val_u64 = read_u64_le(bytes, &mut o);
         let max_val_u64 = read_u64_le(bytes, &mut o);
         // Handle backward compatibility: if buffer is too short, default to 0
-        let null_count = if o < bytes.len() { read_u64_le(bytes, &mut o) } else { 0 };
-        let distinct_count = if o < bytes.len() { read_u64_le(bytes, &mut o) } else { 0 };
+        let null_count = if o < bytes.len() {
+            read_u64_le(bytes, &mut o)
+        } else {
+            0
+        };
+        let distinct_count = if o < bytes.len() {
+            read_u64_le(bytes, &mut o)
+        } else {
+            0
+        };
 
         Self {
             chunk_pk,

@@ -1,9 +1,9 @@
 use crate::plans::PlanResult;
 use crate::schema::PlanSchema;
-use llkv_types::FieldId;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_expr::expr::{AggregateCall, Expr as LlkvExpr, Filter, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
+use llkv_types::FieldId;
 use llkv_types::ids::ROW_ID_FIELD_ID;
 
 pub fn full_table_scan_filter(_field_id: FieldId) -> LlkvExpr<'static, FieldId> {
@@ -382,11 +382,7 @@ where
 }
 
 // TODO: Move to `resolvers.rs`
-fn resolve_field_id<F>(
-    schema: &PlanSchema,
-    name: &str,
-    unknown_column: F,
-) -> PlanResult<FieldId>
+fn resolve_field_id<F>(schema: &PlanSchema, name: &str, unknown_column: F) -> PlanResult<FieldId>
 where
     F: Fn(&str) -> Error,
 {

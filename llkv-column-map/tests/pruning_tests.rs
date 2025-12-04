@@ -1,17 +1,17 @@
 use arrow::array::*;
-use llkv_column_map::store::pruning::{IntRanges, RangeKey, compute_chunk_stats};
-use std::ops::Bound;
-use std::sync::Arc;
-use std::collections::HashMap;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use llkv_column_map::store::pruning::{IntRanges, RangeKey, compute_chunk_stats};
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
     PrimitiveWithRowIdsVisitor, ScanBuilder, ScanOptions,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind, ROW_ID_COLUMN_NAME};
-use llkv_storage::pager::{MemPager, InstrumentedPager};
+use llkv_storage::pager::{InstrumentedPager, MemPager};
 use llkv_types::LogicalFieldId;
+use std::collections::HashMap;
+use std::ops::Bound;
+use std::sync::Arc;
 
 #[test]
 fn test_compute_chunk_stats_integers() {
@@ -84,7 +84,11 @@ fn test_pruning_ranges_overlap() {
 fn test_pruning_ranges_floats() {
     let mut ranges = IntRanges::default();
     // Range: [-1.0, 1.0]
-    RangeKey::store(&mut ranges, Bound::Included(-1.0f64), Bound::Included(1.0f64));
+    RangeKey::store(
+        &mut ranges,
+        Bound::Included(-1.0f64),
+        Bound::Included(1.0f64),
+    );
 
     // Helper to convert f64 to sortable u64
     fn f64_to_u64(val: f64) -> u64 {
@@ -128,12 +132,8 @@ fn test_pruning_skips_irrelevant_chunks() {
     // Chunk 1: 0..1000
     // Chunk 2: 2000..3000
     // Chunk 3: 4000..5000
-    
-    let ranges = vec![
-        (0..1000),
-        (2000..3000),
-        (4000..5000),
-    ];
+
+    let ranges = vec![(0..1000), (2000..3000), (4000..5000)];
 
     for range in ranges {
         let _n = range.end - range.start;
@@ -178,10 +178,9 @@ fn test_pruning_skips_irrelevant_chunks() {
         .unwrap();
 
     assert!(!coll.out.is_empty());
-    assert!(coll.out.iter().all(|&x| x >= 2500 && x <= 2600));
+    assert!(coll.out.iter().all(|&x| (2500..=2600).contains(&x)));
 
     let access_count_pruned = stats.snapshot().physical_gets;
-    println!("Access count with pruning target: {}", access_count_pruned);
 
     // Now query for everything [0, 5000]. Should hit all chunks.
     stats.reset();
@@ -194,10 +193,14 @@ fn test_pruning_skips_irrelevant_chunks() {
         .with_range::<u64, _>(0..=5000)
         .run(&mut coll_all)
         .unwrap();
-    
+
     let access_count_all = stats.snapshot().physical_gets;
-    println!("Access count all: {}", access_count_all);
 
     // If pruning works, access_count_pruned should be significantly less than access_count_all.
-    assert!(access_count_pruned < access_count_all, "Pruning did not reduce IO! Pruned: {}, All: {}", access_count_pruned, access_count_all);
+    assert!(
+        access_count_pruned < access_count_all,
+        "Pruning did not reduce IO! Pruned: {}, All: {}",
+        access_count_pruned,
+        access_count_all
+    );
 }

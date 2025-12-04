@@ -2,10 +2,10 @@
 
 use crate::ExecutorResult;
 use crate::types::ExecutorTable;
+use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
-use llkv_plan::physical::table::{TableProvider, ExecutionTable};
 
 /// Trait for providing table access to the executor.
 ///

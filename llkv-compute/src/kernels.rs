@@ -1,4 +1,6 @@
-use arrow::array::{Array, ArrayRef, Date32Array, IntervalMonthDayNanoArray, Scalar, new_null_array};
+use arrow::array::{
+    Array, ArrayRef, Date32Array, IntervalMonthDayNanoArray, Scalar, new_null_array,
+};
 use arrow::compute::kernels::cmp;
 use arrow::compute::{cast, kernels::numeric, nullif};
 use arrow::datatypes::{DataType, IntervalMonthDayNanoType};

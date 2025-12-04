@@ -1,19 +1,34 @@
-use std::any::Any;
-use std::sync::Arc;
-use std::fmt;
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use crate::physical::PhysicalPlan;
 use crate::physical::table::ExecutionTable;
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
-use llkv_scan::{ScanProjection, ScanStreamOptions, RowIdFilter, ScanOrderSpec};
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::scan::ranges::IntRanges;
 use llkv_expr::Expr;
-use llkv_types::LogicalFieldId;
+use llkv_scan::{RowIdFilter, ScanOrderSpec, ScanProjection, ScanStreamOptions};
+use llkv_storage::pager::Pager;
 use llkv_types::FieldId;
+use llkv_types::LogicalFieldId;
+use simd_r_drive_entry_handle::EntryHandle;
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
 
 pub struct ScanExec<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub table_name: String,
+    pub schema: SchemaRef,
+    pub table: Arc<dyn ExecutionTable<P>>,
+    pub ranges: Option<IntRanges>,
+    pub driving_column: Option<LogicalFieldId>,
+    pub filter: Option<Expr<'static, FieldId>>,
+    pub projections: Vec<ScanProjection>,
+    pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+    pub order: Option<ScanOrderSpec>,
+}
+
+pub struct ScanExecParams<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
@@ -45,17 +60,18 @@ impl<P> ScanExec<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub fn new(
-        table_name: String,
-        schema: SchemaRef,
-        table: Arc<dyn ExecutionTable<P>>,
-        ranges: Option<IntRanges>,
-        driving_column: Option<LogicalFieldId>,
-        filter: Option<Expr<'static, FieldId>>,
-        projections: Vec<ScanProjection>,
-        row_filter: Option<Arc<dyn RowIdFilter<P>>>,
-        order: Option<ScanOrderSpec>,
-    ) -> Self {
+    pub fn new(params: ScanExecParams<P>) -> Self {
+        let ScanExecParams {
+            table_name,
+            schema,
+            table,
+            ranges,
+            driving_column,
+            filter,
+            projections,
+            row_filter,
+            order,
+        } = params;
         Self {
             table_name,
             schema,
@@ -78,14 +94,16 @@ where
         Arc::clone(&self.schema)
     }
 
-    fn execute(&self) -> Result<Box<dyn Iterator<Item = Result<RecordBatch, String>> + Send>, String> {
+    fn execute(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = Result<RecordBatch, String>> + Send>, String> {
         let mut batches = Vec::new();
-        
+
         // Use the provided filter or default to true
         let filter_expr = self.filter.clone().unwrap_or(Expr::Literal(true));
-        
+
         let options = ScanStreamOptions {
-            ranges: self.ranges.clone(),
+            ranges: self.ranges,
             driving_column: self.driving_column,
             row_id_filter: self.row_filter.clone(),
             order: self.order,
@@ -93,12 +111,10 @@ where
             ..ScanStreamOptions::default()
         };
 
-        self.table.scan_stream(
-            &self.projections,
-            &filter_expr,
-            options,
-            &mut |batch| batches.push(Ok(batch))
-        )?;
+        self.table
+            .scan_stream(&self.projections, &filter_expr, options, &mut |batch| {
+                batches.push(Ok(batch))
+            })?;
 
         Ok(Box::new(batches.into_iter()))
     }
@@ -114,17 +130,17 @@ where
         if !children.is_empty() {
             return Err("ScanExec expects no children".to_string());
         }
-        Ok(Arc::new(ScanExec {
+        Ok(Arc::new(ScanExec::new(ScanExecParams {
             table_name: self.table_name.clone(),
             schema: self.schema.clone(),
             table: self.table.clone(),
-            ranges: self.ranges.clone(),
+            ranges: self.ranges,
             driving_column: self.driving_column,
             filter: self.filter.clone(),
             projections: self.projections.clone(),
             row_filter: self.row_filter.clone(),
             order: self.order,
-        }))
+        })))
     }
 
     fn as_any(&self) -> &dyn Any {
