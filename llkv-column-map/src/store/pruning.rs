@@ -4,7 +4,13 @@
 //! metadata statistics (min/max values) and query predicates.
 
 use arrow::array::ArrayRef;
+use rustc_hash::FxHashSet;
 use std::ops::Bound;
+
+use crate::codecs::{
+    sortable_u64_from_f32, sortable_u64_from_f64, sortable_u64_from_i16, sortable_u64_from_i32,
+    sortable_u64_from_i64, sortable_u64_from_i8,
+};
 
 /// Statistics for a chunk of data, used for pruning.
 #[derive(Debug, Clone, Copy)]
@@ -107,8 +113,8 @@ impl IntRanges {
         }
         if let Some((lb, ub)) = self.i64_r
             && !check_overlap(
-                map_bound(lb, i64_to_u64_sortable),
-                map_bound(ub, i64_to_u64_sortable),
+                map_bound(lb, sortable_u64_from_i64),
+                map_bound(ub, sortable_u64_from_i64),
                 chunk_min,
                 chunk_max,
             )
@@ -127,8 +133,8 @@ impl IntRanges {
         }
         if let Some((lb, ub)) = self.i32_r
             && !check_overlap(
-                map_bound(lb, i32_to_u64_sortable),
-                map_bound(ub, i32_to_u64_sortable),
+                map_bound(lb, sortable_u64_from_i32),
+                map_bound(ub, sortable_u64_from_i32),
                 chunk_min,
                 chunk_max,
             )
@@ -147,8 +153,8 @@ impl IntRanges {
         }
         if let Some((lb, ub)) = self.i16_r
             && !check_overlap(
-                map_bound(lb, i16_to_u64_sortable),
-                map_bound(ub, i16_to_u64_sortable),
+                map_bound(lb, sortable_u64_from_i16),
+                map_bound(ub, sortable_u64_from_i16),
                 chunk_min,
                 chunk_max,
             )
@@ -167,8 +173,8 @@ impl IntRanges {
         }
         if let Some((lb, ub)) = self.i8_r
             && !check_overlap(
-                map_bound(lb, i8_to_u64_sortable),
-                map_bound(ub, i8_to_u64_sortable),
+                map_bound(lb, sortable_u64_from_i8),
+                map_bound(ub, sortable_u64_from_i8),
                 chunk_min,
                 chunk_max,
             )
@@ -177,8 +183,8 @@ impl IntRanges {
         }
         if let Some((lb, ub)) = self.f64_r
             && !check_overlap(
-                map_bound(lb, f64_to_u64_sortable),
-                map_bound(ub, f64_to_u64_sortable),
+                map_bound(lb, sortable_u64_from_f64),
+                map_bound(ub, sortable_u64_from_f64),
                 chunk_min,
                 chunk_max,
             )
@@ -187,8 +193,8 @@ impl IntRanges {
         }
         if let Some((lb, ub)) = self.f32_r
             && !check_overlap(
-                map_bound(lb, f32_to_u64_sortable),
-                map_bound(ub, f32_to_u64_sortable),
+                map_bound(lb, sortable_u64_from_f32),
+                map_bound(ub, sortable_u64_from_f32),
                 chunk_min,
                 chunk_max,
             )
@@ -255,32 +261,6 @@ where
     }
 }
 
-fn f64_to_u64_sortable(val: f64) -> u64 {
-    let bits = val.to_bits();
-    if bits & 0x8000_0000_0000_0000 != 0 {
-        !bits
-    } else {
-        bits | 0x8000_0000_0000_0000
-    }
-}
-
-fn f32_to_u64_sortable(v: f32) -> u64 {
-    f64_to_u64_sortable(v as f64)
-}
-
-fn i8_to_u64_sortable(v: i8) -> u64 {
-    ((v as u8) ^ 0x80) as u64
-}
-fn i16_to_u64_sortable(v: i16) -> u64 {
-    ((v as u16) ^ 0x8000) as u64
-}
-fn i32_to_u64_sortable(v: i32) -> u64 {
-    ((v as u32) ^ 0x8000_0000) as u64
-}
-fn i64_to_u64_sortable(v: i64) -> u64 {
-    (v as u64) ^ 0x8000_0000_0000_0000
-}
-
 fn str_to_u64_prefix(s: &str) -> u64 {
     let bytes = s.as_bytes();
     let mut buf = [0u8; 8];
@@ -292,7 +272,6 @@ fn str_to_u64_prefix(s: &str) -> u64 {
 pub fn compute_chunk_stats(array: &ArrayRef) -> Option<ChunkStats> {
     use arrow::array::*;
     use arrow::datatypes::*;
-    use std::collections::HashSet;
 
     if array.is_empty() {
         return None;
@@ -315,7 +294,7 @@ pub fn compute_chunk_stats(array: &ArrayRef) -> Option<ChunkStats> {
             let arr = array.as_any().downcast_ref::<$array_ty>().unwrap();
             let mut min_val: Option<$ty> = None;
             let mut max_val: Option<$ty> = None;
-            let mut distinct = HashSet::with_capacity(len);
+            let mut distinct = FxHashSet::with_capacity_and_hasher(len, Default::default());
 
             for i in 0..len {
                 if arr.is_null(i) {
@@ -358,7 +337,7 @@ pub fn compute_chunk_stats(array: &ArrayRef) -> Option<ChunkStats> {
             let arr = array.as_any().downcast_ref::<$array_ty>().unwrap();
             let mut min_val: Option<&str> = None;
             let mut max_val: Option<&str> = None;
-            let mut distinct = HashSet::with_capacity(len);
+            let mut distinct = FxHashSet::with_capacity_and_hasher(len, Default::default());
 
             for i in 0..len {
                 if arr.is_null(i) {
@@ -402,22 +381,22 @@ pub fn compute_chunk_stats(array: &ArrayRef) -> Option<ChunkStats> {
     }
 
     match array.data_type() {
-        DataType::Int8 => stats_primitive!(i8, Int8Array, i8_to_u64_sortable),
-        DataType::Int16 => stats_primitive!(i16, Int16Array, i16_to_u64_sortable),
-        DataType::Int32 => stats_primitive!(i32, Int32Array, i32_to_u64_sortable),
-        DataType::Int64 => stats_primitive!(i64, Int64Array, i64_to_u64_sortable),
+        DataType::Int8 => stats_primitive!(i8, Int8Array, sortable_u64_from_i8),
+        DataType::Int16 => stats_primitive!(i16, Int16Array, sortable_u64_from_i16),
+        DataType::Int32 => stats_primitive!(i32, Int32Array, sortable_u64_from_i32),
+        DataType::Int64 => stats_primitive!(i64, Int64Array, sortable_u64_from_i64),
         DataType::UInt8 => stats_primitive!(u8, UInt8Array, |v: u8| v as u64),
         DataType::UInt16 => stats_primitive!(u16, UInt16Array, |v: u16| v as u64),
         DataType::UInt32 => stats_primitive!(u32, UInt32Array, |v: u32| v as u64),
         DataType::UInt64 => stats_primitive!(u64, UInt64Array, |v: u64| v),
-        DataType::Date32 => stats_primitive!(i32, Date32Array, i32_to_u64_sortable),
-        DataType::Date64 => stats_primitive!(i64, Date64Array, i64_to_u64_sortable),
+        DataType::Date32 => stats_primitive!(i32, Date32Array, sortable_u64_from_i32),
+        DataType::Date64 => stats_primitive!(i64, Date64Array, sortable_u64_from_i64),
 
         DataType::Float32 => {
             let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
             let mut min_val: f32 = f32::INFINITY;
             let mut max_val: f32 = f32::NEG_INFINITY;
-            let mut distinct = HashSet::with_capacity(len);
+            let mut distinct = FxHashSet::with_capacity_and_hasher(len, Default::default());
             let mut has_valid = false;
 
             for i in 0..len {
@@ -444,8 +423,8 @@ pub fn compute_chunk_stats(array: &ArrayRef) -> Option<ChunkStats> {
                 });
             }
 
-            let min_u64 = f64_to_u64_sortable(min_val as f64);
-            let max_u64 = f64_to_u64_sortable(max_val as f64);
+            let min_u64 = sortable_u64_from_f64(min_val as f64);
+            let max_u64 = sortable_u64_from_f64(max_val as f64);
 
             Some(ChunkStats {
                 min_u64,
@@ -458,7 +437,7 @@ pub fn compute_chunk_stats(array: &ArrayRef) -> Option<ChunkStats> {
             let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
             let mut min_val: f64 = f64::INFINITY;
             let mut max_val: f64 = f64::NEG_INFINITY;
-            let mut distinct = HashSet::with_capacity(len);
+            let mut distinct = FxHashSet::with_capacity_and_hasher(len, Default::default());
             let mut has_valid = false;
 
             for i in 0..len {
@@ -485,8 +464,8 @@ pub fn compute_chunk_stats(array: &ArrayRef) -> Option<ChunkStats> {
                 });
             }
 
-            let min_u64 = f64_to_u64_sortable(min_val);
-            let max_u64 = f64_to_u64_sortable(max_val);
+            let min_u64 = sortable_u64_from_f64(min_val);
+            let max_u64 = sortable_u64_from_f64(max_val);
 
             Some(ChunkStats {
                 min_u64,
