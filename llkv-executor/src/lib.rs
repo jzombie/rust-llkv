@@ -4093,7 +4093,7 @@ where
                     display_name,
                     physical_plan,
                     plan.distinct,
-                    plan.order_by.clone(),
+                    Vec::new(), // PhysicalPlanner handles sorting
                 ));
             }
             Err(e) => {

@@ -10,9 +10,10 @@ use crate::translation::{translate_predicate, build_projected_columns, build_wil
 use llkv_result::Error;
 use crate::physical::ranges::extract_ranges;
 use llkv_scan::RowIdFilter;
-
-// I need to move ranges module too?
-// llkv-executor/src/physical_plan/ranges.rs
+use crate::physical::projection::ProjectionExec;
+use llkv_scan::ScanProjection;
+use crate::plans::OrderTarget;
+use crate::physical::sort::SortExec;
 
 pub struct PhysicalPlanner<P>
 where
@@ -37,25 +38,73 @@ where
         if let Some(table_ref) = plan.tables.first() {
              let table_name = table_ref.qualified_name();
              let table = self.provider.get_table(&table_name).map_err(|e| e.to_string())?;
+             let table_id = table.table_id();
              
-             // Build projections
-             // table.schema() returns Arc<PlanSchema>
-             // table.table_id() ? ExecutionTable needs table_id() method?
-             // Or PlanSchema has table_id? No.
-             // We need table_id to build LogicalFieldId.
-             
-             // I need to add table_id() to ExecutionTable trait.
-             
-             let table_id = table.table_id(); // Assuming I add this
-             
-             let projections = if plan.projections.is_empty() {
+             // 1. Determine requested projections
+             let requested_projections = if plan.projections.is_empty() {
                  build_wildcard_projections(&table.schema(), table_id)
              } else {
                  build_projected_columns(&table.schema(), table_id, &plan.projections).map_err(|e| e.to_string())?
              };
 
-             // Build schema from projections
-             let schema = schema_for_projections(&table.schema(), &projections).map_err(|e| e.to_string())?;
+             // 2. Determine extra columns needed for ORDER BY and resolve targets
+             let mut scan_projections = requested_projections.clone();
+             let mut extra_columns = Vec::new();
+             let mut resolved_order_by = Vec::new();
+
+             for order in &plan.order_by {
+                 match &order.target {
+                     OrderTarget::All => {
+                         // Expand to all requested projections
+                         for proj in &requested_projections {
+                             let name = get_projection_name(proj, &table.schema());
+                             let mut new_order = order.clone();
+                             new_order.target = OrderTarget::Column(name);
+                             resolved_order_by.push(new_order);
+                         }
+                     },
+                     OrderTarget::Index(idx) => {
+                         if *idx < requested_projections.len() {
+                             let proj = &requested_projections[*idx];
+                             let name = get_projection_name(proj, &table.schema());
+                             let mut new_order = order.clone();
+                             new_order.target = OrderTarget::Column(name);
+                             resolved_order_by.push(new_order);
+                         } else {
+                             return Err(format!("ORDER BY index {} out of bounds", idx));
+                         }
+                     },
+                     OrderTarget::Column(name) => {
+                         // Check if column is already in projections
+                         let is_projected = scan_projections.iter().any(|p| {
+                             get_projection_name(p, &table.schema()).eq_ignore_ascii_case(name)
+                         });
+
+                         if !is_projected {
+                             // Find the column in the table schema
+                             if let Some(col) = table.schema().columns.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+                                 let logical_field_id = LogicalFieldId::for_user(table_id, col.field_id);
+                                 let projection = ScanProjection::Column(llkv_column_map::store::Projection {
+                                     logical_field_id,
+                                     alias: None,
+                                 });
+                                 scan_projections.push(projection);
+                                 extra_columns.push(name.clone());
+                             } else {
+                                 return Err(format!("ORDER BY references unknown column '{}'", name));
+                             }
+                         }
+                         
+                         // Add to resolved order by
+                         let mut new_order = order.clone();
+                         new_order.target = OrderTarget::Column(name.clone());
+                         resolved_order_by.push(new_order);
+                     }
+                 }
+             }
+
+             // 3. Build schema for the scan (includes extra columns)
+             let scan_schema = schema_for_projections(&table.schema(), &scan_projections).map_err(|e| e.to_string())?;
              
              // Try to extract ranges from filter
              let mut ranges = None;
@@ -83,19 +132,65 @@ where
                  }
              }
 
-             Ok(Arc::new(ScanExec::new(
+             let scan_exec = Arc::new(ScanExec::new(
                  table_name.clone(), 
-                 schema, 
+                 scan_schema.clone(), 
                  table.clone(), 
                  ranges, 
                  driving_column, 
                  physical_filter, 
-                 projections,
+                 scan_projections,
                  row_filter,
-                 None, // TODO: Implement ORDER BY support in PhysicalPlanner
-             )))
+                 None, 
+             ));
+
+             let mut current_plan: Arc<dyn PhysicalPlan> = scan_exec;
+
+             // 5. Add SortExec if needed
+             if !resolved_order_by.is_empty() {
+                 current_plan = Arc::new(SortExec::new(current_plan, resolved_order_by));
+             }
+
+             // 4. If we added extra columns, wrap in ProjectionExec
+             if !extra_columns.is_empty() {
+                 // Build the final schema (without extra columns)
+                 let final_schema = schema_for_projections(&table.schema(), &requested_projections).map_err(|e| e.to_string())?;
+                 
+                 // Map requested projections to indices in scan_schema
+                 let mut expr = Vec::new();
+                 for (i, _) in requested_projections.iter().enumerate() {
+                     let field = final_schema.field(i);
+                     // Find index in scan_schema
+                     if let Ok(idx) = scan_schema.index_of(field.name()) {
+                         expr.push((idx, field.name().clone()));
+                     } else {
+                         return Err(format!("Failed to find column '{}' in scan schema", field.name()));
+                     }
+                 }
+                 
+                 Ok(Arc::new(ProjectionExec::new(current_plan, final_schema, expr)))
+             } else {
+                 Ok(current_plan)
+             }
         } else {
             Err("No tables in select plan".to_string())
         }
+    }
+}
+
+fn get_projection_name(proj: &ScanProjection, schema: &crate::schema::PlanSchema) -> String {
+    match proj {
+        ScanProjection::Column(p) => {
+            if let Some(alias) = &p.alias {
+                alias.clone()
+            } else {
+                // Look up column name
+                schema.columns.iter()
+                    .find(|c| c.field_id == p.logical_field_id.field_id())
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| format!("col_{}", p.logical_field_id.field_id()))
+            }
+        },
+        ScanProjection::Computed { alias, .. } => alias.clone(),
     }
 }

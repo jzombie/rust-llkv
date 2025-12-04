@@ -8,6 +8,8 @@ use arrow::record_batch::RecordBatch;
 pub mod scan;
 pub mod table;
 pub mod ranges;
+pub mod projection;
+pub mod sort;
 
 /// A physical plan represents an executable query plan.
 ///
