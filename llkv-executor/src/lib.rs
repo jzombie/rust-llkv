@@ -73,6 +73,8 @@ pub mod insert;
 pub mod scan;
 pub mod translation;
 pub mod types;
+pub mod physical_plan;
+pub mod planner;
 
 // ============================================================================
 // Type Aliases and Re-exports
@@ -4177,6 +4179,8 @@ where
                 order: Some(order_spec),
                 row_id_filter: row_filter.clone(),
                 include_row_ids: true,
+                ranges: None,
+                driving_column: None,
             }
         } else {
             if row_filter.is_some() {
@@ -4187,6 +4191,8 @@ where
                 order: None,
                 row_id_filter: row_filter.clone(),
                 include_row_ids: true,
+                ranges: None,
+                driving_column: None,
             }
         };
 
@@ -4340,6 +4346,8 @@ where
             order: None,
             row_id_filter: row_filter.clone(),
             include_row_ids: true,
+            ranges: None,
+            driving_column: None,
         };
 
         let subquery_lookup: FxHashMap<llkv_expr::SubqueryId, &llkv_plan::FilterSubquery> =
@@ -4603,6 +4611,8 @@ where
             order: None,
             row_id_filter: row_filter.clone(),
             include_row_ids: true,
+            ranges: None,
+            driving_column: None,
         };
 
         let execution = SelectExecution::new_projection(
@@ -5677,6 +5687,8 @@ where
             order: None,
             row_id_filter: row_filter.clone(),
             include_row_ids: true,
+            ranges: None,
+            driving_column: None,
         };
 
         let mut states: Vec<AggregateState> = Vec::with_capacity(specs.len());
@@ -6636,6 +6648,8 @@ where
             order: None,
             row_id_filter: None,
             include_row_ids: true,
+            ranges: None,
+            driving_column: None,
         };
 
         let count_star_override: Option<i64> = None;
@@ -10912,6 +10926,9 @@ where
     Aggregation {
         batch: RecordBatch,
     },
+    PhysicalPlan {
+        plan: Arc<dyn llkv_plan::physical::PhysicalPlan>,
+    },
 }
 
 impl<P> SelectExecution<P>
@@ -10959,6 +10976,19 @@ where
 
     pub fn from_batch(table_name: String, schema: Arc<Schema>, batch: RecordBatch) -> Self {
         Self::new_single_batch(table_name, schema, batch)
+    }
+
+    pub fn from_physical_plan(
+        table_name: String,
+        plan: Arc<dyn llkv_plan::physical::PhysicalPlan>,
+    ) -> Self {
+        Self {
+            table_name,
+            schema: plan.schema(),
+            stream: SelectStream::PhysicalPlan { plan },
+            limit: None,
+            offset: None,
+        }
     }
 
     pub fn table_name(&self) -> &str {
@@ -11142,6 +11172,14 @@ where
                     for batch in null_batches {
                         on_batch(batch)?;
                     }
+                }
+                Ok(())
+            }
+            SelectStream::PhysicalPlan { plan } => {
+                let iterator = plan.execute().map_err(|e| Error::Internal(e))?;
+                for batch_result in iterator {
+                    let batch = batch_result.map_err(|e| Error::Internal(e))?;
+                    on_batch(batch)?;
                 }
                 Ok(())
             }
@@ -11528,6 +11566,7 @@ where
         &filter_expr,
         ScanStreamOptions {
             include_nulls: true,
+            driving_column: None,
             ..ScanStreamOptions::default()
         },
         &mut |batch| {

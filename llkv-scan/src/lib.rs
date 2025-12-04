@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
 use croaring::Treemap;
+use llkv_column_map::store::scan::ranges::IntRanges;
 use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext, Projection};
 use llkv_expr::{Expr, ScalarExpr};
 use llkv_result::Result as LlkvResult;
@@ -103,6 +104,8 @@ where
     pub order: Option<ScanOrderSpec>,
     pub row_id_filter: Option<Arc<dyn RowIdFilter<P>>>,
     pub include_row_ids: bool,
+    pub ranges: Option<IntRanges>,
+    pub driving_column: Option<LogicalFieldId>,
 }
 
 impl<P> Clone for ScanStreamOptions<P>
@@ -115,6 +118,8 @@ where
             order: self.order,
             row_id_filter: self.row_id_filter.clone(),
             include_row_ids: self.include_row_ids,
+            ranges: self.ranges.clone(),
+            driving_column: self.driving_column,
         }
     }
 }
@@ -129,6 +134,8 @@ where
             order: None,
             row_id_filter: None,
             include_row_ids: false,
+            ranges: None,
+            driving_column: None,
         }
     }
 }
@@ -146,6 +153,8 @@ where
                 &self.row_id_filter.as_ref().map(|_| "<RowIdFilter>"),
             )
             .field("include_row_ids", &self.include_row_ids)
+            .field("ranges", &self.ranges)
+            .field("driving_column", &self.driving_column)
             .finish()
     }
 }
@@ -212,6 +221,8 @@ where
     fn stream_row_ids(
         &self,
         chunk_size: usize,
+        ranges: Option<IntRanges>,
+        driving_column: Option<LogicalFieldId>,
         on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     ) -> LlkvResult<()>;
     fn as_any(&self) -> &dyn std::any::Any;

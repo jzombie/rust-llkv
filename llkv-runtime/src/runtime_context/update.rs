@@ -960,6 +960,8 @@ where
             order: None,
             row_id_filter: Some(row_filter),
             include_row_ids: true,
+            ranges: None,
+            driving_column: None,
         };
 
         table

@@ -203,6 +203,7 @@ pub fn unsorted_visit<P: Pager<Blob = EntryHandle>>(
     pager: &P,
     catalog: &FxHashMap<LogicalFieldId, PhysicalKey>,
     field_id: LogicalFieldId,
+    ranges: crate::store::scan::ranges::IntRanges,
     visitor: &mut dyn PrimitiveVisitor,
 ) -> Result<()> {
     let descriptor_pk = *catalog.get(&field_id).ok_or(Error::NotFound)?;
@@ -220,7 +221,7 @@ pub fn unsorted_visit<P: Pager<Blob = EntryHandle>>(
     let mut metas: Vec<ChunkMetadata> = Vec::new();
     for m in DescriptorIterator::new(pager, desc.head_page_pk) {
         let meta = m?;
-        if meta.row_count > 0 {
+        if meta.row_count > 0 && ranges.matches(meta.min_val_u64, meta.max_val_u64) {
             metas.push(meta);
         }
     }
@@ -350,6 +351,7 @@ pub fn unsorted_with_row_ids_and_nulls_visit<P: Pager<Blob = EntryHandle>>(
     rowid_fid: LogicalFieldId,
     anchor_rowid_fid: LogicalFieldId,
     _nulls_first: bool, // Anchor order interleave; nulls_first ignored for unsorted
+    ranges: crate::store::scan::ranges::IntRanges,
     visitor: &mut dyn PrimitiveWithRowIdsAndNullsVisitor,
 ) -> Result<()> {
     let v_pk = *catalog.get(&value_fid).ok_or(Error::NotFound)?;
@@ -393,19 +395,20 @@ pub fn unsorted_with_row_ids_and_nulls_visit<P: Pager<Blob = EntryHandle>>(
 
     // Gather metas and blobs
     let mut v_metas: Vec<ChunkMetadata> = Vec::new();
-    for m in DescriptorIterator::new(pager, v_desc.head_page_pk) {
-        let meta = m?;
-        if meta.row_count > 0 {
-            v_metas.push(meta);
-        }
-    }
     let mut r_metas: Vec<ChunkMetadata> = Vec::new();
-    for m in DescriptorIterator::new(pager, r_desc.head_page_pk) {
-        let meta = m?;
-        if meta.row_count > 0 {
-            r_metas.push(meta);
+
+    let v_iter = DescriptorIterator::new(pager, v_desc.head_page_pk);
+    let r_iter = DescriptorIterator::new(pager, r_desc.head_page_pk);
+
+    for (vm_res, rm_res) in v_iter.zip(r_iter) {
+        let vm = vm_res?;
+        let rm = rm_res?;
+        if vm.row_count > 0 && ranges.matches(vm.min_val_u64, vm.max_val_u64) {
+            v_metas.push(vm);
+            r_metas.push(rm);
         }
     }
+
     let mut a_metas: Vec<ChunkMetadata> = Vec::new();
     for m in DescriptorIterator::new(pager, a_desc.head_page_pk) {
         let meta = m?;

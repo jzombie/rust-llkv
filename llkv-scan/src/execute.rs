@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
 use croaring::Treemap;
+use llkv_column_map::store::scan::ranges::IntRanges;
 use llkv_compute::analysis::computed_expr_requires_numeric;
 use llkv_compute::eval::ScalarEvaluator;
 use llkv_compute::projection::{
@@ -38,6 +39,8 @@ struct FullTableStreamPlan<'a> {
     null_policy: GatherNullPolicy,
     out_schema: Arc<Schema>,
     projection_plan: Vec<crate::row_stream::ProjectionPlan>,
+    ranges: Option<IntRanges>,
+    driving_column: Option<LogicalFieldId>,
 }
 
 /// Execute a table scan using the shared scan machinery.
@@ -187,6 +190,8 @@ where
         order,
         row_id_filter,
         include_row_ids,
+        ranges,
+        driving_column,
     } = options;
 
     let can_stream_full_table = !include_row_ids
@@ -204,6 +209,8 @@ where
             null_policy,
             out_schema: Arc::clone(&out_schema),
             projection_plan: projection_plan.clone(),
+            ranges,
+            driving_column,
         };
         stream_full_table_scan(storage, table_id, plan, on_batch)?;
         return Ok(());
@@ -342,7 +349,7 @@ where
         Ok(())
     };
 
-    storage.stream_row_ids(ROW_STREAM_CHUNK_SIZE, &mut process_chunk)?;
+    storage.stream_row_ids(ROW_STREAM_CHUNK_SIZE, plan.ranges, plan.driving_column, &mut process_chunk)?;
 
     if !emitted_rows {
         let total_rows = storage.total_rows()?;
