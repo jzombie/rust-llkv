@@ -1,6 +1,6 @@
 # Per-Query Perf Outline
 
-*As documented by "Quantifying TPC-H Choke Points and Their Optimizations*
+*As documented by "Quantifying TPC-H Choke Points and Their Optimizations"*
 
 ## Q4
 
