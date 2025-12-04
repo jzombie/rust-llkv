@@ -4409,16 +4409,12 @@ where
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
-        if plan
+        let has_filter_subqueries = plan
             .filter
             .as_ref()
-            .is_some_and(|filter| !filter.subqueries.is_empty())
-            || !plan.scalar_subqueries.is_empty()
-        {
-            return Err(Error::InvalidArgumentError(
-                "GROUP BY with subqueries is not supported yet".into(),
-            ));
-        }
+            .is_some_and(|filter| !filter.subqueries.is_empty());
+        let has_scalar_subqueries = !plan.scalar_subqueries.is_empty();
+        let has_subqueries = has_filter_subqueries || has_scalar_subqueries;
 
         // Debug: check if we have aggregates in unexpected places
         tracing::debug!(
@@ -4435,12 +4431,14 @@ where
         let mut base_plan = plan.clone();
         base_plan.projections.clear();
         base_plan.aggregates.clear();
-        base_plan.scalar_subqueries.clear();
         base_plan.order_by.clear();
         base_plan.distinct = false;
         base_plan.group_by.clear();
         base_plan.value_table_mode = None;
         base_plan.having = None;
+        if !has_subqueries {
+            base_plan.scalar_subqueries.clear();
+        }
 
         tracing::debug!(
             "[GROUP BY] Base plan: projections={}, aggregates={}, has_filter={}, has_having={}",
@@ -4490,36 +4488,49 @@ where
             }
         };
 
-        let options = ScanStreamOptions {
-            include_nulls: true,
-            order: None,
-            row_id_filter: row_filter.clone(),
-            include_row_ids: true,
-            ranges: None,
-            driving_column: None,
+        let (base_schema, batches, column_lookup_map) = if has_subqueries {
+            let execution = self.execute_projection_with_subqueries(
+                Arc::clone(&table),
+                display_name.clone(),
+                base_plan,
+                row_filter.clone(),
+            )?;
+            let schema = execution.schema();
+            let batches = execution.collect()?;
+            let lookup = build_column_lookup_map(schema.as_ref());
+            (schema, batches, lookup)
+        } else {
+            let options = ScanStreamOptions {
+                include_nulls: true,
+                order: None,
+                row_id_filter: row_filter.clone(),
+                include_row_ids: true,
+                ranges: None,
+                driving_column: None,
+            };
+
+            let execution = SelectExecution::new_projection(
+                display_name.clone(),
+                Arc::clone(&base_schema),
+                Arc::clone(&table),
+                projections,
+                filter_expr,
+                options,
+                full_table_scan,
+                vec![],
+                false,
+            );
+
+            let batches = execution.collect()?;
+            let lookup = build_column_lookup_map(base_schema.as_ref());
+            (base_schema, batches, lookup)
         };
-
-        let execution = SelectExecution::new_projection(
-            display_name.clone(),
-            Arc::clone(&base_schema),
-            Arc::clone(&table),
-            projections,
-            filter_expr,
-            options,
-            full_table_scan,
-            vec![],
-            false,
-        );
-
-        let batches = execution.collect()?;
 
         tracing::debug!(
             "[GROUP BY] Collected {} batches from base scan, total_rows={}",
             batches.len(),
             batches.iter().map(|b| b.num_rows()).sum::<usize>()
         );
-
-        let column_lookup_map = build_column_lookup_map(base_schema.as_ref());
 
         self.execute_group_by_from_batches(
             display_name,
@@ -4538,17 +4549,6 @@ where
         batches: Vec<RecordBatch>,
         column_lookup_map: FxHashMap<String, usize>,
     ) -> ExecutorResult<SelectExecution<P>> {
-        if plan
-            .filter
-            .as_ref()
-            .is_some_and(|filter| !filter.subqueries.is_empty())
-            || !plan.scalar_subqueries.is_empty()
-        {
-            return Err(Error::InvalidArgumentError(
-                "GROUP BY with subqueries is not supported yet".into(),
-            ));
-        }
-
         // If there are aggregates with GROUP BY, OR if HAVING contains aggregates, use aggregates path
         // Must check HAVING because aggregates can appear in HAVING even if not in SELECT projections
         let having_has_aggregates = plan
