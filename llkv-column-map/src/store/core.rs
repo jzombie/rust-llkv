@@ -1024,13 +1024,23 @@ where
                     (0, 0)
                 };
 
+                // Compute stats for data chunk
+                let stats = compute_chunk_stats(&s_norm);
+                let (data_min, data_max, null_count, distinct_count) = stats
+                    .as_ref()
+                    .map(|s| (s.min_u64, s.max_u64, s.null_count, s.distinct_count))
+                    .unwrap_or((0, u64::MAX, 0, 0));
+
                 // Create the initial metadata for both chunks.
                 // The `value_order_perm_pk` is initialized to 0 (None).
                 let mut data_meta = ChunkMetadata {
                     chunk_pk: data_pk,
                     row_count: rows as u64,
                     serialized_bytes: s_norm.get_array_memory_size() as u64,
-                    max_val_u64: u64::MAX,
+                    min_val_u64: data_min,
+                    max_val_u64: data_max,
+                    null_count,
+                    distinct_count,
                     ..Default::default()
                 };
                 let mut rid_meta = ChunkMetadata {
@@ -1039,6 +1049,8 @@ where
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
                     min_val_u64: min,
                     max_val_u64: max,
+                    null_count: 0,
+                    distinct_count: rows as u64,
                     ..Default::default()
                 };
 
@@ -1976,7 +1988,7 @@ where
                 let db = by_pk.get(&metas[k].chunk_pk).ok_or(Error::NotFound)?;
                 data_parts.push(deserialize_array(db.clone())?);
                 let rb = by_pk.get(&metas_rid[k].chunk_pk).ok_or(Error::NotFound)?;
-                rid_parts.push(deserialize_array(rb.clone())?);
+                                              rid_parts.push(deserialize_array(rb.clone())?);
             }
             let merged_data = concat_many(data_parts.iter().collect())?;
             let merged_rid_any = concat_many(rid_parts.iter().collect())?;
@@ -2009,11 +2021,21 @@ where
                     key: rid_pk,
                     bytes: rid_bytes,
                 });
+                // Compute stats for the compacted data chunk
+                let stats = compute_chunk_stats(&s_norm);
+                let (data_min, data_max, null_count, distinct_count) = stats
+                    .as_ref()
+                    .map(|s| (s.min_u64, s.max_u64, s.null_count, s.distinct_count))
+                    .unwrap_or((0, u64::MAX, 0, 0));
+
                 let mut meta = ChunkMetadata {
                     chunk_pk: data_pk,
                     row_count: rows as u64,
                     serialized_bytes: s_norm.get_array_memory_size() as u64,
-                    max_val_u64: u64::MAX,
+                    min_val_u64: data_min,
+                    max_val_u64: data_max,
+                    null_count,
+                    distinct_count,
                     ..Default::default()
                 };
                 // If any source chunk had a perm, recompute for this slice.
@@ -2079,6 +2101,8 @@ where
                     serialized_bytes: rid_norm.get_array_memory_size() as u64,
                     min_val_u64: if rows > 0 { min } else { 0 },
                     max_val_u64: if rows > 0 { max } else { 0 },
+                    null_count: 0,
+                    distinct_count: rows as u64,
                 };
                 new_metas.push(meta);
                 new_rid_metas.push(rid_meta);
@@ -2332,3 +2356,5 @@ where
         Ok(all_stats)
     }
 }
+
+use crate::store::pruning::compute_chunk_stats;

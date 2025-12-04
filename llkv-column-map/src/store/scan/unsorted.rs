@@ -254,6 +254,7 @@ pub fn unsorted_with_row_ids_visit<P: Pager<Blob = EntryHandle>>(
     catalog: &FxHashMap<LogicalFieldId, PhysicalKey>,
     value_fid: LogicalFieldId,
     rowid_fid: LogicalFieldId,
+    ranges: crate::store::scan::ranges::IntRanges,
     visitor: &mut dyn PrimitiveWithRowIdsVisitor,
 ) -> Result<()> {
     let v_pk = *catalog.get(&value_fid).ok_or(Error::NotFound)?;
@@ -278,25 +279,22 @@ pub fn unsorted_with_row_ids_visit<P: Pager<Blob = EntryHandle>>(
     let v_desc = ColumnDescriptor::from_le_bytes(v_desc_blob.as_ref());
     let r_desc = ColumnDescriptor::from_le_bytes(r_desc_blob.as_ref());
 
+    // Gather metas and fetch blobs in one batch.
     let mut v_metas: Vec<ChunkMetadata> = Vec::new();
-    for m in DescriptorIterator::new(pager, v_desc.head_page_pk) {
-        let meta = m?;
-        if meta.row_count > 0 {
-            v_metas.push(meta);
-        }
-    }
     let mut r_metas: Vec<ChunkMetadata> = Vec::new();
-    for m in DescriptorIterator::new(pager, r_desc.head_page_pk) {
-        let meta = m?;
-        if meta.row_count > 0 {
-            r_metas.push(meta);
+
+    let v_iter = DescriptorIterator::new(pager, v_desc.head_page_pk);
+    let r_iter = DescriptorIterator::new(pager, r_desc.head_page_pk);
+
+    for (vm_res, rm_res) in v_iter.zip(r_iter) {
+        let vm = vm_res?;
+        let rm = rm_res?;
+        if vm.row_count > 0 && ranges.matches(vm.min_val_u64, vm.max_val_u64) {
+            v_metas.push(vm);
+            r_metas.push(rm);
         }
     }
-    if v_metas.len() != r_metas.len() {
-        return Err(Error::Internal(
-            "unsorted_with_row_ids: chunk count mismatch".into(),
-        ));
-    }
+
     if v_metas.is_empty() {
         return Ok(());
     }

@@ -86,6 +86,7 @@ fn benchmark_rust_llkv() -> (u128, f64) {
                     include_nulls: false,
                     nulls_first: false,
                     anchor_row_id_field: None,
+                    ranges: Default::default(),
                 },
                 &mut visitor,
             )
@@ -111,6 +112,7 @@ fn benchmark_rust_llkv() -> (u128, f64) {
                     include_nulls: false,
                     nulls_first: false,
                     anchor_row_id_field: None,
+                    ranges: Default::default(),
                 },
                 &mut visitor,
             )

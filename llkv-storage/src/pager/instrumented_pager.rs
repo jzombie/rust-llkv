@@ -70,6 +70,24 @@ impl IoStats {
             unknown_put_bytes: self.unknown_put_bytes.load(Ordering::Relaxed),
         }
     }
+
+    /// Reset all statistics to zero.
+    pub fn reset(&self) {
+        self.physical_gets.store(0, Ordering::Relaxed);
+        self.physical_puts.store(0, Ordering::Relaxed);
+        self.physical_frees.store(0, Ordering::Relaxed);
+        self.physical_allocs.store(0, Ordering::Relaxed);
+        self.get_batches.store(0, Ordering::Relaxed);
+        self.put_batches.store(0, Ordering::Relaxed);
+        self.free_batches.store(0, Ordering::Relaxed);
+        self.alloc_batches.store(0, Ordering::Relaxed);
+        self.fresh_puts.store(0, Ordering::Relaxed);
+        self.fresh_put_bytes.store(0, Ordering::Relaxed);
+        self.overwritten_puts.store(0, Ordering::Relaxed);
+        self.overwritten_put_bytes.store(0, Ordering::Relaxed);
+        self.unknown_puts.store(0, Ordering::Relaxed);
+        self.unknown_put_bytes.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Immutable copy of [`IoStats`] counters captured at a specific moment.

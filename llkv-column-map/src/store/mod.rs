@@ -42,6 +42,7 @@ pub use layout::*;
 pub mod rowid;
 pub use rowid::*;
 
+pub mod pruning;
 pub mod scan;
 pub use scan::*;
 

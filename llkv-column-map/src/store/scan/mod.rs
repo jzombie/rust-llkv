@@ -229,6 +229,7 @@ where
                         &catalog.map,
                         field_id,
                         row_fid,
+                        opts.ranges,
                         &mut pv,
                     );
                 } else {
@@ -237,6 +238,7 @@ where
                         &catalog.map,
                         field_id,
                         row_fid,
+                        opts.ranges,
                         visitor,
                     );
                 }

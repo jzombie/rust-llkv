@@ -109,6 +109,7 @@ fn indices_persist_after_drop_and_reopen() {
                     anchor_row_id_field: Some(
                         anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
                     ),
+                    ranges: Default::default(),
                 },
                 &mut v,
             )

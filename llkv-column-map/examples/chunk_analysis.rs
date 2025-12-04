@@ -107,6 +107,7 @@ fn main() {
                     include_nulls: false,
                     nulls_first: false,
                     anchor_row_id_field: None,
+                    ranges: Default::default(),
                 },
                 &mut analyzer,
             )
@@ -160,6 +161,7 @@ fn main() {
                     include_nulls: false,
                     nulls_first: false,
                     anchor_row_id_field: None,
+                    ranges: Default::default(),
                 },
                 &mut analyzer,
             )

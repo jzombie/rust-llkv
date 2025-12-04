@@ -1233,7 +1233,7 @@ where
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
         let row_ids =
-            <T as FilterPrimitive>::run_nullable_filter(self.store(), lfid, |v| match v {
+            <T as FilterPrimitive>::run_nullable_filter(self.store(), lfid, Default::default(), |v| match v {
                 Some(val) => predicate.matches(PredicateValue::borrowed(&val)),
                 None => false,
             })?;
@@ -1263,6 +1263,7 @@ where
         let row_ids = arrow::datatypes::BooleanType::run_nullable_filter(
             self.store(),
             lfid,
+            Default::default(),
             |val: Option<bool>| match val {
                 Some(v) => predicate.matches(&v),
                 None => false,
