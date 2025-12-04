@@ -8,8 +8,8 @@ use rustc_hash::FxHashSet;
 use std::ops::Bound;
 
 use crate::codecs::{
-    sortable_u64_from_f32, sortable_u64_from_f64, sortable_u64_from_i16, sortable_u64_from_i32,
-    sortable_u64_from_i64, sortable_u64_from_i8,
+    sortable_u64_from_f32, sortable_u64_from_f64, sortable_u64_from_i8, sortable_u64_from_i16,
+    sortable_u64_from_i32, sortable_u64_from_i64,
 };
 
 /// Statistics for a chunk of data, used for pruning.
