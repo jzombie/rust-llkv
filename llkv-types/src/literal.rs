@@ -99,6 +99,22 @@ impl Literal {
             }
         }
     }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Literal::Int128(v) => (*v).try_into().ok(),
+            Literal::Float64(v) => Some(*v as i64),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Literal::Int128(v) => (*v).try_into().ok(),
+            Literal::Float64(v) => Some(*v as u64),
+            _ => None,
+        }
+    }
 }
 
 fn format_date32(days: i32) -> String {

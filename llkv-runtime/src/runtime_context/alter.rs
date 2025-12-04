@@ -6,7 +6,7 @@
 //! - DROP COLUMN
 
 use crate::canonical_table_name;
-use llkv_executor::translation::sql_type_to_arrow;
+use llkv_plan::translation::types::sql_type_to_arrow;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;

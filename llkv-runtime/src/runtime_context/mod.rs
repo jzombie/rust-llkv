@@ -945,7 +945,7 @@ where
             let normalized = column_plan.name.to_ascii_lowercase();
             let col_idx = table
                 .schema
-                .lookup
+                .name_to_index
                 .get(&normalized)
                 .copied()
                 .ok_or_else(|| {

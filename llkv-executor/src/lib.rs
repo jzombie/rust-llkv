@@ -71,10 +71,10 @@ use std::cell::RefCell;
 
 pub mod insert;
 pub mod scan;
-pub mod translation;
 pub mod types;
-pub mod physical_plan;
-pub mod planner;
+
+use llkv_plan::planner::PhysicalPlanner;
+use crate::types::provider::TableProviderAdapter;
 
 // ============================================================================
 // Type Aliases and Re-exports
@@ -83,7 +83,8 @@ pub mod planner;
 /// Result type for executor operations.
 pub type ExecutorResult<T> = Result<T, Error>;
 
-use crate::translation::schema::infer_computed_data_type;
+use llkv_plan::translation::schema::infer_computed_data_type;
+use llkv_plan::translation::expression;
 pub use insert::{
     build_array_for_column, normalize_insert_value_for_column, resolve_insert_columns,
 };
@@ -95,7 +96,7 @@ use llkv_compute::scalar::interval::{
     compare_interval_values, interval_value_from_arrow, interval_value_to_arrow,
 };
 pub use llkv_compute::time::current_time_micros;
-pub use translation::{
+pub use llkv_plan::translation::{
     build_projected_columns, build_wildcard_projections, full_table_scan_filter,
     resolve_field_id_from_schema, schema_for_projections, translate_predicate,
     translate_predicate_with, translate_scalar, translate_scalar_with,
@@ -1292,14 +1293,14 @@ where
                     combined_fields.push(Field::new(
                         col.name.clone(),
                         col.data_type.clone(),
-                        col.nullable,
+                        col.is_nullable,
                     ));
                 }
                 for col in &right_table.schema.columns {
                     combined_fields.push(Field::new(
                         col.name.clone(),
                         col.data_type.clone(),
-                        col.nullable,
+                        col.is_nullable,
                     ));
                 }
                 let combined_schema = Arc::new(Schema::new(combined_fields));
@@ -1530,14 +1531,14 @@ where
                                     combined_fields.push(Field::new(
                                         col.name.clone(),
                                         col.data_type.clone(),
-                                        col.nullable,
+                                        col.is_nullable,
                                     ));
                                 }
                                 for col in &right_table.schema.columns {
                                     combined_fields.push(Field::new(
                                         col.name.clone(),
                                         col.data_type.clone(),
-                                        col.nullable,
+                                        col.is_nullable,
                                     ));
                                 }
 
@@ -3891,7 +3892,7 @@ where
                     combined_fields.push(Field::new(
                         column.name.clone(),
                         column.data_type.clone(),
-                        column.nullable,
+                        column.is_nullable,
                     ));
                 }
                 column_counts.push(executor_table.schema.columns.len());
@@ -4083,6 +4084,24 @@ where
             return self.execute_projection_with_subqueries(table, display_name, plan, row_filter);
         }
 
+        // Try to use PhysicalPlanner
+        let adapter = Arc::new(TableProviderAdapter::new(self.provider.clone())) as Arc<dyn llkv_plan::physical::table::TableProvider<P>>;
+        let planner = PhysicalPlanner::new(adapter);
+        match planner.create_physical_plan(&plan, row_filter.clone()) {
+            Ok(physical_plan) => {
+                return Ok(SelectExecution::from_physical_plan(
+                    display_name,
+                    physical_plan,
+                    plan.distinct,
+                    plan.order_by.clone(),
+                ));
+            }
+            Err(e) => {
+                return Err(Error::Internal(format!("Physical planner failed: {}", e)));
+            }
+        }
+
+        /*
         let table_ref = table.as_ref();
         let constant_filter = plan
             .filter
@@ -4113,7 +4132,7 @@ where
 
         let (mut filter_expr, mut full_table_scan) = match &plan.filter {
             Some(filter_wrapper) => (
-                crate::translation::expression::translate_predicate(
+                expression::translate_predicate(
                     filter_wrapper.predicate.clone(),
                     table_ref.schema.as_ref(),
                     |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -4127,7 +4146,7 @@ where
                     )
                 })?;
                 (
-                    crate::translation::expression::full_table_scan_filter(field_id),
+                    expression::full_table_scan_filter(field_id),
                     true,
                 )
             }
@@ -4139,7 +4158,7 @@ where
                     "table has no columns; cannot perform wildcard scan".into(),
                 )
             })?;
-            filter_expr = crate::translation::expression::full_table_scan_filter(field_id);
+            filter_expr = expression::full_table_scan_filter(field_id);
             full_table_scan = true;
         }
 
@@ -4150,7 +4169,7 @@ where
         if let Some(first) = expanded_order.first() {
             match &first.target {
                 OrderTarget::Column(name) => {
-                    if table_ref.schema.resolve(name).is_some() {
+                    if table_ref.schema.column_by_name(name).is_some() {
                         physical_order = Some(resolve_scan_order(table_ref, &projections, first)?);
                     }
                 }
@@ -4207,6 +4226,7 @@ where
             expanded_order,
             plan.distinct,
         ))
+        */
     }
 
     fn execute_projection_with_subqueries(
@@ -4228,12 +4248,12 @@ where
             Vec<SelectProjection>,
         ) = if plan.projections.is_empty() {
             (
-                build_wildcard_projections(table_ref),
+                build_wildcard_projections(&table_ref.schema, table_ref.table_id()),
                 vec![SelectProjection::AllColumns],
             )
         } else {
             (
-                build_projected_columns(table_ref, &plan.projections)?,
+                build_projected_columns(&table_ref.schema, table_ref.table_id(), &plan.projections)?,
                 plan.projections.clone(),
             )
         };
@@ -4244,14 +4264,14 @@ where
             .map(|subquery| (subquery.id, subquery))
             .collect();
 
-        let base_projections = build_wildcard_projections(table_ref);
+        let base_projections = build_wildcard_projections(&table_ref.schema, table_ref.table_id());
 
         let filter_wrapper_opt = plan.filter.as_ref();
 
         // Check if the filter contains scalar subqueries that need to be handled
         let mut filter_has_scalar_subqueries = false;
         if let Some(filter_wrapper) = filter_wrapper_opt {
-            let translated = crate::translation::expression::translate_predicate(
+            let translated = expression::translate_predicate(
                 filter_wrapper.predicate.clone(),
                 table_ref.schema.as_ref(),
                 |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -4263,7 +4283,7 @@ where
 
         let mut translated_filter: Option<llkv_expr::expr::Expr<'static, FieldId>> = None;
         let pushdown_filter = if let Some(filter_wrapper) = filter_wrapper_opt {
-            let translated = crate::translation::expression::translate_predicate(
+            let translated = expression::translate_predicate(
                 filter_wrapper.predicate.clone(),
                 table_ref.schema.as_ref(),
                 |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -4279,7 +4299,7 @@ where
                                 .into(),
                         )
                     })?;
-                    crate::translation::expression::full_table_scan_filter(field_id)
+                    expression::full_table_scan_filter(field_id)
                 } else {
                     // Only EXISTS subqueries, strip them for pushdown
                     strip_exists(&translated)
@@ -4293,7 +4313,7 @@ where
                     "table has no columns; cannot perform scalar subquery projection".into(),
                 )
             })?;
-            crate::translation::expression::full_table_scan_filter(field_id)
+            expression::full_table_scan_filter(field_id)
         };
 
         let mut base_fields: Vec<Field> = Vec::with_capacity(table_ref.schema.columns.len());
@@ -4301,7 +4321,7 @@ where
             base_fields.push(Field::new(
                 column.name.clone(),
                 column.data_type.clone(),
-                column.nullable,
+                column.is_nullable,
             ));
         }
         let base_schema = Arc::new(Schema::new(base_fields));
@@ -4569,8 +4589,8 @@ where
         // For base scan, we want all columns from the table
         // We build wildcard projections directly to avoid any expression evaluation
         let table_ref = table.as_ref();
-        let projections = build_wildcard_projections(table_ref);
-        let base_schema = schema_for_projections(table_ref, &projections)?;
+        let projections = build_wildcard_projections(&table_ref.schema, table_ref.table_id());
+        let base_schema = schema_for_projections(&table_ref.schema, &projections)?;
 
         // Build filter if present (should NOT contain aggregates)
         tracing::debug!(
@@ -4583,7 +4603,7 @@ where
                     "[GROUP BY] Translating filter predicate: {:?}",
                     filter_wrapper.predicate
                 );
-                let expr = crate::translation::expression::translate_predicate(
+                let expr = expression::translate_predicate(
                     filter_wrapper.predicate.clone(),
                     table_ref.schema.as_ref(),
                     |name| {
@@ -5497,7 +5517,7 @@ where
                     function,
                     distinct,
                 } => {
-                    let col = table_ref.schema.resolve(&column).ok_or_else(|| {
+                    let col = table_ref.schema.column_by_name(&column).ok_or_else(|| {
                         Error::InvalidArgumentError(format!(
                             "unknown column '{}' in aggregate",
                             column
@@ -5590,7 +5610,7 @@ where
                         "EXISTS subqueries not yet implemented in aggregate queries".into(),
                     ));
                 }
-                let mut translated = crate::translation::expression::translate_predicate(
+                let mut translated = expression::translate_predicate(
                     filter_wrapper.predicate.clone(),
                     table.schema.as_ref(),
                     |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -5641,7 +5661,7 @@ where
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                crate::translation::expression::full_table_scan_filter(field_id)
+                expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -5853,14 +5873,14 @@ where
                     ));
                 }
                 SelectProjection::Column { name, alias } => {
-                    let col = table_ref.schema.resolve(name).ok_or_else(|| {
+                    let col = table_ref.schema.column_by_name(name).ok_or_else(|| {
                         Error::InvalidArgumentError(format!("unknown column '{}'", name))
                     })?;
                     let field_name = alias.as_ref().unwrap_or(name);
                     fields.push(arrow::datatypes::Field::new(
                         field_name,
                         col.data_type.clone(),
-                        col.nullable,
+                        col.is_nullable,
                     ));
                     // For regular columns in an aggregate query, we'd need to handle GROUP BY
                     // For now, return an error as this is not supported
@@ -6235,7 +6255,7 @@ where
                 }
                 AggregateCall::Count { expr, distinct } => {
                     if let Some(col_name) = try_extract_simple_column(expr) {
-                        let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                             Error::InvalidArgumentError(format!(
                                 "unknown column '{}' in aggregate",
                                 col_name
@@ -6281,7 +6301,7 @@ where
                 AggregateCall::Sum { expr, distinct } => {
                     let (projection_index, data_type, field_id) =
                         if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                                 Error::InvalidArgumentError(format!(
                                     "unknown column '{}' in aggregate",
                                     col_name
@@ -6328,7 +6348,7 @@ where
                 AggregateCall::Total { expr, distinct } => {
                     let (projection_index, data_type, field_id) =
                         if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                                 Error::InvalidArgumentError(format!(
                                     "unknown column '{}' in aggregate",
                                     col_name
@@ -6375,7 +6395,7 @@ where
                 AggregateCall::Avg { expr, distinct } => {
                     let (projection_index, data_type, field_id) =
                         if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                                 Error::InvalidArgumentError(format!(
                                     "unknown column '{}' in aggregate",
                                     col_name
@@ -6427,7 +6447,7 @@ where
                 AggregateCall::Min(expr) => {
                     let (projection_index, data_type, field_id) =
                         if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                                 Error::InvalidArgumentError(format!(
                                     "unknown column '{}' in aggregate",
                                     col_name
@@ -6473,7 +6493,7 @@ where
                 AggregateCall::Max(expr) => {
                     let (projection_index, data_type, field_id) =
                         if let Some(col_name) = try_extract_simple_column(expr) {
-                            let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                            let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                                 Error::InvalidArgumentError(format!(
                                     "unknown column '{}' in aggregate",
                                     col_name
@@ -6518,7 +6538,7 @@ where
                 }
                 AggregateCall::CountNulls(expr) => {
                     if let Some(col_name) = try_extract_simple_column(expr) {
-                        let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                             Error::InvalidArgumentError(format!(
                                 "unknown column '{}' in aggregate",
                                 col_name
@@ -6563,7 +6583,7 @@ where
                     separator,
                 } => {
                     if let Some(col_name) = try_extract_simple_column(expr) {
-                        let col = table_ref.schema.resolve(col_name).ok_or_else(|| {
+                        let col = table_ref.schema.column_by_name(col_name).ok_or_else(|| {
                             Error::InvalidArgumentError(format!(
                                 "unknown column '{}' in aggregate",
                                 col_name
@@ -6612,7 +6632,7 @@ where
         }
 
         let filter_expr = match filter {
-            Some(expr) => crate::translation::expression::translate_predicate(
+            Some(expr) => expression::translate_predicate(
                 expr.clone(),
                 table_ref.schema.as_ref(),
                 |name| Error::InvalidArgumentError(format!("unknown column '{}'", name)),
@@ -6623,7 +6643,7 @@ where
                         "table has no columns; cannot perform aggregate scan".into(),
                     )
                 })?;
-                crate::translation::expression::full_table_scan_filter(field_id)
+                expression::full_table_scan_filter(field_id)
             }
         };
 
@@ -8477,11 +8497,12 @@ impl CrossProductExpressionContext {
             let executor_column = ExecutorColumn {
                 name: field.name().clone(),
                 data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                primary_key: false,
-                unique: false,
+                is_nullable: field.is_nullable(),
+                is_primary_key: false,
+                is_unique: false,
                 field_id: next_field_id,
                 check_expr: None,
+                default_value: None,
             };
             let field_id = next_field_id;
             next_field_id = next_field_id.saturating_add(1);
@@ -8491,7 +8512,7 @@ impl CrossProductExpressionContext {
         }
 
         Ok(Self {
-            schema: Arc::new(ExecutorSchema { columns, lookup }),
+            schema: Arc::new(ExecutorSchema { columns, name_to_index: lookup }),
             field_id_to_index,
             numeric_cache: FxHashMap::default(),
             column_cache: FxHashMap::default(),
@@ -8506,7 +8527,7 @@ impl CrossProductExpressionContext {
     }
 
     fn field_id_for_column(&self, name: &str) -> Option<FieldId> {
-        self.schema.resolve(name).map(|column| column.field_id)
+        self.schema.column_by_name(name).map(|column| column.field_id)
     }
 
     fn reset(&mut self) {
@@ -10928,6 +10949,8 @@ where
     },
     PhysicalPlan {
         plan: Arc<dyn llkv_plan::physical::PhysicalPlan>,
+        distinct: bool,
+        order_by: Vec<OrderByPlan>,
     },
 }
 
@@ -10981,11 +11004,14 @@ where
     pub fn from_physical_plan(
         table_name: String,
         plan: Arc<dyn llkv_plan::physical::PhysicalPlan>,
+        distinct: bool,
+        order_by: Vec<OrderByPlan>,
     ) -> Self {
+        let schema = plan.schema();
         Self {
             table_name,
-            schema: plan.schema(),
-            stream: SelectStream::PhysicalPlan { plan },
+            schema,
+            stream: SelectStream::PhysicalPlan { plan, distinct, order_by },
             limit: None,
             offset: None,
         }
@@ -11175,12 +11201,52 @@ where
                 }
                 Ok(())
             }
-            SelectStream::PhysicalPlan { plan } => {
+            SelectStream::PhysicalPlan { plan, distinct, order_by } => {
+                let mut distinct_state = if distinct {
+                    Some(DistinctState::default())
+                } else {
+                    None
+                };
+                
+                let needs_post_sort = !order_by.is_empty();
+                let mut buffered_batches: Vec<RecordBatch> = Vec::new();
+
                 let iterator = plan.execute().map_err(|e| Error::Internal(e))?;
                 for batch_result in iterator {
-                    let batch = batch_result.map_err(|e| Error::Internal(e))?;
-                    on_batch(batch)?;
+                    let mut batch = batch_result.map_err(|e| Error::Internal(e))?;
+                    
+                    if let Some(state) = distinct_state.as_mut() {
+                        match distinct_filter_batch(batch, state) {
+                            Ok(Some(filtered)) => {
+                                batch = filtered;
+                            }
+                            Ok(None) => {
+                                continue;
+                            }
+                            Err(err) => {
+                                return Err(err);
+                            }
+                        }
+                    }
+
+                    if needs_post_sort {
+                        buffered_batches.push(batch);
+                    } else {
+                        on_batch(batch)?;
+                    }
                 }
+
+                if needs_post_sort && !buffered_batches.is_empty() {
+                    let combined = concat_batches(&schema, &buffered_batches).map_err(|err| {
+                        Error::InvalidArgumentError(format!(
+                            "failed to concatenate result batches for ORDER BY: {}",
+                            err
+                        ))
+                    })?;
+                    let sorted_batch = sort_record_batch_with_order(&schema, &combined, &order_by)?;
+                    on_batch(sorted_batch)?;
+                }
+
                 Ok(())
             }
             SelectStream::Aggregation { batch } => on_batch(batch),
@@ -11330,7 +11396,7 @@ where
 {
     let (column, field_id) = match &order_plan.target {
         OrderTarget::Column(name) => {
-            let column = table.schema.resolve(name).ok_or_else(|| {
+            let column = table.schema.column_by_name(name).ok_or_else(|| {
                 Error::InvalidArgumentError(format!("unknown column '{}' in ORDER BY", name))
             })?;
             (column, column.field_id)
@@ -11505,7 +11571,7 @@ where
         fields.push(Field::new(
             qualified_name,
             column.data_type.clone(),
-            column.nullable,
+            column.is_nullable,
         ));
     }
 
@@ -11553,7 +11619,7 @@ where
     }
 
     let filter_expr = if filter_exprs.is_empty() {
-        crate::translation::expression::full_table_scan_filter(filter_field_id)
+        expression::full_table_scan_filter(filter_field_id)
     } else if filter_exprs.len() == 1 {
         filter_exprs.pop().unwrap()
     } else {
@@ -13821,6 +13887,20 @@ fn sort_record_batch_with_order(
     let mut sort_columns: Vec<SortColumn> = Vec::with_capacity(order_by.len());
 
     for order in order_by {
+        if let OrderTarget::All = &order.target {
+            for i in 0..batch.num_columns() {
+                let source_array = batch.column(i);
+                sort_columns.push(SortColumn {
+                    values: source_array.clone(),
+                    options: Some(SortOptions {
+                        descending: !order.ascending,
+                        nulls_first: order.nulls_first,
+                    }),
+                });
+            }
+            continue;
+        }
+
         let column_index = match &order.target {
             OrderTarget::Column(name) => schema.index_of(name).map_err(|_| {
                 Error::InvalidArgumentError(format!(
@@ -13838,11 +13918,7 @@ fn sort_record_batch_with_order(
                 }
                 *idx
             }
-            OrderTarget::All => {
-                return Err(Error::InvalidArgumentError(
-                    "ORDER BY ALL should be expanded before sorting".into(),
-                ));
-            }
+            OrderTarget::All => unreachable!(),
         };
 
         let source_array = batch.column(column_index);

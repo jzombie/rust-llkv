@@ -115,9 +115,10 @@ where
             column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                primary_key: column.primary_key,
-                unique: column.unique,
+                is_nullable: column.nullable,
+                is_primary_key: column.primary_key,
+                is_unique: column.unique,
+                default_value: None,
                 field_id: column.field_id,
                 check_expr: column.check_expr.clone(),
             });
@@ -125,7 +126,7 @@ where
 
         let schema = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
-            lookup: column_lookup,
+            name_to_index: column_lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
             storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table))),
@@ -180,9 +181,9 @@ where
                         .map(|column| ForeignKeyColumn {
                             name: column.name.clone(),
                             data_type: column.data_type.clone(),
-                            nullable: column.nullable,
-                            primary_key: column.primary_key,
-                            unique: column.unique,
+                            nullable: column.is_nullable,
+                            primary_key: column.is_primary_key,
+                            unique: column.is_unique,
                             field_id: column.field_id,
                         })
                         .collect();
@@ -316,9 +317,10 @@ where
             column_defs.push(ExecutorColumn {
                 name: column.name.clone(),
                 data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                primary_key: column.primary_key,
-                unique: column.unique,
+                is_nullable: column.nullable,
+                is_primary_key: column.primary_key,
+                is_unique: column.unique,
+                default_value: None,
                 field_id: column.field_id,
                 check_expr: column.check_expr.clone(),
             });
@@ -326,7 +328,7 @@ where
 
         let schema_arc = Arc::new(ExecutorSchema {
             columns: column_defs.clone(),
-            lookup: column_lookup,
+            name_to_index: column_lookup,
         });
         let table_entry = Arc::new(ExecutorTable {
             storage: Arc::new(TableStorageAdapter::new(Arc::clone(&table))),

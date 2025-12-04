@@ -1727,15 +1727,19 @@ name = "llkv-plan"
 version = "0.8.5-alpha"
 dependencies = [
  "arrow",
+ "llkv-column-map",
  "llkv-compute",
  "llkv-expr",
  "llkv-result",
+ "llkv-scan",
+ "llkv-storage",
  "llkv-test-utils",
  "llkv-types",
  "regex",
  "rustc-hash",
  "serde",
  "serde_json",
+ "simd-r-drive-entry-handle",
  "sqlparser",
  "thiserror",
  "time",
@@ -1966,6 +1970,7 @@ version = "0.8.5-alpha"
 dependencies = [
  "arrow",
  "arrow-buffer",
+ "bitcode",
  "llkv-result",
  "llkv-test-utils",
  "modular-bitfield",

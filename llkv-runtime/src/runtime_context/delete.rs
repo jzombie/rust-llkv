@@ -7,7 +7,8 @@
 
 use crate::{RuntimeStatementResult, canonical_table_name};
 use croaring::Treemap;
-use llkv_executor::{ExecutorTable, translation};
+use llkv_executor::ExecutorTable;
+use llkv_plan::translation;
 use llkv_expr::Expr as LlkvExpr;
 use llkv_plan::DeletePlan;
 use llkv_result::{Error, Result};

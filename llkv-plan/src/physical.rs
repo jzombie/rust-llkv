@@ -5,6 +5,10 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
+pub mod scan;
+pub mod table;
+pub mod ranges;
+
 /// A physical plan represents an executable query plan.
 ///
 /// It is similar to a logical plan but contains all necessary details for execution,

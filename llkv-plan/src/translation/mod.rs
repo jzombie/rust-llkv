@@ -1,9 +1,3 @@
-//! Expression and query plan translation utilities.
-//!
-//! This module handles translation from string-based expressions to field-ID-based expressions
-//! that can be executed against the storage layer. It also manages projection building and
-//! schema construction for query results.
-
 pub mod expression;
 pub mod projection;
 pub mod schema;

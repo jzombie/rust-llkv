@@ -10869,7 +10869,7 @@ fn resolve_column_type_in_plan(
                 target_col
             };
 
-            if let Some(field) = table.schema.resolve(target_col) {
+            if let Some(field) = table.schema.column_by_name(target_col) {
                 return Ok(field.data_type.clone());
             }
         }
