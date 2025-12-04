@@ -146,7 +146,7 @@ where
                         ranges = Some(r);
                         let logical_field_id = LogicalFieldId::for_user(table_id, col.field_id);
                         driving_column = Some(logical_field_id);
-                        // TODO: Support multiple driving columns? It's currently first-match wins.
+                        // TODO: Support combining multiple range columns, choosing the most selective column
                         break;
                     }
                 }
