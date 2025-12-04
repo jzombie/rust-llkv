@@ -1970,7 +1970,6 @@ version = "0.8.5-alpha"
 dependencies = [
  "arrow",
  "arrow-buffer",
- "bitcode",
  "llkv-result",
  "llkv-test-utils",
  "modular-bitfield",

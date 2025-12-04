@@ -17,7 +17,6 @@ build = []
 [dependencies]
 arrow = { workspace = true }
 arrow-buffer = { workspace = true }
-bitcode.workspace = true
 llkv-result = { workspace = true }
 modular-bitfield.workspace = true
 serde = { workspace = true, features = ["derive"], optional = true }
