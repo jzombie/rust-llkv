@@ -5,8 +5,9 @@
 //! - MVCC-based soft deletion of all rows
 
 use crate::{RuntimeStatementResult, canonical_table_name};
-use llkv_executor::{ExecutorTable, translation};
+use llkv_executor::ExecutorTable;
 use llkv_plan::TruncatePlan;
+use llkv_plan::translation;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_transaction::TransactionSnapshot;

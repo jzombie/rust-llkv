@@ -99,6 +99,46 @@ impl Literal {
             }
         }
     }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Literal::Int128(v) => (*v).try_into().ok(),
+            Literal::Float64(v) => {
+                if !v.is_finite() {
+                    return None;
+                }
+                let truncated = v.trunc();
+                if truncated != *v {
+                    return None;
+                }
+                if truncated < i64::MIN as f64 || truncated > i64::MAX as f64 {
+                    return None;
+                }
+                Some(truncated as i64)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Literal::Int128(v) => (*v).try_into().ok(),
+            Literal::Float64(v) => {
+                if !v.is_finite() || *v < 0.0 {
+                    return None;
+                }
+                let truncated = v.trunc();
+                if truncated != *v {
+                    return None;
+                }
+                if truncated > u64::MAX as f64 {
+                    return None;
+                }
+                Some(truncated as u64)
+            }
+            _ => None,
+        }
+    }
 }
 
 fn format_date32(days: i32) -> String {

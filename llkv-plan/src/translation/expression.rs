@@ -1,25 +1,20 @@
-use crate::{ExecutorResult, ExecutorSchema, FieldId};
-use llkv_column_map::ROW_ID_COLUMN_NAME;
-use llkv_expr::expr::{AggregateCall, Expr as LlkvExpr, Filter, Operator, ScalarExpr};
+use crate::plans::PlanResult;
+use crate::schema::PlanSchema;
+use llkv_column_map::store::ROW_ID_COLUMN_NAME;
+use llkv_expr::expr::{AggregateCall, Expr as LlkvExpr, Filter, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
-use llkv_table::ROW_ID_FIELD_ID;
-use std::ops::Bound;
+use llkv_types::FieldId;
+use llkv_types::ids::ROW_ID_FIELD_ID;
 
-pub fn full_table_scan_filter(field_id: FieldId) -> LlkvExpr<'static, FieldId> {
-    LlkvExpr::Pred(Filter {
-        field_id,
-        op: Operator::Range {
-            lower: Bound::Unbounded,
-            upper: Bound::Unbounded,
-        },
-    })
+pub fn full_table_scan_filter(_field_id: FieldId) -> LlkvExpr<'static, FieldId> {
+    LlkvExpr::Literal(true)
 }
 
 pub fn translate_predicate<F>(
     expr: LlkvExpr<'static, String>,
-    schema: &ExecutorSchema,
+    schema: &PlanSchema,
     unknown_column: F,
-) -> ExecutorResult<LlkvExpr<'static, FieldId>>
+) -> PlanResult<LlkvExpr<'static, FieldId>>
 where
     F: Fn(&str) -> Error + Copy,
 {
@@ -28,10 +23,10 @@ where
 
 pub fn translate_predicate_with<F, G>(
     expr: LlkvExpr<'static, String>,
-    schema: &ExecutorSchema,
+    schema: &PlanSchema,
     unknown_column: F,
     unknown_aggregate: G,
-) -> ExecutorResult<LlkvExpr<'static, FieldId>>
+) -> PlanResult<LlkvExpr<'static, FieldId>>
 where
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
@@ -175,9 +170,9 @@ where
 
 pub fn translate_scalar<F>(
     expr: &ScalarExpr<String>,
-    schema: &ExecutorSchema,
+    schema: &PlanSchema,
     unknown_column: F,
-) -> ExecutorResult<ScalarExpr<FieldId>>
+) -> PlanResult<ScalarExpr<FieldId>>
 where
     F: Fn(&str) -> Error + Copy,
 {
@@ -186,10 +181,10 @@ where
 
 pub fn translate_scalar_with<F, G>(
     expr: &ScalarExpr<String>,
-    schema: &ExecutorSchema,
+    schema: &PlanSchema,
     unknown_column: F,
     _unknown_aggregate: G,
-) -> ExecutorResult<ScalarExpr<FieldId>>
+) -> PlanResult<ScalarExpr<FieldId>>
 where
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
@@ -387,11 +382,7 @@ where
 }
 
 // TODO: Move to `resolvers.rs`
-fn resolve_field_id<F>(
-    schema: &ExecutorSchema,
-    name: &str,
-    unknown_column: F,
-) -> ExecutorResult<FieldId>
+fn resolve_field_id<F>(schema: &PlanSchema, name: &str, unknown_column: F) -> PlanResult<FieldId>
 where
     F: Fn(&str) -> Error,
 {
@@ -401,19 +392,19 @@ where
     }
 
     schema
-        .resolve(name)
+        .column_by_name(name)
         .map(|column| column.field_id)
         .ok_or_else(|| unknown_column(name))
 }
 
 // TODO: Move to `resolvers.rs`
-pub fn resolve_field_id_from_schema(schema: &ExecutorSchema, name: &str) -> LlkvResult<FieldId> {
+pub fn resolve_field_id_from_schema(schema: &PlanSchema, name: &str) -> LlkvResult<FieldId> {
     if name.eq_ignore_ascii_case(ROW_ID_COLUMN_NAME) {
         return Ok(ROW_ID_FIELD_ID);
     }
 
     schema
-        .resolve(name)
+        .column_by_name(name)
         .map(|column| column.field_id)
         .ok_or_else(|| {
             Error::InvalidArgumentError(format!(

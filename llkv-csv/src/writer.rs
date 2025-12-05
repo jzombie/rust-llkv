@@ -231,6 +231,8 @@ where
             order: None,
             row_id_filter: None,
             include_row_ids: false,
+            ranges: None,
+            driving_column: None,
         };
 
         tracing::trace!("[CSV_EXPORT] About to call scan_stream_with_exprs");

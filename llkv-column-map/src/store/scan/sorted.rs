@@ -1618,6 +1618,32 @@ where
     };
     drop(catalog);
 
+    // Prune chunks that don't overlap with the requested ranges
+    let (metas_val, metas_rid) = if opts.with_row_ids {
+        if metas_val.len() != metas_rid.len() {
+            return Err(Error::Internal(
+                "chunk count mismatch before pruning".into(),
+            ));
+        }
+        let mut new_val = Vec::with_capacity(metas_val.len());
+        let mut new_rid = Vec::with_capacity(metas_rid.len());
+        for (mv, mr) in metas_val.into_iter().zip(metas_rid.into_iter()) {
+            if ir.matches(mv.min_val_u64, mv.max_val_u64) {
+                new_val.push(mv);
+                new_rid.push(mr);
+            }
+        }
+        (new_val, new_rid)
+    } else {
+        let mut new_val = Vec::with_capacity(metas_val.len());
+        for mv in metas_val {
+            if ir.matches(mv.min_val_u64, mv.max_val_u64) {
+                new_val.push(mv);
+            }
+        }
+        (new_val, Vec::new())
+    };
+
     if metas_val.is_empty() {
         return Ok(());
     }

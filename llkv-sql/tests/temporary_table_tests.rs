@@ -132,7 +132,7 @@ fn temporary_tables_allow_inserts_after_unique_index() {
         .columns
         .iter()
         .find(|col| col.name.eq_ignore_ascii_case("j"))
-        .map(|col| col.unique)
+        .map(|col| col.is_unique)
         .unwrap_or_default();
     assert!(
         unique_flag,

@@ -69,7 +69,7 @@ where
                     .schema
                     .columns
                     .iter()
-                    .filter(|c| c.primary_key)
+                    .filter(|c| c.is_primary_key)
                     .map(|c| &c.name)
                     .collect::<Vec<_>>()
             );
@@ -250,7 +250,7 @@ where
             let field = mvcc::build_field_with_metadata(
                 &column.name,
                 column.data_type.clone(),
-                column.nullable,
+                column.is_nullable,
                 column.field_id,
             );
             arrays.push(array);

@@ -27,7 +27,7 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
     let mut resolved = Vec::with_capacity(columns.len());
     for column in columns {
         let normalized = column.to_ascii_lowercase();
-        let index = schema.lookup.get(&normalized).ok_or_else(|| {
+        let index = schema.name_to_index.get(&normalized).ok_or_else(|| {
             Error::InvalidArgumentError(format!(
                 "Binder Error: does not have a column named '{}'",
                 column

@@ -1373,6 +1373,7 @@ pub trait FilterPrimitive {
     fn run_nullable_filter<P, F>(
         store: &ColumnStore<P>,
         field_id: LogicalFieldId,
+        ranges: crate::store::scan::ranges::IntRanges,
         predicate: F,
     ) -> Result<Vec<u64>>
     where
@@ -1413,13 +1414,14 @@ macro_rules! impl_filter_primitive {
             fn run_nullable_filter<P, F>(
                 store: &ColumnStore<P>,
                 field_id: LogicalFieldId,
+                ranges: crate::store::scan::ranges::IntRanges,
                 predicate: F,
             ) -> Result<Vec<u64>>
             where
                 P: Pager<Blob = EntryHandle> + Send + Sync,
                 F: FnMut(Option<Self::Native>) -> bool,
             {
-                run_nullable_filter_for::<P, $ty, F>(store, field_id, predicate)
+                run_nullable_filter_for::<P, $ty, F>(store, field_id, ranges, predicate)
             }
 
             fn run_filter<P, F>(
@@ -1475,6 +1477,7 @@ impl FilterPrimitive for arrow::datatypes::BooleanType {
     fn run_nullable_filter<P, F>(
         store: &ColumnStore<P>,
         field_id: LogicalFieldId,
+        _ranges: crate::store::scan::ranges::IntRanges,
         predicate: F,
     ) -> Result<Vec<u64>>
     where
@@ -1642,6 +1645,7 @@ where
 pub(crate) fn run_nullable_filter_for<P, T, F>(
     store: &ColumnStore<P>,
     field_id: LogicalFieldId,
+    ranges: crate::store::scan::ranges::IntRanges,
     predicate: F,
 ) -> Result<Vec<u64>>
 where
@@ -1656,6 +1660,7 @@ where
     let mut visitor = RowIdNullableFilterVisitor::<T, F>::new(predicate);
     ScanBuilder::new(store, field_id)
         .with_row_ids(rowid_fid(field_id))
+        .with_ranges(ranges)
         .run(&mut visitor)?;
     Ok(visitor.into_row_ids())
 }

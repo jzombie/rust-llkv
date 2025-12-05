@@ -9,8 +9,9 @@
 use arrow::array::{Array, UInt64Array};
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_executor::{ExecutorTable, translation};
+use llkv_executor::ExecutorTable;
 use llkv_plan::PlanValue;
+use llkv_plan::translation;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::{
@@ -343,7 +344,7 @@ where
                     name: column.name.clone(),
                     field_id: column.field_id,
                     data_type: column.data_type.clone(),
-                    nullable: column.nullable,
+                    nullable: column.is_nullable,
                     check_expr: column.check_expr.clone(),
                 },
             })
@@ -354,7 +355,7 @@ where
             .columns
             .iter()
             .enumerate()
-            .filter(|(_, column)| column.unique && !column.primary_key)
+            .filter(|(_, column)| column.is_unique && !column.is_primary_key)
             .map(|(idx, column)| InsertUniqueColumn {
                 schema_index: idx,
                 field_id: column.field_id,
@@ -395,7 +396,7 @@ where
             .columns
             .iter()
             .enumerate()
-            .filter(|(_, column)| column.primary_key)
+            .filter(|(_, column)| column.is_primary_key)
             .map(|(idx, _)| idx)
             .collect();
 

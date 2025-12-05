@@ -69,6 +69,7 @@ fn unsorted_scan_works_without_index_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut v,
         )
@@ -127,6 +128,7 @@ fn unsorted_with_row_ids_works_without_index() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut v,
         )
@@ -174,6 +176,7 @@ fn sorted_scan_without_index_returns_error() {
             include_nulls: false,
             nulls_first: false,
             anchor_row_id_field: None,
+            ranges: Default::default(),
         },
         &mut v,
     );

@@ -405,6 +405,11 @@ where
         self
     }
 
+    pub fn with_ranges(mut self, ranges: IntRanges) -> Self {
+        self.ir = ranges;
+        self
+    }
+
     // Generic, monomorphized range setter (no perf impact):
     // Usage: builder.with_range::<u64,_>(2000..=8000)
     pub fn with_range<T, R>(mut self, r: R) -> Self
@@ -429,7 +434,7 @@ where
         self
     }
 
-    pub fn run<V>(self, visitor: &mut V) -> Result<()>
+    pub fn run<V>(mut self, visitor: &mut V) -> Result<()>
     where
         V: crate::store::scan::PrimitiveVisitor
             + crate::store::scan::PrimitiveSortedVisitor
@@ -448,6 +453,10 @@ where
             || self.ir.f64_r.is_some()
             || self.ir.f32_r.is_some()
             || self.ir.bool_r.is_some();
+
+        // Pass ranges to options so the store can use them for pruning
+        self.opts.ranges = self.ir;
+
         if !has_ranges {
             return self.store.scan(self.field_id, self.opts, visitor);
         }

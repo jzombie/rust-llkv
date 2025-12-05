@@ -19,14 +19,18 @@ build = []
 
 [dependencies]
 arrow = { workspace = true, default-features = false }
+llkv-column-map.workspace = true
 llkv-compute.workspace = true
 llkv-expr.workspace = true
 llkv-result.workspace = true
+llkv-scan.workspace = true
+llkv-storage.workspace = true
 llkv-types.workspace = true
 regex.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
 thiserror.workspace = true
 time.workspace = true

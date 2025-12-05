@@ -27,6 +27,8 @@ pub(crate) struct ChunkMetadata {
     pub(crate) serialized_bytes: u64,
     pub(crate) min_val_u64: u64, // For pruning, assumes u64-comparable values
     pub(crate) max_val_u64: u64,
+    pub(crate) null_count: u64,
+    pub(crate) distinct_count: u64,
 }
 
 impl ChunkMetadata {
@@ -41,6 +43,8 @@ impl ChunkMetadata {
         write_u64_le(&mut buf, self.serialized_bytes);
         write_u64_le(&mut buf, self.min_val_u64);
         write_u64_le(&mut buf, self.max_val_u64);
+        write_u64_le(&mut buf, self.null_count);
+        write_u64_le(&mut buf, self.distinct_count);
         buf
     }
 
@@ -52,6 +56,17 @@ impl ChunkMetadata {
         let serialized_bytes = read_u64_le(bytes, &mut o);
         let min_val_u64 = read_u64_le(bytes, &mut o);
         let max_val_u64 = read_u64_le(bytes, &mut o);
+        // Handle backward compatibility: if buffer is too short, default to 0
+        let null_count = if o < bytes.len() {
+            read_u64_le(bytes, &mut o)
+        } else {
+            0
+        };
+        let distinct_count = if o < bytes.len() {
+            read_u64_le(bytes, &mut o)
+        } else {
+            0
+        };
 
         Self {
             chunk_pk,
@@ -60,6 +75,8 @@ impl ChunkMetadata {
             serialized_bytes,
             min_val_u64,
             max_val_u64,
+            null_count,
+            distinct_count,
         }
     }
 }

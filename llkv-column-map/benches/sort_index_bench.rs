@@ -48,7 +48,7 @@ use llkv_column_map::ROW_ID_COLUMN_NAME;
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
 
-use llkv_column_map::store::scan::ScanOptions;
+use llkv_column_map::store::scan::{ScanOptions, ranges::IntRanges};
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_storage::pager::MemPager;
 use llkv_types::LogicalFieldId;
@@ -208,6 +208,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             include_nulls: false,
                             nulls_first: false,
                             anchor_row_id_field: None,
+                            ranges: IntRanges::default(),
                         },
                         &mut v,
                     )
@@ -237,6 +238,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             include_nulls: false,
                             nulls_first: false,
                             anchor_row_id_field: None,
+                            ranges: IntRanges::default(),
                         },
                         &mut c,
                     )
@@ -289,6 +291,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             include_nulls: false,
                             nulls_first: false,
                             anchor_row_id_field: None,
+                            ranges: IntRanges::default(),
                         },
                         &mut c,
                     )
@@ -324,6 +327,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             include_nulls: false,
                             nulls_first: false,
                             anchor_row_id_field: None,
+                            ranges: IntRanges::default(),
                         },
                         &mut v,
                     )
@@ -353,6 +357,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             include_nulls: false,
                             nulls_first: false,
                             anchor_row_id_field: None,
+                            ranges: IntRanges::default(),
                         },
                         &mut c,
                     )
@@ -405,6 +410,7 @@ fn bench_index_matrix_1m(c: &mut Criterion) {
                             include_nulls: false,
                             nulls_first: false,
                             anchor_row_id_field: None,
+                            ranges: IntRanges::default(),
                         },
                         &mut c,
                     )

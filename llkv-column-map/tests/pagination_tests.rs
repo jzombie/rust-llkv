@@ -70,6 +70,7 @@ fn pagination_unsorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )
@@ -95,6 +96,7 @@ fn pagination_unsorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )
@@ -119,6 +121,7 @@ fn pagination_unsorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )
@@ -144,6 +147,7 @@ fn pagination_unsorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )
@@ -203,6 +207,7 @@ fn pagination_sorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )
@@ -229,6 +234,7 @@ fn pagination_sorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )
@@ -270,6 +276,7 @@ fn pagination_sorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )
@@ -295,6 +302,7 @@ fn pagination_sorted_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut vis,
         )

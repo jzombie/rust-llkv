@@ -109,6 +109,7 @@ fn unsorted_with_nulls_anchor_order() {
                 anchor_row_id_field: Some(
                     anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
                 ),
+                ranges: Default::default(),
             },
             &mut c,
         )
