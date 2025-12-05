@@ -10,7 +10,7 @@ use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::schema_ext::CachedSchema;
-use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
+use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::FieldId;
 use llkv_types::LogicalFieldId;
 use rustc_hash::FxHashMap;
@@ -82,6 +82,22 @@ pub fn hash_join_rowid_stream<P, F>(
     right: &Table<P>,
     keys: &[JoinKey],
     options: &JoinOptions,
+    on_batch: F,
+) -> LlkvResult<()>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(JoinIndexBatch<'_>),
+{
+    hash_join_rowid_stream_with_filters(left, right, keys, options, None, None, on_batch)
+}
+
+pub fn hash_join_rowid_stream_with_filters<P, F>(
+    left: &Table<P>,
+    right: &Table<P>,
+    keys: &[JoinKey],
+    options: &JoinOptions,
+    left_filter: Option<Arc<dyn RowIdFilter<P>>>,
+    right_filter: Option<Arc<dyn RowIdFilter<P>>>,
     mut on_batch: F,
 ) -> LlkvResult<()>
 where
@@ -95,7 +111,7 @@ where
     }
 
     if keys.is_empty() {
-        return cross_product_rowid_stream(left, right, options, on_batch);
+        return cross_product_rowid_stream(left, right, options, left_filter, right_filter, on_batch);
     }
 
     let left_schema = left.schema()?;
@@ -104,8 +120,13 @@ where
     let left_projections = build_user_projections(left, &left_schema)?;
     let right_projections = build_user_projections(right, &right_schema)?;
 
-    let (hash_table, build_batches) =
-        build_hash_table(right, &right_projections, keys, &right_schema)?;
+    let (hash_table, build_batches) = build_hash_table(
+        right,
+        &right_projections,
+        keys,
+        &right_schema,
+        right_filter.clone(),
+    )?;
     let probe_key_indices = extract_left_key_indices(keys, &left_schema)?;
 
     let mut probe_batches = Vec::new();
@@ -113,7 +134,10 @@ where
     left.scan_stream(
         &left_projections,
         &probe_filter,
-        ScanStreamOptions::default(),
+        ScanStreamOptions {
+            row_id_filter: left_filter.clone(),
+            ..ScanStreamOptions::default()
+        },
         |probe_batch| probe_batches.push(probe_batch.clone()),
     )?;
 
@@ -237,6 +261,8 @@ fn cross_product_rowid_stream<P, F>(
     left: &Table<P>,
     right: &Table<P>,
     options: &JoinOptions,
+    left_filter: Option<Arc<dyn RowIdFilter<P>>>,
+    right_filter: Option<Arc<dyn RowIdFilter<P>>>,
     mut on_batch: F,
 ) -> LlkvResult<()>
 where
@@ -256,14 +282,20 @@ where
     left.scan_stream(
         &left_projections,
         &filter_left,
-        ScanStreamOptions::default(),
+        ScanStreamOptions {
+            row_id_filter: left_filter,
+            ..ScanStreamOptions::default()
+        },
         |batch| left_batches.push(batch.clone()),
     )?;
 
     right.scan_stream(
         &right_projections,
         &filter_right,
-        ScanStreamOptions::default(),
+        ScanStreamOptions {
+            row_id_filter: right_filter,
+            ..ScanStreamOptions::default()
+        },
         |batch| right_batches.push(batch.clone()),
     )?;
 
@@ -309,6 +341,7 @@ fn build_hash_table<P>(
     projections: &[ScanProjection],
     join_keys: &[JoinKey],
     schema: &Arc<Schema>,
+    row_filter: Option<Arc<dyn RowIdFilter<P>>>,
 ) -> LlkvResult<(HashTable, Vec<RecordBatch>)>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -321,7 +354,10 @@ where
     table.scan_stream(
         projections,
         &filter_expr,
-        ScanStreamOptions::default(),
+        ScanStreamOptions {
+            row_id_filter: row_filter,
+            ..ScanStreamOptions::default()
+        },
         |batch| {
             let batch_idx = batches.len();
 

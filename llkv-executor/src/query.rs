@@ -2,14 +2,18 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
-use llkv_plan::logical_planner::{LogicalPlan, LogicalPlanner};
+use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr};
+use llkv_join::{JoinKey, JoinOptions, JoinSide, JoinType, TableJoinRowIdExt, project_join_columns};
+use llkv_plan::logical_planner::{LogicalPlan, LogicalPlanner, ResolvedJoin};
 use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_plan::physical::PhysicalPlan;
 use llkv_plan::planner::PhysicalPlanner;
 use llkv_plan::plans::SelectPlan;
+use llkv_plan::plans::JoinPlan;
+use llkv_plan::schema::PlanSchema;
 use llkv_result::Error;
 use llkv_scan::RowIdFilter;
 use llkv_storage::pager::Pager;
@@ -82,9 +86,199 @@ where
                     Ok(SelectExecution::new(table_name, schema, batches))
                 }
             }
-            LogicalPlan::Multi(_) => Err(Error::InvalidArgumentError(
-                "multi-table SELECT not supported yet".into(),
-            )),
+            LogicalPlan::Multi(multi) => {
+                if multi.tables.len() != 2 {
+                    return Err(Error::InvalidArgumentError(
+                        "multi-table SELECT currently supports exactly two tables".into(),
+                    ));
+                }
+
+                if !multi.aggregates.is_empty()
+                    || !multi.group_by.is_empty()
+                    || multi.distinct
+                    || multi.compound.is_some()
+                    || multi.having.is_some()
+                {
+                    return Err(Error::InvalidArgumentError(
+                        "multi-table aggregates, DISTINCT, HAVING, or compound queries are not supported yet"
+                            .into(),
+                    ));
+                }
+
+                if !multi.order_by.is_empty() {
+                    return Err(Error::InvalidArgumentError(
+                        "ORDER BY for multi-table queries is not supported yet".into(),
+                    ));
+                }
+
+                let join = multi
+                    .joins
+                    .first()
+                    .ok_or_else(|| Error::InvalidArgumentError("missing join metadata".into()))?;
+
+                if join.left_table_index != 0 {
+                    return Err(Error::InvalidArgumentError(
+                        "only left-deep joins starting from the first table are supported".into(),
+                    ));
+                }
+
+                let left = multi.tables.get(0).ok_or_else(|| {
+                    Error::InvalidArgumentError("missing left table in multi-table plan".into())
+                })?;
+                let right = multi.tables.get(1).ok_or_else(|| {
+                    Error::InvalidArgumentError("missing right table in multi-table plan".into())
+                })?;
+
+                let left_exec = left
+                    .table
+                    .as_any()
+                    .downcast_ref::<ExecutionTableAdapter<P>>()
+                    .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?
+                    .executor_table();
+                let right_exec = right
+                    .table
+                    .as_any()
+                    .downcast_ref::<ExecutionTableAdapter<P>>()
+                    .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?
+                    .executor_table();
+
+                let join_type = map_join_type(join.join_type)?;
+                let join_keys = extract_join_keys(join)?;
+
+                let left_index_by_fid = index_fields_by_id(&left.schema);
+                let right_index_by_fid = index_fields_by_id(&right.schema);
+
+                let mut output_fields = Vec::with_capacity(multi.projections.len());
+                let mut projection_plan = Vec::with_capacity(multi.projections.len());
+
+                for proj in &multi.projections {
+                    match proj {
+                        llkv_plan::logical_planner::ResolvedProjection::Column {
+                            table_index,
+                            logical_field_id,
+                            alias,
+                        } => {
+                            let (schema, index_by_fid) = if *table_index == 0 {
+                                (&left.schema, &left_index_by_fid)
+                            } else {
+                                (&right.schema, &right_index_by_fid)
+                            };
+
+                            let field_id = logical_field_id.field_id();
+                            let Some(col_idx) = index_by_fid.get(&field_id).copied() else {
+                                return Err(Error::InvalidArgumentError(
+                                    format!("field_id {field_id} not found in table {table_index}"),
+                                ));
+                            };
+                            let col = schema
+                                .columns
+                                .get(col_idx)
+                                .ok_or_else(|| Error::Internal("projection index out of bounds".into()))?;
+
+                            let field = ArrowField::new(
+                                alias.clone().unwrap_or_else(|| col.name.clone()),
+                                col.data_type.clone(),
+                                col.is_nullable,
+                            );
+                            output_fields.push(field);
+                            projection_plan.push((*table_index, col_idx));
+                        }
+                        llkv_plan::logical_planner::ResolvedProjection::Computed { .. } => {
+                            return Err(Error::InvalidArgumentError(
+                                "computed projections are not supported yet for multi-table SELECT".into(),
+                            ))
+                        }
+                    }
+                }
+
+                let mut left_projection = Vec::new();
+                let mut right_projection = Vec::new();
+                let mut left_out_map = Vec::new();
+                let mut right_out_map = Vec::new();
+
+                for (out_idx, (table_idx, col_idx)) in projection_plan.iter().enumerate() {
+                    if *table_idx == 0 {
+                        let proj_idx = left_projection.len();
+                        left_projection.push(*col_idx);
+                        left_out_map.push((out_idx, proj_idx));
+                    } else {
+                        let proj_idx = right_projection.len();
+                        right_projection.push(*col_idx);
+                        right_out_map.push((out_idx, proj_idx));
+                    }
+                }
+
+                let mut result_batches = Vec::new();
+                let options = JoinOptions {
+                    join_type,
+                    ..Default::default()
+                };
+
+                let output_schema = Arc::new(Schema::new(output_fields.clone()));
+
+                left_exec.table.join_rowid_stream_with_filter(
+                    &right_exec.table,
+                    &join_keys,
+                    &options,
+                    row_filter.clone(),
+                    row_filter.clone(),
+                    |index_batch| {
+                        let filtered_batch = index_batch;
+
+                        if filtered_batch.left_rows.is_empty() {
+                            return;
+                        }
+
+                        let left_arrays = if left_projection.is_empty() {
+                            Vec::new()
+                        } else {
+                            project_join_columns(
+                                &filtered_batch,
+                                JoinSide::Left,
+                                &left_projection,
+                            )
+                            .expect("left projection gather failed")
+                        };
+
+                        let right_arrays = if right_projection.is_empty() {
+                            Vec::new()
+                        } else {
+                            project_join_columns(
+                                &filtered_batch,
+                                JoinSide::Right,
+                                &right_projection,
+                            )
+                            .expect("right projection gather failed")
+                        };
+
+                        let mut columns = vec![None; projection_plan.len()];
+                        for (out_idx, proj_idx) in &left_out_map {
+                            columns[*out_idx] = Some(left_arrays[*proj_idx].clone());
+                        }
+                        for (out_idx, proj_idx) in &right_out_map {
+                            columns[*out_idx] = Some(right_arrays[*proj_idx].clone());
+                        }
+
+                        let columns: Vec<_> = columns
+                            .into_iter()
+                            .map(|c| c.expect("projection column missing"))
+                            .collect();
+
+                        let batch = RecordBatch::try_new(output_schema.clone(), columns)
+                            .expect("join projection record batch creation failed");
+                        result_batches.push(batch);
+                    },
+                )?;
+
+                let schema = output_schema;
+                let batches = apply_offset_limit(result_batches, plan.offset, plan.limit);
+                let table_name = multi
+                    .table_order
+                    .first()
+                    .map(|t| t.qualified_name())
+                    .unwrap_or_default();
+                Ok(SelectExecution::new(table_name, schema, batches))
+            }
         }
     }
 }
@@ -384,6 +578,100 @@ where
             .collect();
         let plan_schema = Arc::new(llkv_plan::schema::PlanSchema { columns, name_to_index });
         Self { table, plan_schema }
+    }
+
+    fn executor_table(&self) -> Arc<ExecutorTable<P>> {
+        Arc::clone(&self.table)
+    }
+}
+
+fn index_fields_by_id(schema: &PlanSchema) -> FxHashMap<FieldId, usize> {
+    let mut map = FxHashMap::default();
+    for (idx, col) in schema.columns.iter().enumerate() {
+        map.insert(col.field_id, idx);
+    }
+    map
+}
+
+fn map_join_type(join_plan: JoinPlan) -> ExecutorResult<JoinType> {
+    match join_plan {
+        JoinPlan::Inner => Ok(JoinType::Inner),
+        JoinPlan::Left => Ok(JoinType::Left),
+        JoinPlan::Right => Err(Error::InvalidArgumentError(
+            "RIGHT JOIN is not supported yet".into(),
+        )),
+        JoinPlan::Full => Err(Error::InvalidArgumentError(
+            "FULL JOIN is not supported yet".into(),
+        )),
+    }
+}
+
+fn extract_join_keys(join: &ResolvedJoin) -> ExecutorResult<Vec<JoinKey>> {
+    let Some(on) = &join.on else {
+        // Treat missing ON as cross product
+        return Ok(Vec::new());
+    };
+
+    let mut keys = Vec::new();
+    collect_join_keys(on, join.left_table_index, &mut keys)?;
+
+    if keys.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "join ON clause must include at least one equality between tables".into(),
+        ));
+    }
+
+    Ok(keys)
+}
+
+fn collect_join_keys(
+    expr: &LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
+    left_table_index: usize,
+    out: &mut Vec<JoinKey>,
+) -> ExecutorResult<()> {
+    match expr {
+        LlkvExpr::And(list) => {
+            for e in list {
+                collect_join_keys(e, left_table_index, out)?;
+            }
+            Ok(())
+        }
+        LlkvExpr::Compare { left, op, right } => {
+            if !matches!(op, CompareOp::Eq) {
+                return Err(Error::InvalidArgumentError(
+                    "only equality predicates are supported in JOIN ON".into(),
+                ));
+            }
+
+            match (left, right) {
+                (ScalarExpr::Column(l), ScalarExpr::Column(r))
+                    if (l.table_index == left_table_index
+                        && r.table_index == left_table_index + 1)
+                        || (r.table_index == left_table_index
+                            && l.table_index == left_table_index + 1) =>
+                {
+                    let (left_col, right_col) = if l.table_index == left_table_index {
+                        (l, r)
+                    } else {
+                        (r, l)
+                    };
+
+                    out.push(JoinKey {
+                        left_field: left_col.logical_field_id.field_id(),
+                        right_field: right_col.logical_field_id.field_id(),
+                        null_equals_null: false,
+                    });
+                    Ok(())
+                }
+                _ => Err(Error::InvalidArgumentError(
+                    "only equality predicates between consecutive tables are supported in JOIN ON"
+                        .into(),
+                )),
+            }
+        }
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported predicate in JOIN ON clause".into(),
+        )),
     }
 }
 

@@ -10,7 +10,7 @@ mod hash_join;
 
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
-use llkv_table::table::Table;
+use llkv_table::table::{RowIdFilter, Table};
 use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use arrow::array::ArrayRef;
@@ -308,6 +308,18 @@ where
     ) -> LlkvResult<()>
     where
         F: FnMut(JoinIndexBatch<'_>);
+
+    fn join_rowid_stream_with_filter<F>(
+        &self,
+        right: &Table<P>,
+        keys: &[JoinKey],
+        options: &JoinOptions,
+        left_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        right_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(JoinIndexBatch<'_>);
 }
 
 impl<P> TableJoinRowIdExt<P> for Table<P>
@@ -331,6 +343,37 @@ where
             JoinAlgorithm::Hash => {
                 hash_join::hash_join_rowid_stream(self, right, keys, options, on_batch)
             }
+            JoinAlgorithm::SortMerge => Err(Error::Internal(
+                "Sort-merge join not yet implemented; use JoinAlgorithm::Hash".to_string(),
+            )),
+        }
+    }
+
+    fn join_rowid_stream_with_filter<F>(
+        &self,
+        right: &Table<P>,
+        keys: &[JoinKey],
+        options: &JoinOptions,
+        left_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        right_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(JoinIndexBatch<'_>),
+    {
+        validate_join_keys(keys)?;
+        validate_join_options(options)?;
+
+        match options.algorithm {
+            JoinAlgorithm::Hash => hash_join::hash_join_rowid_stream_with_filters(
+                self,
+                right,
+                keys,
+                options,
+                left_filter,
+                right_filter,
+                on_batch,
+            ),
             JoinAlgorithm::SortMerge => Err(Error::Internal(
                 "Sort-merge join not yet implemented; use JoinAlgorithm::Hash".to_string(),
             )),
