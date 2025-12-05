@@ -7,6 +7,7 @@ Large modules and crates must start with a module-level doc comment (`//!`) that
 ## Core Principles
 - Write comments only when they add value—prefer expressive names over redundant narration.
 - Keep tone direct and technical; avoid marketing phrasing or speculative language.
+- Never include inner-monologue or “thinking” tokens (e.g., “should I include this?”, “wait, the user wanted…”); comments must read as final, intentional guidance for a human.
 - When documenting one parameter, document them all; otherwise omit the parameter section entirely.
 - Favor short sentences and bulleted lists for clarity.
 - Large modules must open with a clear summary paragraph that orients readers before diving into details.
