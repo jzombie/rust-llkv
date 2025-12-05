@@ -192,6 +192,93 @@ pub fn gather_indices_from_batches(
     Ok(result)
 }
 
+/// Gather a projected subset of columns from batches using `(batch_idx, row_idx)` pairs.
+///
+/// This mirrors [`gather_indices_from_batches`] but restricts the output to the selected
+/// `projection` columns, preserving the input row order. Contiguous windows from a single
+/// batch are returned as zero-copy slices; scattered references fall back to batched `take`
+/// operations grouped by batch.
+pub fn gather_projected_indices_from_batches(
+    batches: &[RecordBatch],
+    indices: &[(usize, usize)],
+    projection: &[usize],
+) -> LlkvResult<Vec<ArrayRef>> {
+    if batches.is_empty() || indices.is_empty() || projection.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_columns = batches[0].num_columns();
+    for &col_idx in projection {
+        if col_idx >= num_columns {
+            return Err(Error::InvalidArgumentError(format!(
+                "projection index {} out of bounds ({} columns)",
+                col_idx, num_columns
+            )));
+        }
+    }
+
+    let single_batch = indices.iter().all(|(b, _)| *b == indices[0].0);
+    if single_batch {
+        let start = indices[0].1;
+        let contiguous = indices
+            .iter()
+            .enumerate()
+            .all(|(i, &(_, row))| row == start + i);
+        if contiguous {
+            let len = indices.len();
+            let batch = &batches[indices[0].0];
+            let mut result = Vec::with_capacity(projection.len());
+            for &col_idx in projection {
+                result.push(batch.column(col_idx).slice(start, len));
+            }
+            return Ok(result);
+        }
+    }
+
+    let mut grouped: Vec<(usize, UInt32Array)> = Vec::new();
+    let mut current_batch = indices[0].0;
+    let mut current_rows: Vec<u32> = Vec::new();
+
+    for &(batch_idx, row_idx) in indices {
+        if batch_idx == current_batch {
+            current_rows.push(row_idx as u32);
+        } else {
+            if !current_rows.is_empty() {
+                let array = UInt32Array::from(mem::take(&mut current_rows));
+                grouped.push((current_batch, array));
+            }
+            current_batch = batch_idx;
+            current_rows.push(row_idx as u32);
+        }
+    }
+
+    if !current_rows.is_empty() {
+        let array = UInt32Array::from(mem::take(&mut current_rows));
+        grouped.push((current_batch, array));
+    }
+
+    let mut result = Vec::with_capacity(projection.len());
+
+    for &col_idx in projection {
+        let mut segments: Vec<ArrayRef> = Vec::with_capacity(grouped.len());
+        for (batch_idx, rows) in &grouped {
+            let column = batches[*batch_idx].column(col_idx);
+            let segment = take(column.as_ref(), rows, None)?;
+            segments.push(segment);
+        }
+
+        let concatenated = if segments.len() == 1 {
+            segments.pop().unwrap()
+        } else {
+            let inputs: Vec<&dyn Array> = segments.iter().map(|a| a.as_ref()).collect();
+            arrow::compute::concat(&inputs)?
+        };
+        result.push(concatenated);
+    }
+
+    Ok(result)
+}
+
 /// Gather rows from batches with optional matches, producing NULL runs when a
 /// `None` entry is encountered.
 ///
@@ -287,6 +374,134 @@ pub fn gather_optional_indices_from_batches(
     let mut result = Vec::with_capacity(num_columns);
 
     for col_idx in 0..num_columns {
+        let mut column_segments: Vec<ArrayRef> = Vec::with_capacity(segments.len());
+        for segment in &segments {
+            match segment {
+                Segment::Gather { batch_idx, rows } => {
+                    let column = batches[*batch_idx].column(col_idx);
+                    let gathered = take(column.as_ref(), rows, None)?;
+                    column_segments.push(gathered);
+                }
+                Segment::Null { len } => {
+                    let template = batches[0].column(col_idx);
+                    let null_array = arrow::array::new_null_array(template.data_type(), *len);
+                    column_segments.push(null_array);
+                }
+            }
+        }
+
+        let concatenated = if column_segments.len() == 1 {
+            column_segments.pop().unwrap()
+        } else {
+            let inputs: Vec<&dyn Array> = column_segments.iter().map(|a| a.as_ref()).collect();
+            arrow::compute::concat(&inputs)?
+        };
+        result.push(concatenated);
+    }
+
+    Ok(result)
+}
+
+/// Gather a projected subset of columns from batches with optional matches, producing NULL
+/// runs when a `None` entry is encountered. Contiguous windows from a single batch are
+/// returned as zero-copy slices when all entries are `Some`.
+pub fn gather_optional_projected_indices_from_batches(
+    batches: &[RecordBatch],
+    indices: &[Option<(usize, usize)>],
+    projection: &[usize],
+) -> LlkvResult<Vec<ArrayRef>> {
+    if batches.is_empty() || indices.is_empty() || projection.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let num_columns = batches[0].num_columns();
+    for &col_idx in projection {
+        if col_idx >= num_columns {
+            return Err(Error::InvalidArgumentError(format!(
+                "projection index {} out of bounds ({} columns)",
+                col_idx, num_columns
+            )));
+        }
+    }
+
+    if indices.iter().all(|opt| opt.is_some()) {
+        let first = indices[0].expect("checked is_some above");
+        let single_batch = indices
+            .iter()
+            .all(|opt| opt.unwrap().0 == first.0);
+        if single_batch {
+            let start = first.1;
+            let contiguous = indices
+                .iter()
+                .enumerate()
+                .all(|(i, opt)| opt.unwrap().1 == start + i);
+            if contiguous {
+                let len = indices.len();
+                let batch = &batches[first.0];
+                let mut result = Vec::with_capacity(projection.len());
+                for &col_idx in projection {
+                    result.push(batch.column(col_idx).slice(start, len));
+                }
+                return Ok(result);
+            }
+        }
+    }
+
+    enum Segment {
+        Gather { batch_idx: usize, rows: UInt32Array },
+        Null { len: usize },
+    }
+
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut current_batch: Option<usize> = None;
+    let mut current_rows: Vec<u32> = Vec::new();
+    let mut pending_nulls: usize = 0;
+
+    let flush_batch = |segments: &mut Vec<Segment>,
+                       current_batch: &mut Option<usize>,
+                       current_rows: &mut Vec<u32>| {
+        if let Some(batch_idx) = current_batch.take()
+            && !current_rows.is_empty()
+        {
+            let rows = UInt32Array::from(mem::take(current_rows));
+            segments.push(Segment::Gather { batch_idx, rows });
+        }
+    };
+
+    let flush_nulls = |segments: &mut Vec<Segment>, pending_nulls: &mut usize| {
+        if *pending_nulls > 0 {
+            segments.push(Segment::Null {
+                len: *pending_nulls,
+            });
+            *pending_nulls = 0;
+        }
+    };
+
+    for opt in indices {
+        match opt {
+            Some((batch_idx, row_idx)) => {
+                flush_nulls(&mut segments, &mut pending_nulls);
+                if current_batch == Some(*batch_idx) {
+                    current_rows.push(*row_idx as u32);
+                } else {
+                    flush_batch(&mut segments, &mut current_batch, &mut current_rows);
+                    current_batch = Some(*batch_idx);
+                    current_rows.push(*row_idx as u32);
+                }
+            }
+            None => {
+                flush_batch(&mut segments, &mut current_batch, &mut current_rows);
+                pending_nulls += 1;
+            }
+        }
+    }
+
+    flush_batch(&mut segments, &mut current_batch, &mut current_rows);
+    flush_nulls(&mut segments, &mut pending_nulls);
+
+    let mut result = Vec::with_capacity(projection.len());
+
+    for &col_idx in projection {
         let mut column_segments: Vec<ArrayRef> = Vec::with_capacity(segments.len());
         for segment in &segments {
             match segment {
@@ -1096,4 +1311,106 @@ pub(crate) fn filter_rows_with_non_null(columns: Vec<ArrayRef>) -> Result<Vec<Ar
         filtered.push(filtered_column);
     }
     Ok(filtered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        gather_optional_projected_indices_from_batches, gather_projected_indices_from_batches,
+    };
+    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use llkv_result::Result as LlkvResult;
+    use std::sync::Arc;
+
+    #[test]
+    fn projected_indices_zero_copy_contiguous() -> LlkvResult<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            ],
+        )?;
+
+        let out = gather_projected_indices_from_batches(&[batch.clone()], &[(0, 1), (0, 2)], &[1])?;
+
+        let values = out[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(values.value(0), "b");
+        assert_eq!(values.value(1), "c");
+
+        // Contiguous rows from a single batch should share backing buffers.
+        let original = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert!(std::ptr::eq(
+            values.values().as_ptr(),
+            original.values().as_ptr()
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn projected_indices_scattered_batches() -> LlkvResult<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+        let batch_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let batch_b = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3, 4]))])?;
+
+        let out = gather_projected_indices_from_batches(
+            &[batch_a, batch_b],
+            &[(0, 1), (1, 0), (1, 1)],
+            &[0],
+        )?;
+
+        let values = out[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int column");
+        assert_eq!(values.values(), &[2, 3, 4]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn projected_optional_indices_emit_nulls() -> LlkvResult<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![Some(5), None, Some(7)]))],
+        )?;
+
+        let out = gather_optional_projected_indices_from_batches(
+            &[batch],
+            &[Some((0, 0)), None, Some((0, 2))],
+            &[0],
+        )?;
+
+        let values = out[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int column");
+        assert_eq!(values.len(), 3);
+        assert!(!values.is_null(0));
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), 7);
+
+        Ok(())
+    }
 }

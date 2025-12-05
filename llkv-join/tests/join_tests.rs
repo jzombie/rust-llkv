@@ -1,11 +1,11 @@
 //! Integration tests for table join operations.
 
-use arrow::array::{make_array, ArrayData, ArrayRef, Int32Array, Int64Array, MutableArrayData, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::Projection;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_expr::{CompareOp, Expr, ScalarExpr};
-use llkv_join::{JoinIndexBatch, JoinKey, JoinOptions, JoinType, TableJoinRowIdExt};
+use llkv_join::{project_join_columns, JoinIndexBatch, JoinKey, JoinOptions, JoinSide, JoinType, TableJoinRowIdExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::table::{ScanProjection, ScanStreamOptions};
@@ -14,8 +14,8 @@ use llkv_types::LogicalFieldId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Materialize a `JoinIndexBatch` into a `RecordBatch` for assertions.
-/// This is test-only and keeps production code zero-copy.
+/// Materialize a `JoinIndexBatch` into a `RecordBatch` for assertions using the
+/// projection helpers to keep contiguous slices zero-copy.
 fn materialize_join_index_batch(
     batch: &JoinIndexBatch<'_>,
     output_schema: &Arc<Schema>,
@@ -28,82 +28,20 @@ fn materialize_join_index_batch(
         .first()
         .map(|b| b.num_columns())
         .unwrap_or(0);
-    let mut left_sources: Vec<Vec<ArrayData>> = vec![Vec::new(); left_col_count];
-    for lb in batch.left_batches {
-        for col_idx in 0..left_col_count {
-            left_sources[col_idx].push(lb.column(col_idx).to_data());
-        }
-    }
+    let left_projection: Vec<usize> = (0..left_col_count).collect();
+    let mut arrays: Vec<ArrayRef> = project_join_columns(batch, JoinSide::Left, &left_projection)
+        .expect("left projection");
 
-    let mut left_data: Vec<MutableArrayData> = left_sources
-        .iter()
-        .map(|arrays| {
-            let refs: Vec<&ArrayData> = arrays.iter().collect();
-            MutableArrayData::new(refs, true, batch.left_rows.len())
-        })
-        .collect();
-
-    let right_sources_store = if include_right {
+    if include_right {
         let right_col_count = batch
             .right_batches
             .first()
             .map(|b| b.num_columns())
             .unwrap_or(0);
-        let mut right_sources: Vec<Vec<ArrayData>> = vec![Vec::new(); right_col_count];
-        for rb in batch.right_batches {
-            for col_idx in 0..right_col_count {
-                right_sources[col_idx].push(rb.column(col_idx).to_data());
-            }
-        }
-        Some(right_sources)
-    } else {
-        None
-    };
-
-    let mut right_data: Vec<MutableArrayData> = if let Some(ref right_sources) = right_sources_store {
-        right_sources
-            .iter()
-            .map(|arrays| {
-                let refs: Vec<&ArrayData> = arrays.iter().collect();
-                MutableArrayData::new(refs, true, batch.left_rows.len())
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    for (idx, left_ref) in batch.left_rows.iter().enumerate() {
-        for builder in left_data.iter_mut() {
-            builder.extend(left_ref.batch, left_ref.row, left_ref.row + 1);
-        }
-
-        if include_right {
-            match batch.right_rows.get(idx).and_then(|r| r.as_ref()) {
-                Some(rr) => {
-                    for builder in right_data.iter_mut() {
-                        builder.extend(rr.batch, rr.row, rr.row + 1);
-                    }
-                }
-                None => {
-                    for builder in right_data.iter_mut() {
-                        builder.extend_nulls(1);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut arrays: Vec<ArrayRef> = left_data
-        .into_iter()
-        .map(|data| make_array(data.freeze()))
-        .collect();
-
-    if include_right {
-        arrays.extend(
-            right_data
-                .into_iter()
-                .map(|data| make_array(data.freeze())),
-        );
+        let right_projection: Vec<usize> = (0..right_col_count).collect();
+        let right_arrays = project_join_columns(batch, JoinSide::Right, &right_projection)
+            .expect("right projection");
+        arrays.extend(right_arrays);
     }
 
     RecordBatch::try_new(output_schema.clone(), arrays).unwrap()

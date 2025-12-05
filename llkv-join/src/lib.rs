@@ -13,6 +13,11 @@ use llkv_storage::pager::Pager;
 use llkv_table::table::Table;
 use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
+use arrow::array::ArrayRef;
+use llkv_column_map::gather::{
+    gather_optional_projected_indices_from_batches,
+    gather_projected_indices_from_batches,
+};
 use std::fmt;
 
 pub use hash_join::hash_join_rowid_stream;
@@ -133,6 +138,47 @@ pub struct JoinIndexBatch<'a> {
     pub right_rows: Vec<Option<JoinRowRef>>, // empty for SEMI/ANTI
     pub left_batches: &'a [arrow::record_batch::RecordBatch],
     pub right_batches: &'a [arrow::record_batch::RecordBatch],
+}
+
+/// Identify which side of a join to project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinSide {
+    Left,
+    Right,
+}
+
+/// Project a subset of columns for a join output batch without materializing the other side.
+///
+/// The helper preserves output row order and uses zero-copy slices when the row references
+/// describe contiguous ranges from a single batch. Sparse references fall back to batched
+/// `take` operations grouped by batch to limit Arrow allocations.
+pub fn project_join_columns(
+    batch: &JoinIndexBatch<'_>,
+    side: JoinSide,
+    projection: &[usize],
+) -> LlkvResult<Vec<ArrayRef>> {
+    match side {
+        JoinSide::Left => {
+            let rows: Vec<(usize, usize)> = batch
+                .left_rows
+                .iter()
+                .map(|row| (row.batch, row.row))
+                .collect();
+            gather_projected_indices_from_batches(batch.left_batches, &rows, projection)
+        }
+        JoinSide::Right => {
+            let rows: Vec<Option<(usize, usize)>> = batch
+                .right_rows
+                .iter()
+                .map(|opt| opt.map(|row| (row.batch, row.row)))
+                .collect();
+            gather_optional_projected_indices_from_batches(
+                batch.right_batches,
+                &rows,
+                projection,
+            )
+        }
+    }
 }
 
 impl Default for JoinOptions {
@@ -295,6 +341,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     #[test]
     fn test_join_key_constructors() {
@@ -366,5 +416,74 @@ mod tests {
     fn test_join_algorithm_display() {
         assert_eq!(JoinAlgorithm::Hash.to_string(), "Hash");
         assert_eq!(JoinAlgorithm::SortMerge.to_string(), "SortMerge");
+    }
+
+    #[test]
+    fn project_join_columns_left_and_right() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Utf8, true)]));
+
+        let left_batch = RecordBatch::try_new(
+            left_schema,
+            vec![Arc::new(Int32Array::from(vec![11, 22]))],
+        )
+        .unwrap();
+        let right_batch = RecordBatch::try_new(
+            right_schema,
+            vec![Arc::new(StringArray::from(vec![Some("x"), Some("y")]))],
+        )
+        .unwrap();
+
+        let batch = JoinIndexBatch {
+            left_rows: vec![JoinRowRef { batch: 0, row: 1 }],
+            right_rows: vec![Some(JoinRowRef { batch: 0, row: 0 })],
+            left_batches: &[left_batch.clone()],
+            right_batches: &[right_batch.clone()],
+        };
+
+        let left_cols = project_join_columns(&batch, JoinSide::Left, &[0]).unwrap();
+        let left_values = left_cols[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int column");
+        assert_eq!(left_values.values(), &[22]);
+
+        let right_cols = project_join_columns(&batch, JoinSide::Right, &[0]).unwrap();
+        let right_values = right_cols[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(right_values.value(0), "x");
+    }
+
+    #[test]
+    fn project_join_columns_optional_right() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Utf8, true)]));
+
+        let left_batch = RecordBatch::try_new(
+            left_schema,
+            vec![Arc::new(Int32Array::from(vec![5]))],
+        )
+        .unwrap();
+        let right_batch = RecordBatch::try_new(
+            right_schema,
+            vec![Arc::new(StringArray::from(vec![Some("q")]))],
+        )
+        .unwrap();
+
+        let batch = JoinIndexBatch {
+            left_rows: vec![JoinRowRef { batch: 0, row: 0 }],
+            right_rows: vec![None],
+            left_batches: &[left_batch.clone()],
+            right_batches: &[right_batch.clone()],
+        };
+
+        let right_cols = project_join_columns(&batch, JoinSide::Right, &[0]).unwrap();
+        let right_values = right_cols[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(right_values.null_count(), 1);
     }
 }
