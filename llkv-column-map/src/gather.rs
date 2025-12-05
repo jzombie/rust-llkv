@@ -56,6 +56,22 @@ pub fn gather_indices(batch: &RecordBatch, indices: &[usize]) -> LlkvResult<Vec<
         return Ok(Vec::new());
     }
 
+    // Zero-copy fast path: contiguous, increasing row window.
+    let start = indices[0];
+    let is_contiguous = indices
+        .iter()
+        .enumerate()
+        .all(|(i, &idx)| idx == start + i);
+
+    if is_contiguous {
+        let len = indices.len();
+        let mut result = Vec::with_capacity(batch.num_columns());
+        for column in batch.columns() {
+            result.push(column.slice(start, len));
+        }
+        return Ok(result);
+    }
+
     let mut indices_vec: Vec<u32> = Vec::with_capacity(indices.len());
     indices_vec.extend(indices.iter().map(|&idx| idx as u32));
     let indices_array = UInt32Array::from(indices_vec);
@@ -110,6 +126,25 @@ pub fn gather_indices_from_batches(
 ) -> LlkvResult<Vec<ArrayRef>> {
     if batches.is_empty() || indices.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Zero-copy fast path: all rows come from a single batch in a contiguous window.
+    let single_batch = indices.iter().all(|(b, _)| *b == indices[0].0);
+    if single_batch {
+        let start = indices[0].1;
+        let contiguous = indices
+            .iter()
+            .enumerate()
+            .all(|(i, &(_, row))| row == start + i);
+        if contiguous {
+            let len = indices.len();
+            let batch = &batches[indices[0].0];
+            let mut result = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                result.push(column.slice(start, len));
+            }
+            return Ok(result);
+        }
     }
 
     let mut grouped: Vec<(usize, UInt32Array)> = Vec::new();
@@ -170,6 +205,30 @@ pub fn gather_optional_indices_from_batches(
 ) -> LlkvResult<Vec<ArrayRef>> {
     if batches.is_empty() || indices.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Zero-copy fast path: all indices are Some, from one batch, contiguous.
+    if indices.iter().all(|opt| opt.is_some()) {
+        let first = indices[0].expect("checked is_some above");
+        let single_batch = indices
+            .iter()
+            .all(|opt| opt.unwrap().0 == first.0);
+        if single_batch {
+            let start = first.1;
+            let contiguous = indices
+                .iter()
+                .enumerate()
+                .all(|(i, opt)| opt.unwrap().1 == start + i);
+            if contiguous {
+                let len = indices.len();
+                let batch = &batches[first.0];
+                let mut result = Vec::with_capacity(batch.num_columns());
+                for column in batch.columns() {
+                    result.push(column.slice(start, len));
+                }
+                return Ok(result);
+            }
+        }
     }
 
     enum Segment {

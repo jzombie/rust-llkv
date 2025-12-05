@@ -2,14 +2,12 @@
 //!
 //! This crate exposes shared types (`JoinKey`, `JoinType`, `JoinOptions`) used by the
 //! planner and runtime to negotiate join configuration. Execution currently routes
-//! through the hash join implementation in [`hash_join_stream`], with a placeholder for
+//! through the hash join implementation in [`hash_join_rowid_stream`], with a placeholder for
 //! alternate algorithms when they land.
 #![forbid(unsafe_code)]
 
-mod cartesian;
 mod hash_join;
 
-use arrow::array::RecordBatch;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::table::Table;
@@ -17,8 +15,7 @@ use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::fmt;
 
-pub use cartesian::cross_join_pair;
-pub use hash_join::hash_join_stream;
+pub use hash_join::hash_join_rowid_stream;
 
 /// Type of join to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,6 +118,21 @@ pub struct JoinOptions {
     pub memory_limit_bytes: Option<usize>,
     /// Concurrency hint: number of threads for parallel partitions.
     pub concurrency: usize,
+}
+
+/// Reference to a row in a specific batch (batch index, row index).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JoinRowRef {
+    pub batch: usize,
+    pub row: usize,
+}
+
+/// Batch of join output row references with access to source batches for zero-copy projection.
+pub struct JoinIndexBatch<'a> {
+    pub left_rows: Vec<JoinRowRef>,
+    pub right_rows: Vec<Option<JoinRowRef>>, // empty for SEMI/ANTI
+    pub left_batches: &'a [arrow::record_batch::RecordBatch],
+    pub right_batches: &'a [arrow::record_batch::RecordBatch],
 }
 
 impl Default for JoinOptions {
@@ -236,13 +248,12 @@ pub fn validate_join_options(options: &JoinOptions) -> LlkvResult<()> {
     Ok(())
 }
 
-/// Extension trait adding join operations to `Table`.
-pub trait TableJoinExt<P>
+/// Extension trait emitting join results as row-id pairs (zero-copy friendly).
+pub trait TableJoinRowIdExt<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Join this table with another table based on equality predicates.
-    fn join_stream<F>(
+    fn join_rowid_stream<F>(
         &self,
         right: &Table<P>,
         keys: &[JoinKey],
@@ -250,14 +261,14 @@ where
         on_batch: F,
     ) -> LlkvResult<()>
     where
-        F: FnMut(RecordBatch);
+        F: FnMut(JoinIndexBatch<'_>);
 }
 
-impl<P> TableJoinExt<P> for Table<P>
+impl<P> TableJoinRowIdExt<P> for Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn join_stream<F>(
+    fn join_rowid_stream<F>(
         &self,
         right: &Table<P>,
         keys: &[JoinKey],
@@ -265,14 +276,14 @@ where
         on_batch: F,
     ) -> LlkvResult<()>
     where
-        F: FnMut(RecordBatch),
+        F: FnMut(JoinIndexBatch<'_>),
     {
         validate_join_keys(keys)?;
         validate_join_options(options)?;
 
         match options.algorithm {
             JoinAlgorithm::Hash => {
-                hash_join::hash_join_stream(self, right, keys, options, on_batch)
+                hash_join::hash_join_rowid_stream(self, right, keys, options, on_batch)
             }
             JoinAlgorithm::SortMerge => Err(Error::Internal(
                 "Sort-merge join not yet implemented; use JoinAlgorithm::Hash".to_string(),

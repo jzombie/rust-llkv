@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use croaring::Treemap;
 use llkv_expr::Expr;
-use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+use llkv_join::{JoinIndexBatch, JoinKey, JoinOptions, TableJoinRowIdExt};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::table::{ScanProjection, ScanStreamOptions, Table};
@@ -29,12 +29,12 @@ where
 
     fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<Treemap>;
 
-    fn join_stream(
+    fn join_rowid_stream(
         &self,
         right: &dyn StorageTable<P>,
         keys: &[JoinKey],
         options: &JoinOptions,
-        on_batch: &mut dyn FnMut(RecordBatch),
+        on_batch: &mut dyn FnMut(JoinIndexBatch<'_>),
     ) -> LlkvResult<()>;
 
     fn as_any(&self) -> &dyn Any;
@@ -84,19 +84,19 @@ where
         self.table.filter_row_ids(filter_expr)
     }
 
-    fn join_stream(
+    fn join_rowid_stream(
         &self,
         right: &dyn StorageTable<P>,
         keys: &[JoinKey],
         options: &JoinOptions,
-        on_batch: &mut dyn FnMut(RecordBatch),
+        on_batch: &mut dyn FnMut(JoinIndexBatch<'_>),
     ) -> LlkvResult<()> {
         let Some(rhs) = right.as_any().downcast_ref::<TableStorageAdapter<P>>() else {
             return Err(Error::InvalidArgumentError(
-                "join_stream requires compatible storage adapter".into(),
+                "join_rowid_stream requires compatible storage adapter".into(),
             ));
         };
-        self.table.join_stream(rhs.table(), keys, options, on_batch)
+        self.table.join_rowid_stream(rhs.table(), keys, options, on_batch)
     }
 
     fn as_any(&self) -> &dyn Any {

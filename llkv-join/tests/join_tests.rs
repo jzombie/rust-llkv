@@ -1,11 +1,11 @@
 //! Integration tests for table join operations.
 
-use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{make_array, ArrayData, ArrayRef, Int32Array, Int64Array, MutableArrayData, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::Projection;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_expr::{CompareOp, Expr, ScalarExpr};
-use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+use llkv_join::{JoinIndexBatch, JoinKey, JoinOptions, JoinType, TableJoinRowIdExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::table::{ScanProjection, ScanStreamOptions};
@@ -13,6 +13,180 @@ use llkv_table::types::TableId;
 use llkv_types::LogicalFieldId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Materialize a `JoinIndexBatch` into a `RecordBatch` for assertions.
+/// This is test-only and keeps production code zero-copy.
+fn materialize_join_index_batch(
+    batch: &JoinIndexBatch<'_>,
+    output_schema: &Arc<Schema>,
+    join_type: JoinType,
+) -> RecordBatch {
+    let include_right = !matches!(join_type, JoinType::Semi | JoinType::Anti);
+
+    let left_col_count = batch
+        .left_batches
+        .first()
+        .map(|b| b.num_columns())
+        .unwrap_or(0);
+    let mut left_sources: Vec<Vec<ArrayData>> = vec![Vec::new(); left_col_count];
+    for lb in batch.left_batches {
+        for col_idx in 0..left_col_count {
+            left_sources[col_idx].push(lb.column(col_idx).to_data());
+        }
+    }
+
+    let mut left_data: Vec<MutableArrayData> = left_sources
+        .iter()
+        .map(|arrays| {
+            let refs: Vec<&ArrayData> = arrays.iter().collect();
+            MutableArrayData::new(refs, true, batch.left_rows.len())
+        })
+        .collect();
+
+    let right_sources_store = if include_right {
+        let right_col_count = batch
+            .right_batches
+            .first()
+            .map(|b| b.num_columns())
+            .unwrap_or(0);
+        let mut right_sources: Vec<Vec<ArrayData>> = vec![Vec::new(); right_col_count];
+        for rb in batch.right_batches {
+            for col_idx in 0..right_col_count {
+                right_sources[col_idx].push(rb.column(col_idx).to_data());
+            }
+        }
+        Some(right_sources)
+    } else {
+        None
+    };
+
+    let mut right_data: Vec<MutableArrayData> = if let Some(ref right_sources) = right_sources_store {
+        right_sources
+            .iter()
+            .map(|arrays| {
+                let refs: Vec<&ArrayData> = arrays.iter().collect();
+                MutableArrayData::new(refs, true, batch.left_rows.len())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    for (idx, left_ref) in batch.left_rows.iter().enumerate() {
+        for builder in left_data.iter_mut() {
+            builder.extend(left_ref.batch, left_ref.row, left_ref.row + 1);
+        }
+
+        if include_right {
+            match batch.right_rows.get(idx).and_then(|r| r.as_ref()) {
+                Some(rr) => {
+                    for builder in right_data.iter_mut() {
+                        builder.extend(rr.batch, rr.row, rr.row + 1);
+                    }
+                }
+                None => {
+                    for builder in right_data.iter_mut() {
+                        builder.extend_nulls(1);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut arrays: Vec<ArrayRef> = left_data
+        .into_iter()
+        .map(|data| make_array(data.freeze()))
+        .collect();
+
+    if include_right {
+        arrays.extend(
+            right_data
+                .into_iter()
+                .map(|data| make_array(data.freeze())),
+        );
+    }
+
+    RecordBatch::try_new(output_schema.clone(), arrays).unwrap()
+}
+
+fn build_output_schema(
+    left_schema: &Schema,
+    right_schema: &Schema,
+    join_type: JoinType,
+) -> Arc<Schema> {
+    let mut fields = Vec::new();
+    let mut field_names: HashSet<String> = HashSet::new();
+
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        for field in left_schema.fields() {
+            if field
+                .metadata()
+                .get(llkv_column_map::store::FIELD_ID_META_KEY)
+                .is_some()
+            {
+                fields.push(field.clone());
+                field_names.insert(field.name().clone());
+            }
+        }
+        return Arc::new(Schema::new(fields));
+    }
+
+    for field in left_schema.fields() {
+        if field
+            .metadata()
+            .get(llkv_column_map::store::FIELD_ID_META_KEY)
+            .is_some()
+        {
+            fields.push(field.clone());
+            field_names.insert(field.name().clone());
+        }
+    }
+
+    for field in right_schema.fields() {
+        if field
+            .metadata()
+            .get(llkv_column_map::store::FIELD_ID_META_KEY)
+            .is_some()
+        {
+            let field_name = field.name();
+            let new_name = if field_names.contains(field_name) {
+                format!("{}_1", field_name)
+            } else {
+                field_name.clone()
+            };
+
+            let new_field = Arc::new(
+                arrow::datatypes::Field::new(
+                    new_name.clone(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(field.metadata().clone()),
+            );
+
+            fields.push(new_field);
+            field_names.insert(new_name);
+        }
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+fn run_join(
+    left: &Table<MemPager>,
+    right: &Table<MemPager>,
+    keys: &[JoinKey],
+    options: &JoinOptions,
+) -> Vec<RecordBatch> {
+    let output_schema = build_output_schema(&left.schema().unwrap(), &right.schema().unwrap(), options.join_type);
+    let mut out = Vec::new();
+    left.join_rowid_stream(right, keys, options, |index_batch| {
+        let batch = materialize_join_index_batch(&index_batch, &output_schema, options.join_type);
+        out.push(batch);
+    })
+    .unwrap();
+    out
+}
 
 /// Helper to create a test table with row-id, user_id, and name columns.
 fn create_test_table(
@@ -73,11 +247,7 @@ fn test_inner_join_simple() {
     let keys = vec![JoinKey::new(1, 1)]; // Join on id column (field_id=1)
     let options = JoinOptions::inner();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     // Should match: (2, "Bob") with (2, "Beta") and (3, "Charlie") with (3, "Gamma")
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -102,11 +272,7 @@ fn test_left_join() {
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::left();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     // Should have 2 rows: (1, "Alice", NULL) and (2, "Bob", 2, "Beta")
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -130,11 +296,7 @@ fn test_semi_join() {
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::semi();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     // Should have 1 row: (2, "Bob") — only left rows with matches, no right columns
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -163,11 +325,7 @@ fn test_anti_join() {
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::anti();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     // Should have 2 rows: (1, "Alice") and (3, "Charlie") — left rows with NO match
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -199,11 +357,7 @@ fn test_many_to_many_join() {
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::inner();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     // Should have 2 * 3 = 6 rows (Cartesian product of matching keys)
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -223,11 +377,7 @@ fn test_empty_left_table() {
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::inner();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0, "Join with empty left should produce 0 rows");
@@ -243,11 +393,7 @@ fn test_empty_right_table() {
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::inner();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0, "Join with empty right should produce 0 rows");
@@ -263,11 +409,7 @@ fn test_no_matching_rows() {
     let keys = vec![JoinKey::new(1, 1)];
     let options = JoinOptions::inner();
 
-    let mut result_batches = Vec::new();
-    left.join_stream(&right, &keys, &options, |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &keys, &options);
 
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0, "Join with no matches should produce 0 rows");
@@ -280,7 +422,7 @@ fn test_join_validation_errors() {
     let right = create_test_table(2, &pager, vec![(0, 1, "Alpha")]);
 
     // Empty keys is valid (cross product) - should succeed
-    let result = left.join_stream(&right, &[], &JoinOptions::default(), |_| {});
+    let result = left.join_rowid_stream(&right, &[], &JoinOptions::default(), |_| {});
     assert!(result.is_ok());
 
     // Bad batch size should error
@@ -288,7 +430,7 @@ fn test_join_validation_errors() {
         batch_size: 0,
         ..Default::default()
     };
-    let result = left.join_stream(&right, &[JoinKey::new(1, 1)], &bad_opts, |_| {});
+    let result = left.join_rowid_stream(&right, &[JoinKey::new(1, 1)], &bad_opts, |_| {});
     assert!(result.is_err());
 }
 
@@ -472,12 +614,7 @@ fn test_join_with_expression_filters() {
     let join_keys = vec![JoinKey::new(LEFT_CUSTOMER_ID, RIGHT_CUSTOMER_ID)];
     let options = JoinOptions::inner();
 
-    let mut joined_batches: Vec<RecordBatch> = Vec::new();
-    customer_table
-        .join_stream(&orders_table, &join_keys, &options, |batch| {
-            joined_batches.push(batch);
-        })
-        .unwrap();
+    let joined_batches = run_join(&customer_table, &orders_table, &join_keys, &options);
 
     assert!(!joined_batches.is_empty());
     let total_join_rows: usize = joined_batches.iter().map(|b| b.num_rows()).sum();
@@ -568,13 +705,7 @@ fn test_cartesian_product_basic() {
     let left = create_test_table(1, &pager, vec![(0, 1, "A"), (1, 2, "B")]);
     let right = create_test_table(2, &pager, vec![(0, 10, "X"), (1, 20, "Y")]);
 
-    let mut result_batches = Vec::new();
-
-    // Empty join keys = Cartesian product
-    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &[], &JoinOptions::default());
 
     // Should produce 2 × 2 = 4 rows
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -599,12 +730,7 @@ fn test_cartesian_product_asymmetric() {
     // Right: 2 rows
     let right = create_test_table(2, &pager, vec![(0, 10, "X"), (1, 20, "Y")]);
 
-    let mut result_batches = Vec::new();
-
-    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &[], &JoinOptions::default());
 
     // Should produce 3 × 2 = 6 rows
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -622,8 +748,7 @@ fn test_cartesian_product_with_filters() {
 
     let mut all_rows = Vec::new();
 
-    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
-        // Extract data from batch
+    for batch in run_join(&left, &right, &[], &JoinOptions::default()) {
         let left_ids = batch
             .column_by_name("user_id")
             .unwrap()
@@ -640,8 +765,7 @@ fn test_cartesian_product_with_filters() {
         for i in 0..batch.num_rows() {
             all_rows.push((left_ids.value(i), right_ids.value(i)));
         }
-    })
-    .unwrap();
+    }
 
     // Should produce 3 × 3 = 9 rows
     assert_eq!(all_rows.len(), 9);
@@ -672,12 +796,7 @@ fn test_cartesian_product_with_empty_left() {
     let left = create_test_table(1, &pager, vec![]); // Empty
     let right = create_test_table(2, &pager, vec![(0, 10, "X"), (1, 20, "Y")]);
 
-    let mut result_batches = Vec::new();
-
-    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &[], &JoinOptions::default());
 
     // Empty left table means no results
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -693,12 +812,7 @@ fn test_cartesian_product_with_empty_right() {
     let left = create_test_table(1, &pager, vec![(0, 1, "A"), (1, 2, "B")]);
     let right = create_test_table(2, &pager, vec![]); // Empty
 
-    let mut result_batches = Vec::new();
-
-    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &[], &JoinOptions::default());
 
     // Empty right table means no results
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -719,12 +833,7 @@ fn test_cartesian_product_larger_dataset() {
     let left = create_test_table(1, &pager, left_data);
     let right = create_test_table(2, &pager, right_data);
 
-    let mut result_batches = Vec::new();
-
-    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
-        result_batches.push(batch);
-    })
-    .unwrap();
+    let result_batches = run_join(&left, &right, &[], &JoinOptions::default());
 
     // Should produce 10 × 8 = 80 rows
     let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
@@ -742,7 +851,7 @@ fn test_cartesian_product_data_integrity() {
 
     let mut all_rows = Vec::new();
 
-    left.join_stream(&right, &[], &JoinOptions::default(), |batch| {
+    for batch in run_join(&left, &right, &[], &JoinOptions::default()) {
         let left_ids = batch
             .column_by_name("user_id")
             .unwrap()
@@ -776,8 +885,7 @@ fn test_cartesian_product_data_integrity() {
                 right_names.value(i).to_string(),
             ));
         }
-    })
-    .unwrap();
+    }
 
     assert_eq!(all_rows.len(), 4);
 

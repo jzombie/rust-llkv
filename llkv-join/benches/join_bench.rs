@@ -19,7 +19,7 @@ use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+use llkv_join::{JoinKey, JoinOptions, TableJoinRowIdExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::types::TableId;
@@ -110,8 +110,8 @@ fn bench_hash_join_inner_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -142,8 +142,8 @@ fn bench_hash_join_left_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -174,8 +174,8 @@ fn bench_hash_join_semi_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -206,8 +206,8 @@ fn bench_hash_join_anti_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
