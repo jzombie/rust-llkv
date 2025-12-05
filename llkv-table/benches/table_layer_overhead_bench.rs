@@ -16,7 +16,7 @@ use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::Projection;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-    PrimitiveWithRowIdsVisitor, ScanOptions,
+    PrimitiveWithRowIdsVisitor, ScanOptions, ranges::IntRanges,
 };
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_storage::pager::MemPager;
@@ -104,6 +104,7 @@ fn bench_direct_columnstore_sum(table: &Table) -> u128 {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: IntRanges::default(),
             },
             &mut visitor,
         )

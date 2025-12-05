@@ -4,6 +4,7 @@
 //! They are intentionally lightweight so callers can build them inline.
 
 use super::*;
+use crate::store::scan::ranges::IntRanges;
 
 /// Hint flags that shape [`crate::store::scan::ScanBuilder`] iteration semantics.
 ///
@@ -14,7 +15,6 @@ pub struct ScanOptions {
     pub sorted: bool,
     pub reverse: bool,
     pub with_row_ids: bool,
-    // TODO: Include ability to include nulls in output (will require using `with_row_ids`)
     // NOTE: Null emission relies on `with_row_ids`; richer output wiring is tracked separately.
     /// Maximum number of items to return. Applies across chunks/runs.
     /// None means unbounded.
@@ -29,4 +29,6 @@ pub struct ScanOptions {
     pub nulls_first: bool,
     /// Row-id column LogicalFieldId defining the row universe for null detection.
     pub anchor_row_id_field: Option<LogicalFieldId>,
+    /// Optional range bounds for pruning chunks.
+    pub ranges: IntRanges,
 }

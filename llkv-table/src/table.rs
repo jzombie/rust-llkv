@@ -1082,9 +1082,11 @@ where
     fn stream_row_ids(
         &self,
         chunk_size: usize,
+        ranges: Option<llkv_column_map::store::scan::ranges::IntRanges>,
+        driving_column: Option<LogicalFieldId>,
         on_chunk: &mut dyn FnMut(&[u64]) -> LlkvResult<()>,
     ) -> LlkvResult<()> {
-        self.stream_table_row_ids(chunk_size, on_chunk)
+        self.stream_table_row_ids(chunk_size, ranges, driving_column, on_chunk)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1232,11 +1234,15 @@ where
         <T as ArrowPrimitiveType>::Native: PartialOrd + Copy + FromLiteral + PredicateValue,
     {
         let predicate = build_fixed_width_predicate::<T>(op).map_err(Error::predicate_build)?;
-        let row_ids =
-            <T as FilterPrimitive>::run_nullable_filter(self.store(), lfid, |v| match v {
+        let row_ids = <T as FilterPrimitive>::run_nullable_filter(
+            self.store(),
+            lfid,
+            Default::default(),
+            |v| match v {
                 Some(val) => predicate.matches(PredicateValue::borrowed(&val)),
                 None => false,
-            })?;
+            },
+        )?;
         Ok(Treemap::from_iter(row_ids))
     }
 
@@ -1263,6 +1269,7 @@ where
         let row_ids = arrow::datatypes::BooleanType::run_nullable_filter(
             self.store(),
             lfid,
+            Default::default(),
             |val: Option<bool>| match val {
                 Some(v) => predicate.matches(&v),
                 None => false,
@@ -1423,6 +1430,8 @@ where
     fn stream_table_row_ids(
         &self,
         chunk_size: usize,
+        ranges: Option<llkv_column_map::store::scan::ranges::IntRanges>,
+        driving_column: Option<LogicalFieldId>,
         on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
     ) -> LlkvResult<()> {
         use llkv_column_map::store::rowid_fid;
@@ -1440,11 +1449,17 @@ where
             return Ok(());
         };
 
-        let rid_shadow = rowid_fid(first_field);
+        let scan_column = if let Some(dc) = driving_column {
+            dc
+        } else {
+            rowid_fid(first_field)
+        };
+
         let mut emitter = RowIdChunkEmitter::new(chunk_size, false, on_chunk);
-        let scan_result = ScanBuilder::new(self.store(), rid_shadow)
+        let scan_result = ScanBuilder::new(self.store(), scan_column)
             .options(ScanOptions {
                 with_row_ids: true,
+                ranges: ranges.unwrap_or_default(),
                 ..Default::default()
             })
             .run(&mut emitter);
@@ -2424,6 +2439,8 @@ mod tests {
                     order: None,
                     row_id_filter: None,
                     include_row_ids: true,
+                    ranges: None,
+                    driving_column: None,
                 },
                 |b| {
                     let arr = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

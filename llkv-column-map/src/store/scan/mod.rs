@@ -59,10 +59,17 @@ where
     fn scan_visit(
         &self,
         field_id: LogicalFieldId,
+        ranges: crate::store::scan::ranges::IntRanges,
         visitor: &mut dyn crate::store::scan::PrimitiveVisitor,
     ) -> Result<()> {
         let catalog = self.catalog.read().unwrap();
-        crate::store::scan::unsorted_visit(self.pager.as_ref(), &catalog.map, field_id, visitor)
+        crate::store::scan::unsorted_visit(
+            self.pager.as_ref(),
+            &catalog.map,
+            field_id,
+            ranges,
+            visitor,
+        )
     }
 
     /// Convenience: sorted scan with closures over coalesced runs.
@@ -206,7 +213,7 @@ where
                             field_id,
                             row_fid,
                             anchor_fid,
-                            opts.nulls_first,
+                            opts.ranges,
                             &mut pv,
                         );
                     } else {
@@ -216,7 +223,7 @@ where
                             field_id,
                             row_fid,
                             anchor_fid,
-                            opts.nulls_first,
+                            opts.ranges,
                             visitor,
                         );
                     }
@@ -229,6 +236,7 @@ where
                         &catalog.map,
                         field_id,
                         row_fid,
+                        opts.ranges,
                         &mut pv,
                     );
                 } else {
@@ -237,6 +245,7 @@ where
                         &catalog.map,
                         field_id,
                         row_fid,
+                        opts.ranges,
                         visitor,
                     );
                 }
@@ -244,9 +253,9 @@ where
             if paginate {
                 let mut pv =
                     crate::store::scan::PaginateVisitor::new(visitor, opts.offset, opts.limit);
-                return self.scan_visit(field_id, &mut pv);
+                return self.scan_visit(field_id, opts.ranges, &mut pv);
             } else {
-                return self.scan_visit(field_id, visitor);
+                return self.scan_visit(field_id, opts.ranges, visitor);
             }
         }
 
@@ -284,37 +293,39 @@ where
             drop(catalog);
 
             let mut metas_val: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
-            for m in crate::store::descriptor::DescriptorIterator::new(
+            let mut metas_rid: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
+
+            let val_iter = crate::store::descriptor::DescriptorIterator::new(
                 self.pager.as_ref(),
                 desc.head_page_pk,
-            ) {
-                let meta = m?;
-                if meta.row_count == 0 {
-                    continue;
-                }
-                if meta.value_order_perm_pk == 0 {
-                    return Err(Error::NotFound);
-                }
-                metas_val.push(meta);
-            }
-            let mut metas_rid: Vec<crate::store::descriptor::ChunkMetadata> = Vec::new();
-            for m in crate::store::descriptor::DescriptorIterator::new(
+            );
+            let rid_iter = crate::store::descriptor::DescriptorIterator::new(
                 self.pager.as_ref(),
                 rid_desc.head_page_pk,
-            ) {
-                let meta = m?;
-                if meta.row_count == 0 {
+            );
+
+            for (m_val, m_rid) in val_iter.zip(rid_iter) {
+                let meta_val = m_val?;
+                let meta_rid = m_rid?;
+
+                if meta_val.row_count == 0 {
                     continue;
                 }
-                metas_rid.push(meta);
+                if meta_val.value_order_perm_pk == 0 {
+                    return Err(Error::NotFound);
+                }
+
+                if opts
+                    .ranges
+                    .matches(meta_val.min_val_u64, meta_val.max_val_u64)
+                {
+                    metas_val.push(meta_val);
+                    metas_rid.push(meta_rid);
+                }
             }
+
             if metas_val.is_empty() {
                 return Ok(());
-            }
-            if metas_val.len() != metas_rid.len() {
-                return Err(Error::Internal(
-                    "sorted_with_row_ids: chunk count mismatch".into(),
-                ));
             }
 
             let buffers =

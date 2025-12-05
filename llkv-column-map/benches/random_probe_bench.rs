@@ -25,7 +25,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use llkv_column_map::ROW_ID_COLUMN_NAME;
 use llkv_column_map::store::scan::{
     PrimitiveSortedVisitor, PrimitiveSortedWithRowIdsVisitor, PrimitiveVisitor,
-    PrimitiveWithRowIdsVisitor, ScanOptions,
+    PrimitiveWithRowIdsVisitor, ScanOptions, ranges::IntRanges,
 };
 use llkv_column_map::store::{ColumnStore, IndexKind};
 use llkv_storage::pager::MemPager;
@@ -139,6 +139,7 @@ fn count_hits_multiset_scan(
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: IntRanges::default(),
             },
             &mut v,
         )
@@ -200,6 +201,7 @@ fn count_hits_stream_join(store: &ColumnStore<MemPager>, fid: LogicalFieldId, qs
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: IntRanges::default(),
             },
             &mut v,
         )

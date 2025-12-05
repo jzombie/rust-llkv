@@ -99,6 +99,7 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut u,
         )
@@ -141,6 +142,7 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut sa,
         )
@@ -187,6 +189,7 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut sd,
         )
@@ -228,6 +231,7 @@ fn row_ids_unsorted_and_sorted_paths_u64() {
             include_nulls: false,
             nulls_first: false,
             anchor_row_id_field: None,
+            ranges: Default::default(),
         })
         .with_range::<u64, _>(10_000..=20_000)
         .run(&mut rc)

@@ -366,6 +366,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     include_nulls: false,
                     nulls_first: false,
                     anchor_row_id_field: None,
+                    ranges: Default::default(),
                 },
                 &mut visitor,
             )
@@ -463,6 +464,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     include_nulls: false,
                     nulls_first: false,
                     anchor_row_id_field: None,
+                    ranges: Default::default(),
                 },
                 &mut visitor_desc,
             )
@@ -588,6 +590,7 @@ fn scan_all_integer_types_sorted_and_ranges() {
                     include_nulls: false,
                     nulls_first: false,
                     anchor_row_id_field: None,
+                    ranges: Default::default(),
                 },
                 &mut visitor2,
             )

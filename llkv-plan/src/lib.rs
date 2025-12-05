@@ -14,8 +14,12 @@
 
 pub mod canonical;
 pub mod conversion;
+pub mod physical;
 pub mod plan_graph;
+pub mod planner;
 pub mod plans;
+pub mod schema;
+pub mod translation;
 // pub mod program; // Moved to llkv-compute
 pub mod subquery_correlation;
 pub mod table_scan;

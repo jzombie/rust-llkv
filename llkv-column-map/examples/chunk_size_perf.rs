@@ -113,6 +113,7 @@ fn test_chunk_size(target_mb: usize, name: &str) {
                 include_nulls: false,
                 nulls_first: false,
                 anchor_row_id_field: None,
+                ranges: Default::default(),
             },
             &mut tester,
         )

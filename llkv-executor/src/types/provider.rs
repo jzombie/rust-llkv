@@ -2,6 +2,7 @@
 
 use crate::ExecutorResult;
 use crate::types::ExecutorTable;
+use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
@@ -25,4 +26,32 @@ where
     /// An `Arc` to the `ExecutorTable` if found, or an error if the table doesn't exist
     /// or cannot be accessed.
     fn get_table(&self, canonical_name: &str) -> ExecutorResult<Arc<ExecutorTable<P>>>;
+}
+
+pub struct TableProviderAdapter<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    provider: Arc<dyn ExecutorTableProvider<P>>,
+}
+
+impl<P> TableProviderAdapter<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    pub fn new(provider: Arc<dyn ExecutorTableProvider<P>>) -> Self {
+        Self { provider }
+    }
+}
+
+impl<P> TableProvider<P> for TableProviderAdapter<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn get_table(&self, name: &str) -> Result<Arc<dyn ExecutionTable<P>>, String> {
+        self.provider
+            .get_table(name)
+            .map(|t| t as Arc<dyn ExecutionTable<P>>)
+            .map_err(|e| e.to_string())
+    }
 }

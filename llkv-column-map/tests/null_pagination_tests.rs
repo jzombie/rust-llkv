@@ -112,6 +112,7 @@ fn sorted_with_nulls_last_pagination() {
                 anchor_row_id_field: Some(
                     anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
                 ),
+                ranges: Default::default(),
             },
             &mut c,
         )

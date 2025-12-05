@@ -10,9 +10,10 @@ use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_executor::{
-    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
-    TableStorageAdapter, translation,
+    ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorTable, TableStorageAdapter,
 };
+use llkv_plan::schema::{PlanColumn as ExecutorColumn, PlanSchema as ExecutorSchema};
+use llkv_plan::translation;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
 use llkv_table::resolvers::{FieldConstraints, FieldDefinition};
@@ -97,7 +98,7 @@ where
             let field = mvcc::build_field_with_metadata(
                 &column.name,
                 column.data_type.clone(),
-                column.nullable,
+                column.is_nullable,
                 column.field_id,
             );
             fields.push(field);
@@ -366,9 +367,10 @@ where
             executor_columns.push(ExecutorColumn {
                 name: column_name,
                 data_type,
-                nullable,
-                primary_key,
-                unique,
+                is_nullable: nullable,
+                is_primary_key: primary_key,
+                is_unique: unique,
+                default_value: None,
                 field_id,
                 check_expr: fallback_constraints.check_expr.clone(),
             });
@@ -376,7 +378,7 @@ where
 
         let exec_schema = Arc::new(ExecutorSchema {
             columns: executor_columns,
-            lookup,
+            name_to_index: lookup,
         });
 
         // Find the maximum row_id in the table to set next_row_id correctly
@@ -465,8 +467,8 @@ where
         if let Some(field_resolver) = self.catalog.field_resolver(catalog_table_id) {
             for col in &executor_table.schema.columns {
                 let definition = FieldDefinition::new(&col.name)
-                    .with_primary_key(col.primary_key)
-                    .with_unique(col.unique)
+                    .with_primary_key(col.is_primary_key)
+                    .with_unique(col.is_unique)
                     .with_check_expr(col.check_expr.clone());
                 let _ = field_resolver.register_field(definition); // Ignore "already exists" errors
             }
@@ -537,7 +539,7 @@ where
         let mut found = false;
         for column in &mut columns {
             if column.field_id == field_id {
-                column.unique = true;
+                column.is_unique = true;
                 found = true;
                 break;
             }
@@ -548,7 +550,7 @@ where
 
         let schema = Arc::new(ExecutorSchema {
             columns,
-            lookup: table.schema.lookup.clone(),
+            name_to_index: table.schema.name_to_index.clone(),
         });
 
         let next_row_id = table.next_row_id.load(Ordering::SeqCst);

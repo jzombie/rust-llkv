@@ -83,23 +83,12 @@ where
     fn stream_row_ids(
         &self,
         chunk_size: usize,
+        ranges: Option<llkv_column_map::store::scan::ranges::IntRanges>,
+        driving_column: Option<LogicalFieldId>,
         on_chunk: &mut dyn FnMut(&[RowId]) -> ExecutorResult<()>,
     ) -> ExecutorResult<()> {
-        use llkv_expr::{Expr, Filter, Operator};
-        use std::ops::Bound;
-
-        let ids = self.table().filter_row_ids(&Expr::Pred(Filter {
-            field_id: llkv_table::ROW_ID_FIELD_ID,
-            op: Operator::Range {
-                lower: Bound::Unbounded,
-                upper: Bound::Unbounded,
-            },
-        }))?;
-        let rows: Vec<u64> = ids.iter().collect();
-        for chunk in rows.chunks(chunk_size.max(1)) {
-            on_chunk(chunk)?;
-        }
-        Ok(())
+        self.table()
+            .stream_row_ids(chunk_size, ranges, driving_column, on_chunk)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

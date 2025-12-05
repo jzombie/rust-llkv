@@ -11,10 +11,10 @@ use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_executor::{
-    ExecutorColumn, ExecutorTable, build_array_for_column, resolve_insert_columns, translation,
-};
+use llkv_executor::{ExecutorTable, build_array_for_column, resolve_insert_columns};
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
+use llkv_plan::schema::PlanColumn as ExecutorColumn;
+use llkv_plan::translation;
 use llkv_plan::{AssignmentValue, ColumnAssignment, PlanValue, UpdatePlan};
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
@@ -112,12 +112,15 @@ where
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
-            let column = table.schema.resolve(&assignment.column).ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "unknown column '{}' in UPDATE",
-                    assignment.column
-                ))
-            })?;
+            let column = table
+                .schema
+                .column_by_name(&assignment.column)
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "unknown column '{}' in UPDATE",
+                        assignment.column
+                    ))
+                })?;
 
             let prepared_value = match assignment.value {
                 AssignmentValue::Literal(value) => PreparedAssignmentValue::Literal(value),
@@ -460,12 +463,15 @@ where
 
         for assignment in assignments {
             let normalized = assignment.column.to_ascii_lowercase();
-            let column = table.schema.resolve(&assignment.column).ok_or_else(|| {
-                Error::InvalidArgumentError(format!(
-                    "unknown column '{}' in UPDATE",
-                    assignment.column
-                ))
-            })?;
+            let column = table
+                .schema
+                .column_by_name(&assignment.column)
+                .ok_or_else(|| {
+                    Error::InvalidArgumentError(format!(
+                        "unknown column '{}' in UPDATE",
+                        assignment.column
+                    ))
+                })?;
 
             let prepared_value = match assignment.value {
                 AssignmentValue::Literal(value) => PreparedAssignmentValue::Literal(value),
@@ -871,7 +877,7 @@ where
             let field = mvcc::build_field_with_metadata(
                 &column.name,
                 column.data_type.clone(),
-                column.nullable,
+                column.is_nullable,
                 column.field_id,
             );
             arrays.push(array);
@@ -960,6 +966,8 @@ where
             order: None,
             row_id_filter: Some(row_filter),
             include_row_ids: true,
+            ranges: None,
+            driving_column: None,
         };
 
         table

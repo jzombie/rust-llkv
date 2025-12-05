@@ -138,6 +138,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         order: None,
         row_id_filter: None,
         include_row_ids: true,
+        ranges: None,
+        driving_column: None,
     };
 
     benchmark_scenario(
@@ -168,6 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         order: None,
         row_id_filter: None,
         include_row_ids: true,
+        ranges: None,
+        driving_column: None,
     };
 
     benchmark_scenario(

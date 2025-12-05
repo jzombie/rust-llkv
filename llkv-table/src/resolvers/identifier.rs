@@ -32,6 +32,16 @@ impl IdentifierContext {
         self
     }
 
+    pub fn add_available_column(&mut self, column: String) {
+        if let Some(columns) = &mut self.available_columns {
+            columns.insert(column.to_ascii_lowercase());
+        } else {
+            let mut columns = FxHashSet::default();
+            columns.insert(column.to_ascii_lowercase());
+            self.available_columns = Some(columns);
+        }
+    }
+
     pub fn default_table_id(&self) -> Option<TableId> {
         self.default_table_id
     }

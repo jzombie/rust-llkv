@@ -131,6 +131,7 @@ fn sorted_asc_nulls_first_nonpaginate() {
                 anchor_row_id_field: Some(
                     anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
                 ),
+                ranges: Default::default(),
             },
             &mut c,
         )
@@ -173,6 +174,7 @@ fn sorted_desc_nulls_last_paginated() {
                 anchor_row_id_field: Some(
                     anchor_fid.with_namespace(LogicalStorageNamespace::RowIdShadow),
                 ),
+                ranges: Default::default(),
             },
             &mut c,
         )

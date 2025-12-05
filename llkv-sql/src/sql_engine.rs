@@ -5928,7 +5928,7 @@ impl SqlEngine {
         let catalog = self.engine.context().table_catalog();
         let resolver = catalog.identifier_resolver();
 
-        let (mut select_plan, select_context) =
+        let (mut select_plan, mut select_context) =
             self.translate_query_body(query.body.as_ref(), &resolver)?;
         if let Some(order_by) = &query.order_by {
             if !select_plan.aggregates.is_empty() {
@@ -5936,6 +5936,20 @@ impl SqlEngine {
                     "ORDER BY is not supported for aggregate queries".into(),
                 ));
             }
+
+            // Add projection aliases to the context so ORDER BY can reference them
+            for proj in &select_plan.projections {
+                match proj {
+                    llkv_plan::SelectProjection::Column { alias: Some(a), .. } => {
+                        select_context.add_available_column(a.clone());
+                    }
+                    llkv_plan::SelectProjection::Computed { alias, .. } => {
+                        select_context.add_available_column(alias.clone());
+                    }
+                    _ => {}
+                }
+            }
+
             let order_plan = self.translate_order_by(&resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(order_plan);
         }
@@ -5973,7 +5987,7 @@ impl SqlEngine {
 
         validate_simple_query(&query)?;
 
-        let (mut select_plan, select_context) = self.translate_query_body_internal(
+        let (mut select_plan, mut select_context) = self.translate_query_body_internal(
             query.body.as_ref(),
             resolver,
             outer_scopes,
@@ -5986,6 +6000,20 @@ impl SqlEngine {
                     "ORDER BY is not supported for aggregate queries".into(),
                 ));
             }
+
+            // Add projection aliases to the context so ORDER BY can reference them
+            for proj in &select_plan.projections {
+                match proj {
+                    llkv_plan::SelectProjection::Column { alias: Some(a), .. } => {
+                        select_context.add_available_column(a.clone());
+                    }
+                    llkv_plan::SelectProjection::Computed { alias, .. } => {
+                        select_context.add_available_column(alias.clone());
+                    }
+                    _ => {}
+                }
+            }
+
             let order_plan = self.translate_order_by(resolver, select_context, order_by)?;
             select_plan = select_plan.with_order_by(order_plan);
         }
@@ -10841,7 +10869,7 @@ fn resolve_column_type_in_plan(
                 target_col
             };
 
-            if let Some(field) = table.schema.resolve(target_col) {
+            if let Some(field) = table.schema.column_by_name(target_col) {
                 return Ok(field.data_type.clone());
             }
         }
