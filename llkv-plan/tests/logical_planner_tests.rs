@@ -85,6 +85,31 @@ impl TableProvider<TestPager> for DummyProvider {
     }
 }
 
+struct MultiProvider {
+    tables: FxHashMap<String, Arc<DummyTable>>, // lowercased name -> table
+}
+
+impl MultiProvider {
+    fn new(tables: Vec<Arc<DummyTable>>) -> Arc<Self> {
+        let mut map = FxHashMap::default();
+        for table in tables {
+            map.insert(table.name.to_ascii_lowercase(), table);
+        }
+        Arc::new(Self { tables: map })
+    }
+}
+
+impl TableProvider<TestPager> for MultiProvider {
+    fn get_table(&self, name: &str) -> llkv_result::Result<Arc<dyn ExecutionTable<TestPager>>> {
+        let key = name.to_ascii_lowercase();
+        self.tables
+            .get(&key)
+            .cloned()
+            .map(|t| t as Arc<dyn ExecutionTable<TestPager>>)
+            .ok_or_else(|| llkv_result::Error::CatalogError(format!("table '{name}' not found")))
+    }
+}
+
 fn make_schema() -> Arc<PlanSchema> {
     let cols = vec![
         PlanColumn {
@@ -137,6 +162,42 @@ fn build_planner() -> (LogicalPlanner<TestPager>, SingleTableLogicalPlan<TestPag
         _ => panic!("expected single-table logical plan"),
     };
     (planner, single)
+}
+
+fn make_schema_three() -> Arc<PlanSchema> {
+    let cols = vec![
+        PlanColumn {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            field_id: 1,
+            is_nullable: false,
+            is_primary_key: true,
+            is_unique: true,
+            default_value: None,
+            check_expr: None,
+        },
+        PlanColumn {
+            name: "a_id".to_string(),
+            data_type: DataType::Int64,
+            field_id: 2,
+            is_nullable: false,
+            is_primary_key: false,
+            is_unique: false,
+            default_value: None,
+            check_expr: None,
+        },
+        PlanColumn {
+            name: "val".to_string(),
+            data_type: DataType::Int64,
+            field_id: 3,
+            is_nullable: true,
+            is_primary_key: false,
+            is_unique: false,
+            default_value: None,
+            check_expr: None,
+        },
+    ];
+    Arc::new(PlanSchema::new(cols))
 }
 
 #[test]
@@ -258,6 +319,144 @@ fn logical_planner_adds_filter_columns_to_scan_projections() {
             .any(|name| name.eq_ignore_ascii_case("id")),
         "selected column should remain in projections"
     );
+}
+
+#[test]
+fn logical_planner_resolves_multi_table_plan() {
+    let table_a = Arc::new(DummyTable::new("a", make_schema(), 10));
+    let table_b = Arc::new(DummyTable::new("b", make_schema_three(), 20));
+    let provider = MultiProvider::new(vec![table_a.clone(), table_b.clone()]);
+    let planner = LogicalPlanner::new(provider);
+
+    let mut select_plan = SelectPlan::with_tables(vec![TableRef::new("", "a"), TableRef::new("", "b")]);
+    select_plan.projections = vec![
+        SelectProjection::Column {
+            name: "a.id".to_string(),
+            alias: None,
+        },
+        SelectProjection::Column {
+            name: "b.val".to_string(),
+            alias: Some("b_val".to_string()),
+        },
+    ];
+    select_plan.joins.push(JoinMetadata {
+        left_table_index: 0,
+        join_type: JoinPlan::Inner,
+        on_condition: Some(Expr::Compare {
+            left: ScalarExpr::Column("a.id".to_string()),
+            op: CompareOp::Eq,
+            right: ScalarExpr::Column("b.a_id".to_string()),
+        }),
+    });
+    select_plan.group_by = vec!["a.id".to_string()];
+    select_plan.aggregates = vec![llkv_plan::AggregateExpr::count_column(
+        "b.val",
+        "cnt",
+        false,
+    )];
+    select_plan.order_by = vec![OrderByPlan {
+        target: OrderTarget::Column("b.val".to_string()),
+        sort_type: OrderSortType::Native,
+        ascending: false,
+        nulls_first: false,
+    }];
+    select_plan.filter = Some(SelectFilter {
+        predicate: Expr::Pred(Filter {
+            field_id: "b.val".to_string(),
+            op: Operator::GreaterThan(Literal::Int128(0)),
+        }),
+        subqueries: Vec::new(),
+    });
+    select_plan.having = Some(Expr::Compare {
+        left: ScalarExpr::Column("a.id".to_string()),
+        op: CompareOp::Gt,
+        right: ScalarExpr::Literal(Literal::Int128(0)),
+    });
+
+    let plan = planner
+        .create_logical_plan(&select_plan)
+        .expect("logical planning succeeds");
+
+    let multi = match plan {
+        LogicalPlan::Multi(plan) => plan,
+        _ => panic!("expected multi-table plan"),
+    };
+
+    assert_eq!(multi.projections.len(), 2, "projections should be resolved");
+    match &multi.projections[0] {
+        llkv_plan::logical_planner::ResolvedProjection::Column {
+            table_index,
+            logical_field_id,
+            ..
+        } => {
+            assert_eq!(*table_index, 0);
+            assert_eq!(
+                *logical_field_id,
+                LogicalFieldId::for_user(table_a.table_id(), 1)
+            );
+        }
+        other => panic!("unexpected projection: {other:?}"),
+    }
+
+    let join = multi.joins.first().expect("join metadata exists");
+    let on = join.on.as_ref().expect("join ON resolved");
+    match on {
+        Expr::Compare { left, right, .. } => {
+            match left {
+                ScalarExpr::Column(fid) => {
+                    assert_eq!(fid.table_index, 0);
+                    assert_eq!(fid.logical_field_id.table_id(), table_a.table_id());
+                }
+                other => panic!("unexpected left expr: {other:?}"),
+            }
+            match right {
+                ScalarExpr::Column(fid) => {
+                    assert_eq!(fid.table_index, 1);
+                    assert_eq!(fid.logical_field_id.table_id(), table_b.table_id());
+                }
+                other => panic!("unexpected right expr: {other:?}"),
+            }
+        }
+        other => panic!("unexpected ON predicate: {other:?}"),
+    }
+
+    let filter = multi.filter.as_ref().expect("filter resolved");
+    match filter {
+        Expr::Pred(Filter { field_id, .. }) => {
+            assert_eq!(field_id.table_index, 1);
+            assert_eq!(field_id.logical_field_id.table_id(), table_b.table_id());
+        }
+        other => panic!("unexpected filter: {other:?}"),
+    }
+
+    let having = multi.having.as_ref().expect("having resolved");
+    match having {
+        Expr::Compare { left, .. } => match left {
+            ScalarExpr::Column(fid) => {
+                assert_eq!(fid.table_index, 0);
+                assert_eq!(fid.logical_field_id.table_id(), table_a.table_id());
+            }
+            other => panic!("unexpected having expr: {other:?}"),
+        },
+        other => panic!("unexpected having predicate: {other:?}"),
+    }
+
+    let group_key = multi.group_by.first().expect("group by resolved");
+    assert_eq!(group_key.table_index, 0);
+    assert_eq!(group_key.logical_field_id.table_id(), table_a.table_id());
+
+    let agg = multi.aggregates.first().expect("aggregate resolved");
+    let (agg_table, agg_lfid) = agg.input.expect("aggregate input resolved");
+    assert_eq!(agg_table, 1, "aggregate should reference second table");
+    assert_eq!(agg_lfid.table_id(), table_b.table_id());
+
+    let order = multi.order_by.first().expect("order by resolved");
+    let resolved_column = order
+        .resolved_column
+        .as_ref()
+        .expect("order by column resolved");
+    assert_eq!(resolved_column.0, 1);
+    assert_eq!(resolved_column.1.table_id(), table_b.table_id());
 }
 
 #[test]

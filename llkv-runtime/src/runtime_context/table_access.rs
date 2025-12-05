@@ -6,13 +6,13 @@
 //! lazy loading, and direct batch interactions.
 
 use crate::{RuntimeContext, RuntimeTableHandle, canonical_table_name};
-use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
+use arrow::array::{ArrayRef, UInt64Builder};
+use arrow::record_batch::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_executor::{
-    ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorTable, TableStorageAdapter,
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable, TableStorageAdapter,
 };
-use llkv_plan::schema::{PlanColumn as ExecutorColumn, PlanSchema as ExecutorSchema};
 use llkv_plan::translation;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
@@ -34,11 +34,11 @@ impl<P> RuntimeContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    /// Exports all rows from a table as a `RowBatch` - internal storage API.
+    /// Exports all rows from a table as Arrow batches - internal storage API.
     /// Use through `RuntimeSession` or `RuntimeTableHandle` instead.
-    pub(crate) fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<ExecutorRowBatch> {
+    pub(crate) fn export_table_batches(self: &Arc<Self>, name: &str) -> Result<Vec<RecordBatch>> {
         let handle = RuntimeTableHandle::new(Arc::clone(self), name)?;
-        handle.lazy()?.collect_rows()
+        handle.lazy()?.collect_batches()
     }
 
     /// Get raw batches from a table including row_ids - internal storage API.
@@ -54,14 +54,12 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         let filter_expr = match filter {
-            Some(expr) => {
-                translation::expression::translate_predicate(expr, table.schema.as_ref(), |name| {
-                    Error::InvalidArgumentError(format!(
-                        "Binder Error: does not have a column named '{}'",
-                        name
-                    ))
-                })?
-            }
+            Some(expr) => translation::expression::translate_predicate(expr, table.schema.as_ref(), |name| {
+                Error::InvalidArgumentError(format!(
+                    "Binder Error: does not have a column named '{}'",
+                    name
+                ))
+            })?,
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(

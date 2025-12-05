@@ -14,7 +14,7 @@ use llkv_table::{
 use crate::{
     AlterTablePlan, CatalogDdl, CreateIndexPlan, CreateTablePlan, CreateTableSource,
     CreateViewPlan, DeletePlan, DropIndexPlan, DropTablePlan, DropViewPlan, InsertPlan,
-    InsertSource, PlanColumnSpec, PlanOperation, PlanValue, RenameTablePlan, RuntimeContext,
+    InsertSource, PlanColumnSpec, PlanOperation, RenameTablePlan, RuntimeContext,
     RuntimeStatementResult, RuntimeTransactionContext, SelectExecution, SelectPlan,
     SelectProjection, TransactionContext, TransactionKind, TransactionResult, TransactionSession,
     UpdatePlan, information_schema::refresh_information_schema,
@@ -705,20 +705,20 @@ impl RuntimeSession {
             }
             InsertSource::Select { plan: select_plan } => {
                 let select_result = self.execute_select_plan(*select_plan)?;
-                let rows = match select_result {
-                    RuntimeStatementResult::Select { execution, .. } => execution.into_rows()?,
+                let batches = match select_result {
+                    RuntimeStatementResult::Select { execution, .. } => execution.collect()?,
                     _ => {
                         return Err(Error::Internal(
                             "expected Select result when executing INSERT ... SELECT".into(),
                         ));
                     }
                 };
-                let count = rows.len();
+                let count = batches.iter().map(|b| b.num_rows()).sum();
                 Ok((
                     InsertPlan {
                         table,
                         columns,
-                        source: InsertSource::Rows(rows),
+                        source: InsertSource::Batches(batches),
                         on_conflict,
                     },
                     count,
@@ -880,12 +880,12 @@ impl RuntimeSession {
         }
     }
 
-    /// Convenience helper to fetch all rows from a table within this session.
-    pub fn table_rows(&self, table: &str) -> Result<Vec<Vec<PlanValue>>> {
+    /// Convenience helper to fetch all rows from a table within this session as Arrow batches.
+    pub fn table_batches(&self, table: &str) -> Result<Vec<RecordBatch>> {
         let plan =
             SelectPlan::new(table.to_string()).with_projections(vec![SelectProjection::AllColumns]);
         match self.execute_select_plan(plan)? {
-            RuntimeStatementResult::Select { execution, .. } => Ok(execution.collect_rows()?.rows),
+            RuntimeStatementResult::Select { execution, .. } => execution.collect(),
             other => Err(Error::Internal(format!(
                 "expected Select result when reading table '{}', got {:?}",
                 table, other

@@ -67,8 +67,7 @@ where
         filter: LlkvExpr<'static, String>,
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
-        let schema = table.schema.as_ref();
-        let filter_expr = translation::expression::translate_predicate(filter, schema, |name| {
+        let filter_expr = translation::expression::translate_predicate(filter, table.schema.as_ref(), |name| {
             Error::InvalidArgumentError(format!(
                 "Binder Error: does not have a column named '{}'",
                 name

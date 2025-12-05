@@ -1,7 +1,6 @@
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
-use llkv_executor::ExecutorRowBatch;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
@@ -148,8 +147,8 @@ where
         self.context().catalog().table_column_specs(&canonical_name)
     }
 
-    fn export_table_rows(&self, table_name: &str) -> LlkvResult<ExecutorRowBatch> {
-        RuntimeContext::export_table_rows(self.context(), table_name)
+    fn export_table_batches(&self, table_name: &str) -> LlkvResult<Vec<RecordBatch>> {
+        RuntimeContext::export_table_batches(self.context(), table_name)
     }
 
     fn get_batches_with_row_ids(

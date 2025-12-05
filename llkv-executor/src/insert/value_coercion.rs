@@ -1,24 +1,17 @@
 //! Helper functions for value coercion and data preparation used during inserts.
 
-use arrow::array::{
-    ArrayRef, BooleanBuilder, Date32Builder, Decimal128Array, Float64Builder, Int64Builder,
-    IntervalMonthDayNanoArray, StringBuilder,
-};
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, BooleanBuilder, Date32Builder, Decimal128Array, Float64Builder, Int64Builder, IntervalMonthDayNanoArray, StringBuilder};
 use arrow::datatypes::{DataType, FieldRef, IntervalUnit};
 use llkv_compute::date::parse_date32_literal;
-use llkv_compute::scalar::decimal::{
-    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
-    truncate_decimal_to_i64,
-};
+use llkv_compute::scalar::decimal::{align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy, truncate_decimal_to_i64};
 use llkv_compute::scalar::interval::interval_value_to_arrow;
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
-use std::sync::Arc;
 
 use crate::{ExecutorColumn, ExecutorSchema};
 
-/// Resolve the user-specified column list for an INSERT statement into indexes
-/// of the executor schema. If no columns were provided, return the identity order.
 pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Result<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..schema.columns.len()).collect());
@@ -38,11 +31,7 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
     Ok(resolved)
 }
 
-/// Coerce a `PlanValue` into the Arrow data type required by the executor column.
-pub fn normalize_insert_value_for_column(
-    column: &ExecutorColumn,
-    value: PlanValue,
-) -> Result<PlanValue> {
+pub fn normalize_insert_value_for_column(column: &ExecutorColumn, value: PlanValue) -> Result<PlanValue> {
     match (&column.data_type, value) {
         (_, PlanValue::Null) => Ok(PlanValue::Null),
         (DataType::Int64, PlanValue::Integer(v)) => Ok(PlanValue::Integer(v)),
@@ -60,19 +49,9 @@ pub fn normalize_insert_value_for_column(
             "cannot insert {other:?} into INT column '{}'",
             column.name
         ))),
-        (DataType::Boolean, PlanValue::Integer(v)) => {
-            Ok(PlanValue::Integer(if v != 0 { 1 } else { 0 }))
-        }
-        (DataType::Boolean, PlanValue::Float(v)) => {
-            Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 }))
-        }
-        (DataType::Boolean, PlanValue::Decimal(decimal)) => {
-            Ok(PlanValue::Integer(if decimal_truthy(decimal) {
-                1
-            } else {
-                0
-            }))
-        }
+        (DataType::Boolean, PlanValue::Integer(v)) => Ok(PlanValue::Integer(if v != 0 { 1 } else { 0 })),
+        (DataType::Boolean, PlanValue::Float(v)) => Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 })),
+        (DataType::Boolean, PlanValue::Decimal(decimal)) => Ok(PlanValue::Integer(if decimal_truthy(decimal) { 1 } else { 0 })),
         (DataType::Boolean, PlanValue::String(s)) => {
             let normalized = s.trim().to_ascii_lowercase();
             let value = match normalized.as_str() {
@@ -133,15 +112,11 @@ pub fn normalize_insert_value_for_column(
             "expected struct value for struct column '{}', got {other:?}",
             column.name
         ))),
-        (DataType::Interval(IntervalUnit::MonthDayNano), PlanValue::Interval(interval)) => {
-            Ok(PlanValue::Interval(interval))
-        }
-        (DataType::Interval(IntervalUnit::MonthDayNano), other) => {
-            Err(Error::InvalidArgumentError(format!(
-                "cannot insert {other:?} into INTERVAL column '{}'",
-                column.name
-            )))
-        }
+        (DataType::Interval(IntervalUnit::MonthDayNano), PlanValue::Interval(interval)) => Ok(PlanValue::Interval(interval)),
+        (DataType::Interval(IntervalUnit::MonthDayNano), other) => Err(Error::InvalidArgumentError(format!(
+            "cannot insert {other:?} into INTERVAL column '{}'",
+            column.name
+        ))),
         (DataType::Decimal128(precision, scale), PlanValue::Decimal(decimal)) => {
             let aligned = align_decimal_to_scale(decimal, *precision, *scale).map_err(|err| {
                 Error::InvalidArgumentError(format!(
@@ -180,7 +155,6 @@ pub fn normalize_insert_value_for_column(
     }
 }
 
-/// Build an Arrow array that matches the executor column's data type from the provided values.
 pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<ArrayRef> {
     match dtype {
         DataType::Int64 => {
@@ -216,9 +190,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v != 0),
                     PlanValue::Float(v) => builder.append_value(*v != 0.0),
-                    PlanValue::Decimal(decimal) => {
-                        builder.append_value(decimal_truthy(*decimal));
-                    }
+                    PlanValue::Decimal(decimal) => builder.append_value(decimal_truthy(*decimal)),
                     PlanValue::Date32(days) => builder.append_value(*days != 0),
                     PlanValue::String(s) => {
                         let normalized = s.trim().to_ascii_lowercase();
@@ -249,9 +221,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v as f64),
                     PlanValue::Float(v) => builder.append_value(*v),
-                    PlanValue::Decimal(decimal) => {
-                        builder.append_value(decimal.to_f64());
-                    }
+                    PlanValue::Decimal(decimal) => builder.append_value(decimal.to_f64()),
                     PlanValue::Date32(days) => builder.append_value(f64::from(*days)),
                     PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
@@ -269,9 +239,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(v.to_string()),
                     PlanValue::Float(v) => builder.append_value(v.to_string()),
-                    PlanValue::Decimal(decimal) => {
-                        builder.append_value(decimal.to_string());
-                    }
+                    PlanValue::Decimal(decimal) => builder.append_value(decimal.to_string()),
                     PlanValue::Date32(days) => builder.append_value(days.to_string()),
                     PlanValue::String(s) => builder.append_value(s),
                     PlanValue::Struct(_) | PlanValue::Interval(_) => {
@@ -328,8 +296,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     match value {
                         PlanValue::Null => field_values.push(PlanValue::Null),
                         PlanValue::Struct(map) => {
-                            let field_value =
-                                map.get(field_name).cloned().unwrap_or(PlanValue::Null);
+                            let field_value = map.get(field_name).cloned().unwrap_or(PlanValue::Null);
                             field_values.push(field_value);
                         }
                         _ => {
@@ -353,13 +320,12 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                 let entry = match value {
                     PlanValue::Null => None,
                     PlanValue::Decimal(decimal) => {
-                        let aligned = align_decimal_to_scale(*decimal, *precision, *scale)
-                            .map_err(|err| {
-                                Error::InvalidArgumentError(format!(
-                                    "decimal literal {} incompatible with DECIMAL({}, {}): {err}",
-                                    decimal, precision, scale
-                                ))
-                            })?;
+                        let aligned = align_decimal_to_scale(*decimal, *precision, *scale).map_err(|err| {
+                            Error::InvalidArgumentError(format!(
+                                "decimal literal {} incompatible with DECIMAL({}, {}): {err}",
+                                decimal, precision, scale
+                            ))
+                        })?;
                         Some(aligned.raw_value())
                     }
                     PlanValue::Integer(value) => {
@@ -401,20 +367,20 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
             for value in values {
                 match value {
                     PlanValue::Null => converted.push(None),
-                    PlanValue::Interval(interval) => {
-                        converted.push(Some(interval_value_to_arrow(*interval)))
-                    }
-                    other => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "cannot insert {other:?} into INTERVAL column"
-                        )));
+                    PlanValue::Interval(interval) => converted.push(Some(interval_value_to_arrow(*interval))),
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert non-interval into INTERVAL column".into(),
+                        ));
                     }
                 }
             }
-            Ok(Arc::new(IntervalMonthDayNanoArray::from(converted)) as ArrayRef)
+            let array = IntervalMonthDayNanoArray::from(converted);
+            Ok(Arc::new(array) as ArrayRef)
         }
         other => Err(Error::InvalidArgumentError(format!(
-            "unsupported Arrow data type for INSERT: {other:?}"
+            "unsupported Arrow data type {:?} for INSERT array build",
+            other
         ))),
     }
 }

@@ -47,6 +47,16 @@ pub fn cross_join_pair(
         ))
     })?;
 
+    // Arrow string offsets are i32-backed; prevent building batches that would overflow
+    // downstream kernels before allocating any intermediate buffers.
+    if total_rows > i32::MAX as usize {
+        return Err(Error::InvalidArgumentError(format!(
+            "cross join would produce {} rows, exceeding Arrow's row limit of {}",
+            total_rows,
+            i32::MAX
+        )));
+    }
+
     if left_rows > u32::MAX as usize {
         return Err(Error::InvalidArgumentError(
             "cross join left side exceeds supported row index range".into(),

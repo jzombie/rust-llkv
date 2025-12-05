@@ -72,7 +72,22 @@ where
 {
     pub tables: Vec<PlannedTable<P>>,
     pub table_order: Vec<TableRef>,
-    pub filter: Option<Expr<'static, String>>,
+    pub filter: Option<Expr<'static, ResolvedFieldRef>>,
+    pub original_filter: Option<Expr<'static, String>>,
+    pub having: Option<Expr<'static, ResolvedFieldRef>>,
+    pub original_having: Option<Expr<'static, String>>,
+    /// Joins with ON clauses resolved to concrete tables/fields.
+    pub joins: Vec<ResolvedJoin>,
+    /// Projections resolved to concrete columns or computed expressions.
+    pub projections: Vec<ResolvedProjection>,
+    /// Aggregates resolved to concrete input columns.
+    pub aggregates: Vec<ResolvedAggregate>,
+    /// GROUP BY keys resolved to concrete columns.
+    pub group_by: Vec<ResolvedGroupKey>,
+    /// ORDER BY targets resolved to concrete columns when possible.
+    pub order_by: Vec<ResolvedOrderBy>,
+    pub distinct: bool,
+    pub compound: Option<crate::plans::CompoundSelectPlan>,
     /// Columns resolved to concrete tables/fields for pushdown.
     pub resolved_required: Vec<ResolvedColumn>,
     /// Names we could not resolve uniquely (ambiguous or missing).
@@ -94,6 +109,57 @@ pub struct ResolvedColumn {
     pub original: String,
     pub table_index: usize,
     pub logical_field_id: LogicalFieldId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedFieldRef {
+    pub table_index: usize,
+    pub logical_field_id: LogicalFieldId,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedJoin {
+    pub left_table_index: usize,
+    pub join_type: crate::plans::JoinPlan,
+    pub on: Option<Expr<'static, ResolvedFieldRef>>, // predicate with resolved columns
+    pub original_on: Option<Expr<'static, String>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ResolvedProjection {
+    Column {
+        table_index: usize,
+        logical_field_id: LogicalFieldId,
+        alias: Option<String>,
+    },
+    Computed {
+        expr: llkv_expr::expr::ScalarExpr<ResolvedFieldRef>,
+        alias: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedAggregate {
+    pub input: Option<(usize, LogicalFieldId)>,
+    pub alias: String,
+    pub function: crate::plans::AggregateFunction,
+    pub distinct: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedGroupKey {
+    pub table_index: usize,
+    pub logical_field_id: LogicalFieldId,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedOrderBy {
+    pub target: crate::plans::OrderTarget,
+    pub sort_type: crate::plans::OrderSortType,
+    pub ascending: bool,
+    pub nulls_first: bool,
+    /// If the target is a column, record the resolved location.
+    pub resolved_column: Option<(usize, LogicalFieldId)>,
 }
 
 /// Planner that resolves column references and ORDER BY targets before physical planning.
@@ -230,10 +296,41 @@ where
         let (resolved_columns, unresolved_required) =
             resolve_required_columns(plan, &planned_tables);
 
+        let ctx = ResolutionContext {
+            tables: &planned_tables,
+            table_refs: &plan.tables,
+        };
+
+        let filter = match &plan.filter {
+            Some(filter) => Some(resolve_predicate(&ctx, &filter.predicate)?),
+            None => None,
+        };
+
+        let having = match &plan.having {
+            Some(having) => Some(resolve_predicate(&ctx, having)?),
+            None => None,
+        };
+
+        let projections = resolve_projections(plan, &ctx)?;
+        let aggregates = resolve_aggregates(plan, &ctx)?;
+        let group_by = resolve_group_by(plan, &ctx)?;
+        let order_by = resolve_order_by(plan, &ctx)?;
+        let joins = resolve_joins(plan, &ctx)?;
+
         Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
             tables: planned_tables,
             table_order: plan.tables.clone(),
-            filter: plan.filter.as_ref().map(|f| f.predicate.clone()),
+            filter,
+            original_filter: plan.filter.as_ref().map(|f| f.predicate.clone()),
+            having,
+            original_having: plan.having.clone(),
+            joins,
+            projections,
+            aggregates,
+            group_by,
+            order_by,
+            distinct: plan.distinct,
+            compound: plan.compound.clone(),
             resolved_required: resolved_columns,
             unresolved_required,
         }))
@@ -519,24 +616,46 @@ where
         let mut candidates = Vec::new();
 
         for (idx, table) in tables.iter().enumerate() {
-            let table_name_lower = table.name.to_ascii_lowercase();
-            let alias_lower = plan
-                .tables
-                .get(idx)
-                .and_then(|t| t.alias.as_ref())
-                .map(|a| a.to_ascii_lowercase());
+            let Some(table_ref) = plan.tables.get(idx) else { continue };
+            let table_lower = table_ref.table.to_ascii_lowercase();
+            let schema_lower = table_ref.schema.to_ascii_lowercase();
+            let qualified_lower = if schema_lower.is_empty() {
+                table_lower.clone()
+            } else {
+                format!("{}.{}", schema_lower, table_lower)
+            };
+            let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
 
             // If a qualifier exists, check it.
             if parts.len() > 1 {
-                let prefix = parts[0].to_ascii_lowercase();
-                if prefix != table_name_lower
-                    && alias_lower.as_ref().is_some_and(|alias| prefix != *alias)
+                let qualifier = parts[0].to_ascii_lowercase();
+
+                // Support schema.table.column by matching the first two components against the
+                // fully-qualified table name and advancing the column start accordingly.
+                let qualifier_matches_alias = alias_lower
+                    .as_ref()
+                    .is_some_and(|alias| qualifier == *alias);
+                let qualifier_matches_table = alias_lower.is_none()
+                    && (qualifier == qualified_lower
+                        || qualifier == table_lower
+                        || (!schema_lower.is_empty() && qualifier == schema_lower));
+                let col_start = if alias_lower.is_none()
+                    && parts.len() >= 3
+                    && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase())
+                        == qualified_lower
                 {
-                    continue;
-                }
-                let col_name = parts[1..].join("."); // nested paths collapse; schema matching is on base column
-                if table.schema.column_by_name(&col_name).is_some() {
-                    candidates.push((idx, col_name));
+                    Some(2)
+                } else if qualifier_matches_alias || qualifier_matches_table {
+                    Some(1)
+                } else {
+                    None
+                };
+
+                if let Some(start_idx) = col_start {
+                    let col_name = parts[start_idx..].join("."); // nested paths collapse; schema matching is on base column
+                    if table.schema.column_by_name(&col_name).is_some() {
+                        candidates.push((idx, col_name));
+                    }
                 }
             } else if table.schema.column_by_name(&name).is_some() {
                 candidates.push((idx, name.clone()));
@@ -560,4 +679,412 @@ where
     }
 
     (resolved, unresolved)
+}
+
+struct ResolutionContext<'a, P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    tables: &'a [PlannedTable<P>],
+    table_refs: &'a [TableRef],
+}
+
+fn resolve_column_ref<P>(ctx: &ResolutionContext<P>, name: &str) -> Result<(usize, LogicalFieldId)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let parts: Vec<&str> = name.split('.').collect();
+    let mut candidates = Vec::new();
+
+    for (idx, table) in ctx.tables.iter().enumerate() {
+        let Some(table_ref) = ctx.table_refs.get(idx) else { continue };
+        let table_lower = table_ref.table.to_ascii_lowercase();
+        let schema_lower = table_ref.schema.to_ascii_lowercase();
+        let qualified_lower = if schema_lower.is_empty() {
+            table_lower.clone()
+        } else {
+            format!("{}.{}", schema_lower, table_lower)
+        };
+        let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+
+        if parts.len() > 1 {
+            let qualifier = parts[0].to_ascii_lowercase();
+
+            let qualifier_matches_alias = alias_lower
+                .as_ref()
+                .is_some_and(|alias| qualifier == *alias);
+            let qualifier_matches_table = alias_lower.is_none()
+                && (qualifier == qualified_lower
+                    || qualifier == table_lower
+                    || (!schema_lower.is_empty() && qualifier == schema_lower));
+            let col_start = if alias_lower.is_none()
+                && parts.len() >= 3
+                && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase())
+                    == qualified_lower
+            {
+                Some(2)
+            } else if qualifier_matches_alias || qualifier_matches_table {
+                Some(1)
+            } else {
+                None
+            };
+
+            if let Some(start_idx) = col_start {
+                let col_name = parts[start_idx..].join(".");
+                if let Some(col) = table.schema.column_by_name(&col_name) {
+                    let lfid = LogicalFieldId::for_user(table.table_id, col.field_id);
+                    candidates.push((idx, lfid));
+                }
+            }
+        } else if let Some(col) = table.schema.column_by_name(name) {
+            let lfid = LogicalFieldId::for_user(table.table_id, col.field_id);
+            candidates.push((idx, lfid));
+        }
+    }
+
+    match candidates.len() {
+        0 => Err(Error::InvalidArgumentError(format!(
+            "Unknown column '{name}' in multi-table query"
+        ))),
+        1 => Ok(candidates.pop().expect("matched len 1")),
+        _ => Err(Error::InvalidArgumentError(format!(
+            "Ambiguous column reference '{name}'"
+        ))),
+    }
+}
+
+fn resolve_scalar_expr<P>(
+    ctx: &ResolutionContext<P>,
+    expr: &llkv_expr::expr::ScalarExpr<String>,
+) -> Result<llkv_expr::expr::ScalarExpr<ResolvedFieldRef>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    use llkv_expr::expr::{AggregateCall, ScalarExpr};
+
+    Ok(match expr {
+        ScalarExpr::Column(name) => {
+            let (table_idx, lfid) = resolve_column_ref(ctx, name)?;
+            ScalarExpr::Column(ResolvedFieldRef {
+                table_index: table_idx,
+                logical_field_id: lfid,
+            })
+        }
+        ScalarExpr::Literal(lit) => ScalarExpr::Literal(lit.clone()),
+        ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+            left: Box::new(resolve_scalar_expr(ctx, left)?),
+            op: *op,
+            right: Box::new(resolve_scalar_expr(ctx, right)?),
+        },
+        ScalarExpr::Not(inner) => ScalarExpr::Not(Box::new(resolve_scalar_expr(ctx, inner)?)),
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(resolve_scalar_expr(ctx, expr)?),
+            negated: *negated,
+        },
+        ScalarExpr::Aggregate(call) => ScalarExpr::Aggregate(match call {
+            AggregateCall::CountStar => AggregateCall::CountStar,
+            AggregateCall::Count { expr, distinct } => AggregateCall::Count {
+                expr: Box::new(resolve_scalar_expr(ctx, expr)?),
+                distinct: *distinct,
+            },
+            AggregateCall::Sum { expr, distinct } => AggregateCall::Sum {
+                expr: Box::new(resolve_scalar_expr(ctx, expr)?),
+                distinct: *distinct,
+            },
+            AggregateCall::Total { expr, distinct } => AggregateCall::Total {
+                expr: Box::new(resolve_scalar_expr(ctx, expr)?),
+                distinct: *distinct,
+            },
+            AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
+                expr: Box::new(resolve_scalar_expr(ctx, expr)?),
+                distinct: *distinct,
+            },
+            AggregateCall::Min(expr) => {
+                AggregateCall::Min(Box::new(resolve_scalar_expr(ctx, expr)?))
+            }
+            AggregateCall::Max(expr) => {
+                AggregateCall::Max(Box::new(resolve_scalar_expr(ctx, expr)?))
+            }
+            AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(
+                resolve_scalar_expr(ctx, expr)?,
+            )),
+            AggregateCall::GroupConcat {
+                expr,
+                distinct,
+                separator,
+            } => AggregateCall::GroupConcat {
+                expr: Box::new(resolve_scalar_expr(ctx, expr)?),
+                distinct: *distinct,
+                separator: separator.clone(),
+            },
+        }),
+        ScalarExpr::GetField { base, field_name } => ScalarExpr::GetField {
+            base: Box::new(resolve_scalar_expr(ctx, base)?),
+            field_name: field_name.clone(),
+        },
+        ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+            expr: Box::new(resolve_scalar_expr(ctx, expr)?),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+            left: Box::new(resolve_scalar_expr(ctx, left)?),
+            op: *op,
+            right: Box::new(resolve_scalar_expr(ctx, right)?),
+        },
+        ScalarExpr::Coalesce(list) => ScalarExpr::Coalesce(
+            list.iter()
+                .map(|item| resolve_scalar_expr(ctx, item))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        ScalarExpr::ScalarSubquery(subq) => ScalarExpr::ScalarSubquery(subq.clone()),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => ScalarExpr::Case {
+            operand: operand
+                .as_deref()
+                .map(|op| resolve_scalar_expr(ctx, op))
+                .transpose()?
+                .map(Box::new),
+            branches: {
+                let mut out = Vec::with_capacity(branches.len());
+                for (when, then) in branches {
+                    out.push((resolve_scalar_expr(ctx, when)?, resolve_scalar_expr(ctx, then)?));
+                }
+                out
+            },
+            else_expr: else_expr
+                .as_deref()
+                .map(|e| resolve_scalar_expr(ctx, e))
+                .transpose()?
+                .map(Box::new),
+        },
+        ScalarExpr::Random => ScalarExpr::Random,
+    })
+}
+
+fn resolve_predicate<P>(
+    ctx: &ResolutionContext<P>,
+    expr: &Expr<'static, String>,
+) -> Result<Expr<'static, ResolvedFieldRef>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    Ok(match expr {
+        Expr::And(list) => Expr::And(
+            list.iter()
+                .map(|inner| resolve_predicate(ctx, inner))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Expr::Or(list) => Expr::Or(
+            list.iter()
+                .map(|inner| resolve_predicate(ctx, inner))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(resolve_predicate(ctx, inner)?)),
+        Expr::Pred(filter) => {
+            let (table_idx, lfid) = resolve_column_ref(ctx, &filter.field_id)?;
+            Expr::Pred(llkv_expr::expr::Filter {
+                field_id: ResolvedFieldRef {
+                    table_index: table_idx,
+                    logical_field_id: lfid,
+                },
+                op: filter.op.clone(),
+            })
+        }
+        Expr::Compare { left, op, right } => Expr::Compare {
+            left: resolve_scalar_expr(ctx, left)?,
+            op: *op,
+            right: resolve_scalar_expr(ctx, right)?,
+        },
+        Expr::InList { expr, list, negated } => Expr::InList {
+            expr: resolve_scalar_expr(ctx, expr)?,
+            list: list
+                .iter()
+                .map(|item| resolve_scalar_expr(ctx, item))
+                .collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: resolve_scalar_expr(ctx, expr)?,
+            negated: *negated,
+        },
+        Expr::Literal(v) => Expr::Literal(*v),
+        Expr::Exists(subq) => Expr::Exists(subq.clone()),
+    })
+}
+
+fn resolve_projections<P>(
+    plan: &SelectPlan,
+    ctx: &ResolutionContext<P>,
+) -> Result<Vec<ResolvedProjection>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut out = Vec::new();
+    let projections = if plan.projections.is_empty() {
+        vec![crate::plans::SelectProjection::AllColumns]
+    } else {
+        plan.projections.clone()
+    };
+
+    for proj in projections {
+        match proj {
+            crate::plans::SelectProjection::AllColumns => {
+                for (table_idx, table) in ctx.tables.iter().enumerate() {
+                    for col in &table.schema.columns {
+                        out.push(ResolvedProjection::Column {
+                            table_index: table_idx,
+                            logical_field_id: LogicalFieldId::for_user(
+                                table.table_id,
+                                col.field_id,
+                            ),
+                            alias: None,
+                        });
+                    }
+                }
+            }
+            crate::plans::SelectProjection::AllColumnsExcept { exclude } => {
+                for (table_idx, table) in ctx.tables.iter().enumerate() {
+                    for col in &table.schema.columns {
+                        if exclude
+                            .iter()
+                            .any(|ex| ex.eq_ignore_ascii_case(&col.name))
+                        {
+                            continue;
+                        }
+                        out.push(ResolvedProjection::Column {
+                            table_index: table_idx,
+                            logical_field_id: LogicalFieldId::for_user(
+                                table.table_id,
+                                col.field_id,
+                            ),
+                            alias: None,
+                        });
+                    }
+                }
+            }
+            crate::plans::SelectProjection::Column { name, alias } => {
+                let (table_idx, lfid) = resolve_column_ref(ctx, &name)?;
+                out.push(ResolvedProjection::Column {
+                    table_index: table_idx,
+                    logical_field_id: lfid,
+                    alias,
+                });
+            }
+            crate::plans::SelectProjection::Computed { expr, alias } => {
+                out.push(ResolvedProjection::Computed {
+                    expr: resolve_scalar_expr(ctx, &expr)?,
+                    alias,
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn resolve_aggregates<P>(
+    plan: &SelectPlan,
+    ctx: &ResolutionContext<P>,
+) -> Result<Vec<ResolvedAggregate>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut out = Vec::with_capacity(plan.aggregates.len());
+    for agg in &plan.aggregates {
+        match agg {
+            crate::plans::AggregateExpr::CountStar { alias, distinct } => out.push(
+                ResolvedAggregate {
+                    input: None,
+                    alias: alias.clone(),
+                    function: crate::plans::AggregateFunction::Count,
+                    distinct: *distinct,
+                },
+            ),
+            crate::plans::AggregateExpr::Column {
+                column,
+                alias,
+                function,
+                distinct,
+            } => {
+                let (table_idx, lfid) = resolve_column_ref(ctx, column)?;
+                out.push(ResolvedAggregate {
+                    input: Some((table_idx, lfid)),
+                    alias: alias.clone(),
+                    function: function.clone(),
+                    distinct: *distinct,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_group_by<P>(
+    plan: &SelectPlan,
+    ctx: &ResolutionContext<P>,
+) -> Result<Vec<ResolvedGroupKey>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut out = Vec::with_capacity(plan.group_by.len());
+    for key in &plan.group_by {
+        let (table_idx, lfid) = resolve_column_ref(ctx, key)?;
+        out.push(ResolvedGroupKey {
+            table_index: table_idx,
+            logical_field_id: lfid,
+        });
+    }
+    Ok(out)
+}
+
+fn resolve_order_by<P>(
+    plan: &SelectPlan,
+    ctx: &ResolutionContext<P>,
+) -> Result<Vec<ResolvedOrderBy>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut out = Vec::with_capacity(plan.order_by.len());
+    for entry in &plan.order_by {
+        let resolved_column = match &entry.target {
+            OrderTarget::Column(name) => Some(resolve_column_ref(ctx, name)?),
+            _ => None,
+        };
+
+        out.push(ResolvedOrderBy {
+            target: entry.target.clone(),
+            sort_type: entry.sort_type.clone(),
+            ascending: entry.ascending,
+            nulls_first: entry.nulls_first,
+            resolved_column,
+        });
+    }
+    Ok(out)
+}
+
+fn resolve_joins<P>(
+    plan: &SelectPlan,
+    ctx: &ResolutionContext<P>,
+) -> Result<Vec<ResolvedJoin>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut out = Vec::with_capacity(plan.joins.len());
+    for join in &plan.joins {
+        let on = match &join.on_condition {
+            Some(expr) => Some(resolve_predicate(ctx, expr)?),
+            None => None,
+        };
+
+        out.push(ResolvedJoin {
+            left_table_index: join.left_table_index,
+            join_type: join.join_type,
+            on,
+            original_on: join.on_condition.clone(),
+        });
+    }
+    Ok(out)
 }

@@ -1,4 +1,5 @@
 use crate::plans::PlanValue;
+use crate::translation::schema_view::SchemaView;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use llkv_types::FieldId;
 use rustc_hash::FxHashMap;
@@ -55,5 +56,17 @@ impl PlanSchema {
             .map(|c| Field::new(&c.name, c.data_type.clone(), c.is_nullable))
             .collect();
         Arc::new(Schema::new(fields))
+    }
+}
+
+impl SchemaView for PlanSchema {
+    fn field_id_by_name(&self, name: &str) -> Option<FieldId> {
+        self.column_by_name(name).map(|c| c.field_id)
+    }
+}
+
+impl SchemaView for std::sync::Arc<PlanSchema> {
+    fn field_id_by_name(&self, name: &str) -> Option<FieldId> {
+        self.as_ref().field_id_by_name(name)
     }
 }

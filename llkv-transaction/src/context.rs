@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
-use llkv_executor::{ExecutorRowBatch, SelectExecution};
+use llkv_executor::SelectExecution;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropTablePlan, InsertPlan, PlanColumnSpec,
@@ -62,8 +62,8 @@ pub trait TransactionContext: CatalogDdl + Send + Sync {
     /// Get table column specifications
     fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<PlanColumnSpec>>;
 
-    /// Export table rows for snapshotting
-    fn export_table_rows(&self, table_name: &str) -> LlkvResult<ExecutorRowBatch>;
+    /// Export table data for snapshotting
+    fn export_table_batches(&self, table_name: &str) -> LlkvResult<Vec<RecordBatch>>;
 
     /// Get batches with row IDs for seeding updates
     fn get_batches_with_row_ids(

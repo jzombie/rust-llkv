@@ -16,7 +16,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, SortField};
 
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_executor::{SelectExecution, push_query_label};
+use llkv_executor::SelectExecution;
 use llkv_expr::literal::Literal;
 use llkv_plan::validation::{
     ensure_known_columns_case_insensitive, ensure_non_empty, ensure_unique_case_insensitive,
@@ -61,6 +61,14 @@ type SqlStatementResult = RuntimeStatementResult<SqlPager>;
 type SqlContext = RuntimeContext<SqlPager>;
 type SqlSession = RuntimeSession;
 type P = SqlRuntimePager;
+
+struct QueryLabelGuard;
+
+fn push_query_label(label: String) -> QueryLabelGuard {
+    // Reserve hook for query labeling (e.g., tracing spans). No-op for now.
+    let _ = label;
+    QueryLabelGuard
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatementExpectation {

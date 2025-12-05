@@ -1,6 +1,6 @@
 [package]
 name = "llkv-executor"
-description = "Query execution engine for the LLKV toolkit."
+description = "Plan-driven query execution engine for the LLKV toolkit."
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -12,7 +12,6 @@ categories = ["database-implementations"]
 readme = "README.md"
 
 [package.metadata.cargo-udeps.ignore]
-# List dependency names to ignore for this package
 normal = []
 development = ["llkv-test-utils"]
 build = []
