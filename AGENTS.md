@@ -6,6 +6,7 @@ Use this guide as the first stop before making changes. It ties together the rep
 - Always read every file under `.github/instructions/` before starting work; treat them as authoritative constraints.
 - Refer to `dev-docs/feature-placement-guide.md` for where new code belongs. Follow the placement process and guardrails—no shortcuts or in-memory hacks.
 - Follow `dev-docs/comment-style-guide.md` whenever writing or updating comments. Keep summaries concise, document safety clearly, and fix nearby drift while you are there.
+- Follow `dev-docs/testing-guide.md` for an overview of accuracy and performance expectations related to code changes.
 
 ## Working Rules
 - Apply the `.github/instructions` guidance to your workflow (test commands, no truncated output, and the no-shortcut policy).
