@@ -1,5 +1,6 @@
 use arrow::record_batch::RecordBatch;
 use llkv_expr::Expr;
+use llkv_result::Result;
 use llkv_scan::{ScanProjection, ScanStreamOptions};
 use llkv_storage::pager::Pager;
 use llkv_types::FieldId;
@@ -24,7 +25,7 @@ where
         predicate: &Expr<'static, FieldId>,
         options: ScanStreamOptions<P>,
         callback: &mut dyn FnMut(RecordBatch),
-    ) -> Result<(), String>;
+    ) -> Result<()>;
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -33,5 +34,5 @@ pub trait TableProvider<P>: Send + Sync
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn get_table(&self, name: &str) -> Result<Arc<dyn ExecutionTable<P>>, String>;
+    fn get_table(&self, name: &str) -> Result<Arc<dyn ExecutionTable<P>>>;
 }

@@ -48,10 +48,9 @@ impl<P> TableProvider<P> for TableProviderAdapter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn get_table(&self, name: &str) -> Result<Arc<dyn ExecutionTable<P>>, String> {
+    fn get_table(&self, name: &str) -> llkv_result::Result<Arc<dyn ExecutionTable<P>>> {
         self.provider
             .get_table(name)
             .map(|t| t as Arc<dyn ExecutionTable<P>>)
-            .map_err(|e| e.to_string())
     }
 }

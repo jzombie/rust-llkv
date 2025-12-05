@@ -91,6 +91,7 @@ pub use llkv_plan::translation::{
     resolve_field_id_from_schema, schema_for_projections, translate_predicate,
     translate_predicate_with, translate_scalar, translate_scalar_with,
 };
+use llkv_plan::{LogicalPlan, LogicalPlanner, SingleTableLogicalPlan};
 pub use types::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorSchema, ExecutorTable,
     ExecutorTableProvider, StorageTable, TableStorageAdapter,
@@ -528,6 +529,10 @@ where
         let limit = plan.limit;
         let offset = plan.offset;
 
+        let adapter = Arc::new(TableProviderAdapter::new(self.provider.clone()))
+            as Arc<dyn llkv_plan::physical::table::TableProvider<P>>;
+        let logical_plan = LogicalPlanner::new(adapter.clone()).create_logical_plan(&plan)?;
+
         let execution = if plan.compound.is_some() {
             self.execute_compound_select(plan, row_filter)?
         } else if plan.tables.is_empty() {
@@ -549,13 +554,22 @@ where
             let table = self.provider.get_table(&table_ref.qualified_name())?;
             let display_name = table_ref.qualified_name();
 
+            let single_logical_plan = match &logical_plan {
+                LogicalPlan::Single(lp) => lp,
+                LogicalPlan::Multi(_) => {
+                    return Err(Error::Internal(
+                        "logical planner did not produce single-table plan".into(),
+                    ));
+                }
+            };
+
             if !plan.aggregates.is_empty() {
                 self.execute_aggregates(table, display_name, plan, row_filter)?
             } else if self.has_computed_aggregates(&plan) {
                 // Handle computed projections that contain embedded aggregates
                 self.execute_computed_aggregates(table, display_name, plan, row_filter)?
             } else {
-                self.execute_projection(table, display_name, plan, row_filter)?
+                self.execute_projection(table, display_name, plan, row_filter, single_logical_plan)?
             }
         };
 
@@ -4057,6 +4071,7 @@ where
         display_name: String,
         plan: SelectPlan,
         row_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        logical_plan: &SingleTableLogicalPlan<P>,
     ) -> ExecutorResult<SelectExecution<P>> {
         if plan.having.is_some() {
             return Err(Error::InvalidArgumentError(
@@ -4074,11 +4089,8 @@ where
             return self.execute_projection_with_subqueries(table, display_name, plan, row_filter);
         }
 
-        // Try to use PhysicalPlanner
-        let adapter = Arc::new(TableProviderAdapter::new(self.provider.clone()))
-            as Arc<dyn llkv_plan::physical::table::TableProvider<P>>;
-        let planner = PhysicalPlanner::new(adapter);
-        return match planner.create_physical_plan(&plan, row_filter.clone()) {
+        let planner = PhysicalPlanner::new();
+        return match planner.create_physical_plan(logical_plan, row_filter.clone()) {
             Ok(physical_plan) => Ok(SelectExecution::from_physical_plan(
                 display_name,
                 physical_plan,

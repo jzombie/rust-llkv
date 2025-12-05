@@ -114,7 +114,8 @@ where
         self.table
             .scan_stream(&self.projections, &filter_expr, options, &mut |batch| {
                 batches.push(Ok(batch))
-            })?;
+            })
+            .map_err(|e| e.to_string())?;
 
         Ok(Box::new(batches.into_iter()))
     }

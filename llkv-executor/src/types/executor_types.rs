@@ -113,10 +113,9 @@ where
         predicate: &Expr<'static, FieldId>,
         options: ScanStreamOptions<P>,
         callback: &mut dyn FnMut(RecordBatch),
-    ) -> Result<(), String> {
+    ) -> llkv_result::Result<()> {
         self.table
             .scan_stream(projections, predicate, options, callback)
-            .map_err(|e| e.to_string())
     }
 
     fn as_any(&self) -> &dyn Any {
