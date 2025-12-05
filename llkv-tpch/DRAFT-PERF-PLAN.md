@@ -6,3 +6,7 @@
 - Physical planning overhaul: choose index/sorted/range scans, join algorithms and ordering from the logical tree; push projections/filters to scans; reuse order to avoid extra sorts.
 - Executor de-hardening: remove executor-side ad hoc translation for joins/aggregates/compounds; enforce SQL → logical plan → rewrites → physical plan → executor as the single path.
 - Early TPC-H wins: gather stats on TPC-H tables; implement join-key resolution and join-order heuristic; push date/qty/price filters to scans; prefer sort indexes/merge joins for ORDER BY/LIMIT.
+
+## Concerns
+
+- Table & column resolvers seem duplicated between llkv-table, llkv-executor, llkv-plan
