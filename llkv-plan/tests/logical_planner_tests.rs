@@ -3,17 +3,18 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use llkv_expr::Literal;
-use llkv_expr::expr::{Expr, Filter, Operator};
-use llkv_plan::logical_planner::{LogicalPlan, SingleTableLogicalPlan};
+use llkv_expr::expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
+use llkv_plan::logical_planner::{LogicalPlan, SingleTableLogicalPlan, projection_name};
 use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_plan::schema::{PlanColumn, PlanSchema};
 use llkv_plan::{
-    LogicalPlanner, OrderByPlan, OrderSortType, OrderTarget, SelectFilter, SelectPlan,
-    SelectProjection,
+    JoinMetadata, JoinPlan, LogicalPlanner, OrderByPlan, OrderSortType, OrderTarget, SelectFilter,
+    SelectPlan, SelectProjection, TableRef,
 };
 use llkv_scan::{ScanProjection, ScanStreamOptions};
 use llkv_storage::pager::MemPager;
-use llkv_types::{FieldId, TableId};
+use llkv_types::{FieldId, LogicalFieldId, TableId};
+use rustc_hash::FxHashMap;
 
 type TestPager = MemPager;
 
@@ -209,4 +210,211 @@ fn logical_planner_translates_filter_to_field_ids() {
         }
         other => panic!("unexpected original filter: {other:?}"),
     }
+}
+
+#[test]
+fn logical_planner_adds_filter_columns_to_scan_projections() {
+    let schema = make_schema();
+    let table = Arc::new(DummyTable::new("t", schema, 88));
+    let provider = DummyProvider::new(table);
+    let planner = LogicalPlanner::new(provider);
+
+    let mut select_plan = SelectPlan::new("t");
+    select_plan.projections = vec![SelectProjection::Column {
+        name: "id".to_string(),
+        alias: None,
+    }];
+    select_plan.filter = Some(SelectFilter {
+        predicate: Expr::Pred(Filter {
+            field_id: "val".to_string(),
+            op: Operator::GreaterThan(Literal::Int128(10)),
+        }),
+        subqueries: Vec::new(),
+    });
+
+    let logical_plan = planner
+        .create_logical_plan(&select_plan)
+        .expect("logical planning succeeds");
+    let logical_plan = match logical_plan {
+        LogicalPlan::Single(plan) => plan,
+        _ => panic!("expected single-table plan"),
+    };
+
+    let projected_names: Vec<String> = logical_plan
+        .scan_projections
+        .iter()
+        .map(|p| projection_name(p, &logical_plan.schema))
+        .collect();
+
+    assert!(
+        projected_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("val")),
+        "filter column should be included in scan projections"
+    );
+    assert!(
+        projected_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("id")),
+        "selected column should remain in projections"
+    );
+}
+
+#[test]
+fn logical_planner_adds_group_by_and_aggregate_columns() {
+    let schema = make_schema();
+    let table = Arc::new(DummyTable::new("t", schema, 99));
+    let provider = DummyProvider::new(table);
+    let planner = LogicalPlanner::new(provider);
+
+    let mut select_plan = SelectPlan::new("t");
+    select_plan.projections = vec![SelectProjection::Computed {
+        expr: llkv_expr::expr::ScalarExpr::column("id".to_string()),
+        alias: "gid".to_string(),
+    }];
+    select_plan.group_by = vec!["id".to_string()];
+    select_plan.aggregates = vec![llkv_plan::plans::AggregateExpr::count_column(
+        "val", "cnt", false,
+    )];
+
+    let logical_plan = planner
+        .create_logical_plan(&select_plan)
+        .expect("logical planning succeeds");
+    let logical_plan = match logical_plan {
+        LogicalPlan::Single(plan) => plan,
+        _ => panic!("expected single-table plan"),
+    };
+
+    let projected_names: Vec<String> = logical_plan
+        .scan_projections
+        .iter()
+        .map(|p| projection_name(p, &logical_plan.schema))
+        .collect();
+
+    assert!(
+        projected_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("id")),
+        "group-by column should be included in scan projections"
+    );
+    assert!(
+        projected_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("val")),
+        "aggregate input column should be included in scan projections"
+    );
+}
+
+#[derive(Clone)]
+struct MultiTableProvider {
+    tables: FxHashMap<String, Arc<DummyTable>>,
+}
+
+impl MultiTableProvider {
+    fn new(tables: Vec<Arc<DummyTable>>) -> Arc<Self> {
+        let mut map = FxHashMap::default();
+        for table in tables {
+            map.insert(table.name.to_ascii_lowercase(), table);
+        }
+        Arc::new(Self { tables: map })
+    }
+}
+
+impl TableProvider<TestPager> for MultiTableProvider {
+    fn get_table(&self, name: &str) -> llkv_result::Result<Arc<dyn ExecutionTable<TestPager>>> {
+        if let Some(table) = self.tables.get(&name.to_ascii_lowercase()) {
+            Ok(table.clone())
+        } else {
+            Err(llkv_result::Error::CatalogError(format!(
+                "table '{name}' not found"
+            )))
+        }
+    }
+}
+
+fn make_schema_with(id_name: &str, fid: FieldId) -> Arc<PlanSchema> {
+    Arc::new(PlanSchema::new(vec![PlanColumn {
+        name: id_name.to_string(),
+        data_type: DataType::Int64,
+        field_id: fid,
+        is_nullable: false,
+        is_primary_key: false,
+        is_unique: false,
+        default_value: None,
+        check_expr: None,
+    }]))
+}
+
+#[test]
+fn multi_table_resolution_assigns_columns_to_tables() {
+    let cust_schema = make_schema_with("id", 1);
+    let orders_schema = make_schema_with("customer_id", 1);
+    let cust_table = Arc::new(DummyTable::new("customers", cust_schema.clone(), 10));
+    let orders_table = Arc::new(DummyTable::new("orders", orders_schema.clone(), 20));
+
+    let provider = MultiTableProvider::new(vec![cust_table.clone(), orders_table.clone()]);
+    let planner = LogicalPlanner::new(provider);
+
+    let tables = vec![
+        TableRef::with_alias("", "customers", Some("c".to_string())),
+        TableRef::with_alias("", "orders", Some("o".to_string())),
+    ];
+
+    let joins = vec![JoinMetadata {
+        left_table_index: 0,
+        join_type: JoinPlan::Inner,
+        on_condition: Some(Expr::Compare {
+            left: ScalarExpr::column("c.id".to_string()),
+            op: CompareOp::Eq,
+            right: ScalarExpr::column("o.customer_id".to_string()),
+        }),
+    }];
+
+    let mut plan = SelectPlan::with_tables(tables.clone()).with_joins(joins);
+    plan.projections = vec![
+        SelectProjection::Column {
+            name: "c.id".to_string(),
+            alias: None,
+        },
+        SelectProjection::Column {
+            name: "o.customer_id".to_string(),
+            alias: None,
+        },
+    ];
+
+    let logical_plan = planner
+        .create_logical_plan(&plan)
+        .expect("multi-table planning succeeds");
+
+    let (resolved, unresolved) = match logical_plan {
+        LogicalPlan::Multi(multi) => (multi.resolved_required, multi.unresolved_required),
+        _ => panic!("expected multi-table plan"),
+    };
+
+    assert!(
+        unresolved.is_empty(),
+        "expected all columns to resolve, found: {:?}",
+        unresolved
+    );
+
+    let mut cust_seen = false;
+    let mut orders_seen = false;
+    for col in resolved {
+        if col.table_index == 0 {
+            cust_seen = true;
+            assert_eq!(
+                col.logical_field_id,
+                LogicalFieldId::for_user(cust_table.table_id, 1)
+            );
+        } else if col.table_index == 1 {
+            orders_seen = true;
+            assert_eq!(
+                col.logical_field_id,
+                LogicalFieldId::for_user(orders_table.table_id, 1)
+            );
+        }
+    }
+
+    assert!(cust_seen, "customer column should resolve to table 0");
+    assert!(orders_seen, "orders column should resolve to table 1");
 }
