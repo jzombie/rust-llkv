@@ -69,3 +69,8 @@ SQL
 - Performance regressions spotted during SLT runs must be addressed immediately—either by optimizing before merge or by introducing a benchmark in `llkv-slt-tester/benches` that demonstrates parity with the previous behavior.
 
 Following these steps keeps the SQL stack honest and ensures our upstream-derived test corpus remains a reliable safety net for both correctness and throughput.
+
+## Additional Notes
+
+- Generally, workspace tests are tested in debug mode, and compiling them all to release mode could take considerable time.
+- TPC* qualification tests of SF1 or more should likely be compiled in release mode.
