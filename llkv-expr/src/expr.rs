@@ -9,7 +9,8 @@
 
 pub use crate::literal::*;
 use arrow::datatypes::DataType;
-use std::ops::Bound;
+use std::ops::{Bound, Deref};
+use std::sync::Arc;
 
 /// Logical expression over predicates.
 #[derive(Clone, Debug)]
@@ -371,8 +372,7 @@ pub struct Filter<'a, F> {
 
 /// Comparison/matching operators over untyped `Literal`s.
 ///
-/// `In` accepts a borrowed slice of `Literal`s to avoid allocations in the
-/// common case of small, static IN lists built at call sites.
+/// `In` uses [`InList`] to avoid repeated deep clones when predicates are copied.
 #[derive(Debug, Clone)]
 pub enum Operator<'a> {
     Equals(Literal),
@@ -384,7 +384,7 @@ pub enum Operator<'a> {
     GreaterThanOrEquals(Literal),
     LessThan(Literal),
     LessThanOrEquals(Literal),
-    In(&'a [Literal]),
+    In(InList<'a>),
     StartsWith {
         pattern: String,
         case_sensitive: bool,
@@ -399,6 +399,37 @@ pub enum Operator<'a> {
     },
     IsNull,
     IsNotNull,
+}
+
+/// IN-list storage with cheap cloning.
+#[derive(Debug, Clone)]
+pub enum InList<'a> {
+    Borrowed(&'a [Literal]),
+    Shared(Arc<[Literal]>),
+}
+
+impl<'a> InList<'a> {
+    #[inline]
+    pub fn borrowed(values: &'a [Literal]) -> Self {
+        InList::Borrowed(values)
+    }
+
+    #[inline]
+    pub fn shared(values: Vec<Literal>) -> Self {
+        InList::Shared(values.into())
+    }
+}
+
+impl<'a> Deref for InList<'a> {
+    type Target = [Literal];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            InList::Borrowed(slice) => slice,
+            InList::Shared(arc) => arc.as_ref(),
+        }
+    }
 }
 
 impl<'a> Operator<'a> {
@@ -474,7 +505,7 @@ mod tests {
         let in_values = ["x".into(), "y".into(), "z".into()];
         let f3 = Filter {
             field_id: 3u32,
-            op: Operator::In(&in_values),
+            op: Operator::In(InList::borrowed(&in_values)),
         };
         let f4 = Filter {
             field_id: 4u32,
@@ -667,7 +698,7 @@ mod tests {
         let in_values = ["aa".into(), "bb".into(), "cc".into()];
         let f_in = Filter {
             field_id: 9u32,
-            op: Operator::In(&in_values),
+            op: Operator::In(InList::borrowed(&in_values)),
         };
         match f_in.op {
             Operator::In(arr) => {

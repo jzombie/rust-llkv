@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, mpsc};
 
 use arrow::compute::concat_batches;
-use arrow::array::{ArrayRef, Array};
+use arrow::array::{ArrayRef, Array, BooleanArray};
 use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
@@ -17,8 +17,8 @@ use llkv_compute::eval::ScalarEvaluator;
 use llkv_expr::AggregateCall;
 use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr};
 use llkv_expr::literal::Literal;
-use llkv_expr::{Expr, Filter, Operator, BinaryOp};
-use llkv_join::{JoinKey, JoinType};
+use llkv_expr::{Expr, Filter, InList, Operator, BinaryOp};
+use llkv_join::JoinType;
 use llkv_plan::logical_planner::{LogicalPlan, LogicalPlanner, ResolvedJoin};
 use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_plan::planner::PhysicalPlanner;
@@ -172,9 +172,8 @@ where
                     Operator::EndsWith { pattern, case_sensitive } => Operator::EndsWith { pattern: pattern.clone(), case_sensitive: *case_sensitive },
                     Operator::Contains { pattern, case_sensitive } => Operator::Contains { pattern: pattern.clone(), case_sensitive: *case_sensitive },
                     Operator::In(list) => {
-                        let new_list: Vec<Literal> = list.iter().cloned().collect();
-                        let leaked: &'static [Literal] = Box::leak(new_list.into_boxed_slice());
-                        Operator::In(leaked)
+                        let owned: Vec<Literal> = list.iter().cloned().collect();
+                        Operator::In(InList::shared(owned))
                     },
                 };
                 Expr::Pred(llkv_expr::Filter { field_id: f.field_id.clone(), op })
@@ -1470,6 +1469,8 @@ where
                 if table_count == 0 {
                      return Err(Error::Internal("Multi-table plan with no tables".into()));
                 }
+                let (table_filters, residual_filter) =
+                    partition_table_filters(multi.filter.as_ref(), table_count)?;
                 
                 // 1. Analyze required columns
                 let mut required_fields: Vec<FxHashSet<FieldId>> = vec![FxHashSet::default(); table_count];
@@ -1492,8 +1493,8 @@ where
                 for join in &multi.joins {
                     let (keys, filters) = extract_join_keys_and_filters(join)?;
                     for key in keys {
-                        required_fields[join.left_table_index].insert(key.left_field);
-                        required_fields[join.left_table_index + 1].insert(key.right_field);
+                        required_fields[key.left_table].insert(key.left_field);
+                        required_fields[key.right_table].insert(key.right_field);
                     }
                     for filter in filters {
                          let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
@@ -1560,13 +1561,31 @@ where
                         }
                     });
                     
-                    streams.push(Box::new(rx.into_iter()));
+                    let mut stream: BatchIter = Box::new(rx.into_iter());
+
+                    if let Some(filter_expr) = &table_filters[i] {
+                        let mapping: FxHashMap<(usize, FieldId), usize> = table_field_map[i]
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, fid)| ((i, *fid), idx))
+                            .collect();
+
+                        stream = apply_filter_to_stream(stream, filter_expr, mapping)?;
+                    }
+
+                    streams.push(stream);
                 }
 
                 // 3. Build Pipeline
                 let mut current_stream = streams.remove(0);
                 let mut current_schema = schemas[0].clone();
                 let mut col_mapping: FxHashMap<(usize, FieldId), usize> = FxHashMap::default();
+                let mut pending_filters: Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>> =
+                    match residual_filter.clone() {
+                        Some(LlkvExpr::And(list)) => list.clone(),
+                        Some(expr) => vec![expr.clone()],
+                        None => Vec::new(),
+                    };
                 
                 for (idx, fid) in table_field_map[0].iter().enumerate() {
                     col_mapping.insert((0, *fid), idx);
@@ -1583,26 +1602,39 @@ where
                         concat_batches(&right_schema, &right_batches)?
                     };
                     
-                    let join_opt = multi.joins.iter().find(|j| j.left_table_index == i);
-                    
-                    let (join_type, left_indices, right_indices) = if let Some(join) = join_opt {
-                        let (keys, _) = extract_join_keys_and_filters(join)?;
-                        let mut left_indices = Vec::new();
-                        let mut right_indices = Vec::new();
-                        
-                        for key in keys {
-                            let left_idx = *col_mapping.get(&(join.left_table_index, key.left_field))
-                                .ok_or_else(|| Error::Internal("left join key missing".into()))?;
-                            left_indices.push(left_idx);
-                            
-                            let right_idx = table_field_map[i+1].iter().position(|&f| f == key.right_field)
-                                .ok_or_else(|| Error::Internal("right join key missing".into()))?;
-                            right_indices.push(right_idx);
+                    let join = multi
+                        .joins
+                        .iter()
+                        .find(|j| j.left_table_index == i)
+                        .ok_or_else(|| Error::Internal("missing join metadata for multi-table query".into()))?;
+
+                    let (keys, residuals) = extract_join_keys_and_filters(join)?;
+                    pending_filters.extend(residuals);
+                    let mut left_indices = Vec::new();
+                    let mut right_indices = Vec::new();
+
+                    for key in keys {
+                        if key.right_table != i + 1 {
+                            return Err(Error::Internal("join key points to unexpected right table".into()));
                         }
-                        (map_join_type(join.join_type)?, left_indices, right_indices)
-                    } else {
-                        (JoinType::Inner, vec![], vec![])
-                    };
+
+                        if key.left_table > i {
+                            return Err(Error::Internal("join key references future left table".into()));
+                        }
+
+                        let left_idx = *col_mapping
+                            .get(&(key.left_table, key.left_field))
+                            .ok_or_else(|| Error::Internal("left join key missing".into()))?;
+                        left_indices.push(left_idx);
+
+                        let right_idx = table_field_map[key.right_table]
+                            .iter()
+                            .position(|&f| f == key.right_field)
+                            .ok_or_else(|| Error::Internal("right join key missing".into()))?;
+                        right_indices.push(right_idx);
+                    }
+
+                    let join_type = map_join_type(join.join_type)?;
                         
                     let mut new_fields = current_schema.fields().to_vec();
                     new_fields.extend_from_slice(right_schema.fields());
@@ -1623,34 +1655,32 @@ where
                     for (idx, fid) in table_field_map[i+1].iter().enumerate() {
                         col_mapping.insert((i+1, *fid), old_len + idx);
                     }
+
+                    let prefix_limit = i + 1;
+                    let mut applicable = Vec::new();
+                    let mut remaining = Vec::new();
+                    for clause in pending_filters.into_iter() {
+                        let mapped = remap_filter_expr(&clause)?;
+                        let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                        ScalarEvaluator::collect_fields(&mapped, &mut fields);
+                        let tables: FxHashSet<usize> = fields.into_iter().map(|(tbl, _)| tbl).collect();
+
+                        if tables.iter().all(|t| *t <= prefix_limit) {
+                            applicable.push(clause);
+                        } else {
+                            remaining.push(clause);
+                        }
+                    }
+                    pending_filters = remaining;
+
+                    if let Some(apply_expr) = combine_clauses(applicable) {
+                        current_stream = apply_filter_to_stream(current_stream, &apply_expr, col_mapping.clone())?;
+                    }
                 }
                 
-                // 3. Apply Filter (if any)
-                if let Some(filter) = &multi.filter {
-                    let predicate = simplify_predicate(&remap_filter_expr(filter)?);
-                    
-                    let col_mapping_captured = col_mapping.clone();
-                    current_stream = Box::new(current_stream.map(move |batch_res| {
-                        let batch = batch_res?;
-                        
-                        let mut required_fields = FxHashSet::default();
-                        ScalarEvaluator::collect_fields(&predicate, &mut required_fields);
-                        
-                        let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
-                        for (tbl, fid) in required_fields {
-                            if let Some(idx) = col_mapping_captured.get(&(tbl, fid)) {
-                                field_arrays.insert((tbl, fid), batch.column(*idx).clone());
-                            }
-                        }
-                        
-                        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
-                        let result = ScalarEvaluator::evaluate_batch_simplified(&predicate, batch.num_rows(), &numeric_arrays)?;
-                        
-                        let bool_array = result.as_any().downcast_ref::<arrow::array::BooleanArray>()
-                            .ok_or_else(|| Error::Internal("Filter predicate must evaluate to boolean".into()))?;
-                            
-                        arrow::compute::filter_record_batch(&batch, bool_array).map_err(|e| Error::Internal(e.to_string()))
-                    }));
+                // 3. Apply any remaining filters not yet pushed earlier in the join chain.
+                if let Some(final_expr) = combine_clauses(pending_filters) {
+                    current_stream = apply_filter_to_stream(current_stream, &final_expr, col_mapping.clone())?;
                 }
                 
                 // 4. Final Projection
@@ -2485,7 +2515,7 @@ fn predicate_to_scalar(
         }
         Operator::In(list) => {
             let mut combined = ScalarExpr::Literal(Literal::Boolean(false));
-            for lit in *list {
+            for lit in list.iter() {
                 let eq = ScalarExpr::Compare {
                     left: Box::new(col.clone()),
                     op: CompareOp::Eq,
@@ -2521,6 +2551,14 @@ fn predicate_to_scalar(
 
 
 
+#[derive(Debug, Clone)]
+struct PhysicalJoinKey {
+    left_table: usize,
+    left_field: FieldId,
+    right_table: usize,
+    right_field: FieldId,
+}
+
 fn map_join_type(join_plan: JoinPlan) -> ExecutorResult<JoinType> {
     match join_plan {
         JoinPlan::Inner => Ok(JoinType::Inner),
@@ -2537,14 +2575,20 @@ fn map_join_type(join_plan: JoinPlan) -> ExecutorResult<JoinType> {
 fn extract_join_keys_and_filters(
     join: &ResolvedJoin,
 ) -> ExecutorResult<(
-    Vec<JoinKey>,
+    Vec<PhysicalJoinKey>,
     Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
 )> {
     let mut keys = Vec::new();
     let mut residuals = Vec::new();
 
     if let Some(on) = &join.on {
-        collect_join_predicates(on, join.left_table_index, &mut keys, &mut residuals)?;
+        collect_join_predicates(
+            on,
+            join.left_table_index,
+            join.left_table_index + 1,
+            &mut keys,
+            &mut residuals,
+        )?;
     }
 
     Ok((keys, residuals))
@@ -2553,34 +2597,37 @@ fn extract_join_keys_and_filters(
 fn collect_join_predicates(
     expr: &LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
     left_table_index: usize,
-    keys: &mut Vec<JoinKey>,
+    right_table_index: usize,
+    keys: &mut Vec<PhysicalJoinKey>,
     residuals: &mut Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
 ) -> ExecutorResult<()> {
     match expr {
         LlkvExpr::And(list) => {
             for e in list {
-                collect_join_predicates(e, left_table_index, keys, residuals)?;
+                collect_join_predicates(e, left_table_index, right_table_index, keys, residuals)?;
             }
             Ok(())
         }
         LlkvExpr::Compare { left, op, right } => {
             if matches!(op, CompareOp::Eq) {
                 if let (ScalarExpr::Column(l), ScalarExpr::Column(r)) = (left, right) {
-                    if (l.table_index == left_table_index
-                        && r.table_index == left_table_index + 1)
-                        || (r.table_index == left_table_index
-                            && l.table_index == left_table_index + 1)
-                    {
-                        let (left_col, right_col) = if l.table_index == left_table_index {
-                            (l, r)
-                        } else {
-                            (r, l)
-                        };
+                    let (left_col, right_col) = if r.table_index == right_table_index {
+                        (l, r)
+                    } else if l.table_index == right_table_index {
+                        (r, l)
+                    } else {
+                        residuals.push(expr.clone());
+                        return Ok(());
+                    };
 
-                        keys.push(JoinKey {
+                    if left_col.table_index <= left_table_index
+                        && right_col.table_index == right_table_index
+                    {
+                        keys.push(PhysicalJoinKey {
+                            left_table: left_col.table_index,
                             left_field: left_col.logical_field_id.field_id(),
+                            right_table: right_col.table_index,
                             right_field: right_col.logical_field_id.field_id(),
-                            null_equals_null: false,
                         });
                         return Ok(());
                     }
@@ -2595,6 +2642,113 @@ fn collect_join_predicates(
             Ok(())
         }
     }
+}
+
+fn partition_table_filters(
+    filter: Option<&LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
+    table_count: usize,
+) -> ExecutorResult<(
+    Vec<Option<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>>,
+    Option<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
+)> {
+    let mut per_table: Vec<Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>> =
+        vec![Vec::new(); table_count];
+    let mut residuals = Vec::new();
+
+    let clauses: Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>> = match filter {
+        Some(LlkvExpr::And(list)) => list.clone(),
+        Some(expr) => vec![expr.clone()],
+        None => Vec::new(),
+    };
+
+    for clause in clauses {
+        let mapped = remap_filter_expr(&clause)?;
+        let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+        ScalarEvaluator::collect_fields(&mapped, &mut fields);
+        let tables: FxHashSet<usize> = fields.into_iter().map(|(tbl, _)| tbl).collect();
+
+        if tables.len() == 1 {
+            let tbl = *tables.iter().next().unwrap();
+            if tbl < table_count {
+                per_table[tbl].push(clause);
+            } else {
+                residuals.push(clause);
+            }
+        } else {
+            residuals.push(clause);
+        }
+    }
+
+    let per_table = per_table
+        .into_iter()
+        .map(|mut clauses| {
+            if clauses.is_empty() {
+                None
+            } else if clauses.len() == 1 {
+                Some(clauses.pop().unwrap())
+            } else {
+                Some(LlkvExpr::And(clauses))
+            }
+        })
+        .collect();
+
+    let residual = if residuals.is_empty() {
+        None
+    } else if residuals.len() == 1 {
+        Some(residuals.pop().unwrap())
+    } else {
+        Some(LlkvExpr::And(residuals))
+    };
+
+    Ok((per_table, residual))
+}
+
+fn combine_clauses(
+    mut clauses: Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
+) -> Option<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>> {
+    if clauses.is_empty() {
+        None
+    } else if clauses.len() == 1 {
+        clauses.pop()
+    } else {
+        Some(LlkvExpr::And(clauses))
+    }
+}
+
+fn apply_filter_to_stream(
+    stream: BatchIter,
+    filter_expr: &LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
+    col_mapping: FxHashMap<(usize, FieldId), usize>,
+) -> ExecutorResult<BatchIter> {
+    let predicate = simplify_predicate(&remap_filter_expr(filter_expr)?);
+    let col_mapping_captured = col_mapping.clone();
+
+    let filtered = stream.map(move |batch_res| {
+        let batch = batch_res?;
+
+        let mut required_fields = FxHashSet::default();
+        ScalarEvaluator::collect_fields(&predicate, &mut required_fields);
+
+        let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
+        for (tbl, fid) in &required_fields {
+            if let Some(idx) = col_mapping_captured.get(&(*tbl, *fid)) {
+                field_arrays.insert((*tbl, *fid), batch.column(*idx).clone());
+            }
+        }
+
+        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+        let result = ScalarEvaluator::evaluate_batch_simplified(&predicate, batch.num_rows(), &numeric_arrays)?;
+
+        let bool_array = result
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| Error::Internal("Filter predicate must evaluate to boolean".into()))?;
+
+        arrow::compute::filter_record_batch(&batch, bool_array)
+            .map_err(|e| Error::Internal(e.to_string()))
+    });
+
+    Ok(Box::new(filtered))
 }
 
 impl<P> ExecutionTable<P> for ExecutionTableAdapter<P>

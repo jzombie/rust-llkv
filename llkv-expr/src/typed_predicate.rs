@@ -300,7 +300,7 @@ where
         }
         Operator::In(values) => {
             let mut natives = Vec::with_capacity(values.len());
-            for lit in *values {
+            for lit in values.iter() {
                 natives.push(
                     lit.to_native::<T::Native>()
                         .map_err(PredicateBuildError::from)?,
@@ -364,7 +364,7 @@ pub fn build_bool_predicate(op: &Operator<'_>) -> Result<Predicate<bool>, Predic
         }
         Operator::In(values) => {
             let mut natives = Vec::with_capacity(values.len());
-            for lit in *values {
+            for lit in values.iter() {
                 natives.push(lit.to_native::<bool>().map_err(PredicateBuildError::from)?);
             }
             Ok(Predicate::In(natives))
@@ -431,7 +431,7 @@ pub fn build_var_width_predicate(
         }
         Operator::In(values) => {
             let mut out = Vec::with_capacity(values.len());
-            for lit in *values {
+            for lit in values.iter() {
                 out.push(lit.to_string_owned().map_err(PredicateBuildError::from)?);
             }
             Ok(Predicate::In(out))
@@ -466,6 +466,7 @@ pub fn build_var_width_predicate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expr::InList;
     use crate::literal::Literal;
     use std::ops::Bound;
 
@@ -495,7 +496,7 @@ mod tests {
     #[test]
     fn predicate_in_operator() {
         let values = [1.into(), 2.into(), 3.into()];
-        let op = Operator::In(&values);
+        let op = Operator::In(InList::borrowed(&values));
         let predicate = build_fixed_width_predicate::<arrow::datatypes::UInt8Type>(&op).unwrap();
         let two: u8 = 2;
         let five: u8 = 5;
@@ -530,7 +531,7 @@ mod tests {
     #[test]
     fn matches_all_for_empty_in_list() {
         let values: [Literal; 0] = [];
-        let op = Operator::In(&values);
+        let op = Operator::In(InList::borrowed(&values));
         let predicate = build_fixed_width_predicate::<arrow::datatypes::Float32Type>(&op).unwrap();
         assert!(!predicate.matches(&1.23f32));
     }
@@ -557,7 +558,7 @@ mod tests {
     #[test]
     fn string_predicate_in_and_patterns() {
         let vals = ["x".into(), "y".into()];
-        let op = Operator::In(&vals);
+        let op = Operator::In(InList::borrowed(&vals));
         let predicate = build_var_width_predicate(&op).unwrap();
         assert!(predicate.matches("x"));
         assert!(!predicate.matches("z"));

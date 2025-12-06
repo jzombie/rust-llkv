@@ -7376,7 +7376,7 @@ fn bind_filter_operator(
             bind_bound_literal(upper, params)
         }
         Operator::In(list) => {
-            for lit in *list {
+            for lit in list.iter() {
                 if let Literal::String(text) = lit
                     && parse_placeholder_marker(text).is_some()
                 {

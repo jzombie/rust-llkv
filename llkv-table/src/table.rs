@@ -2079,7 +2079,7 @@ mod tests {
         let candidates = [100.into(), 300.into()];
         let filter = pred_expr(Filter {
             field_id: COL_A_U64,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut total: i64 = 0;
@@ -2112,7 +2112,7 @@ mod tests {
         let candidates = [100.into(), 300.into()];
         let filter = pred_expr(Filter {
             field_id: COL_A_U64,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut mn: Option<i32> = None;
@@ -2176,7 +2176,7 @@ mod tests {
         let candidates = [2.0_f32.into(), 3.0_f32.into()];
         let filter = pred_expr(Filter {
             field_id: COL_E_F32,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut vals: Vec<Option<f32>> = Vec::new();
@@ -2687,7 +2687,7 @@ mod tests {
         let candidates = [10.into(), 30.into()];
         let filter = pred_expr(Filter {
             field_id: COL_C_I32,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut vals: Vec<Option<u64>> = Vec::new();

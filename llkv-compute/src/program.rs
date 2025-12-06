@@ -3,7 +3,7 @@
 use std::ops::Bound;
 use std::sync::Arc;
 
-use llkv_expr::{CompareOp, Expr, Filter, Operator, ScalarExpr, literal::Literal};
+use llkv_expr::{CompareOp, Expr, Filter, InList, Operator, ScalarExpr, literal::Literal};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_types::FieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -123,7 +123,7 @@ impl OwnedOperator {
             Self::GreaterThanOrEquals(lit) => Operator::GreaterThanOrEquals(lit.clone()),
             Self::LessThan(lit) => Operator::LessThan(lit.clone()),
             Self::LessThanOrEquals(lit) => Operator::LessThanOrEquals(lit.clone()),
-            Self::In(values) => Operator::In(values.as_slice()),
+            Self::In(values) => Operator::In(InList::borrowed(values.as_slice())),
             Self::StartsWith {
                 pattern,
                 case_sensitive,
@@ -163,7 +163,7 @@ impl<'a> From<&'a Operator<'a>> for OwnedOperator {
             Operator::GreaterThanOrEquals(lit) => Self::GreaterThanOrEquals(lit.clone()),
             Operator::LessThan(lit) => Self::LessThan(lit.clone()),
             Operator::LessThanOrEquals(lit) => Self::LessThanOrEquals(lit.clone()),
-            Operator::In(values) => Self::In((*values).to_vec()),
+            Operator::In(values) => Self::In(values.to_vec()),
             Operator::StartsWith {
                 pattern,
                 case_sensitive,

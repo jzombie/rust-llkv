@@ -9,13 +9,14 @@ use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use llkv_column_map::store::Projection as StoreProjection;
-use llkv_expr::expr::Expr;
+use llkv_expr::expr::{CompareOp, Expr, ScalarExpr};
 use llkv_result::Error;
 use llkv_result::Result;
 use llkv_scan::ScanProjection;
 use llkv_storage::pager::Pager;
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
+use rustc_hash::FxHashSet;
 
 use crate::physical::table::{ExecutionTable, TableProvider};
 use crate::plans::{OrderByPlan, OrderTarget, SelectPlan, TableRef};
@@ -330,7 +331,13 @@ where
         let aggregates = resolve_aggregates(plan, &ctx)?;
         let group_by = resolve_group_by(plan, &ctx)?;
         let order_by = resolve_order_by(plan, &ctx)?;
-        let joins = resolve_joins(plan, &ctx)?;
+        let mut joins = resolve_joins(plan, &ctx)?;
+
+        attach_implicit_joins(
+            &mut joins,
+            planned_tables.len(),
+            filter.as_ref(),
+        );
 
         Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
             tables: planned_tables,
@@ -1107,4 +1114,198 @@ where
         });
     }
     Ok(out)
+}
+
+fn attach_implicit_joins(
+    joins: &mut Vec<ResolvedJoin>,
+    table_count: usize,
+    filter: Option<&Expr<'static, ResolvedFieldRef>>,
+) {
+    if table_count <= 1 {
+        return;
+    }
+
+    let existing: FxHashSet<usize> = joins
+        .iter()
+        .map(|j| j.left_table_index)
+        .collect();
+
+    for left_table_index in 0..(table_count - 1) {
+        if existing.contains(&left_table_index) {
+            continue;
+        }
+
+        let left_tables: FxHashSet<usize> = (0..=left_table_index).collect();
+        let derived_keys = derive_filter_join_keys(filter, &left_tables, left_table_index + 1);
+        let on = build_join_predicate(&derived_keys);
+
+        joins.push(ResolvedJoin {
+            left_table_index,
+            join_type: crate::plans::JoinPlan::Inner,
+            on,
+            original_on: None,
+        });
+    }
+
+    joins.sort_by_key(|j| j.left_table_index);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DerivedJoinKey {
+    left_table_index: usize,
+    right_table_index: usize,
+    left_field: LogicalFieldId,
+    right_field: LogicalFieldId,
+}
+
+fn derive_filter_join_keys(
+    filter: Option<&Expr<'static, ResolvedFieldRef>>,
+    left_tables: &FxHashSet<usize>,
+    right_table: usize,
+) -> Vec<DerivedJoinKey> {
+    fn collect_keys(
+        expr: &Expr<'static, ResolvedFieldRef>,
+        left_tables: &FxHashSet<usize>,
+        right_table: usize,
+        out: &mut Vec<DerivedJoinKey>,
+    ) {
+        match expr {
+            Expr::And(list) => {
+                for e in list {
+                    collect_keys(e, left_tables, right_table, out);
+                }
+            }
+            Expr::Compare { left, op, right } if matches!(op, CompareOp::Eq) => {
+                if let (ScalarExpr::Column(l), ScalarExpr::Column(r)) = (left, right) {
+                    if left_tables.contains(&l.table_index) && r.table_index == right_table {
+                        out.push(DerivedJoinKey {
+                            left_table_index: l.table_index,
+                            right_table_index: right_table,
+                            left_field: l.logical_field_id,
+                            right_field: r.logical_field_id,
+                        });
+                        return;
+                    }
+
+                    if left_tables.contains(&r.table_index) && l.table_index == right_table {
+                        out.push(DerivedJoinKey {
+                            left_table_index: r.table_index,
+                            right_table_index: right_table,
+                            left_field: r.logical_field_id,
+                            right_field: l.logical_field_id,
+                        });
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut keys = Vec::new();
+    if let Some(filter) = filter {
+        collect_keys(filter, left_tables, right_table, &mut keys);
+    }
+    keys
+}
+
+fn build_join_predicate(
+    keys: &[DerivedJoinKey],
+) -> Option<Expr<'static, ResolvedFieldRef>> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut clauses = Vec::with_capacity(keys.len());
+    for key in keys {
+        let left = ScalarExpr::Column(ResolvedFieldRef {
+            table_index: key.left_table_index,
+            logical_field_id: key.left_field,
+        });
+        let right = ScalarExpr::Column(ResolvedFieldRef {
+            table_index: key.right_table_index,
+            logical_field_id: key.right_field,
+        });
+
+        clauses.push(Expr::Compare {
+            left,
+            op: CompareOp::Eq,
+            right,
+        });
+    }
+
+    if clauses.len() == 1 {
+        clauses.pop()
+    } else {
+        Some(Expr::And(clauses))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(table_index: usize, field_id: FieldId) -> ScalarExpr<ResolvedFieldRef> {
+        ScalarExpr::Column(ResolvedFieldRef {
+            table_index,
+            logical_field_id: LogicalFieldId::for_user(42, field_id),
+        })
+    }
+
+    #[test]
+    fn derives_join_keys_from_filter_conjunction() {
+        let filter = Expr::And(vec![Expr::Compare {
+            left: col(0, 1),
+            op: CompareOp::Eq,
+            right: col(1, 2),
+        }]);
+
+        let left_tables: FxHashSet<usize> = [0].into_iter().collect();
+        let keys = derive_filter_join_keys(Some(&filter), &left_tables, 1);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].left_table_index, 0);
+        assert_eq!(keys[0].left_field.field_id(), 1);
+        assert_eq!(keys[0].right_field.field_id(), 2);
+    }
+
+    #[test]
+    fn ignores_non_conjunctive_shapes() {
+        let filter = Expr::Or(vec![Expr::Compare {
+            left: col(0, 1),
+            op: CompareOp::Eq,
+            right: col(1, 2),
+        }]);
+
+        let left_tables: FxHashSet<usize> = [0].into_iter().collect();
+        let keys = derive_filter_join_keys(Some(&filter), &left_tables, 1);
+
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn attaches_implicit_join_when_missing() {
+        let filter = Expr::Compare {
+            left: col(0, 1),
+            op: CompareOp::Eq,
+            right: col(1, 2),
+        };
+
+        let mut joins = Vec::new();
+        attach_implicit_joins(&mut joins, 2, Some(&filter));
+
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].left_table_index, 0);
+        assert!(matches!(joins[0].join_type, crate::plans::JoinPlan::Inner));
+        assert!(matches!(joins[0].on, Some(Expr::Compare { .. })));
+    }
+
+    #[test]
+    fn attaches_cross_join_when_no_keys() {
+        let mut joins = Vec::new();
+        attach_implicit_joins(&mut joins, 2, None);
+
+        assert_eq!(joins.len(), 1);
+        assert!(joins[0].on.is_none());
+    }
 }

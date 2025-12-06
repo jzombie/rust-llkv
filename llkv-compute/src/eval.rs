@@ -15,7 +15,7 @@ use sqlparser::ast::BinaryOperator;
 
 use crate::date::{add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32};
 use crate::fast_numeric::NumericFastPath;
-use crate::kernels::{compute_binary, get_common_type};
+use crate::kernels::{compute_binary, compute_compare, get_common_type};
 
 /// Mapping from field identifiers to the numeric Arrow array used for evaluation.
 pub type NumericArrayMap<F> = FxHashMap<F, ArrayRef>;
@@ -27,18 +27,12 @@ enum VectorizedExpr {
 }
 
 impl VectorizedExpr {
-    fn materialize(self, len: usize, target_type: DataType) -> ArrayRef {
+    fn materialize(self, len: usize) -> ArrayRef {
         match self {
-            VectorizedExpr::Array(array) => {
-                if array.data_type() == &target_type {
-                    array
-                } else {
-                    cast::cast(&array, &target_type).unwrap_or(array)
-                }
-            }
+            VectorizedExpr::Array(array) => array,
             VectorizedExpr::Scalar(scalar_array) => {
                 if scalar_array.is_empty() {
-                    return new_null_array(&target_type, len);
+                    return new_null_array(scalar_array.data_type(), len);
                 }
                 if scalar_array.is_null(0) {
                     return new_null_array(scalar_array.data_type(), len);
@@ -585,9 +579,15 @@ impl ScalarEvaluator {
         }
 
         if let Some(vectorized) =
-            Self::try_evaluate_vectorized(expr, len, arrays, preferred.clone())?
+            Self::try_evaluate_vectorized(expr, len, arrays)?
         {
-            let result = vectorized.materialize(len, preferred);
+            let result = vectorized.materialize(len);
+            if result.data_type() != &preferred {
+                let casted = cast::cast(&result, &preferred).map_err(|e| {
+                    Error::Internal(format!("Failed to cast vectorized result: {}", e))
+                })?;
+                return Ok(casted);
+            }
             return Ok(result);
         }
 
@@ -617,7 +617,6 @@ impl ScalarEvaluator {
         expr: &ScalarExpr<F>,
         len: usize,
         arrays: &NumericArrayMap<F>,
-        _target_type: DataType,
     ) -> LlkvResult<Option<VectorizedExpr>> {
         if expr.contains_interval() {
             return Ok(None);
@@ -634,11 +633,8 @@ impl ScalarEvaluator {
                 Ok(Some(VectorizedExpr::Scalar(array)))
             }
             ScalarExpr::Binary { left, op, right } => {
-                let left_type = left.infer_result_type_from_arrays(arrays);
-                let right_type = right.infer_result_type_from_arrays(arrays);
-
-                let left_vec = Self::try_evaluate_vectorized(left, len, arrays, left_type)?;
-                let right_vec = Self::try_evaluate_vectorized(right, len, arrays, right_type)?;
+                let left_vec = Self::try_evaluate_vectorized(left, len, arrays)?;
+                let right_vec = Self::try_evaluate_vectorized(right, len, arrays)?;
 
                 match (left_vec, right_vec) {
                     (Some(VectorizedExpr::Scalar(lhs)), Some(VectorizedExpr::Scalar(rhs))) => {
@@ -650,23 +646,46 @@ impl ScalarEvaluator {
                         Ok(Some(VectorizedExpr::Array(array)))
                     }
                     (Some(VectorizedExpr::Array(lhs)), Some(VectorizedExpr::Scalar(rhs))) => {
-                        let rhs_expanded = VectorizedExpr::Scalar(rhs)
-                            .materialize(lhs.len(), lhs.data_type().clone());
+                        let rhs_expanded = VectorizedExpr::Scalar(rhs).materialize(lhs.len());
                         let array = compute_binary(&lhs, &rhs_expanded, *op)?;
                         Ok(Some(VectorizedExpr::Array(array)))
                     }
                     (Some(VectorizedExpr::Scalar(lhs)), Some(VectorizedExpr::Array(rhs))) => {
-                        let lhs_expanded = VectorizedExpr::Scalar(lhs)
-                            .materialize(rhs.len(), rhs.data_type().clone());
+                        let lhs_expanded = VectorizedExpr::Scalar(lhs).materialize(rhs.len());
                         let array = compute_binary(&lhs_expanded, &rhs, *op)?;
                         Ok(Some(VectorizedExpr::Array(array)))
                     }
                     _ => Ok(None),
                 }
             }
+            ScalarExpr::Compare { left, op, right } => {
+                let left_vec = Self::try_evaluate_vectorized(left, len, arrays)?;
+                let right_vec = Self::try_evaluate_vectorized(right, len, arrays)?;
+
+                match (left_vec, right_vec) {
+                    (Some(VectorizedExpr::Scalar(lhs)), Some(VectorizedExpr::Scalar(rhs))) => {
+                        let result = compute_compare(&lhs, *op, &rhs)?;
+                        Ok(Some(VectorizedExpr::Scalar(result)))
+                    }
+                    (Some(VectorizedExpr::Array(lhs)), Some(VectorizedExpr::Array(rhs))) => {
+                        let result = compute_compare(&lhs, *op, &rhs)?;
+                        Ok(Some(VectorizedExpr::Array(result)))
+                    }
+                    (Some(VectorizedExpr::Array(lhs)), Some(VectorizedExpr::Scalar(rhs))) => {
+                        let rhs_expanded = VectorizedExpr::Scalar(rhs).materialize(lhs.len());
+                        let result = compute_compare(&lhs, *op, &rhs_expanded)?;
+                        Ok(Some(VectorizedExpr::Array(result)))
+                    }
+                    (Some(VectorizedExpr::Scalar(lhs)), Some(VectorizedExpr::Array(rhs))) => {
+                        let lhs_expanded = VectorizedExpr::Scalar(lhs).materialize(rhs.len());
+                        let result = compute_compare(&lhs_expanded, *op, &rhs)?;
+                        Ok(Some(VectorizedExpr::Array(result)))
+                    }
+                    _ => Ok(None),
+                }
+            }
             ScalarExpr::Cast { expr, data_type } => {
-                let inner_type = expr.infer_result_type_from_arrays(arrays);
-                let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays, inner_type)?;
+                let inner_vec = Self::try_evaluate_vectorized(expr, len, arrays)?;
 
                 match inner_vec {
                     Some(VectorizedExpr::Scalar(array)) => {
@@ -687,19 +706,12 @@ impl ScalarEvaluator {
                 let mut types = Vec::with_capacity(items.len());
 
                 for item in items {
-                    let item_type = item.infer_result_type_from_arrays(arrays);
-                    // If any item cannot be vectorized, we cannot vectorize the whole Coalesce
-                    let vec_expr = match Self::try_evaluate_vectorized(
-                        item,
-                        len,
-                        arrays,
-                        item_type.clone(),
-                    )? {
+                    let vec_expr = match Self::try_evaluate_vectorized(item, len, arrays)? {
                         Some(v) => v,
                         None => return Ok(None),
                     };
 
-                    let array = vec_expr.materialize(len, item_type.clone());
+                    let array = vec_expr.materialize(len);
                     types.push(array.data_type().clone());
                     evaluated_items.push(array);
                 }

@@ -168,8 +168,8 @@ where
                 let operand = stack
                     .pop()
                     .ok_or_else(|| Error::Internal("NOT opcode underflow".into()))?;
-
-                let mut domain_cache = FxHashMap::default();
+                let mut domain_cache: FxHashMap<DomainProgramId, Arc<Treemap>> =
+                    FxHashMap::default();
                 let domain_rows = evaluate_domain_program(
                     storage,
                     programs,
@@ -1008,3 +1008,4 @@ fn compare_op_to_owned(field_id: FieldId, op: CompareOp, literal: &Literal) -> O
 
     Some(OwnedFilter { field_id, op })
 }
+
