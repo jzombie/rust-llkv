@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -24,6 +25,7 @@ use llkv_plan::planner::PhysicalPlanner;
 use llkv_plan::plans::JoinPlan;
 use llkv_plan::plans::SelectPlan;
 use llkv_plan::plans::{AggregateExpr, AggregateFunction};
+use llkv_plan::plans::{CompoundOperator, CompoundQuantifier, CompoundSelectPlan};
 use llkv_plan::plans::FilterSubquery;
 use llkv_plan::schema::{PlanColumn, PlanSchema};
 use llkv_result::Error;
@@ -31,7 +33,7 @@ use llkv_scan::{RowIdFilter, ScanProjection};
 use llkv_storage::pager::Pager;
 use llkv_types::FieldId;
 use llkv_types::LogicalFieldId;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::ExecutorResult;
@@ -1004,6 +1006,220 @@ where
         Ok(SelectExecution::from_stream(table_name, output_schema, trimmed))
     }
 
+    fn execute_compound(
+        &self,
+        compound: &CompoundSelectPlan,
+        subquery_results: &FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
+        row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        let mut current_exec = self.execute_select_with_filter(
+            &compound.initial,
+            subquery_results,
+            row_filter.clone(),
+        )?;
+
+        for op in &compound.operations {
+            let next_exec = self.execute_select_with_filter(
+                &op.plan,
+                subquery_results,
+                row_filter.clone(),
+            )?;
+
+            // Ensure schemas match
+            if current_exec.schema().fields().len() != next_exec.schema().fields().len() {
+                return Err(Error::Internal(format!(
+                    "Compound operator schema mismatch: left has {} columns, right has {}",
+                    current_exec.schema().fields().len(),
+                    next_exec.schema().fields().len()
+                )));
+            }
+
+            match op.operator {
+                CompoundOperator::Union => {
+                    let schema = current_exec.schema();
+                    let stream = Box::new(current_exec.into_stream()?.chain(next_exec.into_stream()?));
+                    current_exec = SelectExecution::from_stream(
+                        "union".to_string(),
+                        schema,
+                        stream,
+                    );
+
+                    if matches!(op.quantifier, CompoundQuantifier::Distinct) {
+                        let schema = current_exec.schema();
+                        let distinct_stream = Box::new(DistinctStream::new(
+                            schema.clone(),
+                            current_exec.into_stream()?,
+                        )?);
+                        current_exec = SelectExecution::from_stream(
+                            "union_distinct".to_string(),
+                            schema,
+                            distinct_stream,
+                        );
+                    }
+                }
+                CompoundOperator::Except => {
+                    // For EXCEPT, we need to materialize the right side to filter the left side.
+                    // EXCEPT ALL is not supported by standard SQL usually (it's EXCEPT), 
+                    // but if quantifier is All, we might need to handle duplicates differently.
+                    // For now, let's implement standard EXCEPT (distinct).
+                    
+                    // Materialize right side
+                    let right_batches = next_exec.collect()?;
+                    let (right_rows, right_hashes) = if !right_batches.is_empty() {
+                        let right_batch = concat_batches(&next_exec.schema(), &right_batches)?;
+                        let converter = RowConverter::new(
+                            right_batch
+                                .schema()
+                                .fields()
+                                .iter()
+                                .map(|f| SortField::new(f.data_type().clone()))
+                                .collect(),
+                        )?;
+                        let rows = converter.convert_columns(right_batch.columns())?;
+                        let mut set = FxHashSet::default();
+                        let mut hashes = FxHashSet::default();
+                        for row in rows.iter() {
+                            let mut hasher = FxHasher::default();
+                            row.hash(&mut hasher);
+                            hashes.insert(hasher.finish());
+                            set.insert(row.owned());
+                        }
+                        (set, hashes)
+                    } else {
+                        (FxHashSet::default(), FxHashSet::default())
+                    };
+
+                    let schema = current_exec.schema();
+                    let converter = RowConverter::new(
+                        schema
+                            .fields()
+                            .iter()
+                            .map(|f| SortField::new(f.data_type().clone()))
+                            .collect(),
+                    )?;
+
+                    let stream_iter = current_exec.into_stream()?;
+                    let stream = stream_iter.map(move |batch_res| {
+                        let batch = batch_res?;
+                        let rows = converter.convert_columns(batch.columns())?;
+                        let mut keep = Vec::with_capacity(batch.num_rows());
+                        for row in rows.iter() {
+                            let mut hasher = FxHasher::default();
+                            row.hash(&mut hasher);
+                            let h = hasher.finish();
+                            if !right_hashes.contains(&h) {
+                                keep.push(true);
+                            } else {
+                                keep.push(!right_rows.contains(&row.owned()));
+                            }
+                        }
+                        let bool_array = arrow::array::BooleanArray::from(keep);
+                        arrow::compute::filter_record_batch(&batch, &bool_array)
+                            .map_err(|e| Error::Internal(e.to_string()))
+                    });
+                    
+                    current_exec = SelectExecution::from_stream(
+                        "except".to_string(),
+                        schema,
+                        Box::new(stream),
+                    );
+                    
+                    // If distinct, apply distinct
+                    if matches!(op.quantifier, CompoundQuantifier::Distinct) {
+                         let schema = current_exec.schema();
+                         let distinct_stream = Box::new(DistinctStream::new(
+                            schema.clone(),
+                            current_exec.into_stream()?,
+                        )?);
+                        current_exec = SelectExecution::from_stream(
+                            "except_distinct".to_string(),
+                            schema,
+                            distinct_stream,
+                        );
+                    }
+                }
+                CompoundOperator::Intersect => {
+                    // Materialize right side
+                    let right_batches = next_exec.collect()?;
+                    let (right_rows, right_hashes) = if !right_batches.is_empty() {
+                        let right_batch = concat_batches(&next_exec.schema(), &right_batches)?;
+                        let converter = RowConverter::new(
+                            right_batch
+                                .schema()
+                                .fields()
+                                .iter()
+                                .map(|f| SortField::new(f.data_type().clone()))
+                                .collect(),
+                        )?;
+                        let rows = converter.convert_columns(right_batch.columns())?;
+                        let mut set = FxHashSet::default();
+                        let mut hashes = FxHashSet::default();
+                        for row in rows.iter() {
+                            let mut hasher = FxHasher::default();
+                            row.hash(&mut hasher);
+                            hashes.insert(hasher.finish());
+                            set.insert(row.owned());
+                        }
+                        (set, hashes)
+                    } else {
+                        (FxHashSet::default(), FxHashSet::default())
+                    };
+
+                    let schema = current_exec.schema();
+                    let converter = RowConverter::new(
+                        schema
+                            .fields()
+                            .iter()
+                            .map(|f| SortField::new(f.data_type().clone()))
+                            .collect(),
+                    )?;
+
+                    let stream_iter = current_exec.into_stream()?;
+                    let stream = stream_iter.map(move |batch_res| {
+                        let batch = batch_res?;
+                        let rows = converter.convert_columns(batch.columns())?;
+                        let mut keep = Vec::with_capacity(batch.num_rows());
+                        for row in rows.iter() {
+                            let mut hasher = FxHasher::default();
+                            row.hash(&mut hasher);
+                            let h = hasher.finish();
+                            if !right_hashes.contains(&h) {
+                                keep.push(false);
+                            } else {
+                                keep.push(right_rows.contains(&row.owned()));
+                            }
+                        }
+                        let bool_array = arrow::array::BooleanArray::from(keep);
+                        arrow::compute::filter_record_batch(&batch, &bool_array)
+                            .map_err(|e| Error::Internal(e.to_string()))
+                    });
+                    
+                    current_exec = SelectExecution::from_stream(
+                        "intersect".to_string(),
+                        schema,
+                        Box::new(stream),
+                    );
+                    
+                     // If distinct, apply distinct
+                    if matches!(op.quantifier, CompoundQuantifier::Distinct) {
+                         let schema = current_exec.schema();
+                         let distinct_stream = Box::new(DistinctStream::new(
+                            schema.clone(),
+                            current_exec.into_stream()?,
+                        )?);
+                        current_exec = SelectExecution::from_stream(
+                            "intersect_distinct".to_string(),
+                            schema,
+                            distinct_stream,
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(current_exec)
+    }
+
     pub fn execute_select(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
         let subquery_results = self.execute_scalar_subqueries(&plan.scalar_subqueries)?;
         self.execute_select_with_filter(&plan, &subquery_results, None)
@@ -1015,6 +1231,10 @@ where
         subquery_results: &FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        if let Some(compound) = &plan.compound {
+            return self.execute_compound(compound, subquery_results, row_filter);
+        }
+
         let mut plan = plan.clone();
 
         // Rewrite projections
@@ -1801,6 +2021,19 @@ where
 
     pub fn table_name(&self) -> &str {
         &self.table_name
+    }
+
+    pub fn into_stream(self) -> ExecutorResult<BatchIter> {
+        let mut guard = self
+            .source
+            .lock()
+            .map_err(|_| Error::Internal("Failed to lock select source".to_string()))?;
+
+        let source = std::mem::replace(&mut *guard, SelectSource::Materialized(vec![]));
+        match source {
+            SelectSource::Stream(iter) => Ok(iter),
+            SelectSource::Materialized(batches) => Ok(Box::new(batches.into_iter().map(Ok))),
+        }
     }
 
     pub fn collect(&self) -> ExecutorResult<Vec<RecordBatch>> {
