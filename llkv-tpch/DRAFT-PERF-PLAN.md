@@ -85,3 +85,7 @@ Implementation order to avoid rework
 ## Concerns
 
 - Table & column resolvers seem duplicated between llkv-table, llkv-executor, llkv-plan
+- HashMap usage instead of FxHashMap
+- llkv-join's vectorized vs. non-vectorized join paths
+- Previous compile paths, are they still used at all?
+- Perf overhead from potentially using TreeMap in the wrong places

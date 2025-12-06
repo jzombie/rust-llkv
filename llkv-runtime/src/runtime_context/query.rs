@@ -51,6 +51,7 @@ where
             )) as Arc<dyn RowIdFilter<P>>)
         };
 
-        executor.execute_select_with_filter(plan, row_filter)
+        let subquery_results = executor.execute_scalar_subqueries(&plan.scalar_subqueries)?;
+        executor.execute_select_with_filter(&plan, &subquery_results, row_filter)
     }
 }

@@ -51,6 +51,8 @@ where
     pub filter: Option<Expr<'static, FieldId>>,
     pub original_filter: Option<Expr<'static, String>>,
     pub extra_columns: Vec<String>,
+    pub scalar_subqueries: Vec<crate::plans::ScalarSubquery>,
+    pub filter_subqueries: Vec<crate::plans::FilterSubquery>,
 }
 
 impl<P> SingleTableLogicalPlan<P>
@@ -92,6 +94,8 @@ where
     pub resolved_required: Vec<ResolvedColumn>,
     /// Names we could not resolve uniquely (ambiguous or missing).
     pub unresolved_required: Vec<String>,
+    pub scalar_subqueries: Vec<crate::plans::ScalarSubquery>,
+    pub filter_subqueries: Vec<crate::plans::FilterSubquery>,
 }
 
 pub struct PlannedTable<P>
@@ -176,6 +180,10 @@ where
 {
     pub fn new(provider: Arc<dyn TableProvider<P>>) -> Self {
         Self { provider }
+    }
+
+    pub fn provider(&self) -> Arc<dyn TableProvider<P>> {
+        self.provider.clone()
     }
 
     pub fn get_table_schema(&self, table_name: &str) -> Result<Arc<PlanSchema>> {
@@ -279,6 +287,8 @@ where
             filter,
             original_filter: plan.filter.as_ref().map(|f| f.predicate.clone()),
             extra_columns,
+            scalar_subqueries: plan.scalar_subqueries.clone(),
+            filter_subqueries: plan.filter.as_ref().map(|f| f.subqueries.clone()).unwrap_or_default(),
         }))
     }
 
@@ -338,6 +348,8 @@ where
             compound: plan.compound.clone(),
             resolved_required: resolved_columns,
             unresolved_required,
+            scalar_subqueries: plan.scalar_subqueries.clone(),
+            filter_subqueries: plan.filter.as_ref().map(|f| f.subqueries.clone()).unwrap_or_default(),
         }))
     }
 }
