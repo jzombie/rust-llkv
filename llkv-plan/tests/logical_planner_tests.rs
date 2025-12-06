@@ -328,7 +328,8 @@ fn logical_planner_resolves_multi_table_plan() {
     let provider = MultiProvider::new(vec![table_a.clone(), table_b.clone()]);
     let planner = LogicalPlanner::new(provider);
 
-    let mut select_plan = SelectPlan::with_tables(vec![TableRef::new("", "a"), TableRef::new("", "b")]);
+    let mut select_plan =
+        SelectPlan::with_tables(vec![TableRef::new("", "a"), TableRef::new("", "b")]);
     select_plan.projections = vec![
         SelectProjection::Column {
             name: "a.id".to_string(),
@@ -350,9 +351,7 @@ fn logical_planner_resolves_multi_table_plan() {
     });
     select_plan.group_by = vec!["a.id".to_string()];
     select_plan.aggregates = vec![llkv_plan::AggregateExpr::count_column(
-        "b.val",
-        "cnt",
-        false,
+        "b.val", "cnt", false,
     )];
     select_plan.order_by = vec![OrderByPlan {
         target: OrderTarget::Column("b.val".to_string()),

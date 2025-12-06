@@ -4,8 +4,8 @@ use std::sync::{Arc, RwLock};
 use arrow::datatypes::DataType;
 use croaring::Treemap;
 use llkv_plan::PlanValue;
-use llkv_plan::translation::SchemaView;
 use llkv_plan::schema::{PlanColumn, PlanSchema};
+use llkv_plan::translation::SchemaView;
 use llkv_result::Result as LlkvResult;
 use llkv_storage::pager::Pager;
 use llkv_table::types::FieldId;
@@ -43,16 +43,28 @@ where
     }
 
     pub fn multi_column_uniques(&self) -> Vec<ExecutorMultiColumnUnique> {
-        self.multi_column_uniques.read().expect("multi-column uniques lock poisoned").clone()
+        self.multi_column_uniques
+            .read()
+            .expect("multi-column uniques lock poisoned")
+            .clone()
     }
 
     pub fn set_multi_column_uniques(&self, uniques: Vec<ExecutorMultiColumnUnique>) {
-        *self.multi_column_uniques.write().expect("multi-column uniques lock poisoned") = uniques;
+        *self
+            .multi_column_uniques
+            .write()
+            .expect("multi-column uniques lock poisoned") = uniques;
     }
 
     pub fn add_multi_column_unique(&self, unique: ExecutorMultiColumnUnique) {
-        let mut guard = self.multi_column_uniques.write().expect("multi-column uniques lock poisoned");
-        if !guard.iter().any(|u| u.column_indices == unique.column_indices) {
+        let mut guard = self
+            .multi_column_uniques
+            .write()
+            .expect("multi-column uniques lock poisoned");
+        if !guard
+            .iter()
+            .any(|u| u.column_indices == unique.column_indices)
+        {
             guard.push(unique);
         }
     }
@@ -137,7 +149,10 @@ impl ExecutorSchema {
             });
         }
 
-        PlanSchema { columns, name_to_index }
+        PlanSchema {
+            columns,
+            name_to_index,
+        }
     }
 }
 
@@ -146,7 +161,6 @@ impl SchemaView for ExecutorSchema {
         self.column_by_name(name).map(|c| c.field_id)
     }
 }
-
 
 /// Lightweight row batch used by admin helpers.
 #[derive(Debug, Clone)]

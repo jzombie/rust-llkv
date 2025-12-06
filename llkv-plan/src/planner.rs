@@ -68,18 +68,22 @@ where
             // Only push scan-order hints when the ORDER BY references a column projection
             // (not a computed expression). This avoids skipping SortExec for computed ORDER BY
             // targets where storage cannot provide ordering guarantees.
-            let matching_projection = logical_plan
-                .scan_projections
-                .iter()
-                .find_map(|proj| match proj {
-                    llkv_scan::ScanProjection::Column(p)
-                        if crate::logical_planner::projection_name(proj, &logical_plan.schema)
+            let matching_projection =
+                logical_plan
+                    .scan_projections
+                    .iter()
+                    .find_map(|proj| match proj {
+                        llkv_scan::ScanProjection::Column(p)
+                            if crate::logical_planner::projection_name(
+                                proj,
+                                &logical_plan.schema,
+                            )
                             .eq_ignore_ascii_case(column_name) =>
-                    {
-                        Some(p)
-                    }
-                    _ => None,
-                })?;
+                        {
+                            Some(p)
+                        }
+                        _ => None,
+                    })?;
 
             let column = logical_plan
                 .schema

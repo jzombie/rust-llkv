@@ -50,8 +50,7 @@ fn fluent_create_insert_select() {
         .first()
         .map(|b| b.schema())
         .expect("non-empty batches");
-    let combined = arrow::compute::concat_batches(&schema, batches.iter())
-        .expect("concat batches");
+    let combined = arrow::compute::concat_batches(&schema, batches.iter()).expect("concat batches");
     let ids = combined
         .column(0)
         .as_any()
@@ -103,12 +102,9 @@ fn fluent_transaction_flow() {
     ));
 
     let rows = session.table_batches("numbers").expect("session rows");
-    let row_schema = rows
-        .first()
-        .map(|b| b.schema())
-        .expect("non-empty batches");
-    let combined = arrow::compute::concat_batches(&row_schema, rows.iter())
-        .expect("concat batches");
+    let row_schema = rows.first().map(|b| b.schema()).expect("non-empty batches");
+    let combined =
+        arrow::compute::concat_batches(&row_schema, rows.iter()).expect("concat batches");
     let values = combined
         .column(0)
         .as_any()

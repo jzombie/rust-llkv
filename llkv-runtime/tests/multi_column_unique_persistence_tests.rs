@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use llkv_result::Error;
-use llkv_runtime::{
-    CreateIndexPlan, IndexColumnPlan, RuntimeContext, RuntimeStatementResult, row,
-};
+use llkv_runtime::{CreateIndexPlan, IndexColumnPlan, RuntimeContext, RuntimeStatementResult, row};
 use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::CatalogDdl;
 

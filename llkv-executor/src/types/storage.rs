@@ -77,7 +77,8 @@ where
         options: ScanStreamOptions<P>,
         on_batch: &mut dyn FnMut(RecordBatch),
     ) -> LlkvResult<()> {
-        self.table.scan_stream(projections, filter_expr, options, on_batch)
+        self.table
+            .scan_stream(projections, filter_expr, options, on_batch)
     }
 
     fn filter_row_ids<'expr>(&self, filter_expr: &Expr<'expr, FieldId>) -> LlkvResult<Treemap> {
@@ -96,7 +97,8 @@ where
                 "join_rowid_stream requires compatible storage adapter".into(),
             ));
         };
-        self.table.join_rowid_stream(rhs.table(), keys, options, on_batch)
+        self.table
+            .join_rowid_stream(rhs.table(), keys, options, on_batch)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -2,10 +2,16 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanBuilder, Date32Builder, Decimal128Array, Float64Builder, Int64Builder, IntervalMonthDayNanoArray, StringBuilder};
+use arrow::array::{
+    ArrayRef, BooleanBuilder, Date32Builder, Decimal128Array, Float64Builder, Int64Builder,
+    IntervalMonthDayNanoArray, StringBuilder,
+};
 use arrow::datatypes::{DataType, FieldRef, IntervalUnit};
 use llkv_compute::date::parse_date32_literal;
-use llkv_compute::scalar::decimal::{align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy, truncate_decimal_to_i64};
+use llkv_compute::scalar::decimal::{
+    align_decimal_to_scale, decimal_from_f64, decimal_from_i64, decimal_truthy,
+    truncate_decimal_to_i64,
+};
 use llkv_compute::scalar::interval::interval_value_to_arrow;
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
@@ -31,7 +37,10 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
     Ok(resolved)
 }
 
-pub fn normalize_insert_value_for_column(column: &ExecutorColumn, value: PlanValue) -> Result<PlanValue> {
+pub fn normalize_insert_value_for_column(
+    column: &ExecutorColumn,
+    value: PlanValue,
+) -> Result<PlanValue> {
     match (&column.data_type, value) {
         (_, PlanValue::Null) => Ok(PlanValue::Null),
         (DataType::Int64, PlanValue::Integer(v)) => Ok(PlanValue::Integer(v)),
@@ -49,9 +58,19 @@ pub fn normalize_insert_value_for_column(column: &ExecutorColumn, value: PlanVal
             "cannot insert {other:?} into INT column '{}'",
             column.name
         ))),
-        (DataType::Boolean, PlanValue::Integer(v)) => Ok(PlanValue::Integer(if v != 0 { 1 } else { 0 })),
-        (DataType::Boolean, PlanValue::Float(v)) => Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 })),
-        (DataType::Boolean, PlanValue::Decimal(decimal)) => Ok(PlanValue::Integer(if decimal_truthy(decimal) { 1 } else { 0 })),
+        (DataType::Boolean, PlanValue::Integer(v)) => {
+            Ok(PlanValue::Integer(if v != 0 { 1 } else { 0 }))
+        }
+        (DataType::Boolean, PlanValue::Float(v)) => {
+            Ok(PlanValue::Integer(if v != 0.0 { 1 } else { 0 }))
+        }
+        (DataType::Boolean, PlanValue::Decimal(decimal)) => {
+            Ok(PlanValue::Integer(if decimal_truthy(decimal) {
+                1
+            } else {
+                0
+            }))
+        }
         (DataType::Boolean, PlanValue::String(s)) => {
             let normalized = s.trim().to_ascii_lowercase();
             let value = match normalized.as_str() {
@@ -112,11 +131,15 @@ pub fn normalize_insert_value_for_column(column: &ExecutorColumn, value: PlanVal
             "expected struct value for struct column '{}', got {other:?}",
             column.name
         ))),
-        (DataType::Interval(IntervalUnit::MonthDayNano), PlanValue::Interval(interval)) => Ok(PlanValue::Interval(interval)),
-        (DataType::Interval(IntervalUnit::MonthDayNano), other) => Err(Error::InvalidArgumentError(format!(
-            "cannot insert {other:?} into INTERVAL column '{}'",
-            column.name
-        ))),
+        (DataType::Interval(IntervalUnit::MonthDayNano), PlanValue::Interval(interval)) => {
+            Ok(PlanValue::Interval(interval))
+        }
+        (DataType::Interval(IntervalUnit::MonthDayNano), other) => {
+            Err(Error::InvalidArgumentError(format!(
+                "cannot insert {other:?} into INTERVAL column '{}'",
+                column.name
+            )))
+        }
         (DataType::Decimal128(precision, scale), PlanValue::Decimal(decimal)) => {
             let aligned = align_decimal_to_scale(decimal, *precision, *scale).map_err(|err| {
                 Error::InvalidArgumentError(format!(
@@ -296,7 +319,8 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     match value {
                         PlanValue::Null => field_values.push(PlanValue::Null),
                         PlanValue::Struct(map) => {
-                            let field_value = map.get(field_name).cloned().unwrap_or(PlanValue::Null);
+                            let field_value =
+                                map.get(field_name).cloned().unwrap_or(PlanValue::Null);
                             field_values.push(field_value);
                         }
                         _ => {
@@ -320,12 +344,13 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                 let entry = match value {
                     PlanValue::Null => None,
                     PlanValue::Decimal(decimal) => {
-                        let aligned = align_decimal_to_scale(*decimal, *precision, *scale).map_err(|err| {
-                            Error::InvalidArgumentError(format!(
-                                "decimal literal {} incompatible with DECIMAL({}, {}): {err}",
-                                decimal, precision, scale
-                            ))
-                        })?;
+                        let aligned = align_decimal_to_scale(*decimal, *precision, *scale)
+                            .map_err(|err| {
+                                Error::InvalidArgumentError(format!(
+                                    "decimal literal {} incompatible with DECIMAL({}, {}): {err}",
+                                    decimal, precision, scale
+                                ))
+                            })?;
                         Some(aligned.raw_value())
                     }
                     PlanValue::Integer(value) => {
@@ -367,7 +392,9 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
             for value in values {
                 match value {
                     PlanValue::Null => converted.push(None),
-                    PlanValue::Interval(interval) => converted.push(Some(interval_value_to_arrow(*interval))),
+                    PlanValue::Interval(interval) => {
+                        converted.push(Some(interval_value_to_arrow(*interval)))
+                    }
                     _ => {
                         return Err(Error::InvalidArgumentError(
                             "cannot insert non-interval into INTERVAL column".into(),

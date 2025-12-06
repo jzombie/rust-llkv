@@ -174,8 +174,7 @@ fn select_from_view_uses_column_alias() {
         .map(|b| b.schema())
         .expect("non-empty batches");
 
-    let combined = arrow::compute::concat_batches(&schema, batches.iter())
-    .expect("concat batches");
+    let combined = arrow::compute::concat_batches(&schema, batches.iter()).expect("concat batches");
     let column = combined
         .column(0)
         .as_any()

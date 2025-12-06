@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use arrow::datatypes::DataType;
+use llkv_expr::expr::{CompareOp, Expr, ScalarExpr};
 use llkv_plan::PlanValue;
-use llkv_plan::plans::{JoinMetadata, JoinPlan, SelectProjection, TableRef};
 use llkv_plan::SelectPlan;
-use llkv_runtime::{CreateTablePlan, InsertConflictAction, InsertPlan, InsertSource, RuntimeContext, RuntimeStatementResult};
+use llkv_plan::plans::{JoinMetadata, JoinPlan, SelectProjection, TableRef};
+use llkv_runtime::{
+    CreateTablePlan, InsertConflictAction, InsertPlan, InsertSource, RuntimeContext,
+    RuntimeStatementResult,
+};
 use llkv_storage::pager::{BoxedPager, MemPager};
 use llkv_table::CatalogDdl;
-use llkv_expr::expr::{CompareOp, Expr, ScalarExpr};
 
 #[test]
 fn executes_inner_join_two_tables() {
@@ -62,9 +65,21 @@ fn executes_inner_join_two_tables() {
         table: "orders".into(),
         columns: vec![],
         source: InsertSource::Rows(vec![
-            vec![PlanValue::Integer(10), PlanValue::Integer(1), PlanValue::Integer(50)],
-            vec![PlanValue::Integer(11), PlanValue::Integer(2), PlanValue::Integer(75)],
-            vec![PlanValue::Integer(12), PlanValue::Integer(3), PlanValue::Integer(125)],
+            vec![
+                PlanValue::Integer(10),
+                PlanValue::Integer(1),
+                PlanValue::Integer(50),
+            ],
+            vec![
+                PlanValue::Integer(11),
+                PlanValue::Integer(2),
+                PlanValue::Integer(75),
+            ],
+            vec![
+                PlanValue::Integer(12),
+                PlanValue::Integer(3),
+                PlanValue::Integer(125),
+            ],
         ]),
         on_conflict: InsertConflictAction::None,
     };

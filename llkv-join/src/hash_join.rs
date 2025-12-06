@@ -49,7 +49,10 @@ impl KeyValue {
         if null_equals_null {
             KeyValue::NullEqual
         } else {
-            KeyValue::NullSide { is_left, id: row_idx }
+            KeyValue::NullSide {
+                is_left,
+                id: row_idx,
+            }
         }
     }
 }
@@ -74,7 +77,6 @@ type RowRef = (usize, usize);
 
 /// Hash table mapping join keys to lists of matching rows.
 type HashTable = FxHashMap<HashKey, Vec<RowRef>>;
-
 
 /// Execute a hash join but emit row-id pairs for zero-copy late materialization.
 pub fn hash_join_rowid_stream<P, F>(
@@ -111,7 +113,14 @@ where
     }
 
     if keys.is_empty() {
-        return cross_product_rowid_stream(left, right, options, left_filter, right_filter, on_batch);
+        return cross_product_rowid_stream(
+            left,
+            right,
+            options,
+            left_filter,
+            right_filter,
+            on_batch,
+        );
     }
 
     let left_schema = left.schema()?;
@@ -129,131 +138,158 @@ where
     )?;
     let probe_key_indices = extract_left_key_indices(keys, &left_schema)?;
 
-    let mut probe_batches = Vec::new();
-    let probe_filter = build_all_rows_filter(&left_projections)?;
-    left.scan_stream(
-        &left_projections,
-        &probe_filter,
-        ScanStreamOptions {
-            row_id_filter: left_filter.clone(),
-            ..ScanStreamOptions::default()
-        },
-        |probe_batch| probe_batches.push(probe_batch.clone()),
-    )?;
-
     let batch_size = options.batch_size.max(1);
-    let mut left_rows: Vec<JoinRowRef> = Vec::with_capacity(batch_size);
-    let mut right_rows: Vec<Option<JoinRowRef>> = Vec::with_capacity(batch_size);
+    let probe_filter = build_all_rows_filter(&left_projections)?;
 
-    let flush = |left_rows: &mut Vec<JoinRowRef>,
-                 right_rows: &mut Vec<Option<JoinRowRef>>,
-                 cb: &mut F| {
+    fn flush_batch<'a, FCb>(
+        left_batch: &'a RecordBatch,
+        left_rows: &mut Vec<usize>,
+        right_rows: &mut Vec<Option<JoinRowRef>>,
+        right_batches: &'a [RecordBatch],
+        cb: &mut FCb,
+    ) where
+        FCb: FnMut(JoinIndexBatch<'a>),
+    {
         if left_rows.is_empty() {
             return;
         }
         let batch = JoinIndexBatch {
+            left_batch,
             left_rows: std::mem::take(left_rows),
             right_rows: std::mem::take(right_rows),
-            left_batches: &probe_batches,
-            right_batches: &build_batches,
+            right_batches,
         };
         cb(batch);
-    };
-
-    for (probe_batch_idx, probe_batch) in probe_batches.iter().enumerate() {
-        for probe_row_idx in 0..probe_batch.num_rows() {
-            let key = extract_hash_key(
-                probe_batch,
-                &probe_key_indices,
-                probe_row_idx,
-                keys,
-                true,
-            )?;
-            let matches = hash_table.get(&key);
-
-            match options.join_type {
-                JoinType::Inner => {
-                    if let Some(build_rows) = matches {
-                        for &(build_batch_idx, build_row_idx) in build_rows {
-                            left_rows.push(JoinRowRef {
-                                batch: probe_batch_idx,
-                                row: probe_row_idx,
-                            });
-                            right_rows.push(Some(JoinRowRef {
-                                batch: build_batch_idx,
-                                row: build_row_idx,
-                            }));
-
-                            if left_rows.len() >= batch_size {
-                                flush(&mut left_rows, &mut right_rows, &mut on_batch);
-                            }
-                        }
-                    }
-                }
-                JoinType::Left => {
-                    if let Some(build_rows) = matches {
-                        for &(build_batch_idx, build_row_idx) in build_rows {
-                            left_rows.push(JoinRowRef {
-                                batch: probe_batch_idx,
-                                row: probe_row_idx,
-                            });
-                            right_rows.push(Some(JoinRowRef {
-                                batch: build_batch_idx,
-                                row: build_row_idx,
-                            }));
-
-                            if left_rows.len() >= batch_size {
-                                flush(&mut left_rows, &mut right_rows, &mut on_batch);
-                            }
-                        }
-                    } else {
-                        left_rows.push(JoinRowRef {
-                            batch: probe_batch_idx,
-                            row: probe_row_idx,
-                        });
-                        right_rows.push(None);
-
-                        if left_rows.len() >= batch_size {
-                            flush(&mut left_rows, &mut right_rows, &mut on_batch);
-                        }
-                    }
-                }
-                JoinType::Semi => {
-                    if matches.map(|m| !m.is_empty()).unwrap_or(false) {
-                        left_rows.push(JoinRowRef {
-                            batch: probe_batch_idx,
-                            row: probe_row_idx,
-                        });
-                        right_rows.push(None);
-
-                        if left_rows.len() >= batch_size {
-                            flush(&mut left_rows, &mut right_rows, &mut on_batch);
-                        }
-                    }
-                }
-                JoinType::Anti => {
-                    if matches.is_none() || matches.unwrap().is_empty() {
-                        left_rows.push(JoinRowRef {
-                            batch: probe_batch_idx,
-                            row: probe_row_idx,
-                        });
-                        right_rows.push(None);
-
-                        if left_rows.len() >= batch_size {
-                            flush(&mut left_rows, &mut right_rows, &mut on_batch);
-                        }
-                    }
-                }
-                JoinType::Right | JoinType::Full => {
-                    return Err(Error::Internal(
-                        "Right and Full outer joins not yet implemented for hash join".to_string(),
-                    ));
-                }
-            }
-        }
     }
 
-    flush(&mut left_rows, &mut right_rows, &mut on_batch);
+    left.scan_stream(
+        &left_projections,
+        &probe_filter,
+        ScanStreamOptions {
+            row_id_filter: left_filter,
+            ..ScanStreamOptions::default()
+        },
+        |probe_batch| {
+            let mut left_rows: Vec<usize> = Vec::with_capacity(batch_size);
+            let mut right_rows: Vec<Option<JoinRowRef>> = Vec::with_capacity(batch_size);
+
+            for probe_row_idx in 0..probe_batch.num_rows() {
+                let key = match extract_hash_key(
+                    &probe_batch,
+                    &probe_key_indices,
+                    probe_row_idx,
+                    keys,
+                    true,
+                ) {
+                    Ok(key) => key,
+                    Err(err) => panic!("{err}"),
+                };
+                let matches = hash_table.get(&key);
+
+                match options.join_type {
+                    JoinType::Inner => {
+                        if let Some(build_rows) = matches {
+                            for &(build_batch_idx, build_row_idx) in build_rows {
+                                left_rows.push(probe_row_idx);
+                                right_rows.push(Some(JoinRowRef {
+                                    batch: build_batch_idx,
+                                    row: build_row_idx,
+                                }));
+
+                                if left_rows.len() >= batch_size {
+                                    flush_batch(
+                                        &probe_batch,
+                                        &mut left_rows,
+                                        &mut right_rows,
+                                        &build_batches,
+                                        &mut on_batch,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    JoinType::Left => {
+                        if let Some(build_rows) = matches {
+                            for &(build_batch_idx, build_row_idx) in build_rows {
+                                left_rows.push(probe_row_idx);
+                                right_rows.push(Some(JoinRowRef {
+                                    batch: build_batch_idx,
+                                    row: build_row_idx,
+                                }));
+
+                                if left_rows.len() >= batch_size {
+                                    flush_batch(
+                                        &probe_batch,
+                                        &mut left_rows,
+                                        &mut right_rows,
+                                        &build_batches,
+                                        &mut on_batch,
+                                    );
+                                }
+                            }
+                        } else {
+                            left_rows.push(probe_row_idx);
+                            right_rows.push(None);
+
+                            if left_rows.len() >= batch_size {
+                                flush_batch(
+                                    &probe_batch,
+                                    &mut left_rows,
+                                    &mut right_rows,
+                                    &build_batches,
+                                    &mut on_batch,
+                                );
+                            }
+                        }
+                    }
+                    JoinType::Semi => {
+                        if matches.map(|m| !m.is_empty()).unwrap_or(false) {
+                            left_rows.push(probe_row_idx);
+                            right_rows.push(None);
+
+                            if left_rows.len() >= batch_size {
+                                flush_batch(
+                                    &probe_batch,
+                                    &mut left_rows,
+                                    &mut right_rows,
+                                    &build_batches,
+                                    &mut on_batch,
+                                );
+                            }
+                        }
+                    }
+                    JoinType::Anti => {
+                        if matches.is_none() || matches.unwrap().is_empty() {
+                            left_rows.push(probe_row_idx);
+                            right_rows.push(None);
+
+                            if left_rows.len() >= batch_size {
+                                flush_batch(
+                                    &probe_batch,
+                                    &mut left_rows,
+                                    &mut right_rows,
+                                    &build_batches,
+                                    &mut on_batch,
+                                );
+                            }
+                        }
+                    }
+                    JoinType::Right | JoinType::Full => {
+                        panic!("Right and Full outer joins not yet implemented for hash join");
+                    }
+                }
+            }
+
+            flush_batch(
+                &probe_batch,
+                &mut left_rows,
+                &mut right_rows,
+                &build_batches,
+                &mut on_batch,
+            );
+        },
+    )?;
+
     Ok(())
 }
 
@@ -274,20 +310,9 @@ where
     let left_projections = build_user_projections(left, &left_schema)?;
     let right_projections = build_user_projections(right, &right_schema)?;
 
-    let mut left_batches = Vec::new();
     let mut right_batches = Vec::new();
     let filter_left = build_all_rows_filter(&left_projections)?;
     let filter_right = build_all_rows_filter(&right_projections)?;
-
-    left.scan_stream(
-        &left_projections,
-        &filter_left,
-        ScanStreamOptions {
-            row_id_filter: left_filter,
-            ..ScanStreamOptions::default()
-        },
-        |batch| left_batches.push(batch.clone()),
-    )?;
 
     right.scan_stream(
         &right_projections,
@@ -299,40 +324,71 @@ where
         |batch| right_batches.push(batch.clone()),
     )?;
 
-    let batch_size = options.batch_size.max(1);
-    let mut left_rows: Vec<JoinRowRef> = Vec::with_capacity(batch_size);
-    let mut right_rows: Vec<Option<JoinRowRef>> = Vec::with_capacity(batch_size);
-
-    let flush = |left_rows: &mut Vec<JoinRowRef>,
-                 right_rows: &mut Vec<Option<JoinRowRef>>,
-                 cb: &mut F| {
+    fn flush_cross<'a, FCb>(
+        left_batch: &'a RecordBatch,
+        left_rows: &mut Vec<usize>,
+        right_rows: &mut Vec<Option<JoinRowRef>>,
+        right_batches: &'a [RecordBatch],
+        cb: &mut FCb,
+    ) where
+        FCb: FnMut(JoinIndexBatch<'a>),
+    {
         if left_rows.is_empty() {
             return;
         }
+
         let batch = JoinIndexBatch {
+            left_batch,
             left_rows: std::mem::take(left_rows),
             right_rows: std::mem::take(right_rows),
-            left_batches: &left_batches,
-            right_batches: &right_batches,
+            right_batches,
         };
         cb(batch);
-    };
+    }
 
-    for (l_idx, l_batch) in left_batches.iter().enumerate() {
-        for l_row in 0..l_batch.num_rows() {
-            for (r_idx, r_batch) in right_batches.iter().enumerate() {
-                for r_row in 0..r_batch.num_rows() {
-                    left_rows.push(JoinRowRef { batch: l_idx, row: l_row });
-                    right_rows.push(Some(JoinRowRef { batch: r_idx, row: r_row }));
-                    if left_rows.len() >= batch_size {
-                        flush(&mut left_rows, &mut right_rows, &mut on_batch);
+    let batch_size = options.batch_size.max(1);
+    left.scan_stream(
+        &left_projections,
+        &filter_left,
+        ScanStreamOptions {
+            row_id_filter: left_filter,
+            ..ScanStreamOptions::default()
+        },
+        |left_batch| {
+            let mut left_rows: Vec<usize> = Vec::with_capacity(batch_size);
+            let mut right_rows: Vec<Option<JoinRowRef>> = Vec::with_capacity(batch_size);
+
+            for l_row in 0..left_batch.num_rows() {
+                for (r_idx, r_batch) in right_batches.iter().enumerate() {
+                    for r_row in 0..r_batch.num_rows() {
+                        left_rows.push(l_row);
+                        right_rows.push(Some(JoinRowRef {
+                            batch: r_idx,
+                            row: r_row,
+                        }));
+                        if left_rows.len() >= batch_size {
+                            flush_cross(
+                                &left_batch,
+                                &mut left_rows,
+                                &mut right_rows,
+                                &right_batches,
+                                &mut on_batch,
+                            );
+                        }
                     }
                 }
             }
-        }
-    }
 
-    flush(&mut left_rows, &mut right_rows, &mut on_batch);
+            flush_cross(
+                &left_batch,
+                &mut left_rows,
+                &mut right_rows,
+                &right_batches,
+                &mut on_batch,
+            );
+        },
+    )?;
+
     Ok(())
 }
 
@@ -363,7 +419,10 @@ where
 
             for row_idx in 0..batch.num_rows() {
                 if let Ok(key) = extract_hash_key(&batch, &key_indices, row_idx, join_keys, false) {
-                    hash_table.entry(key).or_default().push((batch_idx, row_idx));
+                    hash_table
+                        .entry(key)
+                        .or_default()
+                        .push((batch_idx, row_idx));
                 }
             }
 
@@ -387,7 +446,11 @@ fn extract_hash_key(
         let column = batch.column(col_idx);
 
         if column.is_null(row_idx) {
-            values.push(KeyValue::null_as_key(is_left, row_idx, join_key.null_equals_null));
+            values.push(KeyValue::null_as_key(
+                is_left,
+                row_idx,
+                join_key.null_equals_null,
+            ));
             continue;
         }
 
@@ -402,48 +465,94 @@ fn extract_key_value(column: &arrow::array::ArrayRef, row_idx: usize) -> LlkvRes
     use arrow::array::*;
 
     let value = match column.data_type() {
-        DataType::Int8 => KeyValue::Int8(column.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
-            Error::Internal("Expected Int8Array".to_string())
-        })?.value(row_idx)),
-        DataType::Int16 => KeyValue::Int16(column.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
-            Error::Internal("Expected Int16Array".to_string())
-        })?.value(row_idx)),
-        DataType::Int32 => KeyValue::Int32(column.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-            Error::Internal("Expected Int32Array".to_string())
-        })?.value(row_idx)),
-        DataType::Int64 => KeyValue::Int64(column.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-            Error::Internal("Expected Int64Array".to_string())
-        })?.value(row_idx)),
-        DataType::UInt8 => KeyValue::UInt8(column.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
-            Error::Internal("Expected UInt8Array".to_string())
-        })?.value(row_idx)),
-        DataType::UInt16 => KeyValue::UInt16(column.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| {
-            Error::Internal("Expected UInt16Array".to_string())
-        })?.value(row_idx)),
-        DataType::UInt32 => KeyValue::UInt32(column.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
-            Error::Internal("Expected UInt32Array".to_string())
-        })?.value(row_idx)),
-        DataType::UInt64 => KeyValue::UInt64(column.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
-            Error::Internal("Expected UInt64Array".to_string())
-        })?.value(row_idx)),
+        DataType::Int8 => KeyValue::Int8(
+            column
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| Error::Internal("Expected Int8Array".to_string()))?
+                .value(row_idx),
+        ),
+        DataType::Int16 => KeyValue::Int16(
+            column
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| Error::Internal("Expected Int16Array".to_string()))?
+                .value(row_idx),
+        ),
+        DataType::Int32 => KeyValue::Int32(
+            column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| Error::Internal("Expected Int32Array".to_string()))?
+                .value(row_idx),
+        ),
+        DataType::Int64 => KeyValue::Int64(
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| Error::Internal("Expected Int64Array".to_string()))?
+                .value(row_idx),
+        ),
+        DataType::UInt8 => KeyValue::UInt8(
+            column
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| Error::Internal("Expected UInt8Array".to_string()))?
+                .value(row_idx),
+        ),
+        DataType::UInt16 => KeyValue::UInt16(
+            column
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .ok_or_else(|| Error::Internal("Expected UInt16Array".to_string()))?
+                .value(row_idx),
+        ),
+        DataType::UInt32 => KeyValue::UInt32(
+            column
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| Error::Internal("Expected UInt32Array".to_string()))?
+                .value(row_idx),
+        ),
+        DataType::UInt64 => KeyValue::UInt64(
+            column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| Error::Internal("Expected UInt64Array".to_string()))?
+                .value(row_idx),
+        ),
         DataType::Float32 => {
-            let val = column.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
-                Error::Internal("Expected Float32Array".to_string())
-            })?.value(row_idx);
+            let val = column
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| Error::Internal("Expected Float32Array".to_string()))?
+                .value(row_idx);
             KeyValue::Float32(val.to_bits())
         }
         DataType::Float64 => {
-            let val = column.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                Error::Internal("Expected Float64Array".to_string())
-            })?.value(row_idx);
+            let val = column
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| Error::Internal("Expected Float64Array".to_string()))?
+                .value(row_idx);
             KeyValue::Float64(val.to_bits())
         }
-        DataType::Utf8 => KeyValue::Utf8(column.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            Error::Internal("Expected StringArray".to_string())
-        })?.value(row_idx).to_string()),
-        DataType::Binary => KeyValue::Binary(column.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
-            Error::Internal("Expected BinaryArray".to_string())
-        })?.value(row_idx).to_vec()),
+        DataType::Utf8 => KeyValue::Utf8(
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| Error::Internal("Expected StringArray".to_string()))?
+                .value(row_idx)
+                .to_string(),
+        ),
+        DataType::Binary => KeyValue::Binary(
+            column
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::Internal("Expected BinaryArray".to_string()))?
+                .value(row_idx)
+                .to_vec(),
+        ),
         dt => {
             return Err(Error::Internal(format!(
                 "Unsupported join key type: {:?}",
@@ -479,7 +588,6 @@ where
 
     Ok(projections)
 }
-
 
 fn build_all_rows_filter(projections: &[ScanProjection]) -> LlkvResult<Expr<'static, FieldId>> {
     if projections.is_empty() {
@@ -538,4 +646,3 @@ fn find_field_index(schema: &Schema, target_field_id: FieldId) -> LlkvResult<usi
 
     Ok(user_col_idx)
 }
-

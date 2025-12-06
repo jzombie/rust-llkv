@@ -7,8 +7,8 @@
 
 use crate::{RuntimeContext, RuntimeTableHandle, canonical_table_name};
 use arrow::array::{ArrayRef, UInt64Builder};
-use arrow::record_batch::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_executor::{
     ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable, TableStorageAdapter,
@@ -54,12 +54,14 @@ where
         let table = self.lookup_table(&canonical_name)?;
 
         let filter_expr = match filter {
-            Some(expr) => translation::expression::translate_predicate(expr, table.schema.as_ref(), |name| {
-                Error::InvalidArgumentError(format!(
-                    "Binder Error: does not have a column named '{}'",
-                    name
-                ))
-            })?,
+            Some(expr) => {
+                translation::expression::translate_predicate(expr, table.schema.as_ref(), |name| {
+                    Error::InvalidArgumentError(format!(
+                        "Binder Error: does not have a column named '{}'",
+                        name
+                    ))
+                })?
+            }
             None => {
                 let field_id = table.schema.first_field_id().ok_or_else(|| {
                     Error::InvalidArgumentError(

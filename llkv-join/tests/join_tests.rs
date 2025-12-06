@@ -5,7 +5,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use llkv_column_map::store::Projection;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_expr::{CompareOp, Expr, ScalarExpr};
-use llkv_join::{project_join_columns, JoinIndexBatch, JoinKey, JoinOptions, JoinSide, JoinType, TableJoinRowIdExt};
+use llkv_join::{
+    JoinIndexBatch, JoinKey, JoinOptions, JoinSide, JoinType, TableJoinRowIdExt,
+    project_join_columns,
+};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::table::{ScanProjection, ScanStreamOptions};
@@ -23,14 +26,10 @@ fn materialize_join_index_batch(
 ) -> RecordBatch {
     let include_right = !matches!(join_type, JoinType::Semi | JoinType::Anti);
 
-    let left_col_count = batch
-        .left_batches
-        .first()
-        .map(|b| b.num_columns())
-        .unwrap_or(0);
+    let left_col_count = batch.left_batch.num_columns();
     let left_projection: Vec<usize> = (0..left_col_count).collect();
-    let mut arrays: Vec<ArrayRef> = project_join_columns(batch, JoinSide::Left, &left_projection)
-        .expect("left projection");
+    let mut arrays: Vec<ArrayRef> =
+        project_join_columns(batch, JoinSide::Left, &left_projection).expect("left projection");
 
     if include_right {
         let right_col_count = batch
@@ -116,7 +115,11 @@ fn run_join(
     keys: &[JoinKey],
     options: &JoinOptions,
 ) -> Vec<RecordBatch> {
-    let output_schema = build_output_schema(&left.schema().unwrap(), &right.schema().unwrap(), options.join_type);
+    let output_schema = build_output_schema(
+        &left.schema().unwrap(),
+        &right.schema().unwrap(),
+        options.join_type,
+    );
     let mut out = Vec::new();
     left.join_rowid_stream(right, keys, options, |index_batch| {
         let batch = materialize_join_index_batch(&index_batch, &output_schema, options.join_type);

@@ -8,16 +8,15 @@
 
 mod hash_join;
 
+use arrow::array::ArrayRef;
+use llkv_column_map::gather::{
+    gather_optional_projected_indices_from_batches, gather_projected_indices_from_batches,
+};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::table::{RowIdFilter, Table};
 use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
-use arrow::array::ArrayRef;
-use llkv_column_map::gather::{
-    gather_optional_projected_indices_from_batches,
-    gather_projected_indices_from_batches,
-};
 use std::fmt;
 
 pub use hash_join::hash_join_rowid_stream;
@@ -134,9 +133,9 @@ pub struct JoinRowRef {
 
 /// Batch of join output row references with access to source batches for zero-copy projection.
 pub struct JoinIndexBatch<'a> {
-    pub left_rows: Vec<JoinRowRef>,
+    pub left_batch: &'a arrow::record_batch::RecordBatch,
+    pub left_rows: Vec<usize>,
     pub right_rows: Vec<Option<JoinRowRef>>, // empty for SEMI/ANTI
-    pub left_batches: &'a [arrow::record_batch::RecordBatch],
     pub right_batches: &'a [arrow::record_batch::RecordBatch],
 }
 
@@ -162,9 +161,14 @@ pub fn project_join_columns(
             let rows: Vec<(usize, usize)> = batch
                 .left_rows
                 .iter()
-                .map(|row| (row.batch, row.row))
+                .copied()
+                .map(|row| (0, row))
                 .collect();
-            gather_projected_indices_from_batches(batch.left_batches, &rows, projection)
+            gather_projected_indices_from_batches(
+                std::slice::from_ref(batch.left_batch),
+                &rows,
+                projection,
+            )
         }
         JoinSide::Right => {
             let rows: Vec<Option<(usize, usize)>> = batch
@@ -172,11 +176,7 @@ pub fn project_join_columns(
                 .iter()
                 .map(|opt| opt.map(|row| (row.batch, row.row)))
                 .collect();
-            gather_optional_projected_indices_from_batches(
-                batch.right_batches,
-                &rows,
-                projection,
-            )
+            gather_optional_projected_indices_from_batches(batch.right_batches, &rows, projection)
         }
     }
 }
@@ -466,11 +466,9 @@ mod tests {
         let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, false)]));
         let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Utf8, true)]));
 
-        let left_batch = RecordBatch::try_new(
-            left_schema,
-            vec![Arc::new(Int32Array::from(vec![11, 22]))],
-        )
-        .unwrap();
+        let left_batch =
+            RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![11, 22]))])
+                .unwrap();
         let right_batch = RecordBatch::try_new(
             right_schema,
             vec![Arc::new(StringArray::from(vec![Some("x"), Some("y")]))],
@@ -478,9 +476,9 @@ mod tests {
         .unwrap();
 
         let batch = JoinIndexBatch {
-            left_rows: vec![JoinRowRef { batch: 0, row: 1 }],
+            left_batch: &left_batch,
+            left_rows: vec![1],
             right_rows: vec![Some(JoinRowRef { batch: 0, row: 0 })],
-            left_batches: &[left_batch.clone()],
             right_batches: &[right_batch.clone()],
         };
 
@@ -504,11 +502,8 @@ mod tests {
         let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, false)]));
         let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Utf8, true)]));
 
-        let left_batch = RecordBatch::try_new(
-            left_schema,
-            vec![Arc::new(Int32Array::from(vec![5]))],
-        )
-        .unwrap();
+        let left_batch =
+            RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![5]))]).unwrap();
         let right_batch = RecordBatch::try_new(
             right_schema,
             vec![Arc::new(StringArray::from(vec![Some("q")]))],
@@ -516,9 +511,9 @@ mod tests {
         .unwrap();
 
         let batch = JoinIndexBatch {
-            left_rows: vec![JoinRowRef { batch: 0, row: 0 }],
+            left_batch: &left_batch,
+            left_rows: vec![0],
             right_rows: vec![None],
-            left_batches: &[left_batch.clone()],
             right_batches: &[right_batch.clone()],
         };
 

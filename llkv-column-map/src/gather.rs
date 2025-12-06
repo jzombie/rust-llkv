@@ -58,10 +58,7 @@ pub fn gather_indices(batch: &RecordBatch, indices: &[usize]) -> LlkvResult<Vec<
 
     // Zero-copy fast path: contiguous, increasing row window.
     let start = indices[0];
-    let is_contiguous = indices
-        .iter()
-        .enumerate()
-        .all(|(i, &idx)| idx == start + i);
+    let is_contiguous = indices.iter().enumerate().all(|(i, &idx)| idx == start + i);
 
     if is_contiguous {
         let len = indices.len();
@@ -297,9 +294,7 @@ pub fn gather_optional_indices_from_batches(
     // Zero-copy fast path: all indices are Some, from one batch, contiguous.
     if indices.iter().all(|opt| opt.is_some()) {
         let first = indices[0].expect("checked is_some above");
-        let single_batch = indices
-            .iter()
-            .all(|opt| opt.unwrap().0 == first.0);
+        let single_batch = indices.iter().all(|opt| opt.unwrap().0 == first.0);
         if single_batch {
             let start = first.1;
             let contiguous = indices
@@ -426,9 +421,7 @@ pub fn gather_optional_projected_indices_from_batches(
 
     if indices.iter().all(|opt| opt.is_some()) {
         let first = indices[0].expect("checked is_some above");
-        let single_batch = indices
-            .iter()
-            .all(|opt| opt.unwrap().0 == first.0);
+        let single_batch = indices.iter().all(|opt| opt.unwrap().0 == first.0);
         if single_batch {
             let start = first.1;
             let contiguous = indices
@@ -1366,10 +1359,8 @@ mod tests {
     fn projected_indices_scattered_batches() -> LlkvResult<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
-        let batch_a = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )?;
+        let batch_a =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
         let batch_b = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3, 4]))])?;
 
         let out = gather_projected_indices_from_batches(

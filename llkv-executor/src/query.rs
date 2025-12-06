@@ -1,23 +1,22 @@
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 
-use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
-use arrow::row::{OwnedRow, RowConverter, SortField};
-use arrow::record_batch::RecordBatch;
 use arrow::compute::cast;
+use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use arrow::row::{OwnedRow, RowConverter, SortField};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
-use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr};
-use llkv_expr::AggregateCall;
 use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
 use llkv_compute::eval::{ScalarEvaluator, ScalarExprTypeExt};
+use llkv_expr::AggregateCall;
+use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr};
 use llkv_join::{JoinKey, JoinOptions, JoinType, TableJoinRowIdExt};
 use llkv_plan::logical_planner::{LogicalPlan, LogicalPlanner, ResolvedJoin};
 use llkv_plan::physical::table::{ExecutionTable, TableProvider};
-use llkv_plan::physical::PhysicalPlan;
 use llkv_plan::planner::PhysicalPlanner;
-use llkv_plan::plans::SelectPlan;
 use llkv_plan::plans::JoinPlan;
+use llkv_plan::plans::SelectPlan;
 use llkv_plan::schema::PlanSchema;
 use llkv_result::Error;
 use llkv_scan::RowIdFilter;
@@ -26,8 +25,10 @@ use llkv_types::FieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
-use crate::types::{ExecutorTable, ExecutorTableProvider};
 use crate::ExecutorResult;
+use crate::types::{ExecutorTable, ExecutorTableProvider};
+
+type BatchIter = Box<dyn Iterator<Item = ExecutorResult<RecordBatch>> + Send>;
 
 /// Plan-driven SELECT executor bridging planner output to storage.
 pub struct QueryExecutor<P>
@@ -36,6 +37,120 @@ where
 {
     logical_planner: LogicalPlanner<P>,
     physical_planner: PhysicalPlanner<P>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_join_index_batch_streaming(
+    batch: &llkv_join::JoinIndexBatch<'_>,
+    gather_plan_per_table: &[Vec<usize>],
+    projection_out_map: &[Vec<(usize, usize)>],
+    output_schema: &SchemaRef,
+    computed_projections: &[ComputedProjectionPlan],
+    field_id_by_table_index: &[Vec<FieldId>],
+) -> ExecutorResult<RecordBatch> {
+    let table_count = gather_plan_per_table.len();
+    let mut table_arrays: Vec<Vec<arrow::array::ArrayRef>> = vec![Vec::new(); table_count];
+
+    if table_count >= 1 && !gather_plan_per_table[0].is_empty() {
+        let left_rows: Vec<Option<(usize, usize)>> = batch
+            .left_rows
+            .iter()
+            .copied()
+            .map(|row| Some((0, row)))
+            .collect();
+        let arrays = gather_optional_projected_indices_from_batches(
+            std::slice::from_ref(batch.left_batch),
+            &left_rows,
+            &gather_plan_per_table[0],
+        )
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        table_arrays[0] = arrays;
+    }
+
+    if table_count >= 2 && !gather_plan_per_table[1].is_empty() {
+        let right_rows: Vec<Option<(usize, usize)>> = batch
+            .right_rows
+            .iter()
+            .map(|opt| opt.map(|rr| (rr.batch, rr.row)))
+            .collect();
+        let arrays = gather_optional_projected_indices_from_batches(
+            batch.right_batches,
+            &right_rows,
+            &gather_plan_per_table[1],
+        )
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        table_arrays[1] = arrays;
+    }
+
+    let total_columns: usize = output_schema.fields().len();
+    let mut columns: Vec<Option<arrow::array::ArrayRef>> = vec![None; total_columns];
+
+    for (tbl_idx, out_map) in projection_out_map.iter().enumerate() {
+        for (out_idx, proj_idx) in out_map {
+            let arr = table_arrays
+                .get(tbl_idx)
+                .and_then(|arrays| arrays.get(*proj_idx))
+                .ok_or_else(|| Error::Internal("projection index missing".into()))?
+                .clone();
+            columns[*out_idx] = Some(arr);
+        }
+    }
+
+    if !computed_projections.is_empty() {
+        let mut field_arrays: FxHashMap<(usize, FieldId), arrow::array::ArrayRef> =
+            FxHashMap::default();
+
+        for (tbl_idx, gather_plan) in gather_plan_per_table.iter().enumerate() {
+            if gather_plan.is_empty() {
+                continue;
+            }
+
+            let arrays = table_arrays
+                .get(tbl_idx)
+                .ok_or_else(|| Error::Internal("projection arrays missing".into()))?;
+            let field_ids = field_id_by_table_index
+                .get(tbl_idx)
+                .ok_or_else(|| Error::Internal("field ids missing".into()))?;
+
+            for (arr_idx, col_idx) in gather_plan.iter().enumerate() {
+                let fid = *field_ids
+                    .get(*col_idx)
+                    .ok_or_else(|| Error::Internal("field id missing for column".into()))?;
+                let array = arrays
+                    .get(arr_idx)
+                    .ok_or_else(|| Error::Internal("array missing for gather index".into()))?
+                    .clone();
+                field_arrays.insert((tbl_idx, fid), array);
+            }
+        }
+
+        let row_count = batch.left_rows.len();
+        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, row_count);
+
+        for computed in computed_projections {
+            let evaluated = ScalarEvaluator::evaluate_batch_simplified(
+                &computed.expr,
+                row_count,
+                &numeric_arrays,
+            )
+            .map_err(|e| Error::Internal(e.to_string()))?;
+
+            let value = if evaluated.data_type() != &computed.data_type {
+                cast(&evaluated, &computed.data_type).map_err(|e| Error::Internal(e.to_string()))?
+            } else {
+                evaluated
+            };
+
+            columns[computed.out_index] = Some(value);
+        }
+    }
+
+    let columns: Vec<_> = columns
+        .into_iter()
+        .map(|c| c.ok_or_else(|| Error::Internal("projection column missing".into())))
+        .collect::<Result<_, _>>()?;
+
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
 }
 
 impl<P> QueryExecutor<P>
@@ -69,7 +184,13 @@ where
                     .create_physical_plan(&single, row_filter)
                     .map_err(Error::Internal)?;
                 let schema = physical_plan.schema();
-                let batches = collect_batches(&*physical_plan)?;
+
+                let base_iter: BatchIter = Box::new(
+                    physical_plan
+                        .execute()
+                        .map_err(Error::Internal)?
+                        .map(|b| b.map_err(Error::Internal)),
+                );
 
                 if !plan.aggregates.is_empty() {
                     if !plan.group_by.is_empty() {
@@ -78,53 +199,27 @@ where
                         ));
                     }
 
-                    let (agg_schema, agg_batches) = aggregate_select(
-                        &plan,
-                        &single.schema,
-                        &schema,
-                        batches,
-                    )?;
-                    let trimmed = apply_offset_limit(agg_batches, plan.offset, plan.limit);
-                    Ok(SelectExecution::new(table_name, agg_schema, trimmed))
-                } else {
-                    let batches = if plan.distinct {
-                        distinct_record_batches(&schema, batches)?
-                    } else {
-                        batches
-                    };
-                    let batches = apply_offset_limit(batches, plan.offset, plan.limit);
-                    Ok(SelectExecution::new(table_name, schema, batches))
+                    let agg_iter = AggregateStream::new(base_iter, &plan, &single.schema, &schema)?;
+                    let trimmed =
+                        apply_offset_limit_stream(Box::new(agg_iter), plan.offset, plan.limit);
+                    return Ok(SelectExecution::from_stream(table_name, schema, trimmed));
                 }
+
+                let mut iter: BatchIter = base_iter;
+                if plan.distinct {
+                    iter = Box::new(DistinctStream::new(schema.clone(), iter)?);
+                }
+
+                let trimmed = apply_offset_limit_stream(iter, plan.offset, plan.limit);
+                Ok(SelectExecution::from_stream(table_name, schema, trimmed))
             }
             LogicalPlan::Multi(multi) => {
-                if !multi.aggregates.is_empty()
-                    || !multi.group_by.is_empty()
-                    || multi.distinct
-                    || multi.compound.is_some()
-                    || multi.having.is_some()
-                {
-                    return Err(Error::InvalidArgumentError(
-                        "multi-table aggregates, DISTINCT, HAVING, or compound queries are not supported yet"
-                            .into(),
-                    ));
-                }
-
-                if !multi.order_by.is_empty() {
-                    return Err(Error::InvalidArgumentError(
-                        "ORDER BY for multi-table queries is not supported yet".into(),
-                    ));
-                }
-
-                if multi.tables.len() < 2 {
-                    return Err(Error::InvalidArgumentError(
-                        "multi-table SELECT requires at least two tables".into(),
-                    ));
-                }
-
                 let table_count = multi.tables.len();
-                let mut table_index_by_fid: Vec<FxHashMap<FieldId, usize>> = Vec::with_capacity(table_count);
+                let mut table_index_by_fid: Vec<FxHashMap<FieldId, usize>> =
+                    Vec::with_capacity(table_count);
                 let mut exec_tables: Vec<Arc<ExecutorTable<P>>> = Vec::with_capacity(table_count);
-                let mut field_id_by_table_index: Vec<Vec<FieldId>> = Vec::with_capacity(table_count);
+                let mut field_id_by_table_index: Vec<Vec<FieldId>> =
+                    Vec::with_capacity(table_count);
 
                 for table in &multi.tables {
                     let adapter = table
@@ -133,14 +228,16 @@ where
                         .downcast_ref::<ExecutionTableAdapter<P>>()
                         .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?;
                     exec_tables.push(adapter.executor_table());
-                    field_id_by_table_index.push(table.schema.columns.iter().map(|c| c.field_id).collect());
+                    field_id_by_table_index
+                        .push(table.schema.columns.iter().map(|c| c.field_id).collect());
                     table_index_by_fid.push(index_fields_by_id(&table.schema));
                 }
 
                 let mut output_fields = Vec::with_capacity(multi.projections.len());
                 let mut computed_projections: Vec<ComputedProjectionPlan> = Vec::new();
                 let mut gather_plan_per_table: Vec<Vec<usize>> = vec![Vec::new(); table_count];
-                let mut projection_out_map: Vec<Vec<(usize, usize)>> = vec![Vec::new(); table_count];
+                let mut projection_out_map: Vec<Vec<(usize, usize)>> =
+                    vec![Vec::new(); table_count];
                 let mut gather_index_cache: Vec<FxHashMap<usize, usize>> =
                     vec![FxHashMap::default(); table_count];
 
@@ -162,15 +259,14 @@ where
                             let index_by_fid = &table_index_by_fid[*table_index];
                             let field_id = logical_field_id.field_id();
                             let Some(col_idx) = index_by_fid.get(&field_id).copied() else {
-                                return Err(Error::InvalidArgumentError(
-                                    format!("field_id {field_id} not found in table {table_index}"),
-                                ));
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "field_id {field_id} not found in table {table_index}"
+                                )));
                             };
 
-                            let col = schema
-                                .columns
-                                .get(col_idx)
-                                .ok_or_else(|| Error::Internal("projection index out of bounds".into()))?;
+                            let col = schema.columns.get(col_idx).ok_or_else(|| {
+                                Error::Internal("projection index out of bounds".into())
+                            })?;
 
                             let field = ArrowField::new(
                                 alias.clone().unwrap_or_else(|| col.name.clone()),
@@ -178,7 +274,9 @@ where
                                 col.is_nullable,
                             );
                             output_fields.push(field);
-                            let gather_idx = if let Some(existing) = gather_index_cache[*table_index].get(&col_idx) {
+                            let gather_idx = if let Some(existing) =
+                                gather_index_cache[*table_index].get(&col_idx)
+                            {
                                 *existing
                             } else {
                                 let next = gather_plan_per_table[*table_index].len();
@@ -186,20 +284,24 @@ where
                                 gather_index_cache[*table_index].insert(col_idx, next);
                                 next
                             };
-                            projection_out_map[*table_index].push((output_fields.len() - 1, gather_idx));
+                            projection_out_map[*table_index]
+                                .push((output_fields.len() - 1, gather_idx));
                         }
-                        llkv_plan::logical_planner::ResolvedProjection::Computed { expr, alias } => {
+                        llkv_plan::logical_planner::ResolvedProjection::Computed {
+                            expr,
+                            alias,
+                        } => {
                             let remapped_expr = remap_scalar_expr(expr);
 
                             let mut resolver = |key: (usize, FieldId)| {
                                 table_index_by_fid.get(key.0).and_then(|idx_map| {
-                                    idx_map
-                                        .get(&key.1)
-                                        .and_then(|col_idx| multi.tables[key.0]
+                                    idx_map.get(&key.1).and_then(|col_idx| {
+                                        multi.tables[key.0]
                                             .schema
                                             .columns
                                             .get(*col_idx)
-                                            .map(|c| c.data_type.clone()))
+                                            .map(|c| c.data_type.clone())
+                                    })
                                 })
                             };
 
@@ -211,7 +313,11 @@ where
                                     )
                                 })?;
 
-                            output_fields.push(ArrowField::new(alias.clone(), data_type.clone(), true));
+                            output_fields.push(ArrowField::new(
+                                alias.clone(),
+                                data_type.clone(),
+                                true,
+                            ));
                             let out_index = output_fields.len() - 1;
 
                             let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
@@ -244,6 +350,12 @@ where
                     }
                 }
 
+                if table_count != 2 {
+                    return Err(Error::InvalidArgumentError(
+                        "streaming multi-table joins currently support exactly two tables".into(),
+                    ));
+                }
+
                 let mut join_plan_by_left: Vec<Option<&ResolvedJoin>> = vec![None; table_count - 1];
                 for join in &multi.joins {
                     if join.left_table_index + 1 >= table_count {
@@ -259,394 +371,158 @@ where
                     join_plan_by_left[join.left_table_index] = Some(join);
                 }
 
-                let mut table_batches: Vec<Option<Vec<RecordBatch>>> = vec![None; table_count];
-                let mut adjacencies = Vec::with_capacity(table_count - 1);
-
                 let output_schema = Arc::new(Schema::new(output_fields));
-                let join_batch_size = JoinOptions::default().batch_size.max(1);
 
-                for left_index in 0..table_count - 1 {
-                    let join_meta = join_plan_by_left[left_index];
-                    let join_type = match join_meta {
-                        Some(meta) => map_join_type(meta.join_type)?,
-                        None => JoinType::Inner,
-                    };
-                    let join_keys = match join_meta {
-                        Some(meta) => extract_join_keys(meta)?,
-                        None => Vec::new(),
-                    };
-
-                    let options = JoinOptions {
-                        join_type,
-                        ..Default::default()
-                    };
-
-                    let right_index = left_index + 1;
-                    let left_exec = &exec_tables[left_index];
-                    let right_exec = &exec_tables[right_index];
-                    let mut matches: FxHashMap<(usize, usize), Vec<Option<llkv_join::JoinRowRef>>> =
-                        FxHashMap::default();
-
-                    left_exec.table.join_rowid_stream_with_filter(
-                        &right_exec.table,
-                        &join_keys,
-                        &options,
-                        row_filter.clone(),
-                        row_filter.clone(),
-                        |index_batch| {
-                            if table_batches[left_index].is_none() {
-                                table_batches[left_index] =
-                                    Some(index_batch.left_batches.iter().cloned().collect());
-                            }
-                            if table_batches[right_index].is_none() {
-                                table_batches[right_index] =
-                                    Some(index_batch.right_batches.iter().cloned().collect());
-                            }
-
-                            for (left_row, right_row) in index_batch
-                                .left_rows
-                                .iter()
-                                .zip(index_batch.right_rows.iter())
-                            {
-                                matches
-                                    .entry((left_row.batch, left_row.row))
-                                    .or_default()
-                                    .push(*right_row);
-                            }
-                        },
-                    )?;
-
-                    adjacencies.push(JoinAdjacency {
-                        left_index,
-                        _right_index: right_index,
-                        join_type,
-                        matches,
-                    });
-                }
-
-                for (idx, batches) in table_batches.iter().enumerate() {
-                    if batches.is_none() {
-                        return Err(Error::Internal(format!("missing batches for table {idx}")));
-                    }
-                }
-
-                let mut buffered_rows: Vec<Vec<Option<llkv_join::JoinRowRef>>> = Vec::new();
-                let mut result_batches = Vec::new();
-
-                let table_zero_batches = table_batches[0].as_ref().expect("validated above");
-                let mut emit_path = |
-                    path: &[Option<llkv_join::JoinRowRef>],
-                    buffered_rows: &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
-                    result_batches: &mut Vec<RecordBatch>,
-                | -> ExecutorResult<()> {
-                    buffered_rows.push(path.to_vec());
-                    if buffered_rows.len() >= join_batch_size {
-                        flush_join_rows(
-                            buffered_rows,
-                            &gather_plan_per_table,
-                            &projection_out_map,
-                            &table_batches,
-                            &output_schema,
-                            &computed_projections,
-                            &field_id_by_table_index,
-                            result_batches,
-                        )?;
-                    }
-                    Ok(())
+                let join_meta = join_plan_by_left[0];
+                let join_type = match join_meta {
+                    Some(meta) => map_join_type(meta.join_type)?,
+                    None => JoinType::Inner,
+                };
+                let join_keys = match join_meta {
+                    Some(meta) => extract_join_keys(meta)?,
+                    None => Vec::new(),
                 };
 
-                let mut path: Vec<Option<llkv_join::JoinRowRef>> = Vec::with_capacity(table_count);
+                let options = JoinOptions {
+                    join_type,
+                    ..Default::default()
+                };
 
-                for (batch_idx, batch) in table_zero_batches.iter().enumerate() {
-                    for row_idx in 0..batch.num_rows() {
-                        path.clear();
-                        path.push(Some(llkv_join::JoinRowRef {
-                            batch: batch_idx,
-                            row: row_idx,
-                        }));
-                        walk_join_paths(
-                            0,
-                            &adjacencies,
-                            &mut path,
-                            &mut emit_path,
-                            &mut buffered_rows,
-                            &mut result_batches,
-                        )?;
+                let left_table = Arc::clone(&exec_tables[0].table);
+                let right_table = Arc::clone(&exec_tables[1].table);
+
+                let (tx, rx) = mpsc::sync_channel::<ExecutorResult<RecordBatch>>(2);
+
+                let gather_plan_per_table = gather_plan_per_table.clone();
+                let projection_out_map = projection_out_map.clone();
+                let output_schema_cloned = Arc::clone(&output_schema);
+                let computed_projections = computed_projections.clone();
+                let field_id_by_table_index = field_id_by_table_index.clone();
+                let row_filter_left = row_filter.clone();
+                let row_filter_right = row_filter.clone();
+
+                std::thread::spawn(move || {
+                    let send_err = |err: Error| {
+                        let _ = tx.send(Err(err));
+                    };
+
+                    let res = left_table.join_rowid_stream_with_filter(
+                        &right_table,
+                        &join_keys,
+                        &options,
+                        row_filter_left,
+                        row_filter_right,
+                        |index_batch| match materialize_join_index_batch_streaming(
+                            &index_batch,
+                            &gather_plan_per_table,
+                            &projection_out_map,
+                            &output_schema_cloned,
+                            &computed_projections,
+                            &field_id_by_table_index,
+                        ) {
+                            Ok(batch) => {
+                                if tx.send(Ok(batch)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(err));
+                            }
+                        },
+                    );
+
+                    if let Err(e) = res {
+                        send_err(e);
                     }
-                }
+                });
 
-                if !buffered_rows.is_empty() {
-                    flush_join_rows(
-                        &mut buffered_rows,
-                        &gather_plan_per_table,
-                        &projection_out_map,
-                        &table_batches,
-                        &output_schema,
-                        &computed_projections,
-                        &field_id_by_table_index,
-                        &mut result_batches,
-                    )?;
-                }
-
-                let schema = output_schema;
-                let batches = apply_offset_limit(result_batches, plan.offset, plan.limit);
+                let iter: BatchIter = Box::new(rx.into_iter());
+                let trimmed = apply_offset_limit_stream(iter, plan.offset, plan.limit);
                 let table_name = multi
                     .table_order
                     .first()
                     .map(|t| t.qualified_name())
                     .unwrap_or_default();
-                Ok(SelectExecution::new(table_name, schema, batches))
+                Ok(SelectExecution::from_stream(
+                    table_name,
+                    output_schema,
+                    trimmed,
+                ))
             }
         }
     }
 }
 
-fn flush_join_rows(
-    rows: &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
-    gather_plan_per_table: &[Vec<usize>],
-    projection_out_map: &[Vec<(usize, usize)>],
-    table_batches: &[Option<Vec<RecordBatch>>],
-    output_schema: &SchemaRef,
-    computed_projections: &[ComputedProjectionPlan],
-    field_id_by_table_index: &[Vec<FieldId>],
-    result_batches: &mut Vec<RecordBatch>,
-) -> ExecutorResult<()> {
-    if rows.is_empty() {
-        return Ok(());
+struct AggregateStream {
+    states: Vec<AggregateState>,
+    input: BatchIter,
+    done: bool,
+}
+
+impl AggregateStream {
+    fn new(
+        input: BatchIter,
+        plan: &SelectPlan,
+        logical_schema: &llkv_plan::schema::PlanSchema,
+        physical_schema: &SchemaRef,
+    ) -> ExecutorResult<Self> {
+        let states = build_aggregate_states(plan, logical_schema, physical_schema)?;
+        Ok(Self {
+            states,
+            input,
+            done: false,
+        })
     }
+}
 
-    let table_count = gather_plan_per_table.len();
-    let mut per_table_rows: Vec<Vec<Option<(usize, usize)>>> = vec![Vec::new(); table_count];
+impl Iterator for AggregateStream {
+    type Item = ExecutorResult<RecordBatch>;
 
-    for row in rows.iter() {
-        for (tbl_idx, cell) in row.iter().enumerate() {
-            if let Some(rr) = cell {
-                per_table_rows[tbl_idx].push(Some((rr.batch, rr.row)));
-            } else {
-                per_table_rows[tbl_idx].push(None);
-            }
-        }
-    }
-
-    let mut table_arrays: Vec<Vec<arrow::array::ArrayRef>> = vec![Vec::new(); table_count];
-
-    for tbl_idx in 0..table_count {
-        if gather_plan_per_table[tbl_idx].is_empty() {
-            continue;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
         }
 
-        let batches = table_batches[tbl_idx]
-            .as_ref()
-            .ok_or_else(|| Error::Internal("validated earlier for all tables".into()))?;
-        let arrays = gather_optional_projected_indices_from_batches(
-            batches,
-            &per_table_rows[tbl_idx],
-            &gather_plan_per_table[tbl_idx],
-        )
-        .map_err(|e| Error::Internal(e.to_string()))?;
-        table_arrays[tbl_idx] = arrays;
-    }
-
-    let total_columns: usize = output_schema.fields().len();
-    let mut columns: Vec<Option<arrow::array::ArrayRef>> = vec![None; total_columns];
-
-    for (tbl_idx, out_map) in projection_out_map.iter().enumerate() {
-        for (out_idx, proj_idx) in out_map {
-            let arr = table_arrays
-                .get(tbl_idx)
-                .and_then(|arrays| arrays.get(*proj_idx))
-                .ok_or_else(|| Error::Internal("projection index missing".into()))?
-                .clone();
-            columns[*out_idx] = Some(arr);
-        }
-    }
-
-    if !computed_projections.is_empty() {
-        let mut field_arrays: FxHashMap<(usize, FieldId), arrow::array::ArrayRef> = FxHashMap::default();
-        for (tbl_idx, gather_plan) in gather_plan_per_table.iter().enumerate() {
-            if gather_plan.is_empty() {
-                continue;
-            }
-
-            let arrays = table_arrays
-                .get(tbl_idx)
-                .ok_or_else(|| Error::Internal("projection arrays missing".into()))?;
-            let field_ids = field_id_by_table_index
-                .get(tbl_idx)
-                .ok_or_else(|| Error::Internal("field ids missing".into()))?;
-
-            for (arr_idx, col_idx) in gather_plan.iter().enumerate() {
-                let fid = *field_ids
-                    .get(*col_idx)
-                    .ok_or_else(|| Error::Internal("field id missing for column".into()))?;
-                let array = arrays
-                    .get(arr_idx)
-                    .ok_or_else(|| Error::Internal("array missing for gather index".into()))?
-                    .clone();
-                field_arrays.insert((tbl_idx, fid), array);
-            }
-        }
-
-        let row_count = rows.len();
-        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, row_count);
-
-        for computed in computed_projections {
-            let evaluated = ScalarEvaluator::evaluate_batch_simplified(
-                &computed.expr,
-                row_count,
-                &numeric_arrays,
-            )
-            .map_err(|e| Error::Internal(e.to_string()))?;
-
-            let value = if evaluated.data_type() != &computed.data_type {
-                cast(&evaluated, &computed.data_type)
-                    .map_err(|e| Error::Internal(e.to_string()))?
-            } else {
-                evaluated
+        for batch in self.input.by_ref() {
+            let batch = match batch {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
             };
 
-            columns[computed.out_index] = Some(value);
-        }
-    }
-
-    let columns: Vec<_> = columns
-        .into_iter()
-        .map(|c| c.ok_or_else(|| Error::Internal("projection column missing".into())))
-        .collect::<Result<_, _>>()?;
-
-    let batch = RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| Error::Internal(e.to_string()))?;
-    result_batches.push(batch);
-    rows.clear();
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_join_paths<F>(
-    depth: usize,
-    adjacencies: &[JoinAdjacency],
-    path: &mut Vec<Option<llkv_join::JoinRowRef>>,
-    emit_path: &mut F,
-    buffered_rows: &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
-    result_batches: &mut Vec<RecordBatch>,
-) -> ExecutorResult<()>
-where
-    F: FnMut(
-        &[Option<llkv_join::JoinRowRef>],
-        &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
-        &mut Vec<RecordBatch>,
-    ) -> ExecutorResult<()>,
-{
-    if depth >= adjacencies.len() {
-        emit_path(path, buffered_rows, result_batches)?;
-        return Ok(());
-    }
-
-    let adj = &adjacencies[depth];
-    let left_cell = path.get(adj.left_index).and_then(|c| *c);
-
-    let candidates = left_cell
-        .and_then(|lr| adj.matches.get(&(lr.batch, lr.row)));
-
-    match candidates {
-        Some(list) if !list.is_empty() => {
-            for candidate in list {
-                path.push(*candidate);
-                walk_join_paths(
-                    depth + 1,
-                    adjacencies,
-                    path,
-                    emit_path,
-                    buffered_rows,
-                    result_batches,
-                )?;
-                path.pop();
+            for state in self.states.iter_mut() {
+                if let Err(e) = state.update(&batch) {
+                    return Some(Err(e));
+                }
             }
         }
-        _ if matches!(adj.join_type, JoinType::Left) => {
-            path.push(None);
-            walk_join_paths(
-                depth + 1,
-                adjacencies,
-                path,
-                emit_path,
-                buffered_rows,
-                result_batches,
-            )?;
-            path.pop();
+
+        let mut fields = Vec::with_capacity(self.states.len());
+        let mut arrays = Vec::with_capacity(self.states.len());
+        for state in self.states.drain(..) {
+            let (field, array) = match state.finalize() {
+                Ok(res) => res,
+                Err(e) => return Some(Err(e)),
+            };
+            fields.push(field);
+            arrays.push(array);
         }
-        _ => {}
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = match RecordBatch::try_new(Arc::clone(&schema), arrays) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+        };
+
+        self.done = true;
+        Some(Ok(batch))
     }
-
-    Ok(())
 }
 
-struct JoinAdjacency {
-    left_index: usize,
-    _right_index: usize,
-    join_type: JoinType,
-    matches: FxHashMap<(usize, usize), Vec<Option<llkv_join::JoinRowRef>>>,
-}
-
-fn collect_batches(plan: &dyn PhysicalPlan) -> ExecutorResult<Vec<RecordBatch>> {
-    let iter = plan.execute().map_err(Error::Internal)?;
-    let mut out = Vec::new();
-    for batch in iter {
-        out.push(batch.map_err(Error::Internal)?);
-    }
-    Ok(out)
-}
-
-fn apply_offset_limit(
-    batches: Vec<RecordBatch>,
-    offset: Option<usize>,
-    limit: Option<usize>,
-) -> Vec<RecordBatch> {
-    let mut remaining_offset = offset.unwrap_or(0);
-    let mut remaining_limit = limit;
-    let mut trimmed = Vec::new();
-
-    for batch in batches {
-        let mut start = 0usize;
-        let mut len = batch.num_rows();
-
-        if remaining_offset > 0 {
-            if remaining_offset >= len {
-                remaining_offset -= len;
-                continue;
-            }
-            start = remaining_offset;
-            len -= remaining_offset;
-            remaining_offset = 0;
-        }
-
-        if let Some(limit) = remaining_limit {
-            if limit == 0 {
-                break;
-            }
-            if len > limit {
-                len = limit;
-            }
-            remaining_limit = Some(limit - len);
-        }
-
-        trimmed.push(batch.slice(start, len));
-        if let Some(limit) = remaining_limit {
-            if limit == 0 {
-                break;
-            }
-        }
-    }
-
-    trimmed
-}
-
-fn aggregate_select(
+fn build_aggregate_states(
     plan: &SelectPlan,
     logical_schema: &llkv_plan::schema::PlanSchema,
     physical_schema: &SchemaRef,
-    batches: Vec<RecordBatch>,
-) -> Result<(SchemaRef, Vec<RecordBatch>), Error> {
+) -> Result<Vec<AggregateState>, Error> {
     let mut field_index_by_id: FxHashMap<FieldId, usize> = FxHashMap::default();
     for (idx, field) in physical_schema.fields().iter().enumerate() {
         if let Some(fid_str) = field.metadata().get("field_id") {
@@ -675,10 +551,7 @@ fn aggregate_select(
                 distinct,
             } => {
                 let col = logical_schema.column_by_name(column).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!(
-                        "unknown column '{}' in aggregate",
-                        column
-                    ))
+                    Error::InvalidArgumentError(format!("unknown column '{}' in aggregate", column))
                 })?;
 
                 let kind = match function {
@@ -735,40 +608,114 @@ fn aggregate_select(
             ));
         }
 
-        let accumulator = AggregateAccumulator::new_with_projection_index(&spec, projection_idx, None)?;
+        let accumulator =
+            AggregateAccumulator::new_with_projection_index(&spec, projection_idx, None)?;
         states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
     }
 
-    for batch in &batches {
-        for state in states.iter_mut() {
-            state.update(batch)?;
-        }
-    }
-
-    let mut fields = Vec::with_capacity(states.len());
-    let mut arrays = Vec::with_capacity(states.len());
-    for state in states.into_iter() {
-        let (field, array) = state.finalize()?;
-        fields.push(field);
-        arrays.push(array);
-    }
-
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-        .map_err(|e| Error::Internal(e.to_string()))?;
-    Ok((schema, vec![batch]))
+    Ok(states)
 }
 
-/// Materialised SELECT result batches.
-#[derive(Clone, Debug)]
+struct OffsetLimitStream {
+    input: BatchIter,
+    remaining_offset: usize,
+    remaining_limit: Option<usize>,
+}
+
+impl Iterator for OffsetLimitStream {
+    type Item = ExecutorResult<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let batch = match self.input.next() {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => return Some(Err(e)),
+                None => return None,
+            };
+
+            if let Some(limit) = self.remaining_limit {
+                if limit == 0 {
+                    return None;
+                }
+            }
+
+            let mut start = 0usize;
+            let mut len = batch.num_rows();
+
+            if self.remaining_offset > 0 {
+                if self.remaining_offset >= len {
+                    self.remaining_offset -= len;
+                    continue;
+                }
+                start = self.remaining_offset;
+                len -= self.remaining_offset;
+                self.remaining_offset = 0;
+            }
+
+            if let Some(limit) = self.remaining_limit {
+                if len > limit {
+                    len = limit;
+                }
+                self.remaining_limit = Some(limit - len);
+            }
+
+            return Some(Ok(batch.slice(start, len)));
+        }
+    }
+}
+
+fn apply_offset_limit_stream(
+    iter: BatchIter,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> BatchIter {
+    Box::new(OffsetLimitStream {
+        input: iter,
+        remaining_offset: offset.unwrap_or(0),
+        remaining_limit: limit,
+    })
+}
+
+enum SelectSource {
+    Stream(BatchIter),
+    Materialized(Vec<RecordBatch>),
+}
+
+/// Streaming-friendly SELECT execution handle.
 pub struct SelectExecution<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     table_name: String,
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    source: Arc<Mutex<SelectSource>>,
     _marker: PhantomData<P>,
+}
+
+impl<P> Clone for SelectExecution<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            table_name: self.table_name.clone(),
+            schema: Arc::clone(&self.schema),
+            source: Arc::clone(&self.source),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<P> fmt::Debug for SelectExecution<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SelectExecution")
+            .field("table_name", &self.table_name)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl<P> SelectExecution<P>
@@ -776,24 +723,33 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub fn new(table_name: String, schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        Self {
-            table_name,
-            schema,
-            batches,
-            _marker: PhantomData,
-        }
+        Self::from_materialized(table_name, schema, batches)
     }
 
-    pub fn new_single_batch(
-        table_name: String,
-        schema: SchemaRef,
-        batch: RecordBatch,
-    ) -> Self {
-        Self::new(table_name, schema, vec![batch])
+    pub fn new_single_batch(table_name: String, schema: SchemaRef, batch: RecordBatch) -> Self {
+        Self::from_materialized(table_name, schema, vec![batch])
     }
 
     pub fn from_batch(table_name: String, schema: SchemaRef, batch: RecordBatch) -> Self {
         Self::new_single_batch(table_name, schema, batch)
+    }
+
+    pub fn from_stream(table_name: String, schema: SchemaRef, iter: BatchIter) -> Self {
+        Self {
+            table_name,
+            schema,
+            source: Arc::new(Mutex::new(SelectSource::Stream(iter))),
+            _marker: PhantomData,
+        }
+    }
+
+    fn from_materialized(table_name: String, schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            table_name,
+            schema,
+            source: Arc::new(Mutex::new(SelectSource::Materialized(batches))),
+            _marker: PhantomData,
+        }
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -805,15 +761,43 @@ where
     }
 
     pub fn collect(&self) -> ExecutorResult<Vec<RecordBatch>> {
-        Ok(self.batches.clone())
+        let mut guard = self
+            .source
+            .lock()
+            .map_err(|_| Error::Internal("select stream poisoned".into()))?;
+        match &mut *guard {
+            SelectSource::Materialized(batches) => Ok(batches.clone()),
+            SelectSource::Stream(iter) => {
+                let mut collected = Vec::new();
+                for batch in iter {
+                    collected.push(batch?);
+                }
+                *guard = SelectSource::Materialized(collected.clone());
+                Ok(collected)
+            }
+        }
     }
 
     pub fn stream<F>(&self, mut on_batch: F) -> ExecutorResult<()>
     where
         F: FnMut(RecordBatch) -> ExecutorResult<()>,
     {
-        for batch in &self.batches {
-            on_batch(batch.clone())?;
+        let mut guard = self
+            .source
+            .lock()
+            .map_err(|_| Error::Internal("select stream poisoned".into()))?;
+        match &mut *guard {
+            SelectSource::Materialized(batches) => {
+                for batch in batches.iter() {
+                    on_batch(batch.clone())?;
+                }
+            }
+            SelectSource::Stream(iter) => {
+                for batch in iter {
+                    on_batch(batch?)?;
+                }
+                *guard = SelectSource::Materialized(Vec::new());
+            }
         }
         Ok(())
     }
@@ -845,6 +829,7 @@ where
     plan_schema: Arc<llkv_plan::schema::PlanSchema>,
 }
 
+#[derive(Clone)]
 struct ComputedProjectionPlan {
     expr: ScalarExpr<(usize, FieldId)>,
     data_type: arrow::datatypes::DataType,
@@ -887,7 +872,10 @@ where
                 }
             })
             .collect();
-        let plan_schema = Arc::new(llkv_plan::schema::PlanSchema { columns, name_to_index });
+        let plan_schema = Arc::new(llkv_plan::schema::PlanSchema {
+            columns,
+            name_to_index,
+        });
         Self { table, plan_schema }
     }
 
@@ -904,52 +892,76 @@ fn index_fields_by_id(schema: &PlanSchema) -> FxHashMap<FieldId, usize> {
     map
 }
 
-fn distinct_record_batches(
-    schema: &SchemaRef,
-    batches: Vec<RecordBatch>,
-) -> ExecutorResult<Vec<RecordBatch>> {
-    if batches.is_empty() {
-        return Ok(Vec::new());
+struct DistinctStream {
+    schema: SchemaRef,
+    converter: RowConverter,
+    seen: FxHashSet<OwnedRow>,
+    input: BatchIter,
+}
+
+impl DistinctStream {
+    fn new(schema: SchemaRef, input: BatchIter) -> ExecutorResult<Self> {
+        let sort_fields: Vec<SortField> = schema
+            .fields()
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect();
+        let converter =
+            RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
+        Ok(Self {
+            schema,
+            converter,
+            seen: FxHashSet::default(),
+            input,
+        })
     }
+}
 
-    let sort_fields: Vec<SortField> = schema
-        .fields()
-        .iter()
-        .map(|f| SortField::new(f.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
+impl Iterator for DistinctStream {
+    type Item = ExecutorResult<RecordBatch>;
 
-    let mut seen: FxHashSet<OwnedRow> = FxHashSet::default();
-    let mut unique_rows: Vec<Option<(usize, usize)>> = Vec::new();
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(batch) = self.input.next() {
+            let batch = match batch {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
 
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        let rows = converter
-            .convert_columns(batch.columns())
-            .map_err(|e| Error::Internal(e.to_string()))?;
+            let rows = match self.converter.convert_columns(batch.columns()) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            };
 
-        for row_idx in 0..batch.num_rows() {
-            let owned = rows.row(row_idx).owned();
-            if seen.insert(owned) {
-                unique_rows.push(Some((batch_idx, row_idx)));
+            let mut unique_rows: Vec<Option<(usize, usize)>> = Vec::new();
+            for row_idx in 0..batch.num_rows() {
+                let owned = rows.row(row_idx).owned();
+                if self.seen.insert(owned) {
+                    unique_rows.push(Some((0, row_idx)));
+                }
             }
+
+            if unique_rows.is_empty() {
+                continue;
+            }
+
+            let projection: Vec<usize> = (0..self.schema.fields().len()).collect();
+            let arrays = match gather_optional_projected_indices_from_batches(
+                &[batch],
+                &unique_rows,
+                &projection,
+            ) {
+                Ok(a) => a,
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            };
+
+            let out = match RecordBatch::try_new(Arc::clone(&self.schema), arrays) {
+                Ok(b) => b,
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            };
+            return Some(Ok(out));
         }
+        None
     }
-
-    if unique_rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let projection: Vec<usize> = (0..schema.fields().len()).collect();
-    let arrays = gather_optional_projected_indices_from_batches(
-        &batches,
-        &unique_rows,
-        &projection,
-    )
-    .map_err(|e| Error::Internal(e.to_string()))?;
-
-    let batch = RecordBatch::try_new(Arc::clone(schema), arrays)
-        .map_err(|e| Error::Internal(e.to_string()))?;
-    Ok(vec![batch])
 }
 
 fn remap_scalar_expr(
@@ -1021,23 +1033,14 @@ fn remap_scalar_expr(
             branches,
             else_expr,
         } => ScalarExpr::Case {
-            operand: operand
-                .as_deref()
-                .map(remap_scalar_expr)
-                .map(Box::new),
+            operand: operand.as_deref().map(remap_scalar_expr).map(Box::new),
             branches: branches
                 .iter()
                 .map(|(when_expr, then_expr)| {
-                    (
-                        remap_scalar_expr(when_expr),
-                        remap_scalar_expr(then_expr),
-                    )
+                    (remap_scalar_expr(when_expr), remap_scalar_expr(then_expr))
                 })
                 .collect(),
-            else_expr: else_expr
-                .as_deref()
-                .map(remap_scalar_expr)
-                .map(Box::new),
+            else_expr: else_expr.as_deref().map(remap_scalar_expr).map(Box::new),
         },
         ScalarExpr::Coalesce(items) => {
             ScalarExpr::Coalesce(items.iter().map(remap_scalar_expr).collect())
@@ -1157,4 +1160,3 @@ where
         self
     }
 }
-

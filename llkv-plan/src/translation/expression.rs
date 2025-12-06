@@ -408,11 +408,9 @@ pub fn resolve_field_id_from_schema(schema: &PlanSchema, name: &str) -> LlkvResu
         return Ok(ROW_ID_FIELD_ID);
     }
 
-    schema
-        .field_id_by_name(name)
-        .ok_or_else(|| {
-            Error::InvalidArgumentError(format!(
-                "Binder Error: does not have a column named '{name}'"
-            ))
-        })
+    schema.field_id_by_name(name).ok_or_else(|| {
+        Error::InvalidArgumentError(format!(
+            "Binder Error: does not have a column named '{name}'"
+        ))
+    })
 }

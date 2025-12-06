@@ -616,7 +616,9 @@ where
         let mut candidates = Vec::new();
 
         for (idx, table) in tables.iter().enumerate() {
-            let Some(table_ref) = plan.tables.get(idx) else { continue };
+            let Some(table_ref) = plan.tables.get(idx) else {
+                continue;
+            };
             let table_lower = table_ref.table.to_ascii_lowercase();
             let schema_lower = table_ref.schema.to_ascii_lowercase();
             let qualified_lower = if schema_lower.is_empty() {
@@ -641,8 +643,7 @@ where
                         || (!schema_lower.is_empty() && qualifier == schema_lower));
                 let col_start = if alias_lower.is_none()
                     && parts.len() >= 3
-                    && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase())
-                        == qualified_lower
+                    && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase()) == qualified_lower
                 {
                     Some(2)
                 } else if qualifier_matches_alias || qualifier_matches_table {
@@ -697,7 +698,9 @@ where
     let mut candidates = Vec::new();
 
     for (idx, table) in ctx.tables.iter().enumerate() {
-        let Some(table_ref) = ctx.table_refs.get(idx) else { continue };
+        let Some(table_ref) = ctx.table_refs.get(idx) else {
+            continue;
+        };
         let table_lower = table_ref.table.to_ascii_lowercase();
         let schema_lower = table_ref.schema.to_ascii_lowercase();
         let qualified_lower = if schema_lower.is_empty() {
@@ -719,8 +722,7 @@ where
                     || (!schema_lower.is_empty() && qualifier == schema_lower));
             let col_start = if alias_lower.is_none()
                 && parts.len() >= 3
-                && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase())
-                    == qualified_lower
+                && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase()) == qualified_lower
             {
                 Some(2)
             } else if qualifier_matches_alias || qualifier_matches_table {
@@ -805,9 +807,9 @@ where
             AggregateCall::Max(expr) => {
                 AggregateCall::Max(Box::new(resolve_scalar_expr(ctx, expr)?))
             }
-            AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(
-                resolve_scalar_expr(ctx, expr)?,
-            )),
+            AggregateCall::CountNulls(expr) => {
+                AggregateCall::CountNulls(Box::new(resolve_scalar_expr(ctx, expr)?))
+            }
             AggregateCall::GroupConcat {
                 expr,
                 distinct,
@@ -850,7 +852,10 @@ where
             branches: {
                 let mut out = Vec::with_capacity(branches.len());
                 for (when, then) in branches {
-                    out.push((resolve_scalar_expr(ctx, when)?, resolve_scalar_expr(ctx, then)?));
+                    out.push((
+                        resolve_scalar_expr(ctx, when)?,
+                        resolve_scalar_expr(ctx, then)?,
+                    ));
                 }
                 out
             },
@@ -898,7 +903,11 @@ where
             op: *op,
             right: resolve_scalar_expr(ctx, right)?,
         },
-        Expr::InList { expr, list, negated } => Expr::InList {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
             expr: resolve_scalar_expr(ctx, expr)?,
             list: list
                 .iter()
@@ -948,10 +957,7 @@ where
             crate::plans::SelectProjection::AllColumnsExcept { exclude } => {
                 for (table_idx, table) in ctx.tables.iter().enumerate() {
                     for col in &table.schema.columns {
-                        if exclude
-                            .iter()
-                            .any(|ex| ex.eq_ignore_ascii_case(&col.name))
-                        {
+                        if exclude.iter().any(|ex| ex.eq_ignore_ascii_case(&col.name)) {
                             continue;
                         }
                         out.push(ResolvedProjection::Column {
@@ -995,14 +1001,14 @@ where
     let mut out = Vec::with_capacity(plan.aggregates.len());
     for agg in &plan.aggregates {
         match agg {
-            crate::plans::AggregateExpr::CountStar { alias, distinct } => out.push(
-                ResolvedAggregate {
+            crate::plans::AggregateExpr::CountStar { alias, distinct } => {
+                out.push(ResolvedAggregate {
                     input: None,
                     alias: alias.clone(),
                     function: crate::plans::AggregateFunction::Count,
                     distinct: *distinct,
-                },
-            ),
+                })
+            }
             crate::plans::AggregateExpr::Column {
                 column,
                 alias,
@@ -1065,10 +1071,7 @@ where
     Ok(out)
 }
 
-fn resolve_joins<P>(
-    plan: &SelectPlan,
-    ctx: &ResolutionContext<P>,
-) -> Result<Vec<ResolvedJoin>>
+fn resolve_joins<P>(plan: &SelectPlan, ctx: &ResolutionContext<P>) -> Result<Vec<ResolvedJoin>>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
