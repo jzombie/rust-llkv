@@ -26,7 +26,11 @@
 //! - `FLOAT`, `DOUBLE`, `REAL` → `Float64`
 //! - `TEXT`, `VARCHAR` → `Utf8`
 //! - `DATE` → `Date32`
+
+// TODO: Move hardcoded optimizations to the logical planner
+
 pub type SqlResult<T> = llkv_result::Result<T>;
+
 
 mod sql_engine;
 pub use sql_engine::{
