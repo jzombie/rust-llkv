@@ -15,8 +15,8 @@ use llkv_result::Result;
 use llkv_scan::ScanProjection;
 use llkv_storage::pager::Pager;
 use llkv_types::{FieldId, LogicalFieldId, TableId};
-use simd_r_drive_entry_handle::EntryHandle;
 use rustc_hash::FxHashSet;
+use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::physical::table::{ExecutionTable, TableProvider};
 use crate::plans::{OrderByPlan, OrderTarget, SelectPlan, TableRef};
@@ -292,7 +292,11 @@ where
             original_filter: plan.filter.as_ref().map(|f| f.predicate.clone()),
             extra_columns,
             scalar_subqueries: plan.scalar_subqueries.clone(),
-            filter_subqueries: plan.filter.as_ref().map(|f| f.subqueries.clone()).unwrap_or_default(),
+            filter_subqueries: plan
+                .filter
+                .as_ref()
+                .map(|f| f.subqueries.clone())
+                .unwrap_or_default(),
         }))
     }
 
@@ -336,11 +340,7 @@ where
         let order_by = resolve_order_by(plan, &ctx)?;
         let mut joins = resolve_joins(plan, &ctx)?;
 
-        attach_implicit_joins(
-            &mut joins,
-            planned_tables.len(),
-            filter.as_ref(),
-        );
+        attach_implicit_joins(&mut joins, planned_tables.len(), filter.as_ref());
 
         let table_count = planned_tables.len();
         let (table_filters, residual_filter) =
@@ -364,7 +364,11 @@ where
             resolved_required: resolved_columns,
             unresolved_required,
             scalar_subqueries: plan.scalar_subqueries.clone(),
-            filter_subqueries: plan.filter.as_ref().map(|f| f.subqueries.clone()).unwrap_or_default(),
+            filter_subqueries: plan
+                .filter
+                .as_ref()
+                .map(|f| f.subqueries.clone())
+                .unwrap_or_default(),
         }))
     }
 }
@@ -1133,10 +1137,7 @@ fn attach_implicit_joins(
         return;
     }
 
-    let existing: FxHashSet<usize> = joins
-        .iter()
-        .map(|j| j.left_table_index)
-        .collect();
+    let existing: FxHashSet<usize> = joins.iter().map(|j| j.left_table_index).collect();
 
     for left_table_index in 0..(table_count - 1) {
         if existing.contains(&left_table_index) {
@@ -1217,9 +1218,7 @@ fn derive_filter_join_keys(
     keys
 }
 
-fn build_join_predicate(
-    keys: &[DerivedJoinKey],
-) -> Option<Expr<'static, ResolvedFieldRef>> {
+fn build_join_predicate(keys: &[DerivedJoinKey]) -> Option<Expr<'static, ResolvedFieldRef>> {
     if keys.is_empty() {
         return None;
     }
@@ -1252,7 +1251,10 @@ fn build_join_predicate(
 fn partition_table_filters(
     filter: Option<&Expr<'static, ResolvedFieldRef>>,
     table_count: usize,
-) -> (Vec<Option<Expr<'static, ResolvedFieldRef>>>, Option<Expr<'static, ResolvedFieldRef>>) {
+) -> (
+    Vec<Option<Expr<'static, ResolvedFieldRef>>>,
+    Option<Expr<'static, ResolvedFieldRef>>,
+) {
     let mut per_table: Vec<Vec<Expr<'static, ResolvedFieldRef>>> = vec![Vec::new(); table_count];
     let mut residuals = Vec::new();
 
@@ -1299,10 +1301,7 @@ fn partition_table_filters(
     (per_table, residual)
 }
 
-fn collect_filter_tables(
-    expr: &Expr<'static, ResolvedFieldRef>,
-    out: &mut FxHashSet<usize>,
-) {
+fn collect_filter_tables(expr: &Expr<'static, ResolvedFieldRef>, out: &mut FxHashSet<usize>) {
     match expr {
         Expr::And(list) | Expr::Or(list) => {
             for e in list {
@@ -1334,8 +1333,7 @@ fn collect_scalar_tables(expr: &ScalarExpr<ResolvedFieldRef>, out: &mut FxHashSe
         ScalarExpr::Column(c) => {
             out.insert(c.table_index);
         }
-        ScalarExpr::Binary { left, right, .. }
-        | ScalarExpr::Compare { left, right, .. } => {
+        ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
             collect_scalar_tables(left, out);
             collect_scalar_tables(right, out);
         }

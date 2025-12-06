@@ -1,7 +1,7 @@
 use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow::compute::{concat, take};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::row::{OwnedRow, RowConverter, SortField};
-use arrow::compute::{concat, take};
 use llkv_plan::plans::SelectPlan;
 use llkv_plan::schema::PlanSchema;
 use llkv_result::Error;
@@ -29,8 +29,9 @@ where
         physical_schema: &SchemaRef,
     ) -> Result<Self, Error> {
         let states = build_aggregate_states(plan, logical_schema, physical_schema)?;
-        
-        let fields: Vec<arrow::datatypes::Field> = states.iter().map(|s| s.output_field()).collect();
+
+        let fields: Vec<arrow::datatypes::Field> =
+            states.iter().map(|s| s.output_field()).collect();
         let schema = Arc::new(Schema::new(fields));
 
         Ok(Self {
@@ -85,9 +86,7 @@ where
 
         let schema = Arc::new(Schema::new(fields));
         match RecordBatch::try_new(schema, arrays) {
-            Ok(batch) => {
-                Some(Ok(batch))
-            },
+            Ok(batch) => Some(Ok(batch)),
             Err(e) => Some(Err(Error::Arrow(e))),
         }
     }
@@ -104,8 +103,7 @@ fn concat_arrays(chunks: &[ArrayRef]) -> Result<ArrayRef, Error> {
         return Ok(chunks[0].clone());
     }
 
-    let slices: Vec<&dyn arrow::array::Array> =
-        chunks.iter().map(|a| a.as_ref()).collect();
+    let slices: Vec<&dyn arrow::array::Array> = chunks.iter().map(|a| a.as_ref()).collect();
 
     concat(&slices).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -141,7 +139,8 @@ where
             .iter()
             .map(|f| SortField::new(f.data_type().clone()))
             .collect();
-        let converter = RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
+        let converter =
+            RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
 
         let mut fields: Vec<Field> = key_fields.clone();
         let agg_fields: Vec<Field> = template_states.iter().map(|s| s.output_field()).collect();
@@ -286,7 +285,8 @@ where
             return Some(batch);
         }
 
-        let mut agg_arrays_by_col: Vec<Vec<ArrayRef>> = vec![Vec::new(); self.template_states.len()];
+        let mut agg_arrays_by_col: Vec<Vec<ArrayRef>> =
+            vec![Vec::new(); self.template_states.len()];
         let mut agg_fields: Vec<Field> = Vec::new();
 
         for states in group_states {

@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use arrow::array::{UInt32Builder, ArrayRef, RecordBatch};
-use arrow::compute::take;
-use arrow::datatypes::{SchemaRef};
-use arrow::row::{RowConverter, SortField};
-use rustc_hash::FxHashMap;
 use crate::JoinType;
+use arrow::array::{ArrayRef, RecordBatch, UInt32Builder};
+use arrow::compute::take;
+use arrow::datatypes::SchemaRef;
+use arrow::row::{RowConverter, SortField};
 use llkv_result::Error;
+use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 enum JoinMap {
     Hash(FxHashMap<Vec<u8>, Vec<u32>>),
@@ -48,18 +48,19 @@ where
                 .iter()
                 .map(|&i| Arc::clone(right_batch.column(i)))
                 .collect();
-            
+
             let sort_fields: Vec<SortField> = right_key_columns
                 .iter()
                 .map(|c| SortField::new(c.data_type().clone()))
                 .collect();
-            
+
             let converter = RowConverter::new(sort_fields.clone())
                 .map_err(|e| Error::Internal(e.to_string()))?;
-            
-            let rows = converter.convert_columns(&right_key_columns)
+
+            let rows = converter
+                .convert_columns(&right_key_columns)
                 .map_err(|e| Error::Internal(e.to_string()))?;
-            
+
             let mut map: FxHashMap<Vec<u8>, Vec<u32>> = FxHashMap::default();
             for i in 0..rows.num_rows() {
                 let row = rows.row(i);
@@ -67,14 +68,14 @@ where
             }
             JoinMap::Hash(map)
         };
-       
+
         let sort_fields: Vec<SortField> = right_key_indices
             .iter()
             .map(|&i| SortField::new(right_batch.column(i).data_type().clone()))
             .collect();
 
-        let left_converter = RowConverter::new(sort_fields)
-            .map_err(|e| Error::Internal(e.to_string()))?;
+        let left_converter =
+            RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
 
         Ok(Self {
             schema,
@@ -197,8 +198,10 @@ where
             }
         }
 
-        Some(RecordBatch::try_new(Arc::clone(&self.schema), output_columns)
-            .map_err(|e| Error::Internal(e.to_string())))
+        Some(
+            RecordBatch::try_new(Arc::clone(&self.schema), output_columns)
+                .map_err(|e| Error::Internal(e.to_string())),
+        )
     }
 
     fn next_hash_batch(&mut self) -> Option<Result<RecordBatch, Error>> {
@@ -267,8 +270,10 @@ where
             }
         }
 
-        Some(RecordBatch::try_new(Arc::clone(&self.schema), output_columns)
-            .map_err(|e| Error::Internal(e.to_string())))
+        Some(
+            RecordBatch::try_new(Arc::clone(&self.schema), output_columns)
+                .map_err(|e| Error::Internal(e.to_string())),
+        )
     }
 }
 

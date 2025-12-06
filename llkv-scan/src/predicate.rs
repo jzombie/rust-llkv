@@ -1042,4 +1042,3 @@ fn compare_op_to_owned(field_id: FieldId, op: CompareOp, literal: &Literal) -> O
 
     Some(OwnedFilter { field_id, op })
 }
-

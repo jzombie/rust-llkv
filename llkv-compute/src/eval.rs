@@ -578,9 +578,7 @@ impl ScalarEvaluator {
             return Ok(fast_result);
         }
 
-        if let Some(vectorized) =
-            Self::try_evaluate_vectorized(expr, len, arrays)?
-        {
+        if let Some(vectorized) = Self::try_evaluate_vectorized(expr, len, arrays)? {
             let result = vectorized.materialize(len);
             if result.data_type() != &preferred {
                 let casted = cast::cast(&result, &preferred).map_err(|e| {

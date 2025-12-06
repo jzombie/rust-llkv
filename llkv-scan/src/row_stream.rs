@@ -608,7 +608,8 @@ where
                         eval_get_field(base, field_name, gathered_columns, unique_index, table_id)?
                     }
                     _ => {
-                        let numeric_arrays = if let Some(arrays) = numeric_arrays_holder.as_deref() {
+                        let numeric_arrays = if let Some(arrays) = numeric_arrays_holder.as_deref()
+                        {
                             arrays
                         } else {
                             // Build a minimal numeric map on demand when the caller did not

@@ -816,7 +816,7 @@ impl AggregateAccumulator {
                         "SUM aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                
+
                 if let Some(s) = compute::sum(array) {
                     *has_values = true;
                     *value = match *value {
@@ -876,7 +876,7 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                
+
                 if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
                     if let Some(s) = compute::sum(array) {
                         *value += s;
@@ -1133,7 +1133,7 @@ impl AggregateAccumulator {
                         "AVG aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                
+
                 if let Some(s) = compute::sum(array) {
                     *sum = sum.checked_add(s).ok_or_else(|| {
                         Error::InvalidArgumentError("AVG aggregate sum exceeds i64 range".into())
@@ -1186,13 +1186,15 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                
+
                 if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
                     if let Some(s) = compute::sum(array) {
                         *sum += s;
                         let c = (array.len() - array.null_count()) as i64;
                         *count = count.checked_add(c).ok_or_else(|| {
-                            Error::InvalidArgumentError("AVG aggregate count exceeds i64 range".into())
+                            Error::InvalidArgumentError(
+                                "AVG aggregate count exceeds i64 range".into(),
+                            )
                         })?;
                     }
                 } else {
@@ -1309,7 +1311,7 @@ impl AggregateAccumulator {
                         "MIN aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                
+
                 if let Some(m) = compute::min(array) {
                     *value = Some(match *value {
                         Some(current) => current.min(m),
@@ -1326,7 +1328,7 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                
+
                 if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
                     if let Some(m) = compute::min(array) {
                         *value = Some(match *value {
@@ -1388,7 +1390,7 @@ impl AggregateAccumulator {
                         "MAX aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                
+
                 if let Some(m) = compute::max(array) {
                     *value = Some(match *value {
                         Some(current) => current.max(m),
@@ -1405,7 +1407,7 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                
+
                 if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
                     if let Some(m) = compute::max(array) {
                         *value = Some(match *value {
@@ -1516,50 +1518,86 @@ impl AggregateAccumulator {
         match self {
             AggregateAccumulator::CountStar { .. } => Field::new("count", DataType::Int64, false),
             AggregateAccumulator::CountColumn { .. } => Field::new("count", DataType::Int64, false),
-            AggregateAccumulator::CountDistinctColumn { .. } => Field::new("count_distinct", DataType::Int64, false),
+            AggregateAccumulator::CountDistinctColumn { .. } => {
+                Field::new("count_distinct", DataType::Int64, false)
+            }
             AggregateAccumulator::SumInt64 { .. } => Field::new("sum", DataType::Int64, true),
-            AggregateAccumulator::SumDistinctInt64 { .. } => Field::new("sum_distinct", DataType::Int64, true),
+            AggregateAccumulator::SumDistinctInt64 { .. } => {
+                Field::new("sum_distinct", DataType::Int64, true)
+            }
             AggregateAccumulator::SumFloat64 { .. } => Field::new("sum", DataType::Float64, true),
-            AggregateAccumulator::SumDistinctFloat64 { .. } => Field::new("sum_distinct", DataType::Float64, true),
-            AggregateAccumulator::SumDecimal128 { precision, scale, .. } => {
-                Field::new("sum", DataType::Decimal128(*precision, *scale), true)
+            AggregateAccumulator::SumDistinctFloat64 { .. } => {
+                Field::new("sum_distinct", DataType::Float64, true)
             }
-            AggregateAccumulator::SumDistinctDecimal128 { precision, scale, .. } => {
-                Field::new("sum_distinct", DataType::Decimal128(*precision, *scale), true)
+            AggregateAccumulator::SumDecimal128 {
+                precision, scale, ..
+            } => Field::new("sum", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::SumDistinctDecimal128 {
+                precision, scale, ..
+            } => Field::new(
+                "sum_distinct",
+                DataType::Decimal128(*precision, *scale),
+                true,
+            ),
+            AggregateAccumulator::TotalInt64 { .. } => {
+                Field::new("total", DataType::Float64, false)
             }
-            AggregateAccumulator::TotalInt64 { .. } => Field::new("total", DataType::Float64, false),
-            AggregateAccumulator::TotalDistinctInt64 { .. } => Field::new("total_distinct", DataType::Float64, false),
-            AggregateAccumulator::TotalFloat64 { .. } => Field::new("total", DataType::Float64, false),
-            AggregateAccumulator::TotalDistinctFloat64 { .. } => Field::new("total_distinct", DataType::Float64, false),
-            AggregateAccumulator::TotalDecimal128 { precision, scale, .. } => {
-                Field::new("total", DataType::Decimal128(*precision, *scale), false)
+            AggregateAccumulator::TotalDistinctInt64 { .. } => {
+                Field::new("total_distinct", DataType::Float64, false)
             }
-            AggregateAccumulator::TotalDistinctDecimal128 { precision, scale, .. } => {
-                Field::new("total_distinct", DataType::Decimal128(*precision, *scale), false)
+            AggregateAccumulator::TotalFloat64 { .. } => {
+                Field::new("total", DataType::Float64, false)
             }
+            AggregateAccumulator::TotalDistinctFloat64 { .. } => {
+                Field::new("total_distinct", DataType::Float64, false)
+            }
+            AggregateAccumulator::TotalDecimal128 {
+                precision, scale, ..
+            } => Field::new("total", DataType::Decimal128(*precision, *scale), false),
+            AggregateAccumulator::TotalDistinctDecimal128 {
+                precision, scale, ..
+            } => Field::new(
+                "total_distinct",
+                DataType::Decimal128(*precision, *scale),
+                false,
+            ),
             AggregateAccumulator::AvgInt64 { .. } => Field::new("avg", DataType::Float64, true),
-            AggregateAccumulator::AvgDistinctInt64 { .. } => Field::new("avg_distinct", DataType::Float64, true),
+            AggregateAccumulator::AvgDistinctInt64 { .. } => {
+                Field::new("avg_distinct", DataType::Float64, true)
+            }
             AggregateAccumulator::AvgFloat64 { .. } => Field::new("avg", DataType::Float64, true),
-            AggregateAccumulator::AvgDistinctFloat64 { .. } => Field::new("avg_distinct", DataType::Float64, true),
-            AggregateAccumulator::AvgDecimal128 { precision, scale, .. } => {
-                Field::new("avg", DataType::Decimal128(*precision, *scale), true)
+            AggregateAccumulator::AvgDistinctFloat64 { .. } => {
+                Field::new("avg_distinct", DataType::Float64, true)
             }
-            AggregateAccumulator::AvgDistinctDecimal128 { precision, scale, .. } => {
-                Field::new("avg_distinct", DataType::Decimal128(*precision, *scale), true)
-            }
+            AggregateAccumulator::AvgDecimal128 {
+                precision, scale, ..
+            } => Field::new("avg", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::AvgDistinctDecimal128 {
+                precision, scale, ..
+            } => Field::new(
+                "avg_distinct",
+                DataType::Decimal128(*precision, *scale),
+                true,
+            ),
             AggregateAccumulator::MinInt64 { .. } => Field::new("min", DataType::Int64, true),
             AggregateAccumulator::MinFloat64 { .. } => Field::new("min", DataType::Float64, true),
-            AggregateAccumulator::MinDecimal128 { precision, scale, .. } => {
-                Field::new("min", DataType::Decimal128(*precision, *scale), true)
-            }
+            AggregateAccumulator::MinDecimal128 {
+                precision, scale, ..
+            } => Field::new("min", DataType::Decimal128(*precision, *scale), true),
             AggregateAccumulator::MaxInt64 { .. } => Field::new("max", DataType::Int64, true),
             AggregateAccumulator::MaxFloat64 { .. } => Field::new("max", DataType::Float64, true),
-            AggregateAccumulator::MaxDecimal128 { precision, scale, .. } => {
-                Field::new("max", DataType::Decimal128(*precision, *scale), true)
+            AggregateAccumulator::MaxDecimal128 {
+                precision, scale, ..
+            } => Field::new("max", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::CountNulls { .. } => {
+                Field::new("count_nulls", DataType::Int64, false)
             }
-            AggregateAccumulator::CountNulls { .. } => Field::new("count_nulls", DataType::Int64, false),
-            AggregateAccumulator::GroupConcat { .. } => Field::new("group_concat", DataType::Utf8, true),
-            AggregateAccumulator::GroupConcatDistinct { .. } => Field::new("group_concat_distinct", DataType::Utf8, true),
+            AggregateAccumulator::GroupConcat { .. } => {
+                Field::new("group_concat", DataType::Utf8, true)
+            }
+            AggregateAccumulator::GroupConcatDistinct { .. } => {
+                Field::new("group_concat_distinct", DataType::Utf8, true)
+            }
         }
     }
 
