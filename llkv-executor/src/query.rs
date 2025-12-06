@@ -619,6 +619,33 @@ where
                 Ok(ScalarExpr::Column((0, idx as u32)))
             }
             ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
+            ScalarExpr::Aggregate(call) => Ok(ScalarExpr::Aggregate(match call {
+                AggregateCall::CountStar => AggregateCall::CountStar,
+                AggregateCall::Count { expr, distinct } => AggregateCall::Count {
+                    expr: Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?),
+                    distinct: *distinct,
+                },
+                AggregateCall::Sum { expr, distinct } => AggregateCall::Sum {
+                    expr: Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?),
+                    distinct: *distinct,
+                },
+                AggregateCall::Total { expr, distinct } => AggregateCall::Total {
+                    expr: Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?),
+                    distinct: *distinct,
+                },
+                AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
+                    expr: Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?),
+                    distinct: *distinct,
+                },
+                AggregateCall::Min(expr) => AggregateCall::Min(Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?)),
+                AggregateCall::Max(expr) => AggregateCall::Max(Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?)),
+                AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?)),
+                AggregateCall::GroupConcat { expr, distinct, separator } => AggregateCall::GroupConcat {
+                    expr: Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?),
+                    distinct: *distinct,
+                    separator: separator.clone(),
+                },
+            })),
             ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
                 left: Box::new(Self::remap_string_expr_to_indices(left, schema, name_overrides)?),
                 op: *op,
@@ -3253,6 +3280,17 @@ fn infer_type(
             } else {
                 Ok(DataType::Null)
             }
+        },
+        ScalarExpr::Aggregate(call) => match call {
+            AggregateCall::CountStar | AggregateCall::Count { .. } | AggregateCall::CountNulls(_) => {
+                Ok(DataType::Int64)
+            }
+            AggregateCall::Sum { expr, .. } | AggregateCall::Total { expr, .. } => {
+                infer_type(expr, schema, col_mapping)
+            }
+            AggregateCall::Avg { .. } => Ok(DataType::Float64),
+            AggregateCall::Min(expr) | AggregateCall::Max(expr) => infer_type(expr, schema, col_mapping),
+            AggregateCall::GroupConcat { .. } => Ok(DataType::Utf8),
         },
         ScalarExpr::Not(_) | ScalarExpr::IsNull { .. } | ScalarExpr::Compare { .. } => Ok(DataType::Boolean),
         _ => Ok(DataType::Int64),
