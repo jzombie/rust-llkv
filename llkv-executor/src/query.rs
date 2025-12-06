@@ -23,6 +23,7 @@ use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_plan::planner::PhysicalPlanner;
 use llkv_plan::plans::JoinPlan;
 use llkv_plan::plans::SelectPlan;
+use llkv_plan::plans::{AggregateExpr, AggregateFunction};
 use llkv_plan::schema::{PlanColumn, PlanSchema};
 use llkv_result::Error;
 use llkv_scan::{RowIdFilter, ScanProjection};
@@ -64,6 +65,113 @@ where
         }
     }
 
+    fn execute_complex_aggregation(
+        &self,
+        base_stream: BatchIter,
+        base_schema: Arc<Schema>,
+        new_aggregates: Vec<AggregateExpr>,
+        final_exprs: Vec<ScalarExpr<String>>,
+        final_names: Vec<String>,
+        plan: &SelectPlan,
+        table_name: String,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        if !plan.group_by.is_empty() {
+            return Err(Error::InvalidArgumentError(
+                "GROUP BY aggregates are not supported yet".into(),
+            ));
+        }
+
+        // 1. Pre-aggregation stream is just base_stream
+        // The base_stream is expected to yield batches containing the arguments for aggregation
+        // (e.g. _agg_arg_0, _agg_arg_1, etc.) produced by the Scan.
+        
+        // We need to ensure the schema has the field_ids we expect (10000+i) so AggregateStream can match them.
+        let mut fields_with_metadata = Vec::new();
+        for (i, field) in base_schema.fields().iter().enumerate() {
+            let mut metadata = field.metadata().clone();
+            metadata.insert("field_id".to_string(), format!("{}", 10000 + i));
+            let new_field = field.as_ref().clone().with_metadata(metadata);
+            fields_with_metadata.push(new_field);
+        }
+        let pre_agg_schema = Arc::new(Schema::new(fields_with_metadata));
+        
+        let pre_agg_schema_captured = pre_agg_schema.clone();
+        let pre_agg_stream = base_stream.map(move |batch_res| {
+            let batch = batch_res?;
+            // Just replace schema, data is same
+            RecordBatch::try_new(pre_agg_schema_captured.clone(), batch.columns().to_vec())
+                .map_err(|e| Error::Internal(e.to_string()))
+        });
+
+        // 2. Aggregation
+        let mut agg_plan = plan.clone();
+        agg_plan.aggregates = new_aggregates;
+        
+        let mut plan_columns = Vec::new();
+        let mut name_to_index = FxHashMap::default();
+        for (i, field) in pre_agg_schema.fields().iter().enumerate() {
+            plan_columns.push(PlanColumn {
+                name: field.name().clone(),
+                data_type: field.data_type().clone(),
+                field_id: 10000 + i as u32,
+                is_nullable: field.is_nullable(),
+                is_primary_key: false,
+                is_unique: false,
+                default_value: None,
+                check_expr: None,
+            });
+            name_to_index.insert(field.name().clone(), i);
+        }
+        let pre_agg_plan_schema = PlanSchema { columns: plan_columns, name_to_index };
+
+        let agg_iter = AggregateStream::new(Box::new(pre_agg_stream), &agg_plan, &pre_agg_plan_schema, &pre_agg_schema)?;
+        let agg_schema = agg_iter.schema();
+
+        // 3. Final Projection
+        let mut final_output_fields = Vec::new();
+        let mut col_mapping = FxHashMap::default();
+        for (i, field) in agg_schema.fields().iter().enumerate() {
+            col_mapping.insert((0, i as u32), i);
+        }
+
+        for (expr_str, name) in final_exprs.iter().zip(final_names.iter()) {
+            let expr = resolve_scalar_expr_string(expr_str, &agg_schema)?;
+            let dt = infer_type(&expr, &agg_schema, &col_mapping).unwrap_or(arrow::datatypes::DataType::Int64);
+            final_output_fields.push(ArrowField::new(name, dt, true));
+        }
+        let final_output_schema = Arc::new(Schema::new(final_output_fields));
+        let final_output_schema_captured = final_output_schema.clone();
+        let agg_schema_captured = agg_schema.clone();
+
+        let final_stream = agg_iter.map(move |batch_res| {
+            let batch = batch_res?;
+            let mut columns = Vec::new();
+            
+            // Prepare arrays for evaluation
+            let mut field_arrays = FxHashMap::default();
+            for (i, col) in batch.columns().iter().enumerate() {
+                field_arrays.insert((0, i as u32), col.clone());
+            }
+            let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+            
+            for expr_str in &final_exprs {
+                let expr = resolve_scalar_expr_string(expr_str, &agg_schema_captured)?;
+                let result = ScalarEvaluator::evaluate_batch_simplified(&expr, batch.num_rows(), &numeric_arrays)?;
+                columns.push(result);
+            }
+            
+            RecordBatch::try_new(final_output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+        });
+
+        let mut iter: BatchIter = Box::new(final_stream);
+        if plan.distinct {
+             iter = Box::new(DistinctStream::new(final_output_schema.clone(), iter)?);
+        }
+        
+        let trimmed = apply_offset_limit_stream(iter, plan.offset, plan.limit);
+        Ok(SelectExecution::from_stream(table_name, final_output_schema, trimmed))
+    }
+
     pub fn execute_select(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
         self.execute_select_with_filter(plan, None)
     }
@@ -73,6 +181,93 @@ where
         plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        // Check for complex aggregates in single-table queries BEFORE creating logical plan
+        if plan.tables.len() == 1 {
+            let table_ref = &plan.tables[0];
+            let table_name = table_ref.qualified_name();
+            
+            // We need the schema to expand wildcards and check for aggregates
+            if let Ok(schema) = self.logical_planner.get_table_schema(&table_name) {
+                let mut string_projections = Vec::new();
+                let mut final_names = Vec::new();
+                
+                for proj in &plan.projections {
+                     match proj {
+                        llkv_plan::plans::SelectProjection::AllColumns => {
+                             for col in schema.columns.iter() {
+                                 string_projections.push(ScalarExpr::Column(col.name.clone()));
+                                 final_names.push(col.name.clone());
+                             }
+                        }
+                        llkv_plan::plans::SelectProjection::AllColumnsExcept { exclude } => {
+                             for col in schema.columns.iter() {
+                                 if !exclude.contains(&col.name) {
+                                     string_projections.push(ScalarExpr::Column(col.name.clone()));
+                                     final_names.push(col.name.clone());
+                                 }
+                             }
+                        }
+                        llkv_plan::plans::SelectProjection::Column { name, alias } => {
+                            string_projections.push(ScalarExpr::Column(name.clone()));
+                            final_names.push(alias.clone().unwrap_or(name.clone()));
+                        }
+                        llkv_plan::plans::SelectProjection::Computed { expr, alias } => {
+                            string_projections.push(expr.clone());
+                            final_names.push(alias.clone());
+                        }
+                    }
+                }
+
+                let (new_aggregates, final_exprs, pre_agg_exprs) = extract_complex_aggregates(&string_projections);
+                
+                if !new_aggregates.is_empty() {
+                     // Create pre-agg plan that projects the arguments for aggregation
+                     let mut pre_agg_plan = plan.clone();
+                     pre_agg_plan.projections = pre_agg_exprs.iter().enumerate().map(|(i, expr)| {
+                         llkv_plan::plans::SelectProjection::Computed {
+                             expr: expr.clone(),
+                             alias: format!("_agg_arg_{}", i),
+                         }
+                     }).collect();
+                     
+                     // Create logical plan for pre-agg
+                     // This should succeed because pre_agg_exprs do not contain aggregates
+                     let logical_plan = self.logical_planner.create_logical_plan(&pre_agg_plan)?;
+                     
+                     match logical_plan {
+                        LogicalPlan::Single(single) => {
+                            let physical_plan = self
+                                .physical_planner
+                                .create_physical_plan(&single, row_filter)
+                                .map_err(Error::Internal)?;
+                            let schema = physical_plan.schema();
+
+                            let base_iter: BatchIter = Box::new(
+                                physical_plan
+                                    .execute()
+                                    .map_err(Error::Internal)?
+                                    .map(|b| b.map_err(Error::Internal)),
+                            );
+                            
+                            return self.execute_complex_aggregation(
+                                base_iter,
+                                schema,
+                                new_aggregates,
+                                final_exprs,
+                                final_names,
+                                &plan,
+                                table_name,
+                            );
+                        }
+                        _ => {
+                            // Should not happen for single table plan
+                            return Err(Error::Internal("Expected single table plan for pre-aggregation".into()));
+                        }
+                     }
+                }
+            }
+        }
+
         let logical_plan = self.logical_planner.create_logical_plan(&plan)?;
 
         match logical_plan {
@@ -99,9 +294,10 @@ where
                     }
 
                     let agg_iter = AggregateStream::new(base_iter, &plan, &single.schema, &schema)?;
+                    let agg_schema = agg_iter.schema();
                     let trimmed =
                         apply_offset_limit_stream(Box::new(agg_iter), plan.offset, plan.limit);
-                    return Ok(SelectExecution::from_stream(table_name, schema, trimmed));
+                    return Ok(SelectExecution::from_stream(table_name, agg_schema, trimmed));
                 }
 
                 let mut iter: BatchIter = base_iter;
@@ -272,6 +468,34 @@ where
                     }
                 }
                 
+                // 3. Apply Filter (if any)
+                if let Some(filter) = &multi.filter {
+                    let predicate = simplify_predicate(&remap_filter_expr(filter)?);
+                    
+                    let col_mapping_captured = col_mapping.clone();
+                    current_stream = Box::new(current_stream.map(move |batch_res| {
+                        let batch = batch_res?;
+                        
+                        let mut required_fields = FxHashSet::default();
+                        ScalarEvaluator::collect_fields(&predicate, &mut required_fields);
+                        
+                        let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
+                        for (tbl, fid) in required_fields {
+                            if let Some(idx) = col_mapping_captured.get(&(tbl, fid)) {
+                                field_arrays.insert((tbl, fid), batch.column(*idx).clone());
+                            }
+                        }
+                        
+                        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+                        let result = ScalarEvaluator::evaluate_batch_simplified(&predicate, batch.num_rows(), &numeric_arrays)?;
+                        
+                        let bool_array = result.as_any().downcast_ref::<arrow::array::BooleanArray>()
+                            .ok_or_else(|| Error::Internal("Filter predicate must evaluate to boolean".into()))?;
+                            
+                        arrow::compute::filter_record_batch(&batch, bool_array).map_err(|e| Error::Internal(e.to_string()))
+                    }));
+                }
+                
                 // 4. Final Projection
                 let mut plan_columns = Vec::new();
                 let mut name_to_index = FxHashMap::default();
@@ -301,17 +525,19 @@ where
                             ArrowField::new(name, field.data_type().clone(), field.is_nullable())
                                 .with_metadata(metadata)
                         }
-                        llkv_plan::logical_planner::ResolvedProjection::Computed { alias, .. } => {
-                            // Placeholder type, will be inferred or we assume Int64 for now
+                        llkv_plan::logical_planner::ResolvedProjection::Computed { alias, expr } => {
                             let name = alias.clone();
                             let dummy_fid = 999999 + i as u32;
+                            
+                            let remapped = remap_scalar_expr(expr);
+                            let inferred_type = infer_type(&remapped, &current_schema, &col_mapping).unwrap_or(arrow::datatypes::DataType::Int64);
                             
                             let mut metadata = HashMap::new();
                             metadata.insert("field_id".to_string(), dummy_fid.to_string());
 
                             plan_columns.push(PlanColumn {
                                 name: name.clone(),
-                                data_type: arrow::datatypes::DataType::Int64, // Placeholder
+                                data_type: inferred_type.clone(),
                                 field_id: dummy_fid,
                                 is_nullable: true,
                                 is_primary_key: false,
@@ -321,7 +547,7 @@ where
                             });
                             name_to_index.insert(name.to_ascii_lowercase(), i);
 
-                            ArrowField::new(name, arrow::datatypes::DataType::Int64, true)
+                            ArrowField::new(name, inferred_type, true)
                                 .with_metadata(metadata)
                         }
                     }
@@ -329,57 +555,156 @@ where
                 let output_schema = Arc::new(Schema::new(output_fields));
                 let logical_schema = PlanSchema { columns: plan_columns, name_to_index };
                 
-                let output_schema_captured = output_schema.clone();
-                let final_stream = current_stream.map(move |batch_res| {
-                    let batch = batch_res?;
-                    let mut columns = Vec::new();
-                    
-                    for proj in &multi.projections {
-                        match proj {
-                            llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, .. } => {
-                                let idx = col_mapping.get(&(*table_index, logical_field_id.field_id()))
-                                    .ok_or_else(|| Error::Internal("projection column missing".into()))?;
-                                columns.push(batch.column(*idx).clone());
-                            }
-                            llkv_plan::logical_planner::ResolvedProjection::Computed { expr, .. } => {
-                                let remapped = remap_scalar_expr(expr);
-                                
-                                let mut required_fields = FxHashSet::default();
-                                ScalarEvaluator::collect_fields(&remapped, &mut required_fields);
-                                
-                                let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
-                                for (tbl, fid) in required_fields {
-                                    if let Some(idx) = col_mapping.get(&(tbl, fid)) {
-                                        field_arrays.insert((tbl, fid), batch.column(*idx).clone());
-                                    } else {
-                                        return Err(Error::Internal(format!("Missing field {:?} in batch for computed column", (tbl, fid))));
-                                    }
-                                }
-                                
-                                let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
-                                let result = ScalarEvaluator::evaluate_batch_simplified(&remapped, batch.num_rows(), &numeric_arrays)?;
-                                columns.push(result);
-                            }
+                // Check for aggregates
+                let mut string_projections = Vec::new();
+                for proj in &multi.projections {
+                    let expr = match proj {
+                        llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, .. } => {
+                            ScalarExpr::Column((*table_index, logical_field_id.field_id()))
                         }
-                    }
-                    RecordBatch::try_new(output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
-                });
+                        llkv_plan::logical_planner::ResolvedProjection::Computed { expr, .. } => convert_resolved_expr(expr),
+                    };
+                    string_projections.push(map_expr_to_names(&expr, &col_mapping, &current_schema)?);
+                }
 
-                let mut iter: BatchIter = Box::new(final_stream);
+                let (new_aggregates, final_exprs, pre_agg_exprs) = extract_complex_aggregates(&string_projections);
+                let has_aggregates = !new_aggregates.is_empty();
 
-                if !plan.aggregates.is_empty() {
+                let mut iter: BatchIter = if has_aggregates {
                     if !plan.group_by.is_empty() {
                         return Err(Error::InvalidArgumentError(
                             "GROUP BY aggregates are not supported yet".into(),
                         ));
                     }
 
-                    let agg_iter = AggregateStream::new(iter, &plan, &logical_schema, &output_schema)?;
-                    let trimmed =
-                        apply_offset_limit_stream(Box::new(agg_iter), plan.offset, plan.limit);
-                    let table_name = multi.table_order.first().map(|t| t.qualified_name()).unwrap_or_default();
-                    return Ok(SelectExecution::from_stream(table_name, output_schema, trimmed));
-                }
+                    // 1. Pre-aggregation stream
+                    let pre_agg_schema_fields: Vec<ArrowField> = pre_agg_exprs.iter().enumerate().map(|(i, _)| {
+                        ArrowField::new(format!("_agg_arg_{}", i), arrow::datatypes::DataType::Int64, true)
+                            .with_metadata(HashMap::from([("field_id".to_string(), format!("{}", 10000+i))]))
+                    }).collect();
+                    let pre_agg_schema = Arc::new(Schema::new(pre_agg_schema_fields));
+                    
+                    let pre_agg_schema_captured = pre_agg_schema.clone();
+                    let current_schema_captured = current_schema.clone();
+                    
+                    let pre_agg_stream = current_stream.map(move |batch_res| {
+                        let batch = batch_res?;
+                        let mut columns = Vec::new();
+                        
+                        for expr_str in &pre_agg_exprs {
+                            let expr = resolve_scalar_expr_string(expr_str, &current_schema_captured)?;
+                            
+                            let mut required_fields = FxHashSet::default();
+                            ScalarEvaluator::collect_fields(&expr, &mut required_fields);
+                            
+                            let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
+                            for (tbl, fid) in required_fields {
+                                field_arrays.insert((tbl, fid), batch.column(fid as usize).clone());
+                            }
+                            
+                            let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+                            let result = ScalarEvaluator::evaluate_batch_simplified(&expr, batch.num_rows(), &numeric_arrays)?;
+                            columns.push(result);
+                        }
+                        
+                        if columns.is_empty() {
+                            let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                            RecordBatch::try_new_with_options(pre_agg_schema_captured.clone(), columns, &options).map_err(|e| Error::Internal(e.to_string()))
+                        } else {
+                            RecordBatch::try_new(pre_agg_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+                        }
+                    });
+
+                    // 2. Aggregate Stream
+                    let mut dummy_plan = plan.clone();
+                    dummy_plan.aggregates = new_aggregates;
+                    
+                    let mut dummy_cols = Vec::new();
+                    let mut dummy_name_to_idx = FxHashMap::default();
+                    for (i, field) in pre_agg_schema.fields().iter().enumerate() {
+                        let name = field.name().clone();
+                        let fid = field.metadata().get("field_id").unwrap().parse::<u32>().unwrap();
+                        dummy_cols.push(PlanColumn {
+                            name: name.clone(),
+                            data_type: field.data_type().clone(),
+                            field_id: fid,
+                            is_nullable: true,
+                            is_primary_key: false,
+                            is_unique: false,
+                            default_value: None,
+                            check_expr: None,
+                        });
+                        dummy_name_to_idx.insert(name, i);
+                    }
+                    let dummy_logical_schema = PlanSchema { columns: dummy_cols, name_to_index: dummy_name_to_idx };
+
+                    let agg_iter = AggregateStream::new(Box::new(pre_agg_stream), &dummy_plan, &dummy_logical_schema, &pre_agg_schema)?;
+                    let agg_schema = agg_iter.schema();
+
+                    // 3. Final Projection Stream
+                    let output_schema_captured = output_schema.clone();
+                    let final_stream = agg_iter.map(move |batch_res| {
+                        let batch = batch_res?;
+                        let mut columns = Vec::new();
+                        
+                        for expr_str in &final_exprs {
+                            let expr = resolve_scalar_expr_string(expr_str, &agg_schema)?;
+                            
+                            let mut required_fields = FxHashSet::default();
+                            ScalarEvaluator::collect_fields(&expr, &mut required_fields);
+                            
+                            let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
+                            for (tbl, fid) in required_fields {
+                                field_arrays.insert((tbl, fid), batch.column(fid as usize).clone());
+                            }
+                            
+                            let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+                            let result = ScalarEvaluator::evaluate_batch_simplified(&expr, batch.num_rows(), &numeric_arrays)?;
+                            columns.push(result);
+                        }
+                        RecordBatch::try_new(output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+                    });
+                    
+                    Box::new(final_stream)
+
+                } else {
+                    let output_schema_captured = output_schema.clone();
+                    let final_stream = current_stream.map(move |batch_res| {
+                        let batch = batch_res?;
+                        let mut columns = Vec::new();
+                        
+                        for proj in &multi.projections {
+                            match proj {
+                                llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, .. } => {
+                                    let idx = col_mapping.get(&(*table_index, logical_field_id.field_id()))
+                                        .ok_or_else(|| Error::Internal("projection column missing".into()))?;
+                                    columns.push(batch.column(*idx).clone());
+                                }
+                                llkv_plan::logical_planner::ResolvedProjection::Computed { expr, .. } => {
+                                    let remapped = remap_scalar_expr(expr);
+                                    
+                                    let mut required_fields = FxHashSet::default();
+                                    ScalarEvaluator::collect_fields(&remapped, &mut required_fields);
+                                    
+                                    let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
+                                    for (tbl, fid) in required_fields {
+                                        if let Some(idx) = col_mapping.get(&(tbl, fid)) {
+                                            field_arrays.insert((tbl, fid), batch.column(*idx).clone());
+                                        } else {
+                                            return Err(Error::Internal(format!("Missing field {:?} in batch for computed column", (tbl, fid))));
+                                        }
+                                    }
+                                    
+                                    let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+                                    let result = ScalarEvaluator::evaluate_batch_simplified(&remapped, batch.num_rows(), &numeric_arrays)?;
+                                    columns.push(result);
+                                }
+                            }
+                        }
+                        RecordBatch::try_new(output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+                    });
+                    Box::new(final_stream)
+                };
 
                 if plan.distinct {
                     iter = Box::new(DistinctStream::new(output_schema.clone(), iter)?);
@@ -818,6 +1143,34 @@ fn remap_scalar_expr(
     }
 }
 
+fn simplify_predicate(expr: &ScalarExpr<(usize, FieldId)>) -> ScalarExpr<(usize, FieldId)> {
+    match expr {
+        ScalarExpr::IsNull { expr: inner, negated } => {
+            let simplified_inner = simplify_predicate(inner);
+            if let ScalarExpr::Literal(Literal::Null) = simplified_inner {
+                ScalarExpr::Literal(Literal::Boolean(!*negated))
+            } else {
+                ScalarExpr::IsNull {
+                    expr: Box::new(simplified_inner),
+                    negated: *negated,
+                }
+            }
+        }
+        ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+            left: Box::new(simplify_predicate(left)),
+            op: *op,
+            right: Box::new(simplify_predicate(right)),
+        },
+        ScalarExpr::Not(e) => ScalarExpr::Not(Box::new(simplify_predicate(e))),
+        ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+            left: Box::new(simplify_predicate(left)),
+            op: *op,
+            right: Box::new(simplify_predicate(right)),
+        },
+        _ => expr.clone(),
+    }
+}
+
 fn remap_filter_expr(
     expr: &LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
 ) -> ExecutorResult<ScalarExpr<(usize, FieldId)>> {
@@ -1098,5 +1451,423 @@ where
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+struct AggVisitor {
+    aggregates: Vec<AggregateExpr>,
+    pre_agg_projections: Vec<ScalarExpr<String>>,
+}
+
+impl AggVisitor {
+    fn new() -> Self {
+        Self {
+            aggregates: Vec::new(),
+            pre_agg_projections: Vec::new(),
+        }
+    }
+
+    fn visit(&mut self, expr: &ScalarExpr<String>) -> ScalarExpr<String> {
+        match expr {
+            ScalarExpr::Column(c) => ScalarExpr::Column(c.clone()),
+            ScalarExpr::Literal(l) => ScalarExpr::Literal(l.clone()),
+            ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+                left: Box::new(self.visit(left)),
+                op: *op,
+                right: Box::new(self.visit(right)),
+            },
+            ScalarExpr::Not(e) => ScalarExpr::Not(Box::new(self.visit(e))),
+            ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+                expr: Box::new(self.visit(expr)),
+                negated: *negated,
+            },
+            ScalarExpr::Aggregate(call) => {
+                let (arg_expr, distinct, func) = match call {
+                    AggregateCall::CountStar => {
+                         let alias = format!("_agg_res_{}", self.aggregates.len());
+                         self.aggregates.push(AggregateExpr::CountStar {
+                             alias: alias.clone(),
+                             distinct: false,
+                         });
+                         return ScalarExpr::Column(alias);
+                    }
+                    AggregateCall::Count { expr, distinct } => (expr, *distinct, AggregateFunction::Count),
+                    AggregateCall::Sum { expr, distinct } => (expr, *distinct, AggregateFunction::SumInt64),
+                    AggregateCall::Total { expr, distinct } => (expr, *distinct, AggregateFunction::TotalInt64),
+                    AggregateCall::Min(expr) => (expr, false, AggregateFunction::MinInt64),
+                    AggregateCall::Max(expr) => (expr, false, AggregateFunction::MaxInt64),
+                    AggregateCall::CountNulls(expr) => (expr, false, AggregateFunction::CountNulls),
+                    AggregateCall::GroupConcat { expr, distinct, separator: _ } => (expr, *distinct, AggregateFunction::GroupConcat),
+                    AggregateCall::Avg { expr, distinct } => {
+                        let arg_idx = self.pre_agg_projections.len();
+                        self.pre_agg_projections.push(*expr.clone());
+                        let arg_col_name = format!("_agg_arg_{}", arg_idx);
+                        
+                        let sum_alias = format!("_agg_res_{}", self.aggregates.len());
+                        self.aggregates.push(AggregateExpr::Column {
+                            column: arg_col_name.clone(),
+                            alias: sum_alias.clone(),
+                            function: AggregateFunction::SumInt64,
+                            distinct: *distinct,
+                        });
+                        
+                        let count_alias = format!("_agg_res_{}", self.aggregates.len());
+                        self.aggregates.push(AggregateExpr::Column {
+                            column: arg_col_name,
+                            alias: count_alias.clone(),
+                            function: AggregateFunction::Count,
+                            distinct: *distinct,
+                        });
+                        
+                        return ScalarExpr::Binary {
+                            left: Box::new(ScalarExpr::Column(sum_alias)),
+                            op: llkv_expr::expr::BinaryOp::Divide,
+                            right: Box::new(ScalarExpr::Column(count_alias)),
+                        };
+                    }
+                };
+
+                let arg_idx = self.pre_agg_projections.len();
+                self.pre_agg_projections.push(*arg_expr.clone());
+                let arg_col_name = format!("_agg_arg_{}", arg_idx);
+                
+                let alias = format!("_agg_res_{}", self.aggregates.len());
+                self.aggregates.push(AggregateExpr::Column {
+                    column: arg_col_name,
+                    alias: alias.clone(),
+                    function: func,
+                    distinct,
+                });
+                
+                ScalarExpr::Column(alias)
+            }
+            ScalarExpr::GetField { base, field_name } => ScalarExpr::GetField {
+                base: Box::new(self.visit(base)),
+                field_name: field_name.clone(),
+            },
+            ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+                expr: Box::new(self.visit(expr)),
+                data_type: data_type.clone(),
+            },
+            ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+                left: Box::new(self.visit(left)),
+                op: *op,
+                right: Box::new(self.visit(right)),
+            },
+            ScalarExpr::Coalesce(exprs) => ScalarExpr::Coalesce(
+                exprs.iter().map(|e| self.visit(e)).collect()
+            ),
+            ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s.clone()),
+            ScalarExpr::Case { operand, branches, else_expr } => ScalarExpr::Case {
+                operand: operand.as_ref().map(|e| Box::new(self.visit(e))),
+                branches: branches.iter().map(|(w, t)| (self.visit(w), self.visit(t))).collect(),
+                else_expr: else_expr.as_ref().map(|e| Box::new(self.visit(e))),
+            },
+            ScalarExpr::Random => ScalarExpr::Random,
+        }
+    }
+}
+
+fn extract_complex_aggregates(
+    projections: &[ScalarExpr<String>],
+) -> (Vec<AggregateExpr>, Vec<ScalarExpr<String>>, Vec<ScalarExpr<String>>) {
+    let mut visitor = AggVisitor::new();
+    let rewritten = projections.iter().map(|p| visitor.visit(p)).collect();
+    (visitor.aggregates, rewritten, visitor.pre_agg_projections)
+}
+
+fn resolve_scalar_expr_string(
+    expr: &ScalarExpr<String>,
+    schema: &Schema,
+) -> Result<ScalarExpr<(usize, FieldId)>, Error> {
+    match expr {
+        ScalarExpr::Column(name) => {
+            let (idx, field) = schema.column_with_name(name).ok_or_else(|| {
+                Error::InvalidArgumentError(format!("Column not found: {}", name))
+            })?;
+            // FieldId is usually not available in Arrow Schema directly as metadata unless we put it there.
+            // But ScalarEvaluator uses (table_idx, field_idx) where field_idx is the index in the array list.
+            // So we can just use  as FieldId.
+            Ok(ScalarExpr::Column((0, idx as u32)))
+        }
+        ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
+        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+            left: Box::new(resolve_scalar_expr_string(left, schema)?),
+            op: *op,
+            right: Box::new(resolve_scalar_expr_string(right, schema)?),
+        }),
+        ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(resolve_scalar_expr_string(e, schema)?))),
+        ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(resolve_scalar_expr_string(expr, schema)?),
+            negated: *negated,
+        }),
+        ScalarExpr::Aggregate(_) => Err(Error::Internal("Nested aggregates not supported in resolution".into())),
+        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+            base: Box::new(resolve_scalar_expr_string(base, schema)?),
+            field_name: field_name.clone(),
+        }),
+        ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+            expr: Box::new(resolve_scalar_expr_string(expr, schema)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+            left: Box::new(resolve_scalar_expr_string(left, schema)?),
+            op: *op,
+            right: Box::new(resolve_scalar_expr_string(right, schema)?),
+        }),
+        ScalarExpr::Coalesce(exprs) => {
+            let mut resolved = Vec::new();
+            for e in exprs {
+                resolved.push(resolve_scalar_expr_string(e, schema)?);
+            }
+            Ok(ScalarExpr::Coalesce(resolved))
+        }
+        ScalarExpr::ScalarSubquery(s) => Ok(ScalarExpr::ScalarSubquery(s.clone())),
+        ScalarExpr::Case { operand, branches, else_expr } => {
+            let op = if let Some(o) = operand {
+                Some(Box::new(resolve_scalar_expr_string(o, schema)?))
+            } else {
+                None
+            };
+            let mut br = Vec::new();
+            for (w, t) in branches {
+                br.push((resolve_scalar_expr_string(w, schema)?, resolve_scalar_expr_string(t, schema)?));
+            }
+            let el = if let Some(e) = else_expr {
+                Some(Box::new(resolve_scalar_expr_string(e, schema)?))
+            } else {
+                None
+            };
+            Ok(ScalarExpr::Case { operand: op, branches: br, else_expr: el })
+        }
+        ScalarExpr::Random => Ok(ScalarExpr::Random),
+    }
+}
+
+
+use arrow::datatypes::DataType;
+
+fn infer_type(
+    expr: &ScalarExpr<(usize, FieldId)>, 
+    schema: &Schema,
+    col_mapping: &FxHashMap<(usize, FieldId), usize>
+) -> Result<DataType, Error> {
+    let res = match expr {
+        ScalarExpr::Column(id) => {
+            let idx = col_mapping.get(id).ok_or_else(|| Error::Internal("Column not found in mapping".into()))?;
+            Ok(schema.field(*idx).data_type().clone())
+        },
+        ScalarExpr::Literal(l) => {
+             match l {
+                 Literal::Int128(_) => Ok(DataType::Int64),
+                 Literal::Float64(_) => Ok(DataType::Float64),
+                 Literal::Boolean(_) => Ok(DataType::Boolean),
+                 Literal::String(_) => Ok(DataType::Utf8),
+                 Literal::Null => Ok(DataType::Null),
+                 Literal::Decimal128(d) => Ok(DataType::Decimal128(d.precision(), d.scale())),
+                 _ => Ok(DataType::Int64),
+             }
+        },
+        ScalarExpr::Binary { left, op, right } => {
+            let l = infer_type(left, schema, col_mapping)?;
+            let r = infer_type(right, schema, col_mapping)?;
+            if matches!(l, DataType::Float64 | DataType::Float32) || matches!(r, DataType::Float64 | DataType::Float32) {
+                Ok(DataType::Float64)
+            } else if matches!(l, DataType::Decimal128(..)) || matches!(r, DataType::Decimal128(..)) {
+                 // Simplified decimal inference
+                 Ok(DataType::Decimal128(38, 10)) 
+            } else {
+                Ok(DataType::Int64)
+            }
+        },
+        ScalarExpr::Cast { data_type, .. } => Ok(data_type.clone()),
+        ScalarExpr::Case { else_expr, branches, .. } => {
+             if let Some((_, t)) = branches.first() {
+                 infer_type(t, schema, col_mapping)
+             } else if let Some(e) = else_expr {
+                 infer_type(e, schema, col_mapping)
+             } else {
+                 Ok(DataType::Null)
+             }
+        },
+        ScalarExpr::Coalesce(items) => {
+            if let Some(first) = items.first() {
+                infer_type(first, schema, col_mapping)
+            } else {
+                Ok(DataType::Null)
+            }
+        },
+        ScalarExpr::Not(_) | ScalarExpr::IsNull { .. } | ScalarExpr::Compare { .. } => Ok(DataType::Boolean),
+        _ => Ok(DataType::Int64),
+    };
+    res
+}
+
+fn map_expr_to_names(
+    expr: &ScalarExpr<(usize, FieldId)>,
+    col_mapping: &FxHashMap<(usize, FieldId), usize>,
+    schema: &Schema,
+) -> Result<ScalarExpr<String>, Error> {
+    match expr {
+        ScalarExpr::Column(id) => {
+            let idx = col_mapping.get(id).ok_or_else(|| {
+                Error::Internal(format!("Column {:?} not found in mapping", id))
+            })?;
+            let field = schema.field(*idx);
+            Ok(ScalarExpr::Column(field.name().clone()))
+        }
+        ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
+        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+            left: Box::new(map_expr_to_names(left, col_mapping, schema)?),
+            op: *op,
+            right: Box::new(map_expr_to_names(right, col_mapping, schema)?),
+        }),
+        ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(map_expr_to_names(e, col_mapping, schema)?))),
+        ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(map_expr_to_names(expr, col_mapping, schema)?),
+            negated: *negated,
+        }),
+        ScalarExpr::Aggregate(call) => {
+             // Recurse into aggregate arguments
+             let new_call = match call {
+                 AggregateCall::CountStar => AggregateCall::CountStar,
+                 AggregateCall::Count { expr, distinct } => AggregateCall::Count {
+                     expr: Box::new(map_expr_to_names(expr, col_mapping, schema)?),
+                     distinct: *distinct,
+                 },
+                 AggregateCall::Sum { expr, distinct } => AggregateCall::Sum {
+                     expr: Box::new(map_expr_to_names(expr, col_mapping, schema)?),
+                     distinct: *distinct,
+                 },
+                 AggregateCall::Total { expr, distinct } => AggregateCall::Total {
+                     expr: Box::new(map_expr_to_names(expr, col_mapping, schema)?),
+                     distinct: *distinct,
+                 },
+                 AggregateCall::Min(expr) => AggregateCall::Min(Box::new(map_expr_to_names(expr, col_mapping, schema)?)),
+                 AggregateCall::Max(expr) => AggregateCall::Max(Box::new(map_expr_to_names(expr, col_mapping, schema)?)),
+                 AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(map_expr_to_names(expr, col_mapping, schema)?)),
+                 AggregateCall::GroupConcat { expr, distinct, separator } => AggregateCall::GroupConcat {
+                     expr: Box::new(map_expr_to_names(expr, col_mapping, schema)?),
+                     distinct: *distinct,
+                     separator: separator.clone(),
+                 },
+                 AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
+                     expr: Box::new(map_expr_to_names(expr, col_mapping, schema)?),
+                     distinct: *distinct,
+                 },
+             };
+             Ok(ScalarExpr::Aggregate(new_call))
+        },
+        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+            base: Box::new(map_expr_to_names(base, col_mapping, schema)?),
+            field_name: field_name.clone(),
+        }),
+        ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+            expr: Box::new(map_expr_to_names(expr, col_mapping, schema)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+            left: Box::new(map_expr_to_names(left, col_mapping, schema)?),
+            op: *op,
+            right: Box::new(map_expr_to_names(right, col_mapping, schema)?),
+        }),
+        ScalarExpr::Coalesce(exprs) => {
+            let mut mapped = Vec::new();
+            for e in exprs {
+                mapped.push(map_expr_to_names(e, col_mapping, schema)?);
+            }
+            Ok(ScalarExpr::Coalesce(mapped))
+        },
+        ScalarExpr::ScalarSubquery(s) => Ok(ScalarExpr::ScalarSubquery(s.clone())),
+        ScalarExpr::Case { operand, branches, else_expr } => {
+            let op = if let Some(o) = operand {
+                Some(Box::new(map_expr_to_names(o, col_mapping, schema)?))
+            } else {
+                None
+            };
+            let mut br = Vec::new();
+            for (w, t) in branches {
+                br.push((map_expr_to_names(w, col_mapping, schema)?, map_expr_to_names(t, col_mapping, schema)?));
+            }
+            let el = if let Some(e) = else_expr {
+                Some(Box::new(map_expr_to_names(e, col_mapping, schema)?))
+            } else {
+                None
+            };
+            Ok(ScalarExpr::Case { operand: op, branches: br, else_expr: el })
+        },
+        ScalarExpr::Random => Ok(ScalarExpr::Random),
+    }
+}
+
+use llkv_plan::logical_planner::ResolvedFieldRef;
+
+fn convert_resolved_expr(expr: &ScalarExpr<ResolvedFieldRef>) -> ScalarExpr<(usize, FieldId)> {
+    match expr {
+        ScalarExpr::Column(r) => ScalarExpr::Column((r.table_index, r.logical_field_id.field_id())),
+        ScalarExpr::Literal(l) => ScalarExpr::Literal(l.clone()),
+        ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+            left: Box::new(convert_resolved_expr(left)),
+            op: *op,
+            right: Box::new(convert_resolved_expr(right)),
+        },
+        ScalarExpr::Not(e) => ScalarExpr::Not(Box::new(convert_resolved_expr(e))),
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(convert_resolved_expr(expr)),
+            negated: *negated,
+        },
+        ScalarExpr::Aggregate(call) => {
+             let new_call = match call {
+                 AggregateCall::CountStar => AggregateCall::CountStar,
+                 AggregateCall::Count { expr, distinct } => AggregateCall::Count {
+                     expr: Box::new(convert_resolved_expr(expr)),
+                     distinct: *distinct,
+                 },
+                 AggregateCall::Sum { expr, distinct } => AggregateCall::Sum {
+                     expr: Box::new(convert_resolved_expr(expr)),
+                     distinct: *distinct,
+                 },
+                 AggregateCall::Total { expr, distinct } => AggregateCall::Total {
+                     expr: Box::new(convert_resolved_expr(expr)),
+                     distinct: *distinct,
+                 },
+                 AggregateCall::Min(expr) => AggregateCall::Min(Box::new(convert_resolved_expr(expr))),
+                 AggregateCall::Max(expr) => AggregateCall::Max(Box::new(convert_resolved_expr(expr))),
+                 AggregateCall::CountNulls(expr) => AggregateCall::CountNulls(Box::new(convert_resolved_expr(expr))),
+                 AggregateCall::GroupConcat { expr, distinct, separator } => AggregateCall::GroupConcat {
+                     expr: Box::new(convert_resolved_expr(expr)),
+                     distinct: *distinct,
+                     separator: separator.clone(),
+                 },
+                 AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
+                     expr: Box::new(convert_resolved_expr(expr)),
+                     distinct: *distinct,
+                 },
+             };
+             ScalarExpr::Aggregate(new_call)
+        },
+        ScalarExpr::GetField { base, field_name } => ScalarExpr::GetField {
+            base: Box::new(convert_resolved_expr(base)),
+            field_name: field_name.clone(),
+        },
+        ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+            expr: Box::new(convert_resolved_expr(expr)),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+            left: Box::new(convert_resolved_expr(left)),
+            op: *op,
+            right: Box::new(convert_resolved_expr(right)),
+        },
+        ScalarExpr::Coalesce(exprs) => ScalarExpr::Coalesce(
+            exprs.iter().map(|e| convert_resolved_expr(e)).collect()
+        ),
+        ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s.clone()),
+        ScalarExpr::Case { operand, branches, else_expr } => ScalarExpr::Case {
+            operand: operand.as_ref().map(|e| Box::new(convert_resolved_expr(e))),
+            branches: branches.iter().map(|(w, t)| (convert_resolved_expr(w), convert_resolved_expr(t))).collect(),
+            else_expr: else_expr.as_ref().map(|e| Box::new(convert_resolved_expr(e))),
+        },
+        ScalarExpr::Random => ScalarExpr::Random,
     }
 }

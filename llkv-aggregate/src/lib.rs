@@ -1509,6 +1509,58 @@ impl AggregateAccumulator {
         Ok(())
     }
 
+    /// Returns the output field definition for this accumulator.
+    pub fn output_field(&self) -> Field {
+        match self {
+            AggregateAccumulator::CountStar { .. } => Field::new("count", DataType::Int64, false),
+            AggregateAccumulator::CountColumn { .. } => Field::new("count", DataType::Int64, false),
+            AggregateAccumulator::CountDistinctColumn { .. } => Field::new("count_distinct", DataType::Int64, false),
+            AggregateAccumulator::SumInt64 { .. } => Field::new("sum", DataType::Int64, true),
+            AggregateAccumulator::SumDistinctInt64 { .. } => Field::new("sum_distinct", DataType::Int64, true),
+            AggregateAccumulator::SumFloat64 { .. } => Field::new("sum", DataType::Float64, true),
+            AggregateAccumulator::SumDistinctFloat64 { .. } => Field::new("sum_distinct", DataType::Float64, true),
+            AggregateAccumulator::SumDecimal128 { precision, scale, .. } => {
+                Field::new("sum", DataType::Decimal128(*precision, *scale), true)
+            }
+            AggregateAccumulator::SumDistinctDecimal128 { precision, scale, .. } => {
+                Field::new("sum_distinct", DataType::Decimal128(*precision, *scale), true)
+            }
+            AggregateAccumulator::TotalInt64 { .. } => Field::new("total", DataType::Float64, false),
+            AggregateAccumulator::TotalDistinctInt64 { .. } => Field::new("total_distinct", DataType::Float64, false),
+            AggregateAccumulator::TotalFloat64 { .. } => Field::new("total", DataType::Float64, false),
+            AggregateAccumulator::TotalDistinctFloat64 { .. } => Field::new("total_distinct", DataType::Float64, false),
+            AggregateAccumulator::TotalDecimal128 { precision, scale, .. } => {
+                Field::new("total", DataType::Decimal128(*precision, *scale), false)
+            }
+            AggregateAccumulator::TotalDistinctDecimal128 { precision, scale, .. } => {
+                Field::new("total_distinct", DataType::Decimal128(*precision, *scale), false)
+            }
+            AggregateAccumulator::AvgInt64 { .. } => Field::new("avg", DataType::Float64, true),
+            AggregateAccumulator::AvgDistinctInt64 { .. } => Field::new("avg_distinct", DataType::Float64, true),
+            AggregateAccumulator::AvgFloat64 { .. } => Field::new("avg", DataType::Float64, true),
+            AggregateAccumulator::AvgDistinctFloat64 { .. } => Field::new("avg_distinct", DataType::Float64, true),
+            AggregateAccumulator::AvgDecimal128 { precision, scale, .. } => {
+                Field::new("avg", DataType::Decimal128(*precision, *scale), true)
+            }
+            AggregateAccumulator::AvgDistinctDecimal128 { precision, scale, .. } => {
+                Field::new("avg_distinct", DataType::Decimal128(*precision, *scale), true)
+            }
+            AggregateAccumulator::MinInt64 { .. } => Field::new("min", DataType::Int64, true),
+            AggregateAccumulator::MinFloat64 { .. } => Field::new("min", DataType::Float64, true),
+            AggregateAccumulator::MinDecimal128 { precision, scale, .. } => {
+                Field::new("min", DataType::Decimal128(*precision, *scale), true)
+            }
+            AggregateAccumulator::MaxInt64 { .. } => Field::new("max", DataType::Int64, true),
+            AggregateAccumulator::MaxFloat64 { .. } => Field::new("max", DataType::Float64, true),
+            AggregateAccumulator::MaxDecimal128 { precision, scale, .. } => {
+                Field::new("max", DataType::Decimal128(*precision, *scale), true)
+            }
+            AggregateAccumulator::CountNulls { .. } => Field::new("count_nulls", DataType::Int64, false),
+            AggregateAccumulator::GroupConcat { .. } => Field::new("group_concat", DataType::Utf8, true),
+            AggregateAccumulator::GroupConcatDistinct { .. } => Field::new("group_concat_distinct", DataType::Utf8, true),
+        }
+    }
+
     /// Finalizes the accumulator and produces the resulting field and array.
     ///
     /// # Returns
@@ -2003,6 +2055,11 @@ impl AggregateState {
     /// Returns an error if the underlying accumulator update fails.
     pub fn update(&mut self, batch: &RecordBatch) -> AggregateResult<()> {
         self.accumulator.update(batch)
+    }
+
+    /// Returns the output field definition for this state.
+    pub fn output_field(&self) -> Field {
+        self.accumulator.output_field().with_name(&self.alias)
     }
 
     /// Finalizes the state and produces the resulting field and array.

@@ -13,6 +13,7 @@ pub struct AggregateStream<I> {
     states: Vec<AggregateState>,
     input: I,
     done: bool,
+    schema: SchemaRef,
 }
 
 impl<I> AggregateStream<I>
@@ -26,11 +27,20 @@ where
         physical_schema: &SchemaRef,
     ) -> Result<Self, Error> {
         let states = build_aggregate_states(plan, logical_schema, physical_schema)?;
+        
+        let fields: Vec<arrow::datatypes::Field> = states.iter().map(|s| s.output_field()).collect();
+        let schema = Arc::new(Schema::new(fields));
+
         Ok(Self {
             states,
             input,
             done: false,
+            schema,
         })
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -73,7 +83,9 @@ where
 
         let schema = Arc::new(Schema::new(fields));
         match RecordBatch::try_new(schema, arrays) {
-            Ok(batch) => Some(Ok(batch)),
+            Ok(batch) => {
+                Some(Ok(batch))
+            },
             Err(e) => Some(Err(Error::Arrow(e))),
         }
     }

@@ -6606,8 +6606,18 @@ impl SqlEngine {
                 _ => return Ok(None),
             };
 
+            // Unwrap unary plus
+            let mut current_expr = expr;
+            while let SqlExpr::UnaryOp { op, expr } = current_expr {
+                if *op == sqlparser::ast::UnaryOperator::Plus {
+                    current_expr = expr.as_ref();
+                } else {
+                    break;
+                }
+            }
+
             let alias = alias_opt.unwrap_or_else(|| format!("col{}", idx + 1));
-            let SqlExpr::Function(func) = expr else {
+            let SqlExpr::Function(func) = current_expr else {
                 return Ok(None);
             };
 
@@ -6730,10 +6740,6 @@ impl SqlEngine {
                         }
                     };
 
-                    if is_distinct {
-                        return Ok(None);
-                    }
-
                     if func_name == "sum" {
                         if let Some(column) = parse_count_nulls_case(arg_expr)? {
                             AggregateExpr::count_nulls(column, alias)
@@ -6742,7 +6748,12 @@ impl SqlEngine {
                                 return Ok(None);
                             }
                             let column = resolve_column_name(arg_expr)?;
-                            AggregateExpr::sum_int64(column, alias)
+                            AggregateExpr::Column {
+                                column,
+                                alias,
+                                function: llkv_plan::AggregateFunction::SumInt64,
+                                distinct: is_distinct,
+                            }
                         }
                     } else {
                         if !is_simple_aggregate_column(arg_expr) {

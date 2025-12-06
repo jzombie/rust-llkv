@@ -178,6 +178,11 @@ where
         Self { provider }
     }
 
+    pub fn get_table_schema(&self, table_name: &str) -> Result<Arc<PlanSchema>> {
+        let table = self.provider.get_table(table_name)?;
+        Ok(table.schema())
+    }
+
     pub fn create_logical_plan(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
         if plan.tables.len() != 1 {
             return self.plan_multi_table(plan);
