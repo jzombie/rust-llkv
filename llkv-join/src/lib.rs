@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod hash_join;
+pub mod vectorized;
 
 use arrow::array::ArrayRef;
 use llkv_column_map::gather::{

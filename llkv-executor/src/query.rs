@@ -2,34 +2,39 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, mpsc};
 
-use arrow::compute::cast;
+use arrow::compute::concat_batches;
+use arrow::array::ArrayRef;
 use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
-use llkv_compute::eval::{ScalarEvaluator, ScalarExprTypeExt};
+use llkv_column_map::store::Projection;
+
+use llkv_compute::eval::ScalarEvaluator;
 use llkv_expr::AggregateCall;
 use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr};
-use llkv_join::{JoinKey, JoinOptions, JoinType, TableJoinRowIdExt};
+use llkv_expr::literal::Literal;
+use llkv_expr::{Expr, Filter, Operator};
+use llkv_join::{JoinKey, JoinType};
 use llkv_plan::logical_planner::{LogicalPlan, LogicalPlanner, ResolvedJoin};
 use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_plan::planner::PhysicalPlanner;
 use llkv_plan::plans::JoinPlan;
 use llkv_plan::plans::SelectPlan;
-use llkv_plan::schema::PlanSchema;
 use llkv_result::Error;
-use llkv_scan::RowIdFilter;
+use llkv_scan::{RowIdFilter, ScanProjection};
 use llkv_storage::pager::Pager;
 use llkv_types::FieldId;
+use llkv_types::LogicalFieldId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::ExecutorResult;
 use crate::types::{ExecutorTable, ExecutorTableProvider};
+use llkv_join::vectorized::VectorizedHashJoinStream;
 
-type BatchIter = Box<dyn Iterator<Item = ExecutorResult<RecordBatch>> + Send>;
-
+pub type BatchIter = Box<dyn Iterator<Item = ExecutorResult<RecordBatch>> + Send>;
 /// Plan-driven SELECT executor bridging planner output to storage.
 pub struct QueryExecutor<P>
 where
@@ -39,119 +44,11 @@ where
     physical_planner: PhysicalPlanner<P>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn materialize_join_index_batch_streaming(
-    batch: &llkv_join::JoinIndexBatch<'_>,
-    gather_plan_per_table: &[Vec<usize>],
-    projection_out_map: &[Vec<(usize, usize)>],
-    output_schema: &SchemaRef,
-    computed_projections: &[ComputedProjectionPlan],
-    field_id_by_table_index: &[Vec<FieldId>],
-) -> ExecutorResult<RecordBatch> {
-    let table_count = gather_plan_per_table.len();
-    let mut table_arrays: Vec<Vec<arrow::array::ArrayRef>> = vec![Vec::new(); table_count];
 
-    if table_count >= 1 && !gather_plan_per_table[0].is_empty() {
-        let left_rows: Vec<Option<(usize, usize)>> = batch
-            .left_rows
-            .iter()
-            .copied()
-            .map(|row| Some((0, row)))
-            .collect();
-        let arrays = gather_optional_projected_indices_from_batches(
-            std::slice::from_ref(batch.left_batch),
-            &left_rows,
-            &gather_plan_per_table[0],
-        )
-        .map_err(|e| Error::Internal(e.to_string()))?;
-        table_arrays[0] = arrays;
-    }
 
-    if table_count >= 2 && !gather_plan_per_table[1].is_empty() {
-        let right_rows: Vec<Option<(usize, usize)>> = batch
-            .right_rows
-            .iter()
-            .map(|opt| opt.map(|rr| (rr.batch, rr.row)))
-            .collect();
-        let arrays = gather_optional_projected_indices_from_batches(
-            batch.right_batches,
-            &right_rows,
-            &gather_plan_per_table[1],
-        )
-        .map_err(|e| Error::Internal(e.to_string()))?;
-        table_arrays[1] = arrays;
-    }
 
-    let total_columns: usize = output_schema.fields().len();
-    let mut columns: Vec<Option<arrow::array::ArrayRef>> = vec![None; total_columns];
 
-    for (tbl_idx, out_map) in projection_out_map.iter().enumerate() {
-        for (out_idx, proj_idx) in out_map {
-            let arr = table_arrays
-                .get(tbl_idx)
-                .and_then(|arrays| arrays.get(*proj_idx))
-                .ok_or_else(|| Error::Internal("projection index missing".into()))?
-                .clone();
-            columns[*out_idx] = Some(arr);
-        }
-    }
 
-    if !computed_projections.is_empty() {
-        let mut field_arrays: FxHashMap<(usize, FieldId), arrow::array::ArrayRef> =
-            FxHashMap::default();
-
-        for (tbl_idx, gather_plan) in gather_plan_per_table.iter().enumerate() {
-            if gather_plan.is_empty() {
-                continue;
-            }
-
-            let arrays = table_arrays
-                .get(tbl_idx)
-                .ok_or_else(|| Error::Internal("projection arrays missing".into()))?;
-            let field_ids = field_id_by_table_index
-                .get(tbl_idx)
-                .ok_or_else(|| Error::Internal("field ids missing".into()))?;
-
-            for (arr_idx, col_idx) in gather_plan.iter().enumerate() {
-                let fid = *field_ids
-                    .get(*col_idx)
-                    .ok_or_else(|| Error::Internal("field id missing for column".into()))?;
-                let array = arrays
-                    .get(arr_idx)
-                    .ok_or_else(|| Error::Internal("array missing for gather index".into()))?
-                    .clone();
-                field_arrays.insert((tbl_idx, fid), array);
-            }
-        }
-
-        let row_count = batch.left_rows.len();
-        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, row_count);
-
-        for computed in computed_projections {
-            let evaluated = ScalarEvaluator::evaluate_batch_simplified(
-                &computed.expr,
-                row_count,
-                &numeric_arrays,
-            )
-            .map_err(|e| Error::Internal(e.to_string()))?;
-
-            let value = if evaluated.data_type() != &computed.data_type {
-                cast(&evaluated, &computed.data_type).map_err(|e| Error::Internal(e.to_string()))?
-            } else {
-                evaluated
-            };
-
-            columns[computed.out_index] = Some(value);
-        }
-    }
-
-    let columns: Vec<_> = columns
-        .into_iter()
-        .map(|c| c.ok_or_else(|| Error::Internal("projection column missing".into())))
-        .collect::<Result<_, _>>()?;
-
-    RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
-}
 
 impl<P> QueryExecutor<P>
 where
@@ -215,242 +112,219 @@ where
             }
             LogicalPlan::Multi(multi) => {
                 let table_count = multi.tables.len();
-                let mut table_index_by_fid: Vec<FxHashMap<FieldId, usize>> =
-                    Vec::with_capacity(table_count);
-                let mut exec_tables: Vec<Arc<ExecutorTable<P>>> = Vec::with_capacity(table_count);
-                let mut field_id_by_table_index: Vec<Vec<FieldId>> =
-                    Vec::with_capacity(table_count);
-
-                for table in &multi.tables {
-                    let adapter = table
-                        .table
-                        .as_any()
-                        .downcast_ref::<ExecutionTableAdapter<P>>()
-                        .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?;
-                    exec_tables.push(adapter.executor_table());
-                    field_id_by_table_index
-                        .push(table.schema.columns.iter().map(|c| c.field_id).collect());
-                    table_index_by_fid.push(index_fields_by_id(&table.schema));
-                }
-
-                let mut output_fields = Vec::with_capacity(multi.projections.len());
-                let mut computed_projections: Vec<ComputedProjectionPlan> = Vec::new();
-                let mut gather_plan_per_table: Vec<Vec<usize>> = vec![Vec::new(); table_count];
-                let mut projection_out_map: Vec<Vec<(usize, usize)>> =
-                    vec![Vec::new(); table_count];
-                let mut gather_index_cache: Vec<FxHashMap<usize, usize>> =
-                    vec![FxHashMap::default(); table_count];
-
+                
+                // 1. Analyze required columns
+                let mut required_fields: Vec<FxHashSet<FieldId>> = vec![FxHashSet::default(); table_count];
+                
                 for proj in &multi.projections {
                     match proj {
-                        llkv_plan::logical_planner::ResolvedProjection::Column {
-                            table_index,
-                            logical_field_id,
-                            alias,
-                        } => {
-                            if *table_index >= table_count {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "projection references missing table {}",
-                                    table_index
-                                )));
-                            }
-
-                            let schema = &multi.tables[*table_index].schema;
-                            let index_by_fid = &table_index_by_fid[*table_index];
-                            let field_id = logical_field_id.field_id();
-                            let Some(col_idx) = index_by_fid.get(&field_id).copied() else {
-                                return Err(Error::InvalidArgumentError(format!(
-                                    "field_id {field_id} not found in table {table_index}"
-                                )));
-                            };
-
-                            let col = schema.columns.get(col_idx).ok_or_else(|| {
-                                Error::Internal("projection index out of bounds".into())
-                            })?;
-
-                            let field = ArrowField::new(
-                                alias.clone().unwrap_or_else(|| col.name.clone()),
-                                col.data_type.clone(),
-                                col.is_nullable,
-                            );
-                            output_fields.push(field);
-                            let gather_idx = if let Some(existing) =
-                                gather_index_cache[*table_index].get(&col_idx)
-                            {
-                                *existing
-                            } else {
-                                let next = gather_plan_per_table[*table_index].len();
-                                gather_plan_per_table[*table_index].push(col_idx);
-                                gather_index_cache[*table_index].insert(col_idx, next);
-                                next
-                            };
-                            projection_out_map[*table_index]
-                                .push((output_fields.len() - 1, gather_idx));
+                        llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, .. } => {
+                            required_fields[*table_index].insert(logical_field_id.field_id());
                         }
-                        llkv_plan::logical_planner::ResolvedProjection::Computed {
-                            expr,
-                            alias,
-                        } => {
-                            let remapped_expr = remap_scalar_expr(expr);
-
-                            let mut resolver = |key: (usize, FieldId)| {
-                                table_index_by_fid.get(key.0).and_then(|idx_map| {
-                                    idx_map.get(&key.1).and_then(|col_idx| {
-                                        multi.tables[key.0]
-                                            .schema
-                                            .columns
-                                            .get(*col_idx)
-                                            .map(|c| c.data_type.clone())
-                                    })
-                                })
-                            };
-
-                            let data_type = remapped_expr
-                                .infer_result_type(&mut resolver)
-                                .ok_or_else(|| {
-                                    Error::InvalidArgumentError(
-                                        "unable to infer type for computed projection".into(),
-                                    )
-                                })?;
-
-                            output_fields.push(ArrowField::new(
-                                alias.clone(),
-                                data_type.clone(),
-                                true,
-                            ));
-                            let out_index = output_fields.len() - 1;
-
-                            let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
-                            ScalarEvaluator::collect_fields(&remapped_expr, &mut fields);
-                            for (tbl_idx, fid) in fields {
-                                let col_idx = table_index_by_fid
-                                    .get(tbl_idx)
-                                    .and_then(|map| map.get(&fid).copied())
-                                    .ok_or_else(|| {
-                                        Error::InvalidArgumentError(format!(
-                                            "field_id {fid} not found in table {tbl_idx}"
-                                        ))
-                                    })?;
-
-                                if let std::collections::hash_map::Entry::Vacant(entry) =
-                                    gather_index_cache[tbl_idx].entry(col_idx)
-                                {
-                                    let next = gather_plan_per_table[tbl_idx].len();
-                                    gather_plan_per_table[tbl_idx].push(col_idx);
-                                    entry.insert(next);
-                                }
-                            }
-
-                            computed_projections.push(ComputedProjectionPlan {
-                                expr: remapped_expr,
-                                data_type,
-                                out_index,
-                            });
+                        llkv_plan::logical_planner::ResolvedProjection::Computed { expr, .. } => {
+                             let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                             ScalarEvaluator::collect_fields(&remap_scalar_expr(expr), &mut fields);
+                             for (tbl, fid) in fields {
+                                 required_fields[tbl].insert(fid);
+                             }
                         }
                     }
                 }
-
-                if table_count != 2 {
-                    return Err(Error::InvalidArgumentError(
-                        "streaming multi-table joins currently support exactly two tables".into(),
-                    ));
-                }
-
-                let mut join_plan_by_left: Vec<Option<&ResolvedJoin>> = vec![None; table_count - 1];
+                
                 for join in &multi.joins {
-                    if join.left_table_index + 1 >= table_count {
-                        return Err(Error::InvalidArgumentError(
-                            "join references table outside the FROM clause".into(),
-                        ));
+                    let (keys, filters) = extract_join_keys_and_filters(join)?;
+                    for key in keys {
+                        required_fields[join.left_table_index].insert(key.left_field);
+                        required_fields[join.left_table_index + 1].insert(key.right_field);
                     }
-                    if join_plan_by_left[join.left_table_index].is_some() {
-                        return Err(Error::InvalidArgumentError(
-                            "only one join per adjacent table pair is supported".into(),
-                        ));
+                    for filter in filters {
+                         let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                         ScalarEvaluator::collect_fields(&remap_filter_expr(&filter)?, &mut fields);
+                         for (tbl, fid) in fields {
+                             required_fields[tbl].insert(fid);
+                         }
                     }
-                    join_plan_by_left[join.left_table_index] = Some(join);
+                }
+                
+                if let Some(filter) = &multi.filter {
+                     let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                     ScalarEvaluator::collect_fields(&remap_filter_expr(filter)?, &mut fields);
+                     for (tbl, fid) in fields {
+                         required_fields[tbl].insert(fid);
+                     }
                 }
 
-                let output_schema = Arc::new(Schema::new(output_fields));
+                // 2. Create Streams
+                let mut streams: Vec<BatchIter> = Vec::with_capacity(table_count);
+                let mut schemas: Vec<SchemaRef> = Vec::with_capacity(table_count);
+                let mut table_field_map: Vec<Vec<FieldId>> = Vec::with_capacity(table_count);
 
-                let join_meta = join_plan_by_left[0];
-                let join_type = match join_meta {
-                    Some(meta) => map_join_type(meta.join_type)?,
-                    None => JoinType::Inner,
-                };
-                let join_keys = match join_meta {
-                    Some(meta) => extract_join_keys(meta)?,
-                    None => Vec::new(),
-                };
-
-                let options = JoinOptions {
-                    join_type,
-                    ..Default::default()
-                };
-
-                let left_table = Arc::clone(&exec_tables[0].table);
-                let right_table = Arc::clone(&exec_tables[1].table);
-
-                let (tx, rx) = mpsc::sync_channel::<ExecutorResult<RecordBatch>>(2);
-
-                let gather_plan_per_table = gather_plan_per_table.clone();
-                let projection_out_map = projection_out_map.clone();
-                let output_schema_cloned = Arc::clone(&output_schema);
-                let computed_projections = computed_projections.clone();
-                let field_id_by_table_index = field_id_by_table_index.clone();
-                let row_filter_left = row_filter.clone();
-                let row_filter_right = row_filter.clone();
-
-                std::thread::spawn(move || {
-                    let send_err = |err: Error| {
-                        let _ = tx.send(Err(err));
-                    };
-
-                    let res = left_table.join_rowid_stream_with_filter(
-                        &right_table,
-                        &join_keys,
-                        &options,
-                        row_filter_left,
-                        row_filter_right,
-                        |index_batch| match materialize_join_index_batch_streaming(
-                            &index_batch,
-                            &gather_plan_per_table,
-                            &projection_out_map,
-                            &output_schema_cloned,
-                            &computed_projections,
-                            &field_id_by_table_index,
-                        ) {
-                            Ok(batch) => {
-                                if tx.send(Ok(batch)).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(Err(err));
-                            }
-                        },
-                    );
-
-                    if let Err(e) = res {
-                        send_err(e);
+                for (i, table) in multi.tables.iter().enumerate() {
+                    let adapter = table.table.as_any().downcast_ref::<ExecutionTableAdapter<P>>()
+                        .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?;
+                    
+                    let mut fields: Vec<FieldId> = required_fields[i].iter().copied().collect();
+                    if fields.is_empty() {
+                        if let Some(col) = table.schema.columns.first() {
+                            fields.push(col.field_id);
+                        }
                     }
+                    fields.sort_unstable();
+                    table_field_map.push(fields.clone());
+                    
+                    let projections: Vec<ScanProjection> = fields.iter().map(|&fid| {
+                        let col = table.schema.columns.iter().find(|c| c.field_id == fid).unwrap();
+                        let lfid = LogicalFieldId::for_user(adapter.executor_table().table_id(), fid);
+                        ScanProjection::Column(Projection::with_alias(lfid, col.name.clone()))
+                    }).collect();
+                    
+                    let arrow_fields: Vec<ArrowField> = fields.iter().map(|&fid| {
+                        let col = table.schema.columns.iter().find(|c| c.field_id == fid).unwrap();
+                        ArrowField::new(col.name.clone(), col.data_type.clone(), col.is_nullable)
+                    }).collect();
+                    schemas.push(Arc::new(Schema::new(arrow_fields)));
+
+                    let (tx, rx) = mpsc::sync_channel(16);
+                    let storage = adapter.executor_table().storage().clone();
+                    let row_filter = row_filter.clone();
+                    
+                    std::thread::spawn(move || {
+                        let res = storage.scan_stream(
+                            &projections,
+                            &Expr::Pred(Filter { field_id: 0, op: Operator::Range { lower: std::ops::Bound::Unbounded, upper: std::ops::Bound::Unbounded } }),
+                            llkv_scan::ScanStreamOptions { row_id_filter: row_filter.clone(), ..Default::default() },
+                            &mut |batch| {
+                                tx.send(Ok(batch)).ok();
+                            },
+                        );
+                        if let Err(e) = res {
+                            tx.send(Err(e)).ok();
+                        }
+                    });
+                    
+                    streams.push(Box::new(rx.into_iter()));
+                }
+
+                // 3. Build Pipeline
+                let mut current_stream = streams.remove(0);
+                let mut current_schema = schemas[0].clone();
+                let mut col_mapping: FxHashMap<(usize, FieldId), usize> = FxHashMap::default();
+                
+                for (idx, fid) in table_field_map[0].iter().enumerate() {
+                    col_mapping.insert((0, *fid), idx);
+                }
+
+                for i in 0..table_count - 1 {
+                    let right_stream = streams.remove(0);
+                    let right_schema = schemas[i+1].clone();
+                    
+                    let right_batches: Vec<RecordBatch> = right_stream.collect::<Result<Vec<_>, _>>()?;
+                    let right_batch = if right_batches.is_empty() {
+                        RecordBatch::new_empty(right_schema.clone())
+                    } else {
+                        concat_batches(&right_schema, &right_batches)?
+                    };
+                    
+                    let join_opt = multi.joins.iter().find(|j| j.left_table_index == i);
+                    
+                    let (join_type, left_indices, right_indices) = if let Some(join) = join_opt {
+                        let (keys, _) = extract_join_keys_and_filters(join)?;
+                        let mut left_indices = Vec::new();
+                        let mut right_indices = Vec::new();
+                        
+                        for key in keys {
+                            let left_idx = *col_mapping.get(&(join.left_table_index, key.left_field))
+                                .ok_or_else(|| Error::Internal("left join key missing".into()))?;
+                            left_indices.push(left_idx);
+                            
+                            let right_idx = table_field_map[i+1].iter().position(|&f| f == key.right_field)
+                                .ok_or_else(|| Error::Internal("right join key missing".into()))?;
+                            right_indices.push(right_idx);
+                        }
+                        (map_join_type(join.join_type)?, left_indices, right_indices)
+                    } else {
+                        (JoinType::Inner, vec![], vec![])
+                    };
+                        
+                    let mut new_fields = current_schema.fields().to_vec();
+                    new_fields.extend_from_slice(right_schema.fields());
+                    let new_schema = Arc::new(Schema::new(new_fields));
+
+                    current_stream = Box::new(VectorizedHashJoinStream::try_new(
+                        new_schema.clone(),
+                        current_stream,
+                        right_batch,
+                        join_type,
+                        left_indices,
+                        right_indices,
+                    )?);
+                    
+                    let old_len = current_schema.fields().len();
+                    current_schema = new_schema;
+                    
+                    for (idx, fid) in table_field_map[i+1].iter().enumerate() {
+                        col_mapping.insert((i+1, *fid), old_len + idx);
+                    }
+                }
+                
+                // 4. Final Projection
+                let output_fields: Vec<ArrowField> = multi.projections.iter().map(|proj| {
+                    match proj {
+                        llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, alias } => {
+                            let idx = col_mapping.get(&(*table_index, logical_field_id.field_id())).unwrap();
+                            let field = current_schema.field(*idx);
+                            ArrowField::new(alias.clone().unwrap_or_else(|| field.name().clone()), field.data_type().clone(), field.is_nullable())
+                        }
+                        llkv_plan::logical_planner::ResolvedProjection::Computed { alias, .. } => {
+                            // Placeholder type, will be inferred or we assume Int64 for now
+                            ArrowField::new(alias.clone(), arrow::datatypes::DataType::Int64, true)
+                        }
+                    }
+                }).collect();
+                let output_schema = Arc::new(Schema::new(output_fields));
+                
+                let output_schema_captured = output_schema.clone();
+                let final_stream = current_stream.map(move |batch_res| {
+                    let batch = batch_res?;
+                    let mut columns = Vec::new();
+                    
+                    for proj in &multi.projections {
+                        match proj {
+                            llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, .. } => {
+                                let idx = col_mapping.get(&(*table_index, logical_field_id.field_id()))
+                                    .ok_or_else(|| Error::Internal("projection column missing".into()))?;
+                                columns.push(batch.column(*idx).clone());
+                            }
+                            llkv_plan::logical_planner::ResolvedProjection::Computed { expr, .. } => {
+                                let remapped = remap_scalar_expr(expr);
+                                
+                                let mut required_fields = FxHashSet::default();
+                                ScalarEvaluator::collect_fields(&remapped, &mut required_fields);
+                                
+                                let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
+                                for (tbl, fid) in required_fields {
+                                    if let Some(idx) = col_mapping.get(&(tbl, fid)) {
+                                        field_arrays.insert((tbl, fid), batch.column(*idx).clone());
+                                    } else {
+                                        return Err(Error::Internal(format!("Missing field {:?} in batch for computed column", (tbl, fid))));
+                                    }
+                                }
+                                
+                                let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+                                let result = ScalarEvaluator::evaluate_batch_simplified(&remapped, batch.num_rows(), &numeric_arrays)?;
+                                columns.push(result);
+                            }
+                        }
+                    }
+                    RecordBatch::try_new(output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
                 });
 
-                let iter: BatchIter = Box::new(rx.into_iter());
-                let trimmed = apply_offset_limit_stream(iter, plan.offset, plan.limit);
-                let table_name = multi
-                    .table_order
-                    .first()
-                    .map(|t| t.qualified_name())
-                    .unwrap_or_default();
-                Ok(SelectExecution::from_stream(
-                    table_name,
-                    output_schema,
-                    trimmed,
-                ))
-            }
+                let trimmed = apply_offset_limit_stream(Box::new(final_stream), plan.offset, plan.limit);
+                let table_name = multi.table_order.first().map(|t| t.qualified_name()).unwrap_or_default();
+                Ok(SelectExecution::from_stream(table_name, output_schema, trimmed))
         }
     }
+}
 }
 
 struct AggregateStream {
@@ -829,12 +703,7 @@ where
     plan_schema: Arc<llkv_plan::schema::PlanSchema>,
 }
 
-#[derive(Clone)]
-struct ComputedProjectionPlan {
-    expr: ScalarExpr<(usize, FieldId)>,
-    data_type: arrow::datatypes::DataType,
-    out_index: usize,
-}
+
 
 impl<P> fmt::Debug for ExecutionTableAdapter<P>
 where
@@ -884,13 +753,7 @@ where
     }
 }
 
-fn index_fields_by_id(schema: &PlanSchema) -> FxHashMap<FieldId, usize> {
-    let mut map = FxHashMap::default();
-    for (idx, col) in schema.columns.iter().enumerate() {
-        map.insert(col.field_id, idx);
-    }
-    map
-}
+
 
 struct DistinctStream {
     schema: SchemaRef,
@@ -1050,6 +913,184 @@ fn remap_scalar_expr(
     }
 }
 
+fn remap_filter_expr(
+    expr: &LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
+) -> ExecutorResult<ScalarExpr<(usize, FieldId)>> {
+    fn combine_with_op(
+        mut exprs: impl Iterator<Item = ExecutorResult<ScalarExpr<(usize, FieldId)>>>,
+        op: llkv_expr::expr::BinaryOp,
+    ) -> ExecutorResult<ScalarExpr<(usize, FieldId)>> {
+        let first = exprs
+            .next()
+            .transpose()?
+            .unwrap_or_else(|| ScalarExpr::Literal(Literal::Boolean(true)));
+        exprs.try_fold(first, |acc, next| {
+            let rhs = next?;
+            Ok(ScalarExpr::Binary {
+                left: Box::new(acc),
+                op,
+                right: Box::new(rhs),
+            })
+        })
+    }
+
+    match expr {
+        LlkvExpr::And(list) => combine_with_op(list.iter().map(remap_filter_expr), llkv_expr::expr::BinaryOp::And),
+        LlkvExpr::Or(list) => combine_with_op(list.iter().map(remap_filter_expr), llkv_expr::expr::BinaryOp::Or),
+        LlkvExpr::Not(inner) => Ok(ScalarExpr::Not(Box::new(remap_filter_expr(inner)?))),
+        LlkvExpr::Pred(filter) => predicate_to_scalar(filter),
+        LlkvExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+            left: Box::new(remap_scalar_expr(left)),
+            op: *op,
+            right: Box::new(remap_scalar_expr(right)),
+        }),
+        LlkvExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let col = remap_scalar_expr(expr);
+            let mut combined = ScalarExpr::Literal(Literal::Boolean(false));
+            for lit in list {
+                let eq = ScalarExpr::Compare {
+                    left: Box::new(col.clone()),
+                    op: CompareOp::Eq,
+                    right: Box::new(remap_scalar_expr(lit)),
+                };
+                combined = ScalarExpr::Binary {
+                    left: Box::new(combined),
+                    op: llkv_expr::expr::BinaryOp::Or,
+                    right: Box::new(eq),
+                };
+            }
+            if *negated {
+                Ok(ScalarExpr::Not(Box::new(combined)))
+            } else {
+                Ok(combined)
+            }
+        }
+        LlkvExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(remap_scalar_expr(expr)),
+            negated: *negated,
+        }),
+        LlkvExpr::Literal(b) => Ok(ScalarExpr::Literal(Literal::Boolean(*b))),
+        _ => Err(Error::InvalidArgumentError(
+            "unsupported predicate in multi-table filter".into(),
+        )),
+    }
+}
+
+fn predicate_to_scalar(
+    filter: &Filter<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
+) -> ExecutorResult<ScalarExpr<(usize, FieldId)>> {
+    let col = ScalarExpr::Column((
+        filter.field_id.table_index,
+        filter.field_id.logical_field_id.field_id(),
+    ));
+
+    let expr = match &filter.op {
+        Operator::Equals(lit) => ScalarExpr::Compare {
+            left: Box::new(col),
+            op: CompareOp::Eq,
+            right: Box::new(ScalarExpr::Literal(lit.clone())),
+        },
+        Operator::GreaterThan(lit) => ScalarExpr::Compare {
+            left: Box::new(col),
+            op: CompareOp::Gt,
+            right: Box::new(ScalarExpr::Literal(lit.clone())),
+        },
+        Operator::GreaterThanOrEquals(lit) => ScalarExpr::Compare {
+            left: Box::new(col),
+            op: CompareOp::GtEq,
+            right: Box::new(ScalarExpr::Literal(lit.clone())),
+        },
+        Operator::LessThan(lit) => ScalarExpr::Compare {
+            left: Box::new(col),
+            op: CompareOp::Lt,
+            right: Box::new(ScalarExpr::Literal(lit.clone())),
+        },
+        Operator::LessThanOrEquals(lit) => ScalarExpr::Compare {
+            left: Box::new(col),
+            op: CompareOp::LtEq,
+            right: Box::new(ScalarExpr::Literal(lit.clone())),
+        },
+        Operator::Range { lower, upper } => {
+            let lower_expr = match lower {
+                std::ops::Bound::Included(l) => Some(ScalarExpr::Compare {
+                    left: Box::new(col.clone()),
+                    op: CompareOp::GtEq,
+                    right: Box::new(ScalarExpr::Literal(l.clone())),
+                }),
+                std::ops::Bound::Excluded(l) => Some(ScalarExpr::Compare {
+                    left: Box::new(col.clone()),
+                    op: CompareOp::Gt,
+                    right: Box::new(ScalarExpr::Literal(l.clone())),
+                }),
+                std::ops::Bound::Unbounded => None,
+            };
+            let upper_expr = match upper {
+                std::ops::Bound::Included(u) => Some(ScalarExpr::Compare {
+                    left: Box::new(col.clone()),
+                    op: CompareOp::LtEq,
+                    right: Box::new(ScalarExpr::Literal(u.clone())),
+                }),
+                std::ops::Bound::Excluded(u) => Some(ScalarExpr::Compare {
+                    left: Box::new(col.clone()),
+                    op: CompareOp::Lt,
+                    right: Box::new(ScalarExpr::Literal(u.clone())),
+                }),
+                std::ops::Bound::Unbounded => None,
+            };
+
+            match (lower_expr, upper_expr) {
+                (Some(l), Some(u)) => ScalarExpr::Binary {
+                    left: Box::new(l),
+                    op: llkv_expr::expr::BinaryOp::And,
+                    right: Box::new(u),
+                },
+                (Some(l), None) => l,
+                (None, Some(u)) => u,
+                (None, None) => ScalarExpr::Literal(Literal::Boolean(true)),
+            }
+        }
+        Operator::In(list) => {
+            let mut combined = ScalarExpr::Literal(Literal::Boolean(false));
+            for lit in *list {
+                let eq = ScalarExpr::Compare {
+                    left: Box::new(col.clone()),
+                    op: CompareOp::Eq,
+                    right: Box::new(ScalarExpr::Literal(lit.clone())),
+                };
+                combined = ScalarExpr::Binary {
+                    left: Box::new(combined),
+                    op: llkv_expr::expr::BinaryOp::Or,
+                    right: Box::new(eq),
+                };
+            }
+            combined
+        }
+        Operator::IsNull => ScalarExpr::IsNull {
+            expr: Box::new(col),
+            negated: false,
+        },
+        Operator::IsNotNull => ScalarExpr::IsNull {
+            expr: Box::new(col),
+            negated: true,
+        },
+        Operator::StartsWith { .. }
+        | Operator::EndsWith { .. }
+        | Operator::Contains { .. } => {
+            return Err(Error::InvalidArgumentError(
+                "string pattern predicates are not supported in multi-table execution".into(),
+            ))
+        }
+    };
+
+    Ok(expr)
+}
+
+
+
 fn map_join_type(join_plan: JoinPlan) -> ExecutorResult<JoinType> {
     match join_plan {
         JoinPlan::Inner => Ok(JoinType::Inner),
@@ -1063,72 +1104,66 @@ fn map_join_type(join_plan: JoinPlan) -> ExecutorResult<JoinType> {
     }
 }
 
-fn extract_join_keys(join: &ResolvedJoin) -> ExecutorResult<Vec<JoinKey>> {
-    let Some(on) = &join.on else {
-        // Treat missing ON as cross product
-        return Ok(Vec::new());
-    };
-
+fn extract_join_keys_and_filters(
+    join: &ResolvedJoin,
+) -> ExecutorResult<(
+    Vec<JoinKey>,
+    Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
+)> {
     let mut keys = Vec::new();
-    collect_join_keys(on, join.left_table_index, &mut keys)?;
+    let mut residuals = Vec::new();
 
-    if keys.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "join ON clause must include at least one equality between tables".into(),
-        ));
+    if let Some(on) = &join.on {
+        collect_join_predicates(on, join.left_table_index, &mut keys, &mut residuals)?;
     }
 
-    Ok(keys)
+    Ok((keys, residuals))
 }
 
-fn collect_join_keys(
+fn collect_join_predicates(
     expr: &LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
     left_table_index: usize,
-    out: &mut Vec<JoinKey>,
+    keys: &mut Vec<JoinKey>,
+    residuals: &mut Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
 ) -> ExecutorResult<()> {
     match expr {
         LlkvExpr::And(list) => {
             for e in list {
-                collect_join_keys(e, left_table_index, out)?;
+                collect_join_predicates(e, left_table_index, keys, residuals)?;
             }
             Ok(())
         }
         LlkvExpr::Compare { left, op, right } => {
-            if !matches!(op, CompareOp::Eq) {
-                return Err(Error::InvalidArgumentError(
-                    "only equality predicates are supported in JOIN ON".into(),
-                ));
-            }
-
-            match (left, right) {
-                (ScalarExpr::Column(l), ScalarExpr::Column(r))
+            if matches!(op, CompareOp::Eq) {
+                if let (ScalarExpr::Column(l), ScalarExpr::Column(r)) = (left, right) {
                     if (l.table_index == left_table_index
                         && r.table_index == left_table_index + 1)
                         || (r.table_index == left_table_index
-                            && l.table_index == left_table_index + 1) =>
-                {
-                    let (left_col, right_col) = if l.table_index == left_table_index {
-                        (l, r)
-                    } else {
-                        (r, l)
-                    };
+                            && l.table_index == left_table_index + 1)
+                    {
+                        let (left_col, right_col) = if l.table_index == left_table_index {
+                            (l, r)
+                        } else {
+                            (r, l)
+                        };
 
-                    out.push(JoinKey {
-                        left_field: left_col.logical_field_id.field_id(),
-                        right_field: right_col.logical_field_id.field_id(),
-                        null_equals_null: false,
-                    });
-                    Ok(())
+                        keys.push(JoinKey {
+                            left_field: left_col.logical_field_id.field_id(),
+                            right_field: right_col.logical_field_id.field_id(),
+                            null_equals_null: false,
+                        });
+                        return Ok(());
+                    }
                 }
-                _ => Err(Error::InvalidArgumentError(
-                    "only equality predicates between consecutive tables are supported in JOIN ON"
-                        .into(),
-                )),
             }
+
+            residuals.push(expr.clone());
+            Ok(())
         }
-        _ => Err(Error::InvalidArgumentError(
-            "unsupported predicate in JOIN ON clause".into(),
-        )),
+        _ => {
+            residuals.push(expr.clone());
+            Ok(())
+        }
     }
 }
 

@@ -536,6 +536,7 @@ where
                     ProjectionEval::Computed(info) => info,
                     ProjectionEval::Column(_) => unreachable!("plan mismatch"),
                 };
+                let mut temp_numeric_map = NumericArrayMap::default();
                 let array: ArrayRef = match &info.expr {
                     ScalarExpr::Literal(_) => synthesize_computed_literal_array(
                         info,
@@ -607,9 +608,18 @@ where
                         eval_get_field(base, field_name, gathered_columns, unique_index, table_id)?
                     }
                     _ => {
-                        let numeric_arrays = numeric_arrays_holder
-                            .as_ref()
-                            .expect("numeric arrays should exist for computed projection");
+                        let numeric_arrays = if let Some(arrays) = numeric_arrays_holder.as_deref() {
+                            arrays
+                        } else {
+                            // Build a minimal numeric map on demand when the caller did not
+                            // precompute one (e.g., when `requires_numeric` was false but
+                            // the expression still needs evaluation).
+                            temp_numeric_map.clear();
+                            for (lfid, array) in unique_lfids.iter().zip(gathered_columns.iter()) {
+                                temp_numeric_map.insert(lfid.field_id(), array.clone());
+                            }
+                            &temp_numeric_map
+                        };
                         ScalarEvaluator::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
                     }
                 };
