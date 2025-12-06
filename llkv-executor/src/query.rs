@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, mpsc};
@@ -7,7 +8,7 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
-use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
+use llkv_aggregate::AggregateStream;
 use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
 use llkv_column_map::store::Projection;
 
@@ -22,6 +23,7 @@ use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_plan::planner::PhysicalPlanner;
 use llkv_plan::plans::JoinPlan;
 use llkv_plan::plans::SelectPlan;
+use llkv_plan::schema::{PlanColumn, PlanSchema};
 use llkv_result::Error;
 use llkv_scan::{RowIdFilter, ScanProjection};
 use llkv_storage::pager::Pager;
@@ -112,6 +114,9 @@ where
             }
             LogicalPlan::Multi(multi) => {
                 let table_count = multi.tables.len();
+                if table_count == 0 {
+                     return Err(Error::Internal("Multi-table plan with no tables".into()));
+                }
                 
                 // 1. Analyze required columns
                 let mut required_fields: Vec<FxHashSet<FieldId>> = vec![FxHashSet::default(); table_count];
@@ -268,20 +273,61 @@ where
                 }
                 
                 // 4. Final Projection
-                let output_fields: Vec<ArrowField> = multi.projections.iter().map(|proj| {
+                let mut plan_columns = Vec::new();
+                let mut name_to_index = FxHashMap::default();
+
+                let output_fields: Vec<ArrowField> = multi.projections.iter().enumerate().map(|(i, proj)| {
                     match proj {
                         llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, alias } => {
                             let idx = col_mapping.get(&(*table_index, logical_field_id.field_id())).unwrap();
                             let field = current_schema.field(*idx);
-                            ArrowField::new(alias.clone().unwrap_or_else(|| field.name().clone()), field.data_type().clone(), field.is_nullable())
+                            
+                            let name = alias.clone().unwrap_or_else(|| field.name().clone());
+                            let mut metadata = HashMap::new();
+                            metadata.insert("field_id".to_string(), logical_field_id.field_id().to_string());
+                            
+                            plan_columns.push(PlanColumn {
+                                name: name.clone(),
+                                data_type: field.data_type().clone(),
+                                field_id: logical_field_id.field_id(),
+                                is_nullable: field.is_nullable(),
+                                is_primary_key: false,
+                                is_unique: false,
+                                default_value: None,
+                                check_expr: None,
+                            });
+                            name_to_index.insert(name.to_ascii_lowercase(), i);
+
+                            ArrowField::new(name, field.data_type().clone(), field.is_nullable())
+                                .with_metadata(metadata)
                         }
                         llkv_plan::logical_planner::ResolvedProjection::Computed { alias, .. } => {
                             // Placeholder type, will be inferred or we assume Int64 for now
-                            ArrowField::new(alias.clone(), arrow::datatypes::DataType::Int64, true)
+                            let name = alias.clone();
+                            let dummy_fid = 999999 + i as u32;
+                            
+                            let mut metadata = HashMap::new();
+                            metadata.insert("field_id".to_string(), dummy_fid.to_string());
+
+                            plan_columns.push(PlanColumn {
+                                name: name.clone(),
+                                data_type: arrow::datatypes::DataType::Int64, // Placeholder
+                                field_id: dummy_fid,
+                                is_nullable: true,
+                                is_primary_key: false,
+                                is_unique: false,
+                                default_value: None,
+                                check_expr: None,
+                            });
+                            name_to_index.insert(name.to_ascii_lowercase(), i);
+
+                            ArrowField::new(name, arrow::datatypes::DataType::Int64, true)
+                                .with_metadata(metadata)
                         }
                     }
                 }).collect();
                 let output_schema = Arc::new(Schema::new(output_fields));
+                let logical_schema = PlanSchema { columns: plan_columns, name_to_index };
                 
                 let output_schema_captured = output_schema.clone();
                 let final_stream = current_stream.map(move |batch_res| {
@@ -319,7 +365,27 @@ where
                     RecordBatch::try_new(output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
                 });
 
-                let trimmed = apply_offset_limit_stream(Box::new(final_stream), plan.offset, plan.limit);
+                let mut iter: BatchIter = Box::new(final_stream);
+
+                if !plan.aggregates.is_empty() {
+                    if !plan.group_by.is_empty() {
+                        return Err(Error::InvalidArgumentError(
+                            "GROUP BY aggregates are not supported yet".into(),
+                        ));
+                    }
+
+                    let agg_iter = AggregateStream::new(iter, &plan, &logical_schema, &output_schema)?;
+                    let trimmed =
+                        apply_offset_limit_stream(Box::new(agg_iter), plan.offset, plan.limit);
+                    let table_name = multi.table_order.first().map(|t| t.qualified_name()).unwrap_or_default();
+                    return Ok(SelectExecution::from_stream(table_name, output_schema, trimmed));
+                }
+
+                if plan.distinct {
+                    iter = Box::new(DistinctStream::new(output_schema.clone(), iter)?);
+                }
+
+                let trimmed = apply_offset_limit_stream(iter, plan.offset, plan.limit);
                 let table_name = multi.table_order.first().map(|t| t.qualified_name()).unwrap_or_default();
                 Ok(SelectExecution::from_stream(table_name, output_schema, trimmed))
         }
@@ -327,168 +393,7 @@ where
 }
 }
 
-struct AggregateStream {
-    states: Vec<AggregateState>,
-    input: BatchIter,
-    done: bool,
-}
 
-impl AggregateStream {
-    fn new(
-        input: BatchIter,
-        plan: &SelectPlan,
-        logical_schema: &llkv_plan::schema::PlanSchema,
-        physical_schema: &SchemaRef,
-    ) -> ExecutorResult<Self> {
-        let states = build_aggregate_states(plan, logical_schema, physical_schema)?;
-        Ok(Self {
-            states,
-            input,
-            done: false,
-        })
-    }
-}
-
-impl Iterator for AggregateStream {
-    type Item = ExecutorResult<RecordBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        for batch in self.input.by_ref() {
-            let batch = match batch {
-                Ok(b) => b,
-                Err(e) => return Some(Err(e)),
-            };
-
-            for state in self.states.iter_mut() {
-                if let Err(e) = state.update(&batch) {
-                    return Some(Err(e));
-                }
-            }
-        }
-
-        let mut fields = Vec::with_capacity(self.states.len());
-        let mut arrays = Vec::with_capacity(self.states.len());
-        for state in self.states.drain(..) {
-            let (field, array) = match state.finalize() {
-                Ok(res) => res,
-                Err(e) => return Some(Err(e)),
-            };
-            fields.push(field);
-            arrays.push(array);
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        let batch = match RecordBatch::try_new(Arc::clone(&schema), arrays) {
-            Ok(b) => b,
-            Err(e) => return Some(Err(Error::Internal(e.to_string()))),
-        };
-
-        self.done = true;
-        Some(Ok(batch))
-    }
-}
-
-fn build_aggregate_states(
-    plan: &SelectPlan,
-    logical_schema: &llkv_plan::schema::PlanSchema,
-    physical_schema: &SchemaRef,
-) -> Result<Vec<AggregateState>, Error> {
-    let mut field_index_by_id: FxHashMap<FieldId, usize> = FxHashMap::default();
-    for (idx, field) in physical_schema.fields().iter().enumerate() {
-        if let Some(fid_str) = field.metadata().get("field_id") {
-            if let Ok(fid) = fid_str.parse::<FieldId>() {
-                field_index_by_id.insert(fid, idx);
-            }
-        }
-    }
-
-    let mut specs = Vec::with_capacity(plan.aggregates.len());
-    for agg in &plan.aggregates {
-        match agg {
-            llkv_plan::AggregateExpr::CountStar { alias, distinct } => {
-                specs.push(AggregateSpec {
-                    alias: alias.clone(),
-                    kind: AggregateKind::Count {
-                        field_id: None,
-                        distinct: *distinct,
-                    },
-                });
-            }
-            llkv_plan::AggregateExpr::Column {
-                column,
-                alias,
-                function,
-                distinct,
-            } => {
-                let col = logical_schema.column_by_name(column).ok_or_else(|| {
-                    Error::InvalidArgumentError(format!("unknown column '{}' in aggregate", column))
-                })?;
-
-                let kind = match function {
-                    llkv_plan::AggregateFunction::Count => AggregateKind::Count {
-                        field_id: Some(col.field_id),
-                        distinct: *distinct,
-                    },
-                    llkv_plan::AggregateFunction::SumInt64 => AggregateKind::Sum {
-                        field_id: col.field_id,
-                        data_type: col.data_type.clone(),
-                        distinct: *distinct,
-                    },
-                    llkv_plan::AggregateFunction::TotalInt64 => AggregateKind::Total {
-                        field_id: col.field_id,
-                        data_type: col.data_type.clone(),
-                        distinct: *distinct,
-                    },
-                    llkv_plan::AggregateFunction::MinInt64 => AggregateKind::Min {
-                        field_id: col.field_id,
-                        data_type: col.data_type.clone(),
-                    },
-                    llkv_plan::AggregateFunction::MaxInt64 => AggregateKind::Max {
-                        field_id: col.field_id,
-                        data_type: col.data_type.clone(),
-                    },
-                    llkv_plan::AggregateFunction::CountNulls => AggregateKind::CountNulls {
-                        field_id: col.field_id,
-                    },
-                    llkv_plan::AggregateFunction::GroupConcat => {
-                        return Err(Error::InvalidArgumentError(
-                            "GROUP_CONCAT aggregate is not supported yet".into(),
-                        ));
-                    }
-                };
-
-                specs.push(AggregateSpec {
-                    alias: alias.clone(),
-                    kind,
-                });
-            }
-        }
-    }
-
-    let mut states = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let projection_idx = spec
-            .kind
-            .field_id()
-            .and_then(|fid| field_index_by_id.get(&fid).copied());
-
-        if spec.kind.field_id().is_some() && projection_idx.is_none() {
-            return Err(Error::InvalidArgumentError(
-                "aggregate input column missing from scan output".into(),
-            ));
-        }
-
-        let accumulator =
-            AggregateAccumulator::new_with_projection_index(&spec, projection_idx, None)?;
-        states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
-    }
-
-    Ok(states)
-}
 
 struct OffsetLimitStream {
     input: BatchIter,

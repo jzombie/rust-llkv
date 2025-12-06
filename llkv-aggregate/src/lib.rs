@@ -9,6 +9,7 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Float64Builder, Int64Array,
     Int64Builder, RecordBatch, StringArray,
 };
+use arrow::compute;
 use arrow::datatypes::{DataType, Field};
 use llkv_result::Error;
 use llkv_types::FieldId;
@@ -17,6 +18,9 @@ use std::sync::Arc;
 use std::{cmp::Ordering, convert::TryFrom};
 
 pub use llkv_plan::{AggregateExpr, AggregateFunction};
+
+pub mod stream;
+pub use stream::AggregateStream;
 
 /// Result type alias for aggregation routines.
 pub type AggregateResult<T> = Result<T, Error>;
@@ -776,10 +780,7 @@ impl AggregateAccumulator {
                 if matches!(array.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
-                let non_null = i64::try_from(non_null).map_err(|_| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
+                let non_null = (array.len() - array.null_count()) as i64;
                 *value = value.checked_add(non_null).ok_or_else(|| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
                 })?;
@@ -813,19 +814,15 @@ impl AggregateAccumulator {
                         "SUM aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        *has_values = true;
-                        let v = array.value(i);
-                        *value = match *value {
-                            Some(current) => Some(current.checked_add(v).ok_or_else(|| {
-                                Error::InvalidArgumentError("integer overflow".into())
-                            })?),
-                            None => {
-                                return Err(Error::InvalidArgumentError("integer overflow".into()));
-                            }
-                        };
-                    }
+                
+                if let Some(s) = compute::sum(array) {
+                    *has_values = true;
+                    *value = match *value {
+                        Some(current) => Some(current.checked_add(s).ok_or_else(|| {
+                            Error::InvalidArgumentError("integer overflow".into())
+                        })?),
+                        None => Some(s),
+                    };
                 }
             }
             AggregateAccumulator::SumDistinctInt64 {
@@ -877,12 +874,20 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
-                        *value += v;
+                
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(s) = compute::sum(array) {
+                        *value += s;
                         *saw_value = true;
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *value += v;
+                            *saw_value = true;
+                        }
                     }
                 }
             }
@@ -1126,20 +1131,15 @@ impl AggregateAccumulator {
                         "AVG aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *sum = sum.checked_add(v).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "AVG aggregate sum exceeds i64 range".into(),
-                            )
-                        })?;
-                        *count = count.checked_add(1).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "AVG aggregate count exceeds i64 range".into(),
-                            )
-                        })?;
-                    }
+                
+                if let Some(s) = compute::sum(array) {
+                    *sum = sum.checked_add(s).ok_or_else(|| {
+                        Error::InvalidArgumentError("AVG aggregate sum exceeds i64 range".into())
+                    })?;
+                    let c = (array.len() - array.null_count()) as i64;
+                    *count = count.checked_add(c).ok_or_else(|| {
+                        Error::InvalidArgumentError("AVG aggregate count exceeds i64 range".into())
+                    })?;
                 }
             }
             AggregateAccumulator::AvgDistinctInt64 {
@@ -1184,16 +1184,27 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
-                        *sum += v;
-                        *count = count.checked_add(1).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "AVG aggregate count exceeds i64 range".into(),
-                            )
+                
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(s) = compute::sum(array) {
+                        *sum += s;
+                        let c = (array.len() - array.null_count()) as i64;
+                        *count = count.checked_add(c).ok_or_else(|| {
+                            Error::InvalidArgumentError("AVG aggregate count exceeds i64 range".into())
                         })?;
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *sum += v;
+                            *count = count.checked_add(1).ok_or_else(|| {
+                                Error::InvalidArgumentError(
+                                    "AVG aggregate count exceeds i64 range".into(),
+                                )
+                            })?;
+                        }
                     }
                 }
             }
@@ -1296,14 +1307,12 @@ impl AggregateAccumulator {
                         "MIN aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *value = Some(match *value {
-                            Some(current) => current.min(v),
-                            None => v,
-                        });
-                    }
+                
+                if let Some(m) = compute::min(array) {
+                    *value = Some(match *value {
+                        Some(current) => current.min(m),
+                        None => m,
+                    });
                 }
             }
             AggregateAccumulator::MinFloat64 {
@@ -1315,17 +1324,30 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
+                
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(m) = compute::min(array) {
                         *value = Some(match *value {
-                            Some(current) => match v.partial_cmp(&current) {
-                                Some(Ordering::Less) => v,
+                            Some(current) => match m.partial_cmp(&current) {
+                                Some(Ordering::Less) => m,
                                 _ => current,
                             },
-                            None => v,
+                            None => m,
                         });
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *value = Some(match *value {
+                                Some(current) => match v.partial_cmp(&current) {
+                                    Some(Ordering::Less) => v,
+                                    _ => current,
+                                },
+                                None => v,
+                            });
+                        }
                     }
                 }
             }
@@ -1364,14 +1386,12 @@ impl AggregateAccumulator {
                         "MAX aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *value = Some(match *value {
-                            Some(current) => current.max(v),
-                            None => v,
-                        });
-                    }
+                
+                if let Some(m) = compute::max(array) {
+                    *value = Some(match *value {
+                        Some(current) => current.max(m),
+                        None => m,
+                    });
                 }
             }
             AggregateAccumulator::MaxFloat64 {
@@ -1383,17 +1403,30 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
+                
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(m) = compute::max(array) {
                         *value = Some(match *value {
-                            Some(current) => match v.partial_cmp(&current) {
-                                Some(Ordering::Greater) => v,
+                            Some(current) => match m.partial_cmp(&current) {
+                                Some(Ordering::Greater) => m,
                                 _ => current,
                             },
-                            None => v,
+                            None => m,
                         });
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *value = Some(match *value {
+                                Some(current) => match v.partial_cmp(&current) {
+                                    Some(Ordering::Greater) => v,
+                                    _ => current,
+                                },
+                                None => v,
+                            });
+                        }
                     }
                 }
             }
