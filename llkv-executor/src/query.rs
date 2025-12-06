@@ -6,10 +6,115 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use arrow::compute::concat_batches;
 use arrow::array::{ArrayRef, Array, BooleanArray};
+
+impl<P> QueryExecutor<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn execute_complex_aggregation(
+        &self,
+        pre_agg_iter: BatchIter,
+        pre_agg_schema: SchemaRef,
+        aggregates: Vec<AggregateExpr>,
+        final_exprs: Vec<ScalarExpr<String>>,
+        final_names: Vec<String>,
+        plan: &SelectPlan,
+        table_name: String,
+        subquery_results: &FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
+        key_indices: Vec<usize>,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        let mut plan_columns = Vec::new();
+        let mut name_to_index = FxHashMap::default();
+        for (i, field) in pre_agg_schema.fields().iter().enumerate() {
+            let fid = field
+                .metadata()
+                .get("field_id")
+                .and_then(|s| s.parse::<FieldId>().ok())
+                .unwrap_or(i as FieldId);
+
+            plan_columns.push(PlanColumn {
+                name: field.name().clone(),
+                data_type: field.data_type().clone(),
+                field_id: fid,
+                is_nullable: field.is_nullable(),
+                is_primary_key: false,
+                is_unique: false,
+                default_value: None,
+                check_expr: None,
+            });
+            name_to_index.insert(field.name().to_ascii_lowercase(), i);
+        }
+        let logical_schema = PlanSchema { columns: plan_columns, name_to_index };
+
+        let mut agg_plan = plan.clone();
+        agg_plan.aggregates = aggregates;
+
+        let (mut agg_iter, agg_schema): (BatchIter, SchemaRef) = if key_indices.is_empty() {
+            let stream = AggregateStream::new(pre_agg_iter, &agg_plan, &logical_schema, &pre_agg_schema)?;
+            let schema = stream.schema();
+            (Box::new(stream), schema)
+        } else {
+            let stream = GroupedAggregateStream::new(pre_agg_iter, key_indices, &agg_plan, &logical_schema, &pre_agg_schema)?;
+            let schema = stream.schema();
+            (Box::new(stream.map(|b| b)), schema)
+        };
+
+        if let Some(having) = &plan.having {
+            agg_iter = self.apply_residual_filter(agg_iter, having.clone(), Vec::new());
+        }
+
+        let mut final_output_fields = Vec::new();
+        let mut col_mapping = FxHashMap::default();
+        for (i, _field) in agg_schema.fields().iter().enumerate() {
+            col_mapping.insert((0, i as u32), i);
+        }
+
+        for (expr_str, name) in final_exprs.iter().zip(final_names.iter()) {
+            let expr = resolve_scalar_expr_string(expr_str, &agg_schema, subquery_results)?;
+            let dt = infer_type(&expr, &agg_schema, &col_mapping)
+                .unwrap_or(arrow::datatypes::DataType::Int64);
+            final_output_fields.push(ArrowField::new(name, dt, true));
+        }
+        let final_output_schema = Arc::new(Schema::new(final_output_fields));
+        let final_output_schema_captured = final_output_schema.clone();
+        let agg_schema_captured = agg_schema.clone();
+        let subquery_results_captured = subquery_results.clone();
+
+        let final_stream = agg_iter.map(move |batch_res| {
+            let batch = batch_res?;
+            let mut columns = Vec::new();
+
+            let mut field_arrays = FxHashMap::default();
+            for (i, col) in batch.columns().iter().enumerate() {
+                field_arrays.insert((0, i as u32), col.clone());
+            }
+            let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+
+            for expr_str in &final_exprs {
+                let expr = resolve_scalar_expr_string(expr_str, &agg_schema_captured, &subquery_results_captured)?;
+                let result = ScalarEvaluator::evaluate_batch_simplified(&expr, batch.num_rows(), &numeric_arrays)?;
+                columns.push(result);
+            }
+
+            RecordBatch::try_new(final_output_schema_captured.clone(), columns)
+                .map_err(|e| Error::Internal(e.to_string()))
+        });
+
+        let mut iter: BatchIter = Box::new(final_stream);
+        if plan.distinct {
+            iter = Box::new(DistinctStream::new(final_output_schema.clone(), iter)?);
+        }
+
+        let trimmed = apply_offset_limit_stream(iter, plan.offset, plan.limit);
+
+        Ok(SelectExecution::from_stream(table_name, final_output_schema, trimmed))
+    }
+}
+
 use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
-use llkv_aggregate::AggregateStream;
+use llkv_aggregate::{AggregateStream, GroupedAggregateStream};
 use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
 use llkv_column_map::store::Projection;
 
@@ -681,115 +786,6 @@ where
         Box::new(iter)
     }
 
-    fn execute_complex_aggregation(
-        &self,
-        base_stream: BatchIter,
-        base_schema: Arc<Schema>,
-        new_aggregates: Vec<AggregateExpr>,
-        final_exprs: Vec<ScalarExpr<String>>,
-        final_names: Vec<String>,
-        plan: &SelectPlan,
-        table_name: String,
-        subquery_results: &FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
-    ) -> ExecutorResult<SelectExecution<P>> {
-        if !plan.group_by.is_empty() {
-            return Err(Error::InvalidArgumentError(
-                "GROUP BY aggregates are not supported yet".into(),
-            ));
-        }
-
-        // 1. Pre-aggregation stream is just base_stream
-        // The base_stream is expected to yield batches containing the arguments for aggregation
-        // (e.g. _agg_arg_0, _agg_arg_1, etc.) produced by the Scan.
-        
-        // We need to ensure the schema has the field_ids we expect (10000+i) so AggregateStream can match them.
-        let mut fields_with_metadata = Vec::new();
-        for (i, field) in base_schema.fields().iter().enumerate() {
-            let mut metadata = field.metadata().clone();
-            metadata.insert("field_id".to_string(), format!("{}", 10000 + i));
-            let new_field = field.as_ref().clone().with_metadata(metadata);
-            fields_with_metadata.push(new_field);
-        }
-        let pre_agg_schema = Arc::new(Schema::new(fields_with_metadata));
-        
-        let pre_agg_schema_captured = pre_agg_schema.clone();
-        let pre_agg_stream = base_stream.map(move |batch_res| {
-            let batch = batch_res?;
-            // Just replace schema, data is same
-            RecordBatch::try_new(pre_agg_schema_captured.clone(), batch.columns().to_vec())
-                .map_err(|e| Error::Internal(e.to_string()))
-        });
-
-        // 2. Aggregation
-        let mut agg_plan = plan.clone();
-        agg_plan.aggregates = new_aggregates;
-        
-        let mut plan_columns = Vec::new();
-        let mut name_to_index = FxHashMap::default();
-        for (i, field) in pre_agg_schema.fields().iter().enumerate() {
-            plan_columns.push(PlanColumn {
-                name: field.name().clone(),
-                data_type: field.data_type().clone(),
-                field_id: 10000 + i as u32,
-                is_nullable: field.is_nullable(),
-                is_primary_key: false,
-                is_unique: false,
-                default_value: None,
-                check_expr: None,
-            });
-            name_to_index.insert(field.name().clone(), i);
-        }
-        let pre_agg_plan_schema = PlanSchema { columns: plan_columns, name_to_index };
-
-        let agg_iter = AggregateStream::new(Box::new(pre_agg_stream), &agg_plan, &pre_agg_plan_schema, &pre_agg_schema)?;
-        let agg_schema = agg_iter.schema();
-
-        // 3. Final Projection
-        let mut final_output_fields = Vec::new();
-        let mut col_mapping = FxHashMap::default();
-        for (i, _field) in agg_schema.fields().iter().enumerate() {
-            col_mapping.insert((0, i as u32), i);
-        }
-
-        for (expr_str, name) in final_exprs.iter().zip(final_names.iter()) {
-            let expr = resolve_scalar_expr_string(expr_str, &agg_schema, subquery_results)?;
-            let dt = infer_type(&expr, &agg_schema, &col_mapping).unwrap_or(arrow::datatypes::DataType::Int64);
-            final_output_fields.push(ArrowField::new(name, dt, true));
-        }
-        let final_output_schema = Arc::new(Schema::new(final_output_fields));
-        let final_output_schema_captured = final_output_schema.clone();
-        let agg_schema_captured = agg_schema.clone();
-        let subquery_results_captured = subquery_results.clone();
-
-        let final_stream = agg_iter.map(move |batch_res| {
-            let batch = batch_res?;
-            let mut columns = Vec::new();
-            
-            // Prepare arrays for evaluation
-            let mut field_arrays = FxHashMap::default();
-            for (i, col) in batch.columns().iter().enumerate() {
-                field_arrays.insert((0, i as u32), col.clone());
-            }
-            let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
-            
-            for expr_str in &final_exprs {
-                let expr = resolve_scalar_expr_string(expr_str, &agg_schema_captured, &subquery_results_captured)?;
-                let result = ScalarEvaluator::evaluate_batch_simplified(&expr, batch.num_rows(), &numeric_arrays)?;
-                columns.push(result);
-            }
-            
-            RecordBatch::try_new(final_output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
-        });
-
-        let mut iter: BatchIter = Box::new(final_stream);
-        if plan.distinct {
-             iter = Box::new(DistinctStream::new(final_output_schema.clone(), iter)?);
-        }
-        
-        let trimmed = apply_offset_limit_stream(iter, plan.offset, plan.limit);
-        Ok(SelectExecution::from_stream(table_name, final_output_schema, trimmed))
-    }
-
     fn contains_subquery<F: std::fmt::Debug>(expr: &ScalarExpr<F>) -> bool {
         match expr {
             ScalarExpr::ScalarSubquery(_) => true,
@@ -1369,6 +1365,12 @@ where
                              alias: format!("_agg_arg_{}", i),
                          }
                      }).collect();
+
+                     for key in &plan.group_by {
+                         if !projs.iter().any(|p| matches!(p, llkv_plan::plans::SelectProjection::Column { name, .. } if name == key)) {
+                             projs.push(llkv_plan::plans::SelectProjection::Column { name: key.clone(), alias: None });
+                         }
+                     }
                      
                      if residual_filter.is_some() {
                          projs.push(llkv_plan::plans::SelectProjection::AllColumns);
@@ -1398,6 +1400,15 @@ where
                                 base_iter = self.apply_residual_filter(base_iter, residual.clone(), residual_subqueries.clone());
                             }
                             
+                            let mut key_indices = Vec::new();
+                            if !plan.group_by.is_empty() {
+                                for name in &plan.group_by {
+                                    let idx = resolve_group_index(name, &schema, &single.schema)
+                                        .ok_or_else(|| Error::Internal(format!("GROUP BY column not found: {name}")))?;
+                                    key_indices.push(idx);
+                                }
+                            }
+
                             return self.execute_complex_aggregation(
                                 base_iter,
                                 schema,
@@ -1407,6 +1418,7 @@ where
                                 &plan,
                                 table_name,
                                 &subquery_results,
+                                key_indices,
                             );
                         }
                         _ => {
@@ -1507,9 +1519,33 @@ where
 
                 if !plan.aggregates.is_empty() {
                     if !plan.group_by.is_empty() {
-                        return Err(Error::InvalidArgumentError(
-                            "GROUP BY aggregates are not supported yet".into(),
-                        ));
+                        let mut key_indices = Vec::with_capacity(plan.group_by.len());
+                        for name in &plan.group_by {
+                            let idx = resolve_group_index(name, &schema, &single.schema)
+                                .ok_or_else(|| Error::Internal(format!("GROUP BY column not found: {name}")))?;
+                            key_indices.push(idx);
+                        }
+
+                        let grouped = GroupedAggregateStream::new(base_iter, key_indices, &plan, &single.schema, &schema)?;
+                        let agg_schema = grouped.schema();
+                        let mut agg_iter: BatchIter = Box::new(grouped.map(|b| b));
+
+                        if let Some(having) = &plan.having {
+                            agg_iter = self.apply_residual_filter(agg_iter, having.clone(), Vec::new());
+                        }
+
+                        return self.project_stream(
+                            agg_iter,
+                            &agg_schema,
+                            &plan.projections,
+                            table_name,
+                            &plan.scalar_subqueries,
+                            plan.distinct,
+                            &plan.order_by,
+                            plan.offset,
+                            plan.limit,
+                            None,
+                        );
                     }
 
                     let agg_iter = AggregateStream::new(base_iter, &plan, &single.schema, &schema)?;
@@ -1852,6 +1888,24 @@ where
                 let (new_aggregates, final_exprs, pre_agg_exprs) = extract_complex_aggregates(&string_projections);
                 let has_aggregates = !new_aggregates.is_empty();
 
+                let mut final_names = Vec::new();
+                for proj in &multi.projections {
+                    match proj {
+                        llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, alias } => {
+                            if let Some(name) = alias {
+                                final_names.push(name.clone());
+                            } else {
+                                let idx = col_mapping.get(&(*table_index, logical_field_id.field_id()))
+                                    .ok_or_else(|| Error::Internal("projection column missing".into()))?;
+                                final_names.push(current_schema.field(*idx).name().clone());
+                            }
+                        }
+                        llkv_plan::logical_planner::ResolvedProjection::Computed { alias, .. } => {
+                            final_names.push(alias.clone());
+                        }
+                    }
+                }
+
                 if !has_aggregates && !multi.group_by.is_empty() {
                     let mut key_indices = Vec::with_capacity(multi.group_by.len());
                     for key in &multi.group_by {
@@ -1885,44 +1939,58 @@ where
                     );
                 }
 
-                let mut iter: BatchIter = if has_aggregates {
-                    if !plan.group_by.is_empty() {
-                        return Err(Error::InvalidArgumentError(
-                            "GROUP BY aggregates are not supported yet".into(),
-                        ));
+                if has_aggregates {
+                    let mut key_batch_indices = Vec::new();
+                    for key in &multi.group_by {
+                        let idx = col_mapping
+                            .get(&(key.table_index, key.logical_field_id.field_id()))
+                            .copied()
+                            .ok_or_else(|| Error::Internal("GROUP BY column not found in join output".into()))?;
+                        key_batch_indices.push(idx);
                     }
 
-                    // 1. Pre-aggregation stream
-                    let pre_agg_schema_fields: Vec<ArrowField> = pre_agg_exprs.iter().enumerate().map(|(i, _)| {
+                    let mut pre_agg_schema_fields: Vec<ArrowField> = pre_agg_exprs.iter().enumerate().map(|(i, _)| {
                         ArrowField::new(format!("_agg_arg_{}", i), arrow::datatypes::DataType::Int64, true)
                             .with_metadata(HashMap::from([("field_id".to_string(), format!("{}", 10000+i))]))
                     }).collect();
+
+                    for idx in &key_batch_indices {
+                        pre_agg_schema_fields.push(current_schema.field(*idx).clone());
+                    }
+
                     let pre_agg_schema = Arc::new(Schema::new(pre_agg_schema_fields));
-                    
                     let pre_agg_schema_captured = pre_agg_schema.clone();
                     let current_schema_captured = current_schema.clone();
                     let subquery_results_captured = subquery_results.clone();
-                    
+                    let col_mapping_captured = col_mapping.clone();
+                    let pre_agg_exprs_cloned = pre_agg_exprs.clone();
+                    let key_batch_indices_cloned = key_batch_indices.clone();
+
                     let pre_agg_stream = current_stream.map(move |batch_res| {
                         let batch = batch_res?;
                         let mut columns = Vec::new();
-                        
-                        for expr_str in &pre_agg_exprs {
+
+                        for expr_str in &pre_agg_exprs_cloned {
                             let expr = resolve_scalar_expr_string(expr_str, &current_schema_captured, &subquery_results_captured)?;
-                            
+
                             let mut required_fields = FxHashSet::default();
                             ScalarEvaluator::collect_fields(&expr, &mut required_fields);
-                            
+
                             let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
                             for (tbl, fid) in required_fields {
-                                field_arrays.insert((tbl, fid), batch.column(fid as usize).clone());
+                                let idx = col_mapping_captured.get(&(tbl, fid)).ok_or_else(|| Error::Internal("Missing field in pre-aggregation".into()))?;
+                                field_arrays.insert((tbl, fid), batch.column(*idx).clone());
                             }
-                            
+
                             let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
                             let result = ScalarEvaluator::evaluate_batch_simplified(&expr, batch.num_rows(), &numeric_arrays)?;
                             columns.push(result);
                         }
-                        
+
+                        for idx in &key_batch_indices_cloned {
+                            columns.push(batch.column(*idx).clone());
+                        }
+
                         if columns.is_empty() {
                             let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
                             RecordBatch::try_new_with_options(pre_agg_schema_captured.clone(), columns, &options).map_err(|e| Error::Internal(e.to_string()))
@@ -1931,65 +1999,28 @@ where
                         }
                     });
 
-                    // 2. Aggregate Stream
-                    let mut dummy_plan = plan.clone();
-                    dummy_plan.aggregates = new_aggregates;
-                    
-                    let mut dummy_cols = Vec::new();
-                    let mut dummy_name_to_idx = FxHashMap::default();
-                    for (i, field) in pre_agg_schema.fields().iter().enumerate() {
-                        let name = field.name().clone();
-                        let fid = field.metadata().get("field_id").unwrap().parse::<u32>().unwrap();
-                        dummy_cols.push(PlanColumn {
-                            name: name.clone(),
-                            data_type: field.data_type().clone(),
-                            field_id: fid,
-                            is_nullable: true,
-                            is_primary_key: false,
-                            is_unique: false,
-                            default_value: None,
-                            check_expr: None,
-                        });
-                        dummy_name_to_idx.insert(name, i);
-                    }
-                    let dummy_logical_schema = PlanSchema { columns: dummy_cols, name_to_index: dummy_name_to_idx };
+                    let group_key_indices: Vec<usize> = (0..multi.group_by.len()).map(|i| pre_agg_exprs.len() + i).collect();
+                    let table_name = multi.table_order.first().map(|t| t.qualified_name()).unwrap_or_default();
 
-                    let agg_iter = AggregateStream::new(Box::new(pre_agg_stream), &dummy_plan, &dummy_logical_schema, &pre_agg_schema)?;
-                    let agg_schema = agg_iter.schema();
+                    return self.execute_complex_aggregation(
+                        Box::new(pre_agg_stream),
+                        pre_agg_schema,
+                        new_aggregates,
+                        final_exprs,
+                        final_names,
+                        &plan,
+                        table_name,
+                        &subquery_results,
+                        group_key_indices,
+                    );
+                }
 
-                    // 3. Final Projection Stream
-                    let output_schema_captured = output_schema.clone();
-                    let subquery_results_captured = subquery_results.clone();
-                    let final_stream = agg_iter.map(move |batch_res| {
-                        let batch = batch_res?;
-                        let mut columns = Vec::new();
-                        
-                        for expr_str in &final_exprs {
-                            let expr = resolve_scalar_expr_string(expr_str, &agg_schema, &subquery_results_captured)?;
-                            
-                            let mut required_fields = FxHashSet::default();
-                            ScalarEvaluator::collect_fields(&expr, &mut required_fields);
-                            
-                            let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
-                            for (tbl, fid) in required_fields {
-                                field_arrays.insert((tbl, fid), batch.column(fid as usize).clone());
-                            }
-                            
-                            let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
-                            let result = ScalarEvaluator::evaluate_batch_simplified(&expr, batch.num_rows(), &numeric_arrays)?;
-                            columns.push(result);
-                        }
-                        RecordBatch::try_new(output_schema_captured.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
-                    });
-                    
-                    Box::new(final_stream)
-
-                } else {
+                let mut iter: BatchIter = {
                     let output_schema_captured = output_schema.clone();
                     let final_stream = current_stream.map(move |batch_res| {
                         let batch = batch_res?;
                         let mut columns = Vec::new();
-                        
+
                         for proj in &multi.projections {
                             match proj {
                                 llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, .. } => {
@@ -1999,10 +2030,10 @@ where
                                 }
                                 llkv_plan::logical_planner::ResolvedProjection::Computed { expr, .. } => {
                                     let remapped = remap_scalar_expr(expr);
-                                    
+
                                     let mut required_fields = FxHashSet::default();
                                     ScalarEvaluator::collect_fields(&remapped, &mut required_fields);
-                                    
+
                                     let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
                                     for (tbl, fid) in required_fields {
                                         if let Some(idx) = col_mapping.get(&(tbl, fid)) {
@@ -2011,7 +2042,7 @@ where
                                             return Err(Error::Internal(format!("Missing field {:?} in batch for computed column", (tbl, fid))));
                                         }
                                     }
-                                    
+
                                     let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
                                     let result = ScalarEvaluator::evaluate_batch_simplified(&remapped, batch.num_rows(), &numeric_arrays)?;
                                     columns.push(result);
