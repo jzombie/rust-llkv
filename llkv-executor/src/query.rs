@@ -502,44 +502,49 @@ where
     fn remap_string_expr_to_indices(
         expr: &ScalarExpr<String>,
         schema: &Schema,
+        name_overrides: Option<&FxHashMap<String, usize>>,
     ) -> ExecutorResult<ScalarExpr<(usize, u32)>> {
         match expr {
             ScalarExpr::Column(name) => {
-                let idx = schema.index_of(name).map_err(|_| Error::Internal(format!("Column not found: {}", name)))?;
+                let lowered = name.to_ascii_lowercase();
+                let idx = name_overrides
+                    .and_then(|m| m.get(&lowered).copied())
+                    .or_else(|| resolve_schema_index(name, schema))
+                    .ok_or_else(|| Error::Internal(format!("Column not found: {}", name)))?;
                 Ok(ScalarExpr::Column((0, idx as u32)))
             }
             ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
             ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
-                left: Box::new(Self::remap_string_expr_to_indices(left, schema)?),
+                left: Box::new(Self::remap_string_expr_to_indices(left, schema, name_overrides)?),
                 op: *op,
-                right: Box::new(Self::remap_string_expr_to_indices(right, schema)?),
+                right: Box::new(Self::remap_string_expr_to_indices(right, schema, name_overrides)?),
             }),
-            ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(Self::remap_string_expr_to_indices(e, schema)?))),
+            ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(Self::remap_string_expr_to_indices(e, schema, name_overrides)?))),
             ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
-                expr: Box::new(Self::remap_string_expr_to_indices(expr, schema)?),
+                expr: Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?),
                 negated: *negated,
             }),
             ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
-                left: Box::new(Self::remap_string_expr_to_indices(left, schema)?),
+                left: Box::new(Self::remap_string_expr_to_indices(left, schema, name_overrides)?),
                 op: *op,
-                right: Box::new(Self::remap_string_expr_to_indices(right, schema)?),
+                right: Box::new(Self::remap_string_expr_to_indices(right, schema, name_overrides)?),
             }),
             ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
-                expr: Box::new(Self::remap_string_expr_to_indices(expr, schema)?),
+                expr: Box::new(Self::remap_string_expr_to_indices(expr, schema, name_overrides)?),
                 data_type: data_type.clone(),
             }),
             ScalarExpr::Case { operand, branches, else_expr } => Ok(ScalarExpr::Case {
-                operand: operand.as_ref().map(|o| Self::remap_string_expr_to_indices(o, schema)).transpose()?.map(Box::new),
+                operand: operand.as_ref().map(|o| Self::remap_string_expr_to_indices(o, schema, name_overrides)).transpose()?.map(Box::new),
                 branches: branches.iter().map(|(w, t)| {
                     Ok((
-                        Self::remap_string_expr_to_indices(w, schema)?,
-                        Self::remap_string_expr_to_indices(t, schema)?
+                        Self::remap_string_expr_to_indices(w, schema, name_overrides)?,
+                        Self::remap_string_expr_to_indices(t, schema, name_overrides)?
                     ))
                 }).collect::<ExecutorResult<Vec<_>>>()?,
-                else_expr: else_expr.as_ref().map(|e| Self::remap_string_expr_to_indices(e, schema)).transpose()?.map(Box::new),
+                else_expr: else_expr.as_ref().map(|e| Self::remap_string_expr_to_indices(e, schema, name_overrides)).transpose()?.map(Box::new),
             }),
             ScalarExpr::Coalesce(items) => Ok(ScalarExpr::Coalesce(
-                items.iter().map(|e| Self::remap_string_expr_to_indices(e, schema)).collect::<ExecutorResult<Vec<_>>>()?
+                items.iter().map(|e| Self::remap_string_expr_to_indices(e, schema, name_overrides)).collect::<ExecutorResult<Vec<_>>>()?
             )),
             ScalarExpr::ScalarSubquery(s) => Ok(ScalarExpr::ScalarSubquery(s.clone())),
             _ => Err(Error::Internal(format!("Unsupported expression for remapping: {:?}", expr))),
@@ -582,8 +587,8 @@ where
         
         let rewritten_predicate = Self::rewrite_expr_exists(predicate, &exists_results);
         let scalar_expr = Self::expr_to_scalar_expr(&rewritten_predicate);
-        let remapped_expr = Self::remap_string_expr_to_indices(&scalar_expr, &batch.schema())?;
-        
+        let remapped_expr = Self::remap_string_expr_to_indices(&scalar_expr, &batch.schema(), None)?;
+
         let slice = batch.slice(row_index, 1);
         
         let mut field_arrays = FxHashMap::default();
@@ -619,6 +624,26 @@ where
         }
     }
 
+    fn normalize_not_isnull(expr: Expr<'static, String>) -> Expr<'static, String> {
+        match expr {
+            Expr::IsNull { expr, negated } => {
+                if let ScalarExpr::Not(inner) = expr {
+                    let rewritten = Expr::IsNull {
+                        expr: *inner,
+                        negated,
+                    };
+                    Expr::Not(Box::new(Self::normalize_not_isnull(rewritten)))
+                } else {
+                    Expr::IsNull { expr, negated }
+                }
+            }
+            Expr::Not(inner) => Expr::Not(Box::new(Self::normalize_not_isnull(*inner))),
+            Expr::And(list) => Expr::And(list.into_iter().map(Self::normalize_not_isnull).collect()),
+            Expr::Or(list) => Expr::Or(list.into_iter().map(Self::normalize_not_isnull).collect()),
+            other => other,
+        }
+    }
+
     fn apply_residual_filter(
         &self,
         input: BatchIter,
@@ -627,7 +652,7 @@ where
     ) -> BatchIter {
         let provider = self.provider.clone();
         let subqueries = subqueries;
-        let predicate = predicate;
+        let predicate = Self::normalize_not_isnull(predicate);
         
         let iter = input.flat_map(move |batch_res| {
             let batch = match batch_res {
@@ -879,10 +904,13 @@ where
         projections: &[llkv_plan::plans::SelectProjection],
         table_name: String,
         scalar_subqueries: &[llkv_plan::plans::ScalarSubquery],
+        distinct: bool,
         order_by: &[llkv_plan::plans::OrderByPlan],
         offset: Option<usize>,
         limit: Option<usize>,
+        name_overrides: Option<FxHashMap<String, usize>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        let name_overrides = name_overrides.as_ref();
         let mut output_fields = Vec::new();
         let mut exprs = Vec::new();
         
@@ -913,14 +941,18 @@ where
                     }
                 }
                 llkv_plan::plans::SelectProjection::Column { name, alias } => {
-                    let idx = name_to_idx.get(name).ok_or_else(|| Error::Internal(format!("Column not found: {}", name)))?;
-                    let field = input_schema.field(*idx);
+                    let lowered = name.to_ascii_lowercase();
+                    let idx = name_overrides
+                        .and_then(|m| m.get(&lowered).copied())
+                        .or_else(|| resolve_schema_index(name, input_schema))
+                        .ok_or_else(|| Error::Internal(format!("Column not found: {}", name)))?;
+                    let field = input_schema.field(idx);
                     let out_name = alias.clone().unwrap_or_else(|| name.clone());
                     output_fields.push(Arc::new(ArrowField::new(out_name, field.data_type().clone(), field.is_nullable())));
-                    exprs.push(ScalarExpr::Column((0, *idx as u32)));
+                    exprs.push(ScalarExpr::Column((0, idx as u32)));
                 }
                 llkv_plan::plans::SelectProjection::Computed { expr, alias } => {
-                    let remapped = Self::remap_string_expr_to_indices(expr, input_schema)?;
+                    let remapped = Self::remap_string_expr_to_indices(expr, input_schema, name_overrides)?;
                     let dt = infer_type(&remapped, input_schema, &col_mapping).unwrap_or(arrow::datatypes::DataType::Int64);
                     output_fields.push(Arc::new(ArrowField::new(alias.clone(), dt, true)));
                     exprs.push(remapped);
@@ -974,6 +1006,10 @@ where
         });
         
         let mut stream: BatchIter = Box::new(final_stream);
+
+        if distinct {
+            stream = Box::new(DistinctStream::new(output_schema.clone(), stream)?);
+        }
         
         // Apply sort
         if !order_by.is_empty() {
@@ -1392,12 +1428,13 @@ where
                 false
             }
         });
-        let force_manual_projection = residual_filter.is_some() || has_subqueries;
+        let group_needs_full_row = plan.aggregates.is_empty() && !plan.group_by.is_empty();
+        let force_manual_projection = residual_filter.is_some() || has_subqueries || group_needs_full_row;
 
         let plan_for_scan = if force_manual_projection {
             let mut p = plan.clone();
             p.projections = vec![llkv_plan::plans::SelectProjection::AllColumns];
-            // Clear order by to avoid physical plan sorting on computed columns
+            // Clear order by to avoid physical plan sorting on computed columns or dropping GROUP BY keys
             p.order_by = Vec::new();
             p
         } else {
@@ -1418,7 +1455,8 @@ where
                         false
                     }
                 });
-                let force_manual_projection = residual_filter.is_some() || has_subqueries;
+                let group_needs_full_row = plan.aggregates.is_empty() && !plan.group_by.is_empty();
+                let force_manual_projection = residual_filter.is_some() || has_subqueries || group_needs_full_row;
 
                 let physical_plan = self
                     .physical_planner
@@ -1438,6 +1476,35 @@ where
                     base_iter = self.apply_residual_filter(base_iter, residual.clone(), residual_subqueries.clone());
                 }
 
+                // GROUP BY with no aggregates should collapse to distinct group keys.
+                if plan.aggregates.is_empty() && !plan.group_by.is_empty() {
+                    let mut key_indices = Vec::with_capacity(plan.group_by.len());
+                    for name in &plan.group_by {
+                        let idx = resolve_group_index(name, &schema, &single.schema)
+                            .ok_or_else(|| Error::Internal(format!("GROUP BY column not found: {name}")))?;
+                        key_indices.push(idx);
+                    }
+
+                    let mut grouped: BatchIter = Box::new(DistinctOnKeysStream::new(schema.clone(), key_indices, base_iter)?);
+
+                    if let Some(having) = &plan.having {
+                        grouped = self.apply_residual_filter(grouped, having.clone(), Vec::new());
+                    }
+
+                    return self.project_stream(
+                        grouped,
+                        &schema,
+                        &plan.projections,
+                        table_name,
+                        &plan.scalar_subqueries,
+                        plan.distinct,
+                        &plan.order_by,
+                        plan.offset,
+                        plan.limit,
+                        None,
+                    );
+                }
+
                 if !plan.aggregates.is_empty() {
                     if !plan.group_by.is_empty() {
                         return Err(Error::InvalidArgumentError(
@@ -1453,7 +1520,7 @@ where
                 }
 
                 if force_manual_projection {
-                     return self.project_stream(base_iter, &schema, &plan.projections, table_name, &plan.scalar_subqueries, &plan.order_by, plan.offset, plan.limit);
+                 return self.project_stream(base_iter, &schema, &plan.projections, table_name, &plan.scalar_subqueries, plan.distinct, &plan.order_by, plan.offset, plan.limit, None);
                 }
 
                 let mut iter: BatchIter = base_iter;
@@ -1704,6 +1771,17 @@ where
                 let mut plan_columns = Vec::new();
                 let mut name_to_index = FxHashMap::default();
 
+                let mut name_overrides: FxHashMap<String, usize> = FxHashMap::default();
+                for ((tbl, fid), idx) in &col_mapping {
+                    if let Some(table_ref) = multi.table_order.get(*tbl) {
+                        if let Some(col) = multi.tables.get(*tbl).and_then(|t| t.schema.columns.iter().find(|c| c.field_id == *fid)) {
+                            let qualifier = table_ref.display_name().to_ascii_lowercase();
+                            let key = format!("{}.{}", qualifier, col.name.to_ascii_lowercase());
+                            name_overrides.insert(key, *idx);
+                        }
+                    }
+                }
+
                 let output_fields: Vec<ArrowField> = multi.projections.iter().enumerate().map(|(i, proj)| {
                     match proj {
                         llkv_plan::logical_planner::ResolvedProjection::Column { table_index, logical_field_id, alias } => {
@@ -1773,6 +1851,39 @@ where
 
                 let (new_aggregates, final_exprs, pre_agg_exprs) = extract_complex_aggregates(&string_projections);
                 let has_aggregates = !new_aggregates.is_empty();
+
+                if !has_aggregates && !multi.group_by.is_empty() {
+                    let mut key_indices = Vec::with_capacity(multi.group_by.len());
+                    for key in &multi.group_by {
+                        let field_id = key.logical_field_id.field_id();
+                        let idx = col_mapping
+                            .get(&(key.table_index, field_id))
+                            .copied()
+                            .ok_or_else(|| Error::Internal("GROUP BY column not found in join output".into()))?;
+                        key_indices.push(idx);
+                    }
+
+                    let mut grouped: BatchIter = Box::new(DistinctOnKeysStream::new(current_schema.clone(), key_indices, current_stream)?);
+
+                    if let Some(having) = &plan.having {
+                        grouped = self.apply_residual_filter(grouped, having.clone(), Vec::new());
+                    }
+
+                    let table_name = multi.table_order.first().map(|t| t.qualified_name()).unwrap_or_default();
+
+                    return self.project_stream(
+                        grouped,
+                        &current_schema,
+                        &plan.projections,
+                        table_name,
+                        &plan.scalar_subqueries,
+                        plan.distinct,
+                        &plan.order_by,
+                        plan.offset,
+                        plan.limit,
+                        Some(name_overrides.clone()),
+                    );
+                }
 
                 let mut iter: BatchIter = if has_aggregates {
                     if !plan.group_by.is_empty() {
@@ -2211,6 +2322,14 @@ struct DistinctStream {
     input: BatchIter,
 }
 
+struct DistinctOnKeysStream {
+    schema: SchemaRef,
+    converter: RowConverter,
+    key_indices: Vec<usize>,
+    seen: FxHashSet<OwnedRow>,
+    input: BatchIter,
+}
+
 impl DistinctStream {
     fn new(schema: SchemaRef, input: BatchIter) -> ExecutorResult<Self> {
         let sort_fields: Vec<SortField> = schema
@@ -2223,6 +2342,27 @@ impl DistinctStream {
         Ok(Self {
             schema,
             converter,
+            seen: FxHashSet::default(),
+            input,
+        })
+    }
+}
+
+impl DistinctOnKeysStream {
+    fn new(schema: SchemaRef, key_indices: Vec<usize>, input: BatchIter) -> ExecutorResult<Self> {
+        let key_fields: Vec<ArrowField> = key_indices
+            .iter()
+            .map(|&idx| schema.field(idx).clone())
+            .collect();
+        let sort_fields: Vec<SortField> = key_fields
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect();
+        let converter = RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
+        Ok(Self {
+            schema,
+            converter,
+            key_indices,
             seen: FxHashSet::default(),
             input,
         })
@@ -2272,6 +2412,60 @@ impl Iterator for DistinctStream {
             };
             return Some(Ok(out));
         }
+        None
+    }
+}
+
+impl Iterator for DistinctOnKeysStream {
+    type Item = ExecutorResult<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(batch) = self.input.next() {
+            let batch = match batch {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+
+            let key_columns: Vec<ArrayRef> = self
+                .key_indices
+                .iter()
+                .map(|&idx| batch.column(idx).clone())
+                .collect();
+
+            let rows = match self.converter.convert_columns(&key_columns) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            };
+
+            let mut unique_rows: Vec<Option<(usize, usize)>> = Vec::new();
+            for row_idx in 0..batch.num_rows() {
+                let owned = rows.row(row_idx).owned();
+                if self.seen.insert(owned) {
+                    unique_rows.push(Some((0, row_idx)));
+                }
+            }
+
+            if unique_rows.is_empty() {
+                continue;
+            }
+
+            let projection: Vec<usize> = (0..self.schema.fields().len()).collect();
+            let arrays = match gather_optional_projected_indices_from_batches(
+                &[batch],
+                &unique_rows,
+                &projection,
+            ) {
+                Ok(a) => a,
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            };
+
+            let out = match RecordBatch::try_new(Arc::clone(&self.schema), arrays) {
+                Ok(b) => b,
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            };
+            return Some(Ok(out));
+        }
+
         None
     }
 }
@@ -2587,6 +2781,41 @@ fn map_join_type(join_plan: JoinPlan) -> ExecutorResult<JoinType> {
             "FULL JOIN is not supported yet".into(),
         )),
     }
+}
+
+fn resolve_schema_index(name: &str, schema: &Schema) -> Option<usize> {
+    // Try exact match first
+    if let Ok(idx) = schema.index_of(name) {
+        return Some(idx);
+    }
+    // Fallback: compare lowercased and strip qualifiers.
+    let needle = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+    schema
+        .fields()
+        .iter()
+        .position(|f| f.name().to_ascii_lowercase() == needle)
+}
+
+fn resolve_group_index(name: &str, schema: &Schema, plan_schema: &llkv_plan::schema::PlanSchema) -> Option<usize> {
+    if let Some(idx) = resolve_schema_index(name, schema) {
+        return Some(idx);
+    }
+
+    let field_id = plan_schema
+        .column_by_name(name)
+        .map(|c| c.field_id)?;
+
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, f)| {
+            f.metadata()
+                .get("field_id")
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|fid| *fid == field_id)
+                .map(|_| idx)
+        })
 }
 
 fn extract_join_keys_and_filters(
@@ -2973,13 +3202,19 @@ fn infer_type(
         },
         ScalarExpr::Cast { data_type, .. } => Ok(data_type.clone()),
         ScalarExpr::Case { else_expr, branches, .. } => {
-             if let Some((_, t)) = branches.first() {
-                 infer_type(t, schema, col_mapping)
-             } else if let Some(e) = else_expr {
-                 infer_type(e, schema, col_mapping)
-             } else {
-                 Ok(DataType::Null)
-             }
+            let mut types = Vec::new();
+            for (_, t) in branches {
+                types.push(infer_type(t, schema, col_mapping)?);
+            }
+            if let Some(e) = else_expr {
+                types.push(infer_type(e, schema, col_mapping)?);
+            }
+
+            if let Some(non_null) = types.iter().find(|t| **t != DataType::Null) {
+                Ok(non_null.clone())
+            } else {
+                Ok(DataType::Null)
+            }
         },
         ScalarExpr::Coalesce(items) => {
             if let Some(first) = items.first() {

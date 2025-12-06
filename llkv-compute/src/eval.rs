@@ -434,7 +434,7 @@ impl ScalarEvaluator {
             }
             ScalarExpr::IsNull { expr, negated } => {
                 let val = Self::evaluate_value(expr, idx, arrays)?;
-                let is_null = val.is_null(0);
+                let is_null = val.data_type() == &DataType::Null || val.is_null(0);
                 let result = if *negated { !is_null } else { is_null };
                 Ok(Arc::new(arrow::array::BooleanArray::from(vec![result])))
             }

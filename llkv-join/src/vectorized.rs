@@ -24,6 +24,7 @@ pub struct VectorizedHashJoinStream<I> {
     cross_left_batch: Option<RecordBatch>,
     cross_left_row: usize,
     cross_right_row: usize,
+    cross_finished: bool,
 }
 
 impl<I> VectorizedHashJoinStream<I>
@@ -86,6 +87,7 @@ where
             cross_left_batch: None,
             cross_left_row: 0,
             cross_right_row: 0,
+            cross_finished: false,
         })
     }
 }
@@ -113,6 +115,10 @@ where
     const CROSS_CHUNK: usize = 4096;
 
     fn next_cross_batch(&mut self) -> Option<Result<RecordBatch, Error>> {
+        if self.cross_finished {
+            return None;
+        }
+
         let right_len = match self.join_map {
             JoinMap::Cross(count) => count as usize,
             _ => unreachable!(),
@@ -121,7 +127,8 @@ where
         // Defensive: ensure stored count reflects the batch we built from.
         debug_assert_eq!(right_len, self.right_batch.num_rows());
         if right_len == 0 {
-            return Some(Ok(RecordBatch::new_empty(self.schema.clone())));
+            self.cross_finished = true;
+            return None;
         }
 
         // Pull a left batch if we do not have one or exhausted it.
@@ -262,5 +269,44 @@ where
 
         Some(RecordBatch::try_new(Arc::clone(&self.schema), output_columns)
             .map_err(|e| Error::Internal(e.to_string())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn cross_join_with_empty_right_ends_stream() -> Result<(), Error> {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, true)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Int32, true)]));
+
+        let left_batch = RecordBatch::try_new(
+            left_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )?;
+        let right_batch = RecordBatch::new_empty(right_schema);
+
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Int32, true),
+            Field::new("r", DataType::Int32, true),
+        ]));
+
+        let left_stream = vec![Ok(left_batch)].into_iter();
+        let stream = VectorizedHashJoinStream::try_new(
+            output_schema,
+            left_stream,
+            right_batch,
+            JoinType::Inner,
+            Vec::new(),
+            Vec::new(),
+        )?;
+
+        let batches = stream.collect::<Result<Vec<_>, _>>()?;
+        assert!(batches.is_empty());
+        Ok(())
     }
 }
