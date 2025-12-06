@@ -20,7 +20,7 @@ use std::{cmp::Ordering, convert::TryFrom};
 pub use llkv_plan::{AggregateExpr, AggregateFunction};
 
 pub mod stream;
-pub use stream::AggregateStream;
+pub use stream::{AggregateStream, GroupedAggregateStream};
 
 /// Result type alias for aggregation routines.
 pub type AggregateResult<T> = Result<T, Error>;
@@ -89,6 +89,7 @@ impl AggregateKind {
 }
 
 /// Runtime state for an aggregate computation.
+#[derive(Clone)]
 pub struct AggregateState {
     pub alias: String,
     pub accumulator: AggregateAccumulator,
@@ -96,6 +97,7 @@ pub struct AggregateState {
 }
 
 /// Accumulator for incremental aggregate computation.
+#[derive(Clone)]
 pub enum AggregateAccumulator {
     CountStar {
         value: i64,
