@@ -75,6 +75,9 @@ where
 {
     pub tables: Vec<PlannedTable<P>>,
     pub table_order: Vec<TableRef>,
+    /// Filter predicates that reference a single table, partitioned by table index.
+    pub table_filters: Vec<Option<Expr<'static, ResolvedFieldRef>>>,
+    /// Residual filter predicates that reference multiple tables.
     pub filter: Option<Expr<'static, ResolvedFieldRef>>,
     pub original_filter: Option<Expr<'static, String>>,
     pub having: Option<Expr<'static, ResolvedFieldRef>>,
@@ -339,10 +342,15 @@ where
             filter.as_ref(),
         );
 
+        let table_count = planned_tables.len();
+        let (table_filters, residual_filter) =
+            partition_table_filters(filter.as_ref(), table_count);
+
         Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
             tables: planned_tables,
             table_order: plan.tables.clone(),
-            filter,
+            table_filters,
+            filter: residual_filter,
             original_filter: plan.filter.as_ref().map(|f| f.predicate.clone()),
             having,
             original_having: plan.having.clone(),
@@ -1238,6 +1246,127 @@ fn build_join_predicate(
         clauses.pop()
     } else {
         Some(Expr::And(clauses))
+    }
+}
+
+fn partition_table_filters(
+    filter: Option<&Expr<'static, ResolvedFieldRef>>,
+    table_count: usize,
+) -> (Vec<Option<Expr<'static, ResolvedFieldRef>>>, Option<Expr<'static, ResolvedFieldRef>>) {
+    let mut per_table: Vec<Vec<Expr<'static, ResolvedFieldRef>>> = vec![Vec::new(); table_count];
+    let mut residuals = Vec::new();
+
+    let clauses: Vec<Expr<'static, ResolvedFieldRef>> = match filter {
+        Some(Expr::And(list)) => list.clone(),
+        Some(expr) => vec![expr.clone()],
+        None => Vec::new(),
+    };
+
+    for clause in clauses {
+        let mut fields = FxHashSet::default();
+        collect_filter_tables(&clause, &mut fields);
+        if fields.len() == 1 {
+            let tbl = *fields.iter().next().unwrap();
+            if tbl < table_count {
+                per_table[tbl].push(clause);
+                continue;
+            }
+        }
+        residuals.push(clause);
+    }
+
+    let per_table = per_table
+        .into_iter()
+        .map(|mut clauses| {
+            if clauses.is_empty() {
+                None
+            } else if clauses.len() == 1 {
+                Some(clauses.pop().unwrap())
+            } else {
+                Some(Expr::And(clauses))
+            }
+        })
+        .collect();
+
+    let residual = if residuals.is_empty() {
+        None
+    } else if residuals.len() == 1 {
+        Some(residuals.pop().unwrap())
+    } else {
+        Some(Expr::And(residuals))
+    };
+
+    (per_table, residual)
+}
+
+fn collect_filter_tables(
+    expr: &Expr<'static, ResolvedFieldRef>,
+    out: &mut FxHashSet<usize>,
+) {
+    match expr {
+        Expr::And(list) | Expr::Or(list) => {
+            for e in list {
+                collect_filter_tables(e, out);
+            }
+        }
+        Expr::Not(e) => collect_filter_tables(e, out),
+        Expr::Compare { left, right, .. } => {
+            collect_scalar_tables(left, out);
+            collect_scalar_tables(right, out);
+        }
+        Expr::Pred(filter) => {
+            out.insert(filter.field_id.table_index);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_scalar_tables(expr, out);
+            for item in list {
+                collect_scalar_tables(item, out);
+            }
+        }
+        Expr::IsNull { expr, .. } => collect_scalar_tables(expr, out),
+        Expr::Literal(_) => {}
+        Expr::Exists(_) => {}
+    }
+}
+
+fn collect_scalar_tables(expr: &ScalarExpr<ResolvedFieldRef>, out: &mut FxHashSet<usize>) {
+    match expr {
+        ScalarExpr::Column(c) => {
+            out.insert(c.table_index);
+        }
+        ScalarExpr::Binary { left, right, .. }
+        | ScalarExpr::Compare { left, right, .. } => {
+            collect_scalar_tables(left, out);
+            collect_scalar_tables(right, out);
+        }
+        ScalarExpr::Not(e) | ScalarExpr::IsNull { expr: e, .. } => collect_scalar_tables(e, out),
+        ScalarExpr::Cast { expr, .. } => collect_scalar_tables(expr, out),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                collect_scalar_tables(o, out);
+            }
+            for (w, t) in branches {
+                collect_scalar_tables(w, out);
+                collect_scalar_tables(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_scalar_tables(e, out);
+            }
+        }
+        ScalarExpr::Coalesce(list) => {
+            for e in list {
+                collect_scalar_tables(e, out);
+            }
+        }
+        ScalarExpr::Random => {}
+        ScalarExpr::Aggregate(_) => {}
+        ScalarExpr::ScalarSubquery(_) => {}
+        ScalarExpr::Literal(_) => {}
+        ScalarExpr::GetField { base, .. } => collect_scalar_tables(base, out),
     }
 }
 

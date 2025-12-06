@@ -1469,8 +1469,13 @@ where
                 if table_count == 0 {
                      return Err(Error::Internal("Multi-table plan with no tables".into()));
                 }
-                let (table_filters, residual_filter) =
-                    partition_table_filters(multi.filter.as_ref(), table_count)?;
+
+                if multi.table_filters.len() != table_count {
+                    return Err(Error::Internal("table filter metadata does not match table count".into()));
+                }
+
+                let table_filters = multi.table_filters.clone();
+                let residual_filter = multi.filter.clone();
                 
                 // 1. Analyze required columns
                 let mut required_fields: Vec<FxHashSet<FieldId>> = vec![FxHashSet::default(); table_count];
@@ -1505,7 +1510,19 @@ where
                     }
                 }
                 
-                if let Some(filter) = &multi.filter {
+                for (tbl, filter) in table_filters.iter().enumerate() {
+                    if let Some(filter) = filter {
+                        let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                        ScalarEvaluator::collect_fields(&remap_filter_expr(filter)?, &mut fields);
+                        for (table_idx, fid) in fields {
+                            if table_idx == tbl {
+                                required_fields[table_idx].insert(fid);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(filter) = &residual_filter {
                      let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
                      ScalarEvaluator::collect_fields(&remap_filter_expr(filter)?, &mut fields);
                      for (tbl, fid) in fields {
@@ -2642,65 +2659,6 @@ fn collect_join_predicates(
             Ok(())
         }
     }
-}
-
-fn partition_table_filters(
-    filter: Option<&LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
-    table_count: usize,
-) -> ExecutorResult<(
-    Vec<Option<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>>,
-    Option<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>,
-)> {
-    let mut per_table: Vec<Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>>> =
-        vec![Vec::new(); table_count];
-    let mut residuals = Vec::new();
-
-    let clauses: Vec<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>> = match filter {
-        Some(LlkvExpr::And(list)) => list.clone(),
-        Some(expr) => vec![expr.clone()],
-        None => Vec::new(),
-    };
-
-    for clause in clauses {
-        let mapped = remap_filter_expr(&clause)?;
-        let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
-        ScalarEvaluator::collect_fields(&mapped, &mut fields);
-        let tables: FxHashSet<usize> = fields.into_iter().map(|(tbl, _)| tbl).collect();
-
-        if tables.len() == 1 {
-            let tbl = *tables.iter().next().unwrap();
-            if tbl < table_count {
-                per_table[tbl].push(clause);
-            } else {
-                residuals.push(clause);
-            }
-        } else {
-            residuals.push(clause);
-        }
-    }
-
-    let per_table = per_table
-        .into_iter()
-        .map(|mut clauses| {
-            if clauses.is_empty() {
-                None
-            } else if clauses.len() == 1 {
-                Some(clauses.pop().unwrap())
-            } else {
-                Some(LlkvExpr::And(clauses))
-            }
-        })
-        .collect();
-
-    let residual = if residuals.is_empty() {
-        None
-    } else if residuals.len() == 1 {
-        Some(residuals.pop().unwrap())
-    } else {
-        Some(LlkvExpr::And(residuals))
-    };
-
-    Ok((per_table, residual))
 }
 
 fn combine_clauses(

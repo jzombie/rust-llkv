@@ -82,6 +82,14 @@ Implementation order to avoid rework
 7) Add spill-safe, partitioned group-by/aggregate and keep late materialization for non-agg columns.
 8) Profile; add specialization/codegen only if gaps remain vs DuckDB/DataFusion baselines.
 
+## Recent profiling notes (select4)
+- Hot path is predicate evaluation in `llkv_scan::predicate` (`collect_row_ids_for_compare`/`in_list` and Treemap ops); many compares take the full-scan domain path because COALESCE/complex shapes survive pushdown.
+- Multi-field domains are built in fixed order; we should pick the most selective field first (stats-guided) and short-circuit empties to avoid wide domains.
+- Single-column literal `IN` falls back to per-chunk Arrow eval; fuse these into a single `filter_leaf`/`filter_fused` call to avoid repeated gathers/coercions.
+- Rayon overhead from `CHUNK_SIZE=4096` shows up; bump chunk size or make it adaptive to reduce task churn and Treemap merges.
+- Hash join still materializes the entire right side before build; needs chunked/streamed build to cut wall time and peak memory.
+- Planner should keep complex expressions (COALESCE/CASE) out of storage pushdown so we stay on single-column leaf filters where possible.
+
 ## Concerns
 
 - Table & column resolvers seem duplicated between llkv-table, llkv-executor, llkv-plan
