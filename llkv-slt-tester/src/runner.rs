@@ -313,8 +313,25 @@ impl LlkvSltRunner {
         // Execute all records with hash threshold and type hint handling
         let run_result = async {
             let mut current_hash_threshold: usize = 256;
+            let log_progress = std::env::var("LLKV_SLT_PROGRESS").is_ok();
+            let mut record_index: usize = 0;
 
             for record in records {
+                if log_progress {
+                    let preview = match &record {
+                        Record::Statement { sql, .. } => sql,
+                        Record::Query { sql, .. } => sql,
+                        _ => "<control>",
+                    };
+                    let single_line = preview.replace('\n', " ");
+                    let display = if single_line.len() > 80 {
+                        format!("{}...", &single_line[..80])
+                    } else {
+                        single_line
+                    };
+                    eprintln!("[llkv-slt] record {}: {}", record_index, display);
+                }
+
                 if let Record::Statement { expected, .. } = &record {
                     match expected {
                         StatementExpect::Error(_) => {
@@ -421,6 +438,8 @@ impl LlkvSltRunner {
                     current_hash_threshold = new_threshold;
                     runner.with_hash_threshold(new_threshold);
                 }
+
+                record_index += 1;
             }
 
             Ok::<(), sqllogictest::TestError>(())
