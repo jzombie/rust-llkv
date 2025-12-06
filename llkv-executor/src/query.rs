@@ -3,10 +3,15 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
+use arrow::row::{OwnedRow, RowConverter, SortField};
 use arrow::record_batch::RecordBatch;
+use arrow::compute::cast;
 use llkv_aggregate::{AggregateAccumulator, AggregateKind, AggregateSpec, AggregateState};
 use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr};
-use llkv_join::{JoinKey, JoinOptions, JoinSide, JoinType, TableJoinRowIdExt, project_join_columns};
+use llkv_expr::AggregateCall;
+use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
+use llkv_compute::eval::{ScalarEvaluator, ScalarExprTypeExt};
+use llkv_join::{JoinKey, JoinOptions, JoinType, TableJoinRowIdExt};
 use llkv_plan::logical_planner::{LogicalPlan, LogicalPlanner, ResolvedJoin};
 use llkv_plan::physical::table::{ExecutionTable, TableProvider};
 use llkv_plan::physical::PhysicalPlan;
@@ -18,7 +23,7 @@ use llkv_result::Error;
 use llkv_scan::RowIdFilter;
 use llkv_storage::pager::Pager;
 use llkv_types::FieldId;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::types::{ExecutorTable, ExecutorTableProvider};
@@ -82,17 +87,16 @@ where
                     let trimmed = apply_offset_limit(agg_batches, plan.offset, plan.limit);
                     Ok(SelectExecution::new(table_name, agg_schema, trimmed))
                 } else {
+                    let batches = if plan.distinct {
+                        distinct_record_batches(&schema, batches)?
+                    } else {
+                        batches
+                    };
                     let batches = apply_offset_limit(batches, plan.offset, plan.limit);
                     Ok(SelectExecution::new(table_name, schema, batches))
                 }
             }
             LogicalPlan::Multi(multi) => {
-                if multi.tables.len() != 2 {
-                    return Err(Error::InvalidArgumentError(
-                        "multi-table SELECT currently supports exactly two tables".into(),
-                    ));
-                }
-
                 if !multi.aggregates.is_empty()
                     || !multi.group_by.is_empty()
                     || multi.distinct
@@ -111,45 +115,34 @@ where
                     ));
                 }
 
-                let join = multi
-                    .joins
-                    .first()
-                    .ok_or_else(|| Error::InvalidArgumentError("missing join metadata".into()))?;
-
-                if join.left_table_index != 0 {
+                if multi.tables.len() < 2 {
                     return Err(Error::InvalidArgumentError(
-                        "only left-deep joins starting from the first table are supported".into(),
+                        "multi-table SELECT requires at least two tables".into(),
                     ));
                 }
 
-                let left = multi.tables.get(0).ok_or_else(|| {
-                    Error::InvalidArgumentError("missing left table in multi-table plan".into())
-                })?;
-                let right = multi.tables.get(1).ok_or_else(|| {
-                    Error::InvalidArgumentError("missing right table in multi-table plan".into())
-                })?;
+                let table_count = multi.tables.len();
+                let mut table_index_by_fid: Vec<FxHashMap<FieldId, usize>> = Vec::with_capacity(table_count);
+                let mut exec_tables: Vec<Arc<ExecutorTable<P>>> = Vec::with_capacity(table_count);
+                let mut field_id_by_table_index: Vec<Vec<FieldId>> = Vec::with_capacity(table_count);
 
-                let left_exec = left
-                    .table
-                    .as_any()
-                    .downcast_ref::<ExecutionTableAdapter<P>>()
-                    .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?
-                    .executor_table();
-                let right_exec = right
-                    .table
-                    .as_any()
-                    .downcast_ref::<ExecutionTableAdapter<P>>()
-                    .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?
-                    .executor_table();
-
-                let join_type = map_join_type(join.join_type)?;
-                let join_keys = extract_join_keys(join)?;
-
-                let left_index_by_fid = index_fields_by_id(&left.schema);
-                let right_index_by_fid = index_fields_by_id(&right.schema);
+                for table in &multi.tables {
+                    let adapter = table
+                        .table
+                        .as_any()
+                        .downcast_ref::<ExecutionTableAdapter<P>>()
+                        .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?;
+                    exec_tables.push(adapter.executor_table());
+                    field_id_by_table_index.push(table.schema.columns.iter().map(|c| c.field_id).collect());
+                    table_index_by_fid.push(index_fields_by_id(&table.schema));
+                }
 
                 let mut output_fields = Vec::with_capacity(multi.projections.len());
-                let mut projection_plan = Vec::with_capacity(multi.projections.len());
+                let mut computed_projections: Vec<ComputedProjectionPlan> = Vec::new();
+                let mut gather_plan_per_table: Vec<Vec<usize>> = vec![Vec::new(); table_count];
+                let mut projection_out_map: Vec<Vec<(usize, usize)>> = vec![Vec::new(); table_count];
+                let mut gather_index_cache: Vec<FxHashMap<usize, usize>> =
+                    vec![FxHashMap::default(); table_count];
 
                 for proj in &multi.projections {
                     match proj {
@@ -158,18 +151,22 @@ where
                             logical_field_id,
                             alias,
                         } => {
-                            let (schema, index_by_fid) = if *table_index == 0 {
-                                (&left.schema, &left_index_by_fid)
-                            } else {
-                                (&right.schema, &right_index_by_fid)
-                            };
+                            if *table_index >= table_count {
+                                return Err(Error::InvalidArgumentError(format!(
+                                    "projection references missing table {}",
+                                    table_index
+                                )));
+                            }
 
+                            let schema = &multi.tables[*table_index].schema;
+                            let index_by_fid = &table_index_by_fid[*table_index];
                             let field_id = logical_field_id.field_id();
                             let Some(col_idx) = index_by_fid.get(&field_id).copied() else {
                                 return Err(Error::InvalidArgumentError(
                                     format!("field_id {field_id} not found in table {table_index}"),
                                 ));
                             };
+
                             let col = schema
                                 .columns
                                 .get(col_idx)
@@ -181,94 +178,215 @@ where
                                 col.is_nullable,
                             );
                             output_fields.push(field);
-                            projection_plan.push((*table_index, col_idx));
+                            let gather_idx = if let Some(existing) = gather_index_cache[*table_index].get(&col_idx) {
+                                *existing
+                            } else {
+                                let next = gather_plan_per_table[*table_index].len();
+                                gather_plan_per_table[*table_index].push(col_idx);
+                                gather_index_cache[*table_index].insert(col_idx, next);
+                                next
+                            };
+                            projection_out_map[*table_index].push((output_fields.len() - 1, gather_idx));
                         }
-                        llkv_plan::logical_planner::ResolvedProjection::Computed { .. } => {
-                            return Err(Error::InvalidArgumentError(
-                                "computed projections are not supported yet for multi-table SELECT".into(),
-                            ))
+                        llkv_plan::logical_planner::ResolvedProjection::Computed { expr, alias } => {
+                            let remapped_expr = remap_scalar_expr(expr);
+
+                            let mut resolver = |key: (usize, FieldId)| {
+                                table_index_by_fid.get(key.0).and_then(|idx_map| {
+                                    idx_map
+                                        .get(&key.1)
+                                        .and_then(|col_idx| multi.tables[key.0]
+                                            .schema
+                                            .columns
+                                            .get(*col_idx)
+                                            .map(|c| c.data_type.clone()))
+                                })
+                            };
+
+                            let data_type = remapped_expr
+                                .infer_result_type(&mut resolver)
+                                .ok_or_else(|| {
+                                    Error::InvalidArgumentError(
+                                        "unable to infer type for computed projection".into(),
+                                    )
+                                })?;
+
+                            output_fields.push(ArrowField::new(alias.clone(), data_type.clone(), true));
+                            let out_index = output_fields.len() - 1;
+
+                            let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                            ScalarEvaluator::collect_fields(&remapped_expr, &mut fields);
+                            for (tbl_idx, fid) in fields {
+                                let col_idx = table_index_by_fid
+                                    .get(tbl_idx)
+                                    .and_then(|map| map.get(&fid).copied())
+                                    .ok_or_else(|| {
+                                        Error::InvalidArgumentError(format!(
+                                            "field_id {fid} not found in table {tbl_idx}"
+                                        ))
+                                    })?;
+
+                                if let std::collections::hash_map::Entry::Vacant(entry) =
+                                    gather_index_cache[tbl_idx].entry(col_idx)
+                                {
+                                    let next = gather_plan_per_table[tbl_idx].len();
+                                    gather_plan_per_table[tbl_idx].push(col_idx);
+                                    entry.insert(next);
+                                }
+                            }
+
+                            computed_projections.push(ComputedProjectionPlan {
+                                expr: remapped_expr,
+                                data_type,
+                                out_index,
+                            });
                         }
                     }
                 }
 
-                let mut left_projection = Vec::new();
-                let mut right_projection = Vec::new();
-                let mut left_out_map = Vec::new();
-                let mut right_out_map = Vec::new();
+                let mut join_plan_by_left: Vec<Option<&ResolvedJoin>> = vec![None; table_count - 1];
+                for join in &multi.joins {
+                    if join.left_table_index + 1 >= table_count {
+                        return Err(Error::InvalidArgumentError(
+                            "join references table outside the FROM clause".into(),
+                        ));
+                    }
+                    if join_plan_by_left[join.left_table_index].is_some() {
+                        return Err(Error::InvalidArgumentError(
+                            "only one join per adjacent table pair is supported".into(),
+                        ));
+                    }
+                    join_plan_by_left[join.left_table_index] = Some(join);
+                }
 
-                for (out_idx, (table_idx, col_idx)) in projection_plan.iter().enumerate() {
-                    if *table_idx == 0 {
-                        let proj_idx = left_projection.len();
-                        left_projection.push(*col_idx);
-                        left_out_map.push((out_idx, proj_idx));
-                    } else {
-                        let proj_idx = right_projection.len();
-                        right_projection.push(*col_idx);
-                        right_out_map.push((out_idx, proj_idx));
+                let mut table_batches: Vec<Option<Vec<RecordBatch>>> = vec![None; table_count];
+                let mut adjacencies = Vec::with_capacity(table_count - 1);
+
+                let output_schema = Arc::new(Schema::new(output_fields));
+                let join_batch_size = JoinOptions::default().batch_size.max(1);
+
+                for left_index in 0..table_count - 1 {
+                    let join_meta = join_plan_by_left[left_index];
+                    let join_type = match join_meta {
+                        Some(meta) => map_join_type(meta.join_type)?,
+                        None => JoinType::Inner,
+                    };
+                    let join_keys = match join_meta {
+                        Some(meta) => extract_join_keys(meta)?,
+                        None => Vec::new(),
+                    };
+
+                    let options = JoinOptions {
+                        join_type,
+                        ..Default::default()
+                    };
+
+                    let right_index = left_index + 1;
+                    let left_exec = &exec_tables[left_index];
+                    let right_exec = &exec_tables[right_index];
+                    let mut matches: FxHashMap<(usize, usize), Vec<Option<llkv_join::JoinRowRef>>> =
+                        FxHashMap::default();
+
+                    left_exec.table.join_rowid_stream_with_filter(
+                        &right_exec.table,
+                        &join_keys,
+                        &options,
+                        row_filter.clone(),
+                        row_filter.clone(),
+                        |index_batch| {
+                            if table_batches[left_index].is_none() {
+                                table_batches[left_index] =
+                                    Some(index_batch.left_batches.iter().cloned().collect());
+                            }
+                            if table_batches[right_index].is_none() {
+                                table_batches[right_index] =
+                                    Some(index_batch.right_batches.iter().cloned().collect());
+                            }
+
+                            for (left_row, right_row) in index_batch
+                                .left_rows
+                                .iter()
+                                .zip(index_batch.right_rows.iter())
+                            {
+                                matches
+                                    .entry((left_row.batch, left_row.row))
+                                    .or_default()
+                                    .push(*right_row);
+                            }
+                        },
+                    )?;
+
+                    adjacencies.push(JoinAdjacency {
+                        left_index,
+                        _right_index: right_index,
+                        join_type,
+                        matches,
+                    });
+                }
+
+                for (idx, batches) in table_batches.iter().enumerate() {
+                    if batches.is_none() {
+                        return Err(Error::Internal(format!("missing batches for table {idx}")));
                     }
                 }
 
+                let mut buffered_rows: Vec<Vec<Option<llkv_join::JoinRowRef>>> = Vec::new();
                 let mut result_batches = Vec::new();
-                let options = JoinOptions {
-                    join_type,
-                    ..Default::default()
+
+                let table_zero_batches = table_batches[0].as_ref().expect("validated above");
+                let mut emit_path = |
+                    path: &[Option<llkv_join::JoinRowRef>],
+                    buffered_rows: &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
+                    result_batches: &mut Vec<RecordBatch>,
+                | -> ExecutorResult<()> {
+                    buffered_rows.push(path.to_vec());
+                    if buffered_rows.len() >= join_batch_size {
+                        flush_join_rows(
+                            buffered_rows,
+                            &gather_plan_per_table,
+                            &projection_out_map,
+                            &table_batches,
+                            &output_schema,
+                            &computed_projections,
+                            &field_id_by_table_index,
+                            result_batches,
+                        )?;
+                    }
+                    Ok(())
                 };
 
-                let output_schema = Arc::new(Schema::new(output_fields.clone()));
+                let mut path: Vec<Option<llkv_join::JoinRowRef>> = Vec::with_capacity(table_count);
 
-                left_exec.table.join_rowid_stream_with_filter(
-                    &right_exec.table,
-                    &join_keys,
-                    &options,
-                    row_filter.clone(),
-                    row_filter.clone(),
-                    |index_batch| {
-                        let filtered_batch = index_batch;
+                for (batch_idx, batch) in table_zero_batches.iter().enumerate() {
+                    for row_idx in 0..batch.num_rows() {
+                        path.clear();
+                        path.push(Some(llkv_join::JoinRowRef {
+                            batch: batch_idx,
+                            row: row_idx,
+                        }));
+                        walk_join_paths(
+                            0,
+                            &adjacencies,
+                            &mut path,
+                            &mut emit_path,
+                            &mut buffered_rows,
+                            &mut result_batches,
+                        )?;
+                    }
+                }
 
-                        if filtered_batch.left_rows.is_empty() {
-                            return;
-                        }
-
-                        let left_arrays = if left_projection.is_empty() {
-                            Vec::new()
-                        } else {
-                            project_join_columns(
-                                &filtered_batch,
-                                JoinSide::Left,
-                                &left_projection,
-                            )
-                            .expect("left projection gather failed")
-                        };
-
-                        let right_arrays = if right_projection.is_empty() {
-                            Vec::new()
-                        } else {
-                            project_join_columns(
-                                &filtered_batch,
-                                JoinSide::Right,
-                                &right_projection,
-                            )
-                            .expect("right projection gather failed")
-                        };
-
-                        let mut columns = vec![None; projection_plan.len()];
-                        for (out_idx, proj_idx) in &left_out_map {
-                            columns[*out_idx] = Some(left_arrays[*proj_idx].clone());
-                        }
-                        for (out_idx, proj_idx) in &right_out_map {
-                            columns[*out_idx] = Some(right_arrays[*proj_idx].clone());
-                        }
-
-                        let columns: Vec<_> = columns
-                            .into_iter()
-                            .map(|c| c.expect("projection column missing"))
-                            .collect();
-
-                        let batch = RecordBatch::try_new(output_schema.clone(), columns)
-                            .expect("join projection record batch creation failed");
-                        result_batches.push(batch);
-                    },
-                )?;
+                if !buffered_rows.is_empty() {
+                    flush_join_rows(
+                        &mut buffered_rows,
+                        &gather_plan_per_table,
+                        &projection_out_map,
+                        &table_batches,
+                        &output_schema,
+                        &computed_projections,
+                        &field_id_by_table_index,
+                        &mut result_batches,
+                    )?;
+                }
 
                 let schema = output_schema;
                 let batches = apply_offset_limit(result_batches, plan.offset, plan.limit);
@@ -281,6 +399,193 @@ where
             }
         }
     }
+}
+
+fn flush_join_rows(
+    rows: &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
+    gather_plan_per_table: &[Vec<usize>],
+    projection_out_map: &[Vec<(usize, usize)>],
+    table_batches: &[Option<Vec<RecordBatch>>],
+    output_schema: &SchemaRef,
+    computed_projections: &[ComputedProjectionPlan],
+    field_id_by_table_index: &[Vec<FieldId>],
+    result_batches: &mut Vec<RecordBatch>,
+) -> ExecutorResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let table_count = gather_plan_per_table.len();
+    let mut per_table_rows: Vec<Vec<Option<(usize, usize)>>> = vec![Vec::new(); table_count];
+
+    for row in rows.iter() {
+        for (tbl_idx, cell) in row.iter().enumerate() {
+            if let Some(rr) = cell {
+                per_table_rows[tbl_idx].push(Some((rr.batch, rr.row)));
+            } else {
+                per_table_rows[tbl_idx].push(None);
+            }
+        }
+    }
+
+    let mut table_arrays: Vec<Vec<arrow::array::ArrayRef>> = vec![Vec::new(); table_count];
+
+    for tbl_idx in 0..table_count {
+        if gather_plan_per_table[tbl_idx].is_empty() {
+            continue;
+        }
+
+        let batches = table_batches[tbl_idx]
+            .as_ref()
+            .ok_or_else(|| Error::Internal("validated earlier for all tables".into()))?;
+        let arrays = gather_optional_projected_indices_from_batches(
+            batches,
+            &per_table_rows[tbl_idx],
+            &gather_plan_per_table[tbl_idx],
+        )
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        table_arrays[tbl_idx] = arrays;
+    }
+
+    let total_columns: usize = output_schema.fields().len();
+    let mut columns: Vec<Option<arrow::array::ArrayRef>> = vec![None; total_columns];
+
+    for (tbl_idx, out_map) in projection_out_map.iter().enumerate() {
+        for (out_idx, proj_idx) in out_map {
+            let arr = table_arrays
+                .get(tbl_idx)
+                .and_then(|arrays| arrays.get(*proj_idx))
+                .ok_or_else(|| Error::Internal("projection index missing".into()))?
+                .clone();
+            columns[*out_idx] = Some(arr);
+        }
+    }
+
+    if !computed_projections.is_empty() {
+        let mut field_arrays: FxHashMap<(usize, FieldId), arrow::array::ArrayRef> = FxHashMap::default();
+        for (tbl_idx, gather_plan) in gather_plan_per_table.iter().enumerate() {
+            if gather_plan.is_empty() {
+                continue;
+            }
+
+            let arrays = table_arrays
+                .get(tbl_idx)
+                .ok_or_else(|| Error::Internal("projection arrays missing".into()))?;
+            let field_ids = field_id_by_table_index
+                .get(tbl_idx)
+                .ok_or_else(|| Error::Internal("field ids missing".into()))?;
+
+            for (arr_idx, col_idx) in gather_plan.iter().enumerate() {
+                let fid = *field_ids
+                    .get(*col_idx)
+                    .ok_or_else(|| Error::Internal("field id missing for column".into()))?;
+                let array = arrays
+                    .get(arr_idx)
+                    .ok_or_else(|| Error::Internal("array missing for gather index".into()))?
+                    .clone();
+                field_arrays.insert((tbl_idx, fid), array);
+            }
+        }
+
+        let row_count = rows.len();
+        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, row_count);
+
+        for computed in computed_projections {
+            let evaluated = ScalarEvaluator::evaluate_batch_simplified(
+                &computed.expr,
+                row_count,
+                &numeric_arrays,
+            )
+            .map_err(|e| Error::Internal(e.to_string()))?;
+
+            let value = if evaluated.data_type() != &computed.data_type {
+                cast(&evaluated, &computed.data_type)
+                    .map_err(|e| Error::Internal(e.to_string()))?
+            } else {
+                evaluated
+            };
+
+            columns[computed.out_index] = Some(value);
+        }
+    }
+
+    let columns: Vec<_> = columns
+        .into_iter()
+        .map(|c| c.ok_or_else(|| Error::Internal("projection column missing".into())))
+        .collect::<Result<_, _>>()?;
+
+    let batch = RecordBatch::try_new(output_schema.clone(), columns)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    result_batches.push(batch);
+    rows.clear();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_join_paths<F>(
+    depth: usize,
+    adjacencies: &[JoinAdjacency],
+    path: &mut Vec<Option<llkv_join::JoinRowRef>>,
+    emit_path: &mut F,
+    buffered_rows: &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
+    result_batches: &mut Vec<RecordBatch>,
+) -> ExecutorResult<()>
+where
+    F: FnMut(
+        &[Option<llkv_join::JoinRowRef>],
+        &mut Vec<Vec<Option<llkv_join::JoinRowRef>>>,
+        &mut Vec<RecordBatch>,
+    ) -> ExecutorResult<()>,
+{
+    if depth >= adjacencies.len() {
+        emit_path(path, buffered_rows, result_batches)?;
+        return Ok(());
+    }
+
+    let adj = &adjacencies[depth];
+    let left_cell = path.get(adj.left_index).and_then(|c| *c);
+
+    let candidates = left_cell
+        .and_then(|lr| adj.matches.get(&(lr.batch, lr.row)));
+
+    match candidates {
+        Some(list) if !list.is_empty() => {
+            for candidate in list {
+                path.push(*candidate);
+                walk_join_paths(
+                    depth + 1,
+                    adjacencies,
+                    path,
+                    emit_path,
+                    buffered_rows,
+                    result_batches,
+                )?;
+                path.pop();
+            }
+        }
+        _ if matches!(adj.join_type, JoinType::Left) => {
+            path.push(None);
+            walk_join_paths(
+                depth + 1,
+                adjacencies,
+                path,
+                emit_path,
+                buffered_rows,
+                result_batches,
+            )?;
+            path.pop();
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+struct JoinAdjacency {
+    left_index: usize,
+    _right_index: usize,
+    join_type: JoinType,
+    matches: FxHashMap<(usize, usize), Vec<Option<llkv_join::JoinRowRef>>>,
 }
 
 fn collect_batches(plan: &dyn PhysicalPlan) -> ExecutorResult<Vec<RecordBatch>> {
@@ -540,6 +845,12 @@ where
     plan_schema: Arc<llkv_plan::schema::PlanSchema>,
 }
 
+struct ComputedProjectionPlan {
+    expr: ScalarExpr<(usize, FieldId)>,
+    data_type: arrow::datatypes::DataType,
+    out_index: usize,
+}
+
 impl<P> fmt::Debug for ExecutionTableAdapter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -591,6 +902,149 @@ fn index_fields_by_id(schema: &PlanSchema) -> FxHashMap<FieldId, usize> {
         map.insert(col.field_id, idx);
     }
     map
+}
+
+fn distinct_record_batches(
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> ExecutorResult<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sort_fields: Vec<SortField> = schema
+        .fields()
+        .iter()
+        .map(|f| SortField::new(f.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
+
+    let mut seen: FxHashSet<OwnedRow> = FxHashSet::default();
+    let mut unique_rows: Vec<Option<(usize, usize)>> = Vec::new();
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let rows = converter
+            .convert_columns(batch.columns())
+            .map_err(|e| Error::Internal(e.to_string()))?;
+
+        for row_idx in 0..batch.num_rows() {
+            let owned = rows.row(row_idx).owned();
+            if seen.insert(owned) {
+                unique_rows.push(Some((batch_idx, row_idx)));
+            }
+        }
+    }
+
+    if unique_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let projection: Vec<usize> = (0..schema.fields().len()).collect();
+    let arrays = gather_optional_projected_indices_from_batches(
+        &batches,
+        &unique_rows,
+        &projection,
+    )
+    .map_err(|e| Error::Internal(e.to_string()))?;
+
+    let batch = RecordBatch::try_new(Arc::clone(schema), arrays)
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(vec![batch])
+}
+
+fn remap_scalar_expr(
+    expr: &ScalarExpr<llkv_plan::logical_planner::ResolvedFieldRef>,
+) -> ScalarExpr<(usize, FieldId)> {
+    match expr {
+        ScalarExpr::Column(resolved) => {
+            ScalarExpr::Column((resolved.table_index, resolved.logical_field_id.field_id()))
+        }
+        ScalarExpr::Literal(lit) => ScalarExpr::Literal(lit.clone()),
+        ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+            left: Box::new(remap_scalar_expr(left)),
+            op: *op,
+            right: Box::new(remap_scalar_expr(right)),
+        },
+        ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+            left: Box::new(remap_scalar_expr(left)),
+            op: *op,
+            right: Box::new(remap_scalar_expr(right)),
+        },
+        ScalarExpr::Not(inner) => ScalarExpr::Not(Box::new(remap_scalar_expr(inner))),
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(remap_scalar_expr(expr)),
+            negated: *negated,
+        },
+        ScalarExpr::Aggregate(call) => ScalarExpr::Aggregate(match call {
+            AggregateCall::CountStar => AggregateCall::CountStar,
+            AggregateCall::Count { expr, distinct } => AggregateCall::Count {
+                expr: Box::new(remap_scalar_expr(expr)),
+                distinct: *distinct,
+            },
+            AggregateCall::Sum { expr, distinct } => AggregateCall::Sum {
+                expr: Box::new(remap_scalar_expr(expr)),
+                distinct: *distinct,
+            },
+            AggregateCall::Total { expr, distinct } => AggregateCall::Total {
+                expr: Box::new(remap_scalar_expr(expr)),
+                distinct: *distinct,
+            },
+            AggregateCall::Avg { expr, distinct } => AggregateCall::Avg {
+                expr: Box::new(remap_scalar_expr(expr)),
+                distinct: *distinct,
+            },
+            AggregateCall::Min(expr) => AggregateCall::Min(Box::new(remap_scalar_expr(expr))),
+            AggregateCall::Max(expr) => AggregateCall::Max(Box::new(remap_scalar_expr(expr))),
+            AggregateCall::CountNulls(expr) => {
+                AggregateCall::CountNulls(Box::new(remap_scalar_expr(expr)))
+            }
+            AggregateCall::GroupConcat {
+                expr,
+                distinct,
+                separator,
+            } => AggregateCall::GroupConcat {
+                expr: Box::new(remap_scalar_expr(expr)),
+                distinct: *distinct,
+                separator: separator.clone(),
+            },
+        }),
+        ScalarExpr::GetField { base, field_name } => ScalarExpr::GetField {
+            base: Box::new(remap_scalar_expr(base)),
+            field_name: field_name.clone(),
+        },
+        ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+            expr: Box::new(remap_scalar_expr(expr)),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => ScalarExpr::Case {
+            operand: operand
+                .as_deref()
+                .map(remap_scalar_expr)
+                .map(Box::new),
+            branches: branches
+                .iter()
+                .map(|(when_expr, then_expr)| {
+                    (
+                        remap_scalar_expr(when_expr),
+                        remap_scalar_expr(then_expr),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_deref()
+                .map(remap_scalar_expr)
+                .map(Box::new),
+        },
+        ScalarExpr::Coalesce(items) => {
+            ScalarExpr::Coalesce(items.iter().map(remap_scalar_expr).collect())
+        }
+        ScalarExpr::Random => ScalarExpr::Random,
+        ScalarExpr::ScalarSubquery(subquery) => ScalarExpr::ScalarSubquery(subquery.clone()),
+    }
 }
 
 fn map_join_type(join_plan: JoinPlan) -> ExecutorResult<JoinType> {
