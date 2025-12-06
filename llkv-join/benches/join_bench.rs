@@ -2,18 +2,6 @@
 //!
 //! These benchmarks measure join performance with various data sizes and
 //! join types to guide optimization work.
-//!
-//! ## Current Status
-//!
-//! **Nested-loop join only**: O(N×M) complexity makes it impractical for large datasets.
-//! - 10K×10K = 100M comparisons (~1.5 seconds)
-//! - 100K×100K = 10B comparisons (~2.5 minutes)  
-//! - 1M×1M = 1T comparisons (hours - don't even try!)
-//!
-//! **TODO: Implement hash join** (O(N+M)) for production workloads:
-//! - 1M×1M would become ~2M operations (seconds instead of hours)
-//! - See `/Users/administrator/Projects/rust-llkv/llkv-join/src/hash_join.rs`
-//! - Once implemented, add `bench_hash_join_*` functions here for 100K, 1M, 10M row tests
 
 use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
