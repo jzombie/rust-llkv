@@ -98,3 +98,4 @@ Implementation order to avoid rework
 - Previous compile paths, are they still used at all?
 - Perf overhead from potentially using TreeMap in the wrong places
 - Hardcoded column range greater than 10,000 (magic number reserved) for internal usage [can these be offloaded to a temp table with a zero-additional-cost perf somehow]?
+- Table resolver logic should be centralized
