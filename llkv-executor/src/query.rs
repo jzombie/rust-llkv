@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, mpsc};
 
-use arrow::compute::concat_batches;
+use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::array::{ArrayRef, Array, BooleanArray};
 
 impl<P> QueryExecutor<P>
@@ -22,6 +22,7 @@ where
         table_name: String,
         subquery_results: &FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
         key_indices: Vec<usize>,
+        having_expr: Option<ScalarExpr<String>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let mut plan_columns = Vec::new();
         let mut name_to_index = FxHashMap::default();
@@ -59,8 +60,37 @@ where
             (Box::new(stream.map(|b| b)), schema)
         };
 
-        if let Some(having) = &plan.having {
-            agg_iter = self.apply_residual_filter(agg_iter, having.clone(), Vec::new());
+        if let Some(having_expr) = having_expr {
+            let having_expr_captured =
+                resolve_scalar_expr_string(&having_expr, &agg_schema, subquery_results)?;
+            agg_iter = Box::new(agg_iter.map(move |batch_res| {
+                let batch = batch_res?;
+
+                let mut field_arrays = FxHashMap::default();
+                for (i, col) in batch.columns().iter().enumerate() {
+                    field_arrays.insert((0, i as u32), col.clone());
+                }
+                let numeric_arrays =
+                    ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+
+                let filter_value = ScalarEvaluator::evaluate_batch_simplified(
+                    &having_expr_captured,
+                    batch.num_rows(),
+                    &numeric_arrays,
+                )?;
+
+                let bool_arr = filter_value
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        Error::Internal(
+                            "HAVING expression must evaluate to a boolean array".to_string(),
+                        )
+                    })?;
+
+                filter_record_batch(&batch, bool_arr)
+                    .map_err(|e| Error::Internal(format!("HAVING filter failed: {e}")))
+            }));
         }
 
         let mut final_output_fields = Vec::new();
@@ -1381,7 +1411,15 @@ where
                     }
                 }
 
-                let (new_aggregates, final_exprs, pre_agg_exprs) = extract_complex_aggregates(&string_projections);
+                let having_exprs: Vec<ScalarExpr<String>> = plan
+                    .having
+                    .as_ref()
+                    .map(|h| vec![Self::expr_to_scalar_expr(h)])
+                    .unwrap_or_default();
+
+                let (new_aggregates, final_exprs, pre_agg_exprs, rewritten_having_exprs) =
+                    extract_complex_aggregates(&string_projections, &having_exprs);
+                let rewritten_having_expr = rewritten_having_exprs.into_iter().next();
                 
                 if !new_aggregates.is_empty() {
                      // Create pre-agg plan that projects the arguments for aggregation
@@ -1394,7 +1432,7 @@ where
                      }).collect();
 
                      for key in &plan.group_by {
-                         if !projs.iter().any(|p| matches!(p, llkv_plan::plans::SelectProjection::Column { name, .. } if name == key)) {
+                        if !projs.iter().any(|p| matches!(p, llkv_plan::plans::SelectProjection::Column { name, .. } if name == key.as_str())) {
                              projs.push(llkv_plan::plans::SelectProjection::Column { name: key.clone(), alias: None });
                          }
                      }
@@ -1446,6 +1484,7 @@ where
                                 table_name,
                                 &subquery_results,
                                 key_indices,
+                                rewritten_having_expr,
                             );
                         }
                         _ => {
@@ -1912,7 +1951,15 @@ where
                     string_projections.push(map_expr_to_names(&expr, &col_mapping, &current_schema)?);
                 }
 
-                let (new_aggregates, final_exprs, pre_agg_exprs) = extract_complex_aggregates(&string_projections);
+                let having_exprs: Vec<ScalarExpr<String>> = plan
+                    .having
+                    .as_ref()
+                    .map(|h| vec![Self::expr_to_scalar_expr(h)])
+                    .unwrap_or_default();
+
+                let (new_aggregates, final_exprs, pre_agg_exprs, rewritten_having_exprs) =
+                    extract_complex_aggregates(&string_projections, &having_exprs);
+                let rewritten_having_expr = rewritten_having_exprs.into_iter().next();
                 let has_aggregates = !new_aggregates.is_empty();
 
                 let mut final_names = Vec::new();
@@ -2039,6 +2086,7 @@ where
                         table_name,
                         &subquery_results,
                         group_key_indices,
+                        rewritten_having_expr,
                     );
                 }
 
@@ -3141,10 +3189,25 @@ impl AggVisitor {
 
 fn extract_complex_aggregates(
     projections: &[ScalarExpr<String>],
-) -> (Vec<AggregateExpr>, Vec<ScalarExpr<String>>, Vec<ScalarExpr<String>>) {
+    additional_exprs: &[ScalarExpr<String>],
+) -> (
+    Vec<AggregateExpr>,
+    Vec<ScalarExpr<String>>,
+    Vec<ScalarExpr<String>>,
+    Vec<ScalarExpr<String>>,
+) {
     let mut visitor = AggVisitor::new();
     let rewritten = projections.iter().map(|p| visitor.visit(p)).collect();
-    (visitor.aggregates, rewritten, visitor.pre_agg_projections)
+    let additional_rewritten = additional_exprs
+        .iter()
+        .map(|e| visitor.visit(e))
+        .collect();
+    (
+        visitor.aggregates,
+        rewritten,
+        visitor.pre_agg_projections,
+        additional_rewritten,
+    )
 }
 
 fn resolve_scalar_expr_string(
