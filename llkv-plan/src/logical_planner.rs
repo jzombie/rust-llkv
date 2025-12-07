@@ -18,6 +18,11 @@ use llkv_types::{FieldId, LogicalFieldId, TableId};
 use rustc_hash::FxHashSet;
 use simd_r_drive_entry_handle::EntryHandle;
 
+use crate::aggregate_rewrite::{
+    AggregateRewrite, build_single_aggregate_rewrite, expr_to_scalar_expr,
+    extract_complex_aggregates,
+};
+
 use crate::physical::table::{ExecutionTable, TableProvider};
 use crate::plans::{OrderByPlan, OrderTarget, SelectPlan, TableRef};
 use crate::schema::PlanSchema;
@@ -54,6 +59,7 @@ where
     pub extra_columns: Vec<String>,
     pub scalar_subqueries: Vec<crate::plans::ScalarSubquery>,
     pub filter_subqueries: Vec<crate::plans::FilterSubquery>,
+    pub aggregate_rewrite: Option<AggregateRewrite>,
 }
 
 impl<P> SingleTableLogicalPlan<P>
@@ -100,6 +106,7 @@ where
     pub unresolved_required: Vec<String>,
     pub scalar_subqueries: Vec<crate::plans::ScalarSubquery>,
     pub filter_subqueries: Vec<crate::plans::FilterSubquery>,
+    pub aggregate_rewrite: Option<AggregateRewrite>,
 }
 
 pub struct PlannedTable<P>
@@ -266,6 +273,47 @@ where
             }
         }
 
+        let aggregate_rewrite = build_single_aggregate_rewrite(plan, &schema)?;
+        if let Some(rewrite) = &aggregate_rewrite {
+            let mut rewrite_columns = Vec::new();
+            for expr in &rewrite.pre_aggregate_expressions {
+                collect_scalar_columns(expr, &mut rewrite_columns);
+            }
+            if let Some(having) = &rewrite.rewritten_having {
+                collect_scalar_columns(having, &mut rewrite_columns);
+            }
+            for name in rewrite_columns {
+                if let Some(col) = schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&name))
+                {
+                    let logical_field_id = LogicalFieldId::for_user(table_id, col.field_id);
+                    let already_present = scan_projections.iter().any(|p| match p {
+                        ScanProjection::Column(sp) => {
+                            sp.logical_field_id.field_id() == logical_field_id.field_id()
+                        }
+                        _ => false,
+                    });
+                    if !already_present {
+                        scan_projections.insert(
+                            0,
+                            ScanProjection::Column(StoreProjection {
+                                logical_field_id,
+                                alias: None,
+                            }),
+                        );
+                        if !extra_columns
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(&col.name))
+                        {
+                            extra_columns.push(col.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         let scan_schema = schema_for_projections(&schema, &scan_projections)?;
         let final_schema = schema_for_projections(&schema, &requested_projections)?;
 
@@ -297,6 +345,7 @@ where
                 .as_ref()
                 .map(|f| f.subqueries.clone())
                 .unwrap_or_default(),
+            aggregate_rewrite,
         }))
     }
 
@@ -346,6 +395,8 @@ where
         let (table_filters, residual_filter) =
             partition_table_filters(filter.as_ref(), table_count);
 
+        let aggregate_rewrite = build_multi_aggregate_rewrite(plan, &ctx)?;
+
         Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
             tables: planned_tables,
             table_order: plan.tables.clone(),
@@ -369,6 +420,7 @@ where
                 .as_ref()
                 .map(|f| f.subqueries.clone())
                 .unwrap_or_default(),
+            aggregate_rewrite,
         }))
     }
 }
@@ -467,6 +519,97 @@ pub fn projection_name(proj: &ScanProjection, schema: &PlanSchema) -> String {
     }
 }
 
+
+fn build_multi_projection_exprs<P>(
+    plan: &SelectPlan,
+    ctx: &ResolutionContext<P>,
+) -> Result<Vec<(ScalarExpr<String>, String)>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let projections = if plan.projections.is_empty() {
+        vec![crate::plans::SelectProjection::AllColumns]
+    } else {
+        plan.projections.clone()
+    };
+
+    let mut out = Vec::new();
+    for proj in projections {
+        match proj {
+            crate::plans::SelectProjection::AllColumns => {
+                for table in ctx.tables.iter() {
+                    for col in &table.schema.columns {
+                        out.push((ScalarExpr::Column(col.name.clone()), col.name.clone()));
+                    }
+                }
+            }
+            crate::plans::SelectProjection::AllColumnsExcept { exclude } => {
+                for table in ctx.tables.iter() {
+                    for col in &table.schema.columns {
+                        if exclude.iter().any(|ex| ex.eq_ignore_ascii_case(&col.name)) {
+                            continue;
+                        }
+                        out.push((ScalarExpr::Column(col.name.clone()), col.name.clone()));
+                    }
+                }
+            }
+            crate::plans::SelectProjection::Column { name, alias } => {
+                let (table_idx, lfid) = resolve_column_ref(ctx, &name)?;
+                let canonical_name = ctx
+                    .tables
+                    .get(table_idx)
+                    .and_then(|t| {
+                        t.schema
+                            .columns
+                            .iter()
+                            .find(|c| c.field_id == lfid.field_id())
+                    })
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| name.clone());
+
+                let final_name = alias.clone().unwrap_or(canonical_name);
+                out.push((ScalarExpr::Column(name), final_name));
+            }
+            crate::plans::SelectProjection::Computed { expr, alias } => {
+                out.push((expr, alias));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn build_multi_aggregate_rewrite<P>(
+    plan: &SelectPlan,
+    ctx: &ResolutionContext<P>,
+) -> Result<Option<AggregateRewrite>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let projections = build_multi_projection_exprs(plan, ctx)?;
+    let (projection_exprs, final_names): (Vec<_>, Vec<_>) = projections.into_iter().unzip();
+
+    let having_exprs: Vec<ScalarExpr<String>> = plan
+        .having
+        .as_ref()
+        .map(|h| vec![expr_to_scalar_expr(h)])
+        .unwrap_or_default();
+
+    let (aggregates, final_exprs, pre_agg_exprs, rewritten_having) =
+        extract_complex_aggregates(&projection_exprs, &having_exprs);
+
+    if aggregates.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(AggregateRewrite {
+        aggregates,
+        final_expressions: final_exprs,
+        pre_aggregate_expressions: pre_agg_exprs,
+        final_names,
+        rewritten_having: rewritten_having.into_iter().next(),
+    }))
+}
 fn push_column_if_known(
     table_id: TableId,
     schema: &PlanSchema,

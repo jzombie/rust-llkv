@@ -508,7 +508,28 @@ impl ScalarEvaluator {
                 let val = rand::random::<f64>();
                 Ok(Arc::new(Float64Array::from(vec![val])))
             }
-            _ => Err(Error::Internal("Unsupported scalar expression".into())),
+            ScalarExpr::Aggregate(call) => {
+                let kind = match call {
+                    AggregateCall::CountStar => "count_star",
+                    AggregateCall::Count { .. } => "count",
+                    AggregateCall::Sum { .. } => "sum",
+                    AggregateCall::Total { .. } => "total",
+                    AggregateCall::Avg { .. } => "avg",
+                    AggregateCall::Min(_) => "min",
+                    AggregateCall::Max(_) => "max",
+                    AggregateCall::CountNulls(_) => "count_nulls",
+                    AggregateCall::GroupConcat { .. } => "group_concat",
+                };
+                Err(Error::Internal(format!(
+                    "Unsupported aggregate scalar expression ({kind}); aggregate should be rewritten before evaluation"
+                )))
+            }
+            ScalarExpr::GetField { .. } => Err(Error::Internal(
+                "Unsupported get_field scalar expression".into(),
+            )),
+            ScalarExpr::ScalarSubquery(_) => Err(Error::Internal(
+                "Unsupported scalar subquery expression".into(),
+            )),
         }
     }
 

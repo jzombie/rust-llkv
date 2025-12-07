@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod canonical;
+pub mod aggregate_rewrite;
 pub mod conversion;
 pub mod logical_planner;
 pub mod physical;

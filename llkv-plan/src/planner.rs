@@ -146,6 +146,12 @@ where
             ));
         }
 
+        if logical_plan.aggregate_rewrite.is_some() {
+            // Keep all scan columns for aggregate rewrite so executor receives group keys
+            // and aggregate arguments; trimming here would drop required inputs.
+            return Ok(current_plan);
+        }
+
         if logical_plan.has_extra_columns() {
             let mut expr = Vec::new();
             let requested_len = logical_plan.requested_projections.len();

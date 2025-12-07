@@ -11981,6 +11981,43 @@ mod tests {
     }
 
     #[test]
+    fn having_rewrite_uses_group_key_name() {
+        let engine = SqlEngine::new(Arc::new(MemPager::default()));
+
+        engine
+            .execute("CREATE TABLE tab0(col0 INT, col1 INT, col2 INT)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO tab0 VALUES (1, -2, 2)")
+            .expect("seed row");
+
+        let mut result = engine
+            .execute(
+                "SELECT + col1 AS col2 FROM tab0 \
+                 GROUP BY tab0.col1 \
+                 HAVING NOT col1 NOT IN ( - AVG ( DISTINCT col2 ) )",
+            )
+            .expect("execute aggregate with having");
+
+        let select_result = result.remove(0);
+        let batches = match select_result {
+            RuntimeStatementResult::Select { execution, .. } => {
+                execution.collect().expect("collect batches")
+            }
+            _ => panic!("expected select result"),
+        };
+
+        assert_eq!(batches.len(), 1, "expected single batch");
+        let array = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int column");
+        assert_eq!(array.len(), 1, "expected single row");
+        assert_eq!(array.value(0), -2);
+    }
+
+    #[test]
     fn not_null_comparison_filters_all_rows() {
         let pager = Arc::new(MemPager::default());
         let engine = SqlEngine::new(pager);
