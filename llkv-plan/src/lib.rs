@@ -18,6 +18,7 @@ pub mod conversion;
 pub mod logical_planner;
 pub mod physical;
 pub mod plan_graph;
+pub mod prepared;
 pub mod planner;
 pub mod plans;
 pub mod schema;
@@ -40,6 +41,7 @@ pub use llkv_compute::{
 pub use llkv_types::{CanonicalRow, CanonicalScalar};
 pub use logical_planner::*;
 pub use plan_graph::*;
+pub use prepared::*;
 pub use plans::*;
 pub use subquery_correlation::{
     SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,

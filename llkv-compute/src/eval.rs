@@ -520,6 +520,12 @@ impl ScalarEvaluator {
                     AggregateCall::CountNulls(_) => "count_nulls",
                     AggregateCall::GroupConcat { .. } => "group_concat",
                 };
+                if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                    eprintln!(
+                        "[compute] evaluating aggregate in scalar context: {kind}"
+                    );
+                    eprintln!("{:?}", std::backtrace::Backtrace::capture());
+                }
                 Err(Error::Internal(format!(
                     "Unsupported aggregate scalar expression ({kind}); aggregate should be rewritten before evaluation"
                 )))

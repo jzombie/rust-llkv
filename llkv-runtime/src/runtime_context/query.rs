@@ -32,7 +32,7 @@ where
             context: Arc::clone(self),
         });
 
-        let executor = QueryExecutor::new(provider);
+        let executor = QueryExecutor::with_default_planner(provider);
 
         // Check if any table in the query is from information_schema
         let is_information_schema = plan.tables.iter().any(|table_ref| {
@@ -51,7 +51,6 @@ where
             )) as Arc<dyn RowIdFilter<P>>)
         };
 
-        let subquery_results = executor.execute_scalar_subqueries(&plan.scalar_subqueries)?;
-        executor.execute_select_with_filter(&plan, &subquery_results, row_filter)
+        executor.execute_select_with_row_filter(plan, row_filter)
     }
 }

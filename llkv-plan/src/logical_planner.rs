@@ -401,7 +401,7 @@ where
             tables: planned_tables,
             table_order: plan.tables.clone(),
             table_filters,
-            filter: residual_filter,
+            filter: residual_filter.or_else(|| filter.clone()),
             original_filter: plan.filter.as_ref().map(|f| f.predicate.clone()),
             having,
             original_having: plan.having.clone(),
