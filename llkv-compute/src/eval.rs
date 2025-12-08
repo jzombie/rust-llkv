@@ -895,21 +895,56 @@ impl ScalarEvaluator {
                 let operand = operand.as_ref().map(|o| Box::new(Self::simplify(o)));
                 let s_else = else_expr.as_ref().map(|e| Box::new(Self::simplify(e)));
 
+                // Helper to check if an expression carries type info (is not Literal::Null)
+                let is_typed = |e: &ScalarExpr<F>| !Self::is_null(e);
+
+                let mut simplified_branches = Vec::with_capacity(branches.len());
+                for (when, then) in branches {
+                    simplified_branches.push((Self::simplify(when), Self::simplify(then)));
+                }
+
+                // Helper to find a typed fallback if the result is untyped NULL
+                let get_safe_result = |result: ScalarExpr<F>, branches: &[(ScalarExpr<F>, ScalarExpr<F>)]| -> ScalarExpr<F> {
+                    if is_typed(&result) {
+                        return result;
+                    }
+                    // Result is untyped NULL. Check if we are discarding any typed branches.
+                    for (_, then) in branches {
+                        if is_typed(then) {
+                            // Found a typed branch. Return a dummy CASE to preserve type.
+                            return ScalarExpr::Case {
+                                operand: None,
+                                branches: vec![(ScalarExpr::Literal(Literal::Boolean(false)), then.clone())],
+                                else_expr: Some(Box::new(result)),
+                            };
+                        }
+                    }
+                    if let Some(e) = &s_else {
+                        if is_typed(e) {
+                             return ScalarExpr::Case {
+                                operand: None,
+                                branches: vec![(ScalarExpr::Literal(Literal::Boolean(false)), *e.clone())],
+                                else_expr: Some(Box::new(result)),
+                            };
+                        }
+                    }
+                    result
+                };
+
                 // If operand is NULL, the whole CASE expression evaluates to ELSE
                 if let Some(op) = &operand {
                     if Self::is_null(op) {
-                        return s_else
+                        let result = s_else
+                            .clone()
                             .map(|b| *b)
                             .unwrap_or(ScalarExpr::Literal(Literal::Null));
+                        return get_safe_result(result, &simplified_branches);
                     }
                 }
 
                 let mut new_branches = Vec::new();
 
-                for (when, then) in branches {
-                    let s_when = Self::simplify(when);
-                    let s_then = Self::simplify(then);
-
+                for (s_when, s_then) in simplified_branches.iter().cloned() {
                     if Self::is_null(&s_when) {
                         continue;
                     }
@@ -918,7 +953,7 @@ impl ScalarEvaluator {
                     if let Some(op) = &operand {
                         if let (ScalarExpr::Literal(op_lit), ScalarExpr::Literal(when_lit)) = (op.as_ref(), &s_when) {
                             if op_lit == when_lit {
-                                return s_then;
+                                return get_safe_result(s_then, &simplified_branches);
                             } else {
                                 continue;
                             }
@@ -934,7 +969,7 @@ impl ScalarEvaluator {
                             }
                             // If condition is TRUE, return this branch and ignore the rest
                             if matches!(lit, Literal::Boolean(true)) {
-                                return s_then;
+                                return get_safe_result(s_then, &simplified_branches);
                             }
                         }
                     }
@@ -942,9 +977,11 @@ impl ScalarEvaluator {
                 }
 
                 if new_branches.is_empty() {
-                    return s_else
+                    let result = s_else
+                        .clone()
                         .map(|b| *b)
                         .unwrap_or(ScalarExpr::Literal(Literal::Null));
+                    return get_safe_result(result, &simplified_branches);
                 }
 
                 ScalarExpr::Case {
@@ -952,6 +989,36 @@ impl ScalarEvaluator {
                     branches: new_branches,
                     else_expr: s_else,
                 }
+            }
+            ScalarExpr::Coalesce(items) => {
+                let mut new_items = Vec::new();
+                for item in items {
+                    let s_item = Self::simplify(item);
+                    if let ScalarExpr::Literal(lit) = &s_item {
+                        if matches!(lit, Literal::Null) {
+                            continue;
+                        }
+                        // Found non-null literal.
+                        if new_items.is_empty() {
+                            return ScalarExpr::Literal(lit.clone());
+                        }
+                        // We have preceding non-constant expressions.
+                        // This literal terminates the coalesce chain.
+                        new_items.push(s_item);
+                        break;
+                    }
+                    new_items.push(s_item);
+                }
+
+                if new_items.is_empty() {
+                    return ScalarExpr::Literal(Literal::Null);
+                }
+
+                if new_items.len() == 1 {
+                    return new_items[0].clone();
+                }
+
+                ScalarExpr::Coalesce(new_items)
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
