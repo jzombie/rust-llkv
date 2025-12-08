@@ -27,7 +27,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dependencies.ctor]
 optional = true
-version = "0.6.1"
+version = "0.6.3"
 
 [lints]
 workspace = true
