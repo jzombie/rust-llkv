@@ -834,7 +834,6 @@ where
 
     // Default to fail-fast unless overridden by environment variable (e.g. in CI)
     let fail_fast = std::env::var("LLKV_SLT_NO_FAIL_FAST").is_err();
-    let has_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let base = std::path::Path::new(slt_dir);
     let files = {
@@ -877,12 +876,7 @@ where
         // Check if this is a .slturl pointer file
         let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
 
-        let has_failed = has_failed.clone();
         trials.push(Trial::test(name, move || {
-            if fail_fast && has_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(());
-            }
-
             let p = path_clone.clone();
             let fac = factory_factory_clone();
 
@@ -935,8 +929,37 @@ where
                 .join()
                 .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?;
 
-            if res.is_err() && fail_fast {
-                has_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = &res {
+                if fail_fast {
+                    // Print the error explicitly before exiting, as process::exit will prevent
+                    // libtest-mimic from printing the failure summary.
+                    //
+                    // This simulates a panic, but forces the process to exit manually, as a real
+                    // panic insufficient here because the test runner is designed to catch panics.
+                    //
+                    // Note: Failed::msg is private, so we have to parse the Debug output to get
+                    // the unescaped message with proper line breaks.
+                    let debug_str = format!("{:?}", e);
+                    // FIXME: Error messages are contained in a JSON-like string, so here's a rather
+                    // hacky implementation to extract them. This is a workaround since libtest_mimic::Failed
+                    // is private and the struct does not implement `Display`.
+                    if let Some(start) = debug_str.find("msg: Some(\"") {
+                        if let Some(end) = debug_str.rfind("\")") {
+                            let inner = &debug_str[start + 11..end];
+                            let unescaped = inner
+                                .replace("\\n", "\n")
+                                .replace("\\\"", "\"")
+                                .replace("\\\\", "\\")
+                                .replace("\\t", "\t");
+                            eprintln!("{}", unescaped);
+                        } else {
+                            eprintln!("{}", debug_str);
+                        }
+                    } else {
+                        eprintln!("{}", debug_str);
+                    }
+                    std::process::exit(101);
+                }
             }
             res
         }));
