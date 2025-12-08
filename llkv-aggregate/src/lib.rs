@@ -236,6 +236,12 @@ pub enum AggregateAccumulator {
         precision: u8,
         scale: i8,
     },
+    MinNull {
+        column_index: usize,
+    },
+    MaxNull {
+        column_index: usize,
+    },
     CountNulls {
         column_index: usize,
         non_null_rows: i64,
@@ -685,6 +691,7 @@ impl AggregateAccumulator {
                         column_index: idx,
                         value: None,
                     }),
+                    &DataType::Null => Ok(AggregateAccumulator::MinNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "MIN aggregate not supported for column type {:?}",
                         other
@@ -713,6 +720,7 @@ impl AggregateAccumulator {
                         column_index: idx,
                         value: None,
                     }),
+                    &DataType::Null => Ok(AggregateAccumulator::MaxNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "MAX aggregate not supported for column type {:?}",
                         other
@@ -1462,6 +1470,9 @@ impl AggregateAccumulator {
                     }
                 }
             }
+            AggregateAccumulator::MinNull { .. } | AggregateAccumulator::MaxNull { .. } => {
+                // No-op: result is always NULL
+            }
             AggregateAccumulator::CountNulls {
                 column_index,
                 non_null_rows,
@@ -1595,6 +1606,8 @@ impl AggregateAccumulator {
             AggregateAccumulator::MaxDecimal128 {
                 precision, scale, ..
             } => Field::new("max", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::MinNull { .. } => Field::new("min", DataType::Null, true),
+            AggregateAccumulator::MaxNull { .. } => Field::new("max", DataType::Null, true),
             AggregateAccumulator::CountNulls { .. } => {
                 Field::new("count_nulls", DataType::Int64, false)
             }
@@ -2022,6 +2035,14 @@ impl AggregateAccumulator {
                     ) as ArrayRef,
                 };
                 Ok((Field::new("max", data_type, true), array))
+            }
+            AggregateAccumulator::MinNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("min", DataType::Null, true), array))
+            }
+            AggregateAccumulator::MaxNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("max", DataType::Null, true), array))
             }
             AggregateAccumulator::CountNulls {
                 non_null_rows,

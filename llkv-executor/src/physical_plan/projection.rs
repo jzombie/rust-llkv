@@ -80,11 +80,11 @@ where
                 // Cast if needed
                 let expected_type = schema.field(i).data_type();
                 let col = if col.data_type() != expected_type {
-                    panic!("DEBUG: ProjectionExec mismatch! Col: {:?}, Expected: {:?}", col.data_type(), expected_type);
-                    /*
+                    // panic!("DEBUG: ProjectionExec mismatch! Col: {:?}, Expected: {:?}", col.data_type(), expected_type);
+                    
                     arrow::compute::cast(&col, expected_type)
                         .map_err(|e| llkv_result::Error::Internal(e.to_string()))?
-                    */
+                    
                 } else {
                     col
                 };

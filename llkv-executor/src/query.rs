@@ -2718,7 +2718,6 @@ where
                     // Cast if needed
                     let expected_type = schema.field(i).data_type();
                     let col = if col.data_type() != expected_type {
-                        eprintln!("DEBUG: QueryExec Projection mismatch! Col: {:?}, Expected: {:?}", col.data_type(), expected_type);
                         arrow::compute::cast(&col, expected_type)
                             .map_err(|e| Error::Internal(e.to_string()))?
                     } else {
@@ -2731,9 +2730,7 @@ where
                     let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
                     RecordBatch::try_new_with_options(schema.clone(), columns, &options).map_err(|e| Error::Internal(e.to_string()))
                 } else {
-                    // eprintln!("DEBUG: ProjectionExec try_new schema: {:?}, columns: {:?}", schema, columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
                     if let Err(e) = RecordBatch::try_new(schema.clone(), columns.clone()) {
-                        eprintln!("DEBUG: ProjectionExec try_new FAILED! Schema: {:?}, Columns: {:?}", schema, columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
                         return Err(Error::Internal(e.to_string()));
                     }
                     RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))

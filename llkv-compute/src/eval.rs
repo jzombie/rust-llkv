@@ -831,6 +831,39 @@ impl ScalarEvaluator {
         }
     }
 
+    fn contains_aggregate<F>(expr: &ScalarExpr<F>) -> bool {
+        match expr {
+            ScalarExpr::Aggregate(_) => true,
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::contains_aggregate(left) || Self::contains_aggregate(right)
+            }
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::contains_aggregate(left) || Self::contains_aggregate(right)
+            }
+            ScalarExpr::Not(expr) => Self::contains_aggregate(expr),
+            ScalarExpr::IsNull { expr, .. } => Self::contains_aggregate(expr),
+            ScalarExpr::Cast { expr, .. } => Self::contains_aggregate(expr),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .map_or(false, |e| Self::contains_aggregate(e))
+                    || branches.iter().any(|(w, t)| {
+                        Self::contains_aggregate(w) || Self::contains_aggregate(t)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .map_or(false, |e| Self::contains_aggregate(e))
+            }
+            ScalarExpr::Coalesce(exprs) => exprs.iter().any(Self::contains_aggregate),
+            ScalarExpr::GetField { base, .. } => Self::contains_aggregate(base),
+            _ => false,
+        }
+    }
+
     /// Simplify an expression by constant folding and identity removal.
     pub fn simplify<F: Hash + Eq + Clone>(expr: &ScalarExpr<F>) -> ScalarExpr<F> {
         let try_get_type = |e: &ScalarExpr<F>| -> Option<DataType> {
@@ -861,27 +894,38 @@ impl ScalarEvaluator {
                 };
 
                 if !is_logic_op && (is_effectively_null(&l) || is_effectively_null(&r)) {
-                     let type_l = try_get_type(&l);
-                     let type_r = try_get_type(&r);
-                     
-                     let target_type = match (type_l, type_r) {
-                         (Some(t1), Some(t2)) => Some(get_common_type(&t1, &t2)),
-                         (Some(t), None) => Some(t),
-                         (None, Some(t)) => Some(t),
-                         (None, None) => None,
-                     };
-                     
-                     if let Some(dt) = target_type {
-                          return ScalarExpr::Cast {
+                    // If one side is NULL, the result is NULL (for most ops).
+                    // However, if the other side contains an aggregate, we MUST NOT simplify it away.
+                    // This is because the presence of an aggregate changes the query semantics
+                    // (e.g. scalar aggregation on empty input returns 1 row, whereas simple select returns 0 rows).
+                    // If we simplify `COUNT(*) + NULL` to `NULL`, the planner might see no aggregates
+                    // and treat it as a simple select, returning 0 rows instead of 1 row with NULL.
+                    let discard_aggregate = (is_effectively_null(&l) && Self::contains_aggregate(&r))
+                        || (is_effectively_null(&r) && Self::contains_aggregate(&l));
+
+                    if !discard_aggregate {
+                        let type_l = try_get_type(&l);
+                        let type_r = try_get_type(&r);
+
+                        let target_type = match (type_l, type_r) {
+                            (Some(t1), Some(t2)) => Some(get_common_type(&t1, &t2)),
+                            (Some(t), None) => Some(t),
+                            (None, Some(t)) => Some(t),
+                            (None, None) => None,
+                        };
+
+                        if let Some(dt) = target_type {
+                            return ScalarExpr::Cast {
                                 expr: Box::new(ScalarExpr::Literal(Literal::Null)),
                                 data_type: dt,
-                          };
-                     }
-                     
-                     // If both are untyped nulls, return Literal::Null
-                     if Self::is_null(&l) && Self::is_null(&r) {
-                         return ScalarExpr::Literal(Literal::Null);
-                     }
+                            };
+                        }
+
+                        // If both are untyped nulls, return Literal::Null
+                        if Self::is_null(&l) && Self::is_null(&r) {
+                            return ScalarExpr::Literal(Literal::Null);
+                        }
+                    }
                 }
 
                 if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r)
