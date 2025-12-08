@@ -8,7 +8,9 @@ use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::aggregate_rewrite::build_single_aggregate_rewrite;
-use crate::logical_planner::{LogicalPlan, LogicalPlanner};
+use crate::logical_planner::{
+    build_multi_aggregate_rewrite, LogicalPlan, LogicalPlanner, ResolutionContext,
+};
 // use crate::planner::PhysicalPlanner;
 use crate::plans::{
     CompoundOperator, CompoundQuantifier, CompoundSelectPlan, CorrelatedColumn, FilterSubquery,
@@ -319,12 +321,22 @@ where
         let mut logical_plan = self.logical_planner.create_logical_plan(&plan_for_scan)?;
 
         if force_manual_projection && has_aggregates {
-            if let LogicalPlan::Single(single) = &mut logical_plan {
-                // When forcing manual projection, the logical plan was created with AllColumns,
-                // which causes the aggregate rewrite to include all columns in the final output.
-                // We need to re-compute the rewrite using the original projections.
-                single.aggregate_rewrite =
-                    build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
+            match &mut logical_plan {
+                LogicalPlan::Single(single) => {
+                    // When forcing manual projection, the logical plan was created with AllColumns,
+                    // which causes the aggregate rewrite to include all columns in the final output.
+                    // We need to re-compute the rewrite using the original projections.
+                    single.aggregate_rewrite =
+                        build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
+                }
+                LogicalPlan::Multi(multi) => {
+                    let ctx = ResolutionContext {
+                        tables: &multi.tables,
+                        table_refs: &plan_for_execution.tables,
+                    };
+                    multi.aggregate_rewrite =
+                        build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
+                }
             }
         }
 

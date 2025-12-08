@@ -79,7 +79,12 @@ where
                 columns.push(col);
             }
 
-            RecordBatch::try_new(schema.clone(), columns).map_err(|e| llkv_result::Error::Internal(e.to_string()))
+            if columns.is_empty() {
+                let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                RecordBatch::try_new_with_options(schema.clone(), columns, &options).map_err(|e| llkv_result::Error::Internal(e.to_string()))
+            } else {
+                RecordBatch::try_new(schema.clone(), columns).map_err(|e| llkv_result::Error::Internal(e.to_string()))
+            }
         })))
     }
 

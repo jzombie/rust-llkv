@@ -539,6 +539,7 @@ where
                         for item in list {
                             let value_array =
                                 ScalarEvaluator::evaluate_batch(item, chunk.len(), &arrays)?;
+
                             let (new_target, new_value) =
                                 kernels::coerce_types(&target_array, &value_array, BinaryOp::Add)?;
                             target_array = new_target;

@@ -629,6 +629,12 @@ where
         }
     }
 
-    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns.clone())?;
-    Ok(Some(batch))
+    if columns.is_empty() {
+        let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch_len));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(out_schema), columns.clone(), &options)?;
+        Ok(Some(batch))
+    } else {
+        let batch = RecordBatch::try_new(Arc::clone(out_schema), columns.clone())?;
+        Ok(Some(batch))
+    }
 }

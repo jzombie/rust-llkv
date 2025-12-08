@@ -227,6 +227,10 @@ where
         let mut extra_columns: Vec<String> = Vec::new();
 
         // Ensure filter columns are available for scan-level evaluation.
+        // Note: We do NOT add filter columns to scan_projections because ScanExec handles
+        // filtering internally using the storage engine, so these columns don't need to be
+        // materialized in the output batch unless they are also requested projections.
+        /*
         if let Some(filter) = &plan.filter {
             for name in collect_filter_columns(&filter.predicate) {
                 push_column_if_known(
@@ -238,6 +242,8 @@ where
                 );
             }
         }
+        */
+
 
         // Ensure GROUP BY and aggregate inputs are present for scan-level computation.
         for name in &plan.group_by {
@@ -260,6 +266,10 @@ where
                 );
             }
         }
+
+        // If scan_projections is still empty (e.g. SELECT COUNT(*) with no filter columns projected),
+        // we must project at least one column for the scan to work.
+        // Prefer the primary key, otherwise the first column.
 
         let OrderResolution {
             scan_projections: order_scan_projections,
@@ -590,7 +600,7 @@ where
     Ok(out)
 }
 
-fn build_multi_aggregate_rewrite<P>(
+pub(crate) fn build_multi_aggregate_rewrite<P>(
     plan: &SelectPlan,
     ctx: &ResolutionContext<P>,
 ) -> Result<Option<AggregateRewrite>>
@@ -872,12 +882,12 @@ where
     (resolved, unresolved)
 }
 
-struct ResolutionContext<'a, P>
+pub(crate) struct ResolutionContext<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    tables: &'a [PlannedTable<P>],
-    table_refs: &'a [TableRef],
+    pub tables: &'a [PlannedTable<P>],
+    pub table_refs: &'a [TableRef],
 }
 
 fn resolve_column_ref<P>(ctx: &ResolutionContext<P>, name: &str) -> Result<(usize, LogicalFieldId)>

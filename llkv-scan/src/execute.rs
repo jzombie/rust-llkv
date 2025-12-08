@@ -57,12 +57,6 @@ where
     S: ScanStorage<P>,
     F: FnMut(RecordBatch),
 {
-    if projections.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "scan requires at least one projection".into(),
-        ));
-    }
-
     // Determine projection evaluation plan and output schema.
     let mut projection_evals = Vec::with_capacity(projections.len());
     let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();

@@ -1,11 +1,13 @@
 use crate::JoinType;
-use arrow::array::{ArrayRef, RecordBatch, UInt32Builder};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt32Builder};
 use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
 use arrow::row::{RowConverter, SortField};
 use llkv_result::Error;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
+
+pub type JoinFilter = Box<dyn Fn(&RecordBatch) -> Result<BooleanArray, Error> + Send + Sync>;
 
 enum JoinMap {
     Hash(FxHashMap<Vec<u8>, Vec<u32>>),
@@ -20,11 +22,13 @@ pub struct VectorizedHashJoinStream<I> {
     join_type: JoinType,
     left_key_indices: Vec<usize>,
     left_converter: RowConverter,
+    filter: Option<JoinFilter>,
     // Cross join state
     cross_left_batch: Option<RecordBatch>,
     cross_left_row: usize,
     cross_right_row: usize,
     cross_finished: bool,
+    cross_left_row_matched: bool,
 }
 
 impl<I> VectorizedHashJoinStream<I>
@@ -38,6 +42,7 @@ where
         join_type: JoinType,
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,
+        filter: Option<JoinFilter>,
     ) -> Result<Self, Error> {
         let join_map = if left_key_indices.is_empty() {
             // Cross Join
@@ -85,10 +90,12 @@ where
             join_type,
             left_key_indices,
             left_converter,
+            filter,
             cross_left_batch: None,
             cross_left_row: 0,
             cross_right_row: 0,
             cross_finished: false,
+            cross_left_row_matched: false,
         })
     }
 }
@@ -140,6 +147,7 @@ where
                     self.cross_left_batch = Some(b);
                     self.cross_left_row = 0;
                     self.cross_right_row = 0;
+                    self.cross_left_row_matched = false;
                 }
                 Err(e) => return Some(Err(e)),
             }
@@ -148,51 +156,125 @@ where
         let left_batch = self.cross_left_batch.as_ref().unwrap().clone();
         let left_batch_num_rows = left_batch.num_rows();
 
-        let mut left_indices = UInt32Builder::new();
-        let mut right_indices = UInt32Builder::new();
+        let mut cand_left = UInt32Builder::new();
+        let mut cand_right = UInt32Builder::new();
 
-        let mut produced = 0usize;
+        let mut temp_left = self.cross_left_row;
+        let mut temp_right = self.cross_right_row;
+        let mut produced = 0;
 
         while produced < Self::CROSS_CHUNK {
-            if self.cross_left_row >= left_batch_num_rows {
-                // finished current left batch
-                self.cross_left_batch = None;
-                self.cross_right_row = 0;
-                self.cross_left_row = 0;
+            if temp_left >= left_batch_num_rows {
                 break;
             }
 
-            left_indices.append_value(self.cross_left_row as u32);
-            right_indices.append_value(self.cross_right_row as u32);
+            cand_left.append_value(temp_left as u32);
+            cand_right.append_value(temp_right as u32);
 
             produced += 1;
 
-            self.cross_right_row += 1;
-            if self.cross_right_row >= right_len {
-                self.cross_right_row = 0;
-                self.cross_left_row += 1;
+            temp_right += 1;
+            if temp_right >= right_len {
+                temp_right = 0;
+                temp_left += 1;
             }
         }
 
-        let left_indices_array = left_indices.finish();
-        let right_indices_array = right_indices.finish();
+        let cand_left_arr = cand_left.finish();
+        let cand_right_arr = cand_right.finish();
 
-        if left_indices_array.is_empty() {
+        if cand_left_arr.is_empty() {
             // No data produced but stream not finished yet; recurse to grab next left batch.
+            self.cross_left_batch = None;
+            self.cross_left_row = 0;
+            self.cross_right_row = 0;
+            self.cross_left_row_matched = false;
+            return self.next_cross_batch();
+        }
+
+        // Build candidate batch
+        let mut candidate_columns = Vec::new();
+        for col in left_batch.columns() {
+            match take(col, &cand_left_arr, None) {
+                Ok(a) => candidate_columns.push(a),
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            }
+        }
+        for col in self.right_batch.columns() {
+            match take(col, &cand_right_arr, None) {
+                Ok(a) => candidate_columns.push(a),
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            }
+        }
+        let candidate_batch = match RecordBatch::try_new(Arc::clone(&self.schema), candidate_columns) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+        };
+
+        // Apply filter
+        let mask = if let Some(filter) = &self.filter {
+            match filter(&candidate_batch) {
+                Ok(m) => m,
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            BooleanArray::from(vec![true; candidate_batch.num_rows()])
+        };
+
+        // Build final indices
+        let mut final_left = UInt32Builder::new();
+        let mut final_right = UInt32Builder::new();
+        let mut matched = self.cross_left_row_matched;
+
+        for i in 0..cand_left_arr.len() {
+            let l_idx = cand_left_arr.value(i);
+            let r_idx = cand_right_arr.value(i);
+            let passed = mask.is_valid(i) && mask.value(i);
+
+            if passed {
+                final_left.append_value(l_idx);
+                final_right.append_value(r_idx);
+                matched = true;
+            }
+
+            if r_idx as usize == right_len - 1 {
+                if !matched && matches!(self.join_type, JoinType::Left) {
+                    final_left.append_value(l_idx);
+                    final_right.append_null();
+                }
+                matched = false;
+            }
+        }
+
+        self.cross_left_row_matched = matched;
+        self.cross_left_row = temp_left;
+        self.cross_right_row = temp_right;
+
+        if self.cross_left_row >= left_batch_num_rows {
+            self.cross_left_batch = None;
+            self.cross_left_row = 0;
+            self.cross_right_row = 0;
+            self.cross_left_row_matched = false;
+        }
+
+        let final_left_arr = final_left.finish();
+        let final_right_arr = final_right.finish();
+
+        if final_left_arr.is_empty() {
             return self.next_cross_batch();
         }
 
         let mut output_columns = Vec::new();
 
         for col in left_batch.columns() {
-            match take(col, &left_indices_array, None) {
+            match take(col, &final_left_arr, None) {
                 Ok(a) => output_columns.push(a),
                 Err(e) => return Some(Err(Error::Internal(e.to_string()))),
             }
         }
 
         for col in self.right_batch.columns() {
-            match take(col, &right_indices_array, None) {
+            match take(col, &final_right_arr, None) {
                 Ok(a) => output_columns.push(a),
                 Err(e) => return Some(Err(Error::Internal(e.to_string()))),
             }
@@ -215,8 +297,8 @@ where
             Err(e) => return Some(Err(e)),
         };
 
-        let mut left_indices = UInt32Builder::new();
-        let mut right_indices = UInt32Builder::new();
+        let mut cand_left = UInt32Builder::new();
+        let mut cand_right = UInt32Builder::new();
 
         let left_key_columns: Vec<ArrayRef> = self
             .left_key_indices
@@ -231,40 +313,89 @@ where
 
         for i in 0..rows.num_rows() {
             let row = rows.row(i);
-            match map.get(row.as_ref()) {
-                Some(matches) => {
-                    for &right_idx in matches {
-                        left_indices.append_value(i as u32);
-                        right_indices.append_value(right_idx);
-                    }
-                }
-                None => {
-                    if matches!(self.join_type, JoinType::Left) {
-                        left_indices.append_value(i as u32);
-                        right_indices.append_null();
-                    }
+            if let Some(matches) = map.get(row.as_ref()) {
+                for &right_idx in matches {
+                    cand_left.append_value(i as u32);
+                    cand_right.append_value(right_idx);
                 }
             }
         }
 
-        let left_indices_array = left_indices.finish();
-        let right_indices_array = right_indices.finish();
+        let cand_left_arr = cand_left.finish();
+        let cand_right_arr = cand_right.finish();
 
-        if left_indices_array.is_empty() {
-            return Some(Ok(RecordBatch::new_empty(self.schema.clone())));
+        // Build candidate batch
+        let mut candidate_columns = Vec::new();
+        for col in left_batch.columns() {
+            match take(col, &cand_left_arr, None) {
+                Ok(a) => candidate_columns.push(a),
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            }
+        }
+        for col in self.right_batch.columns() {
+            match take(col, &cand_right_arr, None) {
+                Ok(a) => candidate_columns.push(a),
+                Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+            }
+        }
+        let candidate_batch = match RecordBatch::try_new(Arc::clone(&self.schema), candidate_columns) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(Error::Internal(e.to_string()))),
+        };
+
+        // Apply filter
+        let mask = if let Some(filter) = &self.filter {
+            match filter(&candidate_batch) {
+                Ok(m) => m,
+                Err(e) => return Some(Err(e)),
+            }
+        } else {
+            BooleanArray::from(vec![true; candidate_batch.num_rows()])
+        };
+
+        let mut final_left = UInt32Builder::new();
+        let mut final_right = UInt32Builder::new();
+
+        let mut matched_left = if matches!(self.join_type, JoinType::Left) {
+            vec![false; left_batch.num_rows()]
+        } else {
+            Vec::new()
+        };
+
+        for i in 0..cand_left_arr.len() {
+            if mask.is_valid(i) && mask.value(i) {
+                let l_idx = cand_left_arr.value(i);
+                let r_idx = cand_right_arr.value(i);
+                final_left.append_value(l_idx);
+                final_right.append_value(r_idx);
+
+                if matches!(self.join_type, JoinType::Left) {
+                    matched_left[l_idx as usize] = true;
+                }
+            }
         }
 
-        let mut output_columns = Vec::new();
+        if matches!(self.join_type, JoinType::Left) {
+            for (i, &matched) in matched_left.iter().enumerate() {
+                if !matched {
+                    final_left.append_value(i as u32);
+                    final_right.append_null();
+                }
+            }
+        }
 
+        let final_left_arr = final_left.finish();
+        let final_right_arr = final_right.finish();
+
+        let mut output_columns = Vec::new();
         for col in left_batch.columns() {
-            match take(col, &left_indices_array, None) {
+            match take(col, &final_left_arr, None) {
                 Ok(a) => output_columns.push(a),
                 Err(e) => return Some(Err(Error::Internal(e.to_string()))),
             }
         }
-
         for col in self.right_batch.columns() {
-            match take(col, &right_indices_array, None) {
+            match take(col, &final_right_arr, None) {
                 Ok(a) => output_columns.push(a),
                 Err(e) => return Some(Err(Error::Internal(e.to_string()))),
             }

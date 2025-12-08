@@ -72,9 +72,6 @@ where
             (Box::new(stream.map(|b| b)), schema)
         };
 
-        eprintln!("DEBUG: execute_complex_aggregation: key_indices={:?}", key_indices);
-        eprintln!("DEBUG: agg_schema={:?}", agg_schema);
-
         let agg_count = agg_plan.aggregates.len();
         let agg_offset = agg_schema
             .fields()
@@ -1206,7 +1203,6 @@ where
     ) -> ExecutorResult<ScalarExpr<(usize, u32)>> {
         match expr {
             ScalarExpr::Column(name) => {
-                eprintln!("DEBUG: remap_having_expr_to_indices resolving column: {}", name);
                 let idx = resolve_schema_index(name, schema)
                     .ok_or_else(|| Error::Internal(format!("Column not found in schema: {}", name)))?;
                 Ok(ScalarExpr::Column((0, idx as u32)))
@@ -2460,10 +2456,9 @@ where
             }
 
             // 3. Final Projection
-            if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
-                eprintln!("DEBUG: agg_schema fields: {:?}", agg_schema.fields());
-                eprintln!("DEBUG: final_expressions: {:?}", rewrite.final_expressions);
-            }
+            eprintln!("DEBUG: agg_schema fields: {:?}", agg_schema.fields());
+            eprintln!("DEBUG: final_expressions: {:?}", rewrite.final_expressions);
+            
             let mut proj_exprs = Vec::new();
             for (expr, name) in rewrite.final_expressions.iter().zip(&rewrite.final_names) {
                 let resolved_expr = resolve_scalar_expr_to_indices(expr, &agg_schema)?;
@@ -2561,6 +2556,7 @@ where
                 join_type,
                 left_indices,
                 right_indices,
+                None,
             )?;
 
             return Ok(Box::new(stream));
@@ -2679,9 +2675,15 @@ where
                         batch.num_rows(),
                         &field_arrays,
                     ).map_err(|e| Error::Internal(e.to_string()))?;
+
                     columns.push(col);
                 }
-                RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+                if columns.is_empty() {
+                    let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                    RecordBatch::try_new_with_options(schema.clone(), columns, &options).map_err(|e| Error::Internal(e.to_string()))
+                } else {
+                    RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+                }
             })));
         }
 
@@ -3398,20 +3400,10 @@ where
                     new_fields.extend_from_slice(right_schema.fields());
                     let new_schema = Arc::new(Schema::new(new_fields));
 
-                    current_stream = Box::new(VectorizedHashJoinStream::try_new(
-                        new_schema.clone(),
-                        current_stream,
-                        right_batch,
-                        join_type,
-                        left_indices,
-                        right_indices,
-                    )?);
-
+                    let mut temp_col_mapping = col_mapping.clone();
                     let old_len = current_schema.fields().len();
-                    current_schema = new_schema;
-
                     for (idx, fid) in table_field_map[i + 1].iter().enumerate() {
-                        col_mapping.insert((i + 1, *fid), old_len + idx);
+                        temp_col_mapping.insert((i + 1, *fid), old_len + idx);
                     }
 
                     let prefix_limit = i + 1;
@@ -3432,13 +3424,48 @@ where
                     }
                     pending_filters = remaining;
 
-                    if let Some(apply_expr) = combine_clauses(applicable) {
-                        current_stream = apply_filter_to_stream(
-                            current_stream,
-                            &apply_expr,
-                            col_mapping.clone(),
-                        )?;
-                    }
+                    let join_filter: Option<llkv_join::vectorized::JoinFilter> = if !applicable.is_empty() {
+                        let combined = combine_clauses(applicable).unwrap();
+                        let mapped_expr = remap_filter_expr(&combined)?;
+                        let mapping = temp_col_mapping.clone();
+
+                        Some(Box::new(move |batch: &RecordBatch| {
+                             let mut arrays = FxHashMap::default();
+                             for (key, col_idx) in &mapping {
+                                 if *col_idx < batch.num_columns() {
+                                     arrays.insert(*key, batch.column(*col_idx).clone());
+                                 } else {
+                                     return Err(Error::Internal(format!("Column index {} out of bounds", col_idx)));
+                                 }
+                             }
+
+                             let result = ScalarEvaluator::evaluate_batch(&mapped_expr, batch.num_rows(), &arrays)?;
+
+                             if result.data_type() == &arrow::datatypes::DataType::Null {
+                                 return Ok(arrow::array::BooleanArray::new_null(batch.num_rows()));
+                             }
+
+                             let bool_arr = result.as_any().downcast_ref::<arrow::array::BooleanArray>()
+                                 .ok_or_else(|| Error::Internal("Filter expression did not evaluate to boolean".into()))?;
+
+                             Ok(bool_arr.clone())
+                        }))
+                    } else {
+                        None
+                    };
+
+                    current_stream = Box::new(VectorizedHashJoinStream::try_new(
+                        new_schema.clone(),
+                        current_stream,
+                        right_batch,
+                        join_type,
+                        left_indices,
+                        right_indices,
+                        join_filter,
+                    )?);
+
+                    current_schema = new_schema;
+                    col_mapping = temp_col_mapping;
                 }
 
                 // 3. Apply any remaining filters not yet pushed earlier in the join chain.
@@ -5031,7 +5058,17 @@ fn infer_expr_type(expr: &ScalarExpr<usize>, schema: &Schema) -> DataType {
     match expr {
         ScalarExpr::Column(idx) => schema.field(*idx).data_type().clone(),
         ScalarExpr::Literal(l) => get_literal_type(l),
-        ScalarExpr::Binary { left, .. } => infer_expr_type(left, schema),
+        ScalarExpr::Binary { left, right, .. } => {
+            let l = infer_expr_type(left, schema);
+            let r = infer_expr_type(right, schema);
+            if l == DataType::Float64 || r == DataType::Float64 {
+                DataType::Float64
+            } else if l == DataType::Float32 || r == DataType::Float32 {
+                DataType::Float32
+            } else {
+                l
+            }
+        },
         ScalarExpr::Cast { data_type, .. } => data_type.clone(),
         ScalarExpr::Not(_) => DataType::Boolean,
         ScalarExpr::IsNull { .. } => DataType::Boolean,

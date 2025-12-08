@@ -12,3 +12,7 @@ Use this guide as the first stop before making changes. It ties together the rep
 - Apply the `.github/instructions` guidance to your workflow (test commands, no truncated output, and the no-shortcut policy).
 - When planning a feature, identify the lowest crate that owns the responsibility, keep dependencies acyclic, and update linkage docs if architecture changes.
 - Clean up comment style in touched modules and ensure any examples stay runnable with `cargo test --doc` when added.
+
+## Quick SQL Debugging
+
+Compile and run [llkv/src/main.rs](llkv/src/main.rs), sending the SQL via STDIN.

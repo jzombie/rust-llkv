@@ -254,7 +254,7 @@ pub enum AggregateAccumulator {
     },
 }
 
-#[derive(Hash, Eq, PartialEq, Clone)]
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub enum DistinctKey {
     Int(i64),
     Float(u64),
@@ -473,22 +473,24 @@ impl AggregateAccumulator {
     ) -> AggregateResult<Self> {
         match &spec.kind {
             AggregateKind::Count { field_id, distinct } => {
-                if field_id.is_none() {
-                    return Ok(AggregateAccumulator::CountStar { value: 0 });
-                }
-                let idx = projection_idx.ok_or_else(|| {
-                    Error::Internal("Count aggregate requires projection index".into())
-                })?;
-                if *distinct {
-                    Ok(AggregateAccumulator::CountDistinctColumn {
-                        column_index: idx,
-                        seen: FxHashSet::default(),
-                    })
+                if let Some(idx) = projection_idx {
+                    if *distinct {
+                        Ok(AggregateAccumulator::CountDistinctColumn {
+                            column_index: idx,
+                            seen: FxHashSet::default(),
+                        })
+                    } else {
+                        Ok(AggregateAccumulator::CountColumn {
+                            column_index: idx,
+                            value: 0,
+                        })
+                    }
+                } else if field_id.is_none() {
+                    Ok(AggregateAccumulator::CountStar { value: 0 })
                 } else {
-                    Ok(AggregateAccumulator::CountColumn {
-                        column_index: idx,
-                        value: 0,
-                    })
+                    Err(Error::Internal(
+                        "Count aggregate requires projection index".into(),
+                    ))
                 }
             }
             AggregateKind::Sum {

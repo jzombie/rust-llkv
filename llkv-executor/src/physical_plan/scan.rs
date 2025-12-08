@@ -78,7 +78,12 @@ where
                         }).collect::<std::result::Result<Vec<_>, _>>();
 
                         match columns {
-                            Ok(cols) => Some(RecordBatch::try_new(schema.clone(), cols).map_err(|e| Error::Internal(e.to_string()))),
+                            Ok(cols) => {
+                                if cols.is_empty() {
+                                     eprintln!("DEBUG: ScanExec cols is empty! Schema fields: {}, Batch cols: {}", schema.fields().len(), batch.columns().len());
+                                }
+                                Some(RecordBatch::try_new(schema.clone(), cols).map_err(|e| Error::Internal(e.to_string())))
+                            },
                             Err(e) => Some(Err(Error::Internal(format!("Failed to cast scan columns: {}", e)))),
                         }
                     } else {

@@ -305,6 +305,32 @@ impl<F> ScalarExpr<F> {
     pub fn random() -> Self {
         Self::Random
     }
+
+    pub fn contains_aggregate(&self) -> bool {
+        match self {
+            ScalarExpr::Aggregate(_) => true,
+            ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
+                left.contains_aggregate() || right.contains_aggregate()
+            }
+            ScalarExpr::Not(e)
+            | ScalarExpr::Cast { expr: e, .. }
+            | ScalarExpr::IsNull { expr: e, .. }
+            | ScalarExpr::GetField { base: e, .. } => e.contains_aggregate(),
+            ScalarExpr::Coalesce(items) => items.iter().any(|e| e.contains_aggregate()),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand.as_ref().map_or(false, |o| o.contains_aggregate())
+                    || branches
+                        .iter()
+                        .any(|(w, t)| w.contains_aggregate() || t.contains_aggregate())
+                    || else_expr.as_ref().map_or(false, |e| e.contains_aggregate())
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Arithmetic operator for [`ScalarExpr`].

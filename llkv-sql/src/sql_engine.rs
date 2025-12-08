@@ -8458,6 +8458,7 @@ fn try_parse_aggregate_function(
     if func.uses_odbc_syntax {
         return Ok(None);
     }
+
     if !matches!(func.parameters, FunctionArguments::None) {
         return Ok(None);
     }
