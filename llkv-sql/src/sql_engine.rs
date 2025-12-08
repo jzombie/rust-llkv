@@ -10826,7 +10826,7 @@ fn infer_expr_type(
         ScalarExpr::Literal(lit) => Ok(match lit {
             Literal::Int128(_) => DataType::Int64,
             Literal::Float64(_) => DataType::Float64,
-            Literal::Decimal128(v) => DataType::Decimal128(v.precision(), v.scale()),
+            Literal::Decimal128(v) => DataType::Decimal128(std::cmp::max(v.precision(), v.scale() as u8), v.scale()),
             Literal::Boolean(_) => DataType::Boolean,
             Literal::String(_) => DataType::Utf8,
             Literal::Date32(_) => DataType::Date32,

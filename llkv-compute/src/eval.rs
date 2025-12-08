@@ -164,7 +164,7 @@ fn literal_type(lit: &Literal) -> DataType {
         Literal::Boolean(_) => DataType::Boolean,
         Literal::Int128(_) => DataType::Int64, // Default to Int64 for literals
         Literal::Float64(_) => DataType::Float64,
-        Literal::Decimal128(d) => DataType::Decimal128(d.precision(), d.scale()),
+        Literal::Decimal128(d) => DataType::Decimal128(std::cmp::max(d.precision(), d.scale() as u8), d.scale()),
         Literal::String(_) => DataType::Utf8,
         Literal::Date32(_) => DataType::Date32,
         Literal::Interval(_) => DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
@@ -546,8 +546,9 @@ impl ScalarEvaluator {
             Literal::Int128(i) => Arc::new(arrow::array::Int64Array::from(vec![*i as i64])),
             Literal::Float64(f) => Arc::new(Float64Array::from(vec![*f])),
             Literal::Decimal128(d) => {
+                let precision = std::cmp::max(d.precision(), d.scale() as u8);
                 let array = arrow::array::Decimal128Array::from(vec![Some(d.raw_value())])
-                    .with_precision_and_scale(d.precision(), d.scale())
+                    .with_precision_and_scale(precision, d.scale())
                     .unwrap();
                 Arc::new(array)
             }

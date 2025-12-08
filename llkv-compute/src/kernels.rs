@@ -41,6 +41,7 @@ fn coerce_decimals(lhs: (u8, i8), rhs: (u8, i8)) -> DataType {
     let rhs_int = i32::from(rhs.0) - i32::from(rhs.1);
     let int_digits = lhs_int.max(rhs_int);
     let precision = (int_digits + i32::from(scale)).clamp(1, 38) as u8;
+    let precision = std::cmp::max(precision, scale as u8);
     DataType::Decimal128(precision, scale)
 }
 

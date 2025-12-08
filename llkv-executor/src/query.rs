@@ -5046,7 +5046,7 @@ fn get_literal_type(l: &Literal) -> DataType {
         Literal::Null => DataType::Null,
         Literal::Int128(_) => DataType::Int64,
         Literal::Float64(_) => DataType::Float64,
-        Literal::Decimal128(d) => DataType::Decimal128(d.precision(), d.scale()),
+        Literal::Decimal128(d) => DataType::Decimal128(std::cmp::max(d.precision(), d.scale() as u8), d.scale()),
         Literal::String(_) => DataType::Utf8,
         Literal::Boolean(_) => DataType::Boolean,
         Literal::Date32(_) => DataType::Date32,

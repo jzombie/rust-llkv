@@ -215,7 +215,10 @@ pub fn infer_literal_datatype(literal: &Literal) -> LlkvResult<DataType> {
     match literal {
         Literal::Int128(_) => Ok(DataType::Int64),
         Literal::Float64(_) => Ok(DataType::Float64),
-        Literal::Decimal128(value) => Ok(DataType::Decimal128(value.precision(), value.scale())),
+        Literal::Decimal128(value) => Ok(DataType::Decimal128(
+            std::cmp::max(value.precision(), value.scale() as u8),
+            value.scale(),
+        )),
         Literal::Boolean(_) => Ok(DataType::Boolean),
         Literal::String(_) => Ok(DataType::Utf8),
         Literal::Date32(_) => Ok(DataType::Date32),
