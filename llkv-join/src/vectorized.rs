@@ -135,6 +135,7 @@ where
         // Defensive: ensure stored count reflects the batch we built from.
         debug_assert_eq!(right_len, self.right_batch.num_rows());
         if right_len == 0 {
+            tracing::debug!("VectorizedHashJoinStream: right_len is 0, finishing cross join");
             self.cross_finished = true;
             return None;
         }
@@ -439,6 +440,7 @@ mod tests {
             JoinType::Inner,
             Vec::new(),
             Vec::new(),
+            None,
         )?;
 
         let batches = stream.collect::<Result<Vec<_>, _>>()?;

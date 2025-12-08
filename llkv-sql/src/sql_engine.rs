@@ -9428,9 +9428,29 @@ fn translate_condition_with_context(
                     work_stack.push(ConditionFrame::Leaf(result));
                 }
                 other => {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "unsupported WHERE clause: {other:?}"
-                    )));
+                    // Fallback: treat as scalar expression and check for truthiness
+                    // We use `expr <> false` semantics to handle boolean and integer truthiness
+                    // and preserve NULLs (NULL <> false -> NULL).
+                    let scalar = translate_scalar_with_context_scoped(
+                        engine,
+                        resolver,
+                        context.clone(),
+                        other,
+                        outer_scopes,
+                        correlated_tracker.reborrow(),
+                        Some(scalar_subqueries),
+                    )?;
+
+                    let false_literal = llkv_expr::expr::ScalarExpr::Literal(
+                        llkv_expr::literal::Literal::Boolean(false),
+                    );
+
+                    let result = llkv_expr::expr::Expr::Compare {
+                        left: scalar,
+                        op: llkv_expr::expr::CompareOp::NotEq,
+                        right: false_literal,
+                    };
+                    work_stack.push(ConditionFrame::Leaf(result));
                 }
             },
             ConditionFrame::Leaf(translated) => {

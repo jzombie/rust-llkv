@@ -846,7 +846,8 @@ impl ScalarEvaluator {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
 
-                if (Self::is_null(&l) || Self::is_null(&r)) && !Self::contains_aggregate(&l) && !Self::contains_aggregate(&r) {
+                let is_logic_op = matches!(op, BinaryOp::And | BinaryOp::Or);
+                if !is_logic_op && (Self::is_null(&l) || Self::is_null(&r)) && !Self::contains_aggregate(&l) && !Self::contains_aggregate(&r) {
                     return ScalarExpr::Literal(Literal::Null);
                 }
 

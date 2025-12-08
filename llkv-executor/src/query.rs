@@ -2271,6 +2271,9 @@ where
         having: Option<&llkv_expr::expr::Expr<'static, String>>,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+            eprintln!("create_single_table_plan filter: {:?}", plan.filter);
+        }
         let adapter = plan
             .table
             .as_any()
@@ -2722,6 +2725,25 @@ where
                 let result = ScalarEvaluator::evaluate_batch(&scalar_predicate, batch.num_rows(), &numeric_arrays)
                     .map_err(|e| Error::Internal(format!("Filter evaluation failed: {:?}", e)))?;
                 
+                println!("DEBUG: FilterExec: evaluated predicate for {} rows", batch.num_rows());
+                println!("DEBUG: FilterExec: result type: {:?}", result.data_type());
+                if let Some(bool_arr) = result.as_any().downcast_ref::<BooleanArray>() {
+                    println!("DEBUG: FilterExec: true count: {}", bool_arr.true_count());
+                    println!("DEBUG: FilterExec: null count: {}", bool_arr.null_count());
+                    println!("DEBUG: FilterExec: false count: {}", bool_arr.len() - bool_arr.true_count() - bool_arr.null_count());
+                } else {
+                    println!("DEBUG: FilterExec: result is NOT BooleanArray");
+                }
+
+                if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
+                    tracing::debug!("FilterExec: evaluated predicate for {} rows", batch.num_rows());
+                    tracing::debug!("FilterExec: result type: {:?}", result.data_type());
+                    if let Some(bool_arr) = result.as_any().downcast_ref::<BooleanArray>() {
+                        tracing::debug!("FilterExec: true count: {}", bool_arr.true_count());
+                        tracing::debug!("FilterExec: null count: {}", bool_arr.null_count());
+                    }
+                }
+
                 let bool_arr = result.as_any().downcast_ref::<BooleanArray>()
                     .ok_or_else(|| Error::Internal("Filter predicate must return boolean".to_string()))?;
                 
@@ -2909,6 +2931,9 @@ where
                 force_manual_projection,
                 residual_filter.is_some()
             );
+            if let Some(r) = &residual_filter {
+                eprintln!("[executor] residual_filter expr: {:?}", r);
+            }
         }
 
         match &prepared.logical_plan {
@@ -3382,7 +3407,8 @@ where
                         })?;
 
                     let (keys, residuals) = extract_join_keys_and_filters(join)?;
-                    pending_filters.extend(residuals);
+                    // Do NOT mix residuals (ON clause) with pending_filters (WHERE clause) yet.
+                    // pending_filters.extend(residuals); 
                     let mut left_indices = Vec::new();
                     let mut right_indices = Vec::new();
 
@@ -3424,7 +3450,11 @@ where
                     }
 
                     let prefix_limit = i + 1;
-                    let mut applicable = Vec::new();
+                    
+                    // Start with residuals (ON clause) as applicable filters for the join.
+                    // They are intrinsic to the join operation.
+                    let mut applicable = residuals;
+                    
                     let mut remaining = Vec::new();
                     for clause in pending_filters.into_iter() {
                         let mapped = remap_filter_expr(&clause)?;
@@ -3433,7 +3463,12 @@ where
                         let tables: FxHashSet<usize> =
                             fields.into_iter().map(|(tbl, _)| tbl).collect();
 
-                        if tables.iter().all(|t| *t <= prefix_limit) {
+                        // Only push WHERE filters into the join itself for Inner joins.
+                        // For Outer joins, WHERE clause filters must be applied to the result
+                        // of the join.
+                        let is_inner_join = matches!(join_type, JoinType::Inner);
+
+                        if is_inner_join && tables.iter().all(|t| *t <= prefix_limit) {
                             applicable.push(clause);
                         } else {
                             remaining.push(clause);

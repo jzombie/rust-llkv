@@ -332,11 +332,20 @@ where
         let final_schema = schema_for_projections(schema, &requested_projections)?;
 
         let filter = match &plan.filter {
-            Some(filter) => Some(translate_predicate(
-                filter.predicate.clone(),
-                schema,
-                |_| Error::Internal("Unknown column".to_string()),
-            )?),
+            Some(filter) => {
+                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                    eprintln!("LogicalPlan filter input: {:?}", filter.predicate);
+                }
+                let translated = translate_predicate(
+                    filter.predicate.clone(),
+                    schema,
+                    |_| Error::Internal("Unknown column".to_string()),
+                )?;
+                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                    eprintln!("LogicalPlan filter translated: {:?}", translated);
+                }
+                Some(translated)
+            },
             None => None,
         };
 
