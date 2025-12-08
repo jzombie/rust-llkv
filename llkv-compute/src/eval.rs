@@ -794,6 +794,25 @@ impl ScalarEvaluator {
         }
     }
 
+    fn contains_aggregate<F>(expr: &ScalarExpr<F>) -> bool {
+        match expr {
+            ScalarExpr::Aggregate(_) => true,
+            ScalarExpr::Binary { left, right, .. } => Self::contains_aggregate(left) || Self::contains_aggregate(right),
+            ScalarExpr::Not(e) => Self::contains_aggregate(e),
+            ScalarExpr::IsNull { expr, .. } => Self::contains_aggregate(expr),
+            ScalarExpr::Cast { expr, .. } => Self::contains_aggregate(expr),
+            ScalarExpr::Compare { left, right, .. } => Self::contains_aggregate(left) || Self::contains_aggregate(right),
+            ScalarExpr::Case { operand, branches, else_expr } => {
+                operand.as_ref().map_or(false, |e| Self::contains_aggregate(e)) ||
+                branches.iter().any(|(w, t)| Self::contains_aggregate(w) || Self::contains_aggregate(t)) ||
+                else_expr.as_ref().map_or(false, |e| Self::contains_aggregate(e))
+            }
+            ScalarExpr::Coalesce(exprs) => exprs.iter().any(Self::contains_aggregate),
+            ScalarExpr::GetField { base, .. } => Self::contains_aggregate(base),
+            _ => false,
+        }
+    }
+
     fn is_null<F>(expr: &ScalarExpr<F>) -> bool {
         match expr {
             ScalarExpr::Literal(Literal::Null) => true,
@@ -809,7 +828,7 @@ impl ScalarEvaluator {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
 
-                if Self::is_null(&l) || Self::is_null(&r) {
+                if (Self::is_null(&l) || Self::is_null(&r)) && !Self::contains_aggregate(&l) && !Self::contains_aggregate(&r) {
                     return ScalarExpr::Literal(Literal::Null);
                 }
 
@@ -828,7 +847,7 @@ impl ScalarEvaluator {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
 
-                if Self::is_null(&l) || Self::is_null(&r) {
+                if (Self::is_null(&l) || Self::is_null(&r)) && !Self::contains_aggregate(&l) && !Self::contains_aggregate(&r) {
                     return ScalarExpr::Literal(Literal::Null);
                 }
 

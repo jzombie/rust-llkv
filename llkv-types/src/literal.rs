@@ -377,10 +377,21 @@ macro_rules! impl_from_literal_int {
                                 value: *i,
                             }
                         }),
-                        Literal::Float64(_) => Err(LiteralCastError::TypeMismatch {
-                            expected: "integer",
-                            got: "float",
-                        }),
+                        Literal::Float64(f) => {
+                            if !f.is_finite() || f.fract() != 0.0 {
+                                return Err(LiteralCastError::TypeMismatch {
+                                    expected: "integer",
+                                    got: "float",
+                                });
+                            }
+                            if *f < <$ty>::MIN as f64 || *f > <$ty>::MAX as f64 {
+                                return Err(LiteralCastError::FloatOutOfRange {
+                                    target: std::any::type_name::<$ty>(),
+                                    value: *f,
+                                });
+                            }
+                            Ok(*f as $ty)
+                        },
                         Literal::Boolean(_) => Err(LiteralCastError::TypeMismatch {
                             expected: "integer",
                             got: "boolean",
