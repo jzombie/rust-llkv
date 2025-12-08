@@ -880,10 +880,7 @@ where
         let has_failed = has_failed.clone();
         trials.push(Trial::test(name, move || {
             if fail_fast && has_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                // Give the failing test a moment to print its error
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                eprintln!("Aborting remaining tests due to failure (fail-fast enabled).");
-                std::process::exit(1);
+                return Ok(());
             }
 
             let p = path_clone.clone();
