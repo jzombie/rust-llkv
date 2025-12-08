@@ -91,7 +91,7 @@ thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 tpchgen = "2.0.1"
-tracing = "0.1.41"
+tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.2", features = ["env-filter"] }
 walkdir = "2.5"
 
