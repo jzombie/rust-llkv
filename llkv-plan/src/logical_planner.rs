@@ -202,7 +202,7 @@ where
     }
 
     pub fn get_table_schema(&self, table_name: &str) -> Result<Arc<PlanSchema>> {
-        let table = self.provider.get_table(table_name).ok_or_else(|| Error::Internal(format!("Table not found: {}", table_name)))?;
+        let table = self.provider.get_table(table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
         Ok(Arc::new(table.schema().clone()))
     }
 
@@ -213,7 +213,7 @@ where
 
         let table_ref = plan.tables.first().expect("validated length above");
         let table_name = table_ref.qualified_name();
-        let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Table not found: {}", table_name)))?;
+        let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
         let table_id = table.table_id();
         let schema = table.schema();
 
@@ -373,7 +373,7 @@ where
         let mut planned_tables = Vec::with_capacity(plan.tables.len());
         for table_ref in &plan.tables {
             let table_name = table_ref.qualified_name();
-            let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Table not found: {}", table_name)))?;
+            let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
             let table_id = table.table_id();
             let schema = table.schema();
             let plan_schema = Arc::new(schema.clone());
