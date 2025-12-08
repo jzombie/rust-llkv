@@ -4,7 +4,8 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, mpsc};
 
-use arrow::array::{Array, ArrayRef, BooleanArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatchOptions};
+use llkv_compute::projection::infer_literal_datatype;
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::DataType;
 use llkv_aggregate::{AggregateStream, GroupedAggregateStream, AggregateSpec, AggregateKind};
@@ -2456,8 +2457,6 @@ where
             }
 
             // 3. Final Projection
-            eprintln!("DEBUG: agg_schema fields: {:?}", agg_schema.fields());
-            eprintln!("DEBUG: final_expressions: {:?}", rewrite.final_expressions);
             
             let mut proj_exprs = Vec::new();
             for (expr, name) in rewrite.final_expressions.iter().zip(&rewrite.final_names) {
@@ -3159,11 +3158,7 @@ where
             }
             LogicalPlan::Multi(multi) => {
                 let table_count = multi.tables.len();
-                if table_count == 0 {
-                    return Err(Error::Internal("Multi-table plan with no tables".into()));
-                }
-
-                if multi.table_filters.len() != table_count {
+                if table_count > 0 && multi.table_filters.len() != table_count {
                     return Err(Error::Internal(
                         "table filter metadata does not match table count".into(),
                     ));
@@ -3176,6 +3171,7 @@ where
                 let mut required_fields: Vec<FxHashSet<FieldId>> =
                     vec![FxHashSet::default(); table_count];
 
+                if table_count > 0 {
                 for proj in &multi.projections {
                     match proj {
                         llkv_plan::logical_planner::ResolvedProjection::Column {
@@ -3231,12 +3227,21 @@ where
                         required_fields[tbl].insert(fid);
                     }
                 }
+                }
 
                 // 2. Create Streams
-                let mut streams: Vec<BatchIter> = Vec::with_capacity(table_count);
-                let mut schemas: Vec<SchemaRef> = Vec::with_capacity(table_count);
-                let mut table_field_map: Vec<Vec<FieldId>> = Vec::with_capacity(table_count);
+                let mut streams: Vec<BatchIter> = Vec::with_capacity(table_count.max(1));
+                let mut schemas: Vec<SchemaRef> = Vec::with_capacity(table_count.max(1));
+                let mut table_field_map: Vec<Vec<FieldId>> = Vec::with_capacity(table_count.max(1));
 
+                if table_count == 0 {
+                     let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
+                     let options = RecordBatchOptions::new().with_row_count(Some(1));
+                     let batch = RecordBatch::try_new_with_options(schema.clone(), vec![], &options).map_err(|e| Error::Internal(e.to_string()))?;
+                     streams.push(Box::new(std::iter::once(Ok(batch))) as BatchIter);
+                     schemas.push(schema);
+                     table_field_map.push(vec![]);
+                } else {
                 for (i, table) in multi.tables.iter().enumerate() {
                     let adapter = table
                         .table
@@ -3327,6 +3332,7 @@ where
 
                     streams.push(stream);
                 }
+                }
 
                 // 3. Build Pipeline
                 let mut current_stream = streams.remove(0);
@@ -3344,7 +3350,7 @@ where
                     col_mapping.insert((0, *fid), idx);
                 }
 
-                for i in 0..table_count - 1 {
+                for i in 0..table_count.saturating_sub(1) {
                     let right_stream = streams.remove(0);
                     let right_schema = schemas[i + 1].clone();
 
@@ -4870,15 +4876,7 @@ fn infer_type(
                 .ok_or_else(|| Error::Internal("Column not found in mapping".into()))?;
             Ok(schema.field(*idx).data_type().clone())
         }
-        ScalarExpr::Literal(l) => match l {
-            Literal::Int128(_) => Ok(DataType::Int64),
-            Literal::Float64(_) => Ok(DataType::Float64),
-            Literal::Boolean(_) => Ok(DataType::Boolean),
-            Literal::String(_) => Ok(DataType::Utf8),
-            Literal::Null => Ok(DataType::Null),
-            Literal::Decimal128(d) => Ok(DataType::Decimal128(d.precision(), d.scale())),
-            _ => Ok(DataType::Int64),
-        },
+        ScalarExpr::Literal(l) => infer_literal_datatype(l),
         ScalarExpr::Binary { left, op: _, right } => {
             let l = infer_type(left, schema, col_mapping)?;
             let r = infer_type(right, schema, col_mapping)?;

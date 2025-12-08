@@ -1,8 +1,8 @@
 use crate::plans::PlanResult;
 use crate::schema::PlanSchema;
-use arrow::datatypes::{DataType, Field, IntervalUnit, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
+use llkv_compute::projection::infer_literal_datatype;
 use llkv_expr::expr::{BinaryOp, ScalarExpr};
-use llkv_expr::literal::Literal;
 use llkv_result::Error;
 use llkv_scan::ScanProjection;
 use llkv_types::FieldId;
@@ -50,19 +50,13 @@ pub fn infer_computed_data_type(
     expr: &ScalarExpr<FieldId>,
 ) -> PlanResult<DataType> {
     match expr {
-        ScalarExpr::Literal(Literal::Int128(_)) => Ok(DataType::Int64),
-        ScalarExpr::Literal(Literal::Float64(_)) => Ok(DataType::Float64),
-        ScalarExpr::Literal(Literal::Decimal128(value)) => {
-            Ok(DataType::Decimal128(value.precision(), value.scale()))
-        }
-        ScalarExpr::Literal(Literal::Boolean(_)) => Ok(DataType::Boolean),
-        ScalarExpr::Literal(Literal::String(_)) => Ok(DataType::Utf8),
-        ScalarExpr::Literal(Literal::Date32(_)) => Ok(DataType::Date32),
-        ScalarExpr::Literal(Literal::Null) => Ok(DataType::Null),
-        ScalarExpr::Literal(Literal::Struct(_)) => Ok(DataType::Utf8),
-        ScalarExpr::Literal(Literal::Interval(_)) => {
-            Ok(DataType::Interval(IntervalUnit::MonthDayNano))
-        }
+        ScalarExpr::Literal(lit) => {
+            let res = infer_literal_datatype(lit);
+            if let Ok(dt) = &res {
+                println!("Inferred type for literal {:?}: {:?}", lit, dt);
+            }
+            res
+        },
         ScalarExpr::Column(field_id) => {
             let column = schema.column_by_field_id(*field_id).ok_or_else(|| {
                 Error::InvalidArgumentError(format!(

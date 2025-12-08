@@ -1,7 +1,7 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float64Array, UInt32Array, new_null_array};
+use arrow::array::{Array, ArrayRef, Float64Array, StructArray, UInt32Array, new_null_array};
 use arrow::compute::kernels::cast;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{concat, is_not_null, take};
@@ -557,8 +557,25 @@ impl ScalarEvaluator {
                 let val = IntervalMonthDayNanoType::make_value(i.months, i.days, i.nanos);
                 Arc::new(arrow::array::IntervalMonthDayNanoArray::from(vec![val]))
             }
-            Literal::Struct(_) => {
-                new_null_array(&DataType::Struct(arrow::datatypes::Fields::empty()), 1)
+            Literal::Struct(fields) => {
+                if fields.is_empty() {
+                    let struct_array = StructArray::new_empty_fields(1, None);
+                    return Arc::new(struct_array);
+                }
+
+                let mut arrow_fields = Vec::new();
+                let mut child_arrays = Vec::new();
+
+                for (name, val) in fields {
+                    let arr = Self::literal_to_array(val);
+                    let field = Field::new(name, arr.data_type().clone(), true);
+                    arrow_fields.push(field);
+                    child_arrays.push(arr);
+                }
+
+                let struct_array = StructArray::try_new(arrow_fields.into(), child_arrays, None)
+                    .expect("failed to create struct literal array");
+                Arc::new(struct_array)
             }
         }
     }
