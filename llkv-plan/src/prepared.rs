@@ -9,13 +9,13 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::aggregate_rewrite::build_single_aggregate_rewrite;
 use crate::logical_planner::{LogicalPlan, LogicalPlanner};
-use crate::planner::PhysicalPlanner;
+// use crate::planner::PhysicalPlanner;
 use crate::plans::{
     CompoundOperator, CompoundQuantifier, CompoundSelectPlan, CorrelatedColumn, FilterSubquery,
     ScalarSubquery, SelectFilter, SelectPlan, SelectProjection,
 };
-use crate::physical::table::TableProvider;
-use crate::physical::PhysicalPlan;
+use crate::table_provider::TableProvider;
+// use crate::physical::PhysicalPlan;
 
 /// Prepared representation of a SELECT plan with planning metadata attached.
 pub struct PreparedSelectPlan<P>
@@ -24,7 +24,7 @@ where
 {
     pub plan: SelectPlan,
     pub logical_plan: LogicalPlan<P>,
-    pub physical_plan: Option<Arc<dyn PhysicalPlan>>, // Only populated for single-table plans.
+    // pub physical_plan: Option<Arc<dyn PhysicalPlan>>, // Only populated for single-table plans.
     pub scalar_subqueries: Vec<PreparedScalarSubquery<P>>, // Prepared subqueries for ScalarExpr.
     pub filter_subqueries: Vec<PreparedFilterSubquery<P>>, // Prepared subqueries referenced from filters.
     pub compound: Option<PreparedCompoundSelect<P>>,       // Prepared compound operations.
@@ -89,7 +89,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     logical_planner: LogicalPlanner<P>,
-    physical_planner: PhysicalPlanner<P>,
+    // physical_planner: PhysicalPlanner<P>,
 }
 
 impl<P> DefaultPreparedSelectPlanner<P>
@@ -99,7 +99,7 @@ where
     pub fn new(provider: Arc<dyn TableProvider<P>>) -> Self {
         Self {
             logical_planner: LogicalPlanner::new(provider),
-            physical_planner: PhysicalPlanner::new(),
+            // physical_planner: PhysicalPlanner::new(),
         }
     }
 
@@ -206,9 +206,27 @@ where
 {
     fn prepare_select(
         &self,
-        plan: SelectPlan,
+        mut plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> Result<PreparedSelectPlan<P>> {
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+             eprintln!("Before simplify: {:?}", plan.projections);
+        }
+        // Simplify projection expressions to remove dead code (e.g. NULLIF(NULL, col))
+        for proj in &mut plan.projections {
+            if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
+                *expr = llkv_compute::eval::ScalarEvaluator::simplify(expr);
+            }
+        }
+
+        // Simplify HAVING clause
+        if let Some(having) = &mut plan.having {
+            *having = simplify_expr(having.clone());
+        }
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+             eprintln!("After simplify: {:?}", plan.projections);
+        }
+
         let prepared_scalar_subqueries = self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
 
         let filter_subqueries = plan
@@ -224,11 +242,26 @@ where
             .map(|c| self.prepare_compound(c, row_filter.clone()))
             .transpose()?;
 
+        // Simplify WHERE clause
+        if let Some(filter) = &mut plan.filter {
+            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                 eprintln!("Before filter simplify: {:?}", filter.predicate);
+            }
+            filter.predicate = simplify_expr(filter.predicate.clone());
+            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                 eprintln!("After filter simplify: {:?}", filter.predicate);
+            }
+        }
+
         let (pushable_filter, residual_filter) = if let Some(filter) = &plan.filter {
             Self::split_predicate(&filter.predicate)
         } else {
             (None, None)
         };
+
+        if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+            eprintln!("[planner] plan.projections: {:?}", plan.projections);
+        }
 
         let residual_filter_subqueries = if residual_filter.is_some() {
             plan.filter
@@ -287,26 +320,24 @@ where
 
         if force_manual_projection && has_aggregates {
             if let LogicalPlan::Single(single) = &mut logical_plan {
-                if single.aggregate_rewrite.is_none() {
-                    single.aggregate_rewrite =
-                        build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
-                }
+                // When forcing manual projection, the logical plan was created with AllColumns,
+                // which causes the aggregate rewrite to include all columns in the final output.
+                // We need to re-compute the rewrite using the original projections.
+                single.aggregate_rewrite =
+                    build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
             }
         }
 
-        let physical_plan = match &logical_plan {
-            LogicalPlan::Single(single) => Some(
-                self.physical_planner
-                    .create_physical_plan(single, row_filter.clone())
-                    .map_err(Error::Internal)?,
-            ),
-            LogicalPlan::Multi(_) => None,
-        };
+        // let physical_plan = Some(
+        //     self.physical_planner
+        //         .create_physical_plan(&logical_plan, row_filter.clone())
+        //         .map_err(Error::Internal)?,
+        // );
 
         Ok(PreparedSelectPlan {
             plan: plan_for_execution,
             logical_plan,
-            physical_plan,
+            // physical_plan,
             scalar_subqueries: prepared_scalar_subqueries,
             filter_subqueries,
             compound,
@@ -403,5 +434,37 @@ fn contains_aggregate_in_expr(expr: &LlkvExpr<'_, String>) -> bool {
         LlkvExpr::IsNull { expr, .. } => scalar_contains_aggregate(expr),
         LlkvExpr::And(list) | LlkvExpr::Or(list) => list.iter().any(contains_aggregate_in_expr),
         LlkvExpr::Not(inner) => contains_aggregate_in_expr(inner),
+    }
+}
+
+fn simplify_expr<F: std::hash::Hash + Eq + Clone>(expr: Expr<'static, F>) -> Expr<'static, F> {
+    match expr {
+        Expr::And(exprs) => Expr::And(exprs.into_iter().map(simplify_expr).collect()),
+        Expr::Or(exprs) => Expr::Or(exprs.into_iter().map(simplify_expr).collect()),
+        Expr::Not(expr) => Expr::Not(Box::new(simplify_expr(*expr))),
+        Expr::Pred(filter) => Expr::Pred(filter),
+        Expr::Compare { left, op, right } => Expr::Compare {
+            left: llkv_compute::eval::ScalarEvaluator::simplify(&left),
+            op,
+            right: llkv_compute::eval::ScalarEvaluator::simplify(&right),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: llkv_compute::eval::ScalarEvaluator::simplify(&expr),
+            list: list
+                .into_iter()
+                .map(|e| llkv_compute::eval::ScalarEvaluator::simplify(&e))
+                .collect(),
+            negated,
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: llkv_compute::eval::ScalarEvaluator::simplify(&expr),
+            negated,
+        },
+        Expr::Literal(b) => Expr::Literal(b),
+        Expr::Exists(sub) => Expr::Exists(sub),
     }
 }

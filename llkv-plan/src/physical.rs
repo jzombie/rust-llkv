@@ -10,6 +10,9 @@ pub mod ranges;
 pub mod scan;
 pub mod sort;
 pub mod table;
+pub mod join;
+pub mod aggregate;
+pub mod filter;
 
 /// A physical plan represents an executable query plan.
 ///

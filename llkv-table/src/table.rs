@@ -68,7 +68,7 @@ where
     mvcc_cache: RwLock<Option<MvccColumnCache>>,
 }
 
-pub type TableScanStream<'table, P> = ScanRowStream<'table, P, Table<P>>;
+pub type TableScanStream<'table, P> = ScanRowStream<P, &'table Table<P>>;
 
 impl<P> Table<P>
 where

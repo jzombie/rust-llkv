@@ -230,3 +230,141 @@ where
 
 /// Utility alias for tracked numeric arrays during computed projection evaluation.
 pub type NumericArrayMap = FxHashMap<FieldId, arrow_array::ArrayRef>;
+
+impl<P, T> ScanStorage<P> for std::sync::Arc<T>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    T: ScanStorage<P> + ?Sized,
+{
+    fn table_id(&self) -> TableId {
+        (**self).table_id()
+    }
+    fn field_data_type(&self, fid: LogicalFieldId) -> LlkvResult<DataType> {
+        (**self).field_data_type(fid)
+    }
+    fn total_rows(&self) -> LlkvResult<u64> {
+        (**self).total_rows()
+    }
+    fn all_row_ids(&self) -> LlkvResult<croaring::Treemap> {
+        (**self).all_row_ids()
+    }
+    fn prepare_gather_context(
+        &self,
+        logical_fields: &[LogicalFieldId],
+    ) -> LlkvResult<MultiGatherContext> {
+        (**self).prepare_gather_context(logical_fields)
+    }
+    fn gather_row_window_with_context(
+        &self,
+        logical_fields: &[LogicalFieldId],
+        row_ids: &[u64],
+        null_policy: GatherNullPolicy,
+        ctx: Option<&mut MultiGatherContext>,
+    ) -> LlkvResult<RecordBatch> {
+        (**self).gather_row_window_with_context(logical_fields, row_ids, null_policy, ctx)
+    }
+    fn filter_row_ids<'expr>(
+        &self,
+        filter_expr: &Expr<'expr, FieldId>,
+    ) -> LlkvResult<croaring::Treemap> {
+        (**self).filter_row_ids(filter_expr)
+    }
+    fn filter_leaf(
+        &self,
+        filter: &llkv_compute::program::OwnedFilter,
+    ) -> LlkvResult<croaring::Treemap> {
+        (**self).filter_leaf(filter)
+    }
+    fn filter_fused(
+        &self,
+        field_id: FieldId,
+        filters: &[llkv_compute::program::OwnedFilter],
+        cache: &llkv_compute::analysis::PredicateFusionCache,
+    ) -> LlkvResult<RowIdSource> {
+        (**self).filter_fused(field_id, filters, cache)
+    }
+    fn sorted_row_ids_full_table(&self, order_spec: ScanOrderSpec) -> LlkvResult<Option<Vec<u64>>> {
+        (**self).sorted_row_ids_full_table(order_spec)
+    }
+    fn stream_row_ids(
+        &self,
+        chunk_size: usize,
+        ranges: Option<IntRanges>,
+        driving_column: Option<LogicalFieldId>,
+        on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
+    ) -> LlkvResult<()> {
+        (**self).stream_row_ids(chunk_size, ranges, driving_column, on_chunk)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        (**self).as_any()
+    }
+}
+
+impl<P, T> ScanStorage<P> for &T
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    T: ScanStorage<P> + ?Sized,
+{
+    fn table_id(&self) -> TableId {
+        (**self).table_id()
+    }
+    fn field_data_type(&self, fid: LogicalFieldId) -> LlkvResult<DataType> {
+        (**self).field_data_type(fid)
+    }
+    fn total_rows(&self) -> LlkvResult<u64> {
+        (**self).total_rows()
+    }
+    fn all_row_ids(&self) -> LlkvResult<croaring::Treemap> {
+        (**self).all_row_ids()
+    }
+    fn prepare_gather_context(
+        &self,
+        logical_fields: &[LogicalFieldId],
+    ) -> LlkvResult<MultiGatherContext> {
+        (**self).prepare_gather_context(logical_fields)
+    }
+    fn gather_row_window_with_context(
+        &self,
+        logical_fields: &[LogicalFieldId],
+        row_ids: &[u64],
+        null_policy: GatherNullPolicy,
+        ctx: Option<&mut MultiGatherContext>,
+    ) -> LlkvResult<RecordBatch> {
+        (**self).gather_row_window_with_context(logical_fields, row_ids, null_policy, ctx)
+    }
+    fn filter_row_ids<'expr>(
+        &self,
+        filter_expr: &Expr<'expr, FieldId>,
+    ) -> LlkvResult<croaring::Treemap> {
+        (**self).filter_row_ids(filter_expr)
+    }
+    fn filter_leaf(
+        &self,
+        filter: &llkv_compute::program::OwnedFilter,
+    ) -> LlkvResult<croaring::Treemap> {
+        (**self).filter_leaf(filter)
+    }
+    fn filter_fused(
+        &self,
+        field_id: FieldId,
+        filters: &[llkv_compute::program::OwnedFilter],
+        cache: &llkv_compute::analysis::PredicateFusionCache,
+    ) -> LlkvResult<RowIdSource> {
+        (**self).filter_fused(field_id, filters, cache)
+    }
+    fn sorted_row_ids_full_table(&self, order_spec: ScanOrderSpec) -> LlkvResult<Option<Vec<u64>>> {
+        (**self).sorted_row_ids_full_table(order_spec)
+    }
+    fn stream_row_ids(
+        &self,
+        chunk_size: usize,
+        ranges: Option<IntRanges>,
+        driving_column: Option<LogicalFieldId>,
+        on_chunk: &mut dyn FnMut(&[RowId]) -> LlkvResult<()>,
+    ) -> LlkvResult<()> {
+        (**self).stream_row_ids(chunk_size, ranges, driving_column, on_chunk)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        (**self).as_any()
+    }
+}

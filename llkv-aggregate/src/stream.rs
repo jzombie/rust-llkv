@@ -45,6 +45,29 @@ where
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
+
+    pub fn new_from_specs(
+        input: I,
+        specs: Vec<AggregateSpec>,
+        projection_indices: Vec<Option<usize>>,
+    ) -> Result<Self, Error> {
+        let mut states = Vec::with_capacity(specs.len());
+        for (spec, proj_idx) in specs.into_iter().zip(projection_indices) {
+             let accumulator = AggregateAccumulator::new_with_projection_index(&spec, proj_idx, None)?;
+             states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
+        }
+
+        let fields: Vec<arrow::datatypes::Field> =
+            states.iter().map(|s| s.output_field()).collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        Ok(Self {
+            states,
+            input,
+            done: false,
+            schema,
+        })
+    }
 }
 
 impl<I> Iterator for AggregateStream<I>
@@ -159,6 +182,46 @@ where
 
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    pub fn new_from_specs(
+        input: I,
+        key_indices: Vec<usize>,
+        specs: Vec<AggregateSpec>,
+        physical_schema: &SchemaRef,
+        projection_indices: Vec<Option<usize>>,
+    ) -> Result<Self, Error> {
+        let mut states = Vec::with_capacity(specs.len());
+        for (spec, proj_idx) in specs.into_iter().zip(projection_indices) {
+             let accumulator = AggregateAccumulator::new_with_projection_index(&spec, proj_idx, None)?;
+             states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
+        }
+
+        let key_fields: Vec<Field> = key_indices
+            .iter()
+            .map(|&idx| physical_schema.field(idx).clone())
+            .collect();
+
+        let sort_fields: Vec<SortField> = key_fields
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect();
+        let converter =
+            RowConverter::new(sort_fields).map_err(|e| Error::Internal(e.to_string()))?;
+
+        let mut fields: Vec<Field> = key_fields.clone();
+        let agg_fields: Vec<Field> = states.iter().map(|s| s.output_field()).collect();
+        fields.extend(agg_fields);
+        let schema = Arc::new(Schema::new(fields));
+
+        Ok(Self {
+            input,
+            key_indices,
+            template_states: states,
+            schema,
+            converter,
+            finished: false,
+        })
     }
 }
 

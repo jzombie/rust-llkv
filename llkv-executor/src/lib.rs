@@ -5,6 +5,7 @@
 //! hosts DML helpers used by the runtime (value coercion, insert column mapping).
 
 pub mod insert;
+pub mod physical_plan;
 mod query;
 pub mod types;
 

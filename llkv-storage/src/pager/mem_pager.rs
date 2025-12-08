@@ -11,6 +11,7 @@ use std::sync::{
 
 /// In-memory pager used for tests/benchmarks.
 #[allow(clippy::module_name_repetitions)]
+#[derive(Debug)]
 pub struct MemPager {
     next_key: AtomicU64,
     blobs: RwLock<FxHashMap<PhysicalKey, EntryHandle>>,

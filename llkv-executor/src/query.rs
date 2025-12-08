@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex, mpsc};
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::DataType;
+use llkv_aggregate::{AggregateStream, GroupedAggregateStream, AggregateSpec, AggregateKind};
 
 impl<P> QueryExecutor<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     fn execute_complex_aggregation(
         &self,
@@ -62,7 +63,7 @@ where
         } else {
             let stream = GroupedAggregateStream::new(
                 pre_agg_iter,
-                key_indices,
+                key_indices.clone(),
                 &agg_plan,
                 &logical_schema,
                 &pre_agg_schema,
@@ -70,6 +71,9 @@ where
             let schema = stream.schema();
             (Box::new(stream.map(|b| b)), schema)
         };
+
+        eprintln!("DEBUG: execute_complex_aggregation: key_indices={:?}", key_indices);
+        eprintln!("DEBUG: agg_schema={:?}", agg_schema);
 
         let agg_count = agg_plan.aggregates.len();
         let agg_offset = agg_schema
@@ -185,7 +189,6 @@ where
 use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
-use llkv_aggregate::{AggregateStream, GroupedAggregateStream};
 use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
 use llkv_column_map::store::Projection;
 use llkv_compute::eval::ScalarEvaluator;
@@ -194,7 +197,7 @@ use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr, SubqueryId};
 use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, Expr, Filter, InList, Operator};
 use llkv_join::JoinType;
-use llkv_plan::logical_planner::{LogicalPlan, ResolvedJoin};
+use llkv_plan::logical_planner::{LogicalPlan, ResolvedJoin, SingleTableLogicalPlan, MultiTableLogicalPlan};
 use llkv_plan::plans::AggregateExpr;
 use llkv_plan::plans::FilterSubquery;
 use llkv_plan::plans::JoinPlan;
@@ -203,7 +206,14 @@ use llkv_plan::prepared::{
     DefaultPreparedSelectPlanner, PreparedCompoundSelect, PreparedScalarSubquery,
     PreparedSelectPlan, PreparedSelectPlanner,
 };
-use llkv_plan::physical::table::{ExecutionTable, TableProvider};
+use crate::physical_plan::aggregate::AggregateExec;
+use crate::physical_plan::filter::FilterExec;
+use crate::physical_plan::join::HashJoinExec;
+use crate::physical_plan::projection::ProjectionExec;
+use crate::physical_plan::scan::ScanExec;
+use crate::physical_plan::sort::SortExec;
+use llkv_plan::table_provider::{ExecutionTable, TableProvider};
+use crate::physical_plan::PhysicalPlan;
 use llkv_plan::schema::{PlanColumn, PlanSchema};
 use llkv_plan::SelectPlan;
 use llkv_result::Error;
@@ -222,15 +232,105 @@ pub type BatchIter = Box<dyn Iterator<Item = ExecutorResult<RecordBatch>> + Send
 /// Plan-driven SELECT executor bridging planner output to storage.
 pub struct QueryExecutor<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     provider: Arc<dyn ExecutorTableProvider<P>>,
     planner: Arc<dyn PreparedSelectPlanner<P>>,
 }
 
-impl<P> QueryExecutor<P>
+#[derive(Debug)]
+struct DistinctExec<P> {
+    input: Arc<dyn PhysicalPlan<P>>,
+}
+
+impl<P> DistinctExec<P> {
+    fn new(input: Arc<dyn PhysicalPlan<P>>) -> Self {
+        Self { input }
+    }
+}
+
+impl<P> PhysicalPlan<P> for DistinctExec<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+
+    fn execute(&self) -> ExecutorResult<BatchIter> {
+        let input_stream = self.input.execute()?;
+        let distinct_stream = DistinctStream::new(self.input.schema(), input_stream)?;
+        Ok(Box::new(distinct_stream))
+    }
+
+    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
+        vec![self.input.clone()]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+    ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        if children.len() != 1 {
+            return Err(Error::Internal("DistinctExec expects exactly one child".to_string()));
+        }
+        Ok(Arc::new(DistinctExec::new(children[0].clone())))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct LimitExec<P> {
+    input: Arc<dyn PhysicalPlan<P>>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+impl<P> LimitExec<P> {
+    fn new(input: Arc<dyn PhysicalPlan<P>>, offset: Option<usize>, limit: Option<usize>) -> Self {
+        Self { input, offset, limit }
+    }
+}
+
+impl<P> PhysicalPlan<P> for LimitExec<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+{
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+
+    fn execute(&self) -> ExecutorResult<BatchIter> {
+        let input_stream = self.input.execute()?;
+        let limited_stream = apply_offset_limit_stream(input_stream, self.offset, self.limit);
+        Ok(limited_stream)
+    }
+
+    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
+        vec![self.input.clone()]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+    ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        if children.len() != 1 {
+            return Err(Error::Internal("LimitExec expects exactly one child".to_string()));
+        }
+        Ok(Arc::new(LimitExec::new(children[0].clone(), self.offset, self.limit)))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl<P> QueryExecutor<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     pub fn new(
         provider: Arc<dyn ExecutorTableProvider<P>>,
@@ -971,7 +1071,7 @@ where
         new_plan
     }
 
-    fn expr_to_scalar_expr(expr: &Expr<'static, String>) -> ScalarExpr<String> {
+    fn expr_to_scalar_expr<T: Clone + std::fmt::Debug>(expr: &Expr<'_, T>) -> ScalarExpr<T> {
         match expr {
             Expr::And(list) => {
                 if list.is_empty() {
@@ -1097,6 +1197,91 @@ where
             },
             Expr::Literal(b) => ScalarExpr::Literal(Literal::Boolean(*b)),
             Expr::Exists(_) => ScalarExpr::Literal(Literal::Boolean(false)),
+        }
+    }
+
+    fn remap_having_expr_to_indices(
+        expr: &ScalarExpr<String>,
+        schema: &Schema,
+    ) -> ExecutorResult<ScalarExpr<(usize, u32)>> {
+        match expr {
+            ScalarExpr::Column(name) => {
+                eprintln!("DEBUG: remap_having_expr_to_indices resolving column: {}", name);
+                let idx = resolve_schema_index(name, schema)
+                    .ok_or_else(|| Error::Internal(format!("Column not found in schema: {}", name)))?;
+                Ok(ScalarExpr::Column((0, idx as u32)))
+            }
+            ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
+            ScalarExpr::Aggregate(call) => {
+                let dummy_expr = Box::new(ScalarExpr::Literal(Literal::Null));
+                Ok(ScalarExpr::Aggregate(match call {
+                    AggregateCall::CountStar => AggregateCall::CountStar,
+                    AggregateCall::Count { distinct, .. } => AggregateCall::Count { expr: dummy_expr, distinct: *distinct },
+                    AggregateCall::Sum { distinct, .. } => AggregateCall::Sum { expr: dummy_expr, distinct: *distinct },
+                    AggregateCall::Total { distinct, .. } => AggregateCall::Total { expr: dummy_expr, distinct: *distinct },
+                    AggregateCall::Avg { distinct, .. } => AggregateCall::Avg { expr: dummy_expr, distinct: *distinct },
+                    AggregateCall::Min(_) => AggregateCall::Min(dummy_expr),
+                    AggregateCall::Max(_) => AggregateCall::Max(dummy_expr),
+                    AggregateCall::CountNulls(_) => AggregateCall::CountNulls(dummy_expr),
+                    AggregateCall::GroupConcat { distinct, separator, .. } => AggregateCall::GroupConcat { expr: dummy_expr, distinct: *distinct, separator: separator.clone() },
+                }))
+            }
+            ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+                left: Box::new(Self::remap_having_expr_to_indices(left, schema)?),
+                op: *op,
+                right: Box::new(Self::remap_having_expr_to_indices(right, schema)?),
+            }),
+            ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(Self::remap_having_expr_to_indices(e, schema)?))),
+            ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+                expr: Box::new(Self::remap_having_expr_to_indices(expr, schema)?),
+                negated: *negated,
+            }),
+            ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+                expr: Box::new(Self::remap_having_expr_to_indices(expr, schema)?),
+                data_type: data_type.clone(),
+            }),
+            ScalarExpr::Case { operand, branches, else_expr } => {
+                 let op = if let Some(o) = operand {
+                     Some(Box::new(Self::remap_having_expr_to_indices(o, schema)?))
+                 } else {
+                     None
+                 };
+                 let mut new_branches = Vec::new();
+                 for (w, t) in branches {
+                     new_branches.push((
+                         Self::remap_having_expr_to_indices(w, schema)?,
+                         Self::remap_having_expr_to_indices(t, schema)?,
+                     ));
+                 }
+                 let el = if let Some(e) = else_expr {
+                     Some(Box::new(Self::remap_having_expr_to_indices(e, schema)?))
+                 } else {
+                     None
+                 };
+                 Ok(ScalarExpr::Case {
+                     operand: op,
+                     branches: new_branches,
+                     else_expr: el,
+                 })
+            }
+            ScalarExpr::Coalesce(exprs) => {
+                let mut new_exprs = Vec::new();
+                for e in exprs {
+                    new_exprs.push(Self::remap_having_expr_to_indices(e, schema)?);
+                }
+                Ok(ScalarExpr::Coalesce(new_exprs))
+            }
+            ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+                left: Box::new(Self::remap_having_expr_to_indices(left, schema)?),
+                op: *op,
+                right: Box::new(Self::remap_having_expr_to_indices(right, schema)?),
+            }),
+            ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+                base: Box::new(Self::remap_having_expr_to_indices(base, schema)?),
+                field_name: field_name.clone(),
+            }),
+            ScalarExpr::ScalarSubquery(s) => Ok(ScalarExpr::ScalarSubquery(s.clone())),
+            ScalarExpr::Random => Ok(ScalarExpr::Random),
         }
     }
 
@@ -2071,6 +2256,543 @@ where
         self.execute_prepared_with_filter(prepared, &subquery_results)
     }
 
+    fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan<P>,
+        having: Option<&llkv_expr::expr::Expr<'static, String>>,
+    ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        match logical_plan {
+            LogicalPlan::Single(plan) => self.create_single_table_plan(plan, having),
+            LogicalPlan::Multi(plan) => self.create_multi_table_plan(plan),
+        }
+    }
+
+    fn create_single_table_plan(
+        &self,
+        plan: &SingleTableLogicalPlan<P>,
+        having: Option<&llkv_expr::expr::Expr<'static, String>>,
+    ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        let adapter = plan
+            .table
+            .as_any()
+            .downcast_ref::<ExecutionTableAdapter<P>>()
+            .ok_or_else(|| {
+                Error::Internal("Table provider must be an ExecutionTableAdapter".to_string())
+            })?;
+
+        let table = adapter.table.table.clone();
+
+        let mut exec: Arc<dyn PhysicalPlan<P>> = Arc::new(ScanExec {
+            table,
+            schema: plan.scan_schema.clone(),
+            projections: plan.scan_projections.clone(),
+            filter: plan.filter.clone(),
+            limit: None,
+        });
+
+        // Apply Sort
+        if !plan.resolved_order_by.is_empty() {
+            exec = Arc::new(SortExec::new(exec, plan.resolved_order_by.clone()));
+        }
+
+        // Apply Aggregation
+        if let Some(rewrite) = &plan.aggregate_rewrite {
+            // 1. Create Pre-Aggregation Projection
+            let mut pre_agg_proj_exprs = Vec::new();
+            let input_schema = exec.schema();
+
+            // Add group by columns
+            for col_name in &plan.group_by {
+                if let Some((idx, _)) = input_schema.column_with_name(col_name) {
+                    pre_agg_proj_exprs.push((ScalarExpr::Column(idx), col_name.clone()));
+                } else {
+                    return Err(Error::Internal(format!("Group by column {} not found in schema", col_name)));
+                }
+            }
+
+            // Add aggregate arguments
+            for (i, expr) in rewrite.pre_aggregate_expressions.iter().enumerate() {
+                let resolved_expr = resolve_scalar_expr_to_indices(expr, &input_schema)?;
+                let alias = format!("_agg_arg_{}", i);
+                pre_agg_proj_exprs.push((resolved_expr, alias));
+            }
+
+            // Create schema for projection
+            let mut fields = Vec::new();
+            for (e, name) in &pre_agg_proj_exprs {
+                let dt = infer_expr_type(e, &input_schema);
+                fields.push(arrow::datatypes::Field::new(name, dt, true));
+            }
+            let proj_schema = Arc::new(Schema::new(fields));
+
+            exec = Arc::new(ProjectionExec::new(
+                exec,
+                proj_schema.clone(),
+                pre_agg_proj_exprs,
+            ));
+            
+            // 2. Create AggregateExec
+            let group_expr: Vec<usize> = (0..plan.group_by.len()).collect();
+            
+            let mut fields = Vec::new();
+            // Group by fields from the projection schema
+            for i in 0..plan.group_by.len() {
+                fields.push(proj_schema.field(i).clone());
+            }
+            
+            // Aggregate result fields
+            for agg in &rewrite.aggregates {
+                 let dt = match agg {
+                     llkv_plan::plans::AggregateExpr::Column { function, column, .. } => {
+                         let input_type = if let Some((_, field)) = proj_schema.column_with_name(column) {
+                             field.data_type().clone()
+                         } else {
+                             DataType::Int64
+                         };
+
+                         match function {
+                             llkv_plan::plans::AggregateFunction::Count | llkv_plan::plans::AggregateFunction::CountNulls => DataType::Int64,
+                             llkv_plan::plans::AggregateFunction::SumInt64 | llkv_plan::plans::AggregateFunction::TotalInt64 => {
+                                 match input_type {
+                                     DataType::Float64 | DataType::Float32 => DataType::Float64,
+                                     DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
+                                     _ => DataType::Int64,
+                                 }
+                             },
+                             llkv_plan::plans::AggregateFunction::MinInt64 | llkv_plan::plans::AggregateFunction::MaxInt64 => {
+                                 input_type
+                             },
+                             llkv_plan::plans::AggregateFunction::GroupConcat => DataType::Utf8,
+                         }
+                     },
+                     llkv_plan::plans::AggregateExpr::CountStar { .. } => DataType::Int64,
+                 };
+                 let name = match agg {
+                     llkv_plan::plans::AggregateExpr::Column { alias, .. } => alias.clone(),
+                     llkv_plan::plans::AggregateExpr::CountStar { alias, .. } => alias.clone(),
+                 };
+                 fields.push(arrow::datatypes::Field::new(name, dt, true));
+            }
+            
+            let agg_schema = Arc::new(Schema::new(fields));
+
+            exec = Arc::new(AggregateExec::new(
+                exec,
+                group_expr,
+                rewrite.aggregates.clone(),
+                agg_schema.clone(),
+            ));
+
+            // Apply HAVING clause if present
+            // If we have a rewritten having clause from the planner (which handles alias substitution
+            // and aggregate extraction), use that. Otherwise fall back to the raw having clause.
+            let having_expr = if let Some(rewritten) = &rewrite.rewritten_having {
+                Some(rewritten.clone())
+            } else {
+                having.map(Self::expr_to_scalar_expr)
+            };
+
+            if let Some(having_scalar) = having_expr {
+                let having_remapped = Self::remap_having_expr_to_indices(
+                    &having_scalar,
+                    &agg_schema,
+                )?;
+                
+                let agg_offset = plan.group_by.len();
+                let agg_count = rewrite.aggregates.len();
+                let mut next_agg_idx = 0;
+                
+                let having_rewritten = Self::rewrite_aggregate_refs(
+                    having_remapped,
+                    agg_offset,
+                    agg_count,
+                    &mut next_agg_idx,
+                )?;
+                
+                let having_expr = map_scalar_expr_to_usize(having_rewritten);
+                
+                // Create projection to add _having column
+                let mut proj_exprs = Vec::new();
+                let mut proj_fields = Vec::new();
+                
+                // Pass through existing fields
+                for (i, field) in agg_schema.fields().iter().enumerate() {
+                    proj_exprs.push((ScalarExpr::Column(i), field.name().clone()));
+                    proj_fields.push(field.clone());
+                }
+                
+                // Add having condition
+                proj_exprs.push((having_expr, "_having".to_string()));
+                proj_fields.push(Arc::new(arrow::datatypes::Field::new("_having", DataType::Boolean, true)));
+                
+                let proj_schema = Arc::new(Schema::new(proj_fields));
+                
+                exec = Arc::new(ProjectionExec::new(
+                    exec,
+                    proj_schema.clone(),
+                    proj_exprs,
+                ));
+                
+                // Filter on _having
+                let having_idx = agg_schema.fields().len(); // Index of _having
+                let filter_expr = llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
+                    field_id: having_idx as FieldId,
+                    op: llkv_expr::expr::Operator::Equals(llkv_expr::literal::Literal::Boolean(true)),
+                });
+                
+                exec = Arc::new(FilterExec::new(
+                    exec,
+                    filter_expr,
+                    proj_schema.clone(),
+                ));
+                
+                // Project back to agg_schema (drop _having)
+                let mut proj_exprs = Vec::new();
+                for (i, field) in agg_schema.fields().iter().enumerate() {
+                    proj_exprs.push((ScalarExpr::Column(i), field.name().clone()));
+                }
+                
+                exec = Arc::new(ProjectionExec::new(
+                    exec,
+                    agg_schema.clone(),
+                    proj_exprs,
+                ));
+            }
+
+            // 3. Final Projection
+            if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                eprintln!("DEBUG: agg_schema fields: {:?}", agg_schema.fields());
+                eprintln!("DEBUG: final_expressions: {:?}", rewrite.final_expressions);
+            }
+            let mut proj_exprs = Vec::new();
+            for (expr, name) in rewrite.final_expressions.iter().zip(&rewrite.final_names) {
+                let resolved_expr = resolve_scalar_expr_to_indices(expr, &agg_schema)?;
+                proj_exprs.push((resolved_expr, name.clone()));
+            }
+            
+            // Always infer schema from expressions to ensure consistency with executor
+            let final_schema = {
+                let mut fields = Vec::new();
+                let empty_batch = RecordBatch::new_empty(agg_schema.clone());
+                let mut field_arrays = FxHashMap::default();
+                for (i, col) in empty_batch.columns().iter().enumerate() {
+                    field_arrays.insert(i, col.clone());
+                }
+
+                for (expr, name) in &proj_exprs {
+                    let col = ScalarEvaluator::evaluate_batch_simplified(
+                        expr,
+                        0,
+                        &field_arrays,
+                    ).map_err(|e| Error::Internal(format!("Failed to infer type for projection: {}", e)))?;
+                    fields.push(arrow::datatypes::Field::new(name, col.data_type().clone(), true));
+                }
+                Arc::new(Schema::new(fields))
+            };
+
+            exec = Arc::new(ProjectionExec::new(
+                exec,
+                final_schema,
+                proj_exprs,
+            ));
+
+            if plan.distinct {
+                exec = Arc::new(DistinctExec::new(exec));
+            }
+
+            if plan.limit.is_some() || plan.offset.is_some() {
+                exec = Arc::new(LimitExec::new(exec, plan.offset, plan.limit));
+            }
+        }
+
+        Ok(exec)
+    }
+
+    fn create_multi_table_plan(
+        &self,
+        _plan: &MultiTableLogicalPlan<P>,
+    ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        Err(Error::Internal(
+            "Multi-table physical planning not yet implemented".to_string(),
+        ))
+    }
+
+    fn execute_physical_plan_tree(
+        &self,
+        plan: Arc<dyn PhysicalPlan<P>>,
+        subquery_results: &FxHashMap<SubqueryId, Literal>,
+    ) -> ExecutorResult<BatchIter> {
+        if let Some(scan) = plan.as_any().downcast_ref::<ScanExec<P>>() {
+            return scan.execute();
+        }
+
+        if let Some(sort) = plan.as_any().downcast_ref::<SortExec<P>>() {
+            return sort.execute();
+        }
+
+        if let Some(join) = plan.as_any().downcast_ref::<HashJoinExec<P>>() {
+            let left_stream =
+                self.execute_physical_plan_tree(join.left.clone(), subquery_results)?;
+            let right_stream =
+                self.execute_physical_plan_tree(join.right.clone(), subquery_results)?;
+
+            let right_batches: Vec<RecordBatch> =
+                right_stream.collect::<ExecutorResult<Vec<_>>>()?;
+            let right_batch = if right_batches.is_empty() {
+                RecordBatch::new_empty(join.right.schema())
+            } else {
+                concat_batches(&join.right.schema(), &right_batches)?
+            };
+
+            let left_indices: Vec<usize> = join.on.iter().map(|(l, _)| *l).collect();
+            let right_indices: Vec<usize> = join.on.iter().map(|(_, r)| *r).collect();
+
+            let join_type = match join.join_type {
+                llkv_plan::plans::JoinPlan::Inner => JoinType::Inner,
+                llkv_plan::plans::JoinPlan::Left => JoinType::Left,
+                llkv_plan::plans::JoinPlan::Right => JoinType::Right,
+                llkv_plan::plans::JoinPlan::Full => JoinType::Full,
+            };
+
+            let stream = VectorizedHashJoinStream::try_new(
+                join.schema.clone(),
+                left_stream,
+                right_batch,
+                join_type,
+                left_indices,
+                right_indices,
+            )?;
+
+            return Ok(Box::new(stream));
+        }
+
+        if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec<P>>() {
+            let input_stream = self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
+            
+            let mut specs = Vec::new();
+            let mut proj_indices = Vec::new();
+            let arg_start_idx = agg.group_expr.len();
+            
+            for expr in &agg.aggr_expr {
+                let proj_idx = match expr {
+                    llkv_plan::plans::AggregateExpr::CountStar { .. } => None,
+                    llkv_plan::plans::AggregateExpr::Column { column, .. } => {
+                        if let Some(stripped) = column.strip_prefix("_agg_arg_") {
+                            if let Ok(idx) = stripped.parse::<usize>() {
+                                Some(arg_start_idx + idx)
+                            } else {
+                                return Err(Error::Internal(format!("Invalid aggregate argument name: {}", column)));
+                            }
+                        } else {
+                             return Err(Error::Internal(format!("Expected aggregate argument to start with _agg_arg_, got: {}", column)));
+                        }
+                    }
+                };
+                proj_indices.push(proj_idx);
+
+                let (alias, kind) = match expr {
+                    llkv_plan::plans::AggregateExpr::CountStar { alias, distinct } => {
+                        (alias.clone(), AggregateKind::Count {
+                            field_id: None,
+                            distinct: *distinct,
+                        })
+                    }
+                    llkv_plan::plans::AggregateExpr::Column { alias, function, distinct, .. } => {
+                        let dt = if let Some(idx) = proj_idx {
+                            agg.input.schema().field(idx).data_type().clone()
+                        } else {
+                            DataType::Int64
+                        };
+                        
+                        let kind = match function {
+                            llkv_plan::plans::AggregateFunction::Count => AggregateKind::Count {
+                                field_id: None,
+                                distinct: *distinct,
+                            },
+                            llkv_plan::plans::AggregateFunction::SumInt64 => AggregateKind::Sum {
+                                field_id: 0,
+                                data_type: dt,
+                                distinct: *distinct,
+                            },
+                            llkv_plan::plans::AggregateFunction::TotalInt64 => AggregateKind::Total {
+                                field_id: 0,
+                                data_type: dt,
+                                distinct: *distinct,
+                            },
+                            llkv_plan::plans::AggregateFunction::MinInt64 => AggregateKind::Min {
+                                field_id: 0,
+                                data_type: dt,
+                            },
+                            llkv_plan::plans::AggregateFunction::MaxInt64 => AggregateKind::Max {
+                                field_id: 0,
+                                data_type: dt,
+                            },
+                            llkv_plan::plans::AggregateFunction::CountNulls => AggregateKind::CountNulls {
+                                field_id: 0,
+                            },
+                            llkv_plan::plans::AggregateFunction::GroupConcat => {
+                                return Err(Error::Internal("GroupConcat not supported".to_string()));
+                            }
+                        };
+                        (alias.clone(), kind)
+                    }
+                };
+                specs.push(AggregateSpec { alias, kind });
+            }
+            
+            if agg.group_expr.is_empty() {
+                let stream = AggregateStream::new_from_specs(
+                    input_stream,
+                    specs,
+                    proj_indices,
+                )?;
+                return Ok(Box::new(stream));
+            } else {
+                let stream = GroupedAggregateStream::new_from_specs(
+                    input_stream,
+                    agg.group_expr.clone(),
+                    specs,
+                    &agg.input.schema(),
+                    proj_indices,
+                )?;
+                return Ok(Box::new(stream));
+            }
+        }
+
+        if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec<P>>() {
+            let input_stream =
+                self.execute_physical_plan_tree(proj.input.clone(), subquery_results)?;
+            let schema = proj.schema.clone();
+            let expr = proj.expr.clone();
+            return Ok(Box::new(input_stream.map(move |batch_res| {
+                let batch = batch_res?;
+                
+                let mut field_arrays = FxHashMap::default();
+                for (i, col) in batch.columns().iter().enumerate() {
+                    field_arrays.insert(i, col.clone());
+                }
+
+                let mut columns = Vec::new();
+                for (e, _) in &expr {
+                    let col = ScalarEvaluator::evaluate_batch_simplified(
+                        e,
+                        batch.num_rows(),
+                        &field_arrays,
+                    ).map_err(|e| Error::Internal(e.to_string()))?;
+                    columns.push(col);
+                }
+                RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+            })));
+        }
+
+        if let Some(filter) = plan.as_any().downcast_ref::<FilterExec<P>>() {
+            let input_stream = self.execute_physical_plan_tree(filter.input.clone(), subquery_results)?;
+            let predicate = filter.predicate.clone();
+            let schema = filter.schema.clone();
+            
+            // Convert Expr to ScalarExpr outside the closure
+            let scalar_predicate = Self::expr_to_scalar_expr(&predicate);
+
+            return Ok(Box::new(input_stream.map(move |batch_res| {
+                let batch = batch_res?;
+                
+                let mut field_arrays = FxHashMap::default();
+                for (i, col) in batch.columns().iter().enumerate() {
+                    let field = schema.field(i);
+                    let fid = field.metadata().get("field_id")
+                        .and_then(|s| s.parse::<FieldId>().ok())
+                        .unwrap_or(i as FieldId);
+                    field_arrays.insert(fid, col.clone());
+                }
+                
+                let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+                
+                let result = ScalarEvaluator::evaluate_batch(&scalar_predicate, batch.num_rows(), &numeric_arrays)
+                    .map_err(|e| Error::Internal(format!("Filter evaluation failed: {:?}", e)))?;
+                
+                let bool_arr = result.as_any().downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| Error::Internal("Filter predicate must return boolean".to_string()))?;
+                
+                filter_record_batch(&batch, bool_arr)
+                    .map_err(|e| Error::Internal(e.to_string()))
+            })));
+        }
+
+        if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec<P>>() {
+            let input_stream = self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
+            
+            let mut plan_columns = Vec::new();
+            let input_schema = agg.input.schema();
+            for (i, field) in input_schema.fields().iter().enumerate() {
+                let fid = field.metadata().get("field_id")
+                    .and_then(|s| s.parse::<FieldId>().ok())
+                    .unwrap_or(i as FieldId);
+                
+                plan_columns.push(PlanColumn {
+                    name: field.name().clone(),
+                    data_type: field.data_type().clone(),
+                    field_id: fid,
+                    is_nullable: field.is_nullable(),
+                    is_primary_key: false,
+                    is_unique: false,
+                    default_value: None,
+                    check_expr: None,
+                });
+            }
+            let logical_schema = PlanSchema::new(plan_columns);
+            
+            let plan = SelectPlan {
+                tables: vec![],
+                joins: vec![],
+                projections: vec![],
+                filter: None,
+                having: None,
+                scalar_subqueries: vec![],
+                aggregates: agg.aggr_expr.clone(),
+                order_by: vec![],
+                distinct: false,
+                compound: None,
+                group_by: vec![],
+                value_table_mode: None,
+                limit: None,
+                offset: None,
+            };
+            
+            let stream: BatchIter = if agg.group_expr.is_empty() {
+                let s = AggregateStream::new(input_stream, &plan, &logical_schema, &input_schema)?;
+                Box::new(s)
+            } else {
+                let s = GroupedAggregateStream::new(
+                    input_stream,
+                    agg.group_expr.clone(),
+                    &plan,
+                    &logical_schema,
+                    &input_schema,
+                )?;
+                Box::new(s)
+            };
+            
+            return Ok(stream);
+        }
+
+        if let Some(distinct) = plan.as_any().downcast_ref::<DistinctExec<P>>() {
+            let input_stream = self.execute_physical_plan_tree(distinct.input.clone(), subquery_results)?;
+            let distinct_stream = DistinctStream::new(distinct.schema(), input_stream)?;
+            return Ok(Box::new(distinct_stream));
+        }
+
+        if let Some(limit) = plan.as_any().downcast_ref::<LimitExec<P>>() {
+            let input_stream = self.execute_physical_plan_tree(limit.input.clone(), subquery_results)?;
+            let limited_stream = apply_offset_limit_stream(input_stream, limit.offset, limit.limit);
+            return Ok(limited_stream);
+        }
+
+        Err(Error::Internal(format!(
+            "Unsupported physical plan node: {:?}",
+            plan
+        )))
+    }
+
     fn execute_prepared_with_filter(
         &self,
         prepared: &PreparedSelectPlan<P>,
@@ -2189,23 +2911,11 @@ where
                     eprintln!("[executor] aggregate_rewrite: {:?}", aggregate_rewrite);
                 }
 
-                let physical_plan = prepared
-                    .physical_plan
-                    .clone()
-                    .ok_or_else(|| {
-                        Error::Internal(
-                            "Physical plan missing for single-table SELECT".to_string(),
-                        )
-                    })?;
+                let physical_plan = self.create_physical_plan(&prepared.logical_plan, plan.having.as_ref())?;
 
                 let schema = physical_plan.schema();
 
-                let mut base_iter: BatchIter = Box::new(
-                    physical_plan
-                        .execute()
-                        .map_err(Error::Internal)?
-                        .map(|b| b.map_err(Error::Internal)),
-                );
+                let mut base_iter: BatchIter = self.execute_physical_plan_tree(physical_plan, subquery_results)?;
 
                 if let Some(residual) = &residual_filter {
                     base_iter = self.apply_residual_filter(
@@ -2215,111 +2925,16 @@ where
                     );
                 }
 
-                if let Some(rewrite) = aggregate_rewrite.clone() {
-                    let mut col_mapping = FxHashMap::default();
-                    for (i, _field) in schema.fields().iter().enumerate() {
-                        col_mapping.insert((0, i as u32), i);
-                    }
-
-                    let mut pre_agg_schema_fields: Vec<ArrowField> = Vec::new();
-                    for (i, expr_str) in rewrite.pre_aggregate_expressions.iter().enumerate() {
-                        let resolved = resolve_scalar_expr_string(
-                            expr_str,
-                            &schema,
-                            subquery_results,
-                        )?;
-                        let dt = infer_type(&resolved, &schema, &col_mapping)
-                            .unwrap_or(arrow::datatypes::DataType::Int64);
-                        pre_agg_schema_fields.push(
-                            ArrowField::new(format!("_agg_arg_{}", i), dt, true).with_metadata(
-                                HashMap::from([(
-                                    "field_id".to_string(),
-                                    format!("{}", 10000 + i),
-                                )]),
-                            ),
-                        );
-                    }
-
-                    let mut group_key_batch_indices = Vec::new();
-                    if !plan.group_by.is_empty() {
-                        for name in &plan.group_by {
-                            let idx = resolve_group_index(name, &schema, &single.schema).ok_or_else(
-                                || Error::Internal(format!("GROUP BY column not found: {name}")),
-                            )?;
-                            group_key_batch_indices.push(idx);
-                            pre_agg_schema_fields.push(schema.field(idx).clone());
-                        }
-                    }
-
-                    let group_key_indices: Vec<usize> = (0..group_key_batch_indices.len())
-                        .map(|i| rewrite.pre_aggregate_expressions.len() + i)
-                        .collect();
-
-                    let pre_agg_schema = Arc::new(Schema::new(pre_agg_schema_fields));
-                    let pre_agg_schema_captured = pre_agg_schema.clone();
-                    let schema_captured = schema.clone();
-                    let subquery_results_captured = subquery_results.clone();
-                    let pre_agg_exprs = rewrite.pre_aggregate_expressions.clone();
-                    let group_key_batch_indices_captured = group_key_batch_indices.clone();
-
-                    let pre_agg_stream = base_iter.map(move |batch_res| {
-                        let batch = batch_res?;
-                        let mut columns = Vec::new();
-
-                        let mut field_arrays = FxHashMap::default();
-                        for (i, col) in batch.columns().iter().enumerate() {
-                            field_arrays.insert((0, i as u32), col.clone());
-                        }
-                        let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(
-                            &field_arrays,
-                            batch.num_rows(),
-                        );
-
-                        for expr_str in &pre_agg_exprs {
-                            let expr = resolve_scalar_expr_string(
-                                expr_str,
-                                &schema_captured,
-                                &subquery_results_captured,
-                            )?;
-                            let result = ScalarEvaluator::evaluate_batch_simplified(
-                                &expr,
-                                batch.num_rows(),
-                                &numeric_arrays,
-                            )?;
-                            columns.push(result);
-                        }
-
-                        for idx in &group_key_batch_indices_captured {
-                            columns.push(batch.column(*idx).clone());
-                        }
-
-                        if columns.is_empty() {
-                            let options = arrow::record_batch::RecordBatchOptions::new()
-                                .with_row_count(Some(batch.num_rows()));
-                            RecordBatch::try_new_with_options(
-                                pre_agg_schema_captured.clone(),
-                                columns,
-                                &options,
-                            )
-                            .map_err(|e| Error::Internal(e.to_string()))
-                        } else {
-                            RecordBatch::try_new(pre_agg_schema_captured.clone(), columns)
-                                .map_err(|e| Error::Internal(e.to_string()))
-                        }
-                    });
-
-                    return self.execute_complex_aggregation(
-                        Box::new(pre_agg_stream),
-                        pre_agg_schema,
-                        rewrite.aggregates,
-                        rewrite.final_expressions,
-                        rewrite.final_names,
-                        &plan,
+                if let Some(_rewrite) = aggregate_rewrite {
+                    // The physical plan created by `create_physical_plan` already handles the aggregation
+                    // logic (including pre-aggregation projection, aggregation, and final projection)
+                    // when `aggregate_rewrite` is present.
+                    // We simply return the result of the physical plan execution.
+                    return Ok(SelectExecution::from_stream(
                         table_name,
-                        subquery_results,
-                        group_key_indices,
-                        rewrite.rewritten_having,
-                    );
+                        schema,
+                        base_iter,
+                    ));
                 }
 
                 // GROUP BY with no aggregates should collapse to distinct group keys.
@@ -3384,9 +3999,9 @@ impl<P> TableProvider<P> for PlannerTableProvider<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn get_table(&self, name: &str) -> llkv_result::Result<Arc<dyn ExecutionTable<P>>> {
-        let table = self.inner.get_table(name)?;
-        Ok(Arc::new(ExecutionTableAdapter::new(table)))
+    fn get_table(&self, name: &str) -> Option<Arc<dyn ExecutionTable<P>>> {
+        let table = self.inner.get_table(name).ok()?;
+        Some(Arc::new(ExecutionTableAdapter::new(table)))
     }
 }
 
@@ -4082,8 +4697,8 @@ impl<P> ExecutionTable<P> for ExecutionTableAdapter<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn schema(&self) -> Arc<llkv_plan::schema::PlanSchema> {
-        Arc::clone(&self.plan_schema)
+    fn schema(&self) -> &llkv_plan::schema::PlanSchema {
+        &self.plan_schema
     }
 
     fn table_id(&self) -> llkv_types::ids::TableId {
@@ -4103,6 +4718,10 @@ where
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn into_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
         self
     }
 }
@@ -4261,18 +4880,31 @@ fn infer_type(
                 types.push(infer_type(e, schema, col_mapping)?);
             }
 
-            if let Some(non_null) = types.iter().find(|t| **t != DataType::Null) {
-                Ok(non_null.clone())
-            } else {
-                Ok(DataType::Null)
+            if types.is_empty() {
+                return Ok(DataType::Null);
             }
+
+            let mut common = types[0].clone();
+            for t in &types[1..] {
+                common = llkv_compute::kernels::get_common_type(&common, t);
+            }
+            Ok(common)
         }
         ScalarExpr::Coalesce(items) => {
-            if let Some(first) = items.first() {
-                infer_type(first, schema, col_mapping)
-            } else {
-                Ok(DataType::Null)
+            let mut types = Vec::new();
+            for item in items {
+                types.push(infer_type(item, schema, col_mapping)?);
             }
+
+            if types.is_empty() {
+                return Ok(DataType::Null);
+            }
+
+            let mut common = types[0].clone();
+            for t in &types[1..] {
+                common = llkv_compute::kernels::get_common_type(&common, t);
+            }
+            Ok(common)
         }
         ScalarExpr::Aggregate(call) => match call {
             AggregateCall::CountStar
@@ -4378,5 +5010,163 @@ impl Iterator for SortStream {
             },
             Err(e) => Some(Err(e)),
         }
+    }
+}
+
+fn get_literal_type(l: &Literal) -> DataType {
+    match l {
+        Literal::Null => DataType::Null,
+        Literal::Int128(_) => DataType::Int64,
+        Literal::Float64(_) => DataType::Float64,
+        Literal::Decimal128(d) => DataType::Decimal128(d.precision(), d.scale()),
+        Literal::String(_) => DataType::Utf8,
+        Literal::Boolean(_) => DataType::Boolean,
+        Literal::Date32(_) => DataType::Date32,
+        Literal::Struct(_) => DataType::Struct(arrow::datatypes::Fields::from(Vec::<arrow::datatypes::Field>::new())),
+        Literal::Interval(_) => DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+    }
+}
+
+fn infer_expr_type(expr: &ScalarExpr<usize>, schema: &Schema) -> DataType {
+    match expr {
+        ScalarExpr::Column(idx) => schema.field(*idx).data_type().clone(),
+        ScalarExpr::Literal(l) => get_literal_type(l),
+        ScalarExpr::Binary { left, .. } => infer_expr_type(left, schema),
+        ScalarExpr::Cast { data_type, .. } => data_type.clone(),
+        ScalarExpr::Not(_) => DataType::Boolean,
+        ScalarExpr::IsNull { .. } => DataType::Boolean,
+        ScalarExpr::Case { else_expr, branches, .. } => {
+             if let Some(e) = else_expr {
+                 infer_expr_type(e, schema)
+             } else if !branches.is_empty() {
+                 infer_expr_type(&branches[0].1, schema)
+             } else {
+                 DataType::Int64
+             }
+        }
+        ScalarExpr::Coalesce(exprs) => {
+            if !exprs.is_empty() {
+                infer_expr_type(&exprs[0], schema)
+            } else {
+                DataType::Int64
+            }
+        }
+        ScalarExpr::ScalarSubquery(_) => DataType::Int64,
+        ScalarExpr::Aggregate(_) => DataType::Int64,
+        ScalarExpr::Compare { .. } => DataType::Boolean,
+        ScalarExpr::GetField { .. } => DataType::Int64,
+        ScalarExpr::Random => DataType::Float64,
+    }
+}
+
+fn map_scalar_expr_to_usize(expr: ScalarExpr<(usize, FieldId)>) -> ScalarExpr<usize> {
+    match expr {
+        ScalarExpr::Column((_, id)) => ScalarExpr::Column(id as usize),
+        ScalarExpr::Literal(l) => ScalarExpr::Literal(l),
+        ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+            left: Box::new(map_scalar_expr_to_usize(*left)),
+            op,
+            right: Box::new(map_scalar_expr_to_usize(*right)),
+        },
+        ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+            expr: Box::new(map_scalar_expr_to_usize(*expr)),
+            data_type,
+        },
+        ScalarExpr::Not(e) => ScalarExpr::Not(Box::new(map_scalar_expr_to_usize(*e))),
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(map_scalar_expr_to_usize(*expr)),
+            negated,
+        },
+        ScalarExpr::Case { operand, branches, else_expr } => ScalarExpr::Case {
+            operand: operand.map(|o| Box::new(map_scalar_expr_to_usize(*o))),
+            branches: branches.into_iter().map(|(w, t)| (map_scalar_expr_to_usize(w), map_scalar_expr_to_usize(t))).collect(),
+            else_expr: else_expr.map(|e| Box::new(map_scalar_expr_to_usize(*e))),
+        },
+        ScalarExpr::Coalesce(exprs) => ScalarExpr::Coalesce(exprs.into_iter().map(map_scalar_expr_to_usize).collect()),
+        ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s),
+        ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+            left: Box::new(map_scalar_expr_to_usize(*left)),
+            op,
+            right: Box::new(map_scalar_expr_to_usize(*right)),
+        },
+        ScalarExpr::GetField { base, field_name } => ScalarExpr::GetField {
+            base: Box::new(map_scalar_expr_to_usize(*base)),
+            field_name,
+        },
+        ScalarExpr::Random => ScalarExpr::Random,
+        ScalarExpr::Aggregate(_) => panic!("Aggregate expression should have been rewritten"),
+    }
+}
+
+fn resolve_scalar_expr_to_indices(
+    expr: &ScalarExpr<String>,
+    schema: &Schema,
+) -> ExecutorResult<ScalarExpr<usize>> {
+    match expr {
+        ScalarExpr::Column(name) => {
+            if let Some((idx, _)) = schema.column_with_name(name) {
+                Ok(ScalarExpr::Column(idx))
+            } else {
+                Err(Error::Internal(format!("Column {} not found in schema", name)))
+            }
+        }
+        ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
+        ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+            left: Box::new(resolve_scalar_expr_to_indices(left, schema)?),
+            op: *op,
+            right: Box::new(resolve_scalar_expr_to_indices(right, schema)?),
+        }),
+        ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+            expr: Box::new(resolve_scalar_expr_to_indices(expr, schema)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(resolve_scalar_expr_to_indices(e, schema)?))),
+        ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(resolve_scalar_expr_to_indices(expr, schema)?),
+            negated: *negated,
+        }),
+        ScalarExpr::Case { operand, branches, else_expr } => {
+            let op = if let Some(o) = operand {
+                Some(Box::new(resolve_scalar_expr_to_indices(o, schema)?))
+            } else {
+                None
+            };
+            let mut new_branches = Vec::new();
+            for (w, t) in branches {
+                new_branches.push((
+                    resolve_scalar_expr_to_indices(w, schema)?,
+                    resolve_scalar_expr_to_indices(t, schema)?,
+                ));
+            }
+            let el = if let Some(e) = else_expr {
+                Some(Box::new(resolve_scalar_expr_to_indices(e, schema)?))
+            } else {
+                None
+            };
+            Ok(ScalarExpr::Case {
+                operand: op,
+                branches: new_branches,
+                else_expr: el,
+            })
+        }
+        ScalarExpr::Coalesce(exprs) => {
+            let mut new_exprs = Vec::new();
+            for e in exprs {
+                new_exprs.push(resolve_scalar_expr_to_indices(e, schema)?);
+            }
+            Ok(ScalarExpr::Coalesce(new_exprs))
+        }
+        ScalarExpr::ScalarSubquery(s) => Ok(ScalarExpr::ScalarSubquery(s.clone())),
+        ScalarExpr::Aggregate(_) => Err(Error::Internal("Aggregate expression in projection".to_string())),
+        ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+            left: Box::new(resolve_scalar_expr_to_indices(left, schema)?),
+            op: *op,
+            right: Box::new(resolve_scalar_expr_to_indices(right, schema)?),
+        }),
+        ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+            base: Box::new(resolve_scalar_expr_to_indices(base, schema)?),
+            field_name: field_name.clone(),
+        }),
+        ScalarExpr::Random => Ok(ScalarExpr::Random),
     }
 }

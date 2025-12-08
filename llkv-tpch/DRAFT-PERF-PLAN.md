@@ -90,13 +90,15 @@ Implementation order to avoid rework
 - Hash join still materializes the entire right side before build; needs chunked/streamed build to cut wall time and peak memory.
 - Planner should keep complex expressions (COALESCE/CASE) out of storage pushdown so we stay on single-column leaf filters where possible.
 
-## Concerns
+## Concerns (TODOs)
 
 - Table & column resolvers seem duplicated between llkv-table, llkv-executor, llkv-plan
-- HashMap usage instead of FxHashMap
+- `HashMap/Set` usage instead of `FxHashMap/Set`
 - llkv-join's vectorized vs. non-vectorized join paths
 - Previous compile paths, are they still used at all?
 - Perf overhead from potentially using TreeMap in the wrong places
 - Hardcoded column range greater than 10,000 (magic number reserved) for internal usage [can these be offloaded to a temp table with a zero-additional-cost perf somehow]?
 - Table resolver logic should be centralized
 - `expr_to_scalar_expr` should probably be moved to llkv-expr
+- `field_id` hardcodings when they should use constant defined in `llkv-column-map`
+  

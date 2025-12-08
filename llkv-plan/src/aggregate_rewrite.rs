@@ -1,6 +1,7 @@
 use llkv_expr::expr::{AggregateCall, BinaryOp, CompareOp, Expr, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
 use llkv_result::Result;
+use std::collections::{HashMap, HashSet};
 
 use crate::plans::{AggregateExpr, AggregateFunction, SelectPlan, SelectProjection};
 use crate::schema::PlanSchema;
@@ -291,6 +292,9 @@ fn build_single_projection_exprs(
     plan: &SelectPlan,
     schema: &PlanSchema,
 ) -> Vec<(ScalarExpr<String>, String)> {
+    if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+        eprintln!("[planner] build_single_projection_exprs projections: {:?}", plan.projections);
+    }
     let mut out = Vec::new();
     for proj in &plan.projections {
         match proj {
@@ -318,6 +322,84 @@ fn build_single_projection_exprs(
     out
 }
 
+fn substitute_aliases(
+    expr: &ScalarExpr<String>,
+    alias_map: &HashMap<String, ScalarExpr<String>>,
+    grouping_keys: &HashSet<String>,
+) -> ScalarExpr<String> {
+    match expr {
+        ScalarExpr::Column(c) => {
+            // If column is a grouping key, prefer it over alias.
+            if grouping_keys.contains(c) {
+                return ScalarExpr::Column(c.clone());
+            }
+            if let Some(aliased) = alias_map.get(c) {
+                aliased.clone()
+            } else {
+                ScalarExpr::Column(c.clone())
+            }
+        }
+        ScalarExpr::Literal(l) => ScalarExpr::Literal(l.clone()),
+        ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+            left: Box::new(substitute_aliases(left, alias_map, grouping_keys)),
+            op: *op,
+            right: Box::new(substitute_aliases(right, alias_map, grouping_keys)),
+        },
+        ScalarExpr::Not(e) => ScalarExpr::Not(Box::new(substitute_aliases(e, alias_map, grouping_keys))),
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(substitute_aliases(expr, alias_map, grouping_keys)),
+            negated: *negated,
+        },
+        ScalarExpr::Aggregate(call) => {
+            // Aggregates operate on input columns, so we should not substitute aliases
+            // inside the aggregate function arguments.
+            ScalarExpr::Aggregate(call.clone())
+        }
+        ScalarExpr::GetField { base, field_name } => ScalarExpr::GetField {
+            base: Box::new(substitute_aliases(base, alias_map, grouping_keys)),
+            field_name: field_name.clone(),
+        },
+        ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+            expr: Box::new(substitute_aliases(expr, alias_map, grouping_keys)),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+            left: Box::new(substitute_aliases(left, alias_map, grouping_keys)),
+            op: *op,
+            right: Box::new(substitute_aliases(right, alias_map, grouping_keys)),
+        },
+        ScalarExpr::Coalesce(exprs) => ScalarExpr::Coalesce(
+            exprs
+                .iter()
+                .map(|e| substitute_aliases(e, alias_map, grouping_keys))
+                .collect(),
+        ),
+        ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s.clone()),
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => ScalarExpr::Case {
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(substitute_aliases(e, alias_map, grouping_keys))),
+            branches: branches
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        substitute_aliases(w, alias_map, grouping_keys),
+                        substitute_aliases(t, alias_map, grouping_keys),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|e| Box::new(substitute_aliases(e, alias_map, grouping_keys))),
+        },
+        ScalarExpr::Random => ScalarExpr::Random,
+    }
+}
+
 /// Build aggregate rewrite metadata for single-table plans using resolved schema names.
 pub fn build_single_aggregate_rewrite(
     plan: &SelectPlan,
@@ -326,10 +408,20 @@ pub fn build_single_aggregate_rewrite(
     let projections = build_single_projection_exprs(plan, schema);
     let (projection_exprs, final_names): (Vec<_>, Vec<_>) = projections.into_iter().unzip();
 
+    let mut alias_map = HashMap::new();
+    for (i, name) in final_names.iter().enumerate() {
+        alias_map.insert(name.clone(), projection_exprs[i].clone());
+    }
+
+    let mut grouping_keys = HashSet::new();
+    for name in &plan.group_by {
+        grouping_keys.insert(name.clone());
+    }
+
     let having_exprs: Vec<ScalarExpr<String>> = plan
         .having
         .as_ref()
-        .map(|h| vec![expr_to_scalar_expr(h)])
+        .map(|h| vec![substitute_aliases(&expr_to_scalar_expr(h), &alias_map, &grouping_keys)])
         .unwrap_or_default();
 
     let (aggregates, final_exprs, pre_agg_exprs, rewritten_having) =

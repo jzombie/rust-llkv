@@ -24,7 +24,7 @@ use llkv_plan::TruncatePlan;
 /// filtering and conversion of statement results into transaction results.
 pub struct RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug,
 {
     ctx: Arc<RuntimeContext<P>>,
     snapshot: RwLock<TransactionSnapshot>,
@@ -33,7 +33,7 @@ where
 
 impl<P> RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug,
 {
     pub(crate) fn new(ctx: Arc<RuntimeContext<P>>) -> Self {
         let snapshot = ctx.default_snapshot();
@@ -78,7 +78,7 @@ where
 
 impl<P> CatalogDdl for RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     type CreateTableOutput = TransactionResult<P>;
     type DropTableOutput = ();
@@ -129,7 +129,7 @@ where
 // Implement TransactionContext to integrate with llkv-transaction.
 impl<P> TransactionContext for RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     type Pager = P;
     type Snapshot = llkv_table::catalog::TableCatalogSnapshot;

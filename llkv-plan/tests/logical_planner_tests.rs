@@ -5,7 +5,7 @@ use arrow::record_batch::RecordBatch;
 use llkv_expr::Literal;
 use llkv_expr::expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_plan::logical_planner::{LogicalPlan, SingleTableLogicalPlan, projection_name};
-use llkv_plan::physical::table::{ExecutionTable, TableProvider};
+use llkv_plan::table_provider::{ExecutionTable, TableProvider};
 use llkv_plan::schema::{PlanColumn, PlanSchema};
 use llkv_plan::{
     JoinMetadata, JoinPlan, LogicalPlanner, OrderByPlan, OrderSortType, OrderTarget, SelectFilter,
@@ -36,8 +36,8 @@ impl DummyTable {
 }
 
 impl ExecutionTable<TestPager> for DummyTable {
-    fn schema(&self) -> Arc<PlanSchema> {
-        self.schema.clone()
+    fn schema(&self) -> &PlanSchema {
+        &self.schema
     }
 
     fn table_id(&self) -> TableId {
@@ -59,6 +59,10 @@ impl ExecutionTable<TestPager> for DummyTable {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn into_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
 }
 
 struct DummyProvider {
@@ -74,13 +78,15 @@ impl DummyProvider {
 }
 
 impl TableProvider<TestPager> for DummyProvider {
-    fn get_table(&self, name: &str) -> llkv_result::Result<Arc<dyn ExecutionTable<TestPager>>> {
-        if name.eq_ignore_ascii_case(&self.name_lower) {
-            Ok(self.table.clone())
-        } else {
-            Err(llkv_result::Error::CatalogError(format!(
-                "table '{name}' not found"
+    fn get_table(&self, name: &str) -> Option<Arc<dyn ExecutionTable<TestPager>>> {
+        if name == self.table.name {
+            Some(Arc::new(DummyTable::new(
+                &self.table.name,
+                self.table.schema.clone(),
+                self.table.table_id,
             )))
+        } else {
+            None
         }
     }
 }
@@ -100,13 +106,12 @@ impl MultiProvider {
 }
 
 impl TableProvider<TestPager> for MultiProvider {
-    fn get_table(&self, name: &str) -> llkv_result::Result<Arc<dyn ExecutionTable<TestPager>>> {
+    fn get_table(&self, name: &str) -> Option<Arc<dyn ExecutionTable<TestPager>>> {
         let key = name.to_ascii_lowercase();
         self.tables
             .get(&key)
             .cloned()
             .map(|t| t as Arc<dyn ExecutionTable<TestPager>>)
-            .ok_or_else(|| llkv_result::Error::CatalogError(format!("table '{name}' not found")))
     }
 }
 
@@ -519,13 +524,11 @@ impl MultiTableProvider {
 }
 
 impl TableProvider<TestPager> for MultiTableProvider {
-    fn get_table(&self, name: &str) -> llkv_result::Result<Arc<dyn ExecutionTable<TestPager>>> {
+    fn get_table(&self, name: &str) -> Option<Arc<dyn ExecutionTable<TestPager>>> {
         if let Some(table) = self.tables.get(&name.to_ascii_lowercase()) {
-            Ok(table.clone())
+            Some(table.clone())
         } else {
-            Err(llkv_result::Error::CatalogError(format!(
-                "table '{name}' not found"
-            )))
+            None
         }
     }
 }

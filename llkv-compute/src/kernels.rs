@@ -149,7 +149,7 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
                 .unwrap();
-            let result = arrow::compute::kernels::boolean::and(lhs_bool, rhs_bool)
+            let result = arrow::compute::kernels::boolean::and_kleene(lhs_bool, rhs_bool)
                 .map_err(|e| Error::Internal(e.to_string()))?;
             Arc::new(result)
         }
@@ -166,7 +166,7 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
                 .unwrap();
-            let result = arrow::compute::kernels::boolean::or(lhs_bool, rhs_bool)
+            let result = arrow::compute::kernels::boolean::or_kleene(lhs_bool, rhs_bool)
                 .map_err(|e| Error::Internal(e.to_string()))?;
             Arc::new(result)
         }

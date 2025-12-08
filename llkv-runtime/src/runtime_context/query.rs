@@ -17,7 +17,7 @@ use super::{RuntimeContext, provider::ContextProvider};
 
 impl<P> RuntimeContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     /// Execute a SELECT plan while enforcing MVCC visibility rules.
     ///

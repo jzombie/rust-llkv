@@ -23,7 +23,7 @@ use crate::aggregate_rewrite::{
     extract_complex_aggregates,
 };
 
-use crate::physical::table::{ExecutionTable, TableProvider};
+use crate::table_provider::{ExecutionTable, TableProvider};
 use crate::plans::{OrderByPlan, OrderTarget, SelectPlan, TableRef};
 use crate::schema::PlanSchema;
 use crate::translation::{
@@ -60,6 +60,10 @@ where
     pub scalar_subqueries: Vec<crate::plans::ScalarSubquery>,
     pub filter_subqueries: Vec<crate::plans::FilterSubquery>,
     pub aggregate_rewrite: Option<AggregateRewrite>,
+    pub group_by: Vec<String>,
+    pub distinct: bool,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 impl<P> SingleTableLogicalPlan<P>
@@ -198,8 +202,8 @@ where
     }
 
     pub fn get_table_schema(&self, table_name: &str) -> Result<Arc<PlanSchema>> {
-        let table = self.provider.get_table(table_name)?;
-        Ok(table.schema())
+        let table = self.provider.get_table(table_name).ok_or_else(|| Error::Internal(format!("Table not found: {}", table_name)))?;
+        Ok(Arc::new(table.schema().clone()))
     }
 
     pub fn create_logical_plan(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
@@ -209,14 +213,14 @@ where
 
         let table_ref = plan.tables.first().expect("validated length above");
         let table_name = table_ref.qualified_name();
-        let table = self.provider.get_table(&table_name)?;
+        let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Table not found: {}", table_name)))?;
         let table_id = table.table_id();
         let schema = table.schema();
 
         let requested_projections = if plan.projections.is_empty() {
-            build_wildcard_projections(&schema, table_id)
+            build_wildcard_projections(schema, table_id)
         } else {
-            build_projected_columns(&schema, table_id, &plan.projections)?
+            build_projected_columns(schema, table_id, &plan.projections)?
         };
 
         let mut scan_projections = requested_projections.clone();
@@ -227,7 +231,7 @@ where
             for name in collect_filter_columns(&filter.predicate) {
                 push_column_if_known(
                     table_id,
-                    &schema,
+                    schema,
                     &name,
                     &mut scan_projections,
                     &mut extra_columns,
@@ -239,7 +243,7 @@ where
         for name in &plan.group_by {
             push_column_if_known(
                 table_id,
-                &schema,
+                schema,
                 name,
                 &mut scan_projections,
                 &mut extra_columns,
@@ -249,7 +253,7 @@ where
             for name in collect_aggregate_columns(agg) {
                 push_column_if_known(
                     table_id,
-                    &schema,
+                    schema,
                     &name,
                     &mut scan_projections,
                     &mut extra_columns,
@@ -261,7 +265,7 @@ where
             scan_projections: order_scan_projections,
             extra_columns: order_extra_columns,
             resolved_order_by,
-        } = resolve_order_by_targets(&schema, table_id, &scan_projections, &plan.order_by)?;
+        } = resolve_order_by_targets(schema, table_id, &scan_projections, &plan.order_by)?;
 
         scan_projections = order_scan_projections;
         for col in order_extra_columns {
@@ -273,7 +277,7 @@ where
             }
         }
 
-        let aggregate_rewrite = build_single_aggregate_rewrite(plan, &schema)?;
+        let aggregate_rewrite = build_single_aggregate_rewrite(plan, schema)?;
         if let Some(rewrite) = &aggregate_rewrite {
             let mut rewrite_columns = Vec::new();
             for expr in &rewrite.pre_aggregate_expressions {
@@ -314,23 +318,25 @@ where
             }
         }
 
-        let scan_schema = schema_for_projections(&schema, &scan_projections)?;
-        let final_schema = schema_for_projections(&schema, &requested_projections)?;
+        let scan_schema = schema_for_projections(schema, &scan_projections)?;
+        let final_schema = schema_for_projections(schema, &requested_projections)?;
 
         let filter = match &plan.filter {
             Some(filter) => Some(translate_predicate(
                 filter.predicate.clone(),
-                &schema,
+                schema,
                 |_| Error::Internal("Unknown column".to_string()),
             )?),
             None => None,
         };
 
+        let plan_schema = Arc::new(schema.clone());
+
         Ok(LogicalPlan::Single(SingleTableLogicalPlan {
             table_name,
             table,
             table_id,
-            schema,
+            schema: plan_schema,
             requested_projections,
             scan_projections,
             final_schema,
@@ -346,6 +352,10 @@ where
                 .map(|f| f.subqueries.clone())
                 .unwrap_or_default(),
             aggregate_rewrite,
+            group_by: plan.group_by.clone(),
+            distinct: plan.distinct,
+            limit: plan.limit,
+            offset: plan.offset,
         }))
     }
 
@@ -353,15 +363,16 @@ where
         let mut planned_tables = Vec::with_capacity(plan.tables.len());
         for table_ref in &plan.tables {
             let table_name = table_ref.qualified_name();
-            let table = self.provider.get_table(&table_name)?;
+            let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Table not found: {}", table_name)))?;
             let table_id = table.table_id();
             let schema = table.schema();
+            let plan_schema = Arc::new(schema.clone());
 
             planned_tables.push(PlannedTable {
                 name: table_name,
                 table_id,
                 table,
-                schema,
+                schema: plan_schema,
             });
         }
 

@@ -794,12 +794,25 @@ impl ScalarEvaluator {
         }
     }
 
+    fn is_null<F>(expr: &ScalarExpr<F>) -> bool {
+        match expr {
+            ScalarExpr::Literal(Literal::Null) => true,
+            ScalarExpr::Cast { expr, .. } => Self::is_null(expr),
+            _ => false,
+        }
+    }
+
     /// Simplify an expression by constant folding and identity removal.
-    pub fn simplify<F: Hash + Eq + Copy>(expr: &ScalarExpr<F>) -> ScalarExpr<F> {
+    pub fn simplify<F: Hash + Eq + Clone>(expr: &ScalarExpr<F>) -> ScalarExpr<F> {
         match expr {
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
+
+                if Self::is_null(&l) || Self::is_null(&r) {
+                    return ScalarExpr::Literal(Literal::Null);
+                }
+
                 if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r)
                     && let Some(folded) = fold_binary_literals(*op, ll, rr)
                 {
@@ -809,6 +822,86 @@ impl ScalarEvaluator {
                     left: Box::new(l),
                     op: *op,
                     right: Box::new(r),
+                }
+            }
+            ScalarExpr::Compare { left, op, right } => {
+                let l = Self::simplify(left);
+                let r = Self::simplify(right);
+
+                if Self::is_null(&l) || Self::is_null(&r) {
+                    return ScalarExpr::Literal(Literal::Null);
+                }
+
+                ScalarExpr::Compare {
+                    left: Box::new(l),
+                    op: *op,
+                    right: Box::new(r),
+                }
+            }
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                let operand = operand.as_ref().map(|o| Box::new(Self::simplify(o)));
+                let s_else = else_expr.as_ref().map(|e| Box::new(Self::simplify(e)));
+
+                // If operand is NULL, the whole CASE expression evaluates to ELSE
+                if let Some(op) = &operand {
+                    if Self::is_null(op) {
+                        return s_else
+                            .map(|b| *b)
+                            .unwrap_or(ScalarExpr::Literal(Literal::Null));
+                    }
+                }
+
+                let mut new_branches = Vec::new();
+
+                for (when, then) in branches {
+                    let s_when = Self::simplify(when);
+                    let s_then = Self::simplify(then);
+
+                    if Self::is_null(&s_when) {
+                        continue;
+                    }
+
+                    // If we have a simple CASE (operand is Some)
+                    if let Some(op) = &operand {
+                        if let (ScalarExpr::Literal(op_lit), ScalarExpr::Literal(when_lit)) = (op.as_ref(), &s_when) {
+                            if op_lit == when_lit {
+                                return s_then;
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+
+                    // If we have a searched CASE (operand is None)
+                    if operand.is_none() {
+                        if let ScalarExpr::Literal(lit) = &s_when {
+                            // If condition is FALSE, skip this branch
+                            if matches!(lit, Literal::Boolean(false)) {
+                                continue;
+                            }
+                            // If condition is TRUE, return this branch and ignore the rest
+                            if matches!(lit, Literal::Boolean(true)) {
+                                return s_then;
+                            }
+                        }
+                    }
+                    new_branches.push((s_when, s_then));
+                }
+
+                if new_branches.is_empty() {
+                    return s_else
+                        .map(|b| *b)
+                        .unwrap_or(ScalarExpr::Literal(Literal::Null));
+                }
+
+                ScalarExpr::Case {
+                    operand,
+                    branches: new_branches,
+                    else_expr: s_else,
                 }
             }
             ScalarExpr::Cast { expr, data_type } => {

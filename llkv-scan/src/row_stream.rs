@@ -146,12 +146,12 @@ pub enum ProjectionPlan {
     },
 }
 
-pub struct RowStreamBuilder<'storage, P, S>
+pub struct RowStreamBuilder<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
-    storage: &'storage S,
+    storage: S,
     table_id: TableId,
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
@@ -168,14 +168,14 @@ where
     include_row_ids: bool,
 }
 
-impl<'storage, P, S> RowStreamBuilder<'storage, P, S>
+impl<P, S> RowStreamBuilder<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        storage: &'storage S,
+        storage: S,
         table_id: TableId,
         schema: Arc<Schema>,
         unique_lfids: Arc<Vec<LogicalFieldId>>,
@@ -213,7 +213,7 @@ where
         self
     }
 
-    pub fn build(self) -> LlkvResult<ScanRowStream<'storage, P, S>> {
+    pub fn build(self) -> LlkvResult<ScanRowStream<P, S>> {
         let RowStreamBuilder {
             storage,
             table_id,
@@ -324,12 +324,12 @@ where
     }
 }
 
-pub struct ScanRowStream<'storage, P, S>
+pub struct ScanRowStream<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
-    storage: &'storage S,
+    storage: S,
     table_id: TableId,
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
@@ -352,7 +352,7 @@ where
     projection_plan: Vec<ProjectionPlan>,
 }
 
-impl<'storage, P, S> RowStream for ScanRowStream<'storage, P, S>
+impl<P, S> RowStream for ScanRowStream<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
@@ -385,7 +385,7 @@ where
 
             let numeric_cache = self.numeric_arrays_cache.as_mut();
             let batch_opt = materialize_row_window(
-                self.storage,
+                &self.storage,
                 self.table_id,
                 unique_lfids.as_ref(),
                 projection_evals.as_ref(),
@@ -437,7 +437,7 @@ where
     }
 }
 
-impl<'storage, P, S> ScanRowStream<'storage, P, S>
+impl<P, S> ScanRowStream<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
