@@ -664,6 +664,35 @@ impl ScalarEvaluator {
         Ok(result)
     }
 
+    fn is_always_non_null<F: Hash + Eq + Copy>(
+        expr: &ScalarExpr<F>,
+        arrays: &NumericArrayMap<F>,
+    ) -> bool {
+        match expr {
+            ScalarExpr::Column(fid) => {
+                if let Some(arr) = arrays.get(fid) {
+                    arr.null_count() == 0
+                } else {
+                    false
+                }
+            }
+            ScalarExpr::Literal(Literal::Null) => false,
+            ScalarExpr::Literal(_) => true,
+            ScalarExpr::Aggregate(call) => matches!(
+                call,
+                AggregateCall::Count { .. }
+                | AggregateCall::CountStar
+                | AggregateCall::CountNulls(_)
+            ),
+            ScalarExpr::Cast { expr, .. } => Self::is_always_non_null(expr, arrays),
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::is_always_non_null(left, arrays) && Self::is_always_non_null(right, arrays)
+            }
+            ScalarExpr::Coalesce(items) => items.iter().any(|i| Self::is_always_non_null(i, arrays)),
+            _ => false,
+        }
+    }
+
     fn try_evaluate_vectorized<F: Hash + Eq + Copy>(
         expr: &ScalarExpr<F>,
         len: usize,
@@ -765,6 +794,10 @@ impl ScalarEvaluator {
                     let array = vec_expr.materialize(len);
                     types.push(array.data_type().clone());
                     evaluated_items.push(array);
+
+                    if Self::is_always_non_null(item, arrays) {
+                        break;
+                    }
                 }
 
                 if evaluated_items.is_empty() {
@@ -779,6 +812,7 @@ impl ScalarEvaluator {
                 for t in &types[1..] {
                     common_type = get_common_type(&common_type, t);
                 }
+
 
                 // Cast all arrays to common type
                 let mut casted_arrays = Vec::with_capacity(evaluated_items.len());
