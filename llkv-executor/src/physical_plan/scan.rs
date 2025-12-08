@@ -9,7 +9,7 @@ use llkv_types::FieldId;
 use llkv_expr::Expr;
 use simd_r_drive_entry_handle::EntryHandle;
 use crate::physical_plan::{PhysicalPlan, BatchIter};
-use llkv_scan::{ScanProjection, ScanStreamOptions, RowStream, ScanStorage};
+use llkv_scan::{ScanProjection, ScanStreamOptions, RowStream, ScanStorage, RowIdFilter};
 use std::any::Any;
 use std::fmt;
 
@@ -22,6 +22,7 @@ where
     pub projections: Vec<ScanProjection>,
     pub filter: Option<Expr<'static, FieldId>>,
     pub limit: Option<usize>,
+    pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,
 }
 
 impl<P> fmt::Debug for ScanExec<P>
@@ -34,6 +35,7 @@ where
             .field("projections", &self.projections)
             .field("filter", &self.filter)
             .field("limit", &self.limit)
+            .field("row_filter", &self.row_filter.is_some())
             .finish()
     }
 }
@@ -50,6 +52,7 @@ where
         let filter = self.filter.as_ref().unwrap_or(&Expr::Literal(true));
         let mut options = ScanStreamOptions::default();
         options.include_nulls = true;
+        options.row_id_filter = self.row_filter.clone();
         
         let mut stream = llkv_scan::execute::prepare_scan_stream(
             self.table.clone(),
@@ -113,6 +116,7 @@ where
             projections: self.projections.clone(),
             filter: self.filter.clone(),
             limit: self.limit,
+            row_filter: self.row_filter.clone(),
         }))
     }
 

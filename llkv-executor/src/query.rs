@@ -2257,9 +2257,10 @@ where
         &self,
         logical_plan: &LogicalPlan<P>,
         having: Option<&llkv_expr::expr::Expr<'static, String>>,
+        row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         match logical_plan {
-            LogicalPlan::Single(plan) => self.create_single_table_plan(plan, having),
+            LogicalPlan::Single(plan) => self.create_single_table_plan(plan, having, row_filter),
             LogicalPlan::Multi(plan) => self.create_multi_table_plan(plan),
         }
     }
@@ -2268,6 +2269,7 @@ where
         &self,
         plan: &SingleTableLogicalPlan<P>,
         having: Option<&llkv_expr::expr::Expr<'static, String>>,
+        row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         let adapter = plan
             .table
@@ -2285,6 +2287,7 @@ where
             projections: plan.scan_projections.clone(),
             filter: plan.filter.clone(),
             limit: None,
+            row_filter,
         });
 
         // Apply Sort
@@ -2912,7 +2915,7 @@ where
                     eprintln!("[executor] aggregate_rewrite: {:?}", aggregate_rewrite);
                 }
 
-                let physical_plan = self.create_physical_plan(&prepared.logical_plan, plan.having.as_ref())?;
+                let physical_plan = self.create_physical_plan(&prepared.logical_plan, plan.having.as_ref(), row_filter)?;
 
                 let schema = physical_plan.schema();
 
