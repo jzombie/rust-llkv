@@ -10809,11 +10809,11 @@ fn infer_query_output_type(
             llkv_plan::AggregateExpr::Column { function, .. } => match function {
                 llkv_plan::AggregateFunction::Count
                 | llkv_plan::AggregateFunction::SumInt64
-                | llkv_plan::AggregateFunction::TotalInt64
                 | llkv_plan::AggregateFunction::MinInt64
                 | llkv_plan::AggregateFunction::MaxInt64
                 | llkv_plan::AggregateFunction::CountNulls => Ok(DataType::Int64),
-                llkv_plan::AggregateFunction::GroupConcat => Ok(DataType::Utf8),
+                llkv_plan::AggregateFunction::TotalInt64 => Ok(DataType::Float64),
+                llkv_plan::AggregateFunction::GroupConcat { .. } => Ok(DataType::Utf8),
             },
         };
     }

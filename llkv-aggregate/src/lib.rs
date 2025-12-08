@@ -819,14 +819,18 @@ impl AggregateAccumulator {
                     )
                 })?;
 
-                if let Some(s) = compute::sum(array) {
-                    *has_values = true;
-                    *value = match *value {
-                        Some(current) => Some(current.checked_add(s).ok_or_else(|| {
-                            Error::InvalidArgumentError("integer overflow".into())
-                        })?),
-                        None => Some(s),
-                    };
+                for i in 0..array.len() {
+                    if array.is_valid(i) {
+                        let v = array.value(i);
+                        *has_values = true;
+                        *value = match *value {
+                            Some(current) => current.checked_add(v),
+                            None => None,
+                        };
+                        if value.is_none() {
+                            return Err(Error::InvalidArgumentError("integer overflow".into()));
+                        }
+                    }
                 }
             }
             AggregateAccumulator::SumDistinctInt64 {

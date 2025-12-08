@@ -2,6 +2,7 @@ use llkv_expr::expr::{AggregateCall, BinaryOp, CompareOp, Expr, Operator, Scalar
 use llkv_expr::literal::Literal;
 use llkv_result::Result;
 use std::collections::{HashMap, HashSet};
+use arrow::datatypes::DataType;
 
 use crate::plans::{AggregateExpr, AggregateFunction, SelectPlan, SelectProjection};
 use crate::schema::PlanSchema;
@@ -65,8 +66,10 @@ impl AggVisitor {
                     AggregateCall::Min(expr) => (expr, false, AggregateFunction::MinInt64),
                     AggregateCall::Max(expr) => (expr, false, AggregateFunction::MaxInt64),
                     AggregateCall::CountNulls(expr) => (expr, false, AggregateFunction::CountNulls),
-                    AggregateCall::GroupConcat { expr, distinct, separator: _ } => {
-                        (expr, *distinct, AggregateFunction::GroupConcat)
+                    AggregateCall::GroupConcat { expr, distinct, separator } => {
+                        (expr, *distinct, AggregateFunction::GroupConcat {
+                            separator: separator.clone().unwrap_or_else(|| ",".to_string())
+                        })
                     }
                     AggregateCall::Avg { expr, distinct } => {
                         let arg_idx = self.pre_agg_projections.len();
@@ -90,9 +93,15 @@ impl AggVisitor {
                         });
 
                         return ScalarExpr::Binary {
-                            left: Box::new(ScalarExpr::Column(sum_alias)),
+                            left: Box::new(ScalarExpr::Cast {
+                                expr: Box::new(ScalarExpr::Column(sum_alias)),
+                                data_type: DataType::Float64,
+                            }),
                             op: llkv_expr::expr::BinaryOp::Divide,
-                            right: Box::new(ScalarExpr::Column(count_alias)),
+                            right: Box::new(ScalarExpr::Cast {
+                                expr: Box::new(ScalarExpr::Column(count_alias)),
+                                data_type: DataType::Float64,
+                            }),
                         };
                     }
                 };

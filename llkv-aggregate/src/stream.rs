@@ -459,11 +459,11 @@ fn build_aggregate_states(
                     llkv_plan::AggregateFunction::CountNulls => AggregateKind::CountNulls {
                         field_id: col.field_id,
                     },
-                    llkv_plan::AggregateFunction::GroupConcat => {
-                        return Err(Error::InvalidArgumentError(
-                            "GROUP_CONCAT aggregate is not supported yet".into(),
-                        ));
-                    }
+                    llkv_plan::AggregateFunction::GroupConcat { separator } => AggregateKind::GroupConcat {
+                        field_id: col.field_id,
+                        distinct: *distinct,
+                        separator: separator.clone(),
+                    },
                 };
 
                 specs.push(AggregateSpec {

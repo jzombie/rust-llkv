@@ -2352,17 +2352,23 @@ where
 
                          match function {
                              llkv_plan::plans::AggregateFunction::Count | llkv_plan::plans::AggregateFunction::CountNulls => DataType::Int64,
-                             llkv_plan::plans::AggregateFunction::SumInt64 | llkv_plan::plans::AggregateFunction::TotalInt64 => {
+                             llkv_plan::plans::AggregateFunction::SumInt64 => {
                                  match input_type {
                                      DataType::Float64 | DataType::Float32 => DataType::Float64,
                                      DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
                                      _ => DataType::Int64,
                                  }
                              },
+                             llkv_plan::plans::AggregateFunction::TotalInt64 => {
+                                 match input_type {
+                                     DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
+                                     _ => DataType::Float64,
+                                 }
+                             },
                              llkv_plan::plans::AggregateFunction::MinInt64 | llkv_plan::plans::AggregateFunction::MaxInt64 => {
                                  input_type
                              },
-                             llkv_plan::plans::AggregateFunction::GroupConcat => DataType::Utf8,
+                             llkv_plan::plans::AggregateFunction::GroupConcat { .. } => DataType::Utf8,
                          }
                      },
                      llkv_plan::plans::AggregateExpr::CountStar { .. } => DataType::Int64,
@@ -2628,9 +2634,11 @@ where
                             llkv_plan::plans::AggregateFunction::CountNulls => AggregateKind::CountNulls {
                                 field_id: 0,
                             },
-                            llkv_plan::plans::AggregateFunction::GroupConcat => {
-                                return Err(Error::Internal("GroupConcat not supported".to_string()));
-                            }
+                            llkv_plan::plans::AggregateFunction::GroupConcat { separator } => AggregateKind::GroupConcat {
+                                field_id: 0,
+                                distinct: *distinct,
+                                separator: separator.clone(),
+                            },
                         };
                         (alias.clone(), kind)
                     }
