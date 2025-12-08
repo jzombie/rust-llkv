@@ -313,8 +313,25 @@ impl LlkvSltRunner {
         // Execute all records with hash threshold and type hint handling
         let run_result = async {
             let mut current_hash_threshold: usize = 256;
+            let log_progress = std::env::var("LLKV_SLT_PROGRESS").is_ok();
+            let mut record_index: usize = 0;
 
             for record in records {
+                if log_progress {
+                    let preview = match &record {
+                        Record::Statement { sql, .. } => sql,
+                        Record::Query { sql, .. } => sql,
+                        _ => "<control>",
+                    };
+                    let single_line = preview.replace('\n', " ");
+                    let display = if single_line.len() > 80 {
+                        format!("{}...", &single_line[..80])
+                    } else {
+                        single_line
+                    };
+                    eprintln!("[llkv-slt] record {}: {}", record_index, display);
+                }
+
                 if let Record::Statement { expected, .. } = &record {
                     match expected {
                         StatementExpect::Error(_) => {
@@ -421,6 +438,8 @@ impl LlkvSltRunner {
                     current_hash_threshold = new_threshold;
                     runner.with_hash_threshold(new_threshold);
                 }
+
+                record_index += 1;
             }
 
             Ok::<(), sqllogictest::TestError>(())
@@ -812,6 +831,10 @@ where
     if stats_enabled {
         crate::slt_test_engine::enable_stats();
     }
+
+    // Default to fail-fast unless overridden by environment variable (e.g. in CI)
+    let fail_fast = std::env::var("LLKV_SLT_NO_FAIL_FAST").is_err();
+
     let base = std::path::Path::new(slt_dir);
     let files = {
         let mut out = Vec::new();
@@ -853,13 +876,14 @@ where
         // Check if this is a .slturl pointer file
         let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
 
+        let test_name = name.clone();
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
             let fac = factory_factory_clone();
 
             // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
             // Default thread stack is ~2MB which is insufficient for complex SLT test queries
-            std::thread::Builder::new()
+            let res = std::thread::Builder::new()
                 .stack_size(SLT_HARNESS_STACK_SIZE)
                 .spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -904,7 +928,43 @@ where
                 })
                 .map_err(|e| Failed::from(format!("failed to spawn test thread: {e}")))?
                 .join()
-                .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?
+                .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?;
+
+            if let Err(e) = &res {
+                if fail_fast {
+                    eprintln!("test {} ... FAILED", test_name);
+
+                    // Print the error explicitly before exiting, as process::exit will prevent
+                    // libtest-mimic from printing the failure summary.
+                    //
+                    // This simulates a panic, but forces the process to exit manually, as a real
+                    // panic insufficient here because the test runner is designed to catch panics.
+                    //
+                    // Note: Failed::msg is private, so we have to parse the Debug output to get
+                    // the unescaped message with proper line breaks.
+                    let debug_str = format!("{:?}", e);
+                    // FIXME: Error messages are contained in a JSON-like string, so here's a rather
+                    // hacky implementation to extract them. This is a workaround since libtest_mimic::Failed
+                    // is private and the struct does not implement `Display`.
+                    if let Some(start) = debug_str.find("msg: Some(\"") {
+                        if let Some(end) = debug_str.rfind("\")") {
+                            let inner = &debug_str[start + 11..end];
+                            let unescaped = inner
+                                .replace("\\n", "\n")
+                                .replace("\\\"", "\"")
+                                .replace("\\\\", "\\")
+                                .replace("\\t", "\t");
+                            eprintln!("{}", unescaped);
+                        } else {
+                            eprintln!("{}", debug_str);
+                        }
+                    } else {
+                        eprintln!("{}", debug_str);
+                    }
+                    std::process::exit(101);
+                }
+            }
+            res
         }));
     }
 
