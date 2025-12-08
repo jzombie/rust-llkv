@@ -855,14 +855,18 @@ impl SqlEngine {
             if caps.get(2).is_some() {
                 // expr NOT IN () → always true (but still evaluate expr)
                 // We use the same logic as IN () but negated.
-                // IN () -> CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN)
-                // NOT IN () -> NOT (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN))
-                format!("NOT (CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN))", expr)
+                // IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)
+                // NOT IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)
+                // We wrap in a comparison (= FALSE) because the WHERE clause planner only supports
+                // comparisons and boolean logic at the top level, not arbitrary scalar expressions like CAST.
+                format!("(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)", expr)
             } else {
                 // expr IN () → always false (but still evaluate expr)
                 // We use COALESCE to ensure we get FALSE even if expr evaluates to NULL
                 // (since NULL AND FALSE can be NULL in some contexts).
-                format!("CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN)", expr)
+                // We wrap in a comparison (= TRUE) because the WHERE clause planner only supports
+                // comparisons and boolean logic at the top level.
+                format!("(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)", expr)
             }
         })
         .to_string();
