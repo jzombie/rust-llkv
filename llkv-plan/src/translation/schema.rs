@@ -52,9 +52,6 @@ pub fn infer_computed_data_type(
     match expr {
         ScalarExpr::Literal(lit) => {
             let res = infer_literal_datatype(lit);
-            if let Ok(dt) = &res {
-                println!("Inferred type for literal {:?}: {:?}", lit, dt);
-            }
             res
         },
         ScalarExpr::Column(field_id) => {
