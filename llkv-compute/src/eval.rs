@@ -1236,6 +1236,36 @@ impl ScalarEvaluator {
                 }
                 simplified_agg
             }
+            ScalarExpr::IsNull { expr, negated } => {
+                let inner = Self::simplify(expr);
+                let is_effectively_null = if let ScalarExpr::Literal(Literal::Null) = &inner {
+                    true
+                } else if let ScalarExpr::Cast { expr, .. } = &inner {
+                    matches!(expr.as_ref(), ScalarExpr::Literal(Literal::Null))
+                } else {
+                    false
+                };
+
+                if is_effectively_null {
+                    return ScalarExpr::Literal(Literal::Boolean(!*negated));
+                }
+
+                if let ScalarExpr::Literal(_) = &inner {
+                    return ScalarExpr::Literal(Literal::Boolean(*negated));
+                }
+
+                ScalarExpr::IsNull {
+                    expr: Box::new(inner),
+                    negated: *negated,
+                }
+            }
+            ScalarExpr::Not(expr) => {
+                let inner = Self::simplify(expr);
+                if let ScalarExpr::Literal(Literal::Boolean(b)) = &inner {
+                    return ScalarExpr::Literal(Literal::Boolean(!b));
+                }
+                ScalarExpr::Not(Box::new(inner))
+            }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);
                 if let ScalarExpr::Literal(lit) = &inner

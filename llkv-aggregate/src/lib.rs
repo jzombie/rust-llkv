@@ -242,6 +242,15 @@ pub enum AggregateAccumulator {
     MaxNull {
         column_index: usize,
     },
+    SumNull {
+        column_index: usize,
+    },
+    TotalNull {
+        column_index: usize,
+    },
+    AvgNull {
+        column_index: usize,
+    },
     CountNulls {
         column_index: usize,
         non_null_rows: i64,
@@ -550,6 +559,7 @@ impl AggregateAccumulator {
                             saw_value: false,
                         })
                     }
+                    (&DataType::Null, _) => Ok(AggregateAccumulator::SumNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "SUM aggregate not supported for column type {:?}",
                         other.0
@@ -605,6 +615,7 @@ impl AggregateAccumulator {
                             value: 0.0,
                         })
                     }
+                    (&DataType::Null, _) => Ok(AggregateAccumulator::TotalNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "TOTAL aggregate not supported for column type {:?}",
                         other.0
@@ -663,6 +674,7 @@ impl AggregateAccumulator {
                             count: 0,
                         })
                     }
+                    (&DataType::Null, _) => Ok(AggregateAccumulator::AvgNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "AVG aggregate not supported for column type {:?}",
                         other.0
@@ -1470,7 +1482,11 @@ impl AggregateAccumulator {
                     }
                 }
             }
-            AggregateAccumulator::MinNull { .. } | AggregateAccumulator::MaxNull { .. } => {
+            AggregateAccumulator::MinNull { .. }
+            | AggregateAccumulator::MaxNull { .. }
+            | AggregateAccumulator::SumNull { .. }
+            | AggregateAccumulator::TotalNull { .. }
+            | AggregateAccumulator::AvgNull { .. } => {
                 // No-op: result is always NULL
             }
             AggregateAccumulator::CountNulls {
@@ -1608,6 +1624,9 @@ impl AggregateAccumulator {
             } => Field::new("max", DataType::Decimal128(*precision, *scale), true),
             AggregateAccumulator::MinNull { .. } => Field::new("min", DataType::Null, true),
             AggregateAccumulator::MaxNull { .. } => Field::new("max", DataType::Null, true),
+            AggregateAccumulator::SumNull { .. } => Field::new("sum", DataType::Null, true),
+            AggregateAccumulator::TotalNull { .. } => Field::new("total", DataType::Null, true),
+            AggregateAccumulator::AvgNull { .. } => Field::new("avg", DataType::Null, true),
             AggregateAccumulator::CountNulls { .. } => {
                 Field::new("count_nulls", DataType::Int64, false)
             }
@@ -2043,6 +2062,18 @@ impl AggregateAccumulator {
             AggregateAccumulator::MaxNull { .. } => {
                 let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
                 Ok((Field::new("max", DataType::Null, true), array))
+            }
+            AggregateAccumulator::SumNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("sum", DataType::Null, true), array))
+            }
+            AggregateAccumulator::TotalNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("total", DataType::Null, true), array))
+            }
+            AggregateAccumulator::AvgNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("avg", DataType::Null, true), array))
             }
             AggregateAccumulator::CountNulls {
                 non_null_rows,
