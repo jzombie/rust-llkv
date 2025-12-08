@@ -565,9 +565,15 @@ where
                 }
             }
             crate::plans::SelectProjection::AllColumnsExcept { exclude } => {
-                for table in ctx.tables.iter() {
+                let mut excluded_fields = FxHashSet::default();
+                for ex in exclude {
+                    let (table_idx, lfid) = resolve_column_ref(ctx, ex.as_str())?;
+                    excluded_fields.insert((table_idx, lfid.field_id()));
+                }
+
+                for (table_idx, table) in ctx.tables.iter().enumerate() {
                     for col in &table.schema.columns {
-                        if exclude.iter().any(|ex| ex.eq_ignore_ascii_case(&col.name)) {
+                        if excluded_fields.contains(&(table_idx, col.field_id)) {
                             continue;
                         }
                         out.push((ScalarExpr::Column(col.name.clone()), col.name.clone()));
@@ -1155,9 +1161,15 @@ where
                 }
             }
             crate::plans::SelectProjection::AllColumnsExcept { exclude } => {
+                let mut excluded_fields = FxHashSet::default();
+                for ex in exclude {
+                    let (table_idx, lfid) = resolve_column_ref(ctx, ex.as_str())?;
+                    excluded_fields.insert((table_idx, lfid.field_id()));
+                }
+
                 for (table_idx, table) in ctx.tables.iter().enumerate() {
                     for col in &table.schema.columns {
-                        if exclude.iter().any(|ex| ex.eq_ignore_ascii_case(&col.name)) {
+                        if excluded_fields.contains(&(table_idx, col.field_id)) {
                             continue;
                         }
                         out.push(ResolvedProjection::Column {
