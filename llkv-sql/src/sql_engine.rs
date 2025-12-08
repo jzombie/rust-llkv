@@ -850,17 +850,29 @@ impl SqlEngine {
                 .expect("valid empty IN regex")
         });
 
-        re.replace_all(sql, |caps: &regex::Captures| {
+        let result = re.replace_all(sql, |caps: &regex::Captures| {
             let expr = &caps[1];
             if caps.get(2).is_some() {
                 // expr NOT IN () → always true (but still evaluate expr)
-                format!("({} = NULL OR 1 = 1)", expr)
+                // We use the same logic as IN () but negated.
+                // IN () -> CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN)
+                // NOT IN () -> NOT (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN))
+                format!("NOT (CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN))", expr)
             } else {
                 // expr IN () → always false (but still evaluate expr)
-                format!("({} = NULL AND 0 = 1)", expr)
+                // We use COALESCE to ensure we get FALSE even if expr evaluates to NULL
+                // (since NULL AND FALSE can be NULL in some contexts).
+                format!("CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN)", expr)
             }
         })
-        .to_string()
+        .to_string();
+        
+        if result != sql {
+            tracing::debug!("preprocess_empty_in_lists: rewritten '{}' to '{}'", sql, result);
+        } else {
+            tracing::debug!("preprocess_empty_in_lists: no match for '{}'", sql);
+        }
+        result
     }
 
     /// Strip SQLite index hints (INDEXED BY, NOT INDEXED) from table references.
