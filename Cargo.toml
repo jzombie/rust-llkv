@@ -72,7 +72,7 @@ llkv-test-utils = { path = "./llkv-test-utils", version = "0.8.5-alpha" }
 llkv-threading = { path = "./llkv-threading", version = "0.8.5-alpha" }
 llkv-transaction = { path = "./llkv-transaction", version = "0.8.5-alpha" }
 llkv-types = { path = "./llkv-types", version = "0.8.5-alpha" }
-modular-bitfield = "0.13.0"
+modular-bitfield = "0.13.1"
 num_enum = "0.7.5"
 rand = "0.9.1"
 rayon = "1.10.0"
