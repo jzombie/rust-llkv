@@ -48,7 +48,8 @@ where
 
     fn execute(&self) -> Result<BatchIter> {
         let filter = self.filter.as_ref().unwrap_or(&Expr::Literal(true));
-        let options = ScanStreamOptions::default(); 
+        let mut options = ScanStreamOptions::default();
+        options.include_nulls = true;
         
         let mut stream = llkv_scan::execute::prepare_scan_stream(
             self.table.clone(),
