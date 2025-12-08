@@ -876,6 +876,7 @@ where
         // Check if this is a .slturl pointer file
         let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
 
+        let test_name = name.clone();
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
             let fac = factory_factory_clone();
@@ -931,6 +932,8 @@ where
 
             if let Err(e) = &res {
                 if fail_fast {
+                    eprintln!("test {} ... FAILED", test_name);
+
                     // Print the error explicitly before exiting, as process::exit will prevent
                     // libtest-mimic from printing the failure summary.
                     //
