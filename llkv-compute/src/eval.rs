@@ -459,7 +459,11 @@ impl ScalarEvaluator {
                     let is_match = if let Some(op_val) = &operand_val {
                         // Simple CASE: operand = when_val
                         // If either is null, result is null (false for condition)
-                        if op_val.is_null(0) || when_val.is_null(0) {
+                        if op_val.data_type() == &DataType::Null
+                            || when_val.data_type() == &DataType::Null
+                            || op_val.is_null(0)
+                            || when_val.is_null(0)
+                        {
                             false
                         } else {
                             let eq =
@@ -468,11 +472,11 @@ impl ScalarEvaluator {
                                 .as_any()
                                 .downcast_ref::<arrow::array::BooleanArray>()
                                 .unwrap();
-                            bool_arr.value(0)
+                            bool_arr.is_valid(0) && bool_arr.value(0)
                         }
                     } else {
                         // Searched CASE: when_val is boolean condition
-                        if when_val.is_null(0) {
+                        if when_val.data_type() == &DataType::Null || when_val.is_null(0) {
                             false
                         } else {
                             let bool_arr = cast::cast(&when_val, &DataType::Boolean)
@@ -481,7 +485,7 @@ impl ScalarEvaluator {
                                 .as_any()
                                 .downcast_ref::<arrow::array::BooleanArray>()
                                 .unwrap();
-                            bool_arr.value(0)
+                            bool_arr.is_valid(0) && bool_arr.value(0)
                         }
                     };
 
@@ -601,12 +605,13 @@ impl ScalarEvaluator {
     }
 
     /// Evaluate a scalar expression that has already been simplified.
-    pub fn evaluate_batch_simplified<F: Hash + Eq + Copy>(
+    pub fn evaluate_batch_simplified<F: Hash + Eq + Copy + std::fmt::Debug>(
         expr: &ScalarExpr<F>,
         len: usize,
         arrays: &NumericArrayMap<F>,
     ) -> LlkvResult<ArrayRef> {
         let preferred = expr.infer_result_type_from_arrays(arrays);
+
 
         if len == 0 {
             return Ok(new_null_array(&preferred, 0));
@@ -652,8 +657,11 @@ impl ScalarEvaluator {
                 values.push(val);
             }
         }
-        concat(&values.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
-            .map_err(|e| Error::Internal(e.to_string()))
+        let result = concat(&values.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
+            .map_err(|e| Error::Internal(e.to_string()))?;
+
+
+        Ok(result)
     }
 
     fn try_evaluate_vectorized<F: Hash + Eq + Copy>(
@@ -834,7 +842,10 @@ impl ScalarEvaluator {
     fn is_null<F>(expr: &ScalarExpr<F>) -> bool {
         match expr {
             ScalarExpr::Literal(Literal::Null) => true,
-            ScalarExpr::Cast { expr, .. } => Self::is_null(expr),
+            // We do NOT recurse into Cast here because we want to preserve the type information
+            // of CAST(NULL AS T). If we identify it as null and simplify it to Literal::Null,
+            // we lose the type T, which causes schema mismatches in RecordBatch creation.
+            // ScalarExpr::Cast { expr, .. } => Self::is_null(expr),
             _ => false,
         }
     }
