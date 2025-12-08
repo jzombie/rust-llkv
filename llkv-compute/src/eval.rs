@@ -820,25 +820,6 @@ impl ScalarEvaluator {
         }
     }
 
-    fn contains_aggregate<F>(expr: &ScalarExpr<F>) -> bool {
-        match expr {
-            ScalarExpr::Aggregate(_) => true,
-            ScalarExpr::Binary { left, right, .. } => Self::contains_aggregate(left) || Self::contains_aggregate(right),
-            ScalarExpr::Not(e) => Self::contains_aggregate(e),
-            ScalarExpr::IsNull { expr, .. } => Self::contains_aggregate(expr),
-            ScalarExpr::Cast { expr, .. } => Self::contains_aggregate(expr),
-            ScalarExpr::Compare { left, right, .. } => Self::contains_aggregate(left) || Self::contains_aggregate(right),
-            ScalarExpr::Case { operand, branches, else_expr } => {
-                operand.as_ref().map_or(false, |e| Self::contains_aggregate(e)) ||
-                branches.iter().any(|(w, t)| Self::contains_aggregate(w) || Self::contains_aggregate(t)) ||
-                else_expr.as_ref().map_or(false, |e| Self::contains_aggregate(e))
-            }
-            ScalarExpr::Coalesce(exprs) => exprs.iter().any(Self::contains_aggregate),
-            ScalarExpr::GetField { base, .. } => Self::contains_aggregate(base),
-            _ => false,
-        }
-    }
-
     fn is_null<F>(expr: &ScalarExpr<F>) -> bool {
         match expr {
             ScalarExpr::Literal(Literal::Null) => true,
@@ -852,14 +833,55 @@ impl ScalarEvaluator {
 
     /// Simplify an expression by constant folding and identity removal.
     pub fn simplify<F: Hash + Eq + Clone>(expr: &ScalarExpr<F>) -> ScalarExpr<F> {
+        let try_get_type = |e: &ScalarExpr<F>| -> Option<DataType> {
+            match e {
+                ScalarExpr::Cast { data_type, .. } => Some(data_type.clone()),
+                ScalarExpr::Literal(lit) => match lit {
+                    Literal::Int128(_) => Some(DataType::Int64),
+                    Literal::Float64(_) => Some(DataType::Float64),
+                    Literal::Boolean(_) => Some(DataType::Boolean),
+                    Literal::String(_) => Some(DataType::Utf8),
+                    Literal::Date32(_) => Some(DataType::Date32),
+                    Literal::Decimal128(d) => Some(DataType::Decimal128(d.precision(), d.scale())),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+
         match expr {
             ScalarExpr::Binary { left, op, right } => {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
 
                 let is_logic_op = matches!(op, BinaryOp::And | BinaryOp::Or);
-                if !is_logic_op && (Self::is_null(&l) || Self::is_null(&r)) && !Self::contains_aggregate(&l) && !Self::contains_aggregate(&r) {
-                    return ScalarExpr::Literal(Literal::Null);
+                
+                let is_effectively_null = |e: &ScalarExpr<F>| {
+                    Self::is_null(e) || matches!(e, ScalarExpr::Cast { expr, .. } if Self::is_null(expr))
+                };
+
+                if !is_logic_op && (is_effectively_null(&l) || is_effectively_null(&r)) {
+                     let type_l = try_get_type(&l);
+                     let type_r = try_get_type(&r);
+                     
+                     let target_type = match (type_l, type_r) {
+                         (Some(t1), Some(t2)) => Some(get_common_type(&t1, &t2)),
+                         (Some(t), None) => Some(t),
+                         (None, Some(t)) => Some(t),
+                         (None, None) => None,
+                     };
+                     
+                     if let Some(dt) = target_type {
+                          return ScalarExpr::Cast {
+                                expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                data_type: dt,
+                          };
+                     }
+                     
+                     // If both are untyped nulls, return Literal::Null
+                     if Self::is_null(&l) && Self::is_null(&r) {
+                         return ScalarExpr::Literal(Literal::Null);
+                     }
                 }
 
                 if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r)
@@ -877,8 +899,23 @@ impl ScalarEvaluator {
                 let l = Self::simplify(left);
                 let r = Self::simplify(right);
 
-                if (Self::is_null(&l) || Self::is_null(&r)) && !Self::contains_aggregate(&l) && !Self::contains_aggregate(&r) {
+                let is_effectively_null = |e: &ScalarExpr<F>| {
+                    Self::is_null(e) || matches!(e, ScalarExpr::Cast { expr, .. } if Self::is_null(expr))
+                };
+
+                // Simplify to Literal::Null if EITHER is effectively null.
+                if is_effectively_null(&l) || is_effectively_null(&r) {
                     return ScalarExpr::Literal(Literal::Null);
+                }
+
+                if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r) {
+                    let l_arr = Self::literal_to_array(ll);
+                    let r_arr = Self::literal_to_array(rr);
+                    if let Ok(res) = crate::kernels::compute_compare(&l_arr, *op, &r_arr) {
+                         if let Ok(lit) = Literal::from_array_ref(&res, 0) {
+                             return ScalarExpr::Literal(lit);
+                         }
+                    }
                 }
 
                 ScalarExpr::Compare {
@@ -908,9 +945,16 @@ impl ScalarEvaluator {
                     if is_typed(&result) {
                         return result;
                     }
+
                     // Result is untyped NULL. Check if we are discarding any typed branches.
                     for (_, then) in branches {
                         if is_typed(then) {
+                            if let Some(dt) = try_get_type(then) {
+                                return ScalarExpr::Cast {
+                                    expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                    data_type: dt,
+                                };
+                            }
                             // Found a typed branch. Return a dummy CASE to preserve type.
                             return ScalarExpr::Case {
                                 operand: None,
@@ -921,6 +965,12 @@ impl ScalarEvaluator {
                     }
                     if let Some(e) = &s_else {
                         if is_typed(e) {
+                             if let Some(dt) = try_get_type(e) {
+                                return ScalarExpr::Cast {
+                                    expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                    data_type: dt,
+                                };
+                            }
                              return ScalarExpr::Case {
                                 operand: None,
                                 branches: vec![(ScalarExpr::Literal(Literal::Boolean(false)), *e.clone())],
@@ -991,34 +1041,156 @@ impl ScalarEvaluator {
                 }
             }
             ScalarExpr::Coalesce(items) => {
-                let mut new_items = Vec::new();
+                let mut simplified_items = Vec::with_capacity(items.len());
+                let mut non_null_items = Vec::new();
+
                 for item in items {
                     let s_item = Self::simplify(item);
-                    if let ScalarExpr::Literal(lit) = &s_item {
-                        if matches!(lit, Literal::Null) {
-                            continue;
+                    simplified_items.push(s_item.clone());
+
+                    // Check if item is effectively NULL (Literal::Null, Cast(Null), or Aggregate(Null))
+                    let is_effectively_null = if Self::is_null(&s_item) {
+                        true
+                    } else if let ScalarExpr::Cast { expr, .. } = &s_item {
+                        Self::is_null(expr)
+                    } else if let ScalarExpr::Aggregate(agg) = &s_item {
+                        match agg {
+                            AggregateCall::Avg { expr, .. }
+                            | AggregateCall::Sum { expr, .. }
+                            | AggregateCall::Min(expr)
+                            | AggregateCall::Max(expr) => {
+                                let inner = Self::simplify(expr);
+                                Self::is_null(&inner)
+                                    || (matches!(inner, ScalarExpr::Cast { expr, .. } if Self::is_null(&expr)))
+                            }
+                            // Count(NULL) is 0, not NULL.
+                            _ => false,
                         }
+                    } else {
+                        false
+                    };
+
+                    if is_effectively_null {
+                        continue;
+                    }
+
+                    if let ScalarExpr::Literal(lit) = &s_item {
                         // Found non-null literal.
-                        if new_items.is_empty() {
+                        if non_null_items.is_empty() {
                             return ScalarExpr::Literal(lit.clone());
                         }
                         // We have preceding non-constant expressions.
                         // This literal terminates the coalesce chain.
-                        new_items.push(s_item);
+                        non_null_items.push(s_item);
                         break;
                     }
-                    new_items.push(s_item);
+                    non_null_items.push(s_item);
                 }
 
-                if new_items.is_empty() {
-                    return ScalarExpr::Literal(Literal::Null);
+                if non_null_items.is_empty() {
+                    // All items were effectively NULL.
+                    // To preserve types (e.g. AVG(NULL) is Double, Literal::Null is Untyped),
+                    // we should return the original simplified items if they contain any typed expressions.
+                    // If all were Literal::Null, we can return Literal::Null.
+                    let all_literals = simplified_items
+                        .iter()
+                        .all(|i| matches!(i, ScalarExpr::Literal(Literal::Null)));
+                    if all_literals {
+                        return ScalarExpr::Literal(Literal::Null);
+                    }
+                    return ScalarExpr::Coalesce(simplified_items);
                 }
 
-                if new_items.len() == 1 {
-                    return new_items[0].clone();
+                if non_null_items.len() == 1 {
+                    return non_null_items[0].clone();
                 }
 
-                ScalarExpr::Coalesce(new_items)
+                ScalarExpr::Coalesce(non_null_items)
+            }
+            ScalarExpr::Aggregate(agg) => {
+                let simplified_agg = match agg {
+                    AggregateCall::Avg { expr, distinct } => ScalarExpr::Aggregate(AggregateCall::Avg {
+                        expr: Box::new(Self::simplify(expr)),
+                        distinct: *distinct,
+                    }),
+                    AggregateCall::Sum { expr, distinct } => ScalarExpr::Aggregate(AggregateCall::Sum {
+                        expr: Box::new(Self::simplify(expr)),
+                        distinct: *distinct,
+                    }),
+                    AggregateCall::Total { expr, distinct } => ScalarExpr::Aggregate(AggregateCall::Total {
+                        expr: Box::new(Self::simplify(expr)),
+                        distinct: *distinct,
+                    }),
+                    AggregateCall::Min(expr) => {
+                        ScalarExpr::Aggregate(AggregateCall::Min(Box::new(Self::simplify(expr))))
+                    }
+                    AggregateCall::Max(expr) => {
+                        ScalarExpr::Aggregate(AggregateCall::Max(Box::new(Self::simplify(expr))))
+                    }
+                    AggregateCall::Count { expr, distinct } => {
+                        ScalarExpr::Aggregate(AggregateCall::Count {
+                            expr: Box::new(Self::simplify(expr)),
+                            distinct: *distinct,
+                        })
+                    }
+                    AggregateCall::CountNulls(expr) => {
+                        ScalarExpr::Aggregate(AggregateCall::CountNulls(Box::new(Self::simplify(expr))))
+                    }
+                    AggregateCall::GroupConcat {
+                        expr,
+                        distinct,
+                        separator,
+                    } => ScalarExpr::Aggregate(AggregateCall::GroupConcat {
+                        expr: Box::new(Self::simplify(expr)),
+                        distinct: *distinct,
+                        separator: separator.clone(),
+                    }),
+                    AggregateCall::CountStar => ScalarExpr::Aggregate(AggregateCall::CountStar),
+                };
+
+                // Check for effective nulls and return typed Nulls if possible
+                match &simplified_agg {
+                    ScalarExpr::Aggregate(agg_call) => {
+                        match agg_call {
+                            AggregateCall::Avg { expr, .. } => {
+                                if Self::is_null(expr) {
+                                    return ScalarExpr::Cast {
+                                        expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                        data_type: DataType::Float64,
+                                    };
+                                }
+                            }
+                            AggregateCall::Min(expr) | AggregateCall::Max(expr) => {
+                                if Self::is_null(expr) {
+                                    if let Some(dt) = try_get_type(expr) {
+                                         return ScalarExpr::Cast {
+                                            expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                            data_type: dt,
+                                        };
+                                    }
+                                }
+                            }
+                            AggregateCall::Sum { expr, .. } | AggregateCall::Total { expr, .. } => {
+                                if Self::is_null(expr) {
+                                    if let Some(dt) = try_get_type(expr) {
+                                         return ScalarExpr::Cast {
+                                            expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                            data_type: dt,
+                                        };
+                                    }
+                                }
+                            }
+                            AggregateCall::Count { expr, .. } => {
+                                if Self::is_null(expr) {
+                                    return ScalarExpr::Literal(Literal::Int128(0));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                simplified_agg
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let inner = Self::simplify(expr);

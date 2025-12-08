@@ -165,7 +165,20 @@ where
                 columns.push(result);
             }
 
-            RecordBatch::try_new(final_output_schema_captured.clone(), columns)
+            let mut cast_columns = Vec::with_capacity(columns.len());
+            for (i, col) in columns.iter().enumerate() {
+                let expected_type = final_output_schema_captured.field(i).data_type();
+                if col.data_type() != expected_type {
+                    // Attempt to cast if types mismatch (e.g. NullArray -> Int64Array)
+                    let casted = arrow::compute::cast(col, expected_type)
+                        .map_err(|e| Error::Internal(format!("Failed to cast column {} from {:?} to {:?}: {}", i, col.data_type(), expected_type, e)))?;
+                    cast_columns.push(casted);
+                } else {
+                    cast_columns.push(col.clone());
+                }
+            }
+
+            RecordBatch::try_new(final_output_schema_captured.clone(), cast_columns)
                 .map_err(|e| Error::Internal(e.to_string()))
         });
 
@@ -1976,7 +1989,20 @@ where
                 }
             }
 
-            RecordBatch::try_new(output_schema_captured.clone(), columns)
+            let mut cast_columns = Vec::with_capacity(columns.len());
+            for (i, col) in columns.iter().enumerate() {
+                let expected_type = output_schema_captured.field(i).data_type();
+                if col.data_type() != expected_type {
+                    // Attempt to cast if types mismatch (e.g. NullArray -> Int64Array)
+                    let casted = arrow::compute::cast(col, expected_type)
+                        .map_err(|e| Error::Internal(format!("Failed to cast column {} from {:?} to {:?}: {}", i, col.data_type(), expected_type, e)))?;
+                    cast_columns.push(casted);
+                } else {
+                    cast_columns.push(col.clone());
+                }
+            }
+
+            RecordBatch::try_new(output_schema_captured.clone(), cast_columns)
                 .map_err(|e| Error::Internal(e.to_string()))
         });
 
@@ -2682,12 +2708,22 @@ where
                 }
 
                 let mut columns = Vec::new();
-                for (e, _) in &expr {
+                for (i, (e, _)) in expr.iter().enumerate() {
                     let col = ScalarEvaluator::evaluate_batch_simplified(
                         e,
                         batch.num_rows(),
                         &field_arrays,
                     ).map_err(|e| Error::Internal(e.to_string()))?;
+
+                    // Cast if needed
+                    let expected_type = schema.field(i).data_type();
+                    let col = if col.data_type() != expected_type {
+                        eprintln!("DEBUG: QueryExec Projection mismatch! Col: {:?}, Expected: {:?}", col.data_type(), expected_type);
+                        arrow::compute::cast(&col, expected_type)
+                            .map_err(|e| Error::Internal(e.to_string()))?
+                    } else {
+                        col
+                    };
 
                     columns.push(col);
                 }
@@ -2695,6 +2731,11 @@ where
                     let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
                     RecordBatch::try_new_with_options(schema.clone(), columns, &options).map_err(|e| Error::Internal(e.to_string()))
                 } else {
+                    // eprintln!("DEBUG: ProjectionExec try_new schema: {:?}, columns: {:?}", schema, columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
+                    if let Err(e) = RecordBatch::try_new(schema.clone(), columns.clone()) {
+                        eprintln!("DEBUG: ProjectionExec try_new FAILED! Schema: {:?}, Columns: {:?}", schema, columns.iter().map(|c| c.data_type()).collect::<Vec<_>>());
+                        return Err(Error::Internal(e.to_string()));
+                    }
                     RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
                 }
             })));
@@ -3840,7 +3881,21 @@ where
                                 }
                             }
                         }
-                        RecordBatch::try_new(output_schema_captured.clone(), columns)
+
+                        let mut cast_columns = Vec::with_capacity(columns.len());
+                        for (i, col) in columns.iter().enumerate() {
+                            let expected_type = output_schema_captured.field(i).data_type();
+                            if col.data_type() != expected_type {
+                                // Attempt to cast if types mismatch (e.g. NullArray -> Int64Array)
+                                let casted = arrow::compute::cast(col, expected_type)
+                                    .map_err(|e| Error::Internal(format!("Failed to cast column {} from {:?} to {:?}: {}", i, col.data_type(), expected_type, e)))?;
+                                cast_columns.push(casted);
+                            } else {
+                                cast_columns.push(col.clone());
+                            }
+                        }
+
+                        RecordBatch::try_new(output_schema_captured.clone(), cast_columns)
                             .map_err(|e| Error::Internal(e.to_string()))
                     });
                     Box::new(final_stream)

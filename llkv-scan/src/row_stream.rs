@@ -624,6 +624,16 @@ where
                         ScalarEvaluator::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
                     }
                 };
+
+                // Cast if needed to match output schema
+                let expected_type = out_schema.field(columns.len()).data_type();
+                let array = if array.data_type() != expected_type {
+                    arrow::compute::cast(&array, expected_type)
+                        .map_err(|e| llkv_result::Error::Internal(e.to_string()))?
+                } else {
+                    array
+                };
+
                 columns.push(array);
             }
         }

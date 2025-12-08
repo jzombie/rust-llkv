@@ -5313,6 +5313,7 @@ impl SqlEngine {
                     for idx in &column_indices {
                         arrays.push(Arc::clone(batch.column(*idx)));
                     }
+                    // eprintln!("DEBUG: llkv-sql view support try_new schema: {:?}, columns: {:?}", projected_schema, arrays.iter().map(|c| c.data_type()).collect::<Vec<_>>());
                     let projected = RecordBatch::try_new(Arc::clone(&projected_schema), arrays)?;
                     projected_batches.push(projected);
                 }

@@ -320,6 +320,34 @@ where
 
         let mut logical_plan = self.logical_planner.create_logical_plan(&plan_for_scan)?;
 
+        // Ensure the expression output type matches the inferred schema type.
+        // This is necessary because some expressions (like CASE) might evaluate to an untyped NullArray
+        // even if the schema inference determined a specific type (e.g. Int64).
+        // Wrapping in Cast ensures the Executor produces the correct array type.
+        if let LogicalPlan::Single(single_plan) = &mut logical_plan {
+            for proj in &mut single_plan.requested_projections {
+                if let llkv_scan::ScanProjection::Computed { expr, .. } = proj {
+                    if let Ok(inferred_type) =
+                        crate::translation::schema::infer_computed_data_type(&single_plan.schema, expr)
+                    {
+                        if inferred_type != arrow::datatypes::DataType::Null {
+                            match expr {
+                                ScalarExpr::Literal(_)
+                                | ScalarExpr::Column(_)
+                                | ScalarExpr::Cast { .. } => {}
+                                _ => {
+                                    *expr = ScalarExpr::Cast {
+                                        expr: Box::new(expr.clone()),
+                                        data_type: inferred_type,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if force_manual_projection && has_aggregates {
             match &mut logical_plan {
                 LogicalPlan::Single(single) => {

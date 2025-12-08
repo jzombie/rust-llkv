@@ -122,6 +122,8 @@ pub fn infer_computed_data_type(
             let mut is_float = false;
             let mut is_decimal = false;
             let mut max_scale = 0;
+            let mut has_int = false;
+            let mut other_type = None;
 
             for (_, then_expr) in branches {
                 let dtype = infer_computed_data_type(schema, then_expr)?;
@@ -131,7 +133,11 @@ pub fn infer_computed_data_type(
                         is_decimal = true;
                         max_scale = max_scale.max(s);
                     }
-                    _ => {}
+                    DataType::Int64 => has_int = true,
+                    DataType::Null => {}
+                    t => {
+                        other_type = Some(t);
+                    }
                 }
             }
             if let Some(inner) = else_expr.as_deref() {
@@ -142,7 +148,11 @@ pub fn infer_computed_data_type(
                         is_decimal = true;
                         max_scale = max_scale.max(s);
                     }
-                    _ => {}
+                    DataType::Int64 => has_int = true,
+                    DataType::Null => {}
+                    t => {
+                        other_type = Some(t);
+                    }
                 }
             }
 
@@ -150,14 +160,20 @@ pub fn infer_computed_data_type(
                 Ok(DataType::Float64)
             } else if is_decimal {
                 Ok(DataType::Decimal128(38, max_scale))
-            } else {
+            } else if has_int {
                 Ok(DataType::Int64)
+            } else if let Some(t) = other_type {
+                Ok(t)
+            } else {
+                Ok(DataType::Null)
             }
         }
         ScalarExpr::Coalesce(items) => {
             let mut is_float = false;
             let mut is_decimal = false;
             let mut max_scale = 0;
+            let mut has_int = false;
+            let mut other_type = None;
 
             for item in items {
                 let dtype = infer_computed_data_type(schema, item)?;
@@ -167,7 +183,11 @@ pub fn infer_computed_data_type(
                         is_decimal = true;
                         max_scale = max_scale.max(s);
                     }
-                    _ => {}
+                    DataType::Int64 => has_int = true,
+                    DataType::Null => {}
+                    t => {
+                        other_type = Some(t);
+                    }
                 }
             }
 
@@ -175,8 +195,12 @@ pub fn infer_computed_data_type(
                 Ok(DataType::Float64)
             } else if is_decimal {
                 Ok(DataType::Decimal128(38, max_scale))
-            } else {
+            } else if has_int {
                 Ok(DataType::Int64)
+            } else if let Some(t) = other_type {
+                Ok(t)
+            } else {
+                Ok(DataType::Null)
             }
         }
         ScalarExpr::Random => Ok(DataType::Float64),
