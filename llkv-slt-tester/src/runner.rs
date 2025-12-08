@@ -313,8 +313,25 @@ impl LlkvSltRunner {
         // Execute all records with hash threshold and type hint handling
         let run_result = async {
             let mut current_hash_threshold: usize = 256;
+            let log_progress = std::env::var("LLKV_SLT_PROGRESS").is_ok();
+            let mut record_index: usize = 0;
 
             for record in records {
+                if log_progress {
+                    let preview = match &record {
+                        Record::Statement { sql, .. } => sql,
+                        Record::Query { sql, .. } => sql,
+                        _ => "<control>",
+                    };
+                    let single_line = preview.replace('\n', " ");
+                    let display = if single_line.len() > 80 {
+                        format!("{}...", &single_line[..80])
+                    } else {
+                        single_line
+                    };
+                    eprintln!("[llkv-slt] record {}: {}", record_index, display);
+                }
+
                 if let Record::Statement { expected, .. } = &record {
                     match expected {
                         StatementExpect::Error(_) => {
@@ -421,6 +438,8 @@ impl LlkvSltRunner {
                     current_hash_threshold = new_threshold;
                     runner.with_hash_threshold(new_threshold);
                 }
+
+                record_index += 1;
             }
 
             Ok::<(), sqllogictest::TestError>(())
@@ -812,6 +831,11 @@ where
     if stats_enabled {
         crate::slt_test_engine::enable_stats();
     }
+
+    // Default to fail-fast unless overridden by environment variable (e.g. in CI)
+    let fail_fast = std::env::var("LLKV_SLT_NO_FAIL_FAST").is_err();
+    let has_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let base = std::path::Path::new(slt_dir);
     let files = {
         let mut out = Vec::new();
@@ -853,13 +877,21 @@ where
         // Check if this is a .slturl pointer file
         let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
 
+        let has_failed = has_failed.clone();
         trials.push(Trial::test(name, move || {
+            if fail_fast && has_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                // Give the failing test a moment to print its error
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                eprintln!("Aborting remaining tests due to failure (fail-fast enabled).");
+                std::process::exit(1);
+            }
+
             let p = path_clone.clone();
             let fac = factory_factory_clone();
 
             // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
             // Default thread stack is ~2MB which is insufficient for complex SLT test queries
-            std::thread::Builder::new()
+            let res = std::thread::Builder::new()
                 .stack_size(SLT_HARNESS_STACK_SIZE)
                 .spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -904,7 +936,12 @@ where
                 })
                 .map_err(|e| Failed::from(format!("failed to spawn test thread: {e}")))?
                 .join()
-                .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?
+                .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?;
+
+            if res.is_err() && fail_fast {
+                has_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            res
         }));
     }
 
