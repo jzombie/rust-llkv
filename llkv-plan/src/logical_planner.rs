@@ -416,7 +416,13 @@ where
         }
 
         // Reorder tables using greedy algorithm to avoid cross joins
-        let table_pairs = reorder_tables_greedy(table_pairs, plan.filter.as_ref().map(|f| &f.predicate));
+        // Only reorder if there are no explicit joins, as explicit joins enforce a specific order
+        // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
+        let table_pairs = if plan.joins.is_empty() {
+            reorder_tables_greedy(table_pairs, plan.filter.as_ref().map(|f| &f.predicate))
+        } else {
+            table_pairs
+        };
 
         debug!("Planned tables order:");
         for (i, (table, table_ref)) in table_pairs.iter().enumerate() {

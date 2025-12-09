@@ -11596,23 +11596,7 @@ fn extract_tables(from: &[TableWithJoins]) -> SqlResult<ExtractedJoinData> {
     let mut join_filters = Vec::new();
 
     for item in from {
-        let prior_table_len = tables.len();
-        let prior_join_len = join_metadata.len();
-
         flatten_table_with_joins(item, &mut tables, &mut join_metadata, &mut join_filters)?;
-
-        let new_table_len = tables.len();
-        if prior_table_len > 0 && new_table_len > prior_table_len {
-            join_metadata.insert(
-                prior_join_len,
-                llkv_plan::JoinMetadata {
-                    left_table_index: prior_table_len - 1,
-                    join_type: llkv_plan::JoinPlan::Inner,
-                    on_condition: None,
-                },
-            );
-            join_filters.insert(prior_join_len, None);
-        }
     }
 
     Ok((tables, join_metadata, join_filters))
