@@ -80,8 +80,12 @@ where
             .saturating_sub(agg_count);
 
         if let Some(having_expr) = having_expr {
+            let mut name_to_index = FxHashMap::default();
+            for (i, field) in agg_schema.fields().iter().enumerate() {
+                name_to_index.insert(field.name().clone(), i);
+            }
             let having_expr_captured =
-                resolve_scalar_expr_string(&having_expr, &agg_schema, subquery_results)?;
+                resolve_scalar_expr_using_map(&having_expr, &name_to_index, subquery_results)?;
             let mut next_agg_idx = 0;
             let having_expr_rewritten = Self::rewrite_aggregate_refs(
                 having_expr_captured,
@@ -127,8 +131,13 @@ where
 
         let mut resolved_final_exprs = Vec::new();
 
+        let mut name_to_index = FxHashMap::default();
+        for (i, field) in agg_schema.fields().iter().enumerate() {
+            name_to_index.insert(field.name().clone(), i);
+        }
+
         for (expr_str, name) in final_exprs.iter().zip(final_names.iter()) {
-            let expr = resolve_scalar_expr_string(expr_str, &agg_schema, subquery_results)?;
+            let expr = resolve_scalar_expr_using_map(expr_str, &name_to_index, subquery_results)?;
             let mut next_agg_idx = 0;
             let rewritten = Self::rewrite_aggregate_refs(
                 expr,
@@ -204,7 +213,7 @@ use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
 use llkv_column_map::store::Projection;
 use llkv_compute::eval::ScalarEvaluator;
 use llkv_expr::AggregateCall;
-use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr, SubqueryId};
+use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr, SubqueryId, Mappable};
 use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, Expr, Filter, InList, Operator};
 use llkv_join::JoinType;
@@ -3669,11 +3678,13 @@ where
                         simple_mapping.insert((0, i as u32), i);
                     }
 
+                    let name_to_index = build_qualified_name_map(&current_schema, &col_mapping, multi);
+
                     let mut pre_agg_schema_fields: Vec<ArrowField> = Vec::new();
                     for (i, expr_str) in rewrite.pre_aggregate_expressions.iter().enumerate() {
-                        let resolved = resolve_scalar_expr_string(
+                        let resolved = resolve_scalar_expr_using_map(
                             expr_str,
-                            &current_schema,
+                            &name_to_index,
                             &subquery_results,
                         )?;
                         let dt = infer_type(&resolved, &current_schema, &simple_mapping)
@@ -3697,7 +3708,18 @@ where
                                 Error::Internal("GROUP BY column not found in join output".into())
                             })?;
                         group_key_batch_indices.push(idx);
-                        pre_agg_schema_fields.push(current_schema.field(idx).clone());
+
+                        let mut field = current_schema.field(idx).clone();
+                        if let Some(table_ref) = multi.table_order.get(key.table_index) {
+                            if let Some(table_info) = multi.tables.get(key.table_index) {
+                                if let Some(col) = table_info.schema.columns.iter().find(|c| c.field_id == key.logical_field_id.field_id()) {
+                                    let qualified_name = format!("{}.{}", table_ref.display_name().to_ascii_lowercase(), col.name.to_ascii_lowercase());
+                                    field = ArrowField::new(qualified_name, field.data_type().clone(), field.is_nullable())
+                                        .with_metadata(field.metadata().clone());
+                                }
+                            }
+                        }
+                        pre_agg_schema_fields.push(field);
                     }
 
                     let group_key_indices: Vec<usize> = (0..group_key_batch_indices.len())
@@ -3706,10 +3728,11 @@ where
 
                     let pre_agg_schema = Arc::new(Schema::new(pre_agg_schema_fields));
                     let pre_agg_schema_captured = pre_agg_schema.clone();
-                    let current_schema_captured = current_schema.clone();
+                    let _current_schema_captured = current_schema.clone();
                     let subquery_results_captured = subquery_results.clone();
                     let pre_agg_exprs = rewrite.pre_aggregate_expressions.clone();
                     let group_key_batch_indices_captured = group_key_batch_indices.clone();
+                    let name_to_index_captured = name_to_index.clone();
 
                     let pre_agg_stream = current_stream.map(move |batch_res| {
                         let batch = batch_res?;
@@ -3725,9 +3748,9 @@ where
                         );
 
                         for expr_str in &pre_agg_exprs {
-                            let expr = resolve_scalar_expr_string(
+                            let expr = resolve_scalar_expr_using_map(
                                 expr_str,
-                                &current_schema_captured,
+                                &name_to_index_captured,
                                 &subquery_results_captured,
                             )?;
                             let result = ScalarEvaluator::evaluate_batch_simplified(
@@ -4883,6 +4906,37 @@ where
     }
 }
 
+fn resolve_scalar_expr_using_map(
+    expr: &ScalarExpr<String>,
+    name_to_index: &FxHashMap<String, usize>,
+    subquery_results: &FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
+) -> Result<ScalarExpr<(usize, FieldId)>, Error> {
+    let mut resolver = |name: String| -> Result<(usize, FieldId), Error> {
+        let idx = *name_to_index.get(&name).ok_or_else(|| {
+            let mut available: Vec<&String> = name_to_index.keys().collect();
+            available.sort();
+            Error::InvalidArgumentError(format!(
+                "Column not found: {name}. Available columns: {:?}",
+                available
+            ))
+        })?;
+        Ok((0, idx as u32))
+    };
+
+    expr.clone().try_map(&mut resolver)
+    .map(|e| match e {
+        ScalarExpr::ScalarSubquery(s) => {
+            if let Some(lit) = subquery_results.get(&s.id) {
+                ScalarExpr::Literal(lit.clone())
+            } else {
+                ScalarExpr::ScalarSubquery(s)
+            }
+        }
+        _ => e,
+    })
+}
+
+#[allow(dead_code)]
 fn resolve_scalar_expr_string(
     expr: &ScalarExpr<String>,
     schema: &Schema,
@@ -4986,6 +5040,47 @@ fn resolve_scalar_expr_string(
         }
         ScalarExpr::Random => Ok(ScalarExpr::Random),
     }
+}
+
+fn build_qualified_name_map<P>(
+    current_schema: &Schema,
+    col_mapping: &FxHashMap<(usize, FieldId), usize>,
+    multi: &llkv_plan::logical_planner::MultiTableLogicalPlan<P>,
+) -> FxHashMap<String, usize>
+where
+    P: llkv_storage::pager::Pager<Blob = simd_r_drive_entry_handle::EntryHandle> + Send + Sync,
+{
+    let mut name_to_index = FxHashMap::default();
+    let mut index_to_source = FxHashMap::default();
+
+    for ((table_idx, field_id), col_idx) in col_mapping {
+        index_to_source.insert(*col_idx, (*table_idx, *field_id));
+    }
+
+    for (i, field) in current_schema.fields().iter().enumerate() {
+        name_to_index.insert(field.name().clone(), i);
+
+        if let Some((table_idx, field_id)) = index_to_source.get(&i) {
+            if let Some(table_ref) = multi.table_order.get(*table_idx) {
+                let table_name = table_ref
+                    .alias
+                    .as_ref()
+                    .unwrap_or(&table_ref.table);
+                if let Some(planned_table) = multi.tables.get(*table_idx) {
+                    if let Some(col) = planned_table
+                        .schema
+                        .columns
+                        .iter()
+                        .find(|c| c.field_id == *field_id)
+                    {
+                        let qualified = format!("{}.{}", table_name, col.name);
+                        name_to_index.insert(qualified, i);
+                    }
+                }
+            }
+        }
+    }
+    name_to_index
 }
 
 fn infer_type(
