@@ -26,6 +26,8 @@ where
     fn table_id(&self) -> TableId;
     fn schema(&self) -> &PlanSchema;
 
+    fn approximate_row_count(&self) -> Option<usize>;
+
     fn scan_stream(
         &self,
         projections: &[ScanProjection],

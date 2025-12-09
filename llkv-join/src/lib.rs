@@ -7,9 +7,11 @@
 #![forbid(unsafe_code)]
 
 mod hash_join;
-pub mod vectorized;
 
 use arrow::array::ArrayRef;
+use arrow::array::BooleanArray;
+use arrow::record_batch::RecordBatch;
+
 use llkv_column_map::gather::{
     gather_optional_projected_indices_from_batches, gather_projected_indices_from_batches,
 };
@@ -18,9 +20,13 @@ use llkv_storage::pager::Pager;
 use llkv_table::table::{RowIdFilter, Table};
 use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
+use std::collections::HashSet;
 use std::fmt;
 
-pub use hash_join::hash_join_rowid_stream;
+pub use hash_join::{hash_join_rowid_stream, HashJoinStream};
+
+/// Filter function for joins.
+pub type JoinFilter = Box<dyn Fn(&RecordBatch) -> LlkvResult<BooleanArray> + Send + Sync>;
 
 /// Type of join to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -268,15 +274,22 @@ impl JoinOptions {
     }
 }
 
-// TODO: Build out more fully or remove
-// NOTE: Validation presently only asserts that zero keys implies a Cartesian
-// join. Extend this once the planner provides richer metadata about key
-// compatibility (equality types, null semantics, etc.).
 /// Validate join keys before execution.
 ///
-/// Note: Empty keys = cross product (Cartesian product).
-pub fn validate_join_keys(_keys: &[JoinKey]) -> LlkvResult<()> {
-    // Empty keys is valid for cross product
+/// Checks:
+/// - Keys are not empty (unless cross join is intended, but usually handled by planner).
+/// - No duplicate keys (same left and right field).
+pub fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
+    // Note: Empty keys are valid for cross product, so we don't error on empty.
+    
+    let mut seen = HashSet::new();
+    for key in keys {
+        if !seen.insert((key.left_field, key.right_field)) {
+             return Err(Error::InvalidArgumentError(format!(
+                 "Duplicate join key: left={}, right={}", key.left_field, key.right_field
+             )));
+        }
+    }
     Ok(())
 }
 
@@ -426,6 +439,9 @@ mod tests {
 
         let keys = vec![JoinKey::new(1, 2)];
         assert!(validate_join_keys(&keys).is_ok());
+        
+        let dup_keys = vec![JoinKey::new(1, 2), JoinKey::new(1, 2)];
+        assert!(validate_join_keys(&dup_keys).is_err());
     }
 
     #[test]

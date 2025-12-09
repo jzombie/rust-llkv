@@ -246,7 +246,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::ExecutorResult;
 use crate::types::{ExecutorTable, ExecutorTableProvider};
-use llkv_join::vectorized::VectorizedHashJoinStream;
+use llkv_join::HashJoinStream;
 
 pub type BatchIter = Box<dyn Iterator<Item = ExecutorResult<RecordBatch>> + Send>;
 /// Plan-driven SELECT executor bridging planner output to storage.
@@ -2601,7 +2601,7 @@ where
                 llkv_plan::plans::JoinPlan::Full => JoinType::Full,
             };
 
-            let stream = VectorizedHashJoinStream::try_new(
+            let stream = HashJoinStream::try_new(
                 join.schema.clone(),
                 left_stream,
                 right_batch,
@@ -3529,7 +3529,7 @@ where
                     }
                     pending_filters = remaining;
 
-                    let join_filter: Option<llkv_join::vectorized::JoinFilter> = if !applicable.is_empty() {
+                    let join_filter: Option<llkv_join::JoinFilter> = if !applicable.is_empty() {
                         let combined = combine_clauses(applicable).unwrap();
                         let mapped_expr = remap_filter_expr(&combined)?;
                         let mapping = temp_col_mapping.clone();
@@ -3559,7 +3559,7 @@ where
                         None
                     };
 
-                    current_stream = Box::new(VectorizedHashJoinStream::try_new(
+                    current_stream = Box::new(HashJoinStream::try_new(
                         new_schema.clone(),
                         current_stream,
                         right_batch,
@@ -4806,6 +4806,8 @@ fn collect_join_predicates(
                             right_field: right_col.logical_field_id.field_id(),
                         });
                         return Ok(());
+                    } else {
+                        println!("DEBUG: Indices mismatch: left_col.table_index={} <= left_table_index={} is {}", left_col.table_index, left_table_index, left_col.table_index <= left_table_index);
                     }
                 }
             }
@@ -4883,6 +4885,10 @@ where
 
     fn table_id(&self) -> llkv_types::ids::TableId {
         self.table.table_id()
+    }
+
+    fn approximate_row_count(&self) -> Option<usize> {
+        self.table.table.total_rows().ok().map(|n| n as usize)
     }
 
     fn scan_stream(

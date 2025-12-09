@@ -17,6 +17,7 @@ use llkv_storage::pager::Pager;
 use llkv_types::{FieldId, LogicalFieldId, TableId};
 use rustc_hash::FxHashSet;
 use simd_r_drive_entry_handle::EntryHandle;
+use tracing::debug;
 
 use crate::aggregate_rewrite::{
     AggregateRewrite, build_single_aggregate_rewrite, expr_to_scalar_expr,
@@ -123,6 +124,20 @@ where
     pub schema: Arc<PlanSchema>,
 }
 
+impl<P> Clone for PlannedTable<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            table_id: self.table_id,
+            table: self.table.clone(),
+            schema: self.schema.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedColumn {
     pub original: String,
@@ -207,12 +222,10 @@ where
     }
 
     pub fn create_logical_plan(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
-        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-            eprintln!("create_logical_plan tables len: {}", plan.tables.len());
-            eprintln!("create_logical_plan projections len: {}", plan.projections.len());
-            if !plan.projections.is_empty() {
-                eprintln!("create_logical_plan first projection: {:?}", plan.projections[0]);
-            }
+        debug!("create_logical_plan tables len: {}", plan.tables.len());
+        debug!("create_logical_plan projections len: {}", plan.projections.len());
+        if !plan.projections.is_empty() {
+            debug!("create_logical_plan first projection: {:?}", plan.projections[0]);
         }
         if plan.tables.len() != 1 {
             return self.plan_multi_table(plan);
@@ -340,17 +353,13 @@ where
 
         let filter = match &plan.filter {
             Some(filter) => {
-                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                    eprintln!("LogicalPlan filter input: {:?}", filter.predicate);
-                }
+                debug!("LogicalPlan filter input: {:?}", filter.predicate);
                 let translated = translate_predicate(
                     filter.predicate.clone(),
                     schema,
                     |_| Error::Internal("Unknown column".to_string()),
                 )?;
-                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                    eprintln!("LogicalPlan filter translated: {:?}", translated);
-                }
+                debug!("LogicalPlan filter translated: {:?}", translated);
                 Some(translated)
             },
             None => None,
@@ -386,7 +395,7 @@ where
     }
 
     fn plan_multi_table(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
-        let mut planned_tables = Vec::with_capacity(plan.tables.len());
+        let mut table_pairs = Vec::with_capacity(plan.tables.len());
         for table_ref in &plan.tables {
             let table_name = table_ref.qualified_name();
             let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
@@ -394,20 +403,31 @@ where
             let schema = table.schema();
             let plan_schema = Arc::new(schema.clone());
 
-            planned_tables.push(PlannedTable {
+            let planned = PlannedTable {
                 name: table_name,
                 table_id,
                 table,
                 schema: plan_schema,
-            });
+            };
+            table_pairs.push((planned, table_ref.clone()));
         }
 
+        // Reorder tables using greedy algorithm to avoid cross joins
+        let table_pairs = reorder_tables_greedy(table_pairs, plan.filter.as_ref().map(|f| &f.predicate));
+
+        debug!("Planned tables order:");
+        for (i, (table, table_ref)) in table_pairs.iter().enumerate() {
+            debug!("  {}: {} (rows: {:?})", i, table_ref.table, table.table.approximate_row_count());
+        }
+
+        let (planned_tables, ordered_table_refs): (Vec<_>, Vec<_>) = table_pairs.into_iter().unzip();
+
         let (resolved_columns, unresolved_required) =
-            resolve_required_columns(plan, &planned_tables);
+            resolve_required_columns(plan, &planned_tables, &ordered_table_refs);
 
         let ctx = ResolutionContext {
             tables: &planned_tables,
-            table_refs: &plan.tables,
+            table_refs: &ordered_table_refs,
         };
 
         let filter = match &plan.filter {
@@ -436,7 +456,7 @@ where
 
         Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
             tables: planned_tables,
-            table_order: plan.tables.clone(),
+            table_order: ordered_table_refs,
             table_filters,
             filter: residual_filter.or_else(|| filter.clone()),
             original_filter: plan.filter.as_ref().map(|f| f.predicate.clone()),
@@ -574,9 +594,7 @@ where
     for proj in projections {
         match proj {
             crate::plans::SelectProjection::AllColumns => {
-                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                    eprintln!("build_multi_projection_exprs: processing AllColumns, tables len: {}", ctx.tables.len());
-                }
+                debug!("build_multi_projection_exprs: processing AllColumns, tables len: {}", ctx.tables.len());
                 for table in ctx.tables.iter() {
                     for col in &table.schema.columns {
                         out.push((ScalarExpr::Column(col.name.clone()), col.name.clone()));
@@ -828,6 +846,7 @@ fn collect_required_columns(plan: &SelectPlan) -> Vec<String> {
 fn resolve_required_columns<P>(
     plan: &SelectPlan,
     tables: &[PlannedTable<P>],
+    table_refs: &[TableRef],
 ) -> (Vec<ResolvedColumn>, Vec<String>)
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -841,7 +860,7 @@ where
         let mut candidates = Vec::new();
 
         for (idx, table) in tables.iter().enumerate() {
-            let Some(table_ref) = plan.tables.get(idx) else {
+            let Some(table_ref) = table_refs.get(idx) else {
                 continue;
             };
             let table_lower = table_ref.table.to_ascii_lowercase();
@@ -1163,14 +1182,10 @@ where
         plan.projections.clone()
     };
 
-    if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-        eprintln!("resolve_projections: input len: {}", projections.len());
-    }
+    debug!("resolve_projections: input len: {}", projections.len());
 
     for proj in projections {
-        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-            eprintln!("resolve_projections: processing proj variant: {:?}", proj);
-        }
+        debug!("resolve_projections: processing proj variant: {:?}", proj);
         match proj {
             crate::plans::SelectProjection::AllColumns => {
                 for (table_idx, table) in ctx.tables.iter().enumerate() {
@@ -1218,9 +1233,7 @@ where
                 });
             }
             crate::plans::SelectProjection::Computed { expr, alias } => {
-                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                    eprintln!("resolve_projections: pushing Computed alias={}", alias);
-                }
+                debug!("resolve_projections: pushing Computed alias={}", alias);
                 out.push(ResolvedProjection::Computed {
                     expr: resolve_scalar_expr(ctx, &expr)?,
                     alias,
@@ -1342,23 +1355,38 @@ fn attach_implicit_joins(
         return;
     }
 
-    let existing: FxHashSet<usize> = joins.iter().map(|j| j.left_table_index).collect();
-
     for left_table_index in 0..(table_count - 1) {
-        if existing.contains(&left_table_index) {
-            continue;
-        }
-
         let left_tables: FxHashSet<usize> = (0..=left_table_index).collect();
         let derived_keys = derive_filter_join_keys(filter, &left_tables, left_table_index + 1);
-        let on = build_join_predicate(&derived_keys);
+        
+        debug!("attach_implicit_joins: left_table_index={}, right_table={}, keys={:?}", left_table_index, left_table_index + 1, derived_keys);
 
-        joins.push(ResolvedJoin {
-            left_table_index,
-            join_type: crate::plans::JoinPlan::Inner,
-            on,
-            original_on: None,
-        });
+        let derived_on = build_join_predicate(&derived_keys);
+
+        if let Some(existing_join) = joins
+            .iter_mut()
+            .find(|j| j.left_table_index == left_table_index)
+        {
+            let is_cross = match &existing_join.on {
+                None => true,
+                Some(Expr::Literal(true)) => true,
+                _ => false,
+            };
+
+            if is_cross {
+                if let Some(new_on) = derived_on {
+                    existing_join.on = Some(new_on);
+                    existing_join.join_type = crate::plans::JoinPlan::Inner;
+                }
+            }
+        } else {
+            joins.push(ResolvedJoin {
+                left_table_index,
+                join_type: crate::plans::JoinPlan::Inner,
+                on: derived_on,
+                original_on: None,
+            });
+        }
     }
 
     joins.sort_by_key(|j| j.left_table_index);
@@ -1639,5 +1667,187 @@ mod tests {
 
         assert_eq!(joins.len(), 1);
         assert!(joins[0].on.is_none());
+    }
+}
+
+fn reorder_tables_greedy<P>(
+    tables: Vec<(PlannedTable<P>, TableRef)>,
+    filter: Option<&Expr<'static, String>>,
+) -> Vec<(PlannedTable<P>, TableRef)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if tables.is_empty() {
+        return tables;
+    }
+
+    // 1. Build Adjacency Graph
+    let mut adj = vec![FxHashSet::default(); tables.len()];
+    if let Some(expr) = filter {
+        build_join_graph(expr, &tables, &mut adj);
+    }
+
+    debug!("Join Graph Adjacency:");
+    for (i, neighbors) in adj.iter().enumerate() {
+        debug!("  Table {}: {:?}", i, neighbors);
+    }
+
+    // 2. Greedy Selection
+    let mut ordered_indices = Vec::with_capacity(tables.len());
+    let mut remaining: FxHashSet<usize> = (0..tables.len()).collect();
+    let mut connected_to_ordered: FxHashSet<usize> = FxHashSet::default();
+
+    // Start with the largest table
+    let first_idx = find_largest_table(&tables, &remaining);
+    move_table(first_idx, &mut remaining, &mut ordered_indices, &mut connected_to_ordered, &adj);
+
+    while !remaining.is_empty() {
+        // Find candidates that are connected to the already ordered tables
+        let candidates: Vec<usize> = remaining.iter().cloned()
+            .filter(|idx| connected_to_ordered.contains(idx))
+            .collect();
+
+        let next_idx = if !candidates.is_empty() {
+            // Pick the largest connected table
+            find_largest_table_in_candidates(&tables, &candidates)
+        } else {
+            // No connected table (Cross Join or Disjoint). Pick largest remaining.
+            find_largest_table(&tables, &remaining)
+        };
+
+        move_table(next_idx, &mut remaining, &mut ordered_indices, &mut connected_to_ordered, &adj);
+    }
+
+    // Reconstruct the vector in the new order
+    let mut result = Vec::with_capacity(tables.len());
+    for idx in ordered_indices {
+        result.push(tables[idx].clone());
+    }
+    
+    result
+}
+
+fn move_table(
+    idx: usize,
+    remaining: &mut FxHashSet<usize>,
+    ordered: &mut Vec<usize>,
+    connected_to_ordered: &mut FxHashSet<usize>,
+    adj: &[FxHashSet<usize>],
+) {
+    remaining.remove(&idx);
+    ordered.push(idx);
+    for &neighbor in &adj[idx] {
+        if remaining.contains(&neighbor) {
+            connected_to_ordered.insert(neighbor);
+        }
+    }
+}
+
+fn find_largest_table<P>(
+    tables: &[(PlannedTable<P>, TableRef)],
+    candidates: &FxHashSet<usize>,
+) -> usize 
+where P: Pager<Blob = EntryHandle> + Send + Sync
+{
+    candidates.iter().cloned().max_by(|&a, &b| {
+        let count_a = tables[a].0.table.approximate_row_count().unwrap_or(0);
+        let count_b = tables[b].0.table.approximate_row_count().unwrap_or(0);
+        count_a.cmp(&count_b)
+    }).unwrap()
+}
+
+fn find_largest_table_in_candidates<P>(
+    tables: &[(PlannedTable<P>, TableRef)],
+    candidates: &[usize],
+) -> usize 
+where P: Pager<Blob = EntryHandle> + Send + Sync
+{
+    candidates.iter().cloned().max_by(|&a, &b| {
+        let count_a = tables[a].0.table.approximate_row_count().unwrap_or(0);
+        let count_b = tables[b].0.table.approximate_row_count().unwrap_or(0);
+        count_a.cmp(&count_b)
+    }).unwrap()
+}
+
+fn build_join_graph<P>(
+    expr: &Expr<'static, String>,
+    tables: &[(PlannedTable<P>, TableRef)],
+    adj: &mut Vec<FxHashSet<usize>>,
+) 
+where P: Pager<Blob = EntryHandle> + Send + Sync
+{
+    match expr {
+        Expr::Compare { left, op, right } => {
+            if matches!(op, CompareOp::Eq) {
+                if let (Some(t1), Some(t2)) = (resolve_table_idx(left, tables), resolve_table_idx(right, tables)) {
+                    if t1 != t2 {
+                        adj[t1].insert(t2);
+                        adj[t2].insert(t1);
+                    }
+                }
+            }
+        }
+        Expr::And(list) => {
+            for e in list {
+                build_join_graph(e, tables, adj);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_table_idx<P>(
+    expr: &ScalarExpr<String>,
+    tables: &[(PlannedTable<P>, TableRef)],
+) -> Option<usize>
+where P: Pager<Blob = EntryHandle> + Send + Sync
+{
+    match expr {
+        ScalarExpr::Column(name) => {
+            let parts: Vec<&str> = name.split('.').collect();
+            let mut candidates = Vec::new();
+            
+            for (idx, (table, table_ref)) in tables.iter().enumerate() {
+                let table_lower = table_ref.table.to_ascii_lowercase();
+                let schema_lower = table_ref.schema.to_ascii_lowercase();
+                let qualified_lower = if schema_lower.is_empty() {
+                    table_lower.clone()
+                } else {
+                    format!("{}.{}", schema_lower, table_lower)
+                };
+                let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+
+                if parts.len() > 1 {
+                    let qualifier = parts[0].to_ascii_lowercase();
+                    let qualifier_matches_alias = alias_lower
+                        .as_ref()
+                        .is_some_and(|alias| qualifier == *alias);
+                    let qualifier_matches_table = alias_lower.is_none()
+                        && (qualifier == qualified_lower
+                            || qualifier == table_lower
+                            || (!schema_lower.is_empty() && qualifier == schema_lower));
+                    
+                    if qualifier_matches_alias || qualifier_matches_table {
+                         // Check if column exists in table schema
+                         let col_name = parts[1..].join(".");
+                         if table.schema.column_by_name(&col_name).is_some() {
+                             candidates.push(idx);
+                         }
+                    }
+                } else {
+                    // Unqualified column name
+                    if table.schema.column_by_name(name).is_some() {
+                        candidates.push(idx);
+                    }
+                }
+            }
+            
+            if candidates.len() == 1 {
+                Some(candidates[0])
+            } else {
+                None
+            }
+        }
+        _ => None
     }
 }

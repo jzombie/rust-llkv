@@ -1755,6 +1755,7 @@ dependencies = [
  "sqlparser",
  "thiserror",
  "time",
+ "tracing",
 ]
 
 [[package]]
