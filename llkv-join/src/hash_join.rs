@@ -525,7 +525,7 @@ impl HashJoinStream {
             .map(|&i| SortField::new(right_batch.schema().field(i).data_type().clone()))
             .collect();
         
-        let mut build_converter = RowConverter::new(build_fields.clone())
+        let build_converter = RowConverter::new(build_fields.clone())
             .map_err(|e| Error::Internal(e.to_string()))?;
             
         let build_columns: Vec<_> = right_indices
@@ -661,12 +661,6 @@ impl Iterator for HashJoinStream {
                                 left_builder.append_value(current_idx as u64);
                                 right_builder.append_value(build_row_idx as u64);
                                 rows_produced += 1;
-                                if rows_produced >= self.target_batch_size {
-                                    break; // Break inner loop, but we might need to resume THIS row if we had many matches? 
-                                           // Actually, for simplicity, let's finish the current row fully.
-                                           // If a single row explodes to > target_batch_size, we just yield a larger batch.
-                                           // This avoids complex state of "which match index are we at".
-                                }
                             }
                         }
                     }
