@@ -433,25 +433,10 @@ where
     ///
     /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn total_rows_for_field(&self, field_id: LogicalFieldId) -> Result<u64> {
-        let catalog = self.catalog.read().unwrap();
-        let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
-        drop(catalog);
-
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: desc_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
-
-        let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        Ok(desc.total_row_count)
+        let counts = self.batch_total_rows_for_fields(&[field_id])?;
+        counts[0].ok_or(Error::NotFound)
     }
 
-    // TODO: Return Result<Vec<Option<usize>>> instead?
     /// Get the total number of rows for multiple fields in a batch.
     ///
     /// Returns a vector of options, where `Some(count)` is the row count for the corresponding
@@ -488,7 +473,6 @@ where
         Ok(out)
     }
 
-    // TODO: Return Result<usize> instead?
     /// Get the total number of rows in a table.
     ///
     /// This returns the maximum row count across all user-data columns in the table.
@@ -516,14 +500,10 @@ where
             return Ok(0);
         }
 
+        let counts = self.batch_total_rows_for_fields(&candidates)?;
+
         // Return the maximum total_row_count across all user columns for the table.
-        let mut max_rows: u64 = 0;
-        for field in candidates {
-            let rows = self.total_rows_for_field(field)?;
-            if rows > max_rows {
-                max_rows = rows;
-            }
-        }
+        let max_rows = counts.into_iter().flatten().max().unwrap_or(0);
         Ok(max_rows)
     }
 
