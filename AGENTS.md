@@ -13,6 +13,7 @@ Use this guide as the first stop before making changes. It ties together the rep
 - When planning a feature, identify the lowest crate that owns the responsibility, keep dependencies acyclic, and update linkage docs if architecture changes.
 - Clean up comment style in touched modules and ensure any examples stay runnable with `cargo test --doc` when added.
 
-## Quick SQL Debugging
+## SQL Testing and Debugging
 
-Compile and run [llkv/src/main.rs](llkv/src/main.rs), sending the SQL via STDIN.
+- For quick SQL scripts: Compile and run [llkv/src/main.rs](llkv/src/main.rs), sending the SQL via STDIN.
+- For SLT testing, it is often helpful to use the full relative path (e.g. `cargo test --package llkv-slt-tester --test slturl_test -- slt/sqlite/random/groupby/slt_good_8.slturl`) instead of the filename (e.g. `slt_good_8.slturl`).
