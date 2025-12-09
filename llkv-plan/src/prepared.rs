@@ -10,6 +10,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::aggregate_rewrite::build_single_aggregate_rewrite;
 use crate::logical_planner::{
     build_multi_aggregate_rewrite, LogicalPlan, LogicalPlanner, ResolutionContext,
+    TableResolutionInfo,
 };
 // use crate::planner::PhysicalPlanner;
 use crate::plans::{
@@ -211,6 +212,7 @@ where
         mut plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> Result<PreparedSelectPlan<P>> {
+        let start = std::time::Instant::now();
         // Simplify projection expressions to remove dead code (e.g. NULLIF(NULL, col))
         for proj in &mut plan.projections {
             if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
@@ -222,7 +224,9 @@ where
         if let Some(having) = &mut plan.having {
             *having = simplify_expr(having.clone());
         }
+        let t_simplify = start.elapsed();
 
+        let start_sub = std::time::Instant::now();
         let prepared_scalar_subqueries = self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
 
         let filter_subqueries = plan
@@ -237,6 +241,7 @@ where
             .as_ref()
             .map(|c| self.prepare_compound(c, row_filter.clone()))
             .transpose()?;
+        let t_subqueries = start_sub.elapsed();
 
         // Simplify WHERE clause
         if let Some(filter) = &mut plan.filter {
@@ -303,8 +308,11 @@ where
             plan_for_execution.clone()
         };
 
+        let start_logical = std::time::Instant::now();
         let mut logical_plan = self.logical_planner.create_logical_plan(&plan_for_scan)?;
+        let t_logical = start_logical.elapsed();
 
+        let start_inference = std::time::Instant::now();
         // Ensure the expression output type matches the inferred schema type.
         // This is necessary because some expressions (like CASE) might evaluate to an untyped NullArray
         // even if the schema inference determined a specific type (e.g. Int64).
@@ -332,7 +340,9 @@ where
                 }
             }
         }
+        let t_inference = start_inference.elapsed();
 
+        let start_rewrite = std::time::Instant::now();
         if force_manual_projection && has_aggregates {
             match &mut logical_plan {
                 LogicalPlan::Single(single) => {
@@ -343,14 +353,37 @@ where
                         build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
                 }
                 LogicalPlan::Multi(multi) => {
+                    let mut infos = Vec::with_capacity(multi.tables.len());
+                    for table_ref in &plan_for_execution.tables {
+                        let table_lower = table_ref.table.to_ascii_lowercase();
+                        let schema_lower = table_ref.schema.to_ascii_lowercase();
+                        let qualified_lower = if schema_lower.is_empty() {
+                            table_lower.clone()
+                        } else {
+                            format!("{}.{}", schema_lower, table_lower)
+                        };
+                        let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+                        infos.push(TableResolutionInfo {
+                            table_lower,
+                            schema_lower,
+                            qualified_lower,
+                            alias_lower,
+                        });
+                    }
+
                     let ctx = ResolutionContext {
                         tables: &multi.tables,
-                        table_refs: &plan_for_execution.tables,
+                        infos: &infos,
                     };
                     multi.aggregate_rewrite =
                         build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
                 }
             }
+        }
+        let t_rewrite = start_rewrite.elapsed();
+
+        if start.elapsed() > std::time::Duration::from_millis(10) {
+            eprintln!("Slow prepare_select breakdown: Simplify: {:?}, Subqueries: {:?}, Logical: {:?}, Inference: {:?}, Rewrite: {:?}", t_simplify, t_subqueries, t_logical, t_inference, t_rewrite);
         }
 
         // let physical_plan = Some(

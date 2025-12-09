@@ -1081,9 +1081,12 @@ impl SqlEngine {
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
+        let start_preprocess = std::time::Instant::now();
         // Preprocess SQL
         let processed_sql = Self::preprocess_sql_input(sql);
+        let preprocess_duration = start_preprocess.elapsed();
 
+        let start_parse = std::time::Instant::now();
         let dialect = GenericDialect {};
         let statements = match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
             Ok(stmts) => stmts,
@@ -1104,6 +1107,12 @@ impl SqlEngine {
                 }
             }
         };
+        let parse_duration = start_parse.elapsed();
+
+        if preprocess_duration.as_millis() > 5 || parse_duration.as_millis() > 5 {
+             println!("Slow parse/preprocess: Preprocess: {:?} | Parse: {:?}", preprocess_duration, parse_duration);
+        }
+
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements.iter() {
             let statement_expectation = next_statement_expectation();
@@ -1127,7 +1136,12 @@ impl SqlEngine {
                 _ => {
                     // Flush before any non-INSERT
                     let mut flushed = self.flush_buffer_results()?;
+                    let start_exec_stmt = std::time::Instant::now();
                     let current = self.execute_statement(statement.clone())?;
+                    let exec_stmt_duration = start_exec_stmt.elapsed();
+                    if exec_stmt_duration.as_millis() > 10 {
+                        println!("Slow execute_statement: {:?}", exec_stmt_duration);
+                    }
                     results.push(current);
                     results.append(&mut flushed);
                 }
@@ -5104,8 +5118,20 @@ impl SqlEngine {
             return Ok(result);
         }
 
+        let start_build = std::time::Instant::now();
         let select_plan = self.build_select_plan(query)?;
-        self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)))
+        let build_duration = start_build.elapsed();
+        if build_duration.as_millis() > 10 {
+            println!("Slow build_select_plan: {:?}", build_duration);
+        }
+
+        let start_exec_plan = std::time::Instant::now();
+        let res = self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)));
+        let exec_plan_duration = start_exec_plan.elapsed();
+        if exec_plan_duration.as_millis() > 10 {
+            println!("Slow execute_plan_statement: {:?}", exec_plan_duration);
+        }
+        res
     }
 
     fn try_execute_simple_view_select(

@@ -2266,11 +2266,21 @@ where
         plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
+        let start_prepare = std::time::Instant::now();
         let prepared = self
             .planner
             .prepare_select(plan, row_filter)
             .map_err(Error::from)?;
-        self.execute_prepared_select(&prepared)
+        if start_prepare.elapsed().as_millis() > 5 {
+             println!("Slow prepare_select: {:?}", start_prepare.elapsed());
+        }
+
+        let start_exec_prepared = std::time::Instant::now();
+        let result = self.execute_prepared_select(&prepared);
+        if start_exec_prepared.elapsed().as_millis() > 5 {
+             println!("Slow execute_prepared_select: {:?}", start_exec_prepared.elapsed());
+        }
+        result
     }
 
     pub fn execute_prepared_select(

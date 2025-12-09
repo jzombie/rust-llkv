@@ -373,11 +373,12 @@ impl AsyncDB for EngineHarness {
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         tracing::debug!("[HARNESS] run() called, sql=\"{}\"", sql.trim());
-        let start = std::time::Instant::now();
+        let start_plan = std::time::Instant::now();
         match self.engine.execute(sql) {
             Ok(mut results) => {
+                let plan_duration = start_plan.elapsed();
                 if results.is_empty() {
-                    let duration = start.elapsed();
+                    let duration = start_plan.elapsed();
                     record_statement(sql, duration, "EMPTY");
                     return Ok(DBOutput::StatementComplete(0));
                 }
@@ -395,7 +396,15 @@ impl AsyncDB for EngineHarness {
                 }
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
+                        let start_exec = std::time::Instant::now();
                         let batches = execution.collect()?;
+                        let exec_duration = start_exec.elapsed();
+
+                        if plan_duration.as_millis() > 10 || exec_duration.as_millis() > 10 {
+                            println!("Slow query: {} | Plan: {:?} | Exec: {:?}", sql.trim().lines().next().unwrap_or(""), plan_duration, exec_duration);
+                        }
+                        record_query(sql, plan_duration + exec_duration, "SELECT");
+
                         let mut expected_types = expectations::take();
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
@@ -603,12 +612,10 @@ impl AsyncDB for EngineHarness {
                             );
                         }
 
-                        let duration = start.elapsed();
-                        record_query(sql, duration, "SELECT");
                         Ok(DBOutput::Rows { types, rows })
                     }
                     RuntimeStatementResult::Insert { rows_inserted, .. } => {
-                        let duration = start.elapsed();
+                        let duration = start_plan.elapsed();
                         record_statement(sql, duration, "INSERT");
                         if in_query_context {
                             let types = expectations::take()
@@ -622,7 +629,7 @@ impl AsyncDB for EngineHarness {
                         }
                     }
                     RuntimeStatementResult::Update { rows_updated, .. } => {
-                        let duration = start.elapsed();
+                        let duration = start_plan.elapsed();
                         record_statement(sql, duration, "UPDATE");
                         if in_query_context {
                             let types = expectations::take()
@@ -636,7 +643,7 @@ impl AsyncDB for EngineHarness {
                         }
                     }
                     RuntimeStatementResult::Delete { rows_deleted, .. } => {
-                        let duration = start.elapsed();
+                        let duration = start_plan.elapsed();
                         record_statement(sql, duration, "DELETE");
                         if in_query_context {
                             let types = expectations::take()
@@ -653,14 +660,14 @@ impl AsyncDB for EngineHarness {
                     | RuntimeStatementResult::CreateIndex { .. }
                     | RuntimeStatementResult::Transaction { .. }
                     | RuntimeStatementResult::NoOp => {
-                        let duration = start.elapsed();
+                        let duration = start_plan.elapsed();
                         record_statement(sql, duration, "DDL/TXN");
                         Ok(DBOutput::StatementComplete(0))
                     }
                 }
             }
             Err(e) => {
-                let duration = start.elapsed();
+                let duration = start_plan.elapsed();
                 record_statement(sql, duration, "ERROR");
                 Err(e)
             }
