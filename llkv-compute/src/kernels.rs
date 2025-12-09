@@ -111,7 +111,8 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
 
     let result_arr: ArrayRef = match op {
         BinaryOp::Add => {
-            numeric::add(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?
+            let res = numeric::add(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?;
+            res
         }
         BinaryOp::Subtract => {
             numeric::sub(&lhs_arr, &rhs_arr).map_err(|e| Error::Internal(e.to_string()))?

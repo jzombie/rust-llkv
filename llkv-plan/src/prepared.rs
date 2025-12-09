@@ -211,9 +211,6 @@ where
         mut plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> Result<PreparedSelectPlan<P>> {
-        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-             eprintln!("Before simplify: {:?}", plan.projections);
-        }
         // Simplify projection expressions to remove dead code (e.g. NULLIF(NULL, col))
         for proj in &mut plan.projections {
             if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
@@ -224,9 +221,6 @@ where
         // Simplify HAVING clause
         if let Some(having) = &mut plan.having {
             *having = simplify_expr(having.clone());
-        }
-        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-             eprintln!("After simplify: {:?}", plan.projections);
         }
 
         let prepared_scalar_subqueries = self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
@@ -246,13 +240,7 @@ where
 
         // Simplify WHERE clause
         if let Some(filter) = &mut plan.filter {
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                 eprintln!("Before filter simplify: {:?}", filter.predicate);
-            }
             filter.predicate = simplify_expr(filter.predicate.clone());
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                 eprintln!("After filter simplify: {:?}", filter.predicate);
-            }
         }
 
         let (pushable_filter, residual_filter) = if let Some(filter) = &plan.filter {
@@ -260,10 +248,6 @@ where
         } else {
             (None, None)
         };
-
-        if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
-            eprintln!("[planner] plan.projections: {:?}", plan.projections);
-        }
 
         let residual_filter_subqueries = if residual_filter.is_some() {
             plan.filter

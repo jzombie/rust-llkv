@@ -440,6 +440,9 @@ impl ScalarEvaluator {
             }
             ScalarExpr::Cast { expr, data_type } => {
                 let val = Self::evaluate_value(expr, idx, arrays)?;
+                if std::env::var("LLKV_DEBUG_COMPARE").is_ok() {
+                    println!("DEBUG: Cast val={:?} to {:?}", val, data_type);
+                }
                 cast::cast(&val, data_type).map_err(|e| Error::Internal(e.to_string()))
             }
             ScalarExpr::Case {
@@ -453,7 +456,7 @@ impl ScalarEvaluator {
                     None
                 };
 
-                for (when_expr, then_expr) in branches {
+                for (i, (when_expr, then_expr)) in branches.iter().enumerate() {
                     let when_val = Self::evaluate_value(when_expr, idx, arrays)?;
 
                     let is_match = if let Some(op_val) = &operand_val {
@@ -489,13 +492,23 @@ impl ScalarEvaluator {
                         }
                     };
 
+                    if std::env::var("LLKV_DEBUG_COMPARE").is_ok() {
+                        println!("DEBUG: Case branch {} match={}", i, is_match);
+                    }
+
                     if is_match {
                         return Self::evaluate_value(then_expr, idx, arrays);
                     }
                 }
                 if let Some(else_expr) = else_expr {
+                    if std::env::var("LLKV_DEBUG_COMPARE").is_ok() {
+                        println!("DEBUG: Case else branch taken");
+                    }
                     Self::evaluate_value(else_expr, idx, arrays)
                 } else {
+                    if std::env::var("LLKV_DEBUG_COMPARE").is_ok() {
+                        println!("DEBUG: Case implicit else (NULL) taken");
+                    }
                     Ok(new_null_array(&DataType::Null, 1))
                 }
             }
@@ -1092,11 +1105,28 @@ impl ScalarEvaluator {
                     if operand.is_none() {
                         if let ScalarExpr::Literal(lit) = &s_when {
                             // If condition is FALSE, skip this branch
-                            if matches!(lit, Literal::Boolean(false)) {
+                            let is_false = match lit {
+                                Literal::Boolean(b) => !b,
+                                Literal::Int128(i) => *i == 0,
+                                _ => false,
+                            };
+                            if is_false {
                                 continue;
                             }
                             // If condition is TRUE, return this branch and ignore the rest
-                            if matches!(lit, Literal::Boolean(true)) {
+                            let is_true = match lit {
+                                Literal::Boolean(b) => *b,
+                                Literal::Int128(i) => *i != 0,
+                                _ => false,
+                            };
+                            if is_true {
+                                if !new_branches.is_empty() {
+                                    return ScalarExpr::Case {
+                                        operand: None,
+                                        branches: new_branches,
+                                        else_expr: Some(Box::new(s_then)),
+                                    };
+                                }
                                 return get_safe_result(s_then, &simplified_branches);
                             }
                         }
@@ -1295,8 +1325,15 @@ impl ScalarEvaluator {
             }
             ScalarExpr::Not(expr) => {
                 let inner = Self::simplify(expr);
+                if Self::is_null(&inner) {
+                    return ScalarExpr::Literal(Literal::Null);
+                }
                 if let ScalarExpr::Literal(Literal::Boolean(b)) = &inner {
                     return ScalarExpr::Literal(Literal::Boolean(!b));
+                }
+                // Handle Int128 as Boolean (0=False, !=0=True)
+                if let ScalarExpr::Literal(Literal::Int128(i)) = &inner {
+                    return ScalarExpr::Literal(Literal::Boolean(*i == 0));
                 }
                 ScalarExpr::Not(Box::new(inner))
             }

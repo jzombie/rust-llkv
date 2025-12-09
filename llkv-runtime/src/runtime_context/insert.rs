@@ -224,10 +224,24 @@ where
         let row_count = rows.len();
         let mut column_values: Vec<Vec<PlanValue>> =
             vec![Vec::with_capacity(row_count); table.schema.columns.len()];
+
+        // Pre-calculate which columns are provided
+        let mut is_provided = vec![false; table.schema.columns.len()];
+        for &idx in &column_order {
+            is_provided[idx] = true;
+        }
+
         for row in rows {
             for (idx, value) in row.into_iter().enumerate() {
                 let dest_index = column_order[idx];
                 column_values[dest_index].push(value);
+            }
+
+            // Fill missing columns with NULL
+            for (col_idx, &provided) in is_provided.iter().enumerate() {
+                if !provided {
+                    column_values[col_idx].push(PlanValue::Null);
+                }
             }
         }
 
