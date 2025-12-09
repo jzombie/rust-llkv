@@ -1074,7 +1074,8 @@ impl ScalarEvaluator {
 
                 // If operand is NULL, the whole CASE expression evaluates to ELSE
                 if let Some(op) = &operand {
-                    if Self::is_null(op) {
+                    let is_op_null = Self::is_null(op) || matches!(op.as_ref(), ScalarExpr::Cast { expr, .. } if Self::is_null(expr));
+                    if is_op_null {
                         let result = s_else
                             .clone()
                             .map(|b| *b)
@@ -1093,7 +1094,23 @@ impl ScalarEvaluator {
                     // If we have a simple CASE (operand is Some)
                     if let Some(op) = &operand {
                         if let (ScalarExpr::Literal(op_lit), ScalarExpr::Literal(when_lit)) = (op.as_ref(), &s_when) {
-                            if op_lit == when_lit {
+                            // Use compute_compare to handle type coercion (e.g. 30.0 == 30)
+                            let l_arr = Self::literal_to_array(op_lit);
+                            let r_arr = Self::literal_to_array(when_lit);
+                            let is_equal = if let Ok(res) = crate::kernels::compute_compare(&l_arr, CompareOp::Eq, &r_arr) {
+                                if let Ok(lit) = Literal::from_array_ref(&res, 0) {
+                                    match lit {
+                                        Literal::Boolean(b) => b,
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if is_equal {
                                 return get_safe_result(s_then, &simplified_branches);
                             } else {
                                 continue;
