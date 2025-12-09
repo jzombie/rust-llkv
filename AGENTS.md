@@ -16,4 +16,4 @@ Use this guide as the first stop before making changes. It ties together the rep
 ## SQL Testing and Debugging
 
 - For quick SQL scripts: Compile and run [llkv/src/main.rs](llkv/src/main.rs), sending the SQL via STDIN.
-- For SLT testing, it is often helpful to use the full relative path (e.g. `cargo test --package llkv-slt-tester --test slturl_test -- slt/sqlite/random/groupby/slt_good_8.slturl`) instead of the filename (e.g. `slt_good_8.slturl`).
+- For SLT testing, it is often helpful to use the full relative path (e.g. `cargo test --package llkv-slt-tester --test slt_harness -- slt/sqlite/random/groupby/slt_good_8.slturl`) instead of the filename (e.g. `slt_good_8.slturl`).
