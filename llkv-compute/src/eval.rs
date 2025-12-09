@@ -996,7 +996,14 @@ impl ScalarEvaluator {
 
                 // Simplify to Literal::Null if EITHER is effectively null.
                 if is_effectively_null(&l) || is_effectively_null(&r) {
-                    return ScalarExpr::Literal(Literal::Null);
+                    // If one side is NULL, the result is NULL.
+                    // However, if the other side contains an aggregate, we MUST NOT simplify it away.
+                    let discard_aggregate = (is_effectively_null(&l) && Self::contains_aggregate(&r))
+                        || (is_effectively_null(&r) && Self::contains_aggregate(&l));
+
+                    if !discard_aggregate {
+                        return ScalarExpr::Literal(Literal::Null);
+                    }
                 }
 
                 if let (ScalarExpr::Literal(ll), ScalarExpr::Literal(rr)) = (&l, &r) {
