@@ -6262,7 +6262,16 @@ impl SqlEngine {
                 &mut scalar_subqueries,
                 correlated_tracker.reborrow(),
             )?;
+            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                eprintln!("translate_select_internal: projections len before with_projections: {}", projections.len());
+            }
             p = p.with_projections(projections);
+            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                eprintln!("translate_select_internal: p.projections len after with_projections: {}", p.projections.len());
+                if let Some(first) = p.projections.first() {
+                    eprintln!("translate_select_internal: first projection: {:?}", first);
+                }
+            }
             (p, IdentifierContext::new(None))
         } else if select.from.len() == 1 && !has_joins {
             // Single table query
@@ -6813,6 +6822,9 @@ impl SqlEngine {
 
         let mut projections = Vec::with_capacity(projection_items.len());
         for (idx, item) in projection_items.iter().enumerate() {
+            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                eprintln!("build_projection_list: item {:?}", item);
+            }
             match item {
                 SelectItem::Wildcard(options) => {
                     if let Some(exclude) = &options.opt_exclude {
@@ -6910,6 +6922,9 @@ impl SqlEngine {
                             expr: scalar,
                             alias,
                         });
+                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                            eprintln!("build_projection_list: pushed Computed (UnnamedExpr)");
+                        }
                     }
                 },
                 SelectItem::ExprWithAlias { expr, alias } => match expr {
@@ -6974,9 +6989,15 @@ impl SqlEngine {
                             expr: scalar,
                             alias: alias.value.clone(),
                         });
+                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                            eprintln!("build_projection_list: pushed Computed");
+                        }
                     }
                 },
             }
+        }
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+            eprintln!("build_projection_list: result len: {}", projections.len());
         }
         Ok(projections)
     }

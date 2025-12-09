@@ -207,6 +207,13 @@ where
     }
 
     pub fn create_logical_plan(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+            eprintln!("create_logical_plan tables len: {}", plan.tables.len());
+            eprintln!("create_logical_plan projections len: {}", plan.projections.len());
+            if !plan.projections.is_empty() {
+                eprintln!("create_logical_plan first projection: {:?}", plan.projections[0]);
+            }
+        }
         if plan.tables.len() != 1 {
             return self.plan_multi_table(plan);
         }
@@ -567,6 +574,9 @@ where
     for proj in projections {
         match proj {
             crate::plans::SelectProjection::AllColumns => {
+                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                    eprintln!("build_multi_projection_exprs: processing AllColumns, tables len: {}", ctx.tables.len());
+                }
                 for table in ctx.tables.iter() {
                     for col in &table.schema.columns {
                         out.push((ScalarExpr::Column(col.name.clone()), col.name.clone()));
@@ -1153,7 +1163,14 @@ where
         plan.projections.clone()
     };
 
+    if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+        eprintln!("resolve_projections: input len: {}", projections.len());
+    }
+
     for proj in projections {
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+            eprintln!("resolve_projections: processing proj variant: {:?}", proj);
+        }
         match proj {
             crate::plans::SelectProjection::AllColumns => {
                 for (table_idx, table) in ctx.tables.iter().enumerate() {
@@ -1201,6 +1218,9 @@ where
                 });
             }
             crate::plans::SelectProjection::Computed { expr, alias } => {
+                if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                    eprintln!("resolve_projections: pushing Computed alias={}", alias);
+                }
                 out.push(ResolvedProjection::Computed {
                     expr: resolve_scalar_expr(ctx, &expr)?,
                     alias,

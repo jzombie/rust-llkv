@@ -288,10 +288,11 @@ where
             && !plan_for_execution.group_by.is_empty()
             && !has_aggregates;
 
-        let force_manual_projection = residual_filter.is_some()
+        let force_manual_projection = (residual_filter.is_some()
             || has_subqueries
             || group_needs_full_row
-            || has_aggregates;
+            || has_aggregates)
+            && !plan_for_execution.tables.is_empty();
 
         let plan_for_scan = if force_manual_projection {
             let mut p = plan_for_execution.clone();

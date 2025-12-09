@@ -1,5 +1,6 @@
 use llkv_expr::expr::{AggregateCall, BinaryOp, CompareOp, Expr, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
+use llkv_compute::eval::ScalarEvaluator;
 use llkv_result::Result;
 use std::collections::{HashMap, HashSet};
 use arrow::datatypes::DataType;
@@ -135,11 +136,46 @@ impl AggVisitor {
             },
             ScalarExpr::Coalesce(exprs) => ScalarExpr::Coalesce(exprs.iter().map(|e| self.visit(e)).collect()),
             ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s.clone()),
-            ScalarExpr::Case { operand, branches, else_expr } => ScalarExpr::Case {
-                operand: operand.as_ref().map(|e| Box::new(self.visit(e))),
-                branches: branches.iter().map(|(w, t)| (self.visit(w), self.visit(t))).collect(),
-                else_expr: else_expr.as_ref().map(|e| Box::new(self.visit(e))),
-            },
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                // If this is a searched CASE (no operand), we can prune branches that are known false.
+                // This is critical for removing dead code that might reference invalid columns (e.g. non-grouping columns).
+                if operand.is_none() {
+                    let mut new_branches = Vec::new();
+                    for (w, t) in branches {
+                        let is_false = matches!(w, ScalarExpr::Literal(Literal::Boolean(false)));
+                        if !is_false {
+                            new_branches.push((self.visit(w), self.visit(t)));
+                        }
+                    }
+
+                    if new_branches.is_empty() {
+                        if let Some(e) = else_expr {
+                            return self.visit(e);
+                        } else {
+                            return ScalarExpr::Literal(Literal::Null);
+                        }
+                    }
+
+                    return ScalarExpr::Case {
+                        operand: None,
+                        branches: new_branches,
+                        else_expr: else_expr.as_ref().map(|e| Box::new(self.visit(e))),
+                    };
+                }
+
+                ScalarExpr::Case {
+                    operand: operand.as_ref().map(|e| Box::new(self.visit(e))),
+                    branches: branches
+                        .iter()
+                        .map(|(w, t)| (self.visit(w), self.visit(t)))
+                        .collect(),
+                    else_expr: else_expr.as_ref().map(|e| Box::new(self.visit(e))),
+                }
+            }
             ScalarExpr::Random => ScalarExpr::Random,
         }
     }
@@ -159,10 +195,13 @@ pub fn extract_complex_aggregates(
     Vec<ScalarExpr<String>>,
 ) {
     let mut visitor = AggVisitor::new();
-    let rewritten = projections.iter().map(|p| visitor.visit(p)).collect();
+    let rewritten = projections
+        .iter()
+        .map(|p| visitor.visit(&ScalarEvaluator::simplify(p)))
+        .collect();
     let additional_rewritten = additional_exprs
         .iter()
-        .map(|e| visitor.visit(e))
+        .map(|e| visitor.visit(&ScalarEvaluator::simplify(e)))
         .collect();
     (
         visitor.aggregates,

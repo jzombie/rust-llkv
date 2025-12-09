@@ -2285,6 +2285,12 @@ where
         having: Option<&llkv_expr::expr::Expr<'static, String>>,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+            match logical_plan {
+                LogicalPlan::Single(_) => eprintln!("create_physical_plan: Single"),
+                LogicalPlan::Multi(_) => eprintln!("create_physical_plan: Multi"),
+            }
+        }
         match logical_plan {
             LogicalPlan::Single(plan) => self.create_single_table_plan(plan, having, row_filter),
             LogicalPlan::Multi(plan) => self.create_multi_table_plan(plan),
@@ -3825,6 +3831,10 @@ where
                         let batch = batch_res?;
                         let mut columns = Vec::new();
 
+                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                            eprintln!("non-agg path: projections len: {}", projections.len());
+                        }
+
                         for proj in &projections {
                             match proj {
                                 llkv_plan::logical_planner::ResolvedProjection::Column {
@@ -3879,6 +3889,11 @@ where
                             }
                         }
 
+                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                            eprintln!("non-agg path: columns len: {}", columns.len());
+                            eprintln!("non-agg path: output_schema fields: {}", output_schema_captured.fields().len());
+                        }
+
                         let mut cast_columns = Vec::with_capacity(columns.len());
                         for (i, col) in columns.iter().enumerate() {
                             let expected_type = output_schema_captured.field(i).data_type();
@@ -3892,8 +3907,19 @@ where
                             }
                         }
 
-                        RecordBatch::try_new(output_schema_captured.clone(), cast_columns)
+                        if cast_columns.is_empty() {
+                            let options = arrow::record_batch::RecordBatchOptions::new()
+                                .with_row_count(Some(batch.num_rows()));
+                            RecordBatch::try_new_with_options(
+                                output_schema_captured.clone(),
+                                cast_columns,
+                                &options,
+                            )
                             .map_err(|e| Error::Internal(e.to_string()))
+                        } else {
+                            RecordBatch::try_new(output_schema_captured.clone(), cast_columns)
+                                .map_err(|e| Error::Internal(e.to_string()))
+                        }
                     });
                     Box::new(final_stream)
                 };
