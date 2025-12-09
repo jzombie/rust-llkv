@@ -1698,6 +1698,11 @@ where
         return tables;
     }
 
+    // Pre-calculate row counts to avoid repeated calls in the loop
+    let row_counts: Vec<usize> = tables.iter()
+        .map(|(t, _)| t.table.approximate_row_count().unwrap_or(0))
+        .collect();
+
     // 1. Build Adjacency Graph
     let mut adj = vec![FxHashSet::default(); tables.len()];
     if let Some(expr) = filter {
@@ -1715,7 +1720,7 @@ where
     let mut connected_to_ordered: FxHashSet<usize> = FxHashSet::default();
 
     // Start with the largest table
-    let first_idx = find_largest_table(&tables, &remaining);
+    let first_idx = find_largest_table(&row_counts, &remaining);
     move_table(first_idx, &mut remaining, &mut ordered_indices, &mut connected_to_ordered, &adj);
 
     while !remaining.is_empty() {
@@ -1726,10 +1731,10 @@ where
 
         let next_idx = if !candidates.is_empty() {
             // Pick the largest connected table
-            find_largest_table_in_candidates(&tables, &candidates)
+            find_largest_table_in_candidates(&row_counts, &candidates)
         } else {
             // No connected table (Cross Join or Disjoint). Pick largest remaining.
-            find_largest_table(&tables, &remaining)
+            find_largest_table(&row_counts, &remaining)
         };
 
         move_table(next_idx, &mut remaining, &mut ordered_indices, &mut connected_to_ordered, &adj);
@@ -1760,29 +1765,23 @@ fn move_table(
     }
 }
 
-fn find_largest_table<P>(
-    tables: &[(PlannedTable<P>, TableRef)],
+fn find_largest_table(
+    row_counts: &[usize],
     candidates: &FxHashSet<usize>,
 ) -> usize 
-where P: Pager<Blob = EntryHandle> + Send + Sync
 {
     candidates.iter().cloned().max_by(|&a, &b| {
-        let count_a = tables[a].0.table.approximate_row_count().unwrap_or(0);
-        let count_b = tables[b].0.table.approximate_row_count().unwrap_or(0);
-        count_a.cmp(&count_b)
+        row_counts[a].cmp(&row_counts[b])
     }).unwrap()
 }
 
-fn find_largest_table_in_candidates<P>(
-    tables: &[(PlannedTable<P>, TableRef)],
+fn find_largest_table_in_candidates(
+    row_counts: &[usize],
     candidates: &[usize],
 ) -> usize 
-where P: Pager<Blob = EntryHandle> + Send + Sync
 {
     candidates.iter().cloned().max_by(|&a, &b| {
-        let count_a = tables[a].0.table.approximate_row_count().unwrap_or(0);
-        let count_b = tables[b].0.table.approximate_row_count().unwrap_or(0);
-        count_a.cmp(&count_b)
+        row_counts[a].cmp(&row_counts[b])
     }).unwrap()
 }
 
