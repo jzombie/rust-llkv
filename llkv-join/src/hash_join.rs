@@ -552,7 +552,7 @@ impl HashJoinStream {
                          .or_default()
                          .push((0, row_idx)); // batch_idx is always 0 for now
                  } else {
-                     // println!("Skipping row {} due to nulls", row_idx);
+                     // tracing::trace!("Skipping row {} due to nulls", row_idx);
                  }
             }
         }
@@ -563,9 +563,9 @@ impl HashJoinStream {
             .map_err(|e| Error::Internal(e.to_string()))?;
 
         if left_indices.is_empty() {
-            println!("HashJoinStream::try_new: WARNING: Cross Join detected (no join keys). Right batch rows: {}", right_batch.num_rows());
+            tracing::warn!("HashJoinStream::try_new: WARNING: Cross Join detected (no join keys). Right batch rows: {}", right_batch.num_rows());
         } else {
-            // println!("HashJoinStream::try_new: Inner/Left Join. Keys: {}, Right rows: {}", left_indices.len(), right_batch.num_rows());
+            // tracing::trace!("HashJoinStream::try_new: Inner/Left Join. Keys: {}, Right rows: {}", left_indices.len(), right_batch.num_rows());
         }
 
         Ok(Self {
