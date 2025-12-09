@@ -6,9 +6,9 @@
 
 **Work in Progress**
 
-`llkv` is the primary entrypoint crate for the LLKV database toolkit. It provides both a command-line interface and a library that re-exports high-level APIs from the underlying workspace crates.
+`llkv` is the primary entrypoint crate for the [LLKV](../) database toolkit. It provides both a command-line interface and a library that re-exports high-level APIs from the underlying workspace crates.
 
-Arrow column chunks are stored under pager-managed physical keys, so pagers that already offer zero-copy reads—like the SIMD-backed [`simd-r-drive`](https://crates.io/crates/simd-r-drive)—can return contiguous buffers that stay SIMD-friendly.
+[Arrow](https://arrow.apache.org/) column chunks are stored under pager-managed physical keys, so pagers that already offer zero-copy reads—like the SIMD-backed [`simd-r-drive`](https://crates.io/crates/simd-r-drive)—can return contiguous buffers that stay SIMD-friendly.
 
 ## Design Notes
 
