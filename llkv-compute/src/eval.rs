@@ -911,6 +911,48 @@ impl ScalarEvaluator {
         }
     }
 
+    fn sanitize_columns<F: Hash + Eq + Clone>(expr: &ScalarExpr<F>) -> ScalarExpr<F> {
+        match expr {
+            ScalarExpr::Column(_) => ScalarExpr::Literal(Literal::Null),
+            ScalarExpr::GetField { .. } => ScalarExpr::Literal(Literal::Null),
+            ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+                left: Box::new(Self::sanitize_columns(left)),
+                op: *op,
+                right: Box::new(Self::sanitize_columns(right)),
+            },
+            ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+                left: Box::new(Self::sanitize_columns(left)),
+                op: *op,
+                right: Box::new(Self::sanitize_columns(right)),
+            },
+            ScalarExpr::Not(e) => ScalarExpr::Not(Box::new(Self::sanitize_columns(e))),
+            ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+                expr: Box::new(Self::sanitize_columns(expr)),
+                negated: *negated,
+            },
+            ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+                expr: Box::new(Self::sanitize_columns(expr)),
+                data_type: data_type.clone(),
+            },
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => ScalarExpr::Case {
+                operand: operand.as_ref().map(|e| Box::new(Self::sanitize_columns(e))),
+                branches: branches
+                    .iter()
+                    .map(|(w, t)| (Self::sanitize_columns(w), Self::sanitize_columns(t)))
+                    .collect(),
+                else_expr: else_expr.as_ref().map(|e| Box::new(Self::sanitize_columns(e))),
+            },
+            ScalarExpr::Coalesce(exprs) => {
+                ScalarExpr::Coalesce(exprs.iter().map(Self::sanitize_columns).collect())
+            }
+            _ => expr.clone(),
+        }
+    }
+
     /// Simplify an expression by constant folding and identity removal.
     pub fn simplify<F: Hash + Eq + Clone>(expr: &ScalarExpr<F>) -> ScalarExpr<F> {
         let try_get_type = |e: &ScalarExpr<F>| -> Option<DataType> {
@@ -972,6 +1014,23 @@ impl ScalarEvaluator {
                         if Self::is_null(&l) && Self::is_null(&r) {
                             return ScalarExpr::Literal(Literal::Null);
                         }
+                    } else {
+                        // One side is NULL, other has aggregate. Sanitize the other side.
+                        let new_l = if is_effectively_null(&l) {
+                            l.clone()
+                        } else {
+                            Self::sanitize_columns(&l)
+                        };
+                        let new_r = if is_effectively_null(&r) {
+                            r.clone()
+                        } else {
+                            Self::sanitize_columns(&r)
+                        };
+                        return ScalarExpr::Binary {
+                            left: Box::new(new_l),
+                            op: *op,
+                            right: Box::new(new_r),
+                        };
                     }
                 }
 
@@ -1003,6 +1062,22 @@ impl ScalarEvaluator {
 
                     if !discard_aggregate {
                         return ScalarExpr::Literal(Literal::Null);
+                    } else {
+                        let new_l = if is_effectively_null(&l) {
+                            l.clone()
+                        } else {
+                            Self::sanitize_columns(&l)
+                        };
+                        let new_r = if is_effectively_null(&r) {
+                            r.clone()
+                        } else {
+                            Self::sanitize_columns(&r)
+                        };
+                        return ScalarExpr::Compare {
+                            left: Box::new(new_l),
+                            op: *op,
+                            right: Box::new(new_r),
+                        };
                     }
                 }
 
@@ -1094,7 +1169,10 @@ impl ScalarEvaluator {
                 let mut new_branches = Vec::new();
 
                 for (s_when, s_then) in simplified_branches.iter().cloned() {
-                    if Self::is_null(&s_when) {
+                    let is_when_null = Self::is_null(&s_when)
+                        || matches!(&s_when, ScalarExpr::Cast { expr, .. } if Self::is_null(expr));
+
+                    if is_when_null {
                         continue;
                     }
 
