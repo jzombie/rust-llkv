@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::schema::PlanSchema;
 
+// TODO: Dedupe (another one exists inside of llkv-plan)
 pub trait ExecutionTable<P>: Debug + Send + Sync
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -30,6 +31,7 @@ where
     fn as_any(&self) -> &dyn Any;
 }
 
+// TODO: Dedupe (another one exists inside of llkv-plan)
 pub trait TableProvider<P>: Send + Sync
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
