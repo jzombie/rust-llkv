@@ -94,7 +94,8 @@ Implementation order to avoid rework
 
 - Table & column resolvers seem duplicated between llkv-table, llkv-executor, llkv-plan
 - `HashMap/Set` usage instead of `FxHashMap/Set`
-- llkv-join's vectorized vs. non-vectorized join paths
+- `llkv-join`'s streaming vs. non-streaming joins (remove the non-used)
+- Hardcoded batch size in streaming join
 - Previous compile paths, are they still used at all?
 - Perf overhead from potentially using TreeMap in the wrong places
 - Hardcoded column range greater than 10,000 (magic number reserved) for internal usage [can these be offloaded to a temp table with a zero-additional-cost perf somehow]?

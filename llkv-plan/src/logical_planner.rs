@@ -122,6 +122,7 @@ where
     pub table_id: TableId,
     pub table: Arc<dyn ExecutionTable<P>>,
     pub schema: Arc<PlanSchema>,
+    pub original_index: usize,
 }
 
 impl<P> Clone for PlannedTable<P>
@@ -134,6 +135,7 @@ where
             table_id: self.table_id,
             table: self.table.clone(),
             schema: self.schema.clone(),
+            original_index: self.original_index,
         }
     }
 }
@@ -396,7 +398,7 @@ where
 
     fn plan_multi_table(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
         let mut table_pairs = Vec::with_capacity(plan.tables.len());
-        for table_ref in &plan.tables {
+        for (original_index, table_ref) in plan.tables.iter().enumerate() {
             let table_name = table_ref.qualified_name();
             let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
             let table_id = table.table_id();
@@ -408,6 +410,7 @@ where
                 table_id,
                 table,
                 schema: plan_schema,
+                original_index,
             };
             table_pairs.push((planned, table_ref.clone()));
         }
@@ -1188,7 +1191,11 @@ where
         debug!("resolve_projections: processing proj variant: {:?}", proj);
         match proj {
             crate::plans::SelectProjection::AllColumns => {
-                for (table_idx, table) in ctx.tables.iter().enumerate() {
+                // Sort tables by original_index to ensure projection order matches FROM clause
+                let mut sorted_tables: Vec<(usize, &PlannedTable<P>)> = ctx.tables.iter().enumerate().collect();
+                sorted_tables.sort_by_key(|(_, t)| t.original_index);
+
+                for (table_idx, table) in sorted_tables {
                     for col in &table.schema.columns {
                         out.push(ResolvedProjection::Column {
                             table_index: table_idx,
@@ -1208,7 +1215,11 @@ where
                     excluded_fields.insert((table_idx, lfid.field_id()));
                 }
 
-                for (table_idx, table) in ctx.tables.iter().enumerate() {
+                // Sort tables by original_index to ensure projection order matches FROM clause
+                let mut sorted_tables: Vec<(usize, &PlannedTable<P>)> = ctx.tables.iter().enumerate().collect();
+                sorted_tables.sort_by_key(|(_, t)| t.original_index);
+
+                for (table_idx, table) in sorted_tables {
                     for col in &table.schema.columns {
                         if excluded_fields.contains(&(table_idx, col.field_id)) {
                             continue;

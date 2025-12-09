@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use llkv_expr::expr::{Expr, ScalarExpr, SubqueryId};
 use llkv_expr::{AggregateCall, Expr as LlkvExpr};
-use llkv_result::{Error, Result};
+use llkv_result::Result;
 use llkv_scan::RowIdFilter;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
