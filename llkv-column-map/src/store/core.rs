@@ -451,6 +451,44 @@ where
         Ok(desc.total_row_count)
     }
 
+    // TODO: Return Result<Vec<Option<usize>>> instead?
+    /// Get the total number of rows for multiple fields in a batch.
+    ///
+    /// Returns a vector of options, where `Some(count)` is the row count for the corresponding
+    /// field in the input slice, and `None` if the field was not found or has no descriptor.
+    pub fn batch_total_rows_for_fields(&self, field_ids: &[LogicalFieldId]) -> Result<Vec<Option<u64>>> {
+        let catalog = self.catalog.read().unwrap();
+        let mut pks = Vec::with_capacity(field_ids.len());
+        // Map from index in pks to index in field_ids
+        let mut indices = Vec::with_capacity(field_ids.len());
+
+        for (i, field_id) in field_ids.iter().enumerate() {
+            if let Some(pk) = catalog.map.get(field_id) {
+                pks.push(BatchGet::Raw { key: *pk });
+                indices.push(i);
+            }
+        }
+        drop(catalog);
+
+        if pks.is_empty() {
+            return Ok(vec![None; field_ids.len()]);
+        }
+
+        let results = self.pager.batch_get(&pks)?;
+        
+        let mut out = vec![None; field_ids.len()];
+        
+        for (result, &original_idx) in results.into_iter().zip(indices.iter()) {
+             if let GetResult::Raw { bytes, .. } = result {
+                 let desc = ColumnDescriptor::from_le_bytes(bytes.as_ref());
+                 out[original_idx] = Some(desc.total_row_count);
+             }
+        }
+        
+        Ok(out)
+    }
+
+    // TODO: Return Result<usize> instead?
     /// Get the total number of rows in a table.
     ///
     /// This returns the maximum row count across all user-data columns in the table.

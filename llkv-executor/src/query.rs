@@ -4193,6 +4193,13 @@ where
         let table = self.inner.get_table(name).ok()?;
         Some(Arc::new(ExecutionTableAdapter::new(table)))
     }
+
+    fn batch_approximate_row_counts(&self, tables: &[&str]) -> Vec<Option<usize>> {
+        match self.inner.batch_approximate_row_counts(tables) {
+            Ok(counts) => counts,
+            Err(_) => vec![None; tables.len()],
+        }
+    }
 }
 
 struct ExecutionTableAdapter<P>
@@ -4898,7 +4905,7 @@ where
     }
 
     fn approximate_row_count(&self) -> Option<usize> {
-        self.table.table.total_rows().ok().map(|n| n as usize)
+        Some(self.table.total_rows.load(std::sync::atomic::Ordering::Relaxed) as usize)
     }
 
     fn scan_stream(

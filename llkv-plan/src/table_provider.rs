@@ -14,6 +14,16 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     fn get_table(&self, name: &str) -> Option<Arc<dyn ExecutionTable<P>>>;
+
+    /// Get approximate row counts for multiple tables in a batch.
+    ///
+    /// The default implementation calls `get_table` and `approximate_row_count` sequentially.
+    /// Implementations can override this to provide optimized batch lookups.
+    fn batch_approximate_row_counts(&self, tables: &[&str]) -> Vec<Option<usize>> {
+        tables.iter().map(|name| {
+            self.get_table(name).and_then(|t| t.approximate_row_count())
+        }).collect()
+    }
 }
 
 /// Trait for table instances that can be used in execution.

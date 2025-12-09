@@ -453,7 +453,7 @@ where
         // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
         let start_reorder = std::time::Instant::now();
         let table_pairs = if plan.joins.is_empty() {
-            reorder_tables_greedy(table_pairs, &initial_infos, plan.filter.as_ref().map(|f| &f.predicate))
+            reorder_tables_greedy(self.provider.as_ref(), table_pairs, &initial_infos, plan.filter.as_ref().map(|f| &f.predicate))
         } else {
             table_pairs
         };
@@ -1775,6 +1775,7 @@ mod tests {
 }
 
 fn reorder_tables_greedy<P>(
+    provider: &dyn TableProvider<P>,
     tables: Vec<(PlannedTable<P>, TableRef)>,
     infos: &[TableResolutionInfo],
     filter: Option<&Expr<'static, String>>,
@@ -1799,10 +1800,9 @@ where
     }
 
     // Pre-calculate row counts to avoid repeated calls in the loop
-    // TODO: Call as single batch if possible
-    let row_counts: Vec<usize> = tables.iter()
-        .map(|(t, _)| t.table.approximate_row_count().unwrap_or(0))
-        .collect();
+    let table_names: Vec<&str> = tables.iter().map(|(t, _)| t.name.as_str()).collect();
+    let row_counts = provider.batch_approximate_row_counts(&table_names);
+    let row_counts: Vec<usize> = row_counts.into_iter().map(|c| c.unwrap_or(0)).collect();
 
     debug!("Join Graph Adjacency:");
     for (i, neighbors) in adj.iter().enumerate() {
