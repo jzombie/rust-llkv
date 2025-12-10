@@ -2266,20 +2266,20 @@ where
         plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
-        let start_prepare = std::time::Instant::now();
-        let prepared = self
-            .planner
-            .prepare_select(plan, row_filter)
-            .map_err(Error::from)?;
-        if start_prepare.elapsed().as_millis() > 5 {
-             println!("Slow prepare_select: {:?}", start_prepare.elapsed());
-        }
+        let (prepared, t_prepare) = llkv_perf_monitor::measure!("prepare_select", {
+            self.planner
+                .prepare_select(plan, row_filter, None)
+                .map_err(Error::from)?
+        });
+        
+        llkv_perf_monitor::log_if_slow("prepare_select", &[("Prepare", t_prepare)]);
 
-        let start_exec_prepared = std::time::Instant::now();
-        let result = self.execute_prepared_select(&prepared);
-        if start_exec_prepared.elapsed().as_millis() > 5 {
-             println!("Slow execute_prepared_select: {:?}", start_exec_prepared.elapsed());
-        }
+        let (result, t_exec) = llkv_perf_monitor::measure!("execute_prepared_select", {
+            self.execute_prepared_select(&prepared)
+        });
+        
+        llkv_perf_monitor::log_if_slow("execute_prepared_select", &[("Exec", t_exec)]);
+        
         result
     }
 
@@ -2788,16 +2788,6 @@ where
                 let result = ScalarEvaluator::evaluate_batch(&scalar_predicate, batch.num_rows(), &numeric_arrays)
                     .map_err(|e| Error::Internal(format!("Filter evaluation failed: {:?}", e)))?;
                 
-                println!("DEBUG: FilterExec: evaluated predicate for {} rows", batch.num_rows());
-                println!("DEBUG: FilterExec: result type: {:?}", result.data_type());
-                if let Some(bool_arr) = result.as_any().downcast_ref::<BooleanArray>() {
-                    println!("DEBUG: FilterExec: true count: {}", bool_arr.true_count());
-                    println!("DEBUG: FilterExec: null count: {}", bool_arr.null_count());
-                    println!("DEBUG: FilterExec: false count: {}", bool_arr.len() - bool_arr.true_count() - bool_arr.null_count());
-                } else {
-                    println!("DEBUG: FilterExec: result is NOT BooleanArray");
-                }
-
                 if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
                     tracing::debug!("FilterExec: evaluated predicate for {} rows", batch.num_rows());
                     tracing::debug!("FilterExec: result type: {:?}", result.data_type());

@@ -1,0 +1,18 @@
+[package]
+name = "llkv-perf-monitor"
+description = "Performance monitoring utilities for the LLKV toolkit."
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+perf-mon = []
+
+[dependencies]
+
+[lints]
+workspace = true

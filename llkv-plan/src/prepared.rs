@@ -83,6 +83,7 @@ where
         &self,
         plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+        context: Option<&str>,
     ) -> Result<PreparedSelectPlan<P>>;
 }
 
@@ -113,7 +114,11 @@ where
         let mut prepared = Vec::with_capacity(subs.len());
         for sub in subs {
             let prepared_plan = if sub.correlated_columns.is_empty() {
-                Some(Box::new(self.prepare_select((*sub.plan).clone(), None)?))
+                Some(Box::new(self.prepare_select(
+                    (*sub.plan).clone(),
+                    None,
+                    Some(&format!("scalar subquery {:?}", sub.id)),
+                )?))
             } else {
                 None
             };
@@ -134,7 +139,11 @@ where
         let mut prepared = Vec::with_capacity(subs.len());
         for sub in subs {
             let prepared_plan = if sub.correlated_columns.is_empty() {
-                Some(Box::new(self.prepare_select((*sub.plan).clone(), None)?))
+                Some(Box::new(self.prepare_select(
+                    (*sub.plan).clone(),
+                    None,
+                    Some(&format!("filter subquery {:?}", sub.id)),
+                )?))
             } else {
                 None
             };
@@ -153,14 +162,21 @@ where
         compound: &CompoundSelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> Result<PreparedCompoundSelect<P>> {
-        let initial =
-            Box::new(self.prepare_select((*compound.initial).clone(), row_filter.clone())?);
+        let initial = Box::new(self.prepare_select(
+            (*compound.initial).clone(),
+            row_filter.clone(),
+            Some("compound initial"),
+        )?);
         let mut operations = Vec::with_capacity(compound.operations.len());
         for op in &compound.operations {
             operations.push(PreparedCompoundOp {
                 operator: op.operator.clone(),
                 quantifier: op.quantifier.clone(),
-                plan: Box::new(self.prepare_select(op.plan.clone(), row_filter.clone())?),
+                plan: Box::new(self.prepare_select(
+                    op.plan.clone(),
+                    row_filter.clone(),
+                    Some(&format!("compound {:?}", op.operator)),
+                )?),
             });
         }
         Ok(PreparedCompoundSelect { initial, operations })
@@ -211,180 +227,236 @@ where
         &self,
         mut plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+        context: Option<&str>,
     ) -> Result<PreparedSelectPlan<P>> {
-        let start = std::time::Instant::now();
-        // Simplify projection expressions to remove dead code (e.g. NULLIF(NULL, col))
-        for proj in &mut plan.projections {
-            if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
-                *expr = llkv_compute::eval::ScalarEvaluator::simplify(expr);
+        let ((), t_simplify) = llkv_perf_monitor::measure!("simplify", {
+            // Simplify projection expressions to remove dead code (e.g. NULLIF(NULL, col))
+            for proj in &mut plan.projections {
+                if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
+                    *expr = llkv_compute::eval::ScalarEvaluator::simplify(expr);
+                }
             }
-        }
 
-        // Simplify HAVING clause
-        if let Some(having) = &mut plan.having {
-            *having = simplify_expr(having.clone());
-        }
-        let t_simplify = start.elapsed();
+            // Simplify HAVING clause
+            if let Some(having) = &mut plan.having {
+                *having = simplify_expr(having.clone());
+            }
+        });
 
-        let start_sub = std::time::Instant::now();
-        let prepared_scalar_subqueries = self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
+        let (res, t_subqueries) = llkv_perf_monitor::measure!("subqueries", {
+            let prepared_scalar_subqueries = self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
 
-        let filter_subqueries = plan
-            .filter
-            .as_ref()
-            .map(|f| self.prepare_filter_subqueries(&f.subqueries))
-            .transpose()?
-            .unwrap_or_default();
-
-        let compound = plan
-            .compound
-            .as_ref()
-            .map(|c| self.prepare_compound(c, row_filter.clone()))
-            .transpose()?;
-        let t_subqueries = start_sub.elapsed();
-
-        // Simplify WHERE clause
-        if let Some(filter) = &mut plan.filter {
-            filter.predicate = simplify_expr(filter.predicate.clone());
-        }
-
-        let (pushable_filter, residual_filter) = if let Some(filter) = &plan.filter {
-            Self::split_predicate(&filter.predicate)
-        } else {
-            (None, None)
-        };
-
-        let residual_filter_subqueries = if residual_filter.is_some() {
-            plan.filter
-                .as_ref()
-                .map(|f| f.subqueries.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let mut plan_for_execution = plan.clone();
-        plan_for_execution.filter = pushable_filter.map(|predicate| SelectFilter {
-            predicate,
-            subqueries: plan
+            let filter_subqueries = plan
                 .filter
                 .as_ref()
-                .map(|f| f.subqueries.clone())
-                .unwrap_or_default(),
-        });
+                .map(|f| self.prepare_filter_subqueries(&f.subqueries))
+                .transpose()?
+                .unwrap_or_default();
 
-        let has_subqueries = plan_for_execution.projections.iter().any(|p| match p {
-            SelectProjection::Computed { expr, .. } => contains_subquery(expr),
-            _ => false,
-        });
-
-        let has_aggregates = !plan_for_execution.aggregates.is_empty()
-            || plan_for_execution.projections.iter().any(|p| match p {
-                SelectProjection::Computed { expr, .. } => scalar_contains_aggregate(expr),
-                _ => false,
-            })
-            || plan_for_execution
-                .having
+            let compound = plan
+                .compound
                 .as_ref()
-                .map(|h| contains_aggregate_in_expr(h))
-                .unwrap_or(false);
+                .map(|c| self.prepare_compound(c, row_filter.clone()))
+                .transpose()?;
+            
+            Ok::<_, llkv_result::Error>((prepared_scalar_subqueries, filter_subqueries, compound))
+        });
+        let (prepared_scalar_subqueries, filter_subqueries, compound) = res?;
 
-        let group_needs_full_row = plan_for_execution.aggregates.is_empty()
-            && !plan_for_execution.group_by.is_empty()
-            && !has_aggregates;
+        let ((plan_for_execution, residual_filter, residual_filter_subqueries, force_manual_projection, plan_for_scan, has_aggregates), t_analysis) = llkv_perf_monitor::measure!("analysis", {
+            // Simplify WHERE clause
+            if let Some(filter) = &mut plan.filter {
+                filter.predicate = simplify_expr(filter.predicate.clone());
+            }
 
-        let force_manual_projection = (residual_filter.is_some()
-            || has_subqueries
-            || group_needs_full_row
-            || has_aggregates)
-            && !plan_for_execution.tables.is_empty();
+            let (pushable_filter, residual_filter) = if let Some(filter) = &plan.filter {
+                Self::split_predicate(&filter.predicate)
+            } else {
+                (None, None)
+            };
 
-        let plan_for_scan = if force_manual_projection {
-            let mut p = plan_for_execution.clone();
-            p.projections = vec![SelectProjection::AllColumns];
-            p.order_by = Vec::new();
-            p
-        } else {
-            plan_for_execution.clone()
-        };
+            let residual_filter_subqueries = if residual_filter.is_some() {
+                plan.filter
+                    .as_ref()
+                    .map(|f| f.subqueries.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
-        let start_logical = std::time::Instant::now();
-        let mut logical_plan = self.logical_planner.create_logical_plan(&plan_for_scan)?;
-        let t_logical = start_logical.elapsed();
+            let mut plan_for_execution = plan.clone();
+            plan_for_execution.filter = pushable_filter.map(|predicate| SelectFilter {
+                predicate,
+                subqueries: plan
+                    .filter
+                    .as_ref()
+                    .map(|f| f.subqueries.clone())
+                    .unwrap_or_default(),
+            });
 
-        let start_inference = std::time::Instant::now();
-        // Ensure the expression output type matches the inferred schema type.
-        // This is necessary because some expressions (like CASE) might evaluate to an untyped NullArray
-        // even if the schema inference determined a specific type (e.g. Int64).
-        // Wrapping in Cast ensures the Executor produces the correct array type.
-        if let LogicalPlan::Single(single_plan) = &mut logical_plan {
-            for proj in &mut single_plan.requested_projections {
-                if let llkv_scan::ScanProjection::Computed { expr, .. } = proj {
-                    if let Ok(inferred_type) =
-                        crate::translation::schema::infer_computed_data_type(&single_plan.schema, expr)
-                    {
-                        if inferred_type != arrow::datatypes::DataType::Null {
-                            match expr {
-                                ScalarExpr::Literal(_)
-                                | ScalarExpr::Column(_)
-                                | ScalarExpr::Cast { .. } => {}
-                                _ => {
-                                    *expr = ScalarExpr::Cast {
-                                        expr: Box::new(expr.clone()),
-                                        data_type: inferred_type,
-                                    };
+            let has_subqueries = plan_for_execution.projections.iter().any(|p| match p {
+                SelectProjection::Computed { expr, .. } => contains_subquery(expr),
+                _ => false,
+            });
+
+            let has_aggregates = !plan_for_execution.aggregates.is_empty()
+                || plan_for_execution.projections.iter().any(|p| match p {
+                    SelectProjection::Computed { expr, .. } => scalar_contains_aggregate(expr),
+                    _ => false,
+                })
+                || plan_for_execution
+                    .having
+                    .as_ref()
+                    .map(|h| contains_aggregate_in_expr(h))
+                    .unwrap_or(false);
+
+            let group_needs_full_row = plan_for_execution.aggregates.is_empty()
+                && !plan_for_execution.group_by.is_empty()
+                && !has_aggregates;
+
+            let force_manual_projection = (residual_filter.is_some()
+                || has_subqueries
+                || group_needs_full_row
+                || has_aggregates)
+                && !plan_for_execution.tables.is_empty();
+
+            let plan_for_scan = if force_manual_projection {
+                let mut p = plan_for_execution.clone();
+                p.projections = vec![SelectProjection::AllColumns];
+                p.order_by = Vec::new();
+                p
+            } else {
+                plan_for_execution.clone()
+            };
+            (plan_for_execution, residual_filter, residual_filter_subqueries, force_manual_projection, plan_for_scan, has_aggregates)
+        });
+        // The variable `res` here shadows the previous `res` from `t_subqueries` block, but wait...
+        // The `measure!` macro returns `(result, duration)`.
+        // So the result of the block is assigned to the first element of the tuple.
+        // In the line above: `let ((...), t_analysis) = ...`
+        // So the variables are ALREADY destructured.
+        // I don't need `let (...) = res;` because `res` is not defined in this scope as the result of THIS measure block.
+        // The previous `res` (line 265) was consumed.
+        
+        // Wait, I see what happened. I copied the destructuring pattern into the `let` binding of `measure!`.
+        // So `plan_for_execution` etc are already defined.
+        // But then I have `let (...) = res;` which is wrong because `res` refers to the result of `subqueries` measure block?
+        // No, `res` from line 265 was consumed by `let (...) = res?;`.
+        // So `res` is not available here unless I re-declared it?
+        // Ah, I see `let (res, t_subqueries) = ...` on line 246.
+        // Then `let (...) = res?;` on line 265.
+        // So `res` is gone.
+        
+        // The error says: `expected enum Result ... found tuple`.
+        // This implies that `res` IS available and has type `Result`.
+        // But where does `res` come from?
+        // Ah, I see. I might have messed up the edit.
+        
+        // Let's look at the code I wrote:
+        // `let ((plan_for_execution, ...), t_analysis) = llkv_perf_monitor::measure!("analysis", { ... });`
+        // This defines `plan_for_execution` etc.
+        // Then I have: `let (plan_for_execution, ...) = res;`
+        // This line is redundant and incorrect because `res` is the result of the PREVIOUS measure block (subqueries), which was already unpacked.
+        // Wait, if `res` was moved, it shouldn't be available.
+        // Unless `res` is `Copy`? `Result` is not Copy usually.
+        
+        // The error message `expected enum Result ... found tuple` suggests that `res` is indeed the Result from `subqueries`.
+        // And I am trying to assign it to a tuple of 6 elements.
+        // But `res` contains `(prepared_scalar_subqueries, filter_subqueries, compound)`.
+        
+        // So I should just DELETE the line `let (...) = res;`.
+        
+        // Let's verify.
+
+
+        let (res, t_logical) = llkv_perf_monitor::measure!("logical_plan", {
+            self.logical_planner.create_logical_plan(&plan_for_scan)
+        });
+        let mut logical_plan = res?;
+
+        let ((), t_inference) = llkv_perf_monitor::measure!("inference", {
+            // Ensure the expression output type matches the inferred schema type.
+            // This is necessary because some expressions (like CASE) might evaluate to an untyped NullArray
+            // even if the schema inference determined a specific type (e.g. Int64).
+            // Wrapping in Cast ensures the Executor produces the correct array type.
+            if let LogicalPlan::Single(single_plan) = &mut logical_plan {
+                for proj in &mut single_plan.requested_projections {
+                    if let llkv_scan::ScanProjection::Computed { expr, .. } = proj {
+                        if let Ok(inferred_type) =
+                            crate::translation::schema::infer_computed_data_type(&single_plan.schema, expr)
+                        {
+                            if inferred_type != arrow::datatypes::DataType::Null {
+                                match expr {
+                                    ScalarExpr::Literal(_)
+                                    | ScalarExpr::Column(_)
+                                    | ScalarExpr::Cast { .. } => {}
+                                    _ => {
+                                        *expr = ScalarExpr::Cast {
+                                            expr: Box::new(expr.clone()),
+                                            data_type: inferred_type,
+                                        };
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        let t_inference = start_inference.elapsed();
+        });
 
-        let start_rewrite = std::time::Instant::now();
-        if force_manual_projection && has_aggregates {
-            match &mut logical_plan {
-                LogicalPlan::Single(single) => {
-                    // When forcing manual projection, the logical plan was created with AllColumns,
-                    // which causes the aggregate rewrite to include all columns in the final output.
-                    // We need to re-compute the rewrite using the original projections.
-                    single.aggregate_rewrite =
-                        build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
-                }
-                LogicalPlan::Multi(multi) => {
-                    let mut infos = Vec::with_capacity(multi.tables.len());
-                    for table_ref in &plan_for_execution.tables {
-                        let table_lower = table_ref.table.to_ascii_lowercase();
-                        let schema_lower = table_ref.schema.to_ascii_lowercase();
-                        let qualified_lower = if schema_lower.is_empty() {
-                            table_lower.clone()
-                        } else {
-                            format!("{}.{}", schema_lower, table_lower)
-                        };
-                        let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
-                        infos.push(TableResolutionInfo {
-                            table_lower,
-                            schema_lower,
-                            qualified_lower,
-                            alias_lower,
-                        });
+        let (res, t_rewrite) = llkv_perf_monitor::measure!("rewrite", {
+            if force_manual_projection && has_aggregates {
+                match &mut logical_plan {
+                    LogicalPlan::Single(single) => {
+                        // When forcing manual projection, the logical plan was created with AllColumns,
+                        // which causes the aggregate rewrite to include all columns in the final output.
+                        // We need to re-compute the rewrite using the original projections.
+                        single.aggregate_rewrite =
+                            build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
                     }
+                    LogicalPlan::Multi(multi) => {
+                        let mut infos = Vec::with_capacity(multi.tables.len());
+                        for table_ref in &plan_for_execution.tables {
+                            let table_lower = table_ref.table.to_ascii_lowercase();
+                            let schema_lower = table_ref.schema.to_ascii_lowercase();
+                            let qualified_lower = if schema_lower.is_empty() {
+                                table_lower.clone()
+                            } else {
+                                format!("{}.{}", schema_lower, table_lower)
+                            };
+                            let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+                            infos.push(TableResolutionInfo {
+                                table_lower,
+                                schema_lower,
+                                qualified_lower,
+                                alias_lower,
+                            });
+                        }
 
-                    let ctx = ResolutionContext {
-                        tables: &multi.tables,
-                        infos: &infos,
-                    };
-                    multi.aggregate_rewrite =
-                        build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
+                        let ctx = ResolutionContext {
+                            tables: &multi.tables,
+                            infos: &infos,
+                        };
+                        multi.aggregate_rewrite =
+                            build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
+                    }
                 }
             }
-        }
-        let t_rewrite = start_rewrite.elapsed();
+            Ok::<_, llkv_result::Error>(())
+        });
+        res?;
 
-        if start.elapsed() > std::time::Duration::from_millis(10) {
-            eprintln!("Slow prepare_select breakdown: Simplify: {:?}, Subqueries: {:?}, Logical: {:?}, Inference: {:?}, Rewrite: {:?}", t_simplify, t_subqueries, t_logical, t_inference, t_rewrite);
-        }
+        llkv_perf_monitor::log_if_slow(
+            &format!("prepare_select breakdown{}", context.map(|c| format!(" ({})", c)).unwrap_or_default()),
+            &[
+                ("Simplify", t_simplify),
+                ("Subqueries", t_subqueries),
+                ("Analysis", t_analysis),
+                ("Logical", t_logical),
+                ("Inference", t_inference),
+                ("Rewrite", t_rewrite),
+            ],
+        );
 
         // let physical_plan = Some(
         //     self.physical_planner

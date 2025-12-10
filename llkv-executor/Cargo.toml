@@ -16,6 +16,10 @@ normal = []
 development = ["llkv-test-utils"]
 build = []
 
+[features]
+default = []
+perf-mon = ["llkv-plan/perf-mon", "llkv-perf-monitor/perf-mon"]
+
 [dependencies]
 arrow = { workspace = true, default-features = false }
 arrow-buffer.workspace = true
@@ -25,6 +29,7 @@ llkv-column-map.workspace = true
 llkv-compute.workspace = true
 llkv-expr.workspace = true
 llkv-join.workspace = true
+llkv-perf-monitor.workspace = true
 llkv-plan.workspace = true
 llkv-result.workspace = true
 llkv-scan.workspace = true

@@ -17,6 +17,10 @@ normal = []
 development = ["llkv-test-utils"]
 build = []
 
+[features]
+default = []
+perf-mon = ["llkv-executor/perf-mon"]
+
 [dependencies]
 arrow = { workspace = true, default-features = false }
 croaring.workspace = true

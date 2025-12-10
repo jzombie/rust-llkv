@@ -239,13 +239,13 @@ where
         let table_id = table.table_id();
         let schema = table.schema();
 
-        let start_proj = std::time::Instant::now();
-        let requested_projections = if plan.projections.is_empty() {
-            build_wildcard_projections(schema, table_id)
-        } else {
-            build_projected_columns(schema, table_id, &plan.projections)?
-        };
-        let t_proj = start_proj.elapsed();
+        let (requested_projections, t_proj) = llkv_perf_monitor::measure!("projections", {
+            if plan.projections.is_empty() {
+                build_wildcard_projections(schema, table_id)
+            } else {
+                build_projected_columns(schema, table_id, &plan.projections)?
+            }
+        });
 
         let mut scan_projections = requested_projections.clone();
         let mut extra_columns: Vec<String> = Vec::new();
@@ -295,13 +295,13 @@ where
         // we must project at least one column for the scan to work.
         // Prefer the primary key, otherwise the first column.
 
-        let start_order = std::time::Instant::now();
-        let OrderResolution {
+        let (OrderResolution {
             scan_projections: order_scan_projections,
             extra_columns: order_extra_columns,
             resolved_order_by,
-        } = resolve_order_by_targets(schema, table_id, &scan_projections, &plan.order_by)?;
-        let t_order = start_order.elapsed();
+        }, t_order) = llkv_perf_monitor::measure!("order_by", {
+            resolve_order_by_targets(schema, table_id, &scan_projections, &plan.order_by)?
+        });
 
         scan_projections = order_scan_projections;
         for col in order_extra_columns {
@@ -313,9 +313,9 @@ where
             }
         }
 
-        let start_agg = std::time::Instant::now();
-        let aggregate_rewrite = build_single_aggregate_rewrite(plan, schema)?;
-        let t_agg = start_agg.elapsed();
+        let (aggregate_rewrite, t_agg) = llkv_perf_monitor::measure!("aggregate_rewrite", {
+            build_single_aggregate_rewrite(plan, schema)?
+        });
 
         if let Some(rewrite) = &aggregate_rewrite {
             let mut rewrite_columns = Vec::new();
@@ -357,30 +357,38 @@ where
             }
         }
 
-        let start_schema = std::time::Instant::now();
-        let scan_schema = schema_for_projections(schema, &scan_projections)?;
-        let final_schema = schema_for_projections(schema, &requested_projections)?;
-        let t_schema = start_schema.elapsed();
+        let ((scan_schema, final_schema), t_schema) = llkv_perf_monitor::measure!("schema", {
+            let scan_schema = schema_for_projections(schema, &scan_projections)?;
+            let final_schema = schema_for_projections(schema, &requested_projections)?;
+            (scan_schema, final_schema)
+        });
 
-        let start_filter = std::time::Instant::now();
-        let filter = match &plan.filter {
-            Some(filter) => {
-                debug!("LogicalPlan filter input: {:?}", filter.predicate);
-                let translated = translate_predicate(
-                    filter.predicate.clone(),
-                    schema,
-                    |_| Error::Internal("Unknown column".to_string()),
-                )?;
-                debug!("LogicalPlan filter translated: {:?}", translated);
-                Some(translated)
-            },
-            None => None,
-        };
-        let t_filter = start_filter.elapsed();
+        let (filter, t_filter) = llkv_perf_monitor::measure!("filter", {
+            match &plan.filter {
+                Some(filter) => {
+                    debug!("LogicalPlan filter input: {:?}", filter.predicate);
+                    let translated = translate_predicate(
+                        filter.predicate.clone(),
+                        schema,
+                        |_| Error::Internal("Unknown column".to_string()),
+                    )?;
+                    debug!("LogicalPlan filter translated: {:?}", translated);
+                    Some(translated)
+                },
+                None => None,
+            }
+        });
 
-        // if start.elapsed() > std::time::Duration::from_millis(10) {
-            eprintln!("Slow create_logical_plan breakdown: Proj: {:?}, Order: {:?}, Agg: {:?}, Schema: {:?}, Filter: {:?}", t_proj, t_order, t_agg, t_schema, t_filter);
-        // }
+        llkv_perf_monitor::log_if_slow(
+            "create_logical_plan breakdown",
+            &[
+                ("Proj", t_proj),
+                ("Order", t_order),
+                ("Agg", t_agg),
+                ("Schema", t_schema),
+                ("Filter", t_filter),
+            ],
+        );
 
         let plan_schema = Arc::new(schema.clone());
 
@@ -451,13 +459,13 @@ where
         // Reorder tables using greedy algorithm to avoid cross joins
         // Only reorder if there are no explicit joins, as explicit joins enforce a specific order
         // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
-        let start_reorder = std::time::Instant::now();
-        let table_pairs = if plan.joins.is_empty() {
-            reorder_tables_greedy(self.provider.as_ref(), table_pairs, &initial_infos, plan.filter.as_ref().map(|f| &f.predicate))
-        } else {
-            table_pairs
-        };
-        let t_reorder = start_reorder.elapsed();
+        let (table_pairs, t_reorder) = llkv_perf_monitor::measure!("reorder_tables", {
+            if plan.joins.is_empty() {
+                reorder_tables_greedy(self.provider.as_ref(), table_pairs, &initial_infos, plan.filter.as_ref().map(|f| &f.predicate))
+            } else {
+                table_pairs
+            }
+        });
 
         debug!("Planned tables order:");
         for (i, (table, table_ref)) in table_pairs.iter().enumerate() {
@@ -484,35 +492,40 @@ where
             });
         }
 
-        let start_req = std::time::Instant::now();
-        let (resolved_columns, unresolved_required) =
-            resolve_required_columns(plan, &planned_tables, &infos);
-        let t_req = start_req.elapsed();
+        let ((resolved_columns, unresolved_required), t_req) = llkv_perf_monitor::measure!("resolve_required_columns", {
+            resolve_required_columns(plan, &planned_tables, &infos)
+        });
 
         let ctx = ResolutionContext {
             tables: &planned_tables,
             infos: &infos,
         };
 
-        let start_filter = std::time::Instant::now();
-        let filter = match &plan.filter {
-            Some(filter) => Some(resolve_predicate(&ctx, &filter.predicate)?),
-            None => None,
-        };
-        let t_filter = start_filter.elapsed();
+        let (filter, t_filter) = llkv_perf_monitor::measure!("resolve_filter", {
+            match &plan.filter {
+                Some(filter) => Some(resolve_predicate(&ctx, &filter.predicate)?),
+                None => None,
+            }
+        });
 
         let having = match &plan.having {
             Some(having) => Some(resolve_predicate(&ctx, having)?),
             None => None,
         };
 
-        let start_proj = std::time::Instant::now();
-        let projections = resolve_projections(plan, &ctx)?;
-        let t_proj = start_proj.elapsed();
+        let (projections, t_proj) = llkv_perf_monitor::measure!("resolve_projections", {
+            resolve_projections(plan, &ctx)?
+        });
 
-        if t_req > std::time::Duration::from_millis(1) || t_filter > std::time::Duration::from_millis(1) || t_proj > std::time::Duration::from_millis(1) || t_reorder > std::time::Duration::from_millis(1) {
-            eprintln!("Slow plan_multi_table breakdown: Reorder: {:?}, Req: {:?}, Filter: {:?}, Proj: {:?}", t_reorder, t_req, t_filter, t_proj);
-        }
+        llkv_perf_monitor::log_if_slow(
+            "plan_multi_table breakdown",
+            &[
+                ("Reorder", t_reorder),
+                ("Req", t_req),
+                ("Filter", t_filter),
+                ("Proj", t_proj),
+            ],
+        );
 
         let aggregates = resolve_aggregates(plan, &ctx)?;
 

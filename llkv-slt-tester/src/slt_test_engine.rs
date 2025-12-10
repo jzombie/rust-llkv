@@ -373,13 +373,16 @@ impl AsyncDB for EngineHarness {
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         tracing::debug!("[HARNESS] run() called, sql=\"{}\"", sql.trim());
-        let start_plan = std::time::Instant::now();
-        match self.engine.execute(sql) {
+        llkv_perf_monitor::set_context(sql);
+        
+        let (results, plan_duration) = llkv_perf_monitor::measure!("execute", {
+            self.engine.execute(sql)
+        });
+        
+        match results {
             Ok(mut results) => {
-                let plan_duration = start_plan.elapsed();
                 if results.is_empty() {
-                    let duration = start_plan.elapsed();
-                    record_statement(sql, duration, "EMPTY");
+                    record_statement(sql, plan_duration, "EMPTY");
                     return Ok(DBOutput::StatementComplete(0));
                 }
                 let mut result = results.remove(0);
@@ -396,13 +399,19 @@ impl AsyncDB for EngineHarness {
                 }
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
-                        let start_exec = std::time::Instant::now();
-                        let batches = execution.collect()?;
-                        let exec_duration = start_exec.elapsed();
+                        let (batches, exec_duration) = llkv_perf_monitor::measure!("collect", {
+                            execution.collect()
+                        });
+                        let batches = batches?;
 
-                        if plan_duration.as_millis() > 10 || exec_duration.as_millis() > 10 {
-                            println!("Slow query: {} | Plan: {:?} | Exec: {:?}", sql.trim().lines().next().unwrap_or(""), plan_duration, exec_duration);
-                        }
+                        llkv_perf_monitor::log_if_slow(
+                            "query execution",
+                            &[
+                                ("Plan", plan_duration),
+                                ("Collect", exec_duration),
+                                ("Total", plan_duration + exec_duration),
+                            ],
+                        );
                         record_query(sql, plan_duration + exec_duration, "SELECT");
 
                         let mut expected_types = expectations::take();
@@ -615,8 +624,7 @@ impl AsyncDB for EngineHarness {
                         Ok(DBOutput::Rows { types, rows })
                     }
                     RuntimeStatementResult::Insert { rows_inserted, .. } => {
-                        let duration = start_plan.elapsed();
-                        record_statement(sql, duration, "INSERT");
+                        record_statement(sql, plan_duration, "INSERT");
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -629,8 +637,7 @@ impl AsyncDB for EngineHarness {
                         }
                     }
                     RuntimeStatementResult::Update { rows_updated, .. } => {
-                        let duration = start_plan.elapsed();
-                        record_statement(sql, duration, "UPDATE");
+                        record_statement(sql, plan_duration, "UPDATE");
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -643,8 +650,7 @@ impl AsyncDB for EngineHarness {
                         }
                     }
                     RuntimeStatementResult::Delete { rows_deleted, .. } => {
-                        let duration = start_plan.elapsed();
-                        record_statement(sql, duration, "DELETE");
+                        record_statement(sql, plan_duration, "DELETE");
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -660,15 +666,13 @@ impl AsyncDB for EngineHarness {
                     | RuntimeStatementResult::CreateIndex { .. }
                     | RuntimeStatementResult::Transaction { .. }
                     | RuntimeStatementResult::NoOp => {
-                        let duration = start_plan.elapsed();
-                        record_statement(sql, duration, "DDL/TXN");
+                        record_statement(sql, plan_duration, "DDL/TXN");
                         Ok(DBOutput::StatementComplete(0))
                     }
                 }
             }
             Err(e) => {
-                let duration = start_plan.elapsed();
-                record_statement(sql, duration, "ERROR");
+                record_statement(sql, plan_duration, "ERROR");
                 Err(e)
             }
         }

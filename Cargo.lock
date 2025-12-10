@@ -1686,6 +1686,7 @@ dependencies = [
  "llkv-compute",
  "llkv-expr",
  "llkv-join",
+ "llkv-perf-monitor",
  "llkv-plan",
  "llkv-result",
  "llkv-scan",
@@ -1735,6 +1736,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "llkv-perf-monitor"
+version = "0.8.5-alpha"
+
+[[package]]
 name = "llkv-plan"
 version = "0.8.5-alpha"
 dependencies = [
@@ -1742,6 +1747,7 @@ dependencies = [
  "llkv-column-map",
  "llkv-compute",
  "llkv-expr",
+ "llkv-perf-monitor",
  "llkv-result",
  "llkv-scan",
  "llkv-storage",
@@ -1820,6 +1826,7 @@ dependencies = [
  "criterion",
  "indoc",
  "libtest-mimic",
+ "llkv-perf-monitor",
  "llkv-result",
  "llkv-runtime",
  "llkv-sql",
@@ -1843,6 +1850,7 @@ dependencies = [
  "llkv-compute",
  "llkv-executor",
  "llkv-expr",
+ "llkv-perf-monitor",
  "llkv-plan",
  "llkv-result",
  "llkv-runtime",

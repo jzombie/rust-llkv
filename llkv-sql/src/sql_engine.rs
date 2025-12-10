@@ -1081,37 +1081,40 @@ impl SqlEngine {
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
-        let start_preprocess = std::time::Instant::now();
-        // Preprocess SQL
-        let processed_sql = Self::preprocess_sql_input(sql);
-        let preprocess_duration = start_preprocess.elapsed();
+        let (processed_sql, preprocess_duration) = llkv_perf_monitor::measure!("preprocess", {
+            Self::preprocess_sql_input(sql)
+        });
 
-        let start_parse = std::time::Instant::now();
-        let dialect = GenericDialect {};
-        let statements = match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
-            Ok(stmts) => stmts,
-            Err(parse_err) => {
-                // SQLite allows omitting BEFORE/AFTER and FOR EACH ROW in CREATE TRIGGER.
-                // If parsing fails and the SQL contains CREATE TRIGGER, attempt to expand
-                // the shorthand form and retry. This is a workaround until sqlparser's
-                // SQLite dialect properly supports the abbreviated syntax.
-                if processed_sql.to_uppercase().contains("CREATE TRIGGER") {
-                    let expanded = Self::preprocess_sqlite_trigger_shorthand(&processed_sql);
-                    parse_sql_with_recursion_limit(&dialect, &expanded).map_err(|_| {
-                        Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}"))
-                    })?
-                } else {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "failed to parse SQL: {parse_err}"
-                    )));
+        let (statements, parse_duration) = llkv_perf_monitor::measure!("parse", {
+            let dialect = GenericDialect {};
+            match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
+                Ok(stmts) => stmts,
+                Err(parse_err) => {
+                    // SQLite allows omitting BEFORE/AFTER and FOR EACH ROW in CREATE TRIGGER.
+                    // If parsing fails and the SQL contains CREATE TRIGGER, attempt to expand
+                    // the shorthand form and retry. This is a workaround until sqlparser's
+                    // SQLite dialect properly supports the abbreviated syntax.
+                    if processed_sql.to_uppercase().contains("CREATE TRIGGER") {
+                        let expanded = Self::preprocess_sqlite_trigger_shorthand(&processed_sql);
+                        parse_sql_with_recursion_limit(&dialect, &expanded).map_err(|_| {
+                            Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}"))
+                        })?
+                    } else {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "failed to parse SQL: {parse_err}"
+                        )));
+                    }
                 }
             }
-        };
-        let parse_duration = start_parse.elapsed();
+        });
 
-        if preprocess_duration.as_millis() > 5 || parse_duration.as_millis() > 5 {
-             println!("Slow parse/preprocess: Preprocess: {:?} | Parse: {:?}", preprocess_duration, parse_duration);
-        }
+        llkv_perf_monitor::log_if_slow(
+            "parse/preprocess",
+            &[
+                ("Preprocess", preprocess_duration),
+                ("Parse", parse_duration),
+            ],
+        );
 
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements.iter() {
@@ -1136,12 +1139,15 @@ impl SqlEngine {
                 _ => {
                     // Flush before any non-INSERT
                     let mut flushed = self.flush_buffer_results()?;
-                    let start_exec_stmt = std::time::Instant::now();
-                    let current = self.execute_statement(statement.clone())?;
-                    let exec_stmt_duration = start_exec_stmt.elapsed();
-                    if exec_stmt_duration.as_millis() > 10 {
-                        println!("Slow execute_statement: {:?}", exec_stmt_duration);
-                    }
+                    let (current, exec_stmt_duration) = llkv_perf_monitor::measure!("execute_statement", {
+                        self.execute_statement(statement.clone())?
+                    });
+                    
+                    llkv_perf_monitor::log_if_slow(
+                        "execute_statement",
+                        &[("Exec", exec_stmt_duration)],
+                    );
+
                     results.push(current);
                     results.append(&mut flushed);
                 }
@@ -5118,19 +5124,17 @@ impl SqlEngine {
             return Ok(result);
         }
 
-        let start_build = std::time::Instant::now();
-        let select_plan = self.build_select_plan(query)?;
-        let build_duration = start_build.elapsed();
-        if build_duration.as_millis() > 10 {
-            println!("Slow build_select_plan: {:?}", build_duration);
-        }
+        let (select_plan, build_duration) = llkv_perf_monitor::measure!("build_select_plan", {
+            self.build_select_plan(query)?
+        });
+        
+        llkv_perf_monitor::log_if_slow("build_select_plan", &[("Build", build_duration)]);
 
-        let start_exec_plan = std::time::Instant::now();
-        let res = self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)));
-        let exec_plan_duration = start_exec_plan.elapsed();
-        if exec_plan_duration.as_millis() > 10 {
-            println!("Slow execute_plan_statement: {:?}", exec_plan_duration);
-        }
+        let (res, exec_plan_duration) = llkv_perf_monitor::measure!("execute_plan_statement", {
+            self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)))
+        });
+        
+        llkv_perf_monitor::log_if_slow("execute_plan_statement", &[("Exec", exec_plan_duration)]);
         res
     }
 
