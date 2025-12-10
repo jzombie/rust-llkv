@@ -32,6 +32,7 @@ struct Measurement {
 struct ReportNode {
     label: String,
     duration: Duration,
+    hits: usize,
     children: BTreeMap<String, ReportNode>,
 }
 
@@ -40,19 +41,21 @@ impl ReportNode {
         Self {
             label: label.into(),
             duration: Duration::ZERO,
+            hits: 0,
             children: BTreeMap::new(),
         }
     }
 
-    fn insert(&mut self, path: Vec<&str>, duration: Duration) {
+    fn insert(&mut self, path: &[&str], duration: Duration) {
+        self.hits = self.hits.saturating_add(1);
         if let Some((head, tail)) = path.split_first() {
             let child = self
                 .children
                 .entry((*head).to_string())
                 .or_insert_with(|| ReportNode::new(*head));
-            child.insert(tail.to_vec(), duration);
+            child.insert(tail, duration);
         } else {
-            self.duration += duration;
+            self.duration = self.duration.saturating_add(duration);
         }
     }
 
@@ -205,7 +208,8 @@ impl PerfContext {
             .into_iter()
             .filter(|(label, _)| label != "query_total")
         {
-            root.insert(label.split(':').collect::<Vec<_>>(), duration);
+            let label_parts: Vec<_> = label.split(':').collect();
+            root.insert(&label_parts, duration);
         }
 
         let root_total = root.total_duration();
@@ -308,9 +312,14 @@ fn write_node(
         output.push_str(line_sep);
         output.push_str(line_sep);
     } else {
+        let hits_suffix = if node.hits > 1 {
+            format!(" [hits={}]", node.hits)
+        } else {
+            String::new()
+        };
         output.push_str(&format!(
-            "{prefix}{connector}{}: {duration_ms:.3}ms ({pct:.1}%){}",
-            node.label, line_sep
+            "{prefix}{connector}{}{}: {duration_ms:.3}ms ({pct:.1}%){}",
+            node.label, hits_suffix, line_sep
         ));
     }
 
