@@ -30,6 +30,7 @@ llkv-runtime.workspace = true
 llkv-sql.workspace = true
 llkv-storage.workspace = true
 llkv-perf-monitor.workspace = true
+llkv-types.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
 sqllogictest.workspace = true

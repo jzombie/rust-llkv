@@ -8,6 +8,7 @@ pub mod decimal;
 pub mod ids;
 pub mod interval;
 pub mod literal;
+pub mod query_context;
 
 pub use canonical::{CanonicalRow, CanonicalScalar};
 pub use decimal::{DecimalError, DecimalValue};
@@ -17,3 +18,4 @@ pub use ids::{
 };
 pub use interval::IntervalValue;
 pub use literal::{FromLiteral, Literal, LiteralCastError, LiteralExt};
+pub use query_context::{QueryContext, begin_query};

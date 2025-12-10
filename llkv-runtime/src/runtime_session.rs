@@ -25,6 +25,7 @@ use crate::{
     TEMPORARY_NAMESPACE_ID, TemporaryRuntimeNamespace,
 };
 use llkv_plan::TruncatePlan;
+use llkv_types::QueryContext;
 
 type StatementResult = RuntimeStatementResult<BoxedPager>;
 type TxnResult = TransactionResult<BoxedPager>;
@@ -333,6 +334,7 @@ impl RuntimeSession {
         &self,
         namespace: Arc<TemporaryRuntimeNamespace>,
         plan: SelectPlan,
+        ctx: &QueryContext,
     ) -> Result<StatementResult> {
         let table_name = if plan.tables.len() == 1 {
             plan.tables[0].qualified_name()
@@ -342,7 +344,7 @@ impl RuntimeSession {
 
         let context = namespace.context();
         let temp_tx_context = self.new_temp_tx_context(context);
-        let execution = TransactionContext::execute_select(&temp_tx_context, plan)?;
+        let execution = TransactionContext::execute_select_with_ctx(&temp_tx_context, plan, ctx)?;
         let schema = execution.schema();
         let batches = execution.collect()?;
 
@@ -801,24 +803,32 @@ impl RuntimeSession {
 
     /// Select rows (outside or inside transaction).
     pub fn execute_select_plan(&self, plan: SelectPlan) -> Result<StatementResult> {
+        self.execute_select_plan_with_ctx(plan, &QueryContext::new())
+    }
+
+    pub fn execute_select_plan_with_ctx(
+        &self,
+        plan: SelectPlan,
+        ctx: &QueryContext,
+    ) -> Result<StatementResult> {
         if let Some(namespace_id) = self.namespace_for_select_plan(&plan) {
             if namespace_id == TEMPORARY_NAMESPACE_ID {
                 let namespace = self
                     .temporary_namespace()
                     .ok_or_else(|| Error::Internal("temporary namespace unavailable".into()))?;
-                return self.select_from_namespace(namespace, plan);
+                return self.select_from_namespace(namespace, plan, ctx);
             }
             if namespace_id == INFORMATION_SCHEMA_NAMESPACE_ID {
                 let namespace = self.information_schema_namespace();
-                return self.select_from_namespace(namespace, plan);
+                return self.select_from_namespace(namespace, plan, ctx);
             }
         }
 
         if self.has_active_transaction() {
-            let tx_result = match self
-                .inner
-                .execute_operation(PlanOperation::Select(Box::new(plan.clone())))
-            {
+            let tx_result = match self.inner.execute_operation_with_ctx(
+                PlanOperation::Select(Box::new(plan.clone())),
+                ctx,
+            ) {
                 Ok(result) => result,
                 Err(e) => {
                     // Only abort transaction on specific errors (constraint violations, etc.)
@@ -868,8 +878,8 @@ impl RuntimeSession {
             } else {
                 String::new()
             };
-            let execution = self.with_autocommit_transaction_context(|ctx| {
-                TransactionContext::execute_select(ctx, plan)
+            let execution = self.with_autocommit_transaction_context(|txn_ctx| {
+                TransactionContext::execute_select_with_ctx(txn_ctx, plan, ctx)
             })?;
             let schema = execution.schema();
             Ok(RuntimeStatementResult::Select {

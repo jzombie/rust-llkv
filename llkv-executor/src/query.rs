@@ -249,6 +249,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use crate::ExecutorResult;
 use crate::types::{ExecutorTable, ExecutorTableProvider};
 use llkv_join::HashJoinStream;
+use llkv_types::QueryContext;
 
 pub type BatchIter = Box<dyn Iterator<Item = ExecutorResult<RecordBatch>> + Send>;
 /// Plan-driven SELECT executor bridging planner output to storage.
@@ -608,20 +609,21 @@ where
         expr: &Expr<'_, String>,
         prepared_subqueries: &[PreparedScalarSubquery<P>],
         cache: &mut FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
+        ctx: &QueryContext,
     ) -> ExecutorResult<Expr<'static, String>> {
         match expr {
             Expr::And(list) => Ok(Expr::And(
                 list.iter()
-                    .map(|e| self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache))
+                    .map(|e| self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache, ctx))
                     .collect::<ExecutorResult<Vec<_>>>()?,
             )),
             Expr::Or(list) => Ok(Expr::Or(
                 list.iter()
-                    .map(|e| self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache))
+                    .map(|e| self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache, ctx))
                     .collect::<ExecutorResult<Vec<_>>>()?,
             )),
             Expr::Not(e) => Ok(Expr::Not(Box::new(
-                self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache)?,
+                self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache, ctx)?,
             ))),
             Expr::Pred(f) => {
                 let op = match &f.op {
@@ -668,12 +670,13 @@ where
                 }))
             }
             Expr::Compare { left, op, right } => Ok(Expr::Compare {
-                left: self.rewrite_scalar_subqueries_with_exec(left, prepared_subqueries, cache)?,
+                left: self.rewrite_scalar_subqueries_with_exec(left, prepared_subqueries, cache, ctx)?,
                 op: *op,
                 right: self.rewrite_scalar_subqueries_with_exec(
                     right,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?,
             }),
             Expr::InList {
@@ -681,17 +684,17 @@ where
                 list,
                 negated,
             } => Ok(Expr::InList {
-                expr: self.rewrite_scalar_subqueries_with_exec(expr, prepared_subqueries, cache)?,
+                expr: self.rewrite_scalar_subqueries_with_exec(expr, prepared_subqueries, cache, ctx)?,
                 list: list
                     .iter()
                     .map(|e| {
-                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache)
+                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache, ctx)
                     })
                     .collect::<ExecutorResult<Vec<_>>>()?,
                 negated: *negated,
             }),
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-                expr: self.rewrite_scalar_subqueries_with_exec(expr, prepared_subqueries, cache)?,
+                expr: self.rewrite_scalar_subqueries_with_exec(expr, prepared_subqueries, cache, ctx)?,
                 negated: *negated,
             }),
             Expr::Literal(b) => Ok(Expr::Literal(*b)),
@@ -705,6 +708,7 @@ where
         expr: &ScalarExpr<F>,
         prepared_subqueries: &[PreparedScalarSubquery<P>],
         cache: &mut FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
+        ctx: &QueryContext,
     ) -> ExecutorResult<ScalarExpr<F>> {
         match expr {
             ScalarExpr::ScalarSubquery(s) => {
@@ -714,7 +718,7 @@ where
 
                 if let Some(def) = prepared_subqueries.iter().find(|p| p.id == s.id) {
                     if let Some(plan) = &def.prepared_plan {
-                        let exec = self.execute_prepared_select(plan)?;
+                        let exec = self.execute_prepared_select(plan, ctx)?;
                         let batches = exec.collect()?;
 
                         let mut result_val = None;
@@ -749,22 +753,25 @@ where
                     left,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?),
                 op: *op,
                 right: Box::new(self.rewrite_scalar_subqueries_with_exec(
                     right,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?),
             }),
             ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(
-                self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache)?,
+                self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache, ctx)?,
             ))),
             ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
                 expr: Box::new(self.rewrite_scalar_subqueries_with_exec(
                     expr,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?),
                 negated: *negated,
             }),
@@ -773,6 +780,7 @@ where
                     expr,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?),
                 data_type: data_type.clone(),
             }),
@@ -781,19 +789,21 @@ where
                     left,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?),
                 op: *op,
                 right: Box::new(self.rewrite_scalar_subqueries_with_exec(
                     right,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?),
             }),
             ScalarExpr::Coalesce(exprs) => Ok(ScalarExpr::Coalesce(
                 exprs
                     .iter()
                     .map(|e| {
-                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache)
+                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache, ctx)
                     })
                     .collect::<ExecutorResult<Vec<_>>>()?,
             )),
@@ -805,7 +815,7 @@ where
                 operand: operand
                     .as_ref()
                     .map(|o| {
-                        self.rewrite_scalar_subqueries_with_exec(o, prepared_subqueries, cache)
+                        self.rewrite_scalar_subqueries_with_exec(o, prepared_subqueries, cache, ctx)
                     })
                     .transpose()?
                     .map(Box::new),
@@ -817,11 +827,13 @@ where
                                 w,
                                 prepared_subqueries,
                                 cache,
+                                ctx,
                             )?,
                             self.rewrite_scalar_subqueries_with_exec(
                                 t,
                                 prepared_subqueries,
                                 cache,
+                                ctx,
                             )?,
                         ))
                     })
@@ -829,7 +841,7 @@ where
                 else_expr: else_expr
                     .as_ref()
                     .map(|e| {
-                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache)
+                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache, ctx)
                     })
                     .transpose()?
                     .map(Box::new),
@@ -839,6 +851,7 @@ where
                     base,
                     prepared_subqueries,
                     cache,
+                    ctx,
                 )?),
                 field_name: field_name.clone(),
             }),
@@ -886,13 +899,14 @@ where
     fn execute_prepared_scalar_subqueries(
         &self,
         subqueries: &[PreparedScalarSubquery<P>],
+        ctx: &QueryContext,
     ) -> ExecutorResult<FxHashMap<SubqueryId, Literal>> {
         let mut results = FxHashMap::default();
         for sub in subqueries {
             let Some(plan) = &sub.prepared_plan else {
                 continue;
             };
-            let execution = self.execute_prepared_select(plan)?;
+            let execution = self.execute_prepared_select(plan, ctx)?;
             let batches = execution.collect()?;
 
             let mut result_val = None;
@@ -2069,11 +2083,12 @@ where
     fn execute_compound_prepared(
         &self,
         compound: &PreparedCompoundSelect<P>,
+        ctx: &QueryContext,
     ) -> ExecutorResult<SelectExecution<P>> {
-        let mut current_exec = self.execute_prepared_select(&compound.initial)?;
+        let mut current_exec = self.execute_prepared_select(&compound.initial, ctx)?;
 
         for op in &compound.operations {
-            let next_exec = self.execute_prepared_select(&op.plan)?;
+            let next_exec = self.execute_prepared_select(&op.plan, ctx)?;
 
             // Ensure schemas match
             if current_exec.schema().fields().len() != next_exec.schema().fields().len() {
@@ -2269,7 +2284,7 @@ where
     }
 
     pub fn execute_select(&self, plan: SelectPlan) -> ExecutorResult<SelectExecution<P>> {
-        self.execute_select_with_row_filter(plan, None)
+        self.execute_select_with_row_filter_ctx(plan, None, &QueryContext::new())
     }
 
     pub fn execute_select_with_row_filter(
@@ -2277,19 +2292,24 @@ where
         plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
     ) -> ExecutorResult<SelectExecution<P>> {
-        let (prepared, t_prepare) = llkv_perf_monitor::measure!("prepare_select", {
+        self.execute_select_with_row_filter_ctx(plan, row_filter, &QueryContext::new())
+    }
+
+    pub fn execute_select_with_row_filter_ctx(
+        &self,
+        plan: SelectPlan,
+        row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+        ctx: &QueryContext,
+    ) -> ExecutorResult<SelectExecution<P>> {
+        let (prepared, _t_prepare) = llkv_perf_monitor::measure!(ctx, "prepare_select", {
             self.planner
-                .prepare_select(plan, row_filter, None)
+                .prepare_select(plan, row_filter, None, ctx)
                 .map_err(Error::from)?
         });
 
-        llkv_perf_monitor::log_if_slow("prepare_select", &[("Prepare", t_prepare)]);
-
-        let (result, t_exec) = llkv_perf_monitor::measure!("execute_prepared_select", {
-            self.execute_prepared_select(&prepared)
+        let (result, _t_exec) = llkv_perf_monitor::measure!(ctx, "execute_prepared_select", {
+            self.execute_prepared_select(&prepared, ctx)
         });
-
-        llkv_perf_monitor::log_if_slow("execute_prepared_select", &[("Exec", t_exec)]);
 
         result
     }
@@ -2297,6 +2317,7 @@ where
     pub fn execute_prepared_select(
         &self,
         prepared: &PreparedSelectPlan<P>,
+        ctx: &QueryContext,
     ) -> ExecutorResult<SelectExecution<P>> {
         if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
             eprintln!(
@@ -2305,8 +2326,8 @@ where
             );
         }
         let subquery_results =
-            self.execute_prepared_scalar_subqueries(&prepared.scalar_subqueries)?;
-        self.execute_prepared_with_filter(prepared, &subquery_results)
+            self.execute_prepared_scalar_subqueries(&prepared.scalar_subqueries, ctx)?;
+        self.execute_prepared_with_filter(prepared, &subquery_results, ctx)
     }
 
     fn create_physical_plan(
@@ -2926,9 +2947,10 @@ where
         &self,
         prepared: &PreparedSelectPlan<P>,
         subquery_results: &FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
+        ctx: &QueryContext,
     ) -> ExecutorResult<SelectExecution<P>> {
         if let Some(compound) = &prepared.compound {
-            return self.execute_compound_prepared(compound);
+            return self.execute_compound_prepared(compound, ctx);
         }
 
         let mut plan = prepared.plan.clone();
@@ -2944,6 +2966,7 @@ where
                         expr,
                         &prepared.scalar_subqueries,
                         &mut scalar_subquery_cache,
+                        ctx,
                     )?;
                     new_projections.push(llkv_plan::plans::SelectProjection::Computed {
                         expr: rewritten,
@@ -2969,6 +2992,7 @@ where
                 &filter.predicate,
                 &prepared.scalar_subqueries,
                 &mut scalar_subquery_cache,
+                ctx,
             )?;
         }
 
@@ -2978,6 +3002,7 @@ where
                 having,
                 &prepared.scalar_subqueries,
                 &mut scalar_subquery_cache,
+                ctx,
             )?;
         }
 
@@ -3046,16 +3071,23 @@ where
                     eprintln!("[executor] aggregate_rewrite: {:?}", aggregate_rewrite);
                 }
 
-                let physical_plan = self.create_physical_plan(
-                    &prepared.logical_plan,
-                    plan.having.as_ref(),
-                    row_filter,
-                )?;
+                let (physical_plan, _t_physical) =
+                    llkv_perf_monitor::measure!(ctx, "create_physical_plan", {
+                        self.create_physical_plan(
+                            &prepared.logical_plan,
+                            plan.having.as_ref(),
+                            row_filter,
+                        )
+                    });
+                let physical_plan = physical_plan?;
 
                 let schema = physical_plan.schema();
 
-                let mut base_iter: BatchIter =
-                    self.execute_physical_plan_tree(physical_plan, subquery_results)?;
+                let (mut base_iter, _t_exec_plan) =
+                    llkv_perf_monitor::measure!(ctx, "execute_physical_plan", {
+                        self.execute_physical_plan_tree(physical_plan, subquery_results)
+                    });
+                let mut base_iter = base_iter?;
 
                 if let Some(residual) = &residual_filter {
                     base_iter = self.apply_residual_filter(

@@ -5,6 +5,7 @@ use llkv_expr::{AggregateCall, Expr as LlkvExpr};
 use llkv_result::Result;
 use llkv_scan::RowIdFilter;
 use llkv_storage::pager::Pager;
+use llkv_types::QueryContext;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::aggregate_rewrite::build_single_aggregate_rewrite;
@@ -83,7 +84,8 @@ where
         &self,
         plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
-        context: Option<&str>,
+        _context: Option<&str>,
+        ctx: &QueryContext,
     ) -> Result<PreparedSelectPlan<P>>;
 }
 
@@ -110,6 +112,7 @@ where
     fn prepare_scalar_subqueries(
         &self,
         subs: &[ScalarSubquery],
+        ctx: &QueryContext,
     ) -> Result<Vec<PreparedScalarSubquery<P>>> {
         let mut prepared = Vec::with_capacity(subs.len());
         for sub in subs {
@@ -118,6 +121,7 @@ where
                     (*sub.plan).clone(),
                     None,
                     Some(&format!("scalar subquery {:?}", sub.id)),
+                    ctx,
                 )?))
             } else {
                 None
@@ -135,6 +139,7 @@ where
     fn prepare_filter_subqueries(
         &self,
         subs: &[FilterSubquery],
+        ctx: &QueryContext,
     ) -> Result<Vec<PreparedFilterSubquery<P>>> {
         let mut prepared = Vec::with_capacity(subs.len());
         for sub in subs {
@@ -143,6 +148,7 @@ where
                     (*sub.plan).clone(),
                     None,
                     Some(&format!("filter subquery {:?}", sub.id)),
+                    ctx,
                 )?))
             } else {
                 None
@@ -161,11 +167,13 @@ where
         &self,
         compound: &CompoundSelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+        ctx: &QueryContext,
     ) -> Result<PreparedCompoundSelect<P>> {
         let initial = Box::new(self.prepare_select(
             (*compound.initial).clone(),
             row_filter.clone(),
             Some("compound initial"),
+            ctx,
         )?);
         let mut operations = Vec::with_capacity(compound.operations.len());
         for op in &compound.operations {
@@ -176,6 +184,7 @@ where
                     op.plan.clone(),
                     row_filter.clone(),
                     Some(&format!("compound {:?}", op.operator)),
+                    ctx,
                 )?),
             });
         }
@@ -230,9 +239,10 @@ where
         &self,
         mut plan: SelectPlan,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
-        context: Option<&str>,
+        _context: Option<&str>,
+        ctx: &QueryContext,
     ) -> Result<PreparedSelectPlan<P>> {
-        let ((), t_simplify) = llkv_perf_monitor::measure!("simplify", {
+        let ((), _t_simplify) = llkv_perf_monitor::measure!(ctx, "simplify", {
             // Simplify projection expressions to remove dead code (e.g. NULLIF(NULL, col))
             for proj in &mut plan.projections {
                 if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
@@ -246,21 +256,21 @@ where
             }
         });
 
-        let (res, t_subqueries) = llkv_perf_monitor::measure!("subqueries", {
+        let (res, _t_subqueries) = llkv_perf_monitor::measure!(ctx, "subqueries", {
             let prepared_scalar_subqueries =
-                self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
+                self.prepare_scalar_subqueries(&plan.scalar_subqueries, ctx)?;
 
             let filter_subqueries = plan
                 .filter
                 .as_ref()
-                .map(|f| self.prepare_filter_subqueries(&f.subqueries))
+                .map(|f| self.prepare_filter_subqueries(&f.subqueries, ctx))
                 .transpose()?
                 .unwrap_or_default();
 
             let compound = plan
                 .compound
                 .as_ref()
-                .map(|c| self.prepare_compound(c, row_filter.clone()))
+                .map(|c| self.prepare_compound(c, row_filter.clone(), ctx))
                 .transpose()?;
 
             Ok::<_, llkv_result::Error>((prepared_scalar_subqueries, filter_subqueries, compound))
@@ -276,8 +286,8 @@ where
                 plan_for_scan,
                 has_aggregates,
             ),
-            t_analysis,
-        ) = llkv_perf_monitor::measure!("analysis", {
+            _t_analysis,
+        ) = llkv_perf_monitor::measure!(ctx, "analysis", {
             // Simplify WHERE clause
             if let Some(filter) = &mut plan.filter {
                 filter.predicate = simplify_expr(filter.predicate.clone());
@@ -389,12 +399,13 @@ where
 
         // Let's verify.
 
-        let (res, t_logical) = llkv_perf_monitor::measure!("logical_plan", {
-            self.logical_planner.create_logical_plan(&plan_for_scan)
+        let (res, _t_logical) = llkv_perf_monitor::measure!(ctx, "logical_plan", {
+            self.logical_planner
+                .create_logical_plan(&plan_for_scan, ctx)
         });
         let mut logical_plan = res?;
 
-        let ((), t_inference) = llkv_perf_monitor::measure!("inference", {
+        let ((), _t_inference) = llkv_perf_monitor::measure!(ctx, "inference", {
             // Ensure the expression output type matches the inferred schema type.
             // This is necessary because some expressions (like CASE) might evaluate to an untyped NullArray
             // even if the schema inference determined a specific type (e.g. Int64).
@@ -427,7 +438,7 @@ where
             }
         });
 
-        let (res, t_rewrite) = llkv_perf_monitor::measure!("rewrite", {
+        let (res, _t_rewrite) = llkv_perf_monitor::measure!(ctx, "rewrite", {
             if force_manual_projection && has_aggregates {
                 match &mut logical_plan {
                     LogicalPlan::Single(single) => {
@@ -469,21 +480,6 @@ where
             Ok::<_, llkv_result::Error>(())
         });
         res?;
-
-        llkv_perf_monitor::log_if_slow(
-            &format!(
-                "prepare_select breakdown{}",
-                context.map(|c| format!(" ({})", c)).unwrap_or_default()
-            ),
-            &[
-                ("Simplify", t_simplify),
-                ("Subqueries", t_subqueries),
-                ("Analysis", t_analysis),
-                ("Logical", t_logical),
-                ("Inference", t_inference),
-                ("Rewrite", t_rewrite),
-            ],
-        );
 
         // let physical_plan = Some(
         //     self.physical_planner

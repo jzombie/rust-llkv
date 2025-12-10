@@ -37,6 +37,7 @@ use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use llkv_table::{CatalogDdl, ConstraintEnforcementMode, TriggerEventMeta, TriggerTimingMeta};
 use llkv_types::decimal::DecimalValue;
+use llkv_types::QueryContext;
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -712,6 +713,15 @@ impl SqlEngine {
     }
 
     fn execute_plan_statement(&self, statement: PlanStatement) -> SqlResult<SqlStatementResult> {
+        let ctx = QueryContext::new();
+        self.execute_plan_statement_with_ctx(statement, &ctx)
+    }
+
+    fn execute_plan_statement_with_ctx(
+        &self,
+        statement: PlanStatement,
+        ctx: &QueryContext,
+    ) -> SqlResult<SqlStatementResult> {
         // Don't apply table error mapping to CREATE VIEW or DROP VIEW statements
         // because the "table" name is the view being created/dropped, not a referenced table.
         // Any "unknown table" errors from CREATE VIEW are about tables referenced in the SELECT.
@@ -736,7 +746,7 @@ impl SqlEngine {
             None
         };
 
-        let result = self.engine.execute_statement(statement).map_err(|err| {
+        let result = self.engine.execute_statement_with_ctx(statement, ctx).map_err(|err| {
             if let Some(table_name) = table {
                 Self::map_table_error(&table_name, err)
             } else {
@@ -1090,12 +1100,20 @@ impl SqlEngine {
     /// scripts, or workflows that need to inspect the specific runtime response for each
     /// statement.
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
+        self.execute_with_ctx(sql, &QueryContext::new())
+    }
+
+    pub fn execute_with_ctx(
+        &self,
+        sql: &str,
+        ctx: &QueryContext,
+    ) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
-        let (processed_sql, preprocess_duration) =
-            llkv_perf_monitor::measure!("preprocess", { Self::preprocess_sql_input(sql) });
+        let (processed_sql, _preprocess_duration) =
+            llkv_perf_monitor::measure!(ctx, "preprocess", Self::preprocess_sql_input(sql));
 
-        let (statements, parse_duration) = llkv_perf_monitor::measure!("parse", {
+        let (statements, _parse_duration) = llkv_perf_monitor::measure!(ctx, "parse", {
             let dialect = GenericDialect {};
             match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
                 Ok(stmts) => stmts,
@@ -1118,14 +1136,6 @@ impl SqlEngine {
             }
         });
 
-        llkv_perf_monitor::log_if_slow(
-            "parse/preprocess",
-            &[
-                ("Preprocess", preprocess_duration),
-                ("Parse", parse_duration),
-            ],
-        );
-
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements.iter() {
             let statement_expectation = next_statement_expectation();
@@ -1142,22 +1152,17 @@ impl SqlEngine {
                 | Statement::Rollback { .. } => {
                     // Flush before transaction boundaries
                     let mut flushed = self.flush_buffer_results()?;
-                    let current = self.execute_statement(statement.clone())?;
+                    let current = self.execute_statement(statement.clone(), ctx)?;
                     results.push(current);
                     results.append(&mut flushed);
                 }
                 _ => {
                     // Flush before any non-INSERT
                     let mut flushed = self.flush_buffer_results()?;
-                    let (current, exec_stmt_duration) =
-                        llkv_perf_monitor::measure!("execute_statement", {
-                            self.execute_statement(statement.clone())?
+                    let (current, _exec_stmt_duration) =
+                        llkv_perf_monitor::measure!(ctx, "execute_statement", {
+                            self.execute_statement(statement.clone(), ctx)?
                         });
-
-                    llkv_perf_monitor::log_if_slow(
-                        "execute_statement",
-                        &[("Exec", exec_stmt_duration)],
-                    );
 
                     results.push(current);
                     results.append(&mut flushed);
@@ -1666,7 +1671,11 @@ impl SqlEngine {
         }
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<SqlStatementResult> {
+    fn execute_statement(
+        &self,
+        statement: Statement,
+        ctx: &QueryContext,
+    ) -> SqlResult<SqlStatementResult> {
         let statement_sql = statement.to_string();
         let _query_label_guard = push_query_label(statement_sql.clone());
         tracing::debug!("SQL execute_statement: {}", statement_sql.trim());
@@ -1709,13 +1718,14 @@ impl SqlEngine {
                 modifier,
             } => self.handle_commit(chain, end, modifier),
             Statement::Rollback { chain, savepoint } => self.handle_rollback(chain, savepoint),
-            other => self.execute_statement_non_transactional(other),
+            other => self.execute_statement_non_transactional(other, ctx),
         }
     }
 
     fn execute_statement_non_transactional(
         &self,
         statement: Statement,
+        ctx: &QueryContext,
     ) -> SqlResult<SqlStatementResult> {
         tracing::trace!("DEBUG SQL execute_statement_non_transactional called");
         match statement {
@@ -1816,7 +1826,7 @@ impl SqlEngine {
                 {
                     self.ensure_information_schema_ready()?;
                 }
-                self.handle_query(*query)
+                self.handle_query(*query, ctx)
             }
             Statement::Update {
                 table,
@@ -4657,7 +4667,8 @@ impl SqlEngine {
     }
 
     fn execute_scalar_int64(&self, query: Query) -> SqlResult<Option<i64>> {
-        let result = self.handle_query(query)?;
+        let local_ctx = QueryContext::new();
+        let result = self.handle_query(query, &local_ctx)?;
         let execution = match result {
             RuntimeStatementResult::Select { execution, .. } => execution,
             _ => {
@@ -4712,7 +4723,8 @@ impl SqlEngine {
             return Ok(avg_literal);
         }
 
-        let result = self.handle_query(subquery)?;
+        let local_ctx = QueryContext::new();
+        let result = self.handle_query(subquery, &local_ctx)?;
         let execution = match result {
             RuntimeStatementResult::Select { execution, .. } => execution,
             _ => {
@@ -4851,7 +4863,8 @@ impl SqlEngine {
                             negated,
                         } => {
                             // Execute the subquery
-                            let result = self.handle_query(*subquery)?;
+                            let local_ctx = QueryContext::new();
+                            let result = self.handle_query(*subquery, &local_ctx)?;
 
                             // Extract values from first column
                             let values = match result {
@@ -5099,16 +5112,30 @@ impl SqlEngine {
             .expect("result stack should have exactly one item"))
     }
 
-    fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
+    fn handle_query(
+        &self,
+        query: Query,
+        ctx: &QueryContext,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         tracing::debug!("handle_query: query={:?}", query);
         let mut visited_views = FxHashSet::default();
-        self.execute_query_with_view_support(query, &mut visited_views)
+        self.execute_query_with_view_support_ctx(query, &mut visited_views, ctx)
     }
 
     fn execute_query_with_view_support(
         &self,
         query: Query,
         visited_views: &mut FxHashSet<String>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let local_ctx = QueryContext::new();
+        self.execute_query_with_view_support_ctx(query, visited_views, &local_ctx)
+    }
+
+    fn execute_query_with_view_support_ctx(
+        &self,
+        query: Query,
+        visited_views: &mut FxHashSet<String>,
+        ctx: &QueryContext,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         // Lazily refresh information_schema only if this query references it.
         // This must happen before any table resolution to ensure the schema tables exist.
@@ -5135,16 +5162,19 @@ impl SqlEngine {
             return Ok(result);
         }
 
-        let (select_plan, build_duration) =
-            llkv_perf_monitor::measure!("build_select_plan", { self.build_select_plan(query)? });
+        let (select_plan, _build_duration) =
+            llkv_perf_monitor::measure!(ctx, "build_select_plan", {
+                self.build_select_plan(query)?
+            });
 
-        llkv_perf_monitor::log_if_slow("build_select_plan", &[("Build", build_duration)]);
+        let (res, _exec_plan_duration) =
+            llkv_perf_monitor::measure!(ctx, "execute_plan_statement", {
+                self.execute_plan_statement_with_ctx(
+                    PlanStatement::Select(Box::new(select_plan)),
+                    ctx,
+                )
+            });
 
-        let (res, exec_plan_duration) = llkv_perf_monitor::measure!("execute_plan_statement", {
-            self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)))
-        });
-
-        llkv_perf_monitor::log_if_slow("execute_plan_statement", &[("Exec", exec_plan_duration)]);
         res
     }
 

@@ -13,6 +13,8 @@ default = []
 perf-mon = []
 
 [dependencies]
+tracing.workspace = true
+line-ending.workspace = true
 
 [lints]
 workspace = true

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use llkv_result::Result;
 use llkv_storage::pager::{BoxedPager, Pager};
 use simd_r_drive_entry_handle::EntryHandle;
+use llkv_types::QueryContext;
 
 use crate::{CatalogDdl, PlanStatement, RuntimeContext, RuntimeSession, RuntimeStatementResult};
 
@@ -65,6 +66,14 @@ impl RuntimeEngine {
     }
 
     pub fn execute_statement(&self, statement: PlanStatement) -> Result<StatementResult> {
+        self.execute_statement_with_ctx(statement, &QueryContext::new())
+    }
+
+    pub fn execute_statement_with_ctx(
+        &self,
+        statement: PlanStatement,
+        ctx: &QueryContext,
+    ) -> Result<StatementResult> {
         match statement {
             PlanStatement::BeginTransaction => self.session.begin_transaction(),
             PlanStatement::CommitTransaction => self.session.commit_transaction(),
@@ -87,7 +96,7 @@ impl RuntimeEngine {
             PlanStatement::Update(plan) => self.session.execute_update_plan(plan),
             PlanStatement::Delete(plan) => self.session.execute_delete_plan(plan),
             PlanStatement::Truncate(plan) => self.session.execute_truncate_plan(plan),
-            PlanStatement::Select(plan) => self.session.execute_select_plan(*plan),
+            PlanStatement::Select(plan) => self.session.execute_select_plan_with_ctx(*plan, ctx),
         }
     }
 

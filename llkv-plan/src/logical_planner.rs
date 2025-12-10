@@ -14,7 +14,7 @@ use llkv_result::Error;
 use llkv_result::Result;
 use llkv_scan::ScanProjection;
 use llkv_storage::pager::Pager;
-use llkv_types::{FieldId, LogicalFieldId, TableId};
+use llkv_types::{FieldId, LogicalFieldId, QueryContext, TableId};
 use rustc_hash::FxHashSet;
 use simd_r_drive_entry_handle::EntryHandle;
 use tracing::debug;
@@ -228,7 +228,11 @@ where
         Ok(Arc::new(table.schema().clone()))
     }
 
-    pub fn create_logical_plan(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
+    pub fn create_logical_plan(
+        &self,
+        plan: &SelectPlan,
+        ctx: &QueryContext,
+    ) -> Result<LogicalPlan<P>> {
         debug!("create_logical_plan tables len: {}", plan.tables.len());
         debug!(
             "create_logical_plan projections len: {}",
@@ -241,7 +245,7 @@ where
             );
         }
         if plan.tables.len() != 1 {
-            return self.plan_multi_table(plan);
+            return self.plan_multi_table(plan, ctx);
         }
 
         let table_ref = plan.tables.first().expect("validated length above");
@@ -255,7 +259,7 @@ where
         let table_id = table.table_id();
         let schema = table.schema();
 
-        let (requested_projections, t_proj) = llkv_perf_monitor::measure!("projections", {
+        let (requested_projections, _t_proj) = llkv_perf_monitor::measure!(ctx, "projections", {
             if plan.projections.is_empty() {
                 build_wildcard_projections(schema, table_id)
             } else {
@@ -316,8 +320,8 @@ where
                 extra_columns: order_extra_columns,
                 resolved_order_by,
             },
-            t_order,
-        ) = llkv_perf_monitor::measure!("order_by", {
+            _t_order,
+        ) = llkv_perf_monitor::measure!(ctx, "order_by", {
             resolve_order_by_targets(schema, table_id, &scan_projections, &plan.order_by)?
         });
 
@@ -331,7 +335,7 @@ where
             }
         }
 
-        let (aggregate_rewrite, t_agg) = llkv_perf_monitor::measure!("aggregate_rewrite", {
+        let (aggregate_rewrite, _t_agg) = llkv_perf_monitor::measure!(ctx, "aggregate_rewrite", {
             build_single_aggregate_rewrite(plan, schema)?
         });
 
@@ -375,13 +379,13 @@ where
             }
         }
 
-        let ((scan_schema, final_schema), t_schema) = llkv_perf_monitor::measure!("schema", {
+        let ((scan_schema, final_schema), _t_schema) = llkv_perf_monitor::measure!(ctx, "schema", {
             let scan_schema = schema_for_projections(schema, &scan_projections)?;
             let final_schema = schema_for_projections(schema, &requested_projections)?;
             (scan_schema, final_schema)
         });
 
-        let (filter, t_filter) = llkv_perf_monitor::measure!("filter", {
+        let (filter, _t_filter) = llkv_perf_monitor::measure!(ctx, "filter", {
             match &plan.filter {
                 Some(filter) => {
                     debug!("LogicalPlan filter input: {:?}", filter.predicate);
@@ -394,17 +398,6 @@ where
                 None => None,
             }
         });
-
-        llkv_perf_monitor::log_if_slow(
-            "create_logical_plan breakdown",
-            &[
-                ("Proj", t_proj),
-                ("Order", t_order),
-                ("Agg", t_agg),
-                ("Schema", t_schema),
-                ("Filter", t_filter),
-            ],
-        );
 
         let plan_schema = Arc::new(schema.clone());
 
@@ -435,7 +428,11 @@ where
         }))
     }
 
-    fn plan_multi_table(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
+    fn plan_multi_table(
+        &self,
+        plan: &SelectPlan,
+        query_ctx: &QueryContext,
+    ) -> Result<LogicalPlan<P>> {
         let mut table_pairs = Vec::with_capacity(plan.tables.len());
         for (original_index, table_ref) in plan.tables.iter().enumerate() {
             let table_name = table_ref.qualified_name();
@@ -480,7 +477,7 @@ where
         // Reorder tables using greedy algorithm to avoid cross joins
         // Only reorder if there are no explicit joins, as explicit joins enforce a specific order
         // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
-        let (table_pairs, t_reorder) = llkv_perf_monitor::measure!("reorder_tables", {
+        let (table_pairs, _t_reorder) = llkv_perf_monitor::measure!(query_ctx, "reorder_tables", {
             if plan.joins.is_empty() {
                 reorder_tables_greedy(
                     self.provider.as_ref(),
@@ -524,49 +521,39 @@ where
             });
         }
 
-        let ((resolved_columns, unresolved_required), t_req) =
-            llkv_perf_monitor::measure!("resolve_required_columns", {
+        let ((resolved_columns, unresolved_required), _t_req) =
+            llkv_perf_monitor::measure!(query_ctx, "resolve_required_columns", {
                 resolve_required_columns(plan, &planned_tables, &infos)
             });
 
-        let ctx = ResolutionContext {
+        let res_ctx = ResolutionContext {
             tables: &planned_tables,
             infos: &infos,
         };
 
-        let (filter, t_filter) = llkv_perf_monitor::measure!("resolve_filter", {
+        let (filter, _t_filter) = llkv_perf_monitor::measure!(query_ctx, "resolve_filter", {
             match &plan.filter {
-                Some(filter) => Some(resolve_predicate(&ctx, &filter.predicate)?),
+                Some(filter) => Some(resolve_predicate(&res_ctx, &filter.predicate)?),
                 None => None,
             }
         });
 
         let having = match &plan.having {
-            Some(having) => Some(resolve_predicate(&ctx, having)?),
+            Some(having) => Some(resolve_predicate(&res_ctx, having)?),
             None => None,
         };
 
-        let (projections, t_proj) = llkv_perf_monitor::measure!("resolve_projections", {
-            resolve_projections(plan, &ctx)?
+        let (projections, _t_proj) = llkv_perf_monitor::measure!(query_ctx, "resolve_projections", {
+            resolve_projections(plan, &res_ctx)?
         });
 
-        llkv_perf_monitor::log_if_slow(
-            "plan_multi_table breakdown",
-            &[
-                ("Reorder", t_reorder),
-                ("Req", t_req),
-                ("Filter", t_filter),
-                ("Proj", t_proj),
-            ],
-        );
+        let aggregates = resolve_aggregates(plan, &res_ctx)?;
 
-        let aggregates = resolve_aggregates(plan, &ctx)?;
+        let group_by = resolve_group_by(plan, &res_ctx)?;
 
-        let group_by = resolve_group_by(plan, &ctx)?;
+        let order_by = resolve_order_by(plan, &res_ctx)?;
 
-        let order_by = resolve_order_by(plan, &ctx)?;
-
-        let mut joins = resolve_joins(plan, &ctx)?;
+        let mut joins = resolve_joins(plan, &res_ctx)?;
 
         attach_implicit_joins(&mut joins, planned_tables.len(), filter.as_ref());
 
@@ -574,7 +561,7 @@ where
         let (table_filters, residual_filter) =
             partition_table_filters(filter.as_ref(), table_count);
 
-        let aggregate_rewrite = build_multi_aggregate_rewrite(plan, &ctx)?;
+        let aggregate_rewrite = build_multi_aggregate_rewrite(plan, &res_ctx)?;
 
         Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
             tables: planned_tables,

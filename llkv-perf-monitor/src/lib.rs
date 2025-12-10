@@ -1,168 +1,340 @@
-use std::cell::RefCell;
-use std::time::Duration;
+//! Performance monitoring helpers used throughout the query pipeline.
 
-thread_local! {
-    static CONTEXT: RefCell<Option<String>> = RefCell::new(None);
-    static CONTEXT_PRINTED: RefCell<bool> = RefCell::new(false);
-    static NESTING: RefCell<usize> = RefCell::new(0);
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use line_ending::LineEnding;
+
+/// Lightweight container for per-query metrics.
+///
+/// When disabled, calls are no-ops so callers can always pass a reference
+/// without branching on feature flags.
+#[derive(Clone, Debug, Default)]
+pub struct PerfContext {
+    inner: Option<Arc<PerfInner>>,
 }
 
-pub struct ScopeGuard;
+#[derive(Debug)]
+struct PerfInner {
+    root_label: String,
+    started_at: Instant,
+    measurements: Mutex<Vec<Measurement>>,
+    stack: Mutex<Vec<String>>,
+}
 
-impl Drop for ScopeGuard {
-    fn drop(&mut self) {
-        NESTING.with(|n| {
-            let mut n = n.borrow_mut();
-            if *n > 0 {
-                *n -= 1;
-            }
-        });
+#[derive(Debug, Clone)]
+struct Measurement {
+    label: String,
+    duration: Duration,
+}
+
+#[derive(Debug, Default)]
+struct ReportNode {
+    label: String,
+    duration: Duration,
+    children: BTreeMap<String, ReportNode>,
+}
+
+impl ReportNode {
+    fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            duration: Duration::ZERO,
+            children: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, path: Vec<&str>, duration: Duration) {
+        if let Some((head, tail)) = path.split_first() {
+            let child = self
+                .children
+                .entry((*head).to_string())
+                .or_insert_with(|| ReportNode::new(*head));
+            child.insert(tail.to_vec(), duration);
+        } else {
+            self.duration += duration;
+        }
+    }
+
+    fn total_duration(&self) -> Duration {
+        let children_sum = self
+            .children
+            .values()
+            .map(|c| c.total_duration())
+            .fold(Duration::ZERO, |acc, d| acc.saturating_add(d));
+        std::cmp::max(self.duration, children_sum)
     }
 }
 
-#[cfg(feature = "perf-mon")]
-pub fn enter_scope(_label: Option<&'static str>) -> ScopeGuard {
-    NESTING.with(|n| *n.borrow_mut() += 1);
-    ScopeGuard
-}
+impl PerfContext {
+    /// Construct a disabled context that ignores all recordings.
+    pub fn disabled() -> Self {
+        Self { inner: None }
+    }
 
-#[cfg(not(feature = "perf-mon"))]
-pub fn enter_scope(_label: Option<&'static str>) -> ScopeGuard {
-    ScopeGuard
-}
+    /// Create a new context anchored to a top-level label (usually the SQL).
+    pub fn new(root_label: impl Into<String>) -> Self {
+        if cfg!(feature = "perf-mon") {
+            let inner = PerfInner {
+                root_label: root_label.into(),
+                started_at: Instant::now(),
+                measurements: Mutex::new(Vec::new()),
+                stack: Mutex::new(Vec::new()),
+            };
+            Self {
+                inner: Some(Arc::new(inner)),
+            }
+        } else {
+            Self::disabled()
+        }
+    }
 
-#[cfg(feature = "perf-mon")]
-pub fn set_context(ctx: &str) {
-    CONTEXT.with(|c| *c.borrow_mut() = Some(ctx.to_string()));
-    CONTEXT_PRINTED.with(|b| *b.borrow_mut() = false);
-}
+    /// Returns true when the context is actively recording measurements.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
 
-#[cfg(not(feature = "perf-mon"))]
-pub fn set_context(_ctx: &str) {}
+    /// Record a new measurement under the provided label.
+    pub fn record(&self, label: impl Into<String>, duration: Duration) {
+        if !cfg!(feature = "perf-mon") {
+            return;
+        }
 
-#[cfg(feature = "perf-mon")]
-pub fn clear_context() {
-    CONTEXT.with(|c| *c.borrow_mut() = None);
-}
-
-#[cfg(not(feature = "perf-mon"))]
-pub fn clear_context() {}
-
-#[cfg(feature = "perf-mon")]
-fn ensure_context_printed() {
-    CONTEXT_PRINTED.with(|b| {
-        if !*b.borrow() {
-            CONTEXT.with(|c| {
-                if let Some(ctx) = &*c.borrow() {
-                    eprintln!("---------------------------------------------------");
-                    eprintln!("Slow Query: {}", ctx.trim());
-                    *b.borrow_mut() = true;
-                }
+        if let Some(inner) = &self.inner {
+            let mut guard = inner
+                .measurements
+                .lock()
+                .expect("perf context mutex poisoned");
+            guard.push(Measurement {
+                label: label.into(),
+                duration,
             });
         }
-    });
+    }
+
+    /// Record a measurement with an explicit label path (e.g. `parent:child`).
+    pub fn record_path(&self, label_path: String, duration: Duration) {
+        if !cfg!(feature = "perf-mon") {
+            return;
+        }
+
+        if let Some(inner) = &self.inner {
+            let mut guard = inner
+                .measurements
+                .lock()
+                .expect("perf context mutex poisoned");
+            guard.push(Measurement {
+                label: label_path,
+                duration,
+            });
+        }
+    }
+
+    /// Push a label onto the active stack, returning the joined path.
+    pub fn push_label(&self, label: &str) -> Option<String> {
+        let inner = self.inner.as_ref()?;
+        let mut stack = inner.stack.lock().expect("perf context mutex poisoned");
+        let effective_label = if stack.last().map(|l| l.as_str() == label).unwrap_or(false) {
+            format!("nested_{label}")
+        } else {
+            label.to_string()
+        };
+        stack.push(effective_label);
+        Some(stack.join(":"))
+    }
+
+    /// Pop the most recent label from the active stack.
+    pub fn pop_label(&self) {
+        if let Some(inner) = &self.inner {
+            let mut stack = inner.stack.lock().expect("perf context mutex poisoned");
+            stack.pop();
+        }
+    }
+
+    /// Return a snapshot of all recorded measurements.
+    pub fn measurements(&self) -> Vec<(String, Duration)> {
+        self.inner
+            .as_ref()
+            .map(|inner| {
+                inner
+                    .measurements
+                    .lock()
+                    .expect("perf context mutex poisoned")
+                    .iter()
+                    .map(|m| (m.label.clone(), m.duration))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn total_elapsed(&self) -> Option<Duration> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.started_at.elapsed())
+    }
+
+    fn root_label(&self) -> Option<&str> {
+        self.inner.as_ref().map(|inner| inner.root_label.as_str())
+    }
+
+    /// Return a formatted textual report of the recorded measurements.
+    ///
+    /// When performance monitoring is disabled or no measurements are present,
+    /// this returns `None`.
+    pub fn render_report(&self) -> Option<String> {
+        if !cfg!(feature = "perf-mon") {
+            return None;
+        }
+        let measurements = self.measurements();
+        if measurements.is_empty() {
+            return None;
+        }
+
+        let total_duration = measurements
+            .iter()
+            .find(|(label, _)| label == "query_total")
+            .map(|(_, duration)| *duration)
+            .or_else(|| self.total_elapsed())
+            .unwrap_or(Duration::ZERO);
+
+        // Build a simple tree by splitting labels on ':' to preserve nesting.
+        let mut root = ReportNode::new(self.root_label().unwrap_or("query"));
+        root.duration = total_duration;
+
+        for (label, duration) in measurements
+            .into_iter()
+            .filter(|(label, _)| label != "query_total")
+        {
+            root.insert(label.split(':').collect::<Vec<_>>(), duration);
+        }
+
+        let root_total = root.total_duration();
+        let line_sep = LineEnding::from_current_platform().as_str();
+        let mut output = String::new();
+        write_node(&mut output, line_sep, &root, "", true, root_total, true);
+        Some(output)
+    }
 }
 
-/// Measures the execution time of the provided expression or block.
-///
-/// Returns a tuple `(result, duration)`.
-///
-/// If the `perf-mon` feature is disabled, the duration is always `Duration::ZERO`
-/// and the timing overhead is eliminated.
+/// Guard that captures the total query duration when dropped.
+pub struct PerfGuard {
+    ctx: PerfContext,
+}
+
+impl Drop for PerfGuard {
+    fn drop(&mut self) {
+        if let Some(total) = self.ctx.total_elapsed() {
+            self.ctx.record("query_total", total);
+        }
+    }
+}
+
+impl PerfGuard {
+    /// Construct a guard that records total duration for the provided context.
+    pub fn new(ctx: PerfContext) -> Self {
+        Self { ctx }
+    }
+}
+
+impl AsRef<PerfContext> for PerfContext {
+    fn as_ref(&self) -> &PerfContext {
+        self
+    }
+}
+
+/// Measure the duration of the provided expression, recording it into the
+/// supplied [`PerfContext`]. Returns a `(result, duration)` tuple.
 #[macro_export]
 macro_rules! measure {
-    ($label:literal, $e:expr) => {{
-        #[cfg(feature = "perf-mon")]
-        {
-            let _guard = $crate::enter_scope(Some($label));
-            let start = std::time::Instant::now();
-            let result = $e;
-            (result, start.elapsed())
-        }
-        #[cfg(not(feature = "perf-mon"))]
-        {
-            let result = $e;
-            (result, std::time::Duration::ZERO)
-        }
-    }};
-    ($e:expr) => {{
-        #[cfg(feature = "perf-mon")]
-        {
-            let _guard = $crate::enter_scope(None);
-            let start = std::time::Instant::now();
-            let result = $e;
-            (result, start.elapsed())
-        }
-        #[cfg(not(feature = "perf-mon"))]
-        {
-            let result = $e;
-            (result, std::time::Duration::ZERO)
+    ($ctx:expr, $label:expr, $body:expr) => {{
+        let __ctx_ref: &llkv_perf_monitor::PerfContext =
+            ::core::convert::AsRef::<llkv_perf_monitor::PerfContext>::as_ref(&$ctx);
+        if cfg!(feature = "perf-mon") {
+            let __path = __ctx_ref.push_label($label);
+            let __perf_start = std::time::Instant::now();
+            let __perf_result = { $body };
+            let __perf_duration = __perf_start.elapsed();
+            if let Some(__path) = __path {
+                __ctx_ref.record_path(__path, __perf_duration);
+                __ctx_ref.pop_label();
+            }
+            (__perf_result, __perf_duration)
+        } else {
+            let __perf_result = { $body };
+            (__perf_result, std::time::Duration::ZERO)
         }
     }};
 }
 
-/// Checks if the provided duration exceeds the configured threshold.
-#[cfg(feature = "perf-mon")]
-pub fn is_slow(duration: Duration) -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static THRESHOLD_MS: AtomicU64 = AtomicU64::new(1); // Default 1ms
-    static INIT: std::sync::Once = std::sync::Once::new();
-
-    INIT.call_once(|| {
-        if let Ok(val) = std::env::var("LLKV_PERF_THRESHOLD_MS") {
-            if let Ok(parsed) = val.parse::<u64>() {
-                THRESHOLD_MS.store(parsed, Ordering::Relaxed);
-            }
-        }
-    });
-
-    let threshold = Duration::from_millis(THRESHOLD_MS.load(Ordering::Relaxed));
-    duration > threshold
+/// Alias to mirror the older name used in the SLT harness.
+#[macro_export]
+macro_rules! measure_with {
+    ($ctx:expr, $label:expr, $body:expr) => {
+        $crate::measure!($ctx, $label, $body)
+    };
 }
 
-#[cfg(not(feature = "perf-mon"))]
-#[inline(always)]
-pub fn is_slow(_duration: Duration) -> bool {
-    false
-}
-
-/// Logs the durations if any of them exceed the threshold configured via `LLKV_PERF_THRESHOLD_MS`.
-/// Defaults to 1ms if not set.
-///
-/// When `perf-mon` is disabled, this function is a no-op and should be optimized away.
-#[cfg(feature = "perf-mon")]
-pub fn log_if_slow(label: &str, parts: &[(&str, Duration)]) -> bool {
-    let mut any_slow = false;
-    for (_, dur) in parts {
-        if is_slow(*dur) {
-            any_slow = true;
-            break;
-        }
-    }
-
-    if any_slow {
-        ensure_context_printed();
-        let depth = NESTING.with(|n| *n.borrow());
-
-        let mut prefix = "│   ".repeat(depth);
-        prefix.push_str("├── ");
-
-        let mut msg = format!("{}Slow {}: ", prefix, label);
-        for (i, (name, dur)) in parts.iter().enumerate() {
-            if i > 0 {
-                msg.push_str(", ");
-            }
-            msg.push_str(&format!("{}: {:?}", name, dur));
-        }
-        eprintln!("{}", msg);
-        true
+fn write_node(
+    output: &mut String,
+    line_sep: &str,
+    node: &ReportNode,
+    prefix: &str,
+    is_last: bool,
+    parent_total: Duration,
+    is_root: bool,
+) {
+    let node_total = node.total_duration();
+    let connector = if is_root {
+        String::new()
+    } else if is_last {
+        "└── ".to_string()
     } else {
-        false
-    }
-}
+        "├── ".to_string()
+    };
 
-#[cfg(not(feature = "perf-mon"))]
-#[inline(always)]
-pub fn log_if_slow(_label: &str, _parts: &[(&str, Duration)]) -> bool {
-    false
+    let duration_ms = node_total.as_secs_f64() * 1000.0;
+    let pct = if parent_total.is_zero() {
+        0.0
+    } else {
+        (node_total.as_secs_f64() / parent_total.as_secs_f64()) * 100.0
+    };
+
+    if is_root {
+        output.push_str(&format!(
+            "Slow query report (total={duration_ms:.3}ms):{line_sep}",
+        ));
+        output.push_str(line_sep);
+        output.push_str(node.label.as_str());
+        output.push_str(line_sep);
+        output.push_str(line_sep);
+    } else {
+        output.push_str(&format!(
+            "{prefix}{connector}{}: {duration_ms:.3}ms ({pct:.1}%){}",
+            node.label, line_sep
+        ));
+    }
+
+    let mut children: Vec<&ReportNode> = node.children.values().collect();
+    children.sort_by(|a, b| b.duration.cmp(&a.duration));
+
+    let next_prefix = if is_root {
+        String::new()
+    } else if is_last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}│   ")
+    };
+
+    for (idx, child) in children.iter().enumerate() {
+        let child_is_last = idx + 1 == children.len();
+        write_node(
+            output,
+            line_sep,
+            child,
+            &next_prefix,
+            child_is_last,
+            node_total,
+            false,
+        );
+    }
 }
