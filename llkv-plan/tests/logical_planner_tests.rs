@@ -5,8 +5,8 @@ use arrow::record_batch::RecordBatch;
 use llkv_expr::Literal;
 use llkv_expr::expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_plan::logical_planner::{LogicalPlan, SingleTableLogicalPlan, projection_name};
-use llkv_plan::table_provider::{ExecutionTable, TableProvider};
 use llkv_plan::schema::{PlanColumn, PlanSchema};
+use llkv_plan::table_provider::{ExecutionTable, TableProvider};
 use llkv_plan::{
     JoinMetadata, JoinPlan, LogicalPlanner, OrderByPlan, OrderSortType, OrderTarget, SelectFilter,
     SelectPlan, SelectProjection, TableRef,

@@ -515,7 +515,8 @@ where
 
         // 2. Batch fetch from store
         use llkv_column_map::store::rowid_fid;
-        let row_id_fields: Vec<LogicalFieldId> = uncached_table_ids.iter()
+        let row_id_fields: Vec<LogicalFieldId> = uncached_table_ids
+            .iter()
             .map(|&tid| rowid_fid(LogicalFieldId::for_user(tid, 0)))
             .collect();
 

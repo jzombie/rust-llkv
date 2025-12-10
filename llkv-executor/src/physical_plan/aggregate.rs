@@ -1,12 +1,12 @@
-use crate::physical_plan::{PhysicalPlan, BatchIter};
-use llkv_plan::plans::AggregateExpr;
+use crate::physical_plan::{BatchIter, PhysicalPlan};
 use arrow::datatypes::SchemaRef;
+use llkv_plan::plans::AggregateExpr;
+use llkv_result::Result;
+use llkv_storage::pager::Pager;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
-use llkv_result::Result;
 
 pub struct AggregateExec<P>
 where
@@ -59,7 +59,9 @@ where
     }
 
     fn execute(&self) -> Result<BatchIter> {
-        Err(llkv_result::Error::Internal("Execution of AggregateExec must be handled by the executor crate".to_string()))
+        Err(llkv_result::Error::Internal(
+            "Execution of AggregateExec must be handled by the executor crate".to_string(),
+        ))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
@@ -71,7 +73,9 @@ where
         children: Vec<Arc<dyn PhysicalPlan<P>>>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
-            return Err(llkv_result::Error::Internal("AggregateExec expects exactly 1 child".to_string()));
+            return Err(llkv_result::Error::Internal(
+                "AggregateExec expects exactly 1 child".to_string(),
+            ));
         }
         Ok(Arc::new(AggregateExec::new(
             children[0].clone(),
@@ -85,4 +89,3 @@ where
         self
     }
 }
-

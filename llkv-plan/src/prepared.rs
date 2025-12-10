@@ -9,8 +9,8 @@ use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::aggregate_rewrite::build_single_aggregate_rewrite;
 use crate::logical_planner::{
-    build_multi_aggregate_rewrite, LogicalPlan, LogicalPlanner, ResolutionContext,
-    TableResolutionInfo,
+    LogicalPlan, LogicalPlanner, ResolutionContext, TableResolutionInfo,
+    build_multi_aggregate_rewrite,
 };
 // use crate::planner::PhysicalPlanner;
 use crate::plans::{
@@ -31,10 +31,10 @@ where
     pub scalar_subqueries: Vec<PreparedScalarSubquery<P>>, // Prepared subqueries for ScalarExpr.
     pub filter_subqueries: Vec<PreparedFilterSubquery<P>>, // Prepared subqueries referenced from filters.
     pub compound: Option<PreparedCompoundSelect<P>>,       // Prepared compound operations.
-    pub residual_filter: Option<Expr<'static, String>>,    // Residual predicate kept for executor-side filtering.
-    pub residual_filter_subqueries: Vec<FilterSubquery>,   // Correlated EXISTS subqueries tied to residual filters.
-    pub force_manual_projection: bool,                     // Whether execution must project manually.
-    pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,       // MVCC row filter to thread into scans.
+    pub residual_filter: Option<Expr<'static, String>>, // Residual predicate kept for executor-side filtering.
+    pub residual_filter_subqueries: Vec<FilterSubquery>, // Correlated EXISTS subqueries tied to residual filters.
+    pub force_manual_projection: bool,                   // Whether execution must project manually.
+    pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,     // MVCC row filter to thread into scans.
 }
 
 pub struct PreparedScalarSubquery<P>
@@ -179,7 +179,10 @@ where
                 )?),
             });
         }
-        Ok(PreparedCompoundSelect { initial, operations })
+        Ok(PreparedCompoundSelect {
+            initial,
+            operations,
+        })
     }
 
     fn split_predicate(
@@ -244,7 +247,8 @@ where
         });
 
         let (res, t_subqueries) = llkv_perf_monitor::measure!("subqueries", {
-            let prepared_scalar_subqueries = self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
+            let prepared_scalar_subqueries =
+                self.prepare_scalar_subqueries(&plan.scalar_subqueries)?;
 
             let filter_subqueries = plan
                 .filter
@@ -258,12 +262,22 @@ where
                 .as_ref()
                 .map(|c| self.prepare_compound(c, row_filter.clone()))
                 .transpose()?;
-            
+
             Ok::<_, llkv_result::Error>((prepared_scalar_subqueries, filter_subqueries, compound))
         });
         let (prepared_scalar_subqueries, filter_subqueries, compound) = res?;
 
-        let ((plan_for_execution, residual_filter, residual_filter_subqueries, force_manual_projection, plan_for_scan, has_aggregates), t_analysis) = llkv_perf_monitor::measure!("analysis", {
+        let (
+            (
+                plan_for_execution,
+                residual_filter,
+                residual_filter_subqueries,
+                force_manual_projection,
+                plan_for_scan,
+                has_aggregates,
+            ),
+            t_analysis,
+        ) = llkv_perf_monitor::measure!("analysis", {
             // Simplify WHERE clause
             if let Some(filter) = &mut plan.filter {
                 filter.predicate = simplify_expr(filter.predicate.clone());
@@ -328,7 +342,14 @@ where
             } else {
                 plan_for_execution.clone()
             };
-            (plan_for_execution, residual_filter, residual_filter_subqueries, force_manual_projection, plan_for_scan, has_aggregates)
+            (
+                plan_for_execution,
+                residual_filter,
+                residual_filter_subqueries,
+                force_manual_projection,
+                plan_for_scan,
+                has_aggregates,
+            )
         });
         // The variable `res` here shadows the previous `res` from `t_subqueries` block, but wait...
         // The `measure!` macro returns `(result, duration)`.
@@ -337,7 +358,7 @@ where
         // So the variables are ALREADY destructured.
         // I don't need `let (...) = res;` because `res` is not defined in this scope as the result of THIS measure block.
         // The previous `res` (line 265) was consumed.
-        
+
         // Wait, I see what happened. I copied the destructuring pattern into the `let` binding of `measure!`.
         // So `plan_for_execution` etc are already defined.
         // But then I have `let (...) = res;` which is wrong because `res` refers to the result of `subqueries` measure block?
@@ -346,12 +367,12 @@ where
         // Ah, I see `let (res, t_subqueries) = ...` on line 246.
         // Then `let (...) = res?;` on line 265.
         // So `res` is gone.
-        
+
         // The error says: `expected enum Result ... found tuple`.
         // This implies that `res` IS available and has type `Result`.
         // But where does `res` come from?
         // Ah, I see. I might have messed up the edit.
-        
+
         // Let's look at the code I wrote:
         // `let ((plan_for_execution, ...), t_analysis) = llkv_perf_monitor::measure!("analysis", { ... });`
         // This defines `plan_for_execution` etc.
@@ -359,15 +380,14 @@ where
         // This line is redundant and incorrect because `res` is the result of the PREVIOUS measure block (subqueries), which was already unpacked.
         // Wait, if `res` was moved, it shouldn't be available.
         // Unless `res` is `Copy`? `Result` is not Copy usually.
-        
+
         // The error message `expected enum Result ... found tuple` suggests that `res` is indeed the Result from `subqueries`.
         // And I am trying to assign it to a tuple of 6 elements.
         // But `res` contains `(prepared_scalar_subqueries, filter_subqueries, compound)`.
-        
-        // So I should just DELETE the line `let (...) = res;`.
-        
-        // Let's verify.
 
+        // So I should just DELETE the line `let (...) = res;`.
+
+        // Let's verify.
 
         let (res, t_logical) = llkv_perf_monitor::measure!("logical_plan", {
             self.logical_planner.create_logical_plan(&plan_for_scan)
@@ -383,7 +403,10 @@ where
                 for proj in &mut single_plan.requested_projections {
                     if let llkv_scan::ScanProjection::Computed { expr, .. } = proj {
                         if let Ok(inferred_type) =
-                            crate::translation::schema::infer_computed_data_type(&single_plan.schema, expr)
+                            crate::translation::schema::infer_computed_data_type(
+                                &single_plan.schema,
+                                expr,
+                            )
                         {
                             if inferred_type != arrow::datatypes::DataType::Null {
                                 match expr {
@@ -424,7 +447,8 @@ where
                             } else {
                                 format!("{}.{}", schema_lower, table_lower)
                             };
-                            let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+                            let alias_lower =
+                                table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
                             infos.push(TableResolutionInfo {
                                 table_lower,
                                 schema_lower,
@@ -447,7 +471,10 @@ where
         res?;
 
         llkv_perf_monitor::log_if_slow(
-            &format!("prepare_select breakdown{}", context.map(|c| format!(" ({})", c)).unwrap_or_default()),
+            &format!(
+                "prepare_select breakdown{}",
+                context.map(|c| format!(" ({})", c)).unwrap_or_default()
+            ),
             &[
                 ("Simplify", t_simplify),
                 ("Subqueries", t_subqueries),
@@ -491,16 +518,26 @@ fn contains_exists(expr: &Expr<'static, String>) -> bool {
 fn contains_subquery<F: std::fmt::Debug>(expr: &ScalarExpr<F>) -> bool {
     match expr {
         ScalarExpr::ScalarSubquery(_) => true,
-        ScalarExpr::Binary { left, right, .. } => contains_subquery(left) || contains_subquery(right),
+        ScalarExpr::Binary { left, right, .. } => {
+            contains_subquery(left) || contains_subquery(right)
+        }
         ScalarExpr::Not(e) => contains_subquery(e),
         ScalarExpr::IsNull { expr, .. } => contains_subquery(expr),
         ScalarExpr::Cast { expr, .. } => contains_subquery(expr),
-        ScalarExpr::Compare { left, right, .. } => contains_subquery(left) || contains_subquery(right),
-        ScalarExpr::Case { operand, branches, else_expr } => {
+        ScalarExpr::Compare { left, right, .. } => {
+            contains_subquery(left) || contains_subquery(right)
+        }
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
             operand
                 .as_ref()
                 .map_or(false, |o| contains_subquery::<F>(o))
-                || branches.iter().any(|(w, t)| contains_subquery(w) || contains_subquery(t))
+                || branches
+                    .iter()
+                    .any(|(w, t)| contains_subquery(w) || contains_subquery(t))
                 || else_expr
                     .as_ref()
                     .map_or(false, |e| contains_subquery::<F>(e))

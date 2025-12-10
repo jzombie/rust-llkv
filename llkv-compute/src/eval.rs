@@ -164,7 +164,9 @@ fn literal_type(lit: &Literal) -> DataType {
         Literal::Boolean(_) => DataType::Boolean,
         Literal::Int128(_) => DataType::Int64, // Default to Int64 for literals
         Literal::Float64(_) => DataType::Float64,
-        Literal::Decimal128(d) => DataType::Decimal128(std::cmp::max(d.precision(), d.scale() as u8), d.scale()),
+        Literal::Decimal128(d) => {
+            DataType::Decimal128(std::cmp::max(d.precision(), d.scale() as u8), d.scale())
+        }
         Literal::String(_) => DataType::Utf8,
         Literal::Date32(_) => DataType::Date32,
         Literal::Interval(_) => DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
@@ -538,9 +540,7 @@ impl ScalarEvaluator {
                     AggregateCall::GroupConcat { .. } => "group_concat",
                 };
                 if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
-                    eprintln!(
-                        "[compute] evaluating aggregate in scalar context: {kind}"
-                    );
+                    eprintln!("[compute] evaluating aggregate in scalar context: {kind}");
                     eprintln!("{:?}", std::backtrace::Backtrace::capture());
                 }
                 Err(Error::Internal(format!(
@@ -625,7 +625,6 @@ impl ScalarEvaluator {
     ) -> LlkvResult<ArrayRef> {
         let preferred = expr.infer_result_type_from_arrays(arrays);
 
-
         if len == 0 {
             return Ok(new_null_array(&preferred, 0));
         }
@@ -673,7 +672,6 @@ impl ScalarEvaluator {
         let result = concat(&values.iter().map(|a| a.as_ref()).collect::<Vec<_>>())
             .map_err(|e| Error::Internal(e.to_string()))?;
 
-
         Ok(result)
     }
 
@@ -694,14 +692,16 @@ impl ScalarEvaluator {
             ScalarExpr::Aggregate(call) => matches!(
                 call,
                 AggregateCall::Count { .. }
-                | AggregateCall::CountStar
-                | AggregateCall::CountNulls(_)
+                    | AggregateCall::CountStar
+                    | AggregateCall::CountNulls(_)
             ),
             ScalarExpr::Cast { expr, .. } => Self::is_always_non_null(expr, arrays),
             ScalarExpr::Binary { left, right, .. } => {
                 Self::is_always_non_null(left, arrays) && Self::is_always_non_null(right, arrays)
             }
-            ScalarExpr::Coalesce(items) => items.iter().any(|i| Self::is_always_non_null(i, arrays)),
+            ScalarExpr::Coalesce(items) => {
+                items.iter().any(|i| Self::is_always_non_null(i, arrays))
+            }
             _ => false,
         }
     }
@@ -826,7 +826,6 @@ impl ScalarEvaluator {
                     common_type = get_common_type(&common_type, t);
                 }
 
-
                 // Cast all arrays to common type
                 let mut casted_arrays = Vec::with_capacity(evaluated_items.len());
                 for array in evaluated_items {
@@ -898,9 +897,9 @@ impl ScalarEvaluator {
                 operand
                     .as_ref()
                     .map_or(false, |e| Self::contains_aggregate(e))
-                    || branches.iter().any(|(w, t)| {
-                        Self::contains_aggregate(w) || Self::contains_aggregate(t)
-                    })
+                    || branches
+                        .iter()
+                        .any(|(w, t)| Self::contains_aggregate(w) || Self::contains_aggregate(t))
                     || else_expr
                         .as_ref()
                         .map_or(false, |e| Self::contains_aggregate(e))
@@ -939,12 +938,16 @@ impl ScalarEvaluator {
                 branches,
                 else_expr,
             } => ScalarExpr::Case {
-                operand: operand.as_ref().map(|e| Box::new(Self::sanitize_columns(e))),
+                operand: operand
+                    .as_ref()
+                    .map(|e| Box::new(Self::sanitize_columns(e))),
                 branches: branches
                     .iter()
                     .map(|(w, t)| (Self::sanitize_columns(w), Self::sanitize_columns(t)))
                     .collect(),
-                else_expr: else_expr.as_ref().map(|e| Box::new(Self::sanitize_columns(e))),
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|e| Box::new(Self::sanitize_columns(e))),
             },
             ScalarExpr::Coalesce(exprs) => {
                 ScalarExpr::Coalesce(exprs.iter().map(Self::sanitize_columns).collect())
@@ -977,9 +980,10 @@ impl ScalarEvaluator {
                 let r = Self::simplify(right);
 
                 let is_logic_op = matches!(op, BinaryOp::And | BinaryOp::Or);
-                
+
                 let is_effectively_null = |e: &ScalarExpr<F>| {
-                    Self::is_null(e) || matches!(e, ScalarExpr::Cast { expr, .. } if Self::is_null(expr))
+                    Self::is_null(e)
+                        || matches!(e, ScalarExpr::Cast { expr, .. } if Self::is_null(expr))
                 };
 
                 if !is_logic_op && (is_effectively_null(&l) || is_effectively_null(&r)) {
@@ -989,7 +993,8 @@ impl ScalarEvaluator {
                     // (e.g. scalar aggregation on empty input returns 1 row, whereas simple select returns 0 rows).
                     // If we simplify `COUNT(*) + NULL` to `NULL`, the planner might see no aggregates
                     // and treat it as a simple select, returning 0 rows instead of 1 row with NULL.
-                    let discard_aggregate = (is_effectively_null(&l) && Self::contains_aggregate(&r))
+                    let discard_aggregate = (is_effectively_null(&l)
+                        && Self::contains_aggregate(&r))
                         || (is_effectively_null(&r) && Self::contains_aggregate(&l));
 
                     if !discard_aggregate {
@@ -1050,14 +1055,16 @@ impl ScalarEvaluator {
                 let r = Self::simplify(right);
 
                 let is_effectively_null = |e: &ScalarExpr<F>| {
-                    Self::is_null(e) || matches!(e, ScalarExpr::Cast { expr, .. } if Self::is_null(expr))
+                    Self::is_null(e)
+                        || matches!(e, ScalarExpr::Cast { expr, .. } if Self::is_null(expr))
                 };
 
                 // Simplify to Literal::Null if EITHER is effectively null.
                 if is_effectively_null(&l) || is_effectively_null(&r) {
                     // If one side is NULL, the result is NULL.
                     // However, if the other side contains an aggregate, we MUST NOT simplify it away.
-                    let discard_aggregate = (is_effectively_null(&l) && Self::contains_aggregate(&r))
+                    let discard_aggregate = (is_effectively_null(&l)
+                        && Self::contains_aggregate(&r))
                         || (is_effectively_null(&r) && Self::contains_aggregate(&l));
 
                     if !discard_aggregate {
@@ -1085,9 +1092,9 @@ impl ScalarEvaluator {
                     let l_arr = Self::literal_to_array(ll);
                     let r_arr = Self::literal_to_array(rr);
                     if let Ok(res) = crate::kernels::compute_compare(&l_arr, *op, &r_arr) {
-                         if let Ok(lit) = Literal::from_array_ref(&res, 0) {
-                             return ScalarExpr::Literal(lit);
-                         }
+                        if let Ok(lit) = Literal::from_array_ref(&res, 0) {
+                            return ScalarExpr::Literal(lit);
+                        }
                     }
                 }
 
@@ -1114,7 +1121,9 @@ impl ScalarEvaluator {
                 }
 
                 // Helper to find a typed fallback if the result is untyped NULL
-                let get_safe_result = |result: ScalarExpr<F>, branches: &[(ScalarExpr<F>, ScalarExpr<F>)]| -> ScalarExpr<F> {
+                let get_safe_result = |result: ScalarExpr<F>,
+                                       branches: &[(ScalarExpr<F>, ScalarExpr<F>)]|
+                 -> ScalarExpr<F> {
                     if is_typed(&result) {
                         return result;
                     }
@@ -1131,22 +1140,28 @@ impl ScalarEvaluator {
                             // Found a typed branch. Return a dummy CASE to preserve type.
                             return ScalarExpr::Case {
                                 operand: None,
-                                branches: vec![(ScalarExpr::Literal(Literal::Boolean(false)), then.clone())],
+                                branches: vec![(
+                                    ScalarExpr::Literal(Literal::Boolean(false)),
+                                    then.clone(),
+                                )],
                                 else_expr: Some(Box::new(result)),
                             };
                         }
                     }
                     if let Some(e) = &s_else {
                         if is_typed(e) {
-                             if let Some(dt) = try_get_type(e) {
+                            if let Some(dt) = try_get_type(e) {
                                 return ScalarExpr::Cast {
                                     expr: Box::new(ScalarExpr::Literal(Literal::Null)),
                                     data_type: dt,
                                 };
                             }
-                             return ScalarExpr::Case {
+                            return ScalarExpr::Case {
                                 operand: None,
-                                branches: vec![(ScalarExpr::Literal(Literal::Boolean(false)), *e.clone())],
+                                branches: vec![(
+                                    ScalarExpr::Literal(Literal::Boolean(false)),
+                                    *e.clone(),
+                                )],
                                 else_expr: Some(Box::new(result)),
                             };
                         }
@@ -1156,7 +1171,8 @@ impl ScalarEvaluator {
 
                 // If operand is NULL, the whole CASE expression evaluates to ELSE
                 if let Some(op) = &operand {
-                    let is_op_null = Self::is_null(op) || matches!(op.as_ref(), ScalarExpr::Cast { expr, .. } if Self::is_null(expr));
+                    let is_op_null = Self::is_null(op)
+                        || matches!(op.as_ref(), ScalarExpr::Cast { expr, .. } if Self::is_null(expr));
                     if is_op_null {
                         let result = s_else
                             .clone()
@@ -1178,11 +1194,15 @@ impl ScalarEvaluator {
 
                     // If we have a simple CASE (operand is Some)
                     if let Some(op) = &operand {
-                        if let (ScalarExpr::Literal(op_lit), ScalarExpr::Literal(when_lit)) = (op.as_ref(), &s_when) {
+                        if let (ScalarExpr::Literal(op_lit), ScalarExpr::Literal(when_lit)) =
+                            (op.as_ref(), &s_when)
+                        {
                             // Use compute_compare to handle type coercion (e.g. 30.0 == 30)
                             let l_arr = Self::literal_to_array(op_lit);
                             let r_arr = Self::literal_to_array(when_lit);
-                            let is_equal = if let Ok(res) = crate::kernels::compute_compare(&l_arr, CompareOp::Eq, &r_arr) {
+                            let is_equal = if let Ok(res) =
+                                crate::kernels::compute_compare(&l_arr, CompareOp::Eq, &r_arr)
+                            {
                                 if let Ok(lit) = Literal::from_array_ref(&res, 0) {
                                     match lit {
                                         Literal::Boolean(b) => b,
@@ -1319,18 +1339,24 @@ impl ScalarEvaluator {
             }
             ScalarExpr::Aggregate(agg) => {
                 let simplified_agg = match agg {
-                    AggregateCall::Avg { expr, distinct } => ScalarExpr::Aggregate(AggregateCall::Avg {
-                        expr: Box::new(Self::simplify(expr)),
-                        distinct: *distinct,
-                    }),
-                    AggregateCall::Sum { expr, distinct } => ScalarExpr::Aggregate(AggregateCall::Sum {
-                        expr: Box::new(Self::simplify(expr)),
-                        distinct: *distinct,
-                    }),
-                    AggregateCall::Total { expr, distinct } => ScalarExpr::Aggregate(AggregateCall::Total {
-                        expr: Box::new(Self::simplify(expr)),
-                        distinct: *distinct,
-                    }),
+                    AggregateCall::Avg { expr, distinct } => {
+                        ScalarExpr::Aggregate(AggregateCall::Avg {
+                            expr: Box::new(Self::simplify(expr)),
+                            distinct: *distinct,
+                        })
+                    }
+                    AggregateCall::Sum { expr, distinct } => {
+                        ScalarExpr::Aggregate(AggregateCall::Sum {
+                            expr: Box::new(Self::simplify(expr)),
+                            distinct: *distinct,
+                        })
+                    }
+                    AggregateCall::Total { expr, distinct } => {
+                        ScalarExpr::Aggregate(AggregateCall::Total {
+                            expr: Box::new(Self::simplify(expr)),
+                            distinct: *distinct,
+                        })
+                    }
                     AggregateCall::Min(expr) => {
                         ScalarExpr::Aggregate(AggregateCall::Min(Box::new(Self::simplify(expr))))
                     }
@@ -1343,9 +1369,9 @@ impl ScalarEvaluator {
                             distinct: *distinct,
                         })
                     }
-                    AggregateCall::CountNulls(expr) => {
-                        ScalarExpr::Aggregate(AggregateCall::CountNulls(Box::new(Self::simplify(expr))))
-                    }
+                    AggregateCall::CountNulls(expr) => ScalarExpr::Aggregate(
+                        AggregateCall::CountNulls(Box::new(Self::simplify(expr))),
+                    ),
                     AggregateCall::GroupConcat {
                         expr,
                         distinct,
@@ -1360,44 +1386,42 @@ impl ScalarEvaluator {
 
                 // Check for effective nulls and return typed Nulls if possible
                 match &simplified_agg {
-                    ScalarExpr::Aggregate(agg_call) => {
-                        match agg_call {
-                            AggregateCall::Avg { expr, .. } => {
-                                if Self::is_null(expr) {
+                    ScalarExpr::Aggregate(agg_call) => match agg_call {
+                        AggregateCall::Avg { expr, .. } => {
+                            if Self::is_null(expr) {
+                                return ScalarExpr::Cast {
+                                    expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                    data_type: DataType::Float64,
+                                };
+                            }
+                        }
+                        AggregateCall::Min(expr) | AggregateCall::Max(expr) => {
+                            if Self::is_null(expr) {
+                                if let Some(dt) = try_get_type(expr) {
                                     return ScalarExpr::Cast {
                                         expr: Box::new(ScalarExpr::Literal(Literal::Null)),
-                                        data_type: DataType::Float64,
+                                        data_type: dt,
                                     };
                                 }
                             }
-                            AggregateCall::Min(expr) | AggregateCall::Max(expr) => {
-                                if Self::is_null(expr) {
-                                    if let Some(dt) = try_get_type(expr) {
-                                         return ScalarExpr::Cast {
-                                            expr: Box::new(ScalarExpr::Literal(Literal::Null)),
-                                            data_type: dt,
-                                        };
-                                    }
-                                }
-                            }
-                            AggregateCall::Sum { expr, .. } | AggregateCall::Total { expr, .. } => {
-                                if Self::is_null(expr) {
-                                    if let Some(dt) = try_get_type(expr) {
-                                         return ScalarExpr::Cast {
-                                            expr: Box::new(ScalarExpr::Literal(Literal::Null)),
-                                            data_type: dt,
-                                        };
-                                    }
-                                }
-                            }
-                            AggregateCall::Count { expr, .. } => {
-                                if Self::is_null(expr) {
-                                    return ScalarExpr::Literal(Literal::Int128(0));
-                                }
-                            }
-                            _ => {}
                         }
-                    }
+                        AggregateCall::Sum { expr, .. } | AggregateCall::Total { expr, .. } => {
+                            if Self::is_null(expr) {
+                                if let Some(dt) = try_get_type(expr) {
+                                    return ScalarExpr::Cast {
+                                        expr: Box::new(ScalarExpr::Literal(Literal::Null)),
+                                        data_type: dt,
+                                    };
+                                }
+                            }
+                        }
+                        AggregateCall::Count { expr, .. } => {
+                            if Self::is_null(expr) {
+                                return ScalarExpr::Literal(Literal::Int128(0));
+                            }
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
                 simplified_agg

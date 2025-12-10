@@ -1,10 +1,10 @@
-pub mod scan;
-pub mod filter;
-pub mod projection;
-pub mod join;
 pub mod aggregate;
-pub mod sort;
+pub mod filter;
+pub mod join;
+pub mod projection;
 pub mod ranges;
+pub mod scan;
+pub mod sort;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;

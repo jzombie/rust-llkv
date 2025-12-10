@@ -1,13 +1,13 @@
-use crate::physical_plan::{PhysicalPlan, BatchIter};
+use crate::physical_plan::{BatchIter, PhysicalPlan};
 use arrow::datatypes::SchemaRef;
 use llkv_expr::expr::Expr;
+use llkv_result::Result;
+use llkv_storage::pager::Pager;
 use llkv_types::FieldId;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
-use llkv_result::Result;
 
 pub struct FilterExec<P>
 where
@@ -56,7 +56,9 @@ where
     }
 
     fn execute(&self) -> Result<BatchIter> {
-        Err(llkv_result::Error::Internal("Execution of FilterExec must be handled by the executor crate".to_string()))
+        Err(llkv_result::Error::Internal(
+            "Execution of FilterExec must be handled by the executor crate".to_string(),
+        ))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
@@ -68,7 +70,9 @@ where
         children: Vec<Arc<dyn PhysicalPlan<P>>>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
-            return Err(llkv_result::Error::Internal("FilterExec expects exactly 1 child".to_string()));
+            return Err(llkv_result::Error::Internal(
+                "FilterExec expects exactly 1 child".to_string(),
+            ));
         }
         Ok(Arc::new(FilterExec::new(
             children[0].clone(),
@@ -81,4 +85,3 @@ where
         self
     }
 }
-

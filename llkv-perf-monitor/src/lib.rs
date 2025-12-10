@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::cell::RefCell;
+use std::time::Duration;
 
 thread_local! {
     static CONTEXT: RefCell<Option<String>> = RefCell::new(None);
@@ -143,10 +143,10 @@ pub fn log_if_slow(label: &str, parts: &[(&str, Duration)]) -> bool {
     if any_slow {
         ensure_context_printed();
         let depth = NESTING.with(|n| *n.borrow());
-        
+
         let mut prefix = "│   ".repeat(depth);
         prefix.push_str("├── ");
-        
+
         let mut msg = format!("{}Slow {}: ", prefix, label);
         for (i, (name, dur)) in parts.iter().enumerate() {
             if i > 0 {

@@ -615,7 +615,9 @@ impl AggregateAccumulator {
                             value: 0.0,
                         })
                     }
-                    (&DataType::Null, _) => Ok(AggregateAccumulator::TotalNull { column_index: idx }),
+                    (&DataType::Null, _) => {
+                        Ok(AggregateAccumulator::TotalNull { column_index: idx })
+                    }
                     other => Err(Error::InvalidArgumentError(format!(
                         "TOTAL aggregate not supported for column type {:?}",
                         other.0

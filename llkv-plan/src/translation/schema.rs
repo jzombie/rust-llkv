@@ -53,7 +53,7 @@ pub fn infer_computed_data_type(
         ScalarExpr::Literal(lit) => {
             let res = infer_literal_datatype(lit);
             res
-        },
+        }
         ScalarExpr::Column(field_id) => {
             let column = schema.column_by_field_id(*field_id).ok_or_else(|| {
                 Error::InvalidArgumentError(format!(

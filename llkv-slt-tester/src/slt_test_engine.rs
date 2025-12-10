@@ -374,11 +374,10 @@ impl AsyncDB for EngineHarness {
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         tracing::debug!("[HARNESS] run() called, sql=\"{}\"", sql.trim());
         llkv_perf_monitor::set_context(sql);
-        
-        let (results, plan_duration) = llkv_perf_monitor::measure!("execute", {
-            self.engine.execute(sql)
-        });
-        
+
+        let (results, plan_duration) =
+            llkv_perf_monitor::measure!("execute", { self.engine.execute(sql) });
+
         match results {
             Ok(mut results) => {
                 if results.is_empty() {
@@ -399,9 +398,8 @@ impl AsyncDB for EngineHarness {
                 }
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
-                        let (batches, exec_duration) = llkv_perf_monitor::measure!("collect", {
-                            execution.collect()
-                        });
+                        let (batches, exec_duration) =
+                            llkv_perf_monitor::measure!("collect", { execution.collect() });
                         let batches = batches?;
 
                         llkv_perf_monitor::log_if_slow(

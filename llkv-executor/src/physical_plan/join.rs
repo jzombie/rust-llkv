@@ -1,12 +1,12 @@
-use crate::physical_plan::{PhysicalPlan, BatchIter};
-use llkv_plan::plans::JoinPlan;
+use crate::physical_plan::{BatchIter, PhysicalPlan};
 use arrow::datatypes::SchemaRef;
+use llkv_plan::plans::JoinPlan;
+use llkv_result::Result;
+use llkv_storage::pager::Pager;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
-use llkv_result::Result;
 
 pub struct HashJoinExec<P>
 where
@@ -62,7 +62,9 @@ where
     }
 
     fn execute(&self) -> Result<BatchIter> {
-        Err(llkv_result::Error::Internal("Execution of HashJoinExec must be handled by the executor crate".to_string()))
+        Err(llkv_result::Error::Internal(
+            "Execution of HashJoinExec must be handled by the executor crate".to_string(),
+        ))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
@@ -74,7 +76,9 @@ where
         children: Vec<Arc<dyn PhysicalPlan<P>>>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 2 {
-            return Err(llkv_result::Error::Internal("HashJoinExec expects exactly 2 children".to_string()));
+            return Err(llkv_result::Error::Internal(
+                "HashJoinExec expects exactly 2 children".to_string(),
+            ));
         }
         Ok(Arc::new(HashJoinExec::new(
             children[0].clone(),
@@ -89,4 +93,3 @@ where
         self
     }
 }
-

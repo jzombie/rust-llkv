@@ -850,29 +850,40 @@ impl SqlEngine {
                 .expect("valid empty IN regex")
         });
 
-        let result = re.replace_all(sql, |caps: &regex::Captures| {
-            let expr = &caps[1];
-            if caps.get(2).is_some() {
-                // expr NOT IN () → always true (but still evaluate expr)
-                // We use the same logic as IN () but negated.
-                // IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)
-                // NOT IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)
-                // We wrap in a comparison (= FALSE) because the WHERE clause planner only supports
-                // comparisons and boolean logic at the top level, not arbitrary scalar expressions like CAST.
-                format!("(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)", expr)
-            } else {
-                // expr IN () → always false (but still evaluate expr)
-                // We use COALESCE to ensure we get FALSE even if expr evaluates to NULL
-                // (since NULL AND FALSE can be NULL in some contexts).
-                // We wrap in a comparison (= TRUE) because the WHERE clause planner only supports
-                // comparisons and boolean logic at the top level.
-                format!("(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)", expr)
-            }
-        })
-        .to_string();
-        
+        let result = re
+            .replace_all(sql, |caps: &regex::Captures| {
+                let expr = &caps[1];
+                if caps.get(2).is_some() {
+                    // expr NOT IN () → always true (but still evaluate expr)
+                    // We use the same logic as IN () but negated.
+                    // IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)
+                    // NOT IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)
+                    // We wrap in a comparison (= FALSE) because the WHERE clause planner only supports
+                    // comparisons and boolean logic at the top level, not arbitrary scalar expressions like CAST.
+                    format!(
+                        "(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)",
+                        expr
+                    )
+                } else {
+                    // expr IN () → always false (but still evaluate expr)
+                    // We use COALESCE to ensure we get FALSE even if expr evaluates to NULL
+                    // (since NULL AND FALSE can be NULL in some contexts).
+                    // We wrap in a comparison (= TRUE) because the WHERE clause planner only supports
+                    // comparisons and boolean logic at the top level.
+                    format!(
+                        "(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)",
+                        expr
+                    )
+                }
+            })
+            .to_string();
+
         if result != sql {
-            tracing::debug!("preprocess_empty_in_lists: rewritten '{}' to '{}'", sql, result);
+            tracing::debug!(
+                "preprocess_empty_in_lists: rewritten '{}' to '{}'",
+                sql,
+                result
+            );
         } else {
             tracing::debug!("preprocess_empty_in_lists: no match for '{}'", sql);
         }
@@ -1081,9 +1092,8 @@ impl SqlEngine {
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
-        let (processed_sql, preprocess_duration) = llkv_perf_monitor::measure!("preprocess", {
-            Self::preprocess_sql_input(sql)
-        });
+        let (processed_sql, preprocess_duration) =
+            llkv_perf_monitor::measure!("preprocess", { Self::preprocess_sql_input(sql) });
 
         let (statements, parse_duration) = llkv_perf_monitor::measure!("parse", {
             let dialect = GenericDialect {};
@@ -1139,10 +1149,11 @@ impl SqlEngine {
                 _ => {
                     // Flush before any non-INSERT
                     let mut flushed = self.flush_buffer_results()?;
-                    let (current, exec_stmt_duration) = llkv_perf_monitor::measure!("execute_statement", {
-                        self.execute_statement(statement.clone())?
-                    });
-                    
+                    let (current, exec_stmt_duration) =
+                        llkv_perf_monitor::measure!("execute_statement", {
+                            self.execute_statement(statement.clone())?
+                        });
+
                     llkv_perf_monitor::log_if_slow(
                         "execute_statement",
                         &[("Exec", exec_stmt_duration)],
@@ -5124,16 +5135,15 @@ impl SqlEngine {
             return Ok(result);
         }
 
-        let (select_plan, build_duration) = llkv_perf_monitor::measure!("build_select_plan", {
-            self.build_select_plan(query)?
-        });
-        
+        let (select_plan, build_duration) =
+            llkv_perf_monitor::measure!("build_select_plan", { self.build_select_plan(query)? });
+
         llkv_perf_monitor::log_if_slow("build_select_plan", &[("Build", build_duration)]);
 
         let (res, exec_plan_duration) = llkv_perf_monitor::measure!("execute_plan_statement", {
             self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)))
         });
-        
+
         llkv_perf_monitor::log_if_slow("execute_plan_statement", &[("Exec", exec_plan_duration)]);
         res
     }
@@ -6293,11 +6303,17 @@ impl SqlEngine {
                 correlated_tracker.reborrow(),
             )?;
             if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!("translate_select_internal: projections len before with_projections: {}", projections.len());
+                eprintln!(
+                    "translate_select_internal: projections len before with_projections: {}",
+                    projections.len()
+                );
             }
             p = p.with_projections(projections);
             if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!("translate_select_internal: p.projections len after with_projections: {}", p.projections.len());
+                eprintln!(
+                    "translate_select_internal: p.projections len after with_projections: {}",
+                    p.projections.len()
+                );
                 if let Some(first) = p.projections.first() {
                     eprintln!("translate_select_internal: first projection: {:?}", first);
                 }
@@ -10914,7 +10930,9 @@ fn infer_expr_type(
         ScalarExpr::Literal(lit) => Ok(match lit {
             Literal::Int128(_) => DataType::Int64,
             Literal::Float64(_) => DataType::Float64,
-            Literal::Decimal128(v) => DataType::Decimal128(std::cmp::max(v.precision(), v.scale() as u8), v.scale()),
+            Literal::Decimal128(v) => {
+                DataType::Decimal128(std::cmp::max(v.precision(), v.scale() as u8), v.scale())
+            }
             Literal::Boolean(_) => DataType::Boolean,
             Literal::String(_) => DataType::Utf8,
             Literal::Date32(_) => DataType::Date32,

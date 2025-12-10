@@ -258,7 +258,9 @@ impl<F> Mappable<F> for AggregateCall<F> {
             }),
             AggregateCall::Min(expr) => Ok(AggregateCall::Min(Box::new(expr.try_map_ref(f)?))),
             AggregateCall::Max(expr) => Ok(AggregateCall::Max(Box::new(expr.try_map_ref(f)?))),
-            AggregateCall::CountNulls(expr) => Ok(AggregateCall::CountNulls(Box::new(expr.try_map_ref(f)?))),
+            AggregateCall::CountNulls(expr) => {
+                Ok(AggregateCall::CountNulls(Box::new(expr.try_map_ref(f)?)))
+            }
             AggregateCall::GroupConcat {
                 expr,
                 distinct,
@@ -437,10 +439,7 @@ impl<F> Mappable<F> for ScalarExpr<F> {
                 branches,
                 else_expr,
             } => {
-                let operand = operand
-                    .map(|o| o.try_map_ref(f))
-                    .transpose()?
-                    .map(Box::new);
+                let operand = operand.map(|o| o.try_map_ref(f)).transpose()?.map(Box::new);
                 let branches = branches
                     .into_iter()
                     .map(|(w, t)| Ok((w.try_map_ref(f)?, t.try_map_ref(f)?)))

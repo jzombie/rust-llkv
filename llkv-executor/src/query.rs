@@ -5,10 +5,10 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, mpsc};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatchOptions};
-use llkv_compute::projection::infer_literal_datatype;
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::DataType;
-use llkv_aggregate::{AggregateStream, GroupedAggregateStream, AggregateSpec, AggregateKind};
+use llkv_aggregate::{AggregateKind, AggregateSpec, AggregateStream, GroupedAggregateStream};
+use llkv_compute::projection::infer_literal_datatype;
 
 impl<P> QueryExecutor<P>
 where
@@ -74,10 +74,7 @@ where
         };
 
         let agg_count = agg_plan.aggregates.len();
-        let agg_offset = agg_schema
-            .fields()
-            .len()
-            .saturating_sub(agg_count);
+        let agg_offset = agg_schema.fields().len().saturating_sub(agg_count);
 
         if let Some(having_expr) = having_expr {
             let mut name_to_index = FxHashMap::default();
@@ -139,12 +136,8 @@ where
         for (expr_str, name) in final_exprs.iter().zip(final_names.iter()) {
             let expr = resolve_scalar_expr_using_map(expr_str, &name_to_index, subquery_results)?;
             let mut next_agg_idx = 0;
-            let rewritten = Self::rewrite_aggregate_refs(
-                expr,
-                agg_offset,
-                agg_count,
-                &mut next_agg_idx,
-            )?;
+            let rewritten =
+                Self::rewrite_aggregate_refs(expr, agg_offset, agg_count, &mut next_agg_idx)?;
             let dt = infer_type(&rewritten, &agg_schema, &col_mapping)
                 .unwrap_or(arrow::datatypes::DataType::Int64);
             final_output_fields.push(ArrowField::new(name, dt, true));
@@ -179,8 +172,15 @@ where
                 let expected_type = final_output_schema_captured.field(i).data_type();
                 if col.data_type() != expected_type {
                     // Attempt to cast if types mismatch (e.g. NullArray -> Int64Array)
-                    let casted = arrow::compute::cast(col, expected_type)
-                        .map_err(|e| Error::Internal(format!("Failed to cast column {} from {:?} to {:?}: {}", i, col.data_type(), expected_type, e)))?;
+                    let casted = arrow::compute::cast(col, expected_type).map_err(|e| {
+                        Error::Internal(format!(
+                            "Failed to cast column {} from {:?} to {:?}: {}",
+                            i,
+                            col.data_type(),
+                            expected_type,
+                            e
+                        ))
+                    })?;
                     cast_columns.push(casted);
                 } else {
                     cast_columns.push(col.clone());
@@ -206,6 +206,13 @@ where
     }
 }
 
+use crate::physical_plan::PhysicalPlan;
+use crate::physical_plan::aggregate::AggregateExec;
+use crate::physical_plan::filter::FilterExec;
+use crate::physical_plan::join::HashJoinExec;
+use crate::physical_plan::projection::ProjectionExec;
+use crate::physical_plan::scan::ScanExec;
+use crate::physical_plan::sort::SortExec;
 use arrow::datatypes::{Field as ArrowField, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, SortField};
@@ -213,11 +220,14 @@ use llkv_column_map::gather::gather_optional_projected_indices_from_batches;
 use llkv_column_map::store::Projection;
 use llkv_compute::eval::ScalarEvaluator;
 use llkv_expr::AggregateCall;
-use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, ScalarExpr, SubqueryId, Mappable};
+use llkv_expr::expr::{CompareOp, Expr as LlkvExpr, Mappable, ScalarExpr, SubqueryId};
 use llkv_expr::literal::Literal;
 use llkv_expr::{BinaryOp, Expr, Filter, InList, Operator};
 use llkv_join::JoinType;
-use llkv_plan::logical_planner::{LogicalPlan, ResolvedJoin, SingleTableLogicalPlan, MultiTableLogicalPlan};
+use llkv_plan::SelectPlan;
+use llkv_plan::logical_planner::{
+    LogicalPlan, MultiTableLogicalPlan, ResolvedJoin, SingleTableLogicalPlan,
+};
 use llkv_plan::plans::AggregateExpr;
 use llkv_plan::plans::FilterSubquery;
 use llkv_plan::plans::JoinPlan;
@@ -226,16 +236,8 @@ use llkv_plan::prepared::{
     DefaultPreparedSelectPlanner, PreparedCompoundSelect, PreparedScalarSubquery,
     PreparedSelectPlan, PreparedSelectPlanner,
 };
-use crate::physical_plan::aggregate::AggregateExec;
-use crate::physical_plan::filter::FilterExec;
-use crate::physical_plan::join::HashJoinExec;
-use crate::physical_plan::projection::ProjectionExec;
-use crate::physical_plan::scan::ScanExec;
-use crate::physical_plan::sort::SortExec;
-use llkv_plan::table_provider::{ExecutionTable, TableProvider};
-use crate::physical_plan::PhysicalPlan;
 use llkv_plan::schema::{PlanColumn, PlanSchema};
-use llkv_plan::SelectPlan;
+use llkv_plan::table_provider::{ExecutionTable, TableProvider};
 use llkv_result::Error;
 use llkv_scan::{RowIdFilter, ScanProjection};
 use llkv_storage::pager::Pager;
@@ -292,7 +294,9 @@ where
         children: Vec<Arc<dyn PhysicalPlan<P>>>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
-            return Err(Error::Internal("DistinctExec expects exactly one child".to_string()));
+            return Err(Error::Internal(
+                "DistinctExec expects exactly one child".to_string(),
+            ));
         }
         Ok(Arc::new(DistinctExec::new(children[0].clone())))
     }
@@ -311,7 +315,11 @@ struct LimitExec<P> {
 
 impl<P> LimitExec<P> {
     fn new(input: Arc<dyn PhysicalPlan<P>>, offset: Option<usize>, limit: Option<usize>) -> Self {
-        Self { input, offset, limit }
+        Self {
+            input,
+            offset,
+            limit,
+        }
     }
 }
 
@@ -338,9 +346,15 @@ where
         children: Vec<Arc<dyn PhysicalPlan<P>>>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
-            return Err(Error::Internal("LimitExec expects exactly one child".to_string()));
+            return Err(Error::Internal(
+                "LimitExec expects exactly one child".to_string(),
+            ));
         }
-        Ok(Arc::new(LimitExec::new(children[0].clone(), self.offset, self.limit)))
+        Ok(Arc::new(LimitExec::new(
+            children[0].clone(),
+            self.offset,
+            self.limit,
+        )))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -361,7 +375,9 @@ where
 
     /// Convenience constructor that wires the default planner to the executor provider.
     pub fn with_default_planner(provider: Arc<dyn ExecutorTableProvider<P>>) -> Self {
-        let planner_provider = Arc::new(PlannerTableProvider { inner: provider.clone() });
+        let planner_provider = Arc::new(PlannerTableProvider {
+            inner: provider.clone(),
+        });
         let planner: Arc<dyn PreparedSelectPlanner<P>> =
             Arc::new(DefaultPreparedSelectPlanner::new(planner_provider));
         Self::new(provider, planner)
@@ -370,8 +386,7 @@ where
     fn scalar_contains_aggregate<F>(expr: &ScalarExpr<F>) -> bool {
         match expr {
             ScalarExpr::Aggregate(_) => true,
-            ScalarExpr::Binary { left, right, .. }
-            | ScalarExpr::Compare { left, right, .. } => {
+            ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
                 Self::scalar_contains_aggregate(left) || Self::scalar_contains_aggregate(right)
             }
             ScalarExpr::Not(e)
@@ -597,24 +612,12 @@ where
         match expr {
             Expr::And(list) => Ok(Expr::And(
                 list.iter()
-                    .map(|e| {
-                        self.rewrite_expr_subqueries_with_exec(
-                            e,
-                            prepared_subqueries,
-                            cache,
-                        )
-                    })
+                    .map(|e| self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache))
                     .collect::<ExecutorResult<Vec<_>>>()?,
             )),
             Expr::Or(list) => Ok(Expr::Or(
                 list.iter()
-                    .map(|e| {
-                        self.rewrite_expr_subqueries_with_exec(
-                            e,
-                            prepared_subqueries,
-                            cache,
-                        )
-                    })
+                    .map(|e| self.rewrite_expr_subqueries_with_exec(e, prepared_subqueries, cache))
                     .collect::<ExecutorResult<Vec<_>>>()?,
             )),
             Expr::Not(e) => Ok(Expr::Not(Box::new(
@@ -665,11 +668,7 @@ where
                 }))
             }
             Expr::Compare { left, op, right } => Ok(Expr::Compare {
-                left: self.rewrite_scalar_subqueries_with_exec(
-                    left,
-                    prepared_subqueries,
-                    cache,
-                )?,
+                left: self.rewrite_scalar_subqueries_with_exec(left, prepared_subqueries, cache)?,
                 op: *op,
                 right: self.rewrite_scalar_subqueries_with_exec(
                     right,
@@ -682,29 +681,17 @@ where
                 list,
                 negated,
             } => Ok(Expr::InList {
-                expr: self.rewrite_scalar_subqueries_with_exec(
-                    expr,
-                    prepared_subqueries,
-                    cache,
-                )?,
+                expr: self.rewrite_scalar_subqueries_with_exec(expr, prepared_subqueries, cache)?,
                 list: list
                     .iter()
                     .map(|e| {
-                        self.rewrite_scalar_subqueries_with_exec(
-                            e,
-                            prepared_subqueries,
-                            cache,
-                        )
+                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache)
                     })
                     .collect::<ExecutorResult<Vec<_>>>()?,
                 negated: *negated,
             }),
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-                expr: self.rewrite_scalar_subqueries_with_exec(
-                    expr,
-                    prepared_subqueries,
-                    cache,
-                )?,
+                expr: self.rewrite_scalar_subqueries_with_exec(expr, prepared_subqueries, cache)?,
                 negated: *negated,
             }),
             Expr::Literal(b) => Ok(Expr::Literal(*b)),
@@ -806,11 +793,7 @@ where
                 exprs
                     .iter()
                     .map(|e| {
-                        self.rewrite_scalar_subqueries_with_exec(
-                            e,
-                            prepared_subqueries,
-                            cache,
-                        )
+                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache)
                     })
                     .collect::<ExecutorResult<Vec<_>>>()?,
             )),
@@ -822,11 +805,7 @@ where
                 operand: operand
                     .as_ref()
                     .map(|o| {
-                        self.rewrite_scalar_subqueries_with_exec(
-                            o,
-                            prepared_subqueries,
-                            cache,
-                        )
+                        self.rewrite_scalar_subqueries_with_exec(o, prepared_subqueries, cache)
                     })
                     .transpose()?
                     .map(Box::new),
@@ -850,11 +829,7 @@ where
                 else_expr: else_expr
                     .as_ref()
                     .map(|e| {
-                        self.rewrite_scalar_subqueries_with_exec(
-                            e,
-                            prepared_subqueries,
-                            cache,
-                        )
+                        self.rewrite_scalar_subqueries_with_exec(e, prepared_subqueries, cache)
                     })
                     .transpose()?
                     .map(Box::new),
@@ -914,7 +889,9 @@ where
     ) -> ExecutorResult<FxHashMap<SubqueryId, Literal>> {
         let mut results = FxHashMap::default();
         for sub in subqueries {
-            let Some(plan) = &sub.prepared_plan else { continue };
+            let Some(plan) = &sub.prepared_plan else {
+                continue;
+            };
             let execution = self.execute_prepared_select(plan)?;
             let batches = execution.collect()?;
 
@@ -1226,8 +1203,9 @@ where
     ) -> ExecutorResult<ScalarExpr<(usize, u32)>> {
         match expr {
             ScalarExpr::Column(name) => {
-                let idx = resolve_schema_index(name, schema)
-                    .ok_or_else(|| Error::Internal(format!("Column not found in schema: {}", name)))?;
+                let idx = resolve_schema_index(name, schema).ok_or_else(|| {
+                    Error::Internal(format!("Column not found in schema: {}", name))
+                })?;
                 Ok(ScalarExpr::Column((0, idx as u32)))
             }
             ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
@@ -1235,14 +1213,34 @@ where
                 let dummy_expr = Box::new(ScalarExpr::Literal(Literal::Null));
                 Ok(ScalarExpr::Aggregate(match call {
                     AggregateCall::CountStar => AggregateCall::CountStar,
-                    AggregateCall::Count { distinct, .. } => AggregateCall::Count { expr: dummy_expr, distinct: *distinct },
-                    AggregateCall::Sum { distinct, .. } => AggregateCall::Sum { expr: dummy_expr, distinct: *distinct },
-                    AggregateCall::Total { distinct, .. } => AggregateCall::Total { expr: dummy_expr, distinct: *distinct },
-                    AggregateCall::Avg { distinct, .. } => AggregateCall::Avg { expr: dummy_expr, distinct: *distinct },
+                    AggregateCall::Count { distinct, .. } => AggregateCall::Count {
+                        expr: dummy_expr,
+                        distinct: *distinct,
+                    },
+                    AggregateCall::Sum { distinct, .. } => AggregateCall::Sum {
+                        expr: dummy_expr,
+                        distinct: *distinct,
+                    },
+                    AggregateCall::Total { distinct, .. } => AggregateCall::Total {
+                        expr: dummy_expr,
+                        distinct: *distinct,
+                    },
+                    AggregateCall::Avg { distinct, .. } => AggregateCall::Avg {
+                        expr: dummy_expr,
+                        distinct: *distinct,
+                    },
                     AggregateCall::Min(_) => AggregateCall::Min(dummy_expr),
                     AggregateCall::Max(_) => AggregateCall::Max(dummy_expr),
                     AggregateCall::CountNulls(_) => AggregateCall::CountNulls(dummy_expr),
-                    AggregateCall::GroupConcat { distinct, separator, .. } => AggregateCall::GroupConcat { expr: dummy_expr, distinct: *distinct, separator: separator.clone() },
+                    AggregateCall::GroupConcat {
+                        distinct,
+                        separator,
+                        ..
+                    } => AggregateCall::GroupConcat {
+                        expr: dummy_expr,
+                        distinct: *distinct,
+                        separator: separator.clone(),
+                    },
                 }))
             }
             ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
@@ -1250,7 +1248,9 @@ where
                 op: *op,
                 right: Box::new(Self::remap_having_expr_to_indices(right, schema)?),
             }),
-            ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(Self::remap_having_expr_to_indices(e, schema)?))),
+            ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(
+                Self::remap_having_expr_to_indices(e, schema)?,
+            ))),
             ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
                 expr: Box::new(Self::remap_having_expr_to_indices(expr, schema)?),
                 negated: *negated,
@@ -1259,29 +1259,33 @@ where
                 expr: Box::new(Self::remap_having_expr_to_indices(expr, schema)?),
                 data_type: data_type.clone(),
             }),
-            ScalarExpr::Case { operand, branches, else_expr } => {
-                 let op = if let Some(o) = operand {
-                     Some(Box::new(Self::remap_having_expr_to_indices(o, schema)?))
-                 } else {
-                     None
-                 };
-                 let mut new_branches = Vec::new();
-                 for (w, t) in branches {
-                     new_branches.push((
-                         Self::remap_having_expr_to_indices(w, schema)?,
-                         Self::remap_having_expr_to_indices(t, schema)?,
-                     ));
-                 }
-                 let el = if let Some(e) = else_expr {
-                     Some(Box::new(Self::remap_having_expr_to_indices(e, schema)?))
-                 } else {
-                     None
-                 };
-                 Ok(ScalarExpr::Case {
-                     operand: op,
-                     branches: new_branches,
-                     else_expr: el,
-                 })
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                let op = if let Some(o) = operand {
+                    Some(Box::new(Self::remap_having_expr_to_indices(o, schema)?))
+                } else {
+                    None
+                };
+                let mut new_branches = Vec::new();
+                for (w, t) in branches {
+                    new_branches.push((
+                        Self::remap_having_expr_to_indices(w, schema)?,
+                        Self::remap_having_expr_to_indices(t, schema)?,
+                    ));
+                }
+                let el = if let Some(e) = else_expr {
+                    Some(Box::new(Self::remap_having_expr_to_indices(e, schema)?))
+                } else {
+                    None
+                };
+                Ok(ScalarExpr::Case {
+                    operand: op,
+                    branches: new_branches,
+                    else_expr: el,
+                })
             }
             ScalarExpr::Coalesce(exprs) => {
                 let mut new_exprs = Vec::new();
@@ -2003,8 +2007,15 @@ where
                 let expected_type = output_schema_captured.field(i).data_type();
                 if col.data_type() != expected_type {
                     // Attempt to cast if types mismatch (e.g. NullArray -> Int64Array)
-                    let casted = arrow::compute::cast(col, expected_type)
-                        .map_err(|e| Error::Internal(format!("Failed to cast column {} from {:?} to {:?}: {}", i, col.data_type(), expected_type, e)))?;
+                    let casted = arrow::compute::cast(col, expected_type).map_err(|e| {
+                        Error::Internal(format!(
+                            "Failed to cast column {} from {:?} to {:?}: {}",
+                            i,
+                            col.data_type(),
+                            expected_type,
+                            e
+                        ))
+                    })?;
                     cast_columns.push(casted);
                 } else {
                     cast_columns.push(col.clone());
@@ -2271,15 +2282,15 @@ where
                 .prepare_select(plan, row_filter, None)
                 .map_err(Error::from)?
         });
-        
+
         llkv_perf_monitor::log_if_slow("prepare_select", &[("Prepare", t_prepare)]);
 
         let (result, t_exec) = llkv_perf_monitor::measure!("execute_prepared_select", {
             self.execute_prepared_select(&prepared)
         });
-        
+
         llkv_perf_monitor::log_if_slow("execute_prepared_select", &[("Exec", t_exec)]);
-        
+
         result
     }
 
@@ -2360,7 +2371,10 @@ where
                 if let Some((idx, _)) = input_schema.column_with_name(col_name) {
                     pre_agg_proj_exprs.push((ScalarExpr::Column(idx), col_name.clone()));
                 } else {
-                    return Err(Error::Internal(format!("Group by column {} not found in schema", col_name)));
+                    return Err(Error::Internal(format!(
+                        "Group by column {} not found in schema",
+                        col_name
+                    )));
                 }
             }
 
@@ -2384,56 +2398,57 @@ where
                 proj_schema.clone(),
                 pre_agg_proj_exprs,
             ));
-            
+
             // 2. Create AggregateExec
             let group_expr: Vec<usize> = (0..plan.group_by.len()).collect();
-            
+
             let mut fields = Vec::new();
             // Group by fields from the projection schema
             for i in 0..plan.group_by.len() {
                 fields.push(proj_schema.field(i).clone());
             }
-            
+
             // Aggregate result fields
             for agg in &rewrite.aggregates {
-                 let dt = match agg {
-                     llkv_plan::plans::AggregateExpr::Column { function, column, .. } => {
-                         let input_type = if let Some((_, field)) = proj_schema.column_with_name(column) {
-                             field.data_type().clone()
-                         } else {
-                             DataType::Int64
-                         };
+                let dt = match agg {
+                    llkv_plan::plans::AggregateExpr::Column {
+                        function, column, ..
+                    } => {
+                        let input_type =
+                            if let Some((_, field)) = proj_schema.column_with_name(column) {
+                                field.data_type().clone()
+                            } else {
+                                DataType::Int64
+                            };
 
-                         match function {
-                             llkv_plan::plans::AggregateFunction::Count | llkv_plan::plans::AggregateFunction::CountNulls => DataType::Int64,
-                             llkv_plan::plans::AggregateFunction::SumInt64 => {
-                                 match input_type {
-                                     DataType::Float64 | DataType::Float32 => DataType::Float64,
-                                     DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
-                                     _ => DataType::Int64,
-                                 }
-                             },
-                             llkv_plan::plans::AggregateFunction::TotalInt64 => {
-                                 match input_type {
-                                     DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
-                                     _ => DataType::Float64,
-                                 }
-                             },
-                             llkv_plan::plans::AggregateFunction::MinInt64 | llkv_plan::plans::AggregateFunction::MaxInt64 => {
-                                 input_type
-                             },
-                             llkv_plan::plans::AggregateFunction::GroupConcat { .. } => DataType::Utf8,
-                         }
-                     },
-                     llkv_plan::plans::AggregateExpr::CountStar { .. } => DataType::Int64,
-                 };
-                 let name = match agg {
-                     llkv_plan::plans::AggregateExpr::Column { alias, .. } => alias.clone(),
-                     llkv_plan::plans::AggregateExpr::CountStar { alias, .. } => alias.clone(),
-                 };
-                 fields.push(arrow::datatypes::Field::new(name, dt, true));
+                        match function {
+                            llkv_plan::plans::AggregateFunction::Count
+                            | llkv_plan::plans::AggregateFunction::CountNulls => DataType::Int64,
+                            llkv_plan::plans::AggregateFunction::SumInt64 => match input_type {
+                                DataType::Float64 | DataType::Float32 => DataType::Float64,
+                                DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
+                                _ => DataType::Int64,
+                            },
+                            llkv_plan::plans::AggregateFunction::TotalInt64 => match input_type {
+                                DataType::Decimal128(p, s) => DataType::Decimal128(p, s),
+                                _ => DataType::Float64,
+                            },
+                            llkv_plan::plans::AggregateFunction::MinInt64
+                            | llkv_plan::plans::AggregateFunction::MaxInt64 => input_type,
+                            llkv_plan::plans::AggregateFunction::GroupConcat { .. } => {
+                                DataType::Utf8
+                            }
+                        }
+                    }
+                    llkv_plan::plans::AggregateExpr::CountStar { .. } => DataType::Int64,
+                };
+                let name = match agg {
+                    llkv_plan::plans::AggregateExpr::Column { alias, .. } => alias.clone(),
+                    llkv_plan::plans::AggregateExpr::CountStar { alias, .. } => alias.clone(),
+                };
+                fields.push(arrow::datatypes::Field::new(name, dt, true));
             }
-            
+
             let agg_schema = Arc::new(Schema::new(fields));
 
             exec = Arc::new(AggregateExec::new(
@@ -2453,80 +2468,72 @@ where
             };
 
             if let Some(having_scalar) = having_expr {
-                let having_remapped = Self::remap_having_expr_to_indices(
-                    &having_scalar,
-                    &agg_schema,
-                )?;
-                
+                let having_remapped =
+                    Self::remap_having_expr_to_indices(&having_scalar, &agg_schema)?;
+
                 let agg_offset = plan.group_by.len();
                 let agg_count = rewrite.aggregates.len();
                 let mut next_agg_idx = 0;
-                
+
                 let having_rewritten = Self::rewrite_aggregate_refs(
                     having_remapped,
                     agg_offset,
                     agg_count,
                     &mut next_agg_idx,
                 )?;
-                
+
                 let having_expr = map_scalar_expr_to_usize(having_rewritten);
-                
+
                 // Create projection to add _having column
                 let mut proj_exprs = Vec::new();
                 let mut proj_fields = Vec::new();
-                
+
                 // Pass through existing fields
                 for (i, field) in agg_schema.fields().iter().enumerate() {
                     proj_exprs.push((ScalarExpr::Column(i), field.name().clone()));
                     proj_fields.push(field.clone());
                 }
-                
+
                 // Add having condition
                 proj_exprs.push((having_expr, "_having".to_string()));
-                proj_fields.push(Arc::new(arrow::datatypes::Field::new("_having", DataType::Boolean, true)));
-                
+                proj_fields.push(Arc::new(arrow::datatypes::Field::new(
+                    "_having",
+                    DataType::Boolean,
+                    true,
+                )));
+
                 let proj_schema = Arc::new(Schema::new(proj_fields));
-                
-                exec = Arc::new(ProjectionExec::new(
-                    exec,
-                    proj_schema.clone(),
-                    proj_exprs,
-                ));
-                
+
+                exec = Arc::new(ProjectionExec::new(exec, proj_schema.clone(), proj_exprs));
+
                 // Filter on _having
                 let having_idx = agg_schema.fields().len(); // Index of _having
                 let filter_expr = llkv_expr::expr::Expr::Pred(llkv_expr::expr::Filter {
                     field_id: having_idx as FieldId,
-                    op: llkv_expr::expr::Operator::Equals(llkv_expr::literal::Literal::Boolean(true)),
+                    op: llkv_expr::expr::Operator::Equals(llkv_expr::literal::Literal::Boolean(
+                        true,
+                    )),
                 });
-                
-                exec = Arc::new(FilterExec::new(
-                    exec,
-                    filter_expr,
-                    proj_schema.clone(),
-                ));
-                
+
+                exec = Arc::new(FilterExec::new(exec, filter_expr, proj_schema.clone()));
+
                 // Project back to agg_schema (drop _having)
                 let mut proj_exprs = Vec::new();
                 for (i, field) in agg_schema.fields().iter().enumerate() {
                     proj_exprs.push((ScalarExpr::Column(i), field.name().clone()));
                 }
-                
-                exec = Arc::new(ProjectionExec::new(
-                    exec,
-                    agg_schema.clone(),
-                    proj_exprs,
-                ));
+
+                exec = Arc::new(ProjectionExec::new(exec, agg_schema.clone(), proj_exprs));
             }
 
             // 3. Final Projection
-            
+
             let mut proj_exprs = Vec::new();
             for (expr, name) in rewrite.final_expressions.iter().zip(&rewrite.final_names) {
                 let resolved_expr = resolve_scalar_expr_to_indices(expr, &agg_schema)?;
                 proj_exprs.push((resolved_expr, name.clone()));
             }
-            
+
             // Always infer schema from expressions to ensure consistency with executor
             let final_schema = {
                 let mut fields = Vec::new();
@@ -2537,21 +2544,20 @@ where
                 }
 
                 for (expr, name) in &proj_exprs {
-                    let col = ScalarEvaluator::evaluate_batch_simplified(
-                        expr,
-                        0,
-                        &field_arrays,
-                    ).map_err(|e| Error::Internal(format!("Failed to infer type for projection: {}", e)))?;
-                    fields.push(arrow::datatypes::Field::new(name, col.data_type().clone(), true));
+                    let col = ScalarEvaluator::evaluate_batch_simplified(expr, 0, &field_arrays)
+                        .map_err(|e| {
+                            Error::Internal(format!("Failed to infer type for projection: {}", e))
+                        })?;
+                    fields.push(arrow::datatypes::Field::new(
+                        name,
+                        col.data_type().clone(),
+                        true,
+                    ));
                 }
                 Arc::new(Schema::new(fields))
             };
 
-            exec = Arc::new(ProjectionExec::new(
-                exec,
-                final_schema,
-                proj_exprs,
-            ));
+            exec = Arc::new(ProjectionExec::new(exec, final_schema, proj_exprs));
 
             if plan.distinct {
                 exec = Arc::new(DistinctExec::new(exec));
@@ -2625,12 +2631,13 @@ where
         }
 
         if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec<P>>() {
-            let input_stream = self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
-            
+            let input_stream =
+                self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
+
             let mut specs = Vec::new();
             let mut proj_indices = Vec::new();
             let arg_start_idx = agg.group_expr.len();
-            
+
             for expr in &agg.aggr_expr {
                 let proj_idx = match expr {
                     llkv_plan::plans::AggregateExpr::CountStar { .. } => None,
@@ -2639,29 +2646,41 @@ where
                             if let Ok(idx) = stripped.parse::<usize>() {
                                 Some(arg_start_idx + idx)
                             } else {
-                                return Err(Error::Internal(format!("Invalid aggregate argument name: {}", column)));
+                                return Err(Error::Internal(format!(
+                                    "Invalid aggregate argument name: {}",
+                                    column
+                                )));
                             }
                         } else {
-                             return Err(Error::Internal(format!("Expected aggregate argument to start with _agg_arg_, got: {}", column)));
+                            return Err(Error::Internal(format!(
+                                "Expected aggregate argument to start with _agg_arg_, got: {}",
+                                column
+                            )));
                         }
                     }
                 };
                 proj_indices.push(proj_idx);
 
                 let (alias, kind) = match expr {
-                    llkv_plan::plans::AggregateExpr::CountStar { alias, distinct } => {
-                        (alias.clone(), AggregateKind::Count {
+                    llkv_plan::plans::AggregateExpr::CountStar { alias, distinct } => (
+                        alias.clone(),
+                        AggregateKind::Count {
                             field_id: None,
                             distinct: *distinct,
-                        })
-                    }
-                    llkv_plan::plans::AggregateExpr::Column { alias, function, distinct, .. } => {
+                        },
+                    ),
+                    llkv_plan::plans::AggregateExpr::Column {
+                        alias,
+                        function,
+                        distinct,
+                        ..
+                    } => {
                         let dt = if let Some(idx) = proj_idx {
                             agg.input.schema().field(idx).data_type().clone()
                         } else {
                             DataType::Int64
                         };
-                        
+
                         let kind = match function {
                             llkv_plan::plans::AggregateFunction::Count => AggregateKind::Count {
                                 field_id: None,
@@ -2672,11 +2691,13 @@ where
                                 data_type: dt,
                                 distinct: *distinct,
                             },
-                            llkv_plan::plans::AggregateFunction::TotalInt64 => AggregateKind::Total {
-                                field_id: 0,
-                                data_type: dt,
-                                distinct: *distinct,
-                            },
+                            llkv_plan::plans::AggregateFunction::TotalInt64 => {
+                                AggregateKind::Total {
+                                    field_id: 0,
+                                    data_type: dt,
+                                    distinct: *distinct,
+                                }
+                            }
                             llkv_plan::plans::AggregateFunction::MinInt64 => AggregateKind::Min {
                                 field_id: 0,
                                 data_type: dt,
@@ -2685,27 +2706,25 @@ where
                                 field_id: 0,
                                 data_type: dt,
                             },
-                            llkv_plan::plans::AggregateFunction::CountNulls => AggregateKind::CountNulls {
-                                field_id: 0,
-                            },
-                            llkv_plan::plans::AggregateFunction::GroupConcat { separator } => AggregateKind::GroupConcat {
-                                field_id: 0,
-                                distinct: *distinct,
-                                separator: separator.clone(),
-                            },
+                            llkv_plan::plans::AggregateFunction::CountNulls => {
+                                AggregateKind::CountNulls { field_id: 0 }
+                            }
+                            llkv_plan::plans::AggregateFunction::GroupConcat { separator } => {
+                                AggregateKind::GroupConcat {
+                                    field_id: 0,
+                                    distinct: *distinct,
+                                    separator: separator.clone(),
+                                }
+                            }
                         };
                         (alias.clone(), kind)
                     }
                 };
                 specs.push(AggregateSpec { alias, kind });
             }
-            
+
             if agg.group_expr.is_empty() {
-                let stream = AggregateStream::new_from_specs(
-                    input_stream,
-                    specs,
-                    proj_indices,
-                )?;
+                let stream = AggregateStream::new_from_specs(input_stream, specs, proj_indices)?;
                 return Ok(Box::new(stream));
             } else {
                 let stream = GroupedAggregateStream::new_from_specs(
@@ -2726,7 +2745,7 @@ where
             let expr = proj.expr.clone();
             return Ok(Box::new(input_stream.map(move |batch_res| {
                 let batch = batch_res?;
-                
+
                 let mut field_arrays = FxHashMap::default();
                 for (i, col) in batch.columns().iter().enumerate() {
                     field_arrays.insert(i, col.clone());
@@ -2738,7 +2757,8 @@ where
                         e,
                         batch.num_rows(),
                         &field_arrays,
-                    ).map_err(|e| Error::Internal(e.to_string()))?;
+                    )
+                    .map_err(|e| Error::Internal(e.to_string()))?;
 
                     // Cast if needed
                     let expected_type = schema.field(i).data_type();
@@ -2752,44 +2772,58 @@ where
                     columns.push(col);
                 }
                 if columns.is_empty() {
-                    let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-                    RecordBatch::try_new_with_options(schema.clone(), columns, &options).map_err(|e| Error::Internal(e.to_string()))
+                    let options = arrow::record_batch::RecordBatchOptions::new()
+                        .with_row_count(Some(batch.num_rows()));
+                    RecordBatch::try_new_with_options(schema.clone(), columns, &options)
+                        .map_err(|e| Error::Internal(e.to_string()))
                 } else {
                     if let Err(e) = RecordBatch::try_new(schema.clone(), columns.clone()) {
                         return Err(Error::Internal(e.to_string()));
                     }
-                    RecordBatch::try_new(schema.clone(), columns).map_err(|e| Error::Internal(e.to_string()))
+                    RecordBatch::try_new(schema.clone(), columns)
+                        .map_err(|e| Error::Internal(e.to_string()))
                 }
             })));
         }
 
         if let Some(filter) = plan.as_any().downcast_ref::<FilterExec<P>>() {
-            let input_stream = self.execute_physical_plan_tree(filter.input.clone(), subquery_results)?;
+            let input_stream =
+                self.execute_physical_plan_tree(filter.input.clone(), subquery_results)?;
             let predicate = filter.predicate.clone();
             let schema = filter.schema.clone();
-            
+
             // Convert Expr to ScalarExpr outside the closure
             let scalar_predicate = Self::expr_to_scalar_expr(&predicate);
 
             return Ok(Box::new(input_stream.map(move |batch_res| {
                 let batch = batch_res?;
-                
+
                 let mut field_arrays = FxHashMap::default();
                 for (i, col) in batch.columns().iter().enumerate() {
                     let field = schema.field(i);
-                    let fid = field.metadata().get("field_id")
+                    let fid = field
+                        .metadata()
+                        .get("field_id")
                         .and_then(|s| s.parse::<FieldId>().ok())
                         .unwrap_or(i as FieldId);
                     field_arrays.insert(fid, col.clone());
                 }
-                
-                let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
-                
-                let result = ScalarEvaluator::evaluate_batch(&scalar_predicate, batch.num_rows(), &numeric_arrays)
-                    .map_err(|e| Error::Internal(format!("Filter evaluation failed: {:?}", e)))?;
-                
+
+                let numeric_arrays =
+                    ScalarEvaluator::prepare_numeric_arrays(&field_arrays, batch.num_rows());
+
+                let result = ScalarEvaluator::evaluate_batch(
+                    &scalar_predicate,
+                    batch.num_rows(),
+                    &numeric_arrays,
+                )
+                .map_err(|e| Error::Internal(format!("Filter evaluation failed: {:?}", e)))?;
+
                 if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
-                    tracing::debug!("FilterExec: evaluated predicate for {} rows", batch.num_rows());
+                    tracing::debug!(
+                        "FilterExec: evaluated predicate for {} rows",
+                        batch.num_rows()
+                    );
                     tracing::debug!("FilterExec: result type: {:?}", result.data_type());
                     if let Some(bool_arr) = result.as_any().downcast_ref::<BooleanArray>() {
                         tracing::debug!("FilterExec: true count: {}", bool_arr.true_count());
@@ -2797,24 +2831,30 @@ where
                     }
                 }
 
-                let bool_arr = result.as_any().downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| Error::Internal("Filter predicate must return boolean".to_string()))?;
-                
-                filter_record_batch(&batch, bool_arr)
-                    .map_err(|e| Error::Internal(e.to_string()))
+                let bool_arr = result
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        Error::Internal("Filter predicate must return boolean".to_string())
+                    })?;
+
+                filter_record_batch(&batch, bool_arr).map_err(|e| Error::Internal(e.to_string()))
             })));
         }
 
         if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec<P>>() {
-            let input_stream = self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
-            
+            let input_stream =
+                self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
+
             let mut plan_columns = Vec::new();
             let input_schema = agg.input.schema();
             for (i, field) in input_schema.fields().iter().enumerate() {
-                let fid = field.metadata().get("field_id")
+                let fid = field
+                    .metadata()
+                    .get("field_id")
                     .and_then(|s| s.parse::<FieldId>().ok())
                     .unwrap_or(i as FieldId);
-                
+
                 plan_columns.push(PlanColumn {
                     name: field.name().clone(),
                     data_type: field.data_type().clone(),
@@ -2827,7 +2867,7 @@ where
                 });
             }
             let logical_schema = PlanSchema::new(plan_columns);
-            
+
             let plan = SelectPlan {
                 tables: vec![],
                 joins: vec![],
@@ -2844,7 +2884,7 @@ where
                 limit: None,
                 offset: None,
             };
-            
+
             let stream: BatchIter = if agg.group_expr.is_empty() {
                 let s = AggregateStream::new(input_stream, &plan, &logical_schema, &input_schema)?;
                 Box::new(s)
@@ -2858,18 +2898,20 @@ where
                 )?;
                 Box::new(s)
             };
-            
+
             return Ok(stream);
         }
 
         if let Some(distinct) = plan.as_any().downcast_ref::<DistinctExec<P>>() {
-            let input_stream = self.execute_physical_plan_tree(distinct.input.clone(), subquery_results)?;
+            let input_stream =
+                self.execute_physical_plan_tree(distinct.input.clone(), subquery_results)?;
             let distinct_stream = DistinctStream::new(distinct.schema(), input_stream)?;
             return Ok(Box::new(distinct_stream));
         }
 
         if let Some(limit) = plan.as_any().downcast_ref::<LimitExec<P>>() {
-            let input_stream = self.execute_physical_plan_tree(limit.input.clone(), subquery_results)?;
+            let input_stream =
+                self.execute_physical_plan_tree(limit.input.clone(), subquery_results)?;
             let limited_stream = apply_offset_limit_stream(input_stream, limit.offset, limit.limit);
             return Ok(limited_stream);
         }
@@ -2914,7 +2956,10 @@ where
         plan.projections = new_projections;
 
         if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
-            eprintln!("[executor] projections after rewrite: {:?}", plan.projections);
+            eprintln!(
+                "[executor] projections after rewrite: {:?}",
+                plan.projections
+            );
             eprintln!("[executor] aggregates: {:?}", plan.aggregates);
         }
 
@@ -3001,11 +3046,16 @@ where
                     eprintln!("[executor] aggregate_rewrite: {:?}", aggregate_rewrite);
                 }
 
-                let physical_plan = self.create_physical_plan(&prepared.logical_plan, plan.having.as_ref(), row_filter)?;
+                let physical_plan = self.create_physical_plan(
+                    &prepared.logical_plan,
+                    plan.having.as_ref(),
+                    row_filter,
+                )?;
 
                 let schema = physical_plan.schema();
 
-                let mut base_iter: BatchIter = self.execute_physical_plan_tree(physical_plan, subquery_results)?;
+                let mut base_iter: BatchIter =
+                    self.execute_physical_plan_tree(physical_plan, subquery_results)?;
 
                 if let Some(residual) = &residual_filter {
                     base_iter = self.apply_residual_filter(
@@ -3020,11 +3070,7 @@ where
                     // logic (including pre-aggregation projection, aggregation, and final projection)
                     // when `aggregate_rewrite` is present.
                     // We simply return the result of the physical plan execution.
-                    return Ok(SelectExecution::from_stream(
-                        table_name,
-                        schema,
-                        base_iter,
-                    ));
+                    return Ok(SelectExecution::from_stream(table_name, schema, base_iter));
                 }
 
                 // GROUP BY with no aggregates should collapse to distinct group keys.
@@ -3082,8 +3128,7 @@ where
                         )?;
                         let agg_schema = grouped.schema();
                         let agg_count = plan.aggregates.len();
-                        let agg_offset =
-                            agg_schema.fields().len().saturating_sub(agg_count);
+                        let agg_offset = agg_schema.fields().len().saturating_sub(agg_count);
                         let mut agg_iter: BatchIter = Box::new(grouped.map(|b| b));
 
                         if let Some(having) = &plan.having {
@@ -3154,8 +3199,7 @@ where
                         );
                     }
 
-                    let agg_iter =
-                        AggregateStream::new(base_iter, &plan, &single.schema, &schema)?;
+                    let agg_iter = AggregateStream::new(base_iter, &plan, &single.schema, &schema)?;
                     let agg_schema = agg_iter.schema();
                     let agg_count = plan.aggregates.len();
                     let agg_offset = agg_schema.fields().len().saturating_sub(agg_count);
@@ -3163,11 +3207,8 @@ where
 
                     if let Some(having) = &plan.having {
                         let having_scalar = Self::expr_to_scalar_expr(having);
-                        let having_remapped = Self::remap_string_expr_to_indices(
-                            &having_scalar,
-                            &agg_schema,
-                            None,
-                        )?;
+                        let having_remapped =
+                            Self::remap_string_expr_to_indices(&having_scalar, &agg_schema, None)?;
                         let mut next_agg_idx = 0;
                         let having_rewritten = Self::rewrite_aggregate_refs(
                             having_remapped,
@@ -3214,8 +3255,7 @@ where
                         }));
                     }
 
-                    let trimmed =
-                        apply_offset_limit_stream(filtered_iter, plan.offset, plan.limit);
+                    let trimmed = apply_offset_limit_stream(filtered_iter, plan.offset, plan.limit);
                     return Ok(SelectExecution::from_stream(
                         table_name, agg_schema, trimmed,
                     ));
@@ -3261,61 +3301,71 @@ where
                     vec![FxHashSet::default(); table_count];
 
                 if table_count > 0 {
-                for proj in &multi.projections {
-                    match proj {
-                        llkv_plan::logical_planner::ResolvedProjection::Column {
-                            table_index,
-                            logical_field_id,
-                            ..
-                        } => {
-                            required_fields[*table_index].insert(logical_field_id.field_id());
+                    for proj in &multi.projections {
+                        match proj {
+                            llkv_plan::logical_planner::ResolvedProjection::Column {
+                                table_index,
+                                logical_field_id,
+                                ..
+                            } => {
+                                required_fields[*table_index].insert(logical_field_id.field_id());
+                            }
+                            llkv_plan::logical_planner::ResolvedProjection::Computed {
+                                expr,
+                                ..
+                            } => {
+                                let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                                ScalarEvaluator::collect_fields(
+                                    &remap_scalar_expr(expr),
+                                    &mut fields,
+                                );
+                                for (tbl, fid) in fields {
+                                    required_fields[tbl].insert(fid);
+                                }
+                            }
                         }
-                        llkv_plan::logical_planner::ResolvedProjection::Computed {
-                            expr, ..
-                        } => {
+                    }
+
+                    for join in &multi.joins {
+                        let (keys, filters) = extract_join_keys_and_filters(join)?;
+                        for key in keys {
+                            required_fields[key.left_table].insert(key.left_field);
+                            required_fields[key.right_table].insert(key.right_field);
+                        }
+                        for filter in filters {
                             let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
-                            ScalarEvaluator::collect_fields(&remap_scalar_expr(expr), &mut fields);
+                            ScalarEvaluator::collect_fields(
+                                &remap_filter_expr(&filter)?,
+                                &mut fields,
+                            );
                             for (tbl, fid) in fields {
                                 required_fields[tbl].insert(fid);
                             }
                         }
                     }
-                }
 
-                for join in &multi.joins {
-                    let (keys, filters) = extract_join_keys_and_filters(join)?;
-                    for key in keys {
-                        required_fields[key.left_table].insert(key.left_field);
-                        required_fields[key.right_table].insert(key.right_field);
+                    for (tbl, filter) in table_filters.iter().enumerate() {
+                        if let Some(filter) = filter {
+                            let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
+                            ScalarEvaluator::collect_fields(
+                                &remap_filter_expr(filter)?,
+                                &mut fields,
+                            );
+                            for (table_idx, fid) in fields {
+                                if table_idx == tbl {
+                                    required_fields[table_idx].insert(fid);
+                                }
+                            }
+                        }
                     }
-                    for filter in filters {
+
+                    if let Some(filter) = &residual_filter {
                         let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
-                        ScalarEvaluator::collect_fields(&remap_filter_expr(&filter)?, &mut fields);
+                        ScalarEvaluator::collect_fields(&remap_filter_expr(filter)?, &mut fields);
                         for (tbl, fid) in fields {
                             required_fields[tbl].insert(fid);
                         }
                     }
-                }
-
-                for (tbl, filter) in table_filters.iter().enumerate() {
-                    if let Some(filter) = filter {
-                        let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
-                        ScalarEvaluator::collect_fields(&remap_filter_expr(filter)?, &mut fields);
-                        for (table_idx, fid) in fields {
-                            if table_idx == tbl {
-                                required_fields[table_idx].insert(fid);
-                            }
-                        }
-                    }
-                }
-
-                if let Some(filter) = &residual_filter {
-                    let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
-                    ScalarEvaluator::collect_fields(&remap_filter_expr(filter)?, &mut fields);
-                    for (tbl, fid) in fields {
-                        required_fields[tbl].insert(fid);
-                    }
-                }
                 }
 
                 // 2. Create Streams
@@ -3324,103 +3374,111 @@ where
                 let mut table_field_map: Vec<Vec<FieldId>> = Vec::with_capacity(table_count.max(1));
 
                 if table_count == 0 {
-                     let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
-                     let options = RecordBatchOptions::new().with_row_count(Some(1));
-                     let batch = RecordBatch::try_new_with_options(schema.clone(), vec![], &options).map_err(|e| Error::Internal(e.to_string()))?;
-                     streams.push(Box::new(std::iter::once(Ok(batch))) as BatchIter);
-                     schemas.push(schema);
-                     table_field_map.push(vec![]);
+                    let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
+                    let options = RecordBatchOptions::new().with_row_count(Some(1));
+                    let batch = RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
+                        .map_err(|e| Error::Internal(e.to_string()))?;
+                    streams.push(Box::new(std::iter::once(Ok(batch))) as BatchIter);
+                    schemas.push(schema);
+                    table_field_map.push(vec![]);
                 } else {
-                for (i, table) in multi.tables.iter().enumerate() {
-                    let adapter = table
-                        .table
-                        .as_any()
-                        .downcast_ref::<ExecutionTableAdapter<P>>()
-                        .ok_or_else(|| Error::Internal("unexpected table adapter type".into()))?;
+                    for (i, table) in multi.tables.iter().enumerate() {
+                        let adapter = table
+                            .table
+                            .as_any()
+                            .downcast_ref::<ExecutionTableAdapter<P>>()
+                            .ok_or_else(|| {
+                                Error::Internal("unexpected table adapter type".into())
+                            })?;
 
-                    let mut fields: Vec<FieldId> = required_fields[i].iter().copied().collect();
-                    if fields.is_empty() {
-                        if let Some(col) = table.schema.columns.first() {
-                            fields.push(col.field_id);
+                        let mut fields: Vec<FieldId> = required_fields[i].iter().copied().collect();
+                        if fields.is_empty() {
+                            if let Some(col) = table.schema.columns.first() {
+                                fields.push(col.field_id);
+                            }
                         }
-                    }
-                    fields.sort_unstable();
-                    table_field_map.push(fields.clone());
+                        fields.sort_unstable();
+                        table_field_map.push(fields.clone());
 
-                    let projections: Vec<ScanProjection> = fields
-                        .iter()
-                        .map(|&fid| {
-                            let col = table
-                                .schema
-                                .columns
-                                .iter()
-                                .find(|c| c.field_id == fid)
-                                .unwrap();
-                            let lfid =
-                                LogicalFieldId::for_user(adapter.executor_table().table_id(), fid);
-                            ScanProjection::Column(Projection::with_alias(lfid, col.name.clone()))
-                        })
-                        .collect();
-
-                    let arrow_fields: Vec<ArrowField> = fields
-                        .iter()
-                        .map(|&fid| {
-                            let col = table
-                                .schema
-                                .columns
-                                .iter()
-                                .find(|c| c.field_id == fid)
-                                .unwrap();
-                            ArrowField::new(
-                                col.name.clone(),
-                                col.data_type.clone(),
-                                col.is_nullable,
-                            )
-                        })
-                        .collect();
-                    schemas.push(Arc::new(Schema::new(arrow_fields)));
-
-                    let (tx, rx) = mpsc::sync_channel(16);
-                    let storage = adapter.executor_table().storage().clone();
-                    let row_filter = row_filter.clone();
-
-                    std::thread::spawn(move || {
-                        let res = storage.scan_stream(
-                            &projections,
-                            &Expr::Pred(Filter {
-                                field_id: 0,
-                                op: Operator::Range {
-                                    lower: std::ops::Bound::Unbounded,
-                                    upper: std::ops::Bound::Unbounded,
-                                },
-                            }),
-                            llkv_scan::ScanStreamOptions {
-                                row_id_filter: row_filter.clone(),
-                                ..Default::default()
-                            },
-                            &mut |batch| {
-                                tx.send(Ok(batch)).ok();
-                            },
-                        );
-                        if let Err(e) = res {
-                            tx.send(Err(e)).ok();
-                        }
-                    });
-
-                    let mut stream: BatchIter = Box::new(rx.into_iter());
-
-                    if let Some(filter_expr) = &table_filters[i] {
-                        let mapping: FxHashMap<(usize, FieldId), usize> = table_field_map[i]
+                        let projections: Vec<ScanProjection> = fields
                             .iter()
-                            .enumerate()
-                            .map(|(idx, fid)| ((i, *fid), idx))
+                            .map(|&fid| {
+                                let col = table
+                                    .schema
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.field_id == fid)
+                                    .unwrap();
+                                let lfid = LogicalFieldId::for_user(
+                                    adapter.executor_table().table_id(),
+                                    fid,
+                                );
+                                ScanProjection::Column(Projection::with_alias(
+                                    lfid,
+                                    col.name.clone(),
+                                ))
+                            })
                             .collect();
 
-                        stream = apply_filter_to_stream(stream, filter_expr, mapping)?;
-                    }
+                        let arrow_fields: Vec<ArrowField> = fields
+                            .iter()
+                            .map(|&fid| {
+                                let col = table
+                                    .schema
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.field_id == fid)
+                                    .unwrap();
+                                ArrowField::new(
+                                    col.name.clone(),
+                                    col.data_type.clone(),
+                                    col.is_nullable,
+                                )
+                            })
+                            .collect();
+                        schemas.push(Arc::new(Schema::new(arrow_fields)));
 
-                    streams.push(stream);
-                }
+                        let (tx, rx) = mpsc::sync_channel(16);
+                        let storage = adapter.executor_table().storage().clone();
+                        let row_filter = row_filter.clone();
+
+                        std::thread::spawn(move || {
+                            let res = storage.scan_stream(
+                                &projections,
+                                &Expr::Pred(Filter {
+                                    field_id: 0,
+                                    op: Operator::Range {
+                                        lower: std::ops::Bound::Unbounded,
+                                        upper: std::ops::Bound::Unbounded,
+                                    },
+                                }),
+                                llkv_scan::ScanStreamOptions {
+                                    row_id_filter: row_filter.clone(),
+                                    ..Default::default()
+                                },
+                                &mut |batch| {
+                                    tx.send(Ok(batch)).ok();
+                                },
+                            );
+                            if let Err(e) = res {
+                                tx.send(Err(e)).ok();
+                            }
+                        });
+
+                        let mut stream: BatchIter = Box::new(rx.into_iter());
+
+                        if let Some(filter_expr) = &table_filters[i] {
+                            let mapping: FxHashMap<(usize, FieldId), usize> = table_field_map[i]
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, fid)| ((i, *fid), idx))
+                                .collect();
+
+                            stream = apply_filter_to_stream(stream, filter_expr, mapping)?;
+                        }
+
+                        streams.push(stream);
+                    }
                 }
 
                 // 3. Build Pipeline
@@ -3461,7 +3519,7 @@ where
 
                     let (keys, residuals) = extract_join_keys_and_filters(join)?;
                     // Do NOT mix residuals (ON clause) with pending_filters (WHERE clause) yet.
-                    // pending_filters.extend(residuals); 
+                    // pending_filters.extend(residuals);
                     let mut left_indices = Vec::new();
                     let mut right_indices = Vec::new();
 
@@ -3503,11 +3561,11 @@ where
                     }
 
                     let prefix_limit = i + 1;
-                    
+
                     // Start with residuals (ON clause) as applicable filters for the join.
                     // They are intrinsic to the join operation.
                     let mut applicable = residuals;
-                    
+
                     let mut remaining = Vec::new();
                     for clause in pending_filters.into_iter() {
                         let mapped = remap_filter_expr(&clause)?;
@@ -3535,25 +3593,38 @@ where
                         let mapping = temp_col_mapping.clone();
 
                         Some(Box::new(move |batch: &RecordBatch| {
-                             let mut arrays = FxHashMap::default();
-                             for (key, col_idx) in &mapping {
-                                 if *col_idx < batch.num_columns() {
-                                     arrays.insert(*key, batch.column(*col_idx).clone());
-                                 } else {
-                                     return Err(Error::Internal(format!("Column index {} out of bounds", col_idx)));
-                                 }
-                             }
+                            let mut arrays = FxHashMap::default();
+                            for (key, col_idx) in &mapping {
+                                if *col_idx < batch.num_columns() {
+                                    arrays.insert(*key, batch.column(*col_idx).clone());
+                                } else {
+                                    return Err(Error::Internal(format!(
+                                        "Column index {} out of bounds",
+                                        col_idx
+                                    )));
+                                }
+                            }
 
-                             let result = ScalarEvaluator::evaluate_batch(&mapped_expr, batch.num_rows(), &arrays)?;
+                            let result = ScalarEvaluator::evaluate_batch(
+                                &mapped_expr,
+                                batch.num_rows(),
+                                &arrays,
+                            )?;
 
-                             if result.data_type() == &arrow::datatypes::DataType::Null {
-                                 return Ok(arrow::array::BooleanArray::new_null(batch.num_rows()));
-                             }
+                            if result.data_type() == &arrow::datatypes::DataType::Null {
+                                return Ok(arrow::array::BooleanArray::new_null(batch.num_rows()));
+                            }
 
-                             let bool_arr = result.as_any().downcast_ref::<arrow::array::BooleanArray>()
-                                 .ok_or_else(|| Error::Internal("Filter expression did not evaluate to boolean".into()))?;
+                            let bool_arr = result
+                                .as_any()
+                                .downcast_ref::<arrow::array::BooleanArray>()
+                                .ok_or_else(|| {
+                                    Error::Internal(
+                                        "Filter expression did not evaluate to boolean".into(),
+                                    )
+                                })?;
 
-                             Ok(bool_arr.clone())
+                            Ok(bool_arr.clone())
                         }))
                     } else {
                         None
@@ -3678,7 +3749,8 @@ where
                         simple_mapping.insert((0, i as u32), i);
                     }
 
-                    let name_to_index = build_qualified_name_map(&current_schema, &col_mapping, multi);
+                    let name_to_index =
+                        build_qualified_name_map(&current_schema, &col_mapping, multi);
 
                     let mut pre_agg_schema_fields: Vec<ArrowField> = Vec::new();
                     for (i, expr_str) in rewrite.pre_aggregate_expressions.iter().enumerate() {
@@ -3691,10 +3763,7 @@ where
                             .unwrap_or(arrow::datatypes::DataType::Int64);
                         pre_agg_schema_fields.push(
                             ArrowField::new(format!("_agg_arg_{}", i), dt, true).with_metadata(
-                                HashMap::from([(
-                                    "field_id".to_string(),
-                                    format!("{}", 10000 + i),
-                                )]),
+                                HashMap::from([("field_id".to_string(), format!("{}", 10000 + i))]),
                             ),
                         );
                     }
@@ -3712,10 +3781,23 @@ where
                         let mut field = current_schema.field(idx).clone();
                         if let Some(table_ref) = multi.table_order.get(key.table_index) {
                             if let Some(table_info) = multi.tables.get(key.table_index) {
-                                if let Some(col) = table_info.schema.columns.iter().find(|c| c.field_id == key.logical_field_id.field_id()) {
-                                    let qualified_name = format!("{}.{}", table_ref.display_name().to_ascii_lowercase(), col.name.to_ascii_lowercase());
-                                    field = ArrowField::new(qualified_name, field.data_type().clone(), field.is_nullable())
-                                        .with_metadata(field.metadata().clone());
+                                if let Some(col) = table_info
+                                    .schema
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.field_id == key.logical_field_id.field_id())
+                                {
+                                    let qualified_name = format!(
+                                        "{}.{}",
+                                        table_ref.display_name().to_ascii_lowercase(),
+                                        col.name.to_ascii_lowercase()
+                                    );
+                                    field = ArrowField::new(
+                                        qualified_name,
+                                        field.data_type().clone(),
+                                        field.is_nullable(),
+                                    )
+                                    .with_metadata(field.metadata().clone());
                                 }
                             }
                         }
@@ -3914,7 +3996,10 @@ where
 
                         if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
                             eprintln!("non-agg path: columns len: {}", columns.len());
-                            eprintln!("non-agg path: output_schema fields: {}", output_schema_captured.fields().len());
+                            eprintln!(
+                                "non-agg path: output_schema fields: {}",
+                                output_schema_captured.fields().len()
+                            );
                         }
 
                         let mut cast_columns = Vec::with_capacity(columns.len());
@@ -3922,8 +4007,16 @@ where
                             let expected_type = output_schema_captured.field(i).data_type();
                             if col.data_type() != expected_type {
                                 // Attempt to cast if types mismatch (e.g. NullArray -> Int64Array)
-                                let casted = arrow::compute::cast(col, expected_type)
-                                    .map_err(|e| Error::Internal(format!("Failed to cast column {} from {:?} to {:?}: {}", i, col.data_type(), expected_type, e)))?;
+                                let casted =
+                                    arrow::compute::cast(col, expected_type).map_err(|e| {
+                                        Error::Internal(format!(
+                                            "Failed to cast column {} from {:?} to {:?}: {}",
+                                            i,
+                                            col.data_type(),
+                                            expected_type,
+                                            e
+                                        ))
+                                    })?;
                                 cast_columns.push(casted);
                             } else {
                                 cast_columns.push(col.clone());
@@ -4814,7 +4907,12 @@ fn collect_join_predicates(
                         });
                         return Ok(());
                     } else {
-                        println!("DEBUG: Indices mismatch: left_col.table_index={} <= left_table_index={} is {}", left_col.table_index, left_table_index, left_col.table_index <= left_table_index);
+                        println!(
+                            "DEBUG: Indices mismatch: left_col.table_index={} <= left_table_index={} is {}",
+                            left_col.table_index,
+                            left_table_index,
+                            left_col.table_index <= left_table_index
+                        );
                     }
                 }
             }
@@ -4895,7 +4993,11 @@ where
     }
 
     fn approximate_row_count(&self) -> Option<usize> {
-        Some(self.table.total_rows.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        Some(
+            self.table
+                .total_rows
+                .load(std::sync::atomic::Ordering::Relaxed) as usize,
+        )
     }
 
     fn scan_stream(
@@ -4936,8 +5038,7 @@ fn resolve_scalar_expr_using_map(
         Ok((0, idx as u32))
     };
 
-    expr.clone().try_map(&mut resolver)
-    .map(|e| match e {
+    expr.clone().try_map(&mut resolver).map(|e| match e {
         ScalarExpr::ScalarSubquery(s) => {
             if let Some(lit) = subquery_results.get(&s.id) {
                 ScalarExpr::Literal(lit.clone())
@@ -4958,11 +5059,8 @@ fn resolve_scalar_expr_string(
     match expr {
         ScalarExpr::Column(name) => {
             let (idx, _field) = schema.column_with_name(name).ok_or_else(|| {
-                let available: Vec<&str> = schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().as_str())
-                    .collect();
+                let available: Vec<&str> =
+                    schema.fields().iter().map(|f| f.name().as_str()).collect();
                 Error::InvalidArgumentError(format!(
                     "Column not found: {name}. Available columns: {}",
                     available.join(", ")
@@ -5075,10 +5173,7 @@ where
 
         if let Some((table_idx, field_id)) = index_to_source.get(&i) {
             if let Some(table_ref) = multi.table_order.get(*table_idx) {
-                let table_name = table_ref
-                    .alias
-                    .as_ref()
-                    .unwrap_or(&table_ref.table);
+                let table_name = table_ref.alias.as_ref().unwrap_or(&table_ref.table);
                 if let Some(planned_table) = multi.tables.get(*table_idx) {
                     if let Some(col) = planned_table
                         .schema
@@ -5275,11 +5370,15 @@ fn get_literal_type(l: &Literal) -> DataType {
         Literal::Null => DataType::Null,
         Literal::Int128(_) => DataType::Int64,
         Literal::Float64(_) => DataType::Float64,
-        Literal::Decimal128(d) => DataType::Decimal128(std::cmp::max(d.precision(), d.scale() as u8), d.scale()),
+        Literal::Decimal128(d) => {
+            DataType::Decimal128(std::cmp::max(d.precision(), d.scale() as u8), d.scale())
+        }
         Literal::String(_) => DataType::Utf8,
         Literal::Boolean(_) => DataType::Boolean,
         Literal::Date32(_) => DataType::Date32,
-        Literal::Struct(_) => DataType::Struct(arrow::datatypes::Fields::from(Vec::<arrow::datatypes::Field>::new())),
+        Literal::Struct(_) => DataType::Struct(arrow::datatypes::Fields::from(Vec::<
+            arrow::datatypes::Field,
+        >::new())),
         Literal::Interval(_) => DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
     }
 }
@@ -5298,18 +5397,22 @@ fn infer_expr_type(expr: &ScalarExpr<usize>, schema: &Schema) -> DataType {
             } else {
                 l
             }
-        },
+        }
         ScalarExpr::Cast { data_type, .. } => data_type.clone(),
         ScalarExpr::Not(_) => DataType::Boolean,
         ScalarExpr::IsNull { .. } => DataType::Boolean,
-        ScalarExpr::Case { else_expr, branches, .. } => {
-             if let Some(e) = else_expr {
-                 infer_expr_type(e, schema)
-             } else if !branches.is_empty() {
-                 infer_expr_type(&branches[0].1, schema)
-             } else {
-                 DataType::Int64
-             }
+        ScalarExpr::Case {
+            else_expr,
+            branches,
+            ..
+        } => {
+            if let Some(e) = else_expr {
+                infer_expr_type(e, schema)
+            } else if !branches.is_empty() {
+                infer_expr_type(&branches[0].1, schema)
+            } else {
+                DataType::Int64
+            }
         }
         ScalarExpr::Coalesce(exprs) => {
             if !exprs.is_empty() {
@@ -5344,12 +5447,21 @@ fn map_scalar_expr_to_usize(expr: ScalarExpr<(usize, FieldId)>) -> ScalarExpr<us
             expr: Box::new(map_scalar_expr_to_usize(*expr)),
             negated,
         },
-        ScalarExpr::Case { operand, branches, else_expr } => ScalarExpr::Case {
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => ScalarExpr::Case {
             operand: operand.map(|o| Box::new(map_scalar_expr_to_usize(*o))),
-            branches: branches.into_iter().map(|(w, t)| (map_scalar_expr_to_usize(w), map_scalar_expr_to_usize(t))).collect(),
+            branches: branches
+                .into_iter()
+                .map(|(w, t)| (map_scalar_expr_to_usize(w), map_scalar_expr_to_usize(t)))
+                .collect(),
             else_expr: else_expr.map(|e| Box::new(map_scalar_expr_to_usize(*e))),
         },
-        ScalarExpr::Coalesce(exprs) => ScalarExpr::Coalesce(exprs.into_iter().map(map_scalar_expr_to_usize).collect()),
+        ScalarExpr::Coalesce(exprs) => {
+            ScalarExpr::Coalesce(exprs.into_iter().map(map_scalar_expr_to_usize).collect())
+        }
         ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s),
         ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
             left: Box::new(map_scalar_expr_to_usize(*left)),
@@ -5374,7 +5486,10 @@ fn resolve_scalar_expr_to_indices(
             if let Some((idx, _)) = schema.column_with_name(name) {
                 Ok(ScalarExpr::Column(idx))
             } else {
-                Err(Error::Internal(format!("Column {} not found in schema", name)))
+                Err(Error::Internal(format!(
+                    "Column {} not found in schema",
+                    name
+                )))
             }
         }
         ScalarExpr::Literal(l) => Ok(ScalarExpr::Literal(l.clone())),
@@ -5387,12 +5502,18 @@ fn resolve_scalar_expr_to_indices(
             expr: Box::new(resolve_scalar_expr_to_indices(expr, schema)?),
             data_type: data_type.clone(),
         }),
-        ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(resolve_scalar_expr_to_indices(e, schema)?))),
+        ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(resolve_scalar_expr_to_indices(
+            e, schema,
+        )?))),
         ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
             expr: Box::new(resolve_scalar_expr_to_indices(expr, schema)?),
             negated: *negated,
         }),
-        ScalarExpr::Case { operand, branches, else_expr } => {
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
             let op = if let Some(o) = operand {
                 Some(Box::new(resolve_scalar_expr_to_indices(o, schema)?))
             } else {
@@ -5424,7 +5545,9 @@ fn resolve_scalar_expr_to_indices(
             Ok(ScalarExpr::Coalesce(new_exprs))
         }
         ScalarExpr::ScalarSubquery(s) => Ok(ScalarExpr::ScalarSubquery(s.clone())),
-        ScalarExpr::Aggregate(_) => Err(Error::Internal("Aggregate expression in projection".to_string())),
+        ScalarExpr::Aggregate(_) => Err(Error::Internal(
+            "Aggregate expression in projection".to_string(),
+        )),
         ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
             left: Box::new(resolve_scalar_expr_to_indices(left, schema)?),
             op: *op,
