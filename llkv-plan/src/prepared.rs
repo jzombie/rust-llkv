@@ -21,7 +21,7 @@ use crate::plans::{
 use crate::table_provider::TableProvider;
 // use crate::physical::PhysicalPlan;
 
-/// Prepared representation of a SELECT plan with planning metadata attached.
+/// A fully prepared SELECT plan ready for execution.
 pub struct PreparedSelectPlan<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -38,6 +38,25 @@ where
     pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,     // MVCC row filter to thread into scans.
 }
 
+impl<P> Clone for PreparedSelectPlan<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            plan: self.plan.clone(),
+            logical_plan: self.logical_plan.clone(),
+            scalar_subqueries: self.scalar_subqueries.clone(),
+            filter_subqueries: self.filter_subqueries.clone(),
+            compound: self.compound.clone(),
+            residual_filter: self.residual_filter.clone(),
+            residual_filter_subqueries: self.residual_filter_subqueries.clone(),
+            force_manual_projection: self.force_manual_projection,
+            row_filter: self.row_filter.clone(),
+        }
+    }
+}
+
 pub struct PreparedScalarSubquery<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -46,6 +65,20 @@ where
     pub correlated_columns: Vec<CorrelatedColumn>,
     pub prepared_plan: Option<Box<PreparedSelectPlan<P>>>,
     pub template: Box<SelectPlan>,
+}
+
+impl<P> Clone for PreparedScalarSubquery<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            correlated_columns: self.correlated_columns.clone(),
+            prepared_plan: self.prepared_plan.clone(),
+            template: self.template.clone(),
+        }
+    }
 }
 
 pub struct PreparedFilterSubquery<P>
@@ -58,12 +91,38 @@ where
     pub template: Box<SelectPlan>,
 }
 
+impl<P> Clone for PreparedFilterSubquery<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            correlated_columns: self.correlated_columns.clone(),
+            prepared_plan: self.prepared_plan.clone(),
+            template: self.template.clone(),
+        }
+    }
+}
+
 pub struct PreparedCompoundSelect<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub initial: Box<PreparedSelectPlan<P>>,
     pub operations: Vec<PreparedCompoundOp<P>>,
+}
+
+impl<P> Clone for PreparedCompoundSelect<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            initial: self.initial.clone(),
+            operations: self.operations.clone(),
+        }
+    }
 }
 
 pub struct PreparedCompoundOp<P>
@@ -74,6 +133,20 @@ where
     pub quantifier: CompoundQuantifier,
     pub plan: Box<PreparedSelectPlan<P>>,
 }
+
+impl<P> Clone for PreparedCompoundOp<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            operator: self.operator.clone(),
+            quantifier: self.quantifier.clone(),
+            plan: self.plan.clone(),
+        }
+    }
+}
+
 
 /// Planner interface that produces executor-ready plans.
 pub trait PreparedSelectPlanner<P>: Send + Sync

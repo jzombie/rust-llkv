@@ -9,6 +9,7 @@ use arrow::compute::{concat_batches, filter_record_batch};
 use arrow::datatypes::DataType;
 use llkv_aggregate::{AggregateKind, AggregateSpec, AggregateStream, GroupedAggregateStream};
 use llkv_compute::projection::infer_literal_datatype;
+use llkv_plan::logical_planner::ResolvedFieldRef;
 
 impl<P> QueryExecutor<P>
 where
@@ -259,6 +260,18 @@ where
 {
     provider: Arc<dyn ExecutorTableProvider<P>>,
     planner: Arc<dyn PreparedSelectPlanner<P>>,
+}
+
+impl<P> Clone for QueryExecutor<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            planner: self.planner.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -604,13 +617,13 @@ where
         }
     }
 
-    fn rewrite_expr_subqueries_with_exec(
+    fn rewrite_expr_subqueries_with_exec<F: Clone>(
         &self,
-        expr: &Expr<'_, String>,
+        expr: &Expr<'_, F>,
         prepared_subqueries: &[PreparedScalarSubquery<P>],
         cache: &mut FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
         ctx: &QueryContext,
-    ) -> ExecutorResult<Expr<'static, String>> {
+    ) -> ExecutorResult<Expr<'static, F>> {
         match expr {
             Expr::And(list) => Ok(Expr::And(
                 list.iter()
@@ -702,6 +715,192 @@ where
         }
     }
 
+    fn rewrite_logical_plan_subqueries(
+        &self,
+        plan: &llkv_plan::logical_planner::LogicalPlan<P>,
+        prepared_subqueries: &[PreparedScalarSubquery<P>],
+        cache: &mut FxHashMap<llkv_expr::expr::SubqueryId, Literal>,
+        ctx: &QueryContext,
+    ) -> ExecutorResult<llkv_plan::logical_planner::LogicalPlan<P>> {
+        if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+            eprintln!("[executor] rewriting logical plan subqueries");
+        }
+        match plan {
+            llkv_plan::logical_planner::LogicalPlan::Single(single) => {
+                let mut new_single = single.clone();
+                if let Some(filter) = &single.filter {
+                    if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                        eprintln!("[executor] rewriting single table filter: {:?}", filter);
+                    }
+                    new_single.filter = Some(self.rewrite_expr_subqueries_with_exec(
+                        filter,
+                        prepared_subqueries,
+                        cache,
+                        ctx,
+                    )?);
+                }
+                Ok(llkv_plan::logical_planner::LogicalPlan::Single(new_single))
+            }
+            llkv_plan::logical_planner::LogicalPlan::Multi(multi) => {
+                let mut new_multi = multi.clone();
+
+                // Rewrite table_filters
+                for (i, filter_opt) in new_multi.table_filters.iter_mut().enumerate() {
+                    if let Some(filter) = filter_opt {
+                        if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                            eprintln!("[executor] rewriting table filter {}: {:?}", i, filter);
+                        }
+                        *filter = self.rewrite_expr_subqueries_with_exec(
+                            filter,
+                            prepared_subqueries,
+                            cache,
+                            ctx,
+                        )?;
+                    }
+                }
+
+                // Rewrite residual filter
+                if let Some(filter) = &new_multi.filter {
+                    if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                        eprintln!("[executor] rewriting residual filter: {:?}", filter);
+                    }
+                    new_multi.filter = Some(self.rewrite_expr_subqueries_with_exec(
+                        filter,
+                        prepared_subqueries,
+                        cache,
+                        ctx,
+                    )?);
+                }
+
+                // Rewrite join conditions
+                for (i, join) in new_multi.joins.iter_mut().enumerate() {
+                    if let Some(cond) = &join.on {
+                        if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                            eprintln!("[executor] rewriting join {} on: {:?}", i, cond);
+                        }
+                        join.on = Some(self.rewrite_expr_subqueries_with_exec(
+                            cond,
+                            prepared_subqueries,
+                            cache,
+                            ctx,
+                        )?);
+                    }
+                }
+
+                Ok(llkv_plan::logical_planner::LogicalPlan::Multi(new_multi))
+            }
+        }
+    }
+
+    fn split_filter<F: Clone + std::fmt::Debug>(
+        expr: &Expr<'static, F>,
+    ) -> (Option<Expr<'static, F>>, Option<Expr<'static, F>>) {
+        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+             eprintln!("split_filter input: {:?}", expr);
+        }
+        if Self::contains_subquery_expr(expr) {
+            match expr {
+                Expr::And(children) => {
+                    let mut safe = Vec::new();
+                    let mut unsafe_ = Vec::new();
+                    for child in children {
+                        let (s, u) = Self::split_filter(child);
+                        if let Some(s) = s {
+                            safe.push(s);
+                        }
+                        if let Some(u) = u {
+                            unsafe_.push(u);
+                        }
+                    }
+                    let safe_expr = if safe.is_empty() {
+                        None
+                    } else {
+                        Some(Expr::And(safe))
+                    };
+                    let unsafe_expr = if unsafe_.is_empty() {
+                        None
+                    } else {
+                        Some(Expr::And(unsafe_))
+                    };
+                    if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                        eprintln!("split_filter result (And): safe={:?}, unsafe={:?}", safe_expr, unsafe_expr);
+                    }
+                    (safe_expr, unsafe_expr)
+                }
+                _ => {
+                    if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                        eprintln!("split_filter result (Unsafe): safe=None, unsafe={:?}", expr);
+                    }
+                    (None, Some(expr.clone()))
+                },
+            }
+        } else {
+            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
+                eprintln!("split_filter result (Safe): safe={:?}, unsafe=None", expr);
+            }
+            (Some(expr.clone()), None)
+        }
+    }
+
+    fn contains_subquery_expr<F>(expr: &Expr<'_, F>) -> bool {
+        match expr {
+            Expr::And(list) | Expr::Or(list) => list.iter().any(Self::contains_subquery_expr),
+            Expr::Not(e) => Self::contains_subquery_expr(e),
+            Expr::Pred(_) => false,
+            Expr::Compare { left, right, .. } => {
+                Self::scalar_contains_subquery(left) || Self::scalar_contains_subquery(right)
+            }
+            Expr::InList { expr, list, .. } => {
+                Self::scalar_contains_subquery(expr)
+                    || list.iter().any(Self::scalar_contains_subquery)
+            }
+            Expr::IsNull { expr, .. } => Self::scalar_contains_subquery(expr),
+            Expr::Literal(_) => false,
+            Expr::Exists(_) => true,
+        }
+    }
+
+    fn scalar_contains_subquery<F>(expr: &ScalarExpr<F>) -> bool {
+        match expr {
+            ScalarExpr::ScalarSubquery(_) => true,
+            ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
+                Self::scalar_contains_subquery(left) || Self::scalar_contains_subquery(right)
+            }
+            ScalarExpr::Not(e)
+            | ScalarExpr::Cast { expr: e, .. }
+            | ScalarExpr::IsNull { expr: e, .. }
+            | ScalarExpr::GetField { base: e, .. } => Self::scalar_contains_subquery(e),
+            ScalarExpr::Coalesce(items) => items.iter().any(Self::scalar_contains_subquery),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .map_or(false, |o| Self::scalar_contains_subquery(o))
+                    || branches.iter().any(|(w, t)| {
+                        Self::scalar_contains_subquery(w) || Self::scalar_contains_subquery(t)
+                    })
+                    || else_expr
+                        .as_ref()
+                        .map_or(false, |e| Self::scalar_contains_subquery(e))
+            }
+            ScalarExpr::Aggregate(call) => match call {
+                AggregateCall::Count { expr, .. }
+                | AggregateCall::Sum { expr, .. }
+                | AggregateCall::Total { expr, .. }
+                | AggregateCall::Avg { expr, .. }
+                | AggregateCall::Min(expr)
+                | AggregateCall::Max(expr)
+                | AggregateCall::CountNulls(expr)
+                | AggregateCall::GroupConcat { expr, .. } => Self::scalar_contains_subquery(expr),
+                AggregateCall::CountStar => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Rewrite scalar subqueries to literals, executing any missing prepared subqueries on-demand.
     fn rewrite_scalar_subqueries_with_exec<F: Clone>(
         &self,
@@ -712,12 +911,33 @@ where
     ) -> ExecutorResult<ScalarExpr<F>> {
         match expr {
             ScalarExpr::ScalarSubquery(s) => {
+                if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                    eprintln!("[executor] rewriting scalar subquery: {:?}", s.id);
+                }
                 if let Some(lit) = cache.get(&s.id) {
+                    if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                        eprintln!("[executor] found in cache: {:?}", lit);
+                    }
                     return Ok(ScalarExpr::Literal(lit.clone()));
                 }
 
                 if let Some(def) = prepared_subqueries.iter().find(|p| p.id == s.id) {
+                    if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                        eprintln!("[executor] found prepared subquery: {:?}", def.id);
+                    }
+
+                    // Skip execution if correlated
+                    if !def.correlated_columns.is_empty() {
+                        if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                            eprintln!("[executor] skipping execution of correlated subquery: {:?}", def.id);
+                        }
+                        return Ok(ScalarExpr::ScalarSubquery(s.clone()));
+                    }
+
                     if let Some(plan) = &def.prepared_plan {
+                        if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
+                            eprintln!("[executor] executing subquery plan");
+                        }
                         let exec = self.execute_prepared_select(plan, ctx)?;
                         let batches = exec.collect()?;
 
@@ -2322,6 +2542,312 @@ where
         result
     }
 
+    fn apply_subquery_filter_to_stream(
+        &self,
+        stream: BatchIter,
+        filter_expr: LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
+        prepared_subqueries: Vec<PreparedScalarSubquery<P>>,
+        ctx: QueryContext,
+        col_mapping: FxHashMap<(usize, FieldId), usize>,
+        outer_col_mapping: FxHashMap<String, (usize, FieldId)>,
+    ) -> ExecutorResult<BatchIter> {
+        let executor = self.clone();
+        let filter_expr = filter_expr.clone();
+        let prepared_subqueries = prepared_subqueries.clone();
+        let ctx = ctx.clone();
+        let col_mapping = col_mapping.clone();
+        let outer_col_mapping = outer_col_mapping.clone();
+
+        Ok(Box::new(stream.map(move |batch_res| {
+            let batch = batch_res?;
+            let num_rows = batch.num_rows();
+            let mut selection = arrow::array::BooleanBuilder::with_capacity(num_rows);
+
+            for row_idx in 0..num_rows {
+                let resolved_filter = executor.evaluate_subqueries_for_row(
+                    &filter_expr,
+                    &prepared_subqueries,
+                    &batch,
+                    row_idx,
+                    &col_mapping,
+                    &outer_col_mapping,
+                    &ctx,
+                )?;
+
+                let remapped_filter = remap_filter_expr(&resolved_filter)?;
+                let predicate = simplify_predicate(&remapped_filter);
+                
+                let mut required_fields = FxHashSet::default();
+                ScalarEvaluator::collect_fields(&predicate, &mut required_fields);
+
+                let mut field_arrays: FxHashMap<(usize, FieldId), ArrayRef> = FxHashMap::default();
+                let row_batch = batch.slice(row_idx, 1);
+                for (tbl, fid) in &required_fields {
+                    if let Some(idx) = col_mapping.get(&(*tbl, *fid)) {
+                        field_arrays.insert((*tbl, *fid), row_batch.column(*idx).clone());
+                    }
+                }
+                
+                let numeric_arrays = ScalarEvaluator::prepare_numeric_arrays(&field_arrays, 1);
+                let result = ScalarEvaluator::evaluate_batch_simplified(
+                    &predicate,
+                    1,
+                    &numeric_arrays,
+                )?;
+                
+                let bool_arr = result.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| Error::Internal("Filter predicate must evaluate to boolean".into()))?;
+                selection.append_value(bool_arr.value(0));
+            }
+            
+            let bool_array = selection.finish();
+            arrow::compute::filter_record_batch(&batch, &bool_array).map_err(|e| Error::Internal(e.to_string()))
+        })))
+    }
+
+    fn evaluate_subqueries_for_row(
+        &self,
+        expr: &LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
+        prepared_subqueries: &[PreparedScalarSubquery<P>],
+        batch: &RecordBatch,
+        row_idx: usize,
+        col_mapping: &FxHashMap<(usize, FieldId), usize>,
+        outer_col_mapping: &FxHashMap<String, (usize, FieldId)>,
+        ctx: &QueryContext,
+    ) -> ExecutorResult<LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>> {
+        match expr {
+            LlkvExpr::And(list) => Ok(LlkvExpr::And(
+                list.iter()
+                    .map(|e| self.evaluate_subqueries_for_row(e, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx))
+                    .collect::<ExecutorResult<Vec<_>>>()?,
+            )),
+            LlkvExpr::Or(list) => Ok(LlkvExpr::Or(
+                list.iter()
+                    .map(|e| self.evaluate_subqueries_for_row(e, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx))
+                    .collect::<ExecutorResult<Vec<_>>>()?,
+            )),
+            LlkvExpr::Not(e) => Ok(LlkvExpr::Not(Box::new(
+                self.evaluate_subqueries_for_row(e, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?,
+            ))),
+            LlkvExpr::Pred(f) => Ok(LlkvExpr::Pred(f.clone())),
+            LlkvExpr::Compare { left, op, right } => Ok(LlkvExpr::Compare {
+                left: self.evaluate_scalar_subqueries_for_row(left, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?,
+                op: *op,
+                right: self.evaluate_scalar_subqueries_for_row(right, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?,
+            }),
+            LlkvExpr::InList { expr, list, negated } => Ok(LlkvExpr::InList {
+                expr: self.evaluate_scalar_subqueries_for_row(expr, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?,
+                list: list.iter().map(|e| self.evaluate_scalar_subqueries_for_row(e, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)).collect::<ExecutorResult<Vec<_>>>()?,
+                negated: *negated,
+            }),
+            LlkvExpr::IsNull { expr, negated } => Ok(LlkvExpr::IsNull {
+                expr: self.evaluate_scalar_subqueries_for_row(expr, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?,
+                negated: *negated,
+            }),
+            LlkvExpr::Literal(l) => Ok(LlkvExpr::Literal(l.clone())),
+            LlkvExpr::Exists(_) => Err(Error::Internal("EXISTS not supported in row evaluation yet".into())),
+        }
+    }
+
+    fn evaluate_scalar_subqueries_for_row(
+        &self,
+        expr: &ScalarExpr<llkv_plan::logical_planner::ResolvedFieldRef>,
+        prepared_subqueries: &[PreparedScalarSubquery<P>],
+        batch: &RecordBatch,
+        row_idx: usize,
+        col_mapping: &FxHashMap<(usize, FieldId), usize>,
+        outer_col_mapping: &FxHashMap<String, (usize, FieldId)>,
+        ctx: &QueryContext,
+    ) -> ExecutorResult<ScalarExpr<llkv_plan::logical_planner::ResolvedFieldRef>> {
+        match expr {
+            ScalarExpr::ScalarSubquery(s) => {
+                if let Some(def) = prepared_subqueries.iter().find(|p| p.id == s.id) {
+                    let mut params = FxHashMap::default();
+                    for corr in &def.correlated_columns {
+                        let outer_col_name = &corr.column;
+                        if let Some(key) = outer_col_mapping.get(outer_col_name) {
+                            if let Some(col_idx) = col_mapping.get(key) {
+                                let col = batch.column(*col_idx);
+                                let scalar = Self::get_scalar(col, row_idx)?;
+                                params.insert(corr.placeholder.clone(), scalar);
+                            } else {
+                                return Err(Error::Internal(format!("Correlated column not found in batch: {}", outer_col_name)));
+                            }
+                        } else {
+                            return Err(Error::Internal(format!("Correlated column not found in mapping: {}", outer_col_name)));
+                        }
+                    }
+                    
+                    let mut plan = *def.template.clone();
+                    Self::replace_params_in_select_plan(&mut plan, &params);
+                    
+                    let prepared_plan = self.planner.prepare_select(plan, None, None, ctx)?;
+                    
+                    let exec = self.execute_prepared_select(&prepared_plan, ctx)?;
+                    let batches = exec.collect()?;
+                    
+                    let mut result_val = None;
+                    for b in batches {
+                        if b.num_rows() > 0 {
+                            if result_val.is_some() || b.num_rows() > 1 {
+                                return Err(Error::Internal("Scalar subquery returned more than one row".into()));
+                            }
+                            if b.num_columns() != 1 {
+                                return Err(Error::Internal("Scalar subquery returned more than one column".into()));
+                            }
+                            let col = b.column(0);
+                            let scalar = Self::get_scalar(col, 0)?;
+                            result_val = Some(scalar);
+                        }
+                    }
+                    
+                    let lit = result_val.unwrap_or(Literal::Null);
+                    return Ok(ScalarExpr::Literal(lit));
+                }
+                Ok(ScalarExpr::ScalarSubquery(s.clone()))
+            }
+            ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+                left: Box::new(self.evaluate_scalar_subqueries_for_row(left, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?),
+                op: *op,
+                right: Box::new(self.evaluate_scalar_subqueries_for_row(right, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?),
+            }),
+            ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+                left: Box::new(self.evaluate_scalar_subqueries_for_row(left, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?),
+                op: *op,
+                right: Box::new(self.evaluate_scalar_subqueries_for_row(right, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?),
+            }),
+            ScalarExpr::Not(e) => Ok(ScalarExpr::Not(Box::new(self.evaluate_scalar_subqueries_for_row(e, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?))),
+            ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+                expr: Box::new(self.evaluate_scalar_subqueries_for_row(expr, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?),
+                data_type: data_type.clone(),
+            }),
+            ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+                expr: Box::new(self.evaluate_scalar_subqueries_for_row(expr, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?),
+                negated: *negated,
+            }),
+            ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+                base: Box::new(self.evaluate_scalar_subqueries_for_row(base, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?),
+                field_name: field_name.clone(),
+            }),
+            ScalarExpr::Coalesce(items) => Ok(ScalarExpr::Coalesce(
+                items.iter().map(|e| self.evaluate_scalar_subqueries_for_row(e, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)).collect::<ExecutorResult<Vec<_>>>()?,
+            )),
+            ScalarExpr::Case { operand, branches, else_expr } => {
+                let operand = if let Some(op) = operand {
+                    Some(Box::new(self.evaluate_scalar_subqueries_for_row(op, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?))
+                } else {
+                    None
+                };
+                let mut new_branches = Vec::new();
+                for (cond, res) in branches {
+                    new_branches.push((
+                        self.evaluate_scalar_subqueries_for_row(cond, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?,
+                        self.evaluate_scalar_subqueries_for_row(res, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?,
+                    ));
+                }
+                let else_expr = if let Some(e) = else_expr {
+                    Some(Box::new(self.evaluate_scalar_subqueries_for_row(e, prepared_subqueries, batch, row_idx, col_mapping, outer_col_mapping, ctx)?))
+                } else {
+                    None
+                };
+                Ok(ScalarExpr::Case { operand, branches: new_branches, else_expr })
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    fn replace_params_in_select_plan(
+        plan: &mut llkv_plan::plans::SelectPlan,
+        params: &FxHashMap<String, Literal>,
+    ) {
+        if let Some(filter) = &mut plan.filter {
+            Self::replace_params_in_llkv_expr(&mut filter.predicate, params);
+        }
+    }
+
+    fn replace_params_in_llkv_expr(
+        expr: &mut LlkvExpr<'static, String>,
+        params: &FxHashMap<String, Literal>,
+    ) {
+        match expr {
+            LlkvExpr::And(list) | LlkvExpr::Or(list) => {
+                for e in list {
+                    Self::replace_params_in_llkv_expr(e, params);
+                }
+            }
+            LlkvExpr::Not(e) => Self::replace_params_in_llkv_expr(e, params),
+            LlkvExpr::Compare { left, right, .. } => {
+                Self::replace_params_in_scalar_expr(left, params);
+                Self::replace_params_in_scalar_expr(right, params);
+            }
+            LlkvExpr::InList { expr, list, .. } => {
+                Self::replace_params_in_scalar_expr(expr, params);
+                for e in list {
+                    Self::replace_params_in_scalar_expr(e, params);
+                }
+            }
+            LlkvExpr::IsNull { expr, .. } => Self::replace_params_in_scalar_expr(expr, params),
+            _ => {}
+        }
+    }
+
+    fn replace_params_in_scalar_expr(
+        expr: &mut ScalarExpr<String>,
+        params: &FxHashMap<String, Literal>,
+    ) {
+        match expr {
+            ScalarExpr::Column(name) => {
+                if let Some(val) = params.get(name) {
+                    *expr = ScalarExpr::Literal(val.clone());
+                }
+            }
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::replace_params_in_scalar_expr(left, params);
+                Self::replace_params_in_scalar_expr(right, params);
+            }
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::replace_params_in_scalar_expr(left, params);
+                Self::replace_params_in_scalar_expr(right, params);
+            }
+            ScalarExpr::Not(e) => Self::replace_params_in_scalar_expr(e, params),
+            ScalarExpr::Cast { expr, .. } => Self::replace_params_in_scalar_expr(expr, params),
+            ScalarExpr::IsNull { expr, .. } => Self::replace_params_in_scalar_expr(expr, params),
+            ScalarExpr::GetField { base, .. } => Self::replace_params_in_scalar_expr(base, params),
+            ScalarExpr::Coalesce(items) => {
+                for item in items {
+                    Self::replace_params_in_scalar_expr(item, params);
+                }
+            }
+            ScalarExpr::Case { operand, branches, else_expr } => {
+                if let Some(op) = operand {
+                    Self::replace_params_in_scalar_expr(op, params);
+                }
+                for (cond, res) in branches {
+                    Self::replace_params_in_scalar_expr(cond, params);
+                    Self::replace_params_in_scalar_expr(res, params);
+                }
+                if let Some(e) = else_expr {
+                    Self::replace_params_in_scalar_expr(e, params);
+                }
+            }
+            ScalarExpr::Aggregate(agg) => {
+                match agg {
+                    llkv_expr::expr::AggregateCall::Count { expr, .. } |
+                    llkv_expr::expr::AggregateCall::Sum { expr, .. } |
+                    llkv_expr::expr::AggregateCall::Total { expr, .. } |
+                    llkv_expr::expr::AggregateCall::Avg { expr, .. } |
+                    llkv_expr::expr::AggregateCall::Min(expr) |
+                    llkv_expr::expr::AggregateCall::Max(expr) |
+                    llkv_expr::expr::AggregateCall::CountNulls(expr) |
+                    llkv_expr::expr::AggregateCall::GroupConcat { expr, .. } => {
+                        Self::replace_params_in_scalar_expr(expr, params);
+                    }
+                    llkv_expr::expr::AggregateCall::CountStar => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn execute_prepared_select(
         &self,
         prepared: &PreparedSelectPlan<P>,
@@ -2343,6 +2869,7 @@ where
         logical_plan: &LogicalPlan<P>,
         having: Option<&llkv_expr::expr::Expr<'static, String>>,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+        prepared_subqueries: &[PreparedScalarSubquery<P>],
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
             match logical_plan {
@@ -2351,8 +2878,8 @@ where
             }
         }
         match logical_plan {
-            LogicalPlan::Single(plan) => self.create_single_table_plan(plan, having, row_filter),
-            LogicalPlan::Multi(plan) => self.create_multi_table_plan(plan),
+            LogicalPlan::Single(plan) => self.create_single_table_plan(plan, having, row_filter, prepared_subqueries),
+            LogicalPlan::Multi(plan) => self.create_multi_table_plan(plan, prepared_subqueries),
         }
     }
 
@@ -2361,6 +2888,7 @@ where
         plan: &SingleTableLogicalPlan<P>,
         having: Option<&llkv_expr::expr::Expr<'static, String>>,
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+        prepared_subqueries: &[PreparedScalarSubquery<P>],
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
             eprintln!("create_single_table_plan filter: {:?}", plan.filter);
@@ -2375,14 +2903,29 @@ where
 
         let table = adapter.table.table.clone();
 
+        let (safe_filter, unsafe_filter) = if let Some(filter) = &plan.filter {
+            Self::split_filter(filter)
+        } else {
+            (None, None)
+        };
+
         let mut exec: Arc<dyn PhysicalPlan<P>> = Arc::new(ScanExec {
             table,
             schema: plan.scan_schema.clone(),
             projections: plan.scan_projections.clone(),
-            filter: plan.filter.clone(),
+            filter: safe_filter,
             limit: None,
             row_filter,
         });
+
+        if let Some(unsafe_f) = unsafe_filter {
+            exec = Arc::new(FilterExec::new(
+                exec,
+                unsafe_f,
+                plan.scan_schema.clone(),
+                prepared_subqueries.to_vec(),
+            ));
+        }
 
         // Apply Sort
         if !plan.resolved_order_by.is_empty() {
@@ -2544,7 +3087,7 @@ where
                     )),
                 });
 
-                exec = Arc::new(FilterExec::new(exec, filter_expr, proj_schema.clone()));
+                exec = Arc::new(FilterExec::new(exec, filter_expr, proj_schema.clone(), vec![]));
 
                 // Project back to agg_schema (drop _having)
                 let mut proj_exprs = Vec::new();
@@ -2603,6 +3146,7 @@ where
     fn create_multi_table_plan(
         &self,
         _plan: &MultiTableLogicalPlan<P>,
+        _prepared_subqueries: &[PreparedScalarSubquery<P>],
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         // TODO: Implement multi-table physical planning; currently the executor does not support this path.
         Err(Error::Internal(
@@ -2610,10 +3154,232 @@ where
         ))
     }
 
+    fn collect_subquery_ids<F>(expr: &ScalarExpr<F>, ids: &mut Vec<llkv_expr::expr::SubqueryId>) {
+        match expr {
+            ScalarExpr::ScalarSubquery(s) => ids.push(s.id),
+            ScalarExpr::Binary { left, right, .. } => {
+                Self::collect_subquery_ids(left, ids);
+                Self::collect_subquery_ids(right, ids);
+            }
+            ScalarExpr::Compare { left, right, .. } => {
+                Self::collect_subquery_ids(left, ids);
+                Self::collect_subquery_ids(right, ids);
+            }
+            ScalarExpr::Not(e) => Self::collect_subquery_ids(e, ids),
+            ScalarExpr::IsNull { expr, .. } => Self::collect_subquery_ids(expr, ids),
+            ScalarExpr::Cast { expr, .. } => Self::collect_subquery_ids(expr, ids),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                if let Some(op) = operand {
+                    Self::collect_subquery_ids(op, ids);
+                }
+                for (cond, res) in branches {
+                    Self::collect_subquery_ids(cond, ids);
+                    Self::collect_subquery_ids(res, ids);
+                }
+                if let Some(e) = else_expr {
+                    Self::collect_subquery_ids(e, ids);
+                }
+            }
+            ScalarExpr::Coalesce(list) => {
+                for e in list {
+                    Self::collect_subquery_ids(e, ids);
+                }
+            }
+            ScalarExpr::GetField { base, .. } => Self::collect_subquery_ids(base, ids),
+            ScalarExpr::Aggregate(agg) => match agg {
+                llkv_expr::expr::AggregateCall::Count { expr, .. }
+                | llkv_expr::expr::AggregateCall::Sum { expr, .. }
+                | llkv_expr::expr::AggregateCall::Total { expr, .. }
+                | llkv_expr::expr::AggregateCall::Avg { expr, .. }
+                | llkv_expr::expr::AggregateCall::GroupConcat { expr, .. } => {
+                    Self::collect_subquery_ids(expr, ids);
+                }
+                llkv_expr::expr::AggregateCall::Min(expr)
+                | llkv_expr::expr::AggregateCall::Max(expr)
+                | llkv_expr::expr::AggregateCall::CountNulls(expr) => {
+                    Self::collect_subquery_ids(expr, ids);
+                }
+                llkv_expr::expr::AggregateCall::CountStar => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn remap_scalar_expr_generic<F1, F2, M>(expr: ScalarExpr<F1>, mapper: &M) -> ScalarExpr<F2>
+    where
+        M: Fn(F1) -> F2,
+        F1: Clone,
+    {
+        match expr {
+            ScalarExpr::Column(f) => ScalarExpr::Column(mapper(f)),
+            ScalarExpr::Literal(l) => ScalarExpr::Literal(l),
+            ScalarExpr::Binary { left, op, right } => ScalarExpr::Binary {
+                left: Box::new(Self::remap_scalar_expr_generic(*left, mapper)),
+                op,
+                right: Box::new(Self::remap_scalar_expr_generic(*right, mapper)),
+            },
+            ScalarExpr::Compare { left, op, right } => ScalarExpr::Compare {
+                left: Box::new(Self::remap_scalar_expr_generic(*left, mapper)),
+                op,
+                right: Box::new(Self::remap_scalar_expr_generic(*right, mapper)),
+            },
+            ScalarExpr::Not(e) => {
+                ScalarExpr::Not(Box::new(Self::remap_scalar_expr_generic(*e, mapper)))
+            }
+            ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+                expr: Box::new(Self::remap_scalar_expr_generic(*expr, mapper)),
+                negated,
+            },
+            ScalarExpr::Cast { expr, data_type } => ScalarExpr::Cast {
+                expr: Box::new(Self::remap_scalar_expr_generic(*expr, mapper)),
+                data_type,
+            },
+            ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s),
+            ScalarExpr::Random => ScalarExpr::Random,
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => ScalarExpr::Case {
+                operand: operand.map(|o| Box::new(Self::remap_scalar_expr_generic(*o, mapper))),
+                branches: branches
+                    .into_iter()
+                    .map(|(c, r)| {
+                        (
+                            Self::remap_scalar_expr_generic(c, mapper),
+                            Self::remap_scalar_expr_generic(r, mapper),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr.map(|e| Box::new(Self::remap_scalar_expr_generic(*e, mapper))),
+            },
+            ScalarExpr::Coalesce(list) => ScalarExpr::Coalesce(
+                list.into_iter()
+                    .map(|e| Self::remap_scalar_expr_generic(e, mapper))
+                    .collect(),
+            ),
+            ScalarExpr::GetField { base, field_name } => ScalarExpr::GetField {
+                base: Box::new(Self::remap_scalar_expr_generic(*base, mapper)),
+                field_name,
+            },
+            ScalarExpr::Aggregate(agg) => {
+                let new_agg = match agg {
+                    llkv_expr::expr::AggregateCall::Count { expr, distinct } => {
+                        llkv_expr::expr::AggregateCall::Count {
+                            expr: Box::new(Self::remap_scalar_expr_generic(*expr, mapper)),
+                            distinct,
+                        }
+                    }
+                    llkv_expr::expr::AggregateCall::Sum { expr, distinct } => {
+                        llkv_expr::expr::AggregateCall::Sum {
+                            expr: Box::new(Self::remap_scalar_expr_generic(*expr, mapper)),
+                            distinct,
+                        }
+                    }
+                    llkv_expr::expr::AggregateCall::Total { expr, distinct } => {
+                        llkv_expr::expr::AggregateCall::Total {
+                            expr: Box::new(Self::remap_scalar_expr_generic(*expr, mapper)),
+                            distinct,
+                        }
+                    }
+                    llkv_expr::expr::AggregateCall::Avg { expr, distinct } => {
+                        llkv_expr::expr::AggregateCall::Avg {
+                            expr: Box::new(Self::remap_scalar_expr_generic(*expr, mapper)),
+                            distinct,
+                        }
+                    }
+                    llkv_expr::expr::AggregateCall::Min(expr) => {
+                        llkv_expr::expr::AggregateCall::Min(Box::new(
+                            Self::remap_scalar_expr_generic(*expr, mapper),
+                        ))
+                    }
+                    llkv_expr::expr::AggregateCall::Max(expr) => {
+                        llkv_expr::expr::AggregateCall::Max(Box::new(
+                            Self::remap_scalar_expr_generic(*expr, mapper),
+                        ))
+                    }
+                    llkv_expr::expr::AggregateCall::CountNulls(expr) => {
+                        llkv_expr::expr::AggregateCall::CountNulls(Box::new(
+                            Self::remap_scalar_expr_generic(*expr, mapper),
+                        ))
+                    }
+                    llkv_expr::expr::AggregateCall::GroupConcat {
+                        expr,
+                        distinct,
+                        separator,
+                    } => llkv_expr::expr::AggregateCall::GroupConcat {
+                        expr: Box::new(Self::remap_scalar_expr_generic(*expr, mapper)),
+                        distinct,
+                        separator,
+                    },
+                    llkv_expr::expr::AggregateCall::CountStar => {
+                        llkv_expr::expr::AggregateCall::CountStar
+                    }
+                };
+                ScalarExpr::Aggregate(new_agg)
+            }
+        }
+    }
+
+    fn remap_expr_generic<F1, F2, M>(
+        expr: LlkvExpr<'static, F1>,
+        mapper: &M,
+    ) -> LlkvExpr<'static, F2>
+    where
+        M: Fn(F1) -> F2,
+        F1: Clone,
+    {
+        match expr {
+            LlkvExpr::And(list) => LlkvExpr::And(
+                list.into_iter()
+                    .map(|e| Self::remap_expr_generic(e, mapper))
+                    .collect(),
+            ),
+            LlkvExpr::Or(list) => LlkvExpr::Or(
+                list.into_iter()
+                    .map(|e| Self::remap_expr_generic(e, mapper))
+                    .collect(),
+            ),
+            LlkvExpr::Not(e) => LlkvExpr::Not(Box::new(Self::remap_expr_generic(*e, mapper))),
+            LlkvExpr::Pred(filter) => LlkvExpr::Pred(llkv_expr::expr::Filter {
+                field_id: mapper(filter.field_id),
+                op: filter.op,
+            }),
+            LlkvExpr::Compare { left, op, right } => LlkvExpr::Compare {
+                left: Self::remap_scalar_expr_generic(left, mapper),
+                op,
+                right: Self::remap_scalar_expr_generic(right, mapper),
+            },
+            LlkvExpr::InList {
+                expr,
+                list,
+                negated,
+            } => LlkvExpr::InList {
+                expr: Self::remap_scalar_expr_generic(expr, mapper),
+                list: list
+                    .into_iter()
+                    .map(|e| Self::remap_scalar_expr_generic(e, mapper))
+                    .collect(),
+                negated,
+            },
+            LlkvExpr::IsNull { expr, negated } => LlkvExpr::IsNull {
+                expr: Self::remap_scalar_expr_generic(expr, mapper),
+                negated,
+            },
+            LlkvExpr::Literal(b) => LlkvExpr::Literal(b),
+            LlkvExpr::Exists(s) => LlkvExpr::Exists(s),
+        }
+    }
+
     fn execute_physical_plan_tree(
         &self,
         plan: Arc<dyn PhysicalPlan<P>>,
         subquery_results: &FxHashMap<SubqueryId, Literal>,
+        ctx: &QueryContext,
     ) -> ExecutorResult<BatchIter> {
         if let Some(scan) = plan.as_any().downcast_ref::<ScanExec<P>>() {
             return scan.execute();
@@ -2625,9 +3391,9 @@ where
 
         if let Some(join) = plan.as_any().downcast_ref::<HashJoinExec<P>>() {
             let left_stream =
-                self.execute_physical_plan_tree(join.left.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(join.left.clone(), subquery_results, ctx)?;
             let right_stream =
-                self.execute_physical_plan_tree(join.right.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(join.right.clone(), subquery_results, ctx)?;
 
             let right_batches: Vec<RecordBatch> =
                 right_stream.collect::<ExecutorResult<Vec<_>>>()?;
@@ -2662,7 +3428,7 @@ where
 
         if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec<P>>() {
             let input_stream =
-                self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(agg.input.clone(), subquery_results, ctx)?;
 
             let mut specs = Vec::new();
             let mut proj_indices = Vec::new();
@@ -2770,7 +3536,7 @@ where
 
         if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec<P>>() {
             let input_stream =
-                self.execute_physical_plan_tree(proj.input.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(proj.input.clone(), subquery_results, ctx)?;
             let schema = proj.schema.clone();
             let expr = proj.expr.clone();
             return Ok(Box::new(input_stream.map(move |batch_res| {
@@ -2818,7 +3584,45 @@ where
 
         if let Some(filter) = plan.as_any().downcast_ref::<FilterExec<P>>() {
             let input_stream =
-                self.execute_physical_plan_tree(filter.input.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(filter.input.clone(), subquery_results, ctx)?;
+
+            if !filter.subqueries.is_empty() {
+                let remapped_expr =
+                    Self::remap_expr_generic(filter.predicate.clone(), &|fid| ResolvedFieldRef {
+                        table_index: 0,
+                        logical_field_id: LogicalFieldId::for_user(0, fid),
+                    });
+
+                let mut outer_col_mapping = FxHashMap::default();
+                for (i, f) in filter.schema.fields().iter().enumerate() {
+                    let fid = f
+                        .metadata()
+                        .get("field_id")
+                        .and_then(|s| s.parse::<FieldId>().ok())
+                        .unwrap_or(i as FieldId);
+                    outer_col_mapping.insert(f.name().clone(), (0, fid));
+                }
+
+                let mut col_mapping = FxHashMap::default();
+                for (i, f) in filter.schema.fields().iter().enumerate() {
+                    let fid = f
+                        .metadata()
+                        .get("field_id")
+                        .and_then(|s| s.parse::<FieldId>().ok())
+                        .unwrap_or(i as FieldId);
+                    col_mapping.insert((0, fid), i);
+                }
+
+                return self.apply_subquery_filter_to_stream(
+                    input_stream,
+                    remapped_expr,
+                    filter.subqueries.clone(),
+                    ctx.clone(),
+                    col_mapping,
+                    outer_col_mapping,
+                );
+            }
+
             let predicate = filter.predicate.clone();
             let schema = filter.schema.clone();
 
@@ -2874,7 +3678,7 @@ where
 
         if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec<P>>() {
             let input_stream =
-                self.execute_physical_plan_tree(agg.input.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(agg.input.clone(), subquery_results, ctx)?;
 
             let mut plan_columns = Vec::new();
             let input_schema = agg.input.schema();
@@ -2934,14 +3738,14 @@ where
 
         if let Some(distinct) = plan.as_any().downcast_ref::<DistinctExec<P>>() {
             let input_stream =
-                self.execute_physical_plan_tree(distinct.input.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(distinct.input.clone(), subquery_results, ctx)?;
             let distinct_stream = DistinctStream::new(distinct.schema(), input_stream)?;
             return Ok(Box::new(distinct_stream));
         }
 
         if let Some(limit) = plan.as_any().downcast_ref::<LimitExec<P>>() {
             let input_stream =
-                self.execute_physical_plan_tree(limit.input.clone(), subquery_results)?;
+                self.execute_physical_plan_tree(limit.input.clone(), subquery_results, ctx)?;
             let limited_stream = apply_offset_limit_stream(input_stream, limit.offset, limit.limit);
             return Ok(limited_stream);
         }
@@ -3068,8 +3872,16 @@ where
             }
         }
 
-        match &prepared.logical_plan {
-            LogicalPlan::Single(single) => {
+        // Rewrite logical plan subqueries (recursively)
+        let logical_plan = self.rewrite_logical_plan_subqueries(
+            &prepared.logical_plan,
+            &prepared.scalar_subqueries,
+            &mut scalar_subquery_cache,
+            ctx,
+        )?;
+
+        match &logical_plan {
+            llkv_plan::logical_planner::LogicalPlan::Single(single) => {
                 let table_name = single.table_name.clone();
 
                 // Preserve planner-provided aggregate rewrite even when forcing
@@ -3086,9 +3898,10 @@ where
                     "create_physical_plan",
                     {
                         self.create_physical_plan(
-                            &prepared.logical_plan,
+                            &logical_plan,
                             plan.having.as_ref(),
                             row_filter,
+                            &prepared.scalar_subqueries,
                         )
                     }
                 );
@@ -3100,7 +3913,7 @@ where
                     ["perf-mon"],
                     ctx,
                     "execute_physical_plan",
-                    self.execute_physical_plan_tree(physical_plan, subquery_results)
+                    self.execute_physical_plan_tree(physical_plan, subquery_results, ctx)
                 );
                 let mut base_iter = base_iter?;
 
@@ -3349,6 +4162,20 @@ where
                 let mut required_fields: Vec<FxHashSet<FieldId>> =
                     vec![FxHashSet::default(); table_count];
 
+                // Add fields from scalar subqueries
+                for subquery in &prepared.scalar_subqueries {
+                    for corr in &subquery.correlated_columns {
+                        for (tbl_idx, table) in multi.tables.iter().enumerate() {
+                            if let Some(col) =
+                                table.schema.columns.iter().find(|c| c.name == corr.column)
+                            {
+                                required_fields[tbl_idx].insert(col.field_id);
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 if table_count > 0 {
                     for proj in &multi.projections {
                         match proj {
@@ -3421,6 +4248,8 @@ where
                 let mut streams: Vec<BatchIter> = Vec::with_capacity(table_count.max(1));
                 let mut schemas: Vec<SchemaRef> = Vec::with_capacity(table_count.max(1));
                 let mut table_field_map: Vec<Vec<FieldId>> = Vec::with_capacity(table_count.max(1));
+
+                let mut deferred_filters = Vec::new();
 
                 if table_count == 0 {
                     let schema = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
@@ -3523,7 +4352,15 @@ where
                                 .map(|(idx, fid)| ((i, *fid), idx))
                                 .collect();
 
-                            stream = apply_filter_to_stream(stream, filter_expr, mapping)?;
+                            let (safe, unsafe_) = Self::split_filter(filter_expr);
+
+                            if let Some(safe) = safe {
+                                stream = apply_filter_to_stream(stream, &safe, mapping.clone())?;
+                            }
+
+                            if let Some(unsafe_) = unsafe_ {
+                                deferred_filters.push(unsafe_);
+                            }
                         }
 
                         streams.push(stream);
@@ -3541,6 +4378,8 @@ where
                     Some(expr) => vec![expr.clone()],
                     None => Vec::new(),
                 };
+
+                pending_filters.extend(deferred_filters);
 
                 for (idx, fid) in table_field_map[0].iter().enumerate() {
                     col_mapping.insert((0, *fid), idx);
@@ -3620,8 +4459,29 @@ where
                         let mapped = remap_filter_expr(&clause)?;
                         let mut fields: FxHashSet<(usize, FieldId)> = FxHashSet::default();
                         ScalarEvaluator::collect_fields(&mapped, &mut fields);
-                        let tables: FxHashSet<usize> =
+                        let mut tables: FxHashSet<usize> =
                             fields.into_iter().map(|(tbl, _)| tbl).collect();
+
+                        let mut subquery_ids = Vec::new();
+                        Self::collect_subquery_ids(&mapped, &mut subquery_ids);
+
+                        for id in subquery_ids {
+                            if let Some(sub) = prepared.scalar_subqueries.iter().find(|s| s.id == id) {
+                                for corr in &sub.correlated_columns {
+                                    for (tbl_idx, table) in multi.tables.iter().enumerate() {
+                                        if table
+                                            .schema
+                                            .columns
+                                            .iter()
+                                            .any(|c| c.name == corr.column)
+                                        {
+                                            tables.insert(tbl_idx);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         // Only push WHERE filters into the join itself for Inner joins.
                         // For Outer joins, WHERE clause filters must be applied to the result
@@ -3636,45 +4496,56 @@ where
                     }
                     pending_filters = remaining;
 
+                    let mut unsafe_join_filters = Vec::new();
                     let join_filter: Option<llkv_join::JoinFilter> = if !applicable.is_empty() {
                         let combined = combine_clauses(applicable).unwrap();
-                        let mapped_expr = remap_filter_expr(&combined)?;
-                        let mapping = temp_col_mapping.clone();
+                        let (safe, unsafe_) = Self::split_filter(&combined);
 
-                        Some(Box::new(move |batch: &RecordBatch| {
-                            let mut arrays = FxHashMap::default();
-                            for (key, col_idx) in &mapping {
-                                if *col_idx < batch.num_columns() {
-                                    arrays.insert(*key, batch.column(*col_idx).clone());
-                                } else {
-                                    return Err(Error::Internal(format!(
-                                        "Column index {} out of bounds",
-                                        col_idx
-                                    )));
+                        if let Some(u) = unsafe_ {
+                            unsafe_join_filters.push(u);
+                        }
+
+                        if let Some(safe) = safe {
+                            let mapped_expr = remap_filter_expr(&safe)?;
+                            let mapping = temp_col_mapping.clone();
+
+                            Some(Box::new(move |batch: &RecordBatch| {
+                                let mut arrays = FxHashMap::default();
+                                for (key, col_idx) in &mapping {
+                                    if *col_idx < batch.num_columns() {
+                                        arrays.insert(*key, batch.column(*col_idx).clone());
+                                    } else {
+                                        return Err(Error::Internal(format!(
+                                            "Column index {} out of bounds",
+                                            col_idx
+                                        )));
+                                    }
                                 }
-                            }
 
-                            let result = ScalarEvaluator::evaluate_batch(
-                                &mapped_expr,
-                                batch.num_rows(),
-                                &arrays,
-                            )?;
+                                let result = ScalarEvaluator::evaluate_batch(
+                                    &mapped_expr,
+                                    batch.num_rows(),
+                                    &arrays,
+                                )?;
 
-                            if result.data_type() == &arrow::datatypes::DataType::Null {
-                                return Ok(arrow::array::BooleanArray::new_null(batch.num_rows()));
-                            }
+                                if result.data_type() == &arrow::datatypes::DataType::Null {
+                                    return Ok(arrow::array::BooleanArray::new_null(batch.num_rows()));
+                                }
 
-                            let bool_arr = result
-                                .as_any()
-                                .downcast_ref::<arrow::array::BooleanArray>()
-                                .ok_or_else(|| {
-                                    Error::Internal(
-                                        "Filter expression did not evaluate to boolean".into(),
-                                    )
-                                })?;
+                                let bool_arr = result
+                                    .as_any()
+                                    .downcast_ref::<arrow::array::BooleanArray>()
+                                    .ok_or_else(|| {
+                                        Error::Internal(
+                                            "Filter expression did not evaluate to boolean".into(),
+                                        )
+                                    })?;
 
-                            Ok(bool_arr.clone())
-                        }))
+                                Ok(bool_arr.clone())
+                            }))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
@@ -3689,14 +4560,56 @@ where
                         join_filter,
                     )?);
 
+                    for unsafe_ in unsafe_join_filters {
+                        let mut outer_col_mapping = FxHashMap::default();
+                        for tbl_idx in 0..=i + 1 {
+                            for (idx, fid) in table_field_map[tbl_idx].iter().enumerate() {
+                                let field = schemas[tbl_idx].field(idx);
+                                outer_col_mapping.insert(field.name().clone(), (tbl_idx, *fid));
+                            }
+                        }
+
+                        current_stream = self.apply_subquery_filter_to_stream(
+                            current_stream,
+                            unsafe_,
+                            prepared.scalar_subqueries.clone(),
+                            ctx.clone(),
+                            temp_col_mapping.clone(),
+                            outer_col_mapping,
+                        )?;
+                    }
+
                     current_schema = new_schema;
                     col_mapping = temp_col_mapping;
                 }
 
                 // 3. Apply any remaining filters not yet pushed earlier in the join chain.
                 if let Some(final_expr) = combine_clauses(pending_filters) {
-                    current_stream =
-                        apply_filter_to_stream(current_stream, &final_expr, col_mapping.clone())?;
+                    let (safe, unsafe_) = Self::split_filter(&final_expr);
+
+                    if let Some(safe) = safe {
+                        current_stream =
+                            apply_filter_to_stream(current_stream, &safe, col_mapping.clone())?;
+                    }
+
+                    if let Some(unsafe_) = unsafe_ {
+                        let mut outer_col_mapping = FxHashMap::default();
+                        for tbl_idx in 0..table_count {
+                            for (idx, fid) in table_field_map[tbl_idx].iter().enumerate() {
+                                let field = schemas[tbl_idx].field(idx);
+                                outer_col_mapping.insert(field.name().clone(), (tbl_idx, *fid));
+                            }
+                        }
+
+                        current_stream = self.apply_subquery_filter_to_stream(
+                            current_stream,
+                            unsafe_,
+                            prepared.scalar_subqueries.clone(),
+                            ctx.clone(),
+                            col_mapping.clone(),
+                            outer_col_mapping,
+                        )?;
+                    }
                 }
 
                 // 4. Final Projection

@@ -1,6 +1,7 @@
 use crate::physical_plan::{BatchIter, PhysicalPlan};
 use arrow::datatypes::SchemaRef;
 use llkv_expr::expr::Expr;
+use llkv_plan::prepared::PreparedScalarSubquery;
 use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use llkv_types::FieldId;
@@ -16,6 +17,7 @@ where
     pub input: Arc<dyn PhysicalPlan<P>>,
     pub predicate: Expr<'static, FieldId>,
     pub schema: SchemaRef,
+    pub subqueries: Vec<PreparedScalarSubquery<P>>,
 }
 
 impl<P> FilterExec<P>
@@ -26,11 +28,13 @@ where
         input: Arc<dyn PhysicalPlan<P>>,
         predicate: Expr<'static, FieldId>,
         schema: SchemaRef,
+        subqueries: Vec<PreparedScalarSubquery<P>>,
     ) -> Self {
         Self {
             input,
             predicate,
             schema,
+            subqueries,
         }
     }
 }
@@ -43,6 +47,7 @@ where
         f.debug_struct("FilterExec")
             .field("predicate", &self.predicate)
             .field("schema", &self.schema)
+            .field("subqueries_count", &self.subqueries.len())
             .finish()
     }
 }
@@ -78,6 +83,7 @@ where
             children[0].clone(),
             self.predicate.clone(),
             self.schema.clone(),
+            self.subqueries.clone(),
         )))
     }
 

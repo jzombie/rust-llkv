@@ -41,6 +41,18 @@ where
     Multi(MultiTableLogicalPlan<P>),
 }
 
+impl<P> Clone for LogicalPlan<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Single(p) => Self::Single(p.clone()),
+            Self::Multi(p) => Self::Multi(p.clone()),
+        }
+    }
+}
+
 /// Logical plan metadata for a single-table query.
 pub struct SingleTableLogicalPlan<P>
 where
@@ -73,6 +85,35 @@ where
 {
     pub fn has_extra_columns(&self) -> bool {
         !self.extra_columns.is_empty()
+    }
+}
+
+impl<P> Clone for SingleTableLogicalPlan<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            table_name: self.table_name.clone(),
+            table_id: self.table_id,
+            table: self.table.clone(),
+            schema: self.schema.clone(),
+            requested_projections: self.requested_projections.clone(),
+            scan_projections: self.scan_projections.clone(),
+            final_schema: self.final_schema.clone(),
+            scan_schema: self.scan_schema.clone(),
+            resolved_order_by: self.resolved_order_by.clone(),
+            filter: self.filter.clone(),
+            original_filter: self.original_filter.clone(),
+            extra_columns: self.extra_columns.clone(),
+            scalar_subqueries: self.scalar_subqueries.clone(),
+            filter_subqueries: self.filter_subqueries.clone(),
+            aggregate_rewrite: self.aggregate_rewrite.clone(),
+            group_by: self.group_by.clone(),
+            distinct: self.distinct,
+            limit: self.limit,
+            offset: self.offset,
+        }
     }
 }
 
@@ -112,6 +153,35 @@ where
     pub scalar_subqueries: Vec<crate::plans::ScalarSubquery>,
     pub filter_subqueries: Vec<crate::plans::FilterSubquery>,
     pub aggregate_rewrite: Option<AggregateRewrite>,
+}
+
+impl<P> Clone for MultiTableLogicalPlan<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            table_order: self.table_order.clone(),
+            table_filters: self.table_filters.clone(),
+            filter: self.filter.clone(),
+            original_filter: self.original_filter.clone(),
+            having: self.having.clone(),
+            original_having: self.original_having.clone(),
+            joins: self.joins.clone(),
+            projections: self.projections.clone(),
+            aggregates: self.aggregates.clone(),
+            group_by: self.group_by.clone(),
+            order_by: self.order_by.clone(),
+            distinct: self.distinct,
+            compound: self.compound.clone(),
+            resolved_required: self.resolved_required.clone(),
+            unresolved_required: self.unresolved_required.clone(),
+            scalar_subqueries: self.scalar_subqueries.clone(),
+            filter_subqueries: self.filter_subqueries.clone(),
+            aggregate_rewrite: self.aggregate_rewrite.clone(),
+        }
+    }
 }
 
 pub struct PlannedTable<P>
