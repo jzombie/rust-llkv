@@ -19,6 +19,7 @@ where
 {
     pub table: Arc<Table<P>>,
     pub schema: SchemaRef,
+    // TODO: Back vector w/ Arc?
     pub projections: Vec<ScanProjection>,
     pub filter: Option<Expr<'static, FieldId>>,
     pub limit: Option<usize>,

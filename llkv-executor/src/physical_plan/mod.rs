@@ -26,12 +26,14 @@ where
     /// Execute the plan and return an iterator of record batches
     fn execute(&self) -> Result<BatchIter>;
 
+    // TODO: Back vector w/ Arc?
     /// Returns the children of this plan
     fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>>;
 
     /// Returns a new plan with the specified children
     fn with_new_children(
         self: Arc<Self>,
+        // TODO: Back vector w/ Arc?
         children: Vec<Arc<dyn PhysicalPlan<P>>>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>>;
 

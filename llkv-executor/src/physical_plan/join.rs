@@ -14,6 +14,7 @@ where
 {
     pub left: Arc<dyn PhysicalPlan<P>>,
     pub right: Arc<dyn PhysicalPlan<P>>,
+    // TODO: Back vector w/ Arc?
     pub on: Vec<(usize, usize)>, // (left_col_idx, right_col_idx)
     pub join_type: JoinPlan,
     pub schema: SchemaRef,

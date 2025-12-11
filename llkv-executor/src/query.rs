@@ -2307,7 +2307,7 @@ where
     ) -> ExecutorResult<SelectExecution<P>> {
         let mut current_exec = self.execute_prepared_select(&compound.initial, ctx)?;
 
-        for op in &compound.operations {
+        for op in compound.operations.iter() {
             let next_exec = self.execute_prepared_select(&op.plan, ctx)?;
 
             // Ensure schemas match
@@ -2546,7 +2546,7 @@ where
         &self,
         stream: BatchIter,
         filter_expr: LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
-        prepared_subqueries: Vec<PreparedScalarSubquery<P>>,
+        prepared_subqueries: Arc<Vec<PreparedScalarSubquery<P>>>,
         ctx: QueryContext,
         col_mapping: FxHashMap<(usize, FieldId), usize>,
         outer_col_mapping: FxHashMap<String, (usize, FieldId)>,
@@ -2662,7 +2662,7 @@ where
             ScalarExpr::ScalarSubquery(s) => {
                 if let Some(def) = prepared_subqueries.iter().find(|p| p.id == s.id) {
                     let mut params = FxHashMap::default();
-                    for corr in &def.correlated_columns {
+                    for corr in def.correlated_columns.iter() {
                         let outer_col_name = &corr.column;
                         if let Some(key) = outer_col_mapping.get(outer_col_name) {
                             if let Some(col_idx) = col_mapping.get(key) {
@@ -2677,7 +2677,7 @@ where
                         }
                     }
                     
-                    let mut plan = *def.template.clone();
+                    let mut plan = (*def.template).clone();
                     Self::replace_params_in_select_plan(&mut plan, &params);
                     
                     let prepared_plan = self.planner.prepare_select(plan, None, None, ctx)?;
@@ -3616,7 +3616,7 @@ where
                 return self.apply_subquery_filter_to_stream(
                     input_stream,
                     remapped_expr,
-                    filter.subqueries.clone(),
+                    Arc::new(filter.subqueries.clone()),
                     ctx.clone(),
                     col_mapping,
                     outer_col_mapping,
@@ -3766,7 +3766,7 @@ where
             return self.execute_compound_prepared(compound, ctx);
         }
 
-        let mut plan = prepared.plan.clone();
+        let mut plan = (*prepared.plan).clone();
         let row_filter = prepared.row_filter.clone();
 
         // Rewrite projections
@@ -3828,7 +3828,7 @@ where
         let residual_subqueries = if residual_filter.is_some() {
             prepared.residual_filter_subqueries.clone()
         } else {
-            Vec::new()
+            Arc::new(Vec::new())
         };
 
         // Check if we need to force manual projection (cached from planner, but re-evaluate if
@@ -3920,8 +3920,8 @@ where
                 if let Some(residual) = &residual_filter {
                     base_iter = self.apply_residual_filter(
                         base_iter,
-                        residual.clone(),
-                        residual_subqueries.clone(),
+                        (**residual).clone(),
+                        (*residual_subqueries).clone(),
                     );
                 }
 
@@ -4163,8 +4163,8 @@ where
                     vec![FxHashSet::default(); table_count];
 
                 // Add fields from scalar subqueries
-                for subquery in &prepared.scalar_subqueries {
-                    for corr in &subquery.correlated_columns {
+                for subquery in prepared.scalar_subqueries.iter() {
+                    for corr in subquery.correlated_columns.iter() {
                         for (tbl_idx, table) in multi.tables.iter().enumerate() {
                             if let Some(col) =
                                 table.schema.columns.iter().find(|c| c.name == corr.column)
@@ -4467,7 +4467,7 @@ where
 
                         for id in subquery_ids {
                             if let Some(sub) = prepared.scalar_subqueries.iter().find(|s| s.id == id) {
-                                for corr in &sub.correlated_columns {
+                                for corr in sub.correlated_columns.iter() {
                                     for (tbl_idx, table) in multi.tables.iter().enumerate() {
                                         if table
                                             .schema

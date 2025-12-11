@@ -16,6 +16,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub input: Arc<dyn PhysicalPlan<P>>,
+    // TODO: Back vector w/ Arc?
     pub order_by: Vec<OrderByPlan>,
 }
 

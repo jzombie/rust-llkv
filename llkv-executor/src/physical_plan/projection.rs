@@ -17,6 +17,7 @@ where
 {
     pub input: Arc<dyn PhysicalPlan<P>>,
     pub schema: SchemaRef,
+    // TODO: Back vector w/ Arc?
     pub expr: Vec<(ScalarExpr<usize>, String)>, // Expression, output name
 }
 

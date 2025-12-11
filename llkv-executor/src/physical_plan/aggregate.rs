@@ -13,6 +13,7 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub input: Arc<dyn PhysicalPlan<P>>,
+    // TODO: Back vectors w/ Arc?
     pub group_expr: Vec<usize>, // Indices in input schema
     pub aggr_expr: Vec<AggregateExpr>,
     pub schema: SchemaRef,

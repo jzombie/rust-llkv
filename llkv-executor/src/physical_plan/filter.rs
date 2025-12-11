@@ -17,6 +17,7 @@ where
     pub input: Arc<dyn PhysicalPlan<P>>,
     pub predicate: Expr<'static, FieldId>,
     pub schema: SchemaRef,
+    // TODO: Back vector w/ Arc?
     pub subqueries: Vec<PreparedScalarSubquery<P>>,
 }
 

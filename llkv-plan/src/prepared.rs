@@ -26,14 +26,14 @@ pub struct PreparedSelectPlan<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub plan: SelectPlan,
-    pub logical_plan: LogicalPlan<P>,
+    pub plan: Arc<SelectPlan>,
+    pub logical_plan: Arc<LogicalPlan<P>>,
     // pub physical_plan: Option<Arc<dyn PhysicalPlan>>, // Only populated for single-table plans.
-    pub scalar_subqueries: Vec<PreparedScalarSubquery<P>>, // Prepared subqueries for ScalarExpr.
-    pub filter_subqueries: Vec<PreparedFilterSubquery<P>>, // Prepared subqueries referenced from filters.
-    pub compound: Option<PreparedCompoundSelect<P>>,       // Prepared compound operations.
-    pub residual_filter: Option<Expr<'static, String>>, // Residual predicate kept for executor-side filtering.
-    pub residual_filter_subqueries: Vec<FilterSubquery>, // Correlated EXISTS subqueries tied to residual filters.
+    pub scalar_subqueries: Arc<Vec<PreparedScalarSubquery<P>>>, // Prepared subqueries for ScalarExpr.
+    pub filter_subqueries: Arc<Vec<PreparedFilterSubquery<P>>>, // Prepared subqueries referenced from filters.
+    pub compound: Option<Arc<PreparedCompoundSelect<P>>>,       // Prepared compound operations.
+    pub residual_filter: Option<Arc<Expr<'static, String>>>, // Residual predicate kept for executor-side filtering.
+    pub residual_filter_subqueries: Arc<Vec<FilterSubquery>>, // Correlated EXISTS subqueries tied to residual filters.
     pub force_manual_projection: bool,                   // Whether execution must project manually.
     pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,     // MVCC row filter to thread into scans.
 }
@@ -62,9 +62,9 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub id: SubqueryId,
-    pub correlated_columns: Vec<CorrelatedColumn>,
-    pub prepared_plan: Option<Box<PreparedSelectPlan<P>>>,
-    pub template: Box<SelectPlan>,
+    pub correlated_columns: Arc<Vec<CorrelatedColumn>>,
+    pub prepared_plan: Option<Arc<PreparedSelectPlan<P>>>,
+    pub template: Arc<SelectPlan>,
 }
 
 impl<P> Clone for PreparedScalarSubquery<P>
@@ -86,9 +86,9 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub id: SubqueryId,
-    pub correlated_columns: Vec<CorrelatedColumn>,
-    pub prepared_plan: Option<Box<PreparedSelectPlan<P>>>,
-    pub template: Box<SelectPlan>,
+    pub correlated_columns: Arc<Vec<CorrelatedColumn>>,
+    pub prepared_plan: Option<Arc<PreparedSelectPlan<P>>>,
+    pub template: Arc<SelectPlan>,
 }
 
 impl<P> Clone for PreparedFilterSubquery<P>
@@ -109,8 +109,8 @@ pub struct PreparedCompoundSelect<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub initial: Box<PreparedSelectPlan<P>>,
-    pub operations: Vec<PreparedCompoundOp<P>>,
+    pub initial: Arc<PreparedSelectPlan<P>>,
+    pub operations: Arc<Vec<PreparedCompoundOp<P>>>,
 }
 
 impl<P> Clone for PreparedCompoundSelect<P>
@@ -131,7 +131,7 @@ where
 {
     pub operator: CompoundOperator,
     pub quantifier: CompoundQuantifier,
-    pub plan: Box<PreparedSelectPlan<P>>,
+    pub plan: Arc<PreparedSelectPlan<P>>,
 }
 
 impl<P> Clone for PreparedCompoundOp<P>
@@ -190,7 +190,7 @@ where
         let mut prepared = Vec::with_capacity(subs.len());
         for sub in subs {
             let prepared_plan = if sub.correlated_columns.is_empty() {
-                Some(Box::new(self.prepare_select(
+                Some(Arc::new(self.prepare_select(
                     (*sub.plan).clone(),
                     None,
                     Some(&format!("scalar subquery {:?}", sub.id)),
@@ -201,9 +201,9 @@ where
             };
             prepared.push(PreparedScalarSubquery {
                 id: sub.id,
-                correlated_columns: sub.correlated_columns.clone(),
+                correlated_columns: Arc::new(sub.correlated_columns.clone()),
                 prepared_plan,
-                template: sub.plan.clone(),
+                template: Arc::new(*sub.plan.clone()),
             });
         }
         Ok(prepared)
@@ -217,7 +217,7 @@ where
         let mut prepared = Vec::with_capacity(subs.len());
         for sub in subs {
             let prepared_plan = if sub.correlated_columns.is_empty() {
-                Some(Box::new(self.prepare_select(
+                Some(Arc::new(self.prepare_select(
                     (*sub.plan).clone(),
                     None,
                     Some(&format!("filter subquery {:?}", sub.id)),
@@ -228,9 +228,9 @@ where
             };
             prepared.push(PreparedFilterSubquery {
                 id: sub.id,
-                correlated_columns: sub.correlated_columns.clone(),
+                correlated_columns: Arc::new(sub.correlated_columns.clone()),
                 prepared_plan,
-                template: sub.plan.clone(),
+                template: Arc::new(*sub.plan.clone()),
             });
         }
         Ok(prepared)
@@ -242,7 +242,7 @@ where
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
         ctx: &QueryContext,
     ) -> Result<PreparedCompoundSelect<P>> {
-        let initial = Box::new(self.prepare_select(
+        let initial = Arc::new(self.prepare_select(
             (*compound.initial).clone(),
             row_filter.clone(),
             Some("compound initial"),
@@ -253,7 +253,7 @@ where
             operations.push(PreparedCompoundOp {
                 operator: op.operator.clone(),
                 quantifier: op.quantifier.clone(),
-                plan: Box::new(self.prepare_select(
+                plan: Arc::new(self.prepare_select(
                     op.plan.clone(),
                     row_filter.clone(),
                     Some(&format!("compound {:?}", op.operator)),
@@ -263,7 +263,7 @@ where
         }
         Ok(PreparedCompoundSelect {
             initial,
-            operations,
+            operations: Arc::new(operations),
         })
     }
 
@@ -546,14 +546,14 @@ where
         // );
 
         Ok(PreparedSelectPlan {
-            plan: plan_for_execution,
-            logical_plan,
+            plan: Arc::new(plan_for_execution),
+            logical_plan: Arc::new(logical_plan),
             // physical_plan,
-            scalar_subqueries: prepared_scalar_subqueries,
-            filter_subqueries,
-            compound,
-            residual_filter,
-            residual_filter_subqueries,
+            scalar_subqueries: Arc::new(prepared_scalar_subqueries),
+            filter_subqueries: Arc::new(filter_subqueries),
+            compound: compound.map(Arc::new),
+            residual_filter: residual_filter.map(Arc::new),
+            residual_filter_subqueries: Arc::new(residual_filter_subqueries),
             force_manual_projection,
             row_filter,
         })
