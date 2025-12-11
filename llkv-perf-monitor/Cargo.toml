@@ -16,5 +16,9 @@ perf-mon = []
 tracing.workspace = true
 line-ending.workspace = true
 
+[dev-dependencies]
+indoc.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true

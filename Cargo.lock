@@ -1739,7 +1739,9 @@ dependencies = [
 name = "llkv-perf-monitor"
 version = "0.8.5-alpha"
 dependencies = [
+ "indoc",
  "line-ending",
+ "tempfile",
  "tracing",
 ]
 
