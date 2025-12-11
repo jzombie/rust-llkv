@@ -114,10 +114,7 @@ fn write_manifest(manifest: &Path, perf_path: &Path, enable_perf: bool) {
             escaped_path
         )
     } else {
-        format!(
-            "llkv-perf-monitor = {{ path = \"{}\" }}",
-            escaped_path
-        )
+        format!("llkv-perf-monitor = {{ path = \"{}\" }}", escaped_path)
     };
 
     fs::write(

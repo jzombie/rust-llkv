@@ -18,13 +18,13 @@ use llkv_storage::pager::Pager;
 use llkv_table::schema_ext::CachedSchema;
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::FieldId;
-use rayon::prelude::*;
 use llkv_types::LogicalFieldId;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 use simd_r_drive_entry_handle::EntryHandle;
+use std::hash::{Hash, Hasher};
 use std::ops::Bound;
 use std::sync::Arc;
-use std::hash::{Hash, Hasher};
 
 /// A reference to a row in a batch: (batch_index, row_index).
 type RowRef = (usize, usize);
@@ -259,7 +259,8 @@ where
                                 let mut matched = false;
                                 if let Some(build_refs) = matches {
                                     for &(build_batch_idx, build_row_idx) in build_refs {
-                                        let build_row = build_rows[build_batch_idx].row(build_row_idx);
+                                        let build_row =
+                                            build_rows[build_batch_idx].row(build_row_idx);
                                         if row == build_row {
                                             buffers.left_rows.push(row_idx);
                                             buffers.right_rows.push(Some(JoinRowRef {
@@ -306,7 +307,11 @@ where
                 });
 
             for chunk in chunk_buffers {
-                for (l, r) in chunk.left_rows.into_iter().zip(chunk.right_rows.into_iter()) {
+                for (l, r) in chunk
+                    .left_rows
+                    .into_iter()
+                    .zip(chunk.right_rows.into_iter())
+                {
                     left_rows.push(l);
                     right_rows.push(r);
                     if left_rows.len() >= batch_size {
@@ -488,7 +493,11 @@ where
             };
 
             for chunk in chunk_buffers {
-                for (l, r) in chunk.left_rows.into_iter().zip(chunk.right_rows.into_iter()) {
+                for (l, r) in chunk
+                    .left_rows
+                    .into_iter()
+                    .zip(chunk.right_rows.into_iter())
+                {
                     left_rows.push(l);
                     right_rows.push(r);
                     if left_rows.len() >= batch_size {
@@ -580,7 +589,10 @@ fn build_hash_table_single_key<A, P>(
     join_key: &JoinKey,
     schema: &Arc<Schema>,
     row_filter: Option<Arc<dyn RowIdFilter<P>>>,
-) -> LlkvResult<(FxHashMap<ScalarKey<A::Native>, Vec<RowRef>>, Vec<RecordBatch>)>
+) -> LlkvResult<(
+    FxHashMap<ScalarKey<A::Native>, Vec<RowRef>>,
+    Vec<RecordBatch>,
+)>
 where
     A: ArrowPrimitiveType,
     A::Native: Copy + Eq + std::hash::Hash,
@@ -1043,8 +1055,7 @@ impl Iterator for HashJoinStream {
                     JoinType::Inner => {
                         if let Some(build_rows_indices) = matches {
                             for &(_, build_row_idx) in build_rows_indices {
-                                if let (Some(build_rows), Some(probe_row)) =
-                                    (build_rows, probe_row)
+                                if let (Some(build_rows), Some(probe_row)) = (build_rows, probe_row)
                                 {
                                     if probe_row != build_rows.row(build_row_idx) {
                                         continue;
@@ -1059,8 +1070,7 @@ impl Iterator for HashJoinStream {
                     JoinType::Left => {
                         if let Some(build_rows_indices) = matches {
                             for &(_, build_row_idx) in build_rows_indices {
-                                if let (Some(build_rows), Some(probe_row)) =
-                                    (build_rows, probe_row)
+                                if let (Some(build_rows), Some(probe_row)) = (build_rows, probe_row)
                                 {
                                     if probe_row != build_rows.row(build_row_idx) {
                                         continue;
