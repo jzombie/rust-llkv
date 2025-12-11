@@ -1,3 +1,4 @@
+// TODO: Replace `HashMap` with `FxHashMap` for better performance.
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
