@@ -79,6 +79,7 @@ impl PerfContext {
 
     /// Create a new context anchored to a top-level label (usually the SQL).
     pub fn new(root_label: impl Into<String>) -> Self {
+        // TODO: Remove cfg! check here and init using macro
         if cfg!(feature = "perf-mon") {
             let inner = PerfInner {
                 root_label: root_label.into(),
@@ -101,6 +102,7 @@ impl PerfContext {
 
     /// Record a new measurement under the provided label.
     pub fn record(&self, label: impl Into<String>, duration: Duration) {
+        // TODO: Remove cfg! check here and gate using macro
         if !cfg!(feature = "perf-mon") {
             return;
         }
@@ -119,6 +121,7 @@ impl PerfContext {
 
     /// Record a measurement with an explicit label path (e.g. `parent:child`).
     pub fn record_path(&self, label_path: String, duration: Duration) {
+        // TODO: Remove cfg! check here and gate using macro
         if !cfg!(feature = "perf-mon") {
             return;
         }
@@ -187,6 +190,7 @@ impl PerfContext {
     /// When performance monitoring is disabled or no measurements are present,
     /// this returns `None`.
     pub fn render_report(&self) -> Option<String> {
+        // TODO: Remove cfg! check here and gate using macro
         if !cfg!(feature = "perf-mon") {
             return None;
         }
