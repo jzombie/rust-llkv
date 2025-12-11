@@ -15,6 +15,7 @@ use std::sync::Arc;
 /// Logical expression over predicates.
 #[derive(Clone, Debug)]
 pub enum Expr<'a, F> {
+    // TODO: Back vectors w/ Arc?
     And(Vec<Expr<'a, F>>),
     Or(Vec<Expr<'a, F>>),
     Not(Box<Expr<'a, F>>),
