@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tempfile::tempdir;
 use indoc::indoc;
+use tempfile::tempdir;
 
 // Ensure that when the `perf-mon` feature is disabled, wrapping a trivial binary
 // with llkv-perf-monitor produces the same optimized assembly as the plain binary.
@@ -15,50 +15,8 @@ fn assembly_matches_when_feature_disabled() {
 
     let perf_path = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-    // Local cargo project that depends on this crate by path.
-    fs::write(
-        &manifest,
-        format!(
-            indoc!(r#"
-                [package]
-                name = "asm-check"
-                version = "0.0.0"
-                edition = "2021"
-
-                [dependencies]
-                llkv-perf-monitor = {{ path = "{}" }}
-            "#),
-            perf_path.display()
-        ),
-    )
-    .expect("write Cargo.toml");
-
-    fs::write(
-        src_bin.join("with.rs"),
-        indoc!(
-            r#"
-            use llkv_perf_monitor::{measure, PerfContext};
-
-            fn main() {
-                let ctx = PerfContext::disabled();
-                let (_r, _d) = measure!(ctx, "hello", { println!("hello world"); });
-            }
-            "#
-        ),
-    )
-    .expect("write with.rs");
-
-    fs::write(
-        src_bin.join("plain.rs"),
-        indoc!(
-            r#"
-            fn main() {
-                println!("hello world");
-            }
-            "#
-        ),
-    )
-    .expect("write plain.rs");
+    write_manifest(&manifest, perf_path, false);
+    write_bins(&src_bin, false);
 
     let target_dir = dir.path().join("target");
 
@@ -72,6 +30,32 @@ fn assembly_matches_when_feature_disabled() {
     let plain_norm = normalize_asm(&fs::read_to_string(plain_s).expect("read plain.s"));
 
     assert_eq!(with_norm, plain_norm, "assembly should match when perf-mon is disabled");
+}
+
+#[test]
+fn assembly_differs_when_perf_enabled() {
+    let dir = tempdir().expect("tempdir");
+    let manifest = dir.path().join("Cargo.toml");
+    let src_bin = dir.path().join("src").join("bin");
+    fs::create_dir_all(&src_bin).expect("mkdirs");
+
+    let perf_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    write_manifest(&manifest, perf_path, true);
+    write_bins(&src_bin, true);
+
+    let target_dir = dir.path().join("target");
+
+    build_asm(dir.path(), "with", &target_dir);
+    build_asm(dir.path(), "plain", &target_dir);
+
+    let with_s = find_asm(&target_dir, "with").expect("with asm");
+    let plain_s = find_asm(&target_dir, "plain").expect("plain asm");
+
+    let with_norm = normalize_asm(&fs::read_to_string(with_s).expect("read with.s"));
+    let plain_norm = normalize_asm(&fs::read_to_string(plain_s).expect("read plain.s"));
+
+    assert_ne!(with_norm, plain_norm, "assembly should differ when perf-mon is enabled");
 }
 
 fn build_asm(workspace: &Path, bin: &str, target_dir: &Path) {
@@ -109,6 +93,71 @@ fn find_asm(target_dir: &Path, stem: &str) -> Option<PathBuf> {
 
 fn normalize_asm(src: &str) -> String {
     extract_opcodes(src).join("\n")
+}
+
+fn write_manifest(manifest: &Path, perf_path: &Path, enable_perf: bool) {
+    let dep = if enable_perf {
+        format!("llkv-perf-monitor = {{ path = \"{}\", features = [\"perf-mon\"] }}", perf_path.display())
+    } else {
+        format!("llkv-perf-monitor = {{ path = \"{}\" }}", perf_path.display())
+    };
+
+    fs::write(
+        manifest,
+        format!(
+            indoc!(r#"
+                [package]
+                name = "asm-check"
+                version = "0.0.0"
+                edition = "2021"
+
+                [dependencies]
+                {dep}
+            "#),
+            dep = dep,
+        ),
+    )
+    .expect("write Cargo.toml");
+}
+
+fn write_bins(src_bin: &Path, enable_perf: bool) {
+    let with_body = if enable_perf {
+        indoc!(
+            r#"
+            use llkv_perf_monitor::{measure, PerfContext};
+
+            fn main() {
+                let ctx = PerfContext::new("root");
+                let (_r, _d) = measure!(ctx, "hello", { println!("hello world"); });
+            }
+            "#
+        )
+    } else {
+        indoc!(
+            r#"
+            use llkv_perf_monitor::{measure, PerfContext};
+
+            fn main() {
+                let ctx = PerfContext::default();
+                let (_r, _d) = measure!(ctx, "hello", { println!("hello world"); });
+            }
+            "#
+        )
+    };
+
+    fs::write(src_bin.join("with.rs"), with_body).expect("write with.rs");
+
+    fs::write(
+        src_bin.join("plain.rs"),
+        indoc!(
+            r#"
+            fn main() {
+                println!("hello world");
+            }
+            "#
+        ),
+    )
+    .expect("write plain.rs");
 }
 
 // Extract opcode sequence from instructions, skipping labels and directives so
