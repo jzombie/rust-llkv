@@ -248,14 +248,35 @@ impl AsRef<PerfContext> for PerfContext {
     }
 }
 
-/// Measure the duration of the provided expression, recording it into the
-/// supplied [`PerfContext`]. Returns a `(result, duration)` tuple.
+/// Measure the provided expression and record the duration into the supplied [`PerfContext`].
+///
+/// Optional feature list: `measure!( ["perf-mon"], ctx, label, { body })`. When the list is empty
+/// (default overload), measurement is enabled. When non-empty, measurement is enabled if **any**
+/// listed feature is active. This helper returns only the expression result; use
+/// `measure_with_duration!` when the caller also needs the elapsed time. When measurement is not
+/// enabled, this macro executes the body without timing overhead.
 #[macro_export]
 macro_rules! measure {
-    ($ctx:expr, $label:expr, $body:expr) => {{
+    ([$($feat:literal),* $(,)?], $ctx:expr, $label:expr, $body:expr) => {{
         let __ctx_ref: &llkv_perf_monitor::PerfContext =
             ::core::convert::AsRef::<llkv_perf_monitor::PerfContext>::as_ref(&$ctx);
-        if cfg!(feature = "perf-mon") {
+        let __measure_enabled = {
+            let mut __enabled = false;
+            let mut __count = 0;
+            $(
+                __count += 1;
+                #[allow(unexpected_cfgs)]
+                if cfg!(feature = $feat) {
+                    __enabled = true;
+                }
+            )*
+            if __count == 0 {
+                __enabled = true;
+            }
+            __enabled
+        };
+
+        if __measure_enabled {
             let __path = __ctx_ref.push_label($label);
             let __perf_start = std::time::Instant::now();
             let __perf_result = { $body };
@@ -264,20 +285,59 @@ macro_rules! measure {
                 __ctx_ref.record_path(__path, __perf_duration);
                 __ctx_ref.pop_label();
             }
-            (__perf_result, __perf_duration)
+            __perf_result
         } else {
-            let __perf_result = { $body };
-            (__perf_result, std::time::Duration::ZERO)
+            { $body }
         }
     }};
+    ($ctx:expr, $label:expr, $body:expr) => {{
+        $crate::measure!([], $ctx, $label, { $body })
+    }};
 }
-
-/// Alias to mirror the older name used in the SLT harness.
+/// Measure the provided expression, record the duration into the supplied [`PerfContext`], and
+/// return both the expression result and the elapsed time.
+///
+/// Optional feature list behaves like `measure!`: empty enables recording; non-empty records when
+/// at least one listed feature is active. Timing always runs; recording to the [`PerfContext`] is
+/// controlled by the feature list. When no listed features are active, the duration is still
+/// returned but no measurement is recorded.
 #[macro_export]
-macro_rules! measure_with {
-    ($ctx:expr, $label:expr, $body:expr) => {
-        $crate::measure!($ctx, $label, $body)
-    };
+macro_rules! measure_with_duration {
+    ([$($feat:literal),* $(,)?], $ctx:expr, $label:expr, $body:expr) => {{
+        let __ctx_ref: &llkv_perf_monitor::PerfContext =
+            ::core::convert::AsRef::<llkv_perf_monitor::PerfContext>::as_ref(&$ctx);
+        let __measure_enabled = {
+            let mut __enabled = false;
+            let mut __count = 0;
+            $(
+                __count += 1;
+                #[allow(unexpected_cfgs)]
+                if cfg!(feature = $feat) {
+                    __enabled = true;
+                }
+            )*
+            if __count == 0 {
+                __enabled = true;
+            }
+            __enabled
+        };
+        // Always time; record is gated by feature list
+        // This defers from measure! which skips timing when disabled
+        let __perf_start = std::time::Instant::now();
+        let __perf_result = { $body };
+        let __perf_duration = __perf_start.elapsed();
+        if __measure_enabled {
+            let __path = __ctx_ref.push_label($label);
+            if let Some(__path) = __path {
+                __ctx_ref.record_path(__path, __perf_duration);
+                __ctx_ref.pop_label();
+            }
+        }
+        (__perf_result, __perf_duration)
+    }};
+    ($ctx:expr, $label:expr, $body:expr) => {{
+        $crate::measure_with_duration!([], $ctx, $label, { $body })
+    }};
 }
 
 fn write_node(

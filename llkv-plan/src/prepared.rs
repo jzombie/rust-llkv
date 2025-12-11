@@ -242,21 +242,28 @@ where
         _context: Option<&str>,
         ctx: &QueryContext,
     ) -> Result<PreparedSelectPlan<P>> {
-        let ((), _t_simplify) = llkv_perf_monitor::measure!(ctx, "simplify", {
-            // Simplify projection expressions to remove dead code (e.g. NULLIF(NULL, col))
+        llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "simplify",
+            {
             for proj in &mut plan.projections {
                 if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
                     *expr = llkv_compute::eval::ScalarEvaluator::simplify(expr);
                 }
             }
 
-            // Simplify HAVING clause
             if let Some(having) = &mut plan.having {
                 *having = simplify_expr(having.clone());
             }
-        });
+            }
+        );
 
-        let (res, _t_subqueries) = llkv_perf_monitor::measure!(ctx, "subqueries", {
+        let res = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "subqueries",
+            {
             let prepared_scalar_subqueries =
                 self.prepare_scalar_subqueries(&plan.scalar_subqueries, ctx)?;
 
@@ -274,21 +281,22 @@ where
                 .transpose()?;
 
             Ok::<_, llkv_result::Error>((prepared_scalar_subqueries, filter_subqueries, compound))
-        });
+            }
+        );
         let (prepared_scalar_subqueries, filter_subqueries, compound) = res?;
 
         let (
-            (
-                plan_for_execution,
-                residual_filter,
-                residual_filter_subqueries,
-                force_manual_projection,
-                plan_for_scan,
-                has_aggregates,
-            ),
-            _t_analysis,
-        ) = llkv_perf_monitor::measure!(ctx, "analysis", {
-            // Simplify WHERE clause
+            plan_for_execution,
+            residual_filter,
+            residual_filter_subqueries,
+            force_manual_projection,
+            plan_for_scan,
+            has_aggregates,
+        ) = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "analysis",
+            {
             if let Some(filter) = &mut plan.filter {
                 filter.predicate = simplify_expr(filter.predicate.clone());
             }
@@ -352,6 +360,7 @@ where
             } else {
                 plan_for_execution.clone()
             };
+
             (
                 plan_for_execution,
                 residual_filter,
@@ -360,52 +369,22 @@ where
                 plan_for_scan,
                 has_aggregates,
             )
-        });
-        // The variable `res` here shadows the previous `res` from `t_subqueries` block, but wait...
-        // The `measure!` macro returns `(result, duration)`.
-        // So the result of the block is assigned to the first element of the tuple.
-        // In the line above: `let ((...), t_analysis) = ...`
-        // So the variables are ALREADY destructured.
-        // I don't need `let (...) = res;` because `res` is not defined in this scope as the result of THIS measure block.
-        // The previous `res` (line 265) was consumed.
+            }
+        );
 
-        // Wait, I see what happened. I copied the destructuring pattern into the `let` binding of `measure!`.
-        // So `plan_for_execution` etc are already defined.
-        // But then I have `let (...) = res;` which is wrong because `res` refers to the result of `subqueries` measure block?
-        // No, `res` from line 265 was consumed by `let (...) = res?;`.
-        // So `res` is not available here unless I re-declared it?
-        // Ah, I see `let (res, t_subqueries) = ...` on line 246.
-        // Then `let (...) = res?;` on line 265.
-        // So `res` is gone.
-
-        // The error says: `expected enum Result ... found tuple`.
-        // This implies that `res` IS available and has type `Result`.
-        // But where does `res` come from?
-        // Ah, I see. I might have messed up the edit.
-
-        // Let's look at the code I wrote:
-        // `let ((plan_for_execution, ...), t_analysis) = llkv_perf_monitor::measure!("analysis", { ... });`
-        // This defines `plan_for_execution` etc.
-        // Then I have: `let (plan_for_execution, ...) = res;`
-        // This line is redundant and incorrect because `res` is the result of the PREVIOUS measure block (subqueries), which was already unpacked.
-        // Wait, if `res` was moved, it shouldn't be available.
-        // Unless `res` is `Copy`? `Result` is not Copy usually.
-
-        // The error message `expected enum Result ... found tuple` suggests that `res` is indeed the Result from `subqueries`.
-        // And I am trying to assign it to a tuple of 6 elements.
-        // But `res` contains `(prepared_scalar_subqueries, filter_subqueries, compound)`.
-
-        // So I should just DELETE the line `let (...) = res;`.
-
-        // Let's verify.
-
-        let (res, _t_logical) = llkv_perf_monitor::measure!(ctx, "logical_plan", {
-            self.logical_planner
-                .create_logical_plan(&plan_for_scan, ctx)
-        });
+        let res = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "logical_plan",
+            self.logical_planner.create_logical_plan(&plan_for_scan, ctx)
+        );
         let mut logical_plan = res?;
 
-        let ((), _t_inference) = llkv_perf_monitor::measure!(ctx, "inference", {
+        llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "inference",
+            {
             // Ensure the expression output type matches the inferred schema type.
             // This is necessary because some expressions (like CASE) might evaluate to an untyped NullArray
             // even if the schema inference determined a specific type (e.g. Int64).
@@ -436,49 +415,55 @@ where
                     }
                 }
             }
-        });
+            }
+        );
 
-        let (res, _t_rewrite) = llkv_perf_monitor::measure!(ctx, "rewrite", {
-            if force_manual_projection && has_aggregates {
-                match &mut logical_plan {
-                    LogicalPlan::Single(single) => {
-                        // When forcing manual projection, the logical plan was created with AllColumns,
-                        // which causes the aggregate rewrite to include all columns in the final output.
-                        // We need to re-compute the rewrite using the original projections.
-                        single.aggregate_rewrite =
-                            build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
-                    }
-                    LogicalPlan::Multi(multi) => {
-                        let mut infos = Vec::with_capacity(multi.tables.len());
-                        for table_ref in &plan_for_execution.tables {
-                            let table_lower = table_ref.table.to_ascii_lowercase();
-                            let schema_lower = table_ref.schema.to_ascii_lowercase();
-                            let qualified_lower = if schema_lower.is_empty() {
-                                table_lower.clone()
-                            } else {
-                                format!("{}.{}", schema_lower, table_lower)
-                            };
-                            let alias_lower =
-                                table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
-                            infos.push(TableResolutionInfo {
-                                table_lower,
-                                schema_lower,
-                                qualified_lower,
-                                alias_lower,
-                            });
+        let res = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "rewrite",
+            {
+                if force_manual_projection && has_aggregates {
+                    match &mut logical_plan {
+                        LogicalPlan::Single(single) => {
+                            // When forcing manual projection, the logical plan was created with AllColumns,
+                            // which causes the aggregate rewrite to include all columns in the final output.
+                            // We need to re-compute the rewrite using the original projections.
+                            single.aggregate_rewrite =
+                                build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
                         }
+                        LogicalPlan::Multi(multi) => {
+                            let mut infos = Vec::with_capacity(multi.tables.len());
+                            for table_ref in &plan_for_execution.tables {
+                                let table_lower = table_ref.table.to_ascii_lowercase();
+                                let schema_lower = table_ref.schema.to_ascii_lowercase();
+                                let qualified_lower = if schema_lower.is_empty() {
+                                    table_lower.clone()
+                                } else {
+                                    format!("{}.{}", schema_lower, table_lower)
+                                };
+                                let alias_lower =
+                                    table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+                                infos.push(TableResolutionInfo {
+                                    table_lower,
+                                    schema_lower,
+                                    qualified_lower,
+                                    alias_lower,
+                                });
+                            }
 
-                        let ctx = ResolutionContext {
-                            tables: &multi.tables,
-                            infos: &infos,
-                        };
-                        multi.aggregate_rewrite =
-                            build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
+                            let ctx = ResolutionContext {
+                                tables: &multi.tables,
+                                infos: &infos,
+                            };
+                            multi.aggregate_rewrite =
+                                build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
+                        }
                     }
                 }
+                Ok::<_, llkv_result::Error>(())
             }
-            Ok::<_, llkv_result::Error>(())
-        });
+        );
         res?;
 
         // let physical_plan = Some(

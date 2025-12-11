@@ -259,13 +259,18 @@ where
         let table_id = table.table_id();
         let schema = table.schema();
 
-        let (requested_projections, _t_proj) = llkv_perf_monitor::measure!(ctx, "projections", {
+        let requested_projections = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "projections",
+            {
             if plan.projections.is_empty() {
                 build_wildcard_projections(schema, table_id)
             } else {
                 build_projected_columns(schema, table_id, &plan.projections)?
             }
-        });
+            }
+        );
 
         let mut scan_projections = requested_projections.clone();
         let mut extra_columns: Vec<String> = Vec::new();
@@ -314,16 +319,16 @@ where
         // we must project at least one column for the scan to work.
         // Prefer the primary key, otherwise the first column.
 
-        let (
-            OrderResolution {
-                scan_projections: order_scan_projections,
-                extra_columns: order_extra_columns,
-                resolved_order_by,
-            },
-            _t_order,
-        ) = llkv_perf_monitor::measure!(ctx, "order_by", {
+        let OrderResolution {
+            scan_projections: order_scan_projections,
+            extra_columns: order_extra_columns,
+            resolved_order_by,
+        } = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "order_by",
             resolve_order_by_targets(schema, table_id, &scan_projections, &plan.order_by)?
-        });
+        );
 
         scan_projections = order_scan_projections;
         for col in order_extra_columns {
@@ -335,9 +340,12 @@ where
             }
         }
 
-        let (aggregate_rewrite, _t_agg) = llkv_perf_monitor::measure!(ctx, "aggregate_rewrite", {
+        let aggregate_rewrite = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "aggregate_rewrite",
             build_single_aggregate_rewrite(plan, schema)?
-        });
+        );
 
         if let Some(rewrite) = &aggregate_rewrite {
             let mut rewrite_columns = Vec::new();
@@ -379,25 +387,35 @@ where
             }
         }
 
-        let ((scan_schema, final_schema), _t_schema) = llkv_perf_monitor::measure!(ctx, "schema", {
-            let scan_schema = schema_for_projections(schema, &scan_projections)?;
-            let final_schema = schema_for_projections(schema, &requested_projections)?;
-            (scan_schema, final_schema)
-        });
-
-        let (filter, _t_filter) = llkv_perf_monitor::measure!(ctx, "filter", {
-            match &plan.filter {
-                Some(filter) => {
-                    debug!("LogicalPlan filter input: {:?}", filter.predicate);
-                    let translated = translate_predicate(filter.predicate.clone(), schema, |_| {
-                        Error::Internal("Unknown column".to_string())
-                    })?;
-                    debug!("LogicalPlan filter translated: {:?}", translated);
-                    Some(translated)
-                }
-                None => None,
+        let (scan_schema, final_schema) = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "schema",
+            {
+                let scan_schema = schema_for_projections(schema, &scan_projections)?;
+                let final_schema = schema_for_projections(schema, &requested_projections)?;
+                (scan_schema, final_schema)
             }
-        });
+        );
+
+        let filter = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "filter",
+            {
+                match &plan.filter {
+                    Some(filter) => {
+                        debug!("LogicalPlan filter input: {:?}", filter.predicate);
+                        let translated = translate_predicate(filter.predicate.clone(), schema, |_| {
+                            Error::Internal("Unknown column".to_string())
+                        })?;
+                        debug!("LogicalPlan filter translated: {:?}", translated);
+                        Some(translated)
+                    }
+                    None => None,
+                }
+            }
+        );
 
         let plan_schema = Arc::new(schema.clone());
 
@@ -477,18 +495,23 @@ where
         // Reorder tables using greedy algorithm to avoid cross joins
         // Only reorder if there are no explicit joins, as explicit joins enforce a specific order
         // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
-        let (table_pairs, _t_reorder) = llkv_perf_monitor::measure!(query_ctx, "reorder_tables", {
-            if plan.joins.is_empty() {
-                reorder_tables_greedy(
-                    self.provider.as_ref(),
-                    table_pairs,
-                    &initial_infos,
-                    plan.filter.as_ref().map(|f| &f.predicate),
-                )
-            } else {
-                table_pairs
+        let table_pairs = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            query_ctx,
+            "reorder_tables",
+            {
+                if plan.joins.is_empty() {
+                    reorder_tables_greedy(
+                        self.provider.as_ref(),
+                        table_pairs,
+                        &initial_infos,
+                        plan.filter.as_ref().map(|f| &f.predicate),
+                    )
+                } else {
+                    table_pairs
+                }
             }
-        });
+        );
 
         debug!("Planned tables order:");
         for (i, (table, table_ref)) in table_pairs.iter().enumerate() {
@@ -521,31 +544,41 @@ where
             });
         }
 
-        let ((resolved_columns, unresolved_required), _t_req) =
-            llkv_perf_monitor::measure!(query_ctx, "resolve_required_columns", {
-                resolve_required_columns(plan, &planned_tables, &infos)
-            });
+        let (resolved_columns, unresolved_required) = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            query_ctx,
+            "resolve_required_columns",
+            resolve_required_columns(plan, &planned_tables, &infos)
+        );
 
         let res_ctx = ResolutionContext {
             tables: &planned_tables,
             infos: &infos,
         };
 
-        let (filter, _t_filter) = llkv_perf_monitor::measure!(query_ctx, "resolve_filter", {
-            match &plan.filter {
-                Some(filter) => Some(resolve_predicate(&res_ctx, &filter.predicate)?),
-                None => None,
+        let filter = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            query_ctx,
+            "resolve_filter",
+            {
+                match &plan.filter {
+                    Some(filter) => Some(resolve_predicate(&res_ctx, &filter.predicate)?),
+                    None => None,
+                }
             }
-        });
+        );
 
         let having = match &plan.having {
             Some(having) => Some(resolve_predicate(&res_ctx, having)?),
             None => None,
         };
 
-        let (projections, _t_proj) = llkv_perf_monitor::measure!(query_ctx, "resolve_projections", {
+        let projections = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            query_ctx,
+            "resolve_projections",
             resolve_projections(plan, &res_ctx)?
-        });
+        );
 
         let aggregates = resolve_aggregates(plan, &res_ctx)?;
 

@@ -403,7 +403,8 @@ impl AsyncDB for EngineHarness {
         let slow_threshold = slow_threshold();
 
         let exec_ctx = perf_ctx.clone_context();
-        let (results, exec_duration) = llkv_perf_monitor::measure_with!(
+        let (results, exec_duration) = llkv_perf_monitor::measure_with_duration!(
+            ["perf-mon"],
             exec_ctx,
             "execute",
             self.engine.execute_with_ctx(sql, perf_ctx.as_ref())
@@ -413,7 +414,7 @@ impl AsyncDB for EngineHarness {
             Ok(mut results) => {
                 if results.is_empty() {
                     record_statement(sql, exec_duration, "EMPTY");
-                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
+                    maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                     return Ok(DBOutput::StatementComplete(0));
                 }
                 let mut result = results.remove(0);
@@ -431,7 +432,8 @@ impl AsyncDB for EngineHarness {
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
                         let collect_ctx = perf_ctx.clone_context();
-                        let (batches, collect_duration) = llkv_perf_monitor::measure_with!(
+                        let (batches, collect_duration) = llkv_perf_monitor::measure_with_duration!(
+                            ["perf-mon"],
                             collect_ctx,
                             "collect",
                             execution.collect()

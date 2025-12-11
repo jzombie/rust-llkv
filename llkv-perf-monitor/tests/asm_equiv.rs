@@ -4,8 +4,7 @@ use std::process::Command;
 use indoc::indoc;
 use tempfile::tempdir;
 
-// Ensure that when the `perf-mon` feature is disabled, wrapping a trivial binary
-// with llkv-perf-monitor produces the same optimized assembly as the plain binary.
+// When perf monitoring is disabled, the wrapper should be a no-op and produce identical assembly.
 #[test]
 fn assembly_matches_when_feature_disabled() {
     let dir = tempdir().expect("tempdir");
@@ -20,8 +19,8 @@ fn assembly_matches_when_feature_disabled() {
 
     let target_dir = dir.path().join("target");
 
-    build_asm(dir.path(), "with", &target_dir);
-    build_asm(dir.path(), "plain", &target_dir);
+    build_asm(dir.path(), "with", &target_dir, false);
+    build_asm(dir.path(), "plain", &target_dir, false);
 
     let with_s = find_asm(&target_dir, "with").expect("with asm");
     let plain_s = find_asm(&target_dir, "plain").expect("plain asm");
@@ -46,8 +45,8 @@ fn assembly_differs_when_perf_enabled() {
 
     let target_dir = dir.path().join("target");
 
-    build_asm(dir.path(), "with", &target_dir);
-    build_asm(dir.path(), "plain", &target_dir);
+    build_asm(dir.path(), "with", &target_dir, true);
+    build_asm(dir.path(), "plain", &target_dir, true);
 
     let with_s = find_asm(&target_dir, "with").expect("with asm");
     let plain_s = find_asm(&target_dir, "plain").expect("plain asm");
@@ -58,13 +57,19 @@ fn assembly_differs_when_perf_enabled() {
     assert_ne!(with_norm, plain_norm, "assembly should differ when perf-mon is enabled");
 }
 
-fn build_asm(workspace: &Path, bin: &str, target_dir: &Path) {
-    let status = Command::new("cargo")
-        .current_dir(workspace)
+fn build_asm(workspace: &Path, bin: &str, target_dir: &Path, enable_perf: bool) {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace)
         .arg("rustc")
         .arg("--bin")
         .arg(bin)
-        .arg("--release")
+        .arg("--release");
+
+    if enable_perf {
+        cmd.arg("--features").arg("perf-mon");
+    }
+
+    let status = cmd
         .arg("--")
         .arg("--emit=asm")
         .arg("-Copt-level=3")
@@ -111,6 +116,9 @@ fn write_manifest(manifest: &Path, perf_path: &Path, enable_perf: bool) {
                 version = "0.0.0"
                 edition = "2021"
 
+                [features]
+                perf-mon = ["llkv-perf-monitor/perf-mon"]
+
                 [dependencies]
                 {dep}
             "#),
@@ -128,7 +136,7 @@ fn write_bins(src_bin: &Path, enable_perf: bool) {
 
             fn main() {
                 let ctx = PerfContext::new("root");
-                let (_r, _d) = measure!(ctx, "hello", { println!("hello world"); });
+                measure!(["perf-mon"], ctx, "hello", { println!("hello world"); });
             }
             "#
         )
@@ -139,7 +147,7 @@ fn write_bins(src_bin: &Path, enable_perf: bool) {
 
             fn main() {
                 let ctx = PerfContext::default();
-                let (_r, _d) = measure!(ctx, "hello", { println!("hello world"); });
+                measure!(["perf-mon"], ctx, "hello", { println!("hello world"); });
             }
             "#
         )

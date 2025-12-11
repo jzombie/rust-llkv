@@ -1110,10 +1110,14 @@ impl SqlEngine {
     ) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
-        let (processed_sql, _preprocess_duration) =
-            llkv_perf_monitor::measure!(ctx, "preprocess", Self::preprocess_sql_input(sql));
+        let processed_sql = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "preprocess",
+            Self::preprocess_sql_input(sql)
+        );
 
-        let (statements, _parse_duration) = llkv_perf_monitor::measure!(ctx, "parse", {
+        let statements = llkv_perf_monitor::measure!(["perf-mon"], ctx, "parse", {
             let dialect = GenericDialect {};
             match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
                 Ok(stmts) => stmts,
@@ -1159,10 +1163,12 @@ impl SqlEngine {
                 _ => {
                     // Flush before any non-INSERT
                     let mut flushed = self.flush_buffer_results()?;
-                    let (current, _exec_stmt_duration) =
-                        llkv_perf_monitor::measure!(ctx, "execute_statement", {
-                            self.execute_statement(statement.clone(), ctx)?
-                        });
+                    let current = llkv_perf_monitor::measure!(
+                        ["perf-mon"],
+                        ctx,
+                        "execute_statement",
+                        self.execute_statement(statement.clone(), ctx)?
+                    );
 
                     results.push(current);
                     results.append(&mut flushed);
@@ -5162,18 +5168,24 @@ impl SqlEngine {
             return Ok(result);
         }
 
-        let (select_plan, _build_duration) =
-            llkv_perf_monitor::measure!(ctx, "build_select_plan", {
-                self.build_select_plan(query)?
-            });
+        let select_plan = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "build_select_plan",
+            self.build_select_plan(query)?
+        );
 
-        let (res, _exec_plan_duration) =
-            llkv_perf_monitor::measure!(ctx, "execute_plan_statement", {
+        let res = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "execute_plan_statement",
+            {
                 self.execute_plan_statement_with_ctx(
                     PlanStatement::Select(Box::new(select_plan)),
                     ctx,
                 )
-            });
+            }
+        );
 
         res
     }

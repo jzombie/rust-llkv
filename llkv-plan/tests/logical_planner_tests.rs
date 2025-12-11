@@ -44,6 +44,10 @@ impl ExecutionTable<TestPager> for DummyTable {
         self.table_id
     }
 
+    fn approximate_row_count(&self) -> Option<usize> {
+        None
+    }
+
     fn scan_stream(
         &self,
         _projections: &[ScanProjection],

@@ -2301,15 +2301,23 @@ where
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
         ctx: &QueryContext,
     ) -> ExecutorResult<SelectExecution<P>> {
-        let (prepared, _t_prepare) = llkv_perf_monitor::measure!(ctx, "prepare_select", {
-            self.planner
-                .prepare_select(plan, row_filter, None, ctx)
-                .map_err(Error::from)?
-        });
+        let prepared = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "prepare_select",
+            {
+                self.planner
+                    .prepare_select(plan, row_filter, None, ctx)
+                    .map_err(Error::from)?
+            }
+        );
 
-        let (result, _t_exec) = llkv_perf_monitor::measure!(ctx, "execute_prepared_select", {
+        let result = llkv_perf_monitor::measure!(
+            ["perf-mon"],
+            ctx,
+            "execute_prepared_select",
             self.execute_prepared_select(&prepared, ctx)
-        });
+        );
 
         result
     }
@@ -3072,22 +3080,28 @@ where
                     eprintln!("[executor] aggregate_rewrite: {:?}", aggregate_rewrite);
                 }
 
-                let (physical_plan, _t_physical) =
-                    llkv_perf_monitor::measure!(ctx, "create_physical_plan", {
+                let physical_plan = llkv_perf_monitor::measure!(
+                    ["perf-mon"],
+                    ctx,
+                    "create_physical_plan",
+                    {
                         self.create_physical_plan(
                             &prepared.logical_plan,
                             plan.having.as_ref(),
                             row_filter,
                         )
-                    });
+                    }
+                );
                 let physical_plan = physical_plan?;
 
                 let schema = physical_plan.schema();
 
-                let (mut base_iter, _t_exec_plan) =
-                    llkv_perf_monitor::measure!(ctx, "execute_physical_plan", {
-                        self.execute_physical_plan_tree(physical_plan, subquery_results)
-                    });
+                let base_iter = llkv_perf_monitor::measure!(
+                    ["perf-mon"],
+                    ctx,
+                    "execute_physical_plan",
+                    self.execute_physical_plan_tree(physical_plan, subquery_results)
+                );
                 let mut base_iter = base_iter?;
 
                 if let Some(residual) = &residual_filter {
