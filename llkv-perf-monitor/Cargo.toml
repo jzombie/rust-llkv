@@ -13,11 +13,11 @@ default = []
 perf-mon = []
 
 [dependencies]
-tracing.workspace = true
 line-ending.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
+llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
 tempfile.workspace = true
 
 [lints]

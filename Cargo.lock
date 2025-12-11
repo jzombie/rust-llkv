@@ -1741,8 +1741,8 @@ version = "0.8.5-alpha"
 dependencies = [
  "indoc",
  "line-ending",
+ "llkv-test-utils",
  "tempfile",
- "tracing",
 ]
 
 [[package]]
