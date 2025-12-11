@@ -1,5 +1,3 @@
-// TODO: Replace `HashMap` with `FxHashMap` for better performance.
-use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -31,7 +29,7 @@ where
         having_expr: Option<ScalarExpr<String>>,
     ) -> ExecutorResult<SelectExecution<P>> {
         let mut plan_columns = Vec::new();
-        let mut name_to_index = FxHashMap::default();
+        let mut name_to_index = fx_hashmap_with_capacity(pre_agg_schema.fields().len());
         for (i, field) in pre_agg_schema.fields().iter().enumerate() {
             let fid = field
                 .metadata()
@@ -80,7 +78,7 @@ where
         let agg_offset = agg_schema.fields().len().saturating_sub(agg_count);
 
         if let Some(having_expr) = having_expr {
-            let mut name_to_index = FxHashMap::default();
+            let mut name_to_index = fx_hashmap_with_capacity(agg_schema.fields().len());
             for (i, field) in agg_schema.fields().iter().enumerate() {
                 name_to_index.insert(field.name().clone(), i);
             }
@@ -96,7 +94,7 @@ where
             agg_iter = Box::new(agg_iter.map(move |batch_res| {
                 let batch = batch_res?;
 
-                let mut field_arrays = FxHashMap::default();
+                let mut field_arrays = fx_hashmap_with_capacity(batch.num_columns());
                 for (i, col) in batch.columns().iter().enumerate() {
                     field_arrays.insert((0, i as u32), col.clone());
                 }
@@ -124,14 +122,14 @@ where
         }
 
         let mut final_output_fields = Vec::new();
-        let mut col_mapping = FxHashMap::default();
+        let mut col_mapping = fx_hashmap_with_capacity(agg_schema.fields().len());
         for (i, _field) in agg_schema.fields().iter().enumerate() {
             col_mapping.insert((0, i as u32), i);
         }
 
         let mut resolved_final_exprs = Vec::new();
 
-        let mut name_to_index = FxHashMap::default();
+        let mut name_to_index = fx_hashmap_with_capacity(agg_schema.fields().len());
         for (i, field) in agg_schema.fields().iter().enumerate() {
             name_to_index.insert(field.name().clone(), i);
         }
@@ -154,7 +152,7 @@ where
             let batch = batch_res?;
             let mut columns = Vec::new();
 
-            let mut field_arrays = FxHashMap::default();
+            let mut field_arrays = fx_hashmap_with_capacity(batch.num_columns());
             for (i, col) in batch.columns().iter().enumerate() {
                 field_arrays.insert((0, i as u32), col.clone());
             }
@@ -248,6 +246,11 @@ use llkv_types::FieldId;
 use llkv_types::LogicalFieldId;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use simd_r_drive_entry_handle::EntryHandle;
+
+#[inline]
+fn fx_hashmap_with_capacity<K, V>(capacity: usize) -> FxHashMap<K, V> {
+    FxHashMap::with_capacity_and_hasher(capacity, Default::default())
+}
 
 use crate::ExecutorResult;
 use crate::types::{ExecutorTable, ExecutorTableProvider};
@@ -1134,7 +1137,7 @@ where
 
     fn rewrite_expr_placeholders(
         expr: &Expr<'static, String>,
-        replacements: &HashMap<String, Literal>,
+        replacements: &FxHashMap<String, Literal>,
     ) -> Expr<'static, String> {
         match expr {
             Expr::And(l) => Expr::And(
@@ -1177,7 +1180,7 @@ where
 
     fn rewrite_scalar_expr_placeholders(
         expr: ScalarExpr<String>,
-        replacements: &HashMap<String, Literal>,
+        replacements: &FxHashMap<String, Literal>,
     ) -> ScalarExpr<String> {
         match expr {
             ScalarExpr::Column(name) => {
@@ -1235,7 +1238,7 @@ where
 
     fn rewrite_select_plan_placeholders(
         plan: &SelectPlan,
-        replacements: &HashMap<String, Literal>,
+        replacements: &FxHashMap<String, Literal>,
     ) -> SelectPlan {
         let mut new_plan = plan.clone();
 
@@ -1687,7 +1690,7 @@ where
         let mut exists_results = FxHashMap::default();
 
         for sub in subqueries {
-            let mut replacements = HashMap::new();
+            let mut replacements = FxHashMap::default();
             for corr in &sub.correlated_columns {
                 let col = batch.column_by_name(&corr.column).ok_or_else(|| {
                     Error::Internal(format!("Correlated column not found: {}", corr.column))
@@ -1893,7 +1896,7 @@ where
                         ))
                     })?;
 
-                let mut replacements = HashMap::new();
+                let mut replacements = FxHashMap::default();
                 for corr in &sub_def.correlated_columns {
                     let col = batch.column_by_name(&corr.column).ok_or_else(|| {
                         Error::Internal(format!("Correlated column not found: {}", corr.column))
@@ -4794,7 +4797,7 @@ where
                             let field = current_schema.field(*idx);
 
                             let name = alias.clone().unwrap_or_else(|| field.name().clone());
-                            let mut metadata = HashMap::new();
+                            let mut metadata = FxHashMap::default();
                             metadata.insert(
                                 "field_id".to_string(),
                                 logical_field_id.field_id().to_string(),
@@ -4813,7 +4816,7 @@ where
                             name_to_index.insert(name.to_ascii_lowercase(), i);
 
                             ArrowField::new(name, field.data_type().clone(), field.is_nullable())
-                                .with_metadata(metadata)
+                                .with_metadata(metadata.into_iter().collect())
                         }
                         llkv_plan::logical_planner::ResolvedProjection::Computed {
                             alias,
@@ -4827,7 +4830,7 @@ where
                                 infer_type(&remapped, &current_schema, &col_mapping)
                                     .unwrap_or(arrow::datatypes::DataType::Int64);
 
-                            let mut metadata = HashMap::new();
+                            let mut metadata = FxHashMap::default();
                             metadata.insert("field_id".to_string(), dummy_fid.to_string());
 
                             plan_columns.push(PlanColumn {
@@ -4842,7 +4845,8 @@ where
                             });
                             name_to_index.insert(name.to_ascii_lowercase(), i);
 
-                            ArrowField::new(name, inferred_type, true).with_metadata(metadata)
+                            ArrowField::new(name, inferred_type, true)
+                                .with_metadata(metadata.into_iter().collect())
                         }
                     })
                     .collect();
@@ -4870,11 +4874,12 @@ where
                         )?;
                         let dt = infer_type(&resolved, &current_schema, &simple_mapping)
                             .unwrap_or(arrow::datatypes::DataType::Int64);
-                        pre_agg_schema_fields.push(
-                            ArrowField::new(format!("_agg_arg_{}", i), dt, true).with_metadata(
-                                HashMap::from([("field_id".to_string(), format!("{}", 10000 + i))]),
-                            ),
-                        );
+                        pre_agg_schema_fields.push({
+                            let mut metadata = FxHashMap::default();
+                            metadata.insert("field_id".to_string(), format!("{}", 10000 + i));
+                            ArrowField::new(format!("_agg_arg_{}", i), dt, true)
+                                .with_metadata(metadata.into_iter().collect())
+                        });
                     }
 
                     let mut group_key_batch_indices = Vec::new();
