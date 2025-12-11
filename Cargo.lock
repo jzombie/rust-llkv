@@ -1943,6 +1943,7 @@ dependencies = [
 name = "llkv-threading"
 version = "0.8.5-alpha"
 dependencies = [
+ "llkv-test-utils",
  "rayon",
  "tracing",
 ]
