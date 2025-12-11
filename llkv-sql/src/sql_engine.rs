@@ -11720,6 +11720,7 @@ fn flatten_table_with_joins(
                 join_metadata.push(llkv_plan::JoinMetadata {
                     left_table_index,
                     join_type: llkv_plan::JoinPlan::Inner,
+                    strategy: None,
                     on_condition: None,
                 });
                 join_filters.push(None);
@@ -11731,6 +11732,7 @@ fn flatten_table_with_joins(
                 join_metadata.push(llkv_plan::JoinMetadata {
                     left_table_index,
                     join_type: llkv_plan::JoinPlan::Inner,
+                    strategy: None,
                     on_condition: None,
                 });
             }
@@ -11741,6 +11743,7 @@ fn flatten_table_with_joins(
                 join_metadata.push(llkv_plan::JoinMetadata {
                     left_table_index,
                     join_type: llkv_plan::JoinPlan::Left,
+                    strategy: None,
                     on_condition: None,
                 });
             }
@@ -11750,6 +11753,7 @@ fn flatten_table_with_joins(
                 join_metadata.push(llkv_plan::JoinMetadata {
                     left_table_index,
                     join_type: llkv_plan::JoinPlan::Left,
+                    strategy: None,
                     on_condition: None,
                 });
                 join_filters.push(None);

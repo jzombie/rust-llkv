@@ -102,4 +102,50 @@ Implementation order to avoid rework
 - Table resolver logic should be centralized
 - `expr_to_scalar_expr` should probably be moved to llkv-expr
 - `field_id` hardcodings when they should use constant defined in `llkv-column-map`
-  
+
+### Join Optimization TODOs
+
+- **Stats**: Add column stats to storage/catalog (row count, NDV, null frac, maybe compact histograms). Expose a provider API to fetch them in bulk. Use a compact format so lookups stay cheap and stats can be fetched per-table in one call.
+- **Logical planner (llkv-plan)**: Use stats to pick join order and set `JoinStrategy` (hash/merge/nested-loop, build side) on each join. Fall back to heuristics when stats are missing. Keep the algorithm hint attached to `JoinMetadata.strategy` so downstream layers stay decoupled.
+- **Physical planner (llkv-executor)**: Implement multi-table physical planning and consume `JoinStrategy` to pick operators and build/probe roles; default to existing hash join when hints are absent. Reuse the single-table scan builder; route single-table plans through the same multi-table path to avoid duplication. Use early projection/filter pushdown and batch-sized, parallel-friendly join operators.
+
+### Implementation Plan (detailed)
+
+1) **Stats plumbing**
+   - Define a compact `ColumnStats` struct (row_count, null_fraction, ndv, optional histogram sketches) in storage/catalog.
+   - Persist stats per `(table_id, column_id)`; add IO path and cache invalidation on updates.
+   - Add provider methods: `batch_column_stats(table_name, &[col_ids]) -> Vec<ColumnStats>` and a bulk per-table call to minimize round-trips.
+
+2) **Logical planner (llkv-plan)**
+   - Fetch column stats for all join keys upfront (bulk call).
+   - Implement join order selection:
+     - For small N: DP over left-deep trees using cost = estimated rows (row_count * selectivity from stats, ndv-driven join selectivity).
+     - For larger N: greedy based on row_count/selectivity, honoring join graph connectivity.
+   - Set `JoinMetadata.strategy` for each join:
+     - `Hash` for equality when build side is smaller (use row_count/selectivity).
+     - `Merge` when both sides already ordered or small NDV range.
+     - `NestedLoop` for tiny probes or non-equality leftovers.
+     - `build_left` boolean set to smaller side.
+   - Keep fallback heuristics when stats are missing.
+
+3) **Physical planner (llkv-executor)**
+   - Implement `create_multi_table_plan`:
+     - Build scans via the existing single-table scan helper (refactor out of `create_single_table_plan`).
+     - Apply per-table filters/projections pushdown.
+     - Stitch a left-deep tree using join metadata and `JoinStrategy` hints; choose operator (hash/merge/nested-loop) and build/probe sides accordingly; default to hash when hints absent.
+     - Route `create_single_table_plan` through the multi-table path for code reuse.
+   - Ensure join operators honor batch sizing and parallelism knobs already in `JoinOptions`.
+
+4) **Executor consumption**
+   - Extend `HashJoinExec` (and future merge/nested operators) to accept `JoinStrategy` / build-side hints.
+   - Preserve streaming interfaces; avoid materializing both sides where possible.
+
+5) **Testing / validation**
+   - Add planner unit tests covering strategy selection with/without stats.
+   - Add integration tests for multi-table physical planning (reusing existing runtime tests).
+   - Benchmark join suite to validate perf; add a regression benchmark if needed.
+
+Notes:
+- Keep `JoinMetadata.strategy` the single carrier of planner intent.
+- Avoid shortcuts: no in-memory-only stats; persist and fetch via catalog/provider.
+- Prefer bulk stat fetch to reduce IO in the planner hot path.

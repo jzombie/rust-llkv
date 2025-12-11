@@ -784,11 +784,31 @@ pub struct JoinMetadata {
     pub left_table_index: usize,
     /// Type of join (INNER, LEFT, RIGHT, etc.).
     pub join_type: JoinPlan,
+    // TODO: Rename to `strategy_hint` or similar?
+    /// Optional planner hint for physical join algorithm/build-side.
+    pub strategy: Option<JoinStrategy>,
     /// Optional ON condition filter expression. Translators also thread this
     /// predicate through [`SelectPlan::filter`] so the optimizer can merge it
     /// with other WHERE clauses, but keeping it here enables join-specific
     /// rewrites (e.g., push-down or hash join pruning).
     pub on_condition: Option<llkv_expr::expr::Expr<'static, String>>,
+}
+
+/// Suggested physical join strategy emitted by the logical planner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinStrategy {
+    /// Algorithm hint (e.g., Hash, Merge, NestedLoop).
+    pub algorithm: JoinAlgorithm,
+    /// Side to build for hash/nested-loop joins.
+    pub build_left: bool,
+}
+
+/// Supported physical join algorithms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinAlgorithm {
+    Hash,
+    Merge,
+    NestedLoop,
 }
 
 /// Logical query plan for SELECT operations.

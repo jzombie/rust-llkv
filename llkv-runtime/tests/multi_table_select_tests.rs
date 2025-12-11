@@ -92,6 +92,7 @@ fn executes_inner_join_two_tables() {
     select_plan.joins.push(JoinMetadata {
         left_table_index: 0,
         join_type: JoinPlan::Inner,
+        strategy: None,
         on_condition: Some(Expr::Compare {
             left: ScalarExpr::column("users.id".to_string()),
             op: CompareOp::Eq,

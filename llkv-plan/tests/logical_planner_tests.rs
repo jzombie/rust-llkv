@@ -345,6 +345,7 @@ fn logical_planner_resolves_multi_table_plan() {
     select_plan.joins.push(JoinMetadata {
         left_table_index: 0,
         join_type: JoinPlan::Inner,
+        strategy: None,
         on_condition: Some(Expr::Compare {
             left: ScalarExpr::Column("a.id".to_string()),
             op: CompareOp::Eq,
@@ -561,6 +562,7 @@ fn multi_table_resolution_assigns_columns_to_tables() {
     let joins = vec![JoinMetadata {
         left_table_index: 0,
         join_type: JoinPlan::Inner,
+        strategy: None,
         on_condition: Some(Expr::Compare {
             left: ScalarExpr::column("c.id".to_string()),
             op: CompareOp::Eq,
