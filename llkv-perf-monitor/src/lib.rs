@@ -74,7 +74,6 @@ impl ReportNode {
 impl PerfContext {
     /// Construct a disabled context that ignores all recordings.
     pub fn disabled() -> Self {
-        println!("PerfContext::disabled called");
         Self { inner: None }
     }
 
