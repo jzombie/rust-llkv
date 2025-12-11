@@ -2792,8 +2792,13 @@ mod tests {
         });
 
         let empty: [Projection; 0] = [];
-        let result = table.scan_stream(&empty, &filter, ScanStreamOptions::default(), |_batch| {});
-        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
+        let mut row_count = 0;
+        let result = table.scan_stream(&empty, &filter, ScanStreamOptions::default(), |batch| {
+            assert_eq!(batch.num_columns(), 0);
+            row_count += batch.num_rows();
+        });
+        assert!(result.is_ok());
+        assert_eq!(row_count, 2);
 
         // Duplicate projections are allowed: the same column will be
         // gathered once and duplicated in the output in the requested
