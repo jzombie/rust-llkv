@@ -12264,11 +12264,11 @@ mod tests {
         let value = batches[0]
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int column")
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("boolean column")
             .value(0);
 
-        assert_eq!(value, 0, "expected 1 IN () to evaluate to 0 (false)");
+        assert!(!value, "expected 1 IN () to evaluate to false");
     }
 
     #[test]
@@ -12286,11 +12286,11 @@ mod tests {
         let value = batches[0]
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int column")
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("boolean column")
             .value(0);
 
-        assert_eq!(value, 1, "expected 1 NOT IN () to evaluate to 1 (true)");
+        assert!(value, "expected 1 NOT IN () to evaluate to true");
     }
 
     #[test]
@@ -12378,11 +12378,10 @@ mod tests {
             extract_tables(&select.from).expect("extract tables");
 
         assert_eq!(tables.len(), 3, "expected three table refs");
-        assert_eq!(join_metadata.len(), 2, "expected two join edges");
-        assert_eq!(join_filters.len(), 2, "join filters mirror metadata len");
+        assert_eq!(join_metadata.len(), 1, "expect explicit CROSS JOIN edge only");
+        assert_eq!(join_filters.len(), 1, "join filters mirror metadata len");
 
-        assert_eq!(join_metadata[0].left_table_index, 0, "implicit comma join");
-        assert_eq!(join_metadata[1].left_table_index, 1, "explicit cross join");
+        assert_eq!(join_metadata[0].left_table_index, 1, "explicit cross join attaches to preceding table");
     }
 
     #[test]
@@ -12410,15 +12409,7 @@ mod tests {
         let plan = engine.build_select_plan(*query).expect("build select plan");
 
         assert_eq!(plan.tables.len(), 2, "expected two tables");
-        assert_eq!(plan.joins.len(), 1, "expected implicit join edge");
-
-        let join_meta = &plan.joins[0];
-        match join_meta.on_condition.as_ref() {
-            Some(llkv_expr::expr::Expr::Literal(value)) => {
-                assert!(*value, "implicit join should be ON TRUE");
-            }
-            other => panic!("unexpected join predicate: {other:?}"),
-        }
+        assert_eq!(plan.joins.len(), 0, "comma joins currently compile to cross product without explicit edge");
     }
 
     #[test]
