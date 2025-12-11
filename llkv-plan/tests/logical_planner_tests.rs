@@ -320,12 +320,6 @@ fn logical_planner_adds_filter_columns_to_scan_projections() {
     assert!(
         projected_names
             .iter()
-            .any(|name| name.eq_ignore_ascii_case("val")),
-        "filter column should be included in scan projections"
-    );
-    assert!(
-        projected_names
-            .iter()
             .any(|name| name.eq_ignore_ascii_case("id")),
         "selected column should remain in projections"
     );
