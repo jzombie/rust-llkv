@@ -18,4 +18,4 @@ pub use ids::{
 };
 pub use interval::IntervalValue;
 pub use literal::{FromLiteral, Literal, LiteralCastError, LiteralExt};
-pub use query_context::{QueryContext, begin_query};
+pub use query_context::{QueryContext, QueryContextHandle};
