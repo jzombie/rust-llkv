@@ -334,8 +334,10 @@ pub enum TriggerTimingMeta {
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub enum TriggerEventMeta {
     Insert,
-    // TODO: Remove _columns?  It's not used?
-    Update { _columns: Vec<String> },
+    #[allow(unused)]
+    Update {
+        columns: Vec<String>,
+    },
     Delete,
 }
 
