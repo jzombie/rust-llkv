@@ -107,15 +107,16 @@ fn normalize_asm(src: &str) -> String {
 }
 
 fn write_manifest(manifest: &Path, perf_path: &Path, enable_perf: bool) {
+    let escaped_path = toml_escape_path(perf_path);
     let dep = if enable_perf {
         format!(
             "llkv-perf-monitor = {{ path = \"{}\", features = [\"perf-mon\"] }}",
-            perf_path.display()
+            escaped_path
         )
     } else {
         format!(
             "llkv-perf-monitor = {{ path = \"{}\" }}",
-            perf_path.display()
+            escaped_path
         )
     };
 
@@ -140,6 +141,15 @@ fn write_manifest(manifest: &Path, perf_path: &Path, enable_perf: bool) {
         ),
     )
     .expect("write Cargo.toml");
+}
+
+fn toml_escape_path(perf_path: &Path) -> String {
+    perf_path
+        .to_str()
+        .expect("perf monitor path should be valid UTF-8")
+        .chars()
+        .flat_map(|c| c.escape_default())
+        .collect()
 }
 
 fn write_bins(src_bin: &Path, enable_perf: bool) {
