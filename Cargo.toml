@@ -101,6 +101,8 @@ walkdir = "2.5"
 print_stderr = "deny"
 print_stdout = "deny"
 disallowed_methods = "deny"
+# TODO: Enable: Enable clippy::clone_on_ref_ptr as deny so that arc.clone() (or rc.clone()) is rejected and we are forced to write Arc::clone(&arc) / Rc::clone(&rc) instead.
+# clone_on_ref_ptr = "deny"
 
 [workspace.metadata.clippy]
 disallowed-methods = ["std::boxed::Box::leak"]
