@@ -254,13 +254,13 @@ impl AsRef<PerfContext> for PerfContext {
 
 /// Measure the provided expression and record the duration into the supplied [`PerfContext`].
 ///
-/// Optional feature list: `measure!( ["perf-mon"], ctx, label, { body })`. When the list is empty
+/// Optional feature list: `maybe_record!( ["perf-mon"], ctx, label, { body })`. When the list is empty
 /// (default overload), measurement is enabled. When non-empty, measurement is enabled if **any**
 /// listed feature is active. This helper returns only the expression result; use
-/// `measure_with_duration!` when the caller also needs the elapsed time. When measurement is not
+/// `measure_and_maybe_record!` when the caller also needs the elapsed time. When measurement is not
 /// enabled, this macro executes the body without timing overhead.
 #[macro_export]
-macro_rules! measure {
+macro_rules! maybe_record {
     ([$($feat:literal),* $(,)?], $ctx:expr, $label:expr, $body:expr) => {{
         let __ctx_ref: &llkv_perf_monitor::PerfContext =
             ::core::convert::AsRef::<llkv_perf_monitor::PerfContext>::as_ref(&$ctx);
@@ -295,18 +295,18 @@ macro_rules! measure {
         }
     }};
     ($ctx:expr, $label:expr, $body:expr) => {{
-        $crate::measure!([], $ctx, $label, { $body })
+        $crate::maybe_record!([], $ctx, $label, { $body })
     }};
 }
 /// Measure the provided expression, record the duration into the supplied [`PerfContext`], and
 /// return both the expression result and the elapsed time.
 ///
-/// Optional feature list behaves like `measure!`: empty enables recording; non-empty records when
+/// Optional feature list behaves like `maybe_record!`: empty enables recording; non-empty records when
 /// at least one listed feature is active. Timing always runs; recording to the [`PerfContext`] is
 /// controlled by the feature list. When no listed features are active, the duration is still
 /// returned but no measurement is recorded.
 #[macro_export]
-macro_rules! measure_with_duration {
+macro_rules! measure_and_maybe_record {
     ([$($feat:literal),* $(,)?], $ctx:expr, $label:expr, $body:expr) => {{
         let __ctx_ref: &llkv_perf_monitor::PerfContext =
             ::core::convert::AsRef::<llkv_perf_monitor::PerfContext>::as_ref(&$ctx);
@@ -326,7 +326,7 @@ macro_rules! measure_with_duration {
             __enabled
         };
         // Always time; record is gated by feature list
-        // This defers from measure! which skips timing when disabled
+        // This defers from maybe_record! which skips timing when disabled
         let __perf_start = std::time::Instant::now();
         let __perf_result = { $body };
         let __perf_duration = __perf_start.elapsed();
@@ -340,7 +340,7 @@ macro_rules! measure_with_duration {
         (__perf_result, __perf_duration)
     }};
     ($ctx:expr, $label:expr, $body:expr) => {{
-        $crate::measure_with_duration!([], $ctx, $label, { $body })
+        $crate::measure_and_maybe_record!([], $ctx, $label, { $body })
     }};
 }
 

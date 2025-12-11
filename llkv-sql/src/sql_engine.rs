@@ -1110,14 +1110,14 @@ impl SqlEngine {
     ) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
-        let processed_sql = llkv_perf_monitor::measure!(
+        let processed_sql = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "preprocess",
             Self::preprocess_sql_input(sql)
         );
 
-        let statements = llkv_perf_monitor::measure!(["perf-mon"], ctx, "parse", {
+        let statements = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "parse", {
             let dialect = GenericDialect {};
             match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
                 Ok(stmts) => stmts,
@@ -1163,7 +1163,7 @@ impl SqlEngine {
                 _ => {
                     // Flush before any non-INSERT
                     let mut flushed = self.flush_buffer_results()?;
-                    let current = llkv_perf_monitor::measure!(
+                    let current = llkv_perf_monitor::maybe_record!(
                         ["perf-mon"],
                         ctx,
                         "execute_statement",
@@ -5168,14 +5168,14 @@ impl SqlEngine {
             return Ok(result);
         }
 
-        let select_plan = llkv_perf_monitor::measure!(
+        let select_plan = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "build_select_plan",
             self.build_select_plan(query)?
         );
 
-        let res = llkv_perf_monitor::measure!(
+        let res = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "execute_plan_statement",

@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use llkv_perf_monitor::{measure_with_duration, PerfContext};
+use llkv_perf_monitor::{measure_and_maybe_record, PerfContext};
 
 #[test]
 fn returns_duration_even_when_perf_feature_disabled() {
     let ctx = PerfContext::disabled();
 
-    let (result, elapsed) = measure_with_duration!(
+    let (result, elapsed) = measure_and_maybe_record!(
         [],
         ctx,
         "sleep",
@@ -25,7 +25,7 @@ fn returns_duration_even_when_perf_feature_disabled() {
 fn returns_duration_when_feature_list_not_matched() {
     let ctx = PerfContext::disabled();
 
-    let (result, elapsed) = measure_with_duration!(
+    let (result, elapsed) = measure_and_maybe_record!(
         ["never-on"],
         ctx,
         "sleep",

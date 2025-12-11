@@ -132,22 +132,22 @@ fn write_bins(src_bin: &Path, enable_perf: bool) {
     let with_body = if enable_perf {
         indoc!(
             r#"
-            use llkv_perf_monitor::{measure, PerfContext};
+            use llkv_perf_monitor::{maybe_record, PerfContext};
 
             fn main() {
                 let ctx = PerfContext::new("root");
-                measure!(["perf-mon"], ctx, "hello", { println!("hello world"); });
+                maybe_record!(["perf-mon"], ctx, "hello", { println!("hello world"); });
             }
             "#
         )
     } else {
         indoc!(
             r#"
-            use llkv_perf_monitor::{measure, PerfContext};
+            use llkv_perf_monitor::{maybe_record, PerfContext};
 
             fn main() {
                 let ctx = PerfContext::default();
-                measure!(["perf-mon"], ctx, "hello", { println!("hello world"); });
+                maybe_record!(["perf-mon"], ctx, "hello", { println!("hello world"); });
             }
             "#
         )

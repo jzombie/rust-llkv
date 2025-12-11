@@ -259,7 +259,7 @@ where
         let table_id = table.table_id();
         let schema = table.schema();
 
-        let requested_projections = llkv_perf_monitor::measure!(
+        let requested_projections = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "projections",
@@ -323,7 +323,7 @@ where
             scan_projections: order_scan_projections,
             extra_columns: order_extra_columns,
             resolved_order_by,
-        } = llkv_perf_monitor::measure!(
+        } = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "order_by",
@@ -340,7 +340,7 @@ where
             }
         }
 
-        let aggregate_rewrite = llkv_perf_monitor::measure!(
+        let aggregate_rewrite = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "aggregate_rewrite",
@@ -387,7 +387,7 @@ where
             }
         }
 
-        let (scan_schema, final_schema) = llkv_perf_monitor::measure!(
+        let (scan_schema, final_schema) = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "schema",
@@ -398,7 +398,7 @@ where
             }
         );
 
-        let filter = llkv_perf_monitor::measure!(
+        let filter = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "filter",
@@ -495,7 +495,7 @@ where
         // Reorder tables using greedy algorithm to avoid cross joins
         // Only reorder if there are no explicit joins, as explicit joins enforce a specific order
         // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
-        let table_pairs = llkv_perf_monitor::measure!(
+        let table_pairs = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             query_ctx,
             "reorder_tables",
@@ -544,7 +544,7 @@ where
             });
         }
 
-        let (resolved_columns, unresolved_required) = llkv_perf_monitor::measure!(
+        let (resolved_columns, unresolved_required) = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             query_ctx,
             "resolve_required_columns",
@@ -556,7 +556,7 @@ where
             infos: &infos,
         };
 
-        let filter = llkv_perf_monitor::measure!(
+        let filter = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             query_ctx,
             "resolve_filter",
@@ -573,7 +573,7 @@ where
             None => None,
         };
 
-        let projections = llkv_perf_monitor::measure!(
+        let projections = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             query_ctx,
             "resolve_projections",

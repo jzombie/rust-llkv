@@ -403,7 +403,7 @@ impl AsyncDB for EngineHarness {
         let slow_threshold = slow_threshold();
 
         let exec_ctx = perf_ctx.clone_context();
-        let (results, exec_duration) = llkv_perf_monitor::measure_with_duration!(
+        let (results, exec_duration) = llkv_perf_monitor::measure_and_maybe_record!(
             ["perf-mon"],
             exec_ctx,
             "execute",
@@ -432,7 +432,7 @@ impl AsyncDB for EngineHarness {
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
                         let collect_ctx = perf_ctx.clone_context();
-                        let (batches, collect_duration) = llkv_perf_monitor::measure_with_duration!(
+                        let (batches, collect_duration) = llkv_perf_monitor::measure_and_maybe_record!(
                             ["perf-mon"],
                             collect_ctx,
                             "collect",

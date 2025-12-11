@@ -242,7 +242,7 @@ where
         _context: Option<&str>,
         ctx: &QueryContext,
     ) -> Result<PreparedSelectPlan<P>> {
-        llkv_perf_monitor::measure!(
+        llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "simplify",
@@ -259,7 +259,7 @@ where
             }
         );
 
-        let res = llkv_perf_monitor::measure!(
+        let res = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "subqueries",
@@ -292,7 +292,7 @@ where
             force_manual_projection,
             plan_for_scan,
             has_aggregates,
-        ) = llkv_perf_monitor::measure!(
+        ) = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "analysis",
@@ -372,7 +372,7 @@ where
             }
         );
 
-        let res = llkv_perf_monitor::measure!(
+        let res = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "logical_plan",
@@ -380,7 +380,7 @@ where
         );
         let mut logical_plan = res?;
 
-        llkv_perf_monitor::measure!(
+        llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "inference",
@@ -418,7 +418,7 @@ where
             }
         );
 
-        let res = llkv_perf_monitor::measure!(
+        let res = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "rewrite",

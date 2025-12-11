@@ -2301,7 +2301,7 @@ where
         row_filter: Option<Arc<dyn RowIdFilter<P>>>,
         ctx: &QueryContext,
     ) -> ExecutorResult<SelectExecution<P>> {
-        let prepared = llkv_perf_monitor::measure!(
+        let prepared = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "prepare_select",
@@ -2312,7 +2312,7 @@ where
             }
         );
 
-        let result = llkv_perf_monitor::measure!(
+        let result = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "execute_prepared_select",
@@ -3080,7 +3080,7 @@ where
                     eprintln!("[executor] aggregate_rewrite: {:?}", aggregate_rewrite);
                 }
 
-                let physical_plan = llkv_perf_monitor::measure!(
+                let physical_plan = llkv_perf_monitor::maybe_record!(
                     ["perf-mon"],
                     ctx,
                     "create_physical_plan",
@@ -3096,7 +3096,7 @@ where
 
                 let schema = physical_plan.schema();
 
-                let base_iter = llkv_perf_monitor::measure!(
+                let base_iter = llkv_perf_monitor::maybe_record!(
                     ["perf-mon"],
                     ctx,
                     "execute_physical_plan",
