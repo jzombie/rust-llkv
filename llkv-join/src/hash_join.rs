@@ -944,14 +944,15 @@ impl HashJoinStream {
         let probe_converter =
             RowConverter::new(probe_fields).map_err(|e| Error::Internal(e.to_string()))?;
 
-        if left_indices.is_empty() {
-            tracing::warn!(
-                "HashJoinStream::try_new: WARNING: Cross Join detected (no join keys). Right batch rows: {}",
-                right_batch.num_rows()
-            );
-        } else {
-            // tracing::trace!("HashJoinStream::try_new: Inner/Left Join. Keys: {}, Right rows: {}", left_indices.len(), right_batch.num_rows());
-        }
+        // TODO: Improve cross-join warning without log spamming (especially in GitHub Actions)
+        // if left_indices.is_empty() {
+        //     tracing::warn!(
+        //         "HashJoinStream::try_new: WARNING: Cross Join detected (no join keys). Right batch rows: {}",
+        //         right_batch.num_rows()
+        //     );
+        // } else {
+        //     // tracing::trace!("HashJoinStream::try_new: Inner/Left Join. Keys: {}, Right rows: {}", left_indices.len(), right_batch.num_rows());
+        // }
 
         Ok(Self {
             schema,
