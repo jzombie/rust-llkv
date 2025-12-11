@@ -6,9 +6,11 @@
 //! composite keys, avoiding per-row allocations and scalar value wrapping.
 
 use crate::{JoinIndexBatch, JoinKey, JoinOptions, JoinRowRef, JoinSide, JoinType};
-use arrow::array::{Array, RecordBatch};
-use arrow::datatypes::Schema;
-use arrow::row::{RowConverter, SortField};
+use arrow::array::{Array, PrimitiveArray, RecordBatch};
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Int32Type, Int64Type, Schema, UInt32Type, UInt64Type,
+};
+use arrow::row::{RowConverter, Rows, SortField};
 use llkv_column_map::store::Projection;
 use llkv_expr::{Expr, Filter, Operator};
 use llkv_result::{Error, Result as LlkvResult};
@@ -16,18 +18,34 @@ use llkv_storage::pager::Pager;
 use llkv_table::schema_ext::CachedSchema;
 use llkv_table::table::{RowIdFilter, ScanProjection, ScanStreamOptions, Table};
 use llkv_table::types::FieldId;
+use rayon::prelude::*;
 use llkv_types::LogicalFieldId;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use simd_r_drive_entry_handle::EntryHandle;
 use std::ops::Bound;
 use std::sync::Arc;
+use std::hash::{Hash, Hasher};
 
 /// A reference to a row in a batch: (batch_index, row_index).
 type RowRef = (usize, usize);
 
-/// Hash table mapping raw row bytes to lists of matching rows.
-/// Using `Vec<u8>` as key is efficient enough with `RowConverter`.
-type HashTable = FxHashMap<Vec<u8>, Vec<RowRef>>;
+/// Hash table keyed by hashed row bytes to lists of matching rows.
+/// Row buffers stay shared to avoid cloning the underlying bytes.
+type HashTable = FxHashMap<u64, Vec<RowRef>>;
+
+/// Key wrapper that encodes NULLs without materializing byte buffers.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ScalarKey<T: Copy + Eq + std::hash::Hash> {
+    Null,
+    Value(T),
+}
+
+#[inline]
+fn hash_row(bytes: &[u8]) -> u64 {
+    let mut hasher = FxHasher::default();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Execute a hash join but emit row-id pairs for zero-copy late materialization.
 pub fn hash_join_rowid_stream<P, F>(
@@ -77,11 +95,67 @@ where
     let left_schema = left.schema()?;
     let right_schema = right.schema()?;
 
+    // Fast path for single-key primitive joins to avoid per-row byte clones.
+    if keys.len() == 1 {
+        let left_dtype = key_datatype(&left_schema, keys[0].left_field)?;
+        let right_dtype = key_datatype(&right_schema, keys[0].right_field)?;
+
+        if left_dtype == right_dtype {
+            match left_dtype {
+                DataType::Int32 => {
+                    return hash_join_rowid_single_key::<Int32Type, _, _>(
+                        left,
+                        right,
+                        keys,
+                        options,
+                        left_filter,
+                        right_filter,
+                        on_batch,
+                    );
+                }
+                DataType::Int64 => {
+                    return hash_join_rowid_single_key::<Int64Type, _, _>(
+                        left,
+                        right,
+                        keys,
+                        options,
+                        left_filter,
+                        right_filter,
+                        on_batch,
+                    );
+                }
+                DataType::UInt32 => {
+                    return hash_join_rowid_single_key::<UInt32Type, _, _>(
+                        left,
+                        right,
+                        keys,
+                        options,
+                        left_filter,
+                        right_filter,
+                        on_batch,
+                    );
+                }
+                DataType::UInt64 => {
+                    return hash_join_rowid_single_key::<UInt64Type, _, _>(
+                        left,
+                        right,
+                        keys,
+                        options,
+                        left_filter,
+                        right_filter,
+                        on_batch,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     let left_projections = build_user_projections(left, &left_schema)?;
     let right_projections = build_user_projections(right, &right_schema)?;
 
     // 1. Build Phase (Right Side)
-    let (hash_table, build_batches, _converter) = build_hash_table(
+    let (hash_table, build_batches, build_rows) = build_hash_table(
         right,
         &right_projections,
         keys,
@@ -141,68 +215,288 @@ where
                 Err(e) => panic!("Failed to convert probe rows: {}", e),
             };
 
-            // Iterate and lookup
-            for (row_idx, row_bytes) in probe_rows.iter().enumerate() {
-                let matches = hash_table.get(row_bytes.as_ref());
+            // Iterate and lookup in parallel chunks to reduce contention and keep order.
+            let total_rows = probe_rows.num_rows();
+            let chunk_size = batch_size;
+            let chunk_count = (total_rows + chunk_size - 1) / chunk_size;
 
-                match options.join_type {
-                    JoinType::Inner => {
-                        if let Some(build_rows) = matches {
-                            for &(build_batch_idx, build_row_idx) in build_rows {
-                                left_rows.push(row_idx);
-                                right_rows.push(Some(JoinRowRef {
-                                    batch: build_batch_idx,
-                                    row: build_row_idx,
-                                }));
-                                if left_rows.len() >= batch_size {
-                                    flush(&mut left_rows, &mut right_rows, true);
+            #[derive(Default)]
+            struct ChunkBuffers {
+                left_rows: Vec<usize>,
+                right_rows: Vec<Option<JoinRowRef>>,
+            }
+
+            let mut chunk_buffers: Vec<ChunkBuffers> =
+                (0..chunk_count).map(|_| ChunkBuffers::default()).collect();
+
+            chunk_buffers
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(chunk_idx, buffers)| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(total_rows);
+
+                    for row_idx in start..end {
+                        let has_nulls = keys
+                            .iter()
+                            .zip(&probe_columns)
+                            .any(|(k, col)| !k.null_equals_null && col.is_null(row_idx));
+
+                        if has_nulls {
+                            if matches!(options.join_type, JoinType::Left) {
+                                buffers.left_rows.push(row_idx);
+                                buffers.right_rows.push(None);
+                            }
+                            continue;
+                        }
+
+                        let row = probe_rows.row(row_idx);
+                        let key_hash = hash_row(row.data());
+                        let matches = hash_table.get(&key_hash);
+
+                        match options.join_type {
+                            JoinType::Inner | JoinType::Left => {
+                                let mut matched = false;
+                                if let Some(build_refs) = matches {
+                                    for &(build_batch_idx, build_row_idx) in build_refs {
+                                        let build_row = build_rows[build_batch_idx].row(build_row_idx);
+                                        if row == build_row {
+                                            buffers.left_rows.push(row_idx);
+                                            buffers.right_rows.push(Some(JoinRowRef {
+                                                batch: build_batch_idx,
+                                                row: build_row_idx,
+                                            }));
+                                            matched = true;
+                                        }
+                                    }
+                                }
+
+                                if options.join_type == JoinType::Left && !matched {
+                                    buffers.left_rows.push(row_idx);
+                                    buffers.right_rows.push(None);
                                 }
                             }
-                        }
-                    }
-                    JoinType::Left => {
-                        if let Some(build_rows) = matches {
-                            for &(build_batch_idx, build_row_idx) in build_rows {
-                                left_rows.push(row_idx);
-                                right_rows.push(Some(JoinRowRef {
-                                    batch: build_batch_idx,
-                                    row: build_row_idx,
-                                }));
-                                if left_rows.len() >= batch_size {
-                                    flush(&mut left_rows, &mut right_rows, true);
+                            JoinType::Semi => {
+                                if let Some(build_refs) = matches {
+                                    if build_refs.iter().any(|&(b_idx, r_idx)| {
+                                        probe_rows.row(row_idx) == build_rows[b_idx].row(r_idx)
+                                    }) {
+                                        buffers.left_rows.push(row_idx);
+                                        buffers.right_rows.push(None);
+                                    }
                                 }
                             }
-                        } else {
-                            left_rows.push(row_idx);
-                            right_rows.push(None);
-                            if left_rows.len() >= batch_size {
-                                flush(&mut left_rows, &mut right_rows, true);
+                            JoinType::Anti => {
+                                let matched = matches
+                                    .map(|build_refs| {
+                                        build_refs.iter().any(|&(b_idx, r_idx)| {
+                                            probe_rows.row(row_idx) == build_rows[b_idx].row(r_idx)
+                                        })
+                                    })
+                                    .unwrap_or(false);
+
+                                if !matched {
+                                    buffers.left_rows.push(row_idx);
+                                    buffers.right_rows.push(None);
+                                }
                             }
+                            _ => panic!("Unsupported join type"),
                         }
                     }
-                    JoinType::Semi => {
-                        if matches.map(|m| !m.is_empty()).unwrap_or(false) {
-                            left_rows.push(row_idx);
-                            right_rows.push(None);
-                            if left_rows.len() >= batch_size {
-                                flush(&mut left_rows, &mut right_rows, true);
-                            }
-                        }
+                });
+
+            for chunk in chunk_buffers {
+                for (l, r) in chunk.left_rows.into_iter().zip(chunk.right_rows.into_iter()) {
+                    left_rows.push(l);
+                    right_rows.push(r);
+                    if left_rows.len() >= batch_size {
+                        flush(&mut left_rows, &mut right_rows, true);
                     }
-                    JoinType::Anti => {
-                        if matches.is_none() || matches.unwrap().is_empty() {
-                            left_rows.push(row_idx);
-                            right_rows.push(None);
-                            if left_rows.len() >= batch_size {
-                                flush(&mut left_rows, &mut right_rows, true);
-                            }
-                        }
-                    }
-                    _ => panic!("Unsupported join type"),
                 }
             }
 
             // Force flush at the end of the batch
+            flush(&mut left_rows, &mut right_rows, true);
+        },
+    )?;
+
+    Ok(())
+}
+
+fn hash_join_rowid_single_key<A, P, F>(
+    left: &Table<P>,
+    right: &Table<P>,
+    keys: &[JoinKey],
+    options: &JoinOptions,
+    left_filter: Option<Arc<dyn RowIdFilter<P>>>,
+    right_filter: Option<Arc<dyn RowIdFilter<P>>>,
+    mut on_batch: F,
+) -> LlkvResult<()>
+where
+    A: ArrowPrimitiveType,
+    A::Native: Send + Sync + Eq + std::hash::Hash + Copy,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    F: FnMut(JoinIndexBatch<'_>),
+{
+    let join_key = &keys[0];
+    let left_schema = left.schema()?;
+    let right_schema = right.schema()?;
+
+    let left_projections = build_user_projections(left, &left_schema)?;
+    let right_projections = build_user_projections(right, &right_schema)?;
+
+    let (hash_table, build_batches) = build_hash_table_single_key::<A, P>(
+        right,
+        &right_projections,
+        join_key,
+        &right_schema,
+        right_filter,
+    )?;
+
+    let prepared_left = prepare_keys(&left_schema, keys, JoinSide::Left)?;
+    let key_idx = prepared_left.batch_indices[0];
+    let batch_size = options.batch_size.max(1);
+    let probe_filter = build_all_rows_filter(&left_projections)?;
+
+    // Parallelize probe processing per batch while keeping output ordered.
+    struct ChunkBuffers {
+        left_rows: Vec<usize>,
+        right_rows: Vec<Option<JoinRowRef>>,
+    }
+    impl Default for ChunkBuffers {
+        fn default() -> Self {
+            Self {
+                left_rows: Vec::new(),
+                right_rows: Vec::new(),
+            }
+        }
+    }
+
+    left.scan_stream(
+        &left_projections,
+        &probe_filter,
+        ScanStreamOptions {
+            row_id_filter: left_filter,
+            ..ScanStreamOptions::default()
+        },
+        |probe_batch| {
+            let key_array = probe_batch
+                .column(key_idx)
+                .as_any()
+                .downcast_ref::<PrimitiveArray<A>>()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Expected primitive array at column {} but found {:?}",
+                        key_idx,
+                        probe_batch.column(key_idx).data_type()
+                    )
+                });
+
+            let total_rows = key_array.len();
+            if total_rows == 0 {
+                return;
+            }
+
+            let chunk_size = batch_size;
+            let chunk_count = (total_rows + chunk_size - 1) / chunk_size;
+            let mut chunk_buffers: Vec<ChunkBuffers> =
+                (0..chunk_count).map(|_| ChunkBuffers::default()).collect();
+
+            chunk_buffers
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(chunk_idx, buffers)| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(total_rows);
+
+                    for row_idx in start..end {
+                        let key = if key_array.is_null(row_idx) {
+                            if !join_key.null_equals_null {
+                                continue;
+                            }
+                            ScalarKey::Null
+                        } else {
+                            ScalarKey::Value(key_array.value(row_idx))
+                        };
+
+                        let matches = hash_table.get(&key);
+                        match options.join_type {
+                            JoinType::Inner => {
+                                if let Some(build_rows) = matches {
+                                    for &(build_batch_idx, build_row_idx) in build_rows {
+                                        buffers.left_rows.push(row_idx);
+                                        buffers.right_rows.push(Some(JoinRowRef {
+                                            batch: build_batch_idx,
+                                            row: build_row_idx,
+                                        }));
+                                    }
+                                }
+                            }
+                            JoinType::Left => {
+                                if let Some(build_rows) = matches {
+                                    for &(build_batch_idx, build_row_idx) in build_rows {
+                                        buffers.left_rows.push(row_idx);
+                                        buffers.right_rows.push(Some(JoinRowRef {
+                                            batch: build_batch_idx,
+                                            row: build_row_idx,
+                                        }));
+                                    }
+                                } else {
+                                    buffers.left_rows.push(row_idx);
+                                    buffers.right_rows.push(None);
+                                }
+                            }
+                            JoinType::Semi => {
+                                if matches.map(|m| !m.is_empty()).unwrap_or(false) {
+                                    buffers.left_rows.push(row_idx);
+                                    buffers.right_rows.push(None);
+                                }
+                            }
+                            JoinType::Anti => {
+                                if matches.is_none() || matches.unwrap().is_empty() {
+                                    buffers.left_rows.push(row_idx);
+                                    buffers.right_rows.push(None);
+                                }
+                            }
+                            _ => {
+                                panic!("Unsupported join type for fast-path hash join");
+                            }
+                        }
+                    }
+                });
+
+            let mut left_rows: Vec<usize> = Vec::with_capacity(batch_size);
+            let mut right_rows: Vec<Option<JoinRowRef>> = Vec::with_capacity(batch_size);
+
+            let mut flush = |left_rows: &mut Vec<usize>,
+                             right_rows: &mut Vec<Option<JoinRowRef>>,
+                             force: bool| {
+                if left_rows.is_empty() {
+                    return;
+                }
+                if !force && left_rows.len() < batch_size {
+                    return;
+                }
+
+                let batch = JoinIndexBatch {
+                    left_batch: &probe_batch,
+                    left_rows: std::mem::take(left_rows),
+                    right_rows: std::mem::take(right_rows),
+                    right_batches: &build_batches,
+                };
+                on_batch(batch);
+            };
+
+            for chunk in chunk_buffers {
+                for (l, r) in chunk.left_rows.into_iter().zip(chunk.right_rows.into_iter()) {
+                    left_rows.push(l);
+                    right_rows.push(r);
+                    if left_rows.len() >= batch_size {
+                        flush(&mut left_rows, &mut right_rows, true);
+                    }
+                }
+            }
+
             flush(&mut left_rows, &mut right_rows, true);
         },
     )?;
@@ -216,12 +510,13 @@ fn build_hash_table<P>(
     join_keys: &[JoinKey],
     schema: &Arc<Schema>,
     row_filter: Option<Arc<dyn RowIdFilter<P>>>,
-) -> LlkvResult<(HashTable, Vec<RecordBatch>, RowConverter)>
+) -> LlkvResult<(HashTable, Vec<RecordBatch>, Vec<Arc<Rows>>)>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     let mut hash_table = HashTable::default();
     let mut batches = Vec::new();
+    let mut build_rows: Vec<Arc<Rows>> = Vec::new();
     let filter_expr = build_all_rows_filter(projections)?;
 
     // Prepare keys and converter
@@ -251,9 +546,10 @@ where
                 Ok(rows) => rows,
                 Err(e) => panic!("Failed to convert build rows: {}", e),
             };
+            let rows = Arc::new(rows);
 
             // Insert into hash table
-            for (row_idx, row_bytes) in rows.iter().enumerate() {
+            for row_idx in 0..rows.num_rows() {
                 // Handle NULLs: if any key part is null and !null_equals_null, skip.
                 let has_nulls = join_keys
                     .iter()
@@ -261,18 +557,84 @@ where
                     .any(|(k, col)| !k.null_equals_null && col.is_null(row_idx));
 
                 if !has_nulls {
+                    let row_bytes = rows.row(row_idx);
+                    let key_hash = hash_row(row_bytes.data());
                     hash_table
-                        .entry(row_bytes.as_ref().to_vec())
+                        .entry(key_hash)
                         .or_default()
                         .push((batch_idx, row_idx));
                 }
             }
 
             batches.push(batch.clone());
+            build_rows.push(rows);
         },
     )?;
 
-    Ok((hash_table, batches, converter))
+    Ok((hash_table, batches, build_rows))
+}
+
+fn build_hash_table_single_key<A, P>(
+    table: &Table<P>,
+    projections: &[ScanProjection],
+    join_key: &JoinKey,
+    schema: &Arc<Schema>,
+    row_filter: Option<Arc<dyn RowIdFilter<P>>>,
+) -> LlkvResult<(FxHashMap<ScalarKey<A::Native>, Vec<RowRef>>, Vec<RecordBatch>)>
+where
+    A: ArrowPrimitiveType,
+    A::Native: Copy + Eq + std::hash::Hash,
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    let mut hash_table: FxHashMap<ScalarKey<A::Native>, Vec<RowRef>> = FxHashMap::default();
+    let mut batches = Vec::new();
+    let filter_expr = build_all_rows_filter(projections)?;
+
+    let prepared = prepare_keys(schema, std::slice::from_ref(join_key), JoinSide::Right)?;
+    let key_idx = prepared.batch_indices[0];
+
+    table.scan_stream(
+        projections,
+        &filter_expr,
+        ScanStreamOptions {
+            row_id_filter: row_filter,
+            ..ScanStreamOptions::default()
+        },
+        |batch| {
+            let batch_idx = batches.len();
+            let key_array = batch
+                .column(key_idx)
+                .as_any()
+                .downcast_ref::<PrimitiveArray<A>>()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Expected primitive array at column {} but found {:?}",
+                        key_idx,
+                        batch.column(key_idx).data_type()
+                    )
+                });
+
+            for row_idx in 0..key_array.len() {
+                let key = if key_array.is_null(row_idx) {
+                    if !join_key.null_equals_null {
+                        continue;
+                    }
+                    ScalarKey::Null
+                } else {
+                    ScalarKey::Value(key_array.value(row_idx))
+                };
+
+                hash_table
+                    .entry(key)
+                    .or_default()
+                    .push((batch_idx, row_idx));
+            }
+
+            batches.push(batch.clone());
+        },
+    )?;
+
+    Ok((hash_table, batches))
 }
 
 // --- Helper functions ---
@@ -329,6 +691,17 @@ fn prepare_keys(schema: &Schema, keys: &[JoinKey], side: JoinSide) -> LlkvResult
         batch_indices,
         sort_fields,
     })
+}
+
+fn key_datatype(schema: &Schema, field_id: FieldId) -> LlkvResult<DataType> {
+    let cached = CachedSchema::new(Arc::new(schema.clone()));
+    let schema_idx = cached.index_of_field_id(field_id).ok_or_else(|| {
+        Error::Internal(format!(
+            "Join key field_id {} not found in schema",
+            field_id
+        ))
+    })?;
+    Ok(schema.field(schema_idx).data_type().clone())
 }
 
 fn cross_product_rowid_stream<P, F>(
@@ -490,6 +863,7 @@ pub struct HashJoinStream {
     left_stream: Box<dyn Iterator<Item = LlkvResult<RecordBatch>> + Send>,
     right_batch: RecordBatch,
     hash_table: HashTable,
+    build_rows: Option<Rows>,
     join_type: JoinType,
     left_indices: Vec<usize>,
     right_indices: Vec<usize>,
@@ -498,7 +872,7 @@ pub struct HashJoinStream {
 
     // State for batch splitting
     active_left_batch: Option<RecordBatch>,
-    active_probe_rows: Option<arrow::row::Rows>,
+    active_probe_rows: Option<Rows>,
     next_left_row_idx: usize,
     target_batch_size: usize,
 }
@@ -530,29 +904,28 @@ impl HashJoinStream {
             .map(|&i| right_batch.column(i).clone())
             .collect();
 
-        if build_columns.is_empty() {
+        let build_rows = if build_columns.is_empty() {
             for row_idx in 0..right_batch.num_rows() {
-                hash_table.entry(vec![]).or_default().push((0, row_idx));
+                hash_table.entry(0).or_default().push((0, row_idx));
             }
+            None
         } else {
             let build_rows = build_converter
                 .convert_columns(&build_columns)
                 .map_err(|e| Error::Internal(e.to_string()))?;
 
-            for (row_idx, row_bytes) in build_rows.iter().enumerate() {
+            for row_idx in 0..build_rows.num_rows() {
                 // Handle NULLs: if any key part is null (and we assume standard SQL equality), skip.
                 let has_nulls = build_columns.iter().any(|col| col.is_null(row_idx));
 
                 if !has_nulls {
-                    hash_table
-                        .entry(row_bytes.as_ref().to_vec())
-                        .or_default()
-                        .push((0, row_idx)); // batch_idx is always 0 for now
-                } else {
-                    // tracing::trace!("Skipping row {} due to nulls", row_idx);
+                    let key_hash = hash_row(build_rows.row(row_idx).data());
+                    hash_table.entry(key_hash).or_default().push((0, row_idx));
                 }
             }
-        }
+            Some(build_rows)
+        };
+
         // 2. Prepare probe converter
         // Left fields must match right fields types for hashing to work
         let probe_fields = build_fields; // Same types
@@ -573,6 +946,7 @@ impl HashJoinStream {
             left_stream,
             right_batch,
             hash_table,
+            build_rows,
             join_type,
             left_indices,
             right_indices,
@@ -652,20 +1026,30 @@ impl Iterator for HashJoinStream {
             let start_idx = self.next_left_row_idx;
             let mut current_idx = start_idx;
 
-            let empty_key = vec![]; // For cross join case
+            let empty_hash = 0_u64; // For cross join case
+            let build_rows = self.build_rows.as_ref();
 
             while current_idx < num_rows && rows_produced < self.target_batch_size {
-                let matches = if let Some(rows) = &self.active_probe_rows {
-                    self.hash_table.get(rows.row(current_idx).as_ref())
+                let (matches, probe_row) = if let Some(rows) = &self.active_probe_rows {
+                    let row = rows.row(current_idx);
+                    let key_hash = hash_row(row.data());
+                    (self.hash_table.get(&key_hash), Some(row))
                 } else {
                     // No join keys -> Cross Join behavior (if hash table has empty key)
-                    self.hash_table.get(&empty_key)
+                    (self.hash_table.get(&empty_hash), None)
                 };
 
                 match self.join_type {
                     JoinType::Inner => {
-                        if let Some(build_rows) = matches {
-                            for &(_, build_row_idx) in build_rows {
+                        if let Some(build_rows_indices) = matches {
+                            for &(_, build_row_idx) in build_rows_indices {
+                                if let (Some(build_rows), Some(probe_row)) =
+                                    (build_rows, probe_row)
+                                {
+                                    if probe_row != build_rows.row(build_row_idx) {
+                                        continue;
+                                    }
+                                }
                                 left_builder.append_value(current_idx as u64);
                                 right_builder.append_value(build_row_idx as u64);
                                 rows_produced += 1;
@@ -673,8 +1057,15 @@ impl Iterator for HashJoinStream {
                         }
                     }
                     JoinType::Left => {
-                        if let Some(build_rows) = matches {
-                            for &(_, build_row_idx) in build_rows {
+                        if let Some(build_rows_indices) = matches {
+                            for &(_, build_row_idx) in build_rows_indices {
+                                if let (Some(build_rows), Some(probe_row)) =
+                                    (build_rows, probe_row)
+                                {
+                                    if probe_row != build_rows.row(build_row_idx) {
+                                        continue;
+                                    }
+                                }
                                 left_builder.append_value(current_idx as u64);
                                 right_builder.append_value(build_row_idx as u64);
                                 rows_produced += 1;
