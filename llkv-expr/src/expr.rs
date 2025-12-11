@@ -382,11 +382,11 @@ impl<F> ScalarExpr<F> {
                 branches,
                 else_expr,
             } => {
-                operand.as_ref().map_or(false, |o| o.contains_aggregate())
+                operand.as_ref().is_some_and(|o| o.contains_aggregate())
                     || branches
                         .iter()
                         .any(|(w, t)| w.contains_aggregate() || t.contains_aggregate())
-                    || else_expr.as_ref().map_or(false, |e| e.contains_aggregate())
+                    || else_expr.as_ref().is_some_and(|e| e.contains_aggregate())
             }
             _ => false,
         }

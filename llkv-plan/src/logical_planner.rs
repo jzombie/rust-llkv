@@ -37,8 +37,8 @@ pub enum LogicalPlan<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    Single(SingleTableLogicalPlan<P>),
-    Multi(MultiTableLogicalPlan<P>),
+    Single(Box<SingleTableLogicalPlan<P>>),
+    Multi(Box<MultiTableLogicalPlan<P>>),
 }
 
 impl<P> Clone for LogicalPlan<P>
@@ -329,18 +329,14 @@ where
         let table_id = table.table_id();
         let schema = table.schema();
 
-        let requested_projections = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "projections",
-            {
-            if plan.projections.is_empty() {
-                build_wildcard_projections(schema, table_id)
-            } else {
-                build_projected_columns(schema, table_id, &plan.projections)?
-            }
-            }
-        );
+        let requested_projections =
+            llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "projections", {
+                if plan.projections.is_empty() {
+                    build_wildcard_projections(schema, table_id)
+                } else {
+                    build_projected_columns(schema, table_id, &plan.projections)?
+                }
+            });
 
         let mut scan_projections = requested_projections.clone();
         let mut extra_columns: Vec<String> = Vec::new();
@@ -457,39 +453,30 @@ where
             }
         }
 
-        let (scan_schema, final_schema) = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "schema",
-            {
+        let (scan_schema, final_schema) =
+            llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "schema", {
                 let scan_schema = schema_for_projections(schema, &scan_projections)?;
                 let final_schema = schema_for_projections(schema, &requested_projections)?;
                 (scan_schema, final_schema)
-            }
-        );
+            });
 
-        let filter = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "filter",
-            {
-                match &plan.filter {
-                    Some(filter) => {
-                        debug!("LogicalPlan filter input: {:?}", filter.predicate);
-                        let translated = translate_predicate(filter.predicate.clone(), schema, |_| {
-                            Error::Internal("Unknown column".to_string())
-                        })?;
-                        debug!("LogicalPlan filter translated: {:?}", translated);
-                        Some(translated)
-                    }
-                    None => None,
+        let filter = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "filter", {
+            match &plan.filter {
+                Some(filter) => {
+                    debug!("LogicalPlan filter input: {:?}", filter.predicate);
+                    let translated = translate_predicate(filter.predicate.clone(), schema, |_| {
+                        Error::Internal("Unknown column".to_string())
+                    })?;
+                    debug!("LogicalPlan filter translated: {:?}", translated);
+                    Some(translated)
                 }
+                None => None,
             }
-        );
+        });
 
         let plan_schema = Arc::new(schema.clone());
 
-        Ok(LogicalPlan::Single(SingleTableLogicalPlan {
+        Ok(LogicalPlan::Single(Box::new(SingleTableLogicalPlan {
             table_name,
             table,
             table_id,
@@ -513,7 +500,7 @@ where
             distinct: plan.distinct,
             limit: plan.limit,
             offset: plan.offset,
-        }))
+        })))
     }
 
     fn plan_multi_table(
@@ -565,11 +552,8 @@ where
         // Reorder tables using greedy algorithm to avoid cross joins
         // Only reorder if there are no explicit joins, as explicit joins enforce a specific order
         // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
-        let table_pairs = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            query_ctx,
-            "reorder_tables",
-            {
+        let table_pairs =
+            llkv_perf_monitor::maybe_record!(["perf-mon"], query_ctx, "reorder_tables", {
                 if plan.joins.is_empty() {
                     reorder_tables_greedy(
                         self.provider.as_ref(),
@@ -580,8 +564,7 @@ where
                 } else {
                     table_pairs
                 }
-            }
-        );
+            });
 
         debug!("Planned tables order:");
         for (i, (table, table_ref)) in table_pairs.iter().enumerate() {
@@ -626,17 +609,12 @@ where
             infos: &infos,
         };
 
-        let filter = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            query_ctx,
-            "resolve_filter",
-            {
-                match &plan.filter {
-                    Some(filter) => Some(resolve_predicate(&res_ctx, &filter.predicate)?),
-                    None => None,
-                }
+        let filter = llkv_perf_monitor::maybe_record!(["perf-mon"], query_ctx, "resolve_filter", {
+            match &plan.filter {
+                Some(filter) => Some(resolve_predicate(&res_ctx, &filter.predicate)?),
+                None => None,
             }
-        );
+        });
 
         let having = match &plan.having {
             Some(having) => Some(resolve_predicate(&res_ctx, having)?),
@@ -666,7 +644,7 @@ where
 
         let aggregate_rewrite = build_multi_aggregate_rewrite(plan, &res_ctx)?;
 
-        Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
+        Ok(LogicalPlan::Multi(Box::new(MultiTableLogicalPlan {
             tables: planned_tables,
             table_order: ordered_table_refs,
             table_filters,
@@ -690,7 +668,7 @@ where
                 .map(|f| f.subqueries.clone())
                 .unwrap_or_default(),
             aggregate_rewrite,
-        }))
+        })))
     }
 }
 
@@ -1612,17 +1590,11 @@ fn attach_implicit_joins(
             .iter_mut()
             .find(|j| j.left_table_index == left_table_index)
         {
-            let is_cross = match &existing_join.on {
-                None => true,
-                Some(Expr::Literal(true)) => true,
-                _ => false,
-            };
+            let is_cross = matches!(&existing_join.on, None | Some(Expr::Literal(true)));
 
-            if is_cross {
-                if let Some(new_on) = derived_on {
-                    existing_join.on = Some(new_on);
-                    existing_join.join_type = crate::plans::JoinPlan::Inner;
-                }
+            if is_cross && let Some(new_on) = derived_on {
+                existing_join.on = Some(new_on);
+                existing_join.join_type = crate::plans::JoinPlan::Inner;
             }
         } else {
             joins.push(ResolvedJoin {
@@ -1662,7 +1634,11 @@ fn derive_filter_join_keys(
                     collect_keys(e, left_tables, right_table, out);
                 }
             }
-            Expr::Compare { left, op, right } if matches!(op, CompareOp::Eq) => {
+            Expr::Compare {
+                left,
+                op: CompareOp::Eq,
+                right,
+            } => {
                 if let (ScalarExpr::Column(l), ScalarExpr::Column(r)) = (left, right) {
                     if left_tables.contains(&l.table_index) && r.table_index == right_table {
                         out.push(DerivedJoinKey {
@@ -1671,17 +1647,13 @@ fn derive_filter_join_keys(
                             left_field: l.logical_field_id,
                             right_field: r.logical_field_id,
                         });
-                        return;
-                    }
-
-                    if left_tables.contains(&r.table_index) && l.table_index == right_table {
+                    } else if left_tables.contains(&r.table_index) && l.table_index == right_table {
                         out.push(DerivedJoinKey {
                             left_table_index: r.table_index,
                             right_table_index: right_table,
                             left_field: r.logical_field_id,
                             right_field: l.logical_field_id,
                         });
-                        return;
                     }
                 }
             }
@@ -1846,75 +1818,6 @@ fn collect_scalar_tables(expr: &ScalarExpr<ResolvedFieldRef>, out: &mut FxHashSe
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn col(table_index: usize, field_id: FieldId) -> ScalarExpr<ResolvedFieldRef> {
-        ScalarExpr::Column(ResolvedFieldRef {
-            table_index,
-            logical_field_id: LogicalFieldId::for_user(42, field_id),
-        })
-    }
-
-    #[test]
-    fn derives_join_keys_from_filter_conjunction() {
-        let filter = Expr::And(vec![Expr::Compare {
-            left: col(0, 1),
-            op: CompareOp::Eq,
-            right: col(1, 2),
-        }]);
-
-        let left_tables: FxHashSet<usize> = [0].into_iter().collect();
-        let keys = derive_filter_join_keys(Some(&filter), &left_tables, 1);
-
-        assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].left_table_index, 0);
-        assert_eq!(keys[0].left_field.field_id(), 1);
-        assert_eq!(keys[0].right_field.field_id(), 2);
-    }
-
-    #[test]
-    fn ignores_non_conjunctive_shapes() {
-        let filter = Expr::Or(vec![Expr::Compare {
-            left: col(0, 1),
-            op: CompareOp::Eq,
-            right: col(1, 2),
-        }]);
-
-        let left_tables: FxHashSet<usize> = [0].into_iter().collect();
-        let keys = derive_filter_join_keys(Some(&filter), &left_tables, 1);
-
-        assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn attaches_implicit_join_when_missing() {
-        let filter = Expr::Compare {
-            left: col(0, 1),
-            op: CompareOp::Eq,
-            right: col(1, 2),
-        };
-
-        let mut joins = Vec::new();
-        attach_implicit_joins(&mut joins, 2, Some(&filter));
-
-        assert_eq!(joins.len(), 1);
-        assert_eq!(joins[0].left_table_index, 0);
-        assert!(matches!(joins[0].join_type, crate::plans::JoinPlan::Inner));
-        assert!(matches!(joins[0].on, Some(Expr::Compare { .. })));
-    }
-
-    #[test]
-    fn attaches_cross_join_when_no_keys() {
-        let mut joins = Vec::new();
-        attach_implicit_joins(&mut joins, 2, None);
-
-        assert_eq!(joins.len(), 1);
-        assert!(joins[0].on.is_none());
-    }
-}
-
 fn reorder_tables_greedy<P>(
     provider: &dyn TableProvider<P>,
     tables: Vec<(PlannedTable<P>, TableRef)>,
@@ -2041,16 +1944,15 @@ fn build_join_graph<P>(
 {
     match expr {
         Expr::Compare { left, op, right } => {
-            if matches!(op, CompareOp::Eq) {
-                if let (Some(t1), Some(t2)) = (
+            if matches!(op, CompareOp::Eq)
+                && let (Some(t1), Some(t2)) = (
                     resolve_table_idx(left, tables, infos),
                     resolve_table_idx(right, tables, infos),
-                ) {
-                    if t1 != t2 {
-                        adj[t1].insert(t2);
-                        adj[t2].insert(t1);
-                    }
-                }
+                )
+                && t1 != t2
+            {
+                adj[t1].insert(t2);
+                adj[t2].insert(t1);
             }
         }
         Expr::And(list) => {
@@ -2114,5 +2016,74 @@ where
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(table_index: usize, field_id: FieldId) -> ScalarExpr<ResolvedFieldRef> {
+        ScalarExpr::Column(ResolvedFieldRef {
+            table_index,
+            logical_field_id: LogicalFieldId::for_user(42, field_id),
+        })
+    }
+
+    #[test]
+    fn derives_join_keys_from_filter_conjunction() {
+        let filter = Expr::And(vec![Expr::Compare {
+            left: col(0, 1),
+            op: CompareOp::Eq,
+            right: col(1, 2),
+        }]);
+
+        let left_tables: FxHashSet<usize> = [0].into_iter().collect();
+        let keys = derive_filter_join_keys(Some(&filter), &left_tables, 1);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].left_table_index, 0);
+        assert_eq!(keys[0].left_field.field_id(), 1);
+        assert_eq!(keys[0].right_field.field_id(), 2);
+    }
+
+    #[test]
+    fn ignores_non_conjunctive_shapes() {
+        let filter = Expr::Or(vec![Expr::Compare {
+            left: col(0, 1),
+            op: CompareOp::Eq,
+            right: col(1, 2),
+        }]);
+
+        let left_tables: FxHashSet<usize> = [0].into_iter().collect();
+        let keys = derive_filter_join_keys(Some(&filter), &left_tables, 1);
+
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn attaches_implicit_join_when_missing() {
+        let filter = Expr::Compare {
+            left: col(0, 1),
+            op: CompareOp::Eq,
+            right: col(1, 2),
+        };
+
+        let mut joins = Vec::new();
+        attach_implicit_joins(&mut joins, 2, Some(&filter));
+
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].left_table_index, 0);
+        assert!(matches!(joins[0].join_type, crate::plans::JoinPlan::Inner));
+        assert!(matches!(joins[0].on, Some(Expr::Compare { .. })));
+    }
+
+    #[test]
+    fn attaches_cross_join_when_no_keys() {
+        let mut joins = Vec::new();
+        attach_implicit_joins(&mut joins, 2, None);
+
+        assert_eq!(joins.len(), 1);
+        assert!(joins[0].on.is_none());
     }
 }

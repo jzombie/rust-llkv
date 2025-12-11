@@ -36,8 +36,8 @@ use llkv_runtime::{
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use llkv_table::{CatalogDdl, ConstraintEnforcementMode, TriggerEventMeta, TriggerTimingMeta};
-use llkv_types::decimal::DecimalValue;
 use llkv_types::QueryContext;
+use llkv_types::decimal::DecimalValue;
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
 use sqlparser::ast::{
@@ -746,13 +746,16 @@ impl SqlEngine {
             None
         };
 
-        let result = self.engine.execute_statement_with_ctx(statement, ctx).map_err(|err| {
-            if let Some(table_name) = table {
-                Self::map_table_error(&table_name, err)
-            } else {
-                err
-            }
-        });
+        let result = self
+            .engine
+            .execute_statement_with_ctx(statement, ctx)
+            .map_err(|err| {
+                if let Some(table_name) = table {
+                    Self::map_table_error(&table_name, err)
+                } else {
+                    err
+                }
+            });
 
         // Invalidate information schema cache after successful schema modifications
         if result.is_ok() && modifies_schema {
@@ -5175,17 +5178,9 @@ impl SqlEngine {
             self.build_select_plan(query)?
         );
 
-        let res = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "execute_plan_statement",
-            {
-                self.execute_plan_statement_with_ctx(
-                    PlanStatement::Select(Box::new(select_plan)),
-                    ctx,
-                )
-            }
-        );
+        let res = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "execute_plan_statement", {
+            self.execute_plan_statement_with_ctx(PlanStatement::Select(Box::new(select_plan)), ctx)
+        });
 
         res
     }
@@ -6344,22 +6339,7 @@ impl SqlEngine {
                 &mut scalar_subqueries,
                 correlated_tracker.reborrow(),
             )?;
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!(
-                    "translate_select_internal: projections len before with_projections: {}",
-                    projections.len()
-                );
-            }
             p = p.with_projections(projections);
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!(
-                    "translate_select_internal: p.projections len after with_projections: {}",
-                    p.projections.len()
-                );
-                if let Some(first) = p.projections.first() {
-                    eprintln!("translate_select_internal: first projection: {:?}", first);
-                }
-            }
             (p, IdentifierContext::new(None))
         } else if select.from.len() == 1 && !has_joins {
             // Single table query
@@ -6910,9 +6890,6 @@ impl SqlEngine {
 
         let mut projections = Vec::with_capacity(projection_items.len());
         for (idx, item) in projection_items.iter().enumerate() {
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!("build_projection_list: item {:?}", item);
-            }
             match item {
                 SelectItem::Wildcard(options) => {
                     if let Some(exclude) = &options.opt_exclude {
@@ -7010,9 +6987,6 @@ impl SqlEngine {
                             expr: scalar,
                             alias,
                         });
-                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                            eprintln!("build_projection_list: pushed Computed (UnnamedExpr)");
-                        }
                     }
                 },
                 SelectItem::ExprWithAlias { expr, alias } => match expr {
@@ -7077,15 +7051,9 @@ impl SqlEngine {
                             expr: scalar,
                             alias: alias.value.clone(),
                         });
-                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                            eprintln!("build_projection_list: pushed Computed");
-                        }
                     }
                 },
             }
-        }
-        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-            eprintln!("build_projection_list: result len: {}", projections.len());
         }
         Ok(projections)
     }
@@ -12378,10 +12346,17 @@ mod tests {
             extract_tables(&select.from).expect("extract tables");
 
         assert_eq!(tables.len(), 3, "expected three table refs");
-        assert_eq!(join_metadata.len(), 1, "expect explicit CROSS JOIN edge only");
+        assert_eq!(
+            join_metadata.len(),
+            1,
+            "expect explicit CROSS JOIN edge only"
+        );
         assert_eq!(join_filters.len(), 1, "join filters mirror metadata len");
 
-        assert_eq!(join_metadata[0].left_table_index, 1, "explicit cross join attaches to preceding table");
+        assert_eq!(
+            join_metadata[0].left_table_index, 1,
+            "explicit cross join attaches to preceding table"
+        );
     }
 
     #[test]
@@ -12409,7 +12384,11 @@ mod tests {
         let plan = engine.build_select_plan(*query).expect("build select plan");
 
         assert_eq!(plan.tables.len(), 2, "expected two tables");
-        assert_eq!(plan.joins.len(), 0, "comma joins currently compile to cross product without explicit edge");
+        assert_eq!(
+            plan.joins.len(),
+            0,
+            "comma joins currently compile to cross product without explicit edge"
+        );
     }
 
     #[test]

@@ -403,11 +403,11 @@ fn build_aggregate_states(
 ) -> Result<Vec<AggregateState>, Error> {
     let mut field_index_by_id: FxHashMap<FieldId, usize> = FxHashMap::default();
     for (idx, field) in physical_schema.fields().iter().enumerate() {
-        if let Some(fid_str) = field.metadata().get("field_id") {
-            if let Ok(fid) = fid_str.parse::<FieldId>() {
-                field_index_by_id.insert(fid, idx);
-                continue;
-            }
+        if let Some(fid_str) = field.metadata().get("field_id")
+            && let Ok(fid) = fid_str.parse::<FieldId>()
+        {
+            field_index_by_id.insert(fid, idx);
+            continue;
         }
         // Fallback: treat the physical column position as its field id when metadata is absent.
         field_index_by_id.insert(idx as FieldId, idx);

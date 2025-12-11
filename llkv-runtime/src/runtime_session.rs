@@ -825,10 +825,10 @@ impl RuntimeSession {
         }
 
         if self.has_active_transaction() {
-            let tx_result = match self.inner.execute_operation_with_ctx(
-                PlanOperation::Select(Box::new(plan.clone())),
-                ctx,
-            ) {
+            let tx_result = match self
+                .inner
+                .execute_operation_with_ctx(PlanOperation::Select(Box::new(plan.clone())), ctx)
+            {
                 Ok(result) => result,
                 Err(e) => {
                     // Only abort transaction on specific errors (constraint violations, etc.)

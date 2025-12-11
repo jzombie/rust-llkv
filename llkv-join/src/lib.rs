@@ -497,7 +497,7 @@ mod tests {
             left_batch: &left_batch,
             left_rows: vec![1],
             right_rows: vec![Some(JoinRowRef { batch: 0, row: 0 })],
-            right_batches: &[right_batch.clone()],
+            right_batches: std::slice::from_ref(&right_batch),
         };
 
         let left_cols = project_join_columns(&batch, JoinSide::Left, &[0]).unwrap();
@@ -532,7 +532,7 @@ mod tests {
             left_batch: &left_batch,
             left_rows: vec![0],
             right_rows: vec![None],
-            right_batches: &[right_batch.clone()],
+            right_batches: std::slice::from_ref(&right_batch),
         };
 
         let right_cols = project_join_columns(&batch, JoinSide::Right, &[0]).unwrap();

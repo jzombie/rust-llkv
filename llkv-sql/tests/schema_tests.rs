@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array};
-use llkv_plan::plans::PlanValue;
+use arrow::array::Array;
 use llkv_runtime::RuntimeStatementResult;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;

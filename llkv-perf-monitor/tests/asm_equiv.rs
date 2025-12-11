@@ -1,7 +1,7 @@
+use indoc::indoc;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use indoc::indoc;
 use tempfile::tempdir;
 
 // When perf monitoring is disabled, the wrapper should be a no-op and produce identical assembly.
@@ -28,7 +28,10 @@ fn assembly_matches_when_feature_disabled() {
     let with_norm = normalize_asm(&fs::read_to_string(with_s).expect("read with.s"));
     let plain_norm = normalize_asm(&fs::read_to_string(plain_s).expect("read plain.s"));
 
-    assert_eq!(with_norm, plain_norm, "assembly should match when perf-mon is disabled");
+    assert_eq!(
+        with_norm, plain_norm,
+        "assembly should match when perf-mon is disabled"
+    );
 }
 
 #[test]
@@ -54,7 +57,10 @@ fn assembly_differs_when_perf_enabled() {
     let with_norm = normalize_asm(&fs::read_to_string(with_s).expect("read with.s"));
     let plain_norm = normalize_asm(&fs::read_to_string(plain_s).expect("read plain.s"));
 
-    assert_ne!(with_norm, plain_norm, "assembly should differ when perf-mon is enabled");
+    assert_ne!(
+        with_norm, plain_norm,
+        "assembly should differ when perf-mon is enabled"
+    );
 }
 
 fn build_asm(workspace: &Path, bin: &str, target_dir: &Path, enable_perf: bool) {
@@ -102,15 +108,22 @@ fn normalize_asm(src: &str) -> String {
 
 fn write_manifest(manifest: &Path, perf_path: &Path, enable_perf: bool) {
     let dep = if enable_perf {
-        format!("llkv-perf-monitor = {{ path = \"{}\", features = [\"perf-mon\"] }}", perf_path.display())
+        format!(
+            "llkv-perf-monitor = {{ path = \"{}\", features = [\"perf-mon\"] }}",
+            perf_path.display()
+        )
     } else {
-        format!("llkv-perf-monitor = {{ path = \"{}\" }}", perf_path.display())
+        format!(
+            "llkv-perf-monitor = {{ path = \"{}\" }}",
+            perf_path.display()
+        )
     };
 
     fs::write(
         manifest,
         format!(
-            indoc!(r#"
+            indoc!(
+                r#"
                 [package]
                 name = "asm-check"
                 version = "0.0.0"
@@ -121,7 +134,8 @@ fn write_manifest(manifest: &Path, perf_path: &Path, enable_perf: bool) {
 
                 [dependencies]
                 {dep}
-            "#),
+            "#
+            ),
             dep = dep,
         ),
     )
@@ -175,20 +189,12 @@ fn extract_opcodes(src: &str) -> Vec<String> {
     src.lines()
         .map(|line| line.trim())
         .filter(|line| {
-            !(
-                line.is_empty()
-                    || line.starts_with('.')
-                    || line.starts_with('#')
-                    || line.ends_with(':')
-            )
+            !(line.is_empty()
+                || line.starts_with('.')
+                || line.starts_with('#')
+                || line.ends_with(':'))
         })
-        .map(|line| {
-            line.split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string()
-        })
+        .map(|line| line.split_whitespace().next().unwrap_or("").to_string())
         .filter(|op| !op.is_empty())
         .collect()
 }
-

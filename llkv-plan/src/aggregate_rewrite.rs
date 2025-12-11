@@ -8,6 +8,13 @@ use std::collections::{HashMap, HashSet};
 use crate::plans::{AggregateExpr, AggregateFunction, SelectPlan, SelectProjection};
 use crate::schema::PlanSchema;
 
+type AggregateRewriteParts = (
+    Vec<AggregateExpr>,
+    Vec<ScalarExpr<String>>,
+    Vec<ScalarExpr<String>>,
+    Vec<ScalarExpr<String>>,
+);
+
 /// Rewritten aggregate state for complex aggregate projections.
 #[derive(Clone, Debug)]
 pub struct AggregateRewrite {
@@ -196,12 +203,7 @@ impl AggVisitor {
 pub fn extract_complex_aggregates(
     projections: &[ScalarExpr<String>],
     additional_exprs: &[ScalarExpr<String>],
-) -> (
-    Vec<AggregateExpr>,
-    Vec<ScalarExpr<String>>,
-    Vec<ScalarExpr<String>>,
-    Vec<ScalarExpr<String>>,
-) {
+) -> AggregateRewriteParts {
     let mut visitor = AggVisitor::new();
     let rewritten = projections
         .iter()
@@ -352,12 +354,6 @@ fn build_single_projection_exprs(
     plan: &SelectPlan,
     schema: &PlanSchema,
 ) -> Vec<(ScalarExpr<String>, String)> {
-    if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
-        eprintln!(
-            "[planner] build_single_projection_exprs projections: {:?}",
-            plan.projections
-        );
-    }
     let mut out = Vec::new();
     for proj in &plan.projections {
         match proj {

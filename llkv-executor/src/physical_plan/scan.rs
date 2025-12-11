@@ -50,9 +50,11 @@ where
 
     fn execute(&self) -> Result<BatchIter> {
         let filter = self.filter.as_ref().unwrap_or(&Expr::Literal(true));
-        let mut options = ScanStreamOptions::default();
-        options.include_nulls = true;
-        options.row_id_filter = self.row_filter.clone();
+        let options = ScanStreamOptions::<P> {
+            include_nulls: true,
+            row_id_filter: self.row_filter.clone(),
+            ..Default::default()
+        };
 
         let mut stream = llkv_scan::execute::prepare_scan_stream(
             self.table.clone(),
@@ -92,19 +94,10 @@ where
                             .collect::<std::result::Result<Vec<_>, _>>();
 
                         match columns {
-                            Ok(cols) => {
-                                if cols.is_empty() {
-                                    eprintln!(
-                                        "DEBUG: ScanExec cols is empty! Schema fields: {}, Batch cols: {}",
-                                        schema.fields().len(),
-                                        batch.columns().len()
-                                    );
-                                }
-                                Some(
-                                    RecordBatch::try_new(schema.clone(), cols)
-                                        .map_err(|e| Error::Internal(e.to_string())),
-                                )
-                            }
+                            Ok(cols) => Some(
+                                RecordBatch::try_new(schema.clone(), cols)
+                                    .map_err(|e| Error::Internal(e.to_string())),
+                            ),
                             Err(e) => Some(Err(Error::Internal(format!(
                                 "Failed to cast scan columns: {}",
                                 e

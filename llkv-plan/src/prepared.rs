@@ -34,8 +34,8 @@ where
     pub compound: Option<Arc<PreparedCompoundSelect<P>>>,    // Prepared compound operations.
     pub residual_filter: Option<Arc<Expr<'static, String>>>, // Residual predicate kept for executor-side filtering.
     pub residual_filter_subqueries: Arc<[FilterSubquery]>, // Correlated EXISTS subqueries tied to residual filters.
-    pub force_manual_projection: bool,                   // Whether execution must project manually.
-    pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,     // MVCC row filter to thread into scans.
+    pub force_manual_projection: bool, // Whether execution must project manually.
+    pub row_filter: Option<Arc<dyn RowIdFilter<P>>>, // MVCC row filter to thread into scans.
 }
 
 impl<P> Clone for PreparedSelectPlan<P>
@@ -146,7 +146,6 @@ where
         }
     }
 }
-
 
 /// Planner interface that produces executor-ready plans.
 pub trait PreparedSelectPlanner<P>: Send + Sync
@@ -315,11 +314,7 @@ where
         _context: Option<&str>,
         ctx: &QueryContext,
     ) -> Result<PreparedSelectPlan<P>> {
-        llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "simplify",
-            {
+        llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "simplify", {
             for proj in &mut plan.projections {
                 if let crate::plans::SelectProjection::Computed { expr, .. } = proj {
                     *expr = llkv_compute::eval::ScalarEvaluator::simplify(expr);
@@ -329,14 +324,9 @@ where
             if let Some(having) = &mut plan.having {
                 *having = simplify_expr(having.clone());
             }
-            }
-        );
+        });
 
-        let res = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "subqueries",
-            {
+        let res = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "subqueries", {
             let prepared_scalar_subqueries =
                 self.prepare_scalar_subqueries(&plan.scalar_subqueries, ctx)?;
 
@@ -354,8 +344,7 @@ where
                 .transpose()?;
 
             Ok::<_, llkv_result::Error>((prepared_scalar_subqueries, filter_subqueries, compound))
-            }
-        );
+        });
         let (prepared_scalar_subqueries, filter_subqueries, compound) = res?;
 
         let (
@@ -365,11 +354,7 @@ where
             force_manual_projection,
             plan_for_scan,
             has_aggregates,
-        ) = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "analysis",
-            {
+        ) = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "analysis", {
             if let Some(filter) = &mut plan.filter {
                 filter.predicate = simplify_expr(filter.predicate.clone());
             }
@@ -442,101 +427,92 @@ where
                 plan_for_scan,
                 has_aggregates,
             )
-            }
-        );
+        });
 
         let res = llkv_perf_monitor::maybe_record!(
             ["perf-mon"],
             ctx,
             "logical_plan",
-            self.logical_planner.create_logical_plan(&plan_for_scan, ctx)
+            self.logical_planner
+                .create_logical_plan(&plan_for_scan, ctx)
         );
         let mut logical_plan = res?;
 
-        llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "inference",
-            {
+        llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "inference", {
             // Ensure the expression output type matches the inferred schema type.
             // This is necessary because some expressions (like CASE) might evaluate to an untyped NullArray
             // even if the schema inference determined a specific type (e.g. Int64).
             // Wrapping in Cast ensures the Executor produces the correct array type.
             if let LogicalPlan::Single(single_plan) = &mut logical_plan {
+                let single_plan = single_plan.as_mut();
                 for proj in &mut single_plan.requested_projections {
-                    if let llkv_scan::ScanProjection::Computed { expr, .. } = proj {
-                        if let Ok(inferred_type) =
+                    if let llkv_scan::ScanProjection::Computed { expr, .. } = proj
+                        && let Ok(inferred_type) =
                             crate::translation::schema::infer_computed_data_type(
                                 &single_plan.schema,
                                 expr,
                             )
-                        {
-                            if inferred_type != arrow::datatypes::DataType::Null {
-                                match expr {
-                                    ScalarExpr::Literal(_)
-                                    | ScalarExpr::Column(_)
-                                    | ScalarExpr::Cast { .. } => {}
-                                    _ => {
-                                        *expr = ScalarExpr::Cast {
-                                            expr: Box::new(expr.clone()),
-                                            data_type: inferred_type,
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            }
-        );
-
-        let res = llkv_perf_monitor::maybe_record!(
-            ["perf-mon"],
-            ctx,
-            "rewrite",
-            {
-                if force_manual_projection && has_aggregates {
-                    match &mut logical_plan {
-                        LogicalPlan::Single(single) => {
-                            // When forcing manual projection, the logical plan was created with AllColumns,
-                            // which causes the aggregate rewrite to include all columns in the final output.
-                            // We need to re-compute the rewrite using the original projections.
-                            single.aggregate_rewrite =
-                                build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
-                        }
-                        LogicalPlan::Multi(multi) => {
-                            let mut infos = Vec::with_capacity(multi.tables.len());
-                            for table_ref in &plan_for_execution.tables {
-                                let table_lower = table_ref.table.to_ascii_lowercase();
-                                let schema_lower = table_ref.schema.to_ascii_lowercase();
-                                let qualified_lower = if schema_lower.is_empty() {
-                                    table_lower.clone()
-                                } else {
-                                    format!("{}.{}", schema_lower, table_lower)
+                        && inferred_type != arrow::datatypes::DataType::Null
+                    {
+                        match expr {
+                            ScalarExpr::Literal(_)
+                            | ScalarExpr::Column(_)
+                            | ScalarExpr::Cast { .. } => {}
+                            _ => {
+                                *expr = ScalarExpr::Cast {
+                                    expr: Box::new(expr.clone()),
+                                    data_type: inferred_type,
                                 };
-                                let alias_lower =
-                                    table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
-                                infos.push(TableResolutionInfo {
-                                    table_lower,
-                                    schema_lower,
-                                    qualified_lower,
-                                    alias_lower,
-                                });
                             }
-
-                            let ctx = ResolutionContext {
-                                tables: &multi.tables,
-                                infos: &infos,
-                            };
-                            multi.aggregate_rewrite =
-                                build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
                         }
                     }
                 }
-                Ok::<_, llkv_result::Error>(())
             }
-        );
+        });
+
+        let res = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "rewrite", {
+            if force_manual_projection && has_aggregates {
+                match &mut logical_plan {
+                    LogicalPlan::Single(single) => {
+                        let single = single.as_mut();
+                        // When forcing manual projection, the logical plan was created with AllColumns,
+                        // which causes the aggregate rewrite to include all columns in the final output.
+                        // We need to re-compute the rewrite using the original projections.
+                        single.aggregate_rewrite =
+                            build_single_aggregate_rewrite(&plan_for_execution, &single.schema)?;
+                    }
+                    LogicalPlan::Multi(multi) => {
+                        let multi = multi.as_mut();
+                        let mut infos = Vec::with_capacity(multi.tables.len());
+                        for table_ref in &plan_for_execution.tables {
+                            let table_lower = table_ref.table.to_ascii_lowercase();
+                            let schema_lower = table_ref.schema.to_ascii_lowercase();
+                            let qualified_lower = if schema_lower.is_empty() {
+                                table_lower.clone()
+                            } else {
+                                format!("{}.{}", schema_lower, table_lower)
+                            };
+                            let alias_lower =
+                                table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+                            infos.push(TableResolutionInfo {
+                                table_lower,
+                                schema_lower,
+                                qualified_lower,
+                                alias_lower,
+                            });
+                        }
+
+                        let ctx = ResolutionContext {
+                            tables: &multi.tables,
+                            infos: &infos,
+                        };
+                        multi.aggregate_rewrite =
+                            build_multi_aggregate_rewrite(&plan_for_execution, &ctx)?;
+                    }
+                }
+            }
+            Ok::<_, llkv_result::Error>(())
+        });
         res?;
 
         // let physical_plan = Some(
@@ -586,15 +562,13 @@ fn contains_subquery<F: std::fmt::Debug>(expr: &ScalarExpr<F>) -> bool {
             branches,
             else_expr,
         } => {
-            operand
-                .as_ref()
-                .map_or(false, |o| contains_subquery::<F>(o))
+            operand.as_ref().is_some_and(|o| contains_subquery::<F>(o))
                 || branches
                     .iter()
                     .any(|(w, t)| contains_subquery(w) || contains_subquery(t))
                 || else_expr
                     .as_ref()
-                    .map_or(false, |e| contains_subquery::<F>(e))
+                    .is_some_and(|e| contains_subquery::<F>(e))
         }
         ScalarExpr::Coalesce(list) => list.iter().any(contains_subquery),
         ScalarExpr::GetField { base, .. } => contains_subquery(base),
@@ -631,13 +605,13 @@ fn scalar_contains_aggregate<F>(expr: &ScalarExpr<F>) -> bool {
         } => {
             operand
                 .as_ref()
-                .map_or(false, |o| scalar_contains_aggregate(o))
+                .is_some_and(|o| scalar_contains_aggregate(o))
                 || branches
                     .iter()
                     .any(|(w, t)| scalar_contains_aggregate(w) || scalar_contains_aggregate(t))
                 || else_expr
                     .as_ref()
-                    .map_or(false, |e| scalar_contains_aggregate(e))
+                    .is_some_and(|e| scalar_contains_aggregate(e))
         }
         _ => false,
     }

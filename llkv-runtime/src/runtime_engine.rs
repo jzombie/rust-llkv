@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use llkv_result::Result;
 use llkv_storage::pager::{BoxedPager, Pager};
-use simd_r_drive_entry_handle::EntryHandle;
 use llkv_types::QueryContext;
+use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{CatalogDdl, PlanStatement, RuntimeContext, RuntimeSession, RuntimeStatementResult};
 

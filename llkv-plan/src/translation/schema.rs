@@ -50,10 +50,7 @@ pub fn infer_computed_data_type(
     expr: &ScalarExpr<FieldId>,
 ) -> PlanResult<DataType> {
     match expr {
-        ScalarExpr::Literal(lit) => {
-            let res = infer_literal_datatype(lit);
-            res
-        }
+        ScalarExpr::Literal(lit) => infer_literal_datatype(lit),
         ScalarExpr::Column(field_id) => {
             let column = schema.column_by_field_id(*field_id).ok_or_else(|| {
                 Error::InvalidArgumentError(format!(

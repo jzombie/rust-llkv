@@ -129,4 +129,3 @@ impl std::ops::Deref for QueryContextHandle {
         &self.ctx
     }
 }
-

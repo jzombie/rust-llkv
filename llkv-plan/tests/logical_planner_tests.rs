@@ -71,13 +71,11 @@ impl ExecutionTable<TestPager> for DummyTable {
 
 struct DummyProvider {
     table: Arc<DummyTable>,
-    name_lower: String,
 }
 
 impl DummyProvider {
     fn new(table: Arc<DummyTable>) -> Arc<Self> {
-        let name_lower = table.name.to_ascii_lowercase();
-        Arc::new(Self { table, name_lower })
+        Arc::new(Self { table })
     }
 }
 
@@ -168,7 +166,7 @@ fn build_planner() -> (LogicalPlanner<TestPager>, SingleTableLogicalPlan<TestPag
         .create_logical_plan(&select_plan, &ctx)
         .expect("logical planning succeeds");
     let single = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table logical plan"),
     };
     (planner, single)
@@ -259,7 +257,7 @@ fn logical_planner_translates_filter_to_field_ids() {
         .expect("logical planning succeeds");
 
     let logical_plan = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table plan"),
     };
 
@@ -307,7 +305,7 @@ fn logical_planner_adds_filter_columns_to_scan_projections() {
         .create_logical_plan(&select_plan, &QueryContext::new())
         .expect("logical planning succeeds");
     let logical_plan = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table plan"),
     };
 
@@ -381,7 +379,7 @@ fn logical_planner_resolves_multi_table_plan() {
         .expect("logical planning succeeds");
 
     let multi = match plan {
-        LogicalPlan::Multi(plan) => plan,
+        LogicalPlan::Multi(plan) => *plan,
         _ => panic!("expected multi-table plan"),
     };
 
@@ -483,7 +481,7 @@ fn logical_planner_adds_group_by_and_aggregate_columns() {
         .create_logical_plan(&select_plan, &QueryContext::new())
         .expect("logical planning succeeds");
     let logical_plan = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table plan"),
     };
 

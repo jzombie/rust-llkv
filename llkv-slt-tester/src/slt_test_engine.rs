@@ -650,13 +650,13 @@ impl AsyncDB for EngineHarness {
                             );
                         }
 
-                            maybe_print_perf_report(&mut perf_ctx, total_duration, slow_threshold);
+                        maybe_print_perf_report(&mut perf_ctx, total_duration, slow_threshold);
 
                         Ok(DBOutput::Rows { types, rows })
                     }
                     RuntimeStatementResult::Insert { rows_inserted, .. } => {
                         record_statement(sql, exec_duration, "INSERT");
-                            maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -670,7 +670,7 @@ impl AsyncDB for EngineHarness {
                     }
                     RuntimeStatementResult::Update { rows_updated, .. } => {
                         record_statement(sql, exec_duration, "UPDATE");
-                            maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -684,7 +684,7 @@ impl AsyncDB for EngineHarness {
                     }
                     RuntimeStatementResult::Delete { rows_deleted, .. } => {
                         record_statement(sql, exec_duration, "DELETE");
-                            maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -701,14 +701,14 @@ impl AsyncDB for EngineHarness {
                     | RuntimeStatementResult::Transaction { .. }
                     | RuntimeStatementResult::NoOp => {
                         record_statement(sql, exec_duration, "DDL/TXN");
-                            maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         Ok(DBOutput::StatementComplete(0))
                     }
                 }
             }
             Err(e) => {
                 record_statement(sql, exec_duration, "ERROR");
-                    maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
+                maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                 Err(e)
             }
         }

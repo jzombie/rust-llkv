@@ -6,8 +6,8 @@ use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::{CatalogDdl, ConstraintEnforcementMode, SingleColumnIndexDescriptor, TableId};
 use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapshot, TxnId};
-use simd_r_drive_entry_handle::EntryHandle;
 use llkv_types::QueryContext;
+use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
     AlterTablePlan, CreateIndexPlan, CreateTablePlan, CreateViewPlan, DeletePlan, DropIndexPlan,
@@ -170,7 +170,8 @@ where
         plan: SelectPlan,
         ctx: &QueryContext,
     ) -> LlkvResult<SelectExecution<Self::Pager>> {
-        self.context().execute_select_with_ctx(plan, self.snapshot(), ctx)
+        self.context()
+            .execute_select_with_ctx(plan, self.snapshot(), ctx)
     }
 
     fn apply_create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<TransactionResult<P>> {

@@ -1,9 +1,9 @@
 //! Performance monitoring helpers used throughout the query pipeline.
 
+use line_ending::LineEnding;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use line_ending::LineEnding;
 
 /// Lightweight container for per-query metrics.
 ///
@@ -176,9 +176,7 @@ impl PerfContext {
     }
 
     fn total_elapsed(&self) -> Option<Duration> {
-        self.inner
-            .as_ref()
-            .map(|inner| inner.started_at.elapsed())
+        self.inner.as_ref().map(|inner| inner.started_at.elapsed())
     }
 
     fn root_label(&self) -> Option<&str> {

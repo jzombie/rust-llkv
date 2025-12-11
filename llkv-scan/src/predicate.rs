@@ -350,13 +350,6 @@ where
     ScalarEvaluator::collect_fields(left, &mut fields);
     ScalarEvaluator::collect_fields(right, &mut fields);
 
-    if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
-        println!(
-            "DEBUG: collect_row_ids_for_compare: fields.len()={}",
-            fields.len()
-        );
-    }
-
     if fields.is_empty() {
         return match evaluate_constant_compare(left, op, right)? {
             Some(true) => collect_all_row_ids(storage, all_rows_cache),
@@ -423,26 +416,26 @@ where
     S: ScanStorage<P>,
 {
     // Fast path: single-column literal IN can be served directly by storage.
-    if let ScalarExpr::Column(fid) = expr {
-        if !negated {
-            let mut literals = Vec::with_capacity(list.len());
-            for item in list {
-                if let ScalarExpr::Literal(lit) = item {
-                    literals.push(lit.clone());
-                } else {
-                    literals.clear();
-                    break;
-                }
+    if let ScalarExpr::Column(fid) = expr
+        && !negated
+    {
+        let mut literals = Vec::with_capacity(list.len());
+        for item in list {
+            if let ScalarExpr::Literal(lit) = item {
+                literals.push(lit.clone());
+            } else {
+                literals.clear();
+                break;
             }
+        }
 
-            if !literals.is_empty() && literals.len() == list.len() {
-                let filter = OwnedFilter {
-                    field_id: *fid,
-                    op: OwnedOperator::In(literals),
-                };
-                if let Ok(rows) = storage.filter_leaf(&filter) {
-                    return Ok(rows);
-                }
+        if !literals.is_empty() && literals.len() == list.len() {
+            let filter = OwnedFilter {
+                field_id: *fid,
+                op: OwnedOperator::In(literals),
+            };
+            if let Ok(rows) = storage.filter_leaf(&filter) {
+                return Ok(rows);
             }
         }
     }
@@ -739,16 +732,7 @@ where
                 op,
                 fields,
             } => {
-                if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
-                    println!(
-                        "DEBUG: PushCompareDomain: left={:?}, right={:?}",
-                        left, right
-                    );
-                }
                 if scalar_expr_constant_null(left)? || scalar_expr_constant_null(right)? {
-                    if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
-                        println!("DEBUG: PushCompareDomain: constant null detected");
-                    }
                     stack.push(Treemap::new());
                     continue;
                 }
@@ -940,12 +924,6 @@ fn evaluate_constant_compare(
     op: CompareOp,
     right: &ScalarExpr<FieldId>,
 ) -> LlkvResult<Option<bool>> {
-    if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
-        println!(
-            "DEBUG: evaluate_constant_compare: left={:?}, op={:?}, right={:?}",
-            left, op, right
-        );
-    }
     let arrays: NumericArrayMap = FxHashMap::default();
     let left_value = ScalarEvaluator::evaluate_value(left, 0, &arrays)?;
     let right_value = ScalarEvaluator::evaluate_value(right, 0, &arrays)?;
@@ -955,21 +933,6 @@ fn evaluate_constant_compare(
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| Error::Internal("compare kernel did not return bools".into()))?;
-
-    if std::env::var("LLKV_DEBUG_FILTER").is_ok() {
-        println!(
-            "DEBUG: evaluate_constant_compare: left={:?}, op={:?}, right={:?}",
-            left, op, right
-        );
-        println!(
-            "DEBUG: evaluate_constant_compare: result={:?}",
-            bool_array.value(0)
-        );
-        println!(
-            "DEBUG: evaluate_constant_compare: is_null={}",
-            bool_array.is_null(0)
-        );
-    }
 
     if bool_array.is_null(0) {
         Ok(None)

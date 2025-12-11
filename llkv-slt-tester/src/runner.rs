@@ -314,9 +314,7 @@ impl LlkvSltRunner {
         let run_result = async {
             let mut current_hash_threshold: usize = 256;
             let log_progress = std::env::var("LLKV_SLT_PROGRESS").is_ok();
-            let mut record_index: usize = 0;
-
-            for record in records {
+            for (record_index, record) in records.into_iter().enumerate() {
                 if log_progress {
                     let preview = match &record {
                         Record::Statement { sql, .. } => sql,
@@ -324,12 +322,16 @@ impl LlkvSltRunner {
                         _ => "<control>",
                     };
                     let single_line = preview.replace('\n', " ");
-                    let display = if single_line.len() > 80 {
+                    let preview_snippet = if single_line.len() > 80 {
                         format!("{}...", &single_line[..80])
                     } else {
                         single_line
                     };
-                    eprintln!("[llkv-slt] record {}: {}", record_index, display);
+                    tracing::info!(
+                        record_index,
+                        preview = %preview_snippet,
+                        "[llkv-slt] record preview"
+                    );
                 }
 
                 if let Record::Statement { expected, .. } = &record {
@@ -439,7 +441,6 @@ impl LlkvSltRunner {
                     runner.with_hash_threshold(new_threshold);
                 }
 
-                record_index += 1;
             }
 
             Ok::<(), sqllogictest::TestError>(())
@@ -472,29 +473,34 @@ impl LlkvSltRunner {
 
             if let Some((orig_line, normalized_line)) = opt_line_info {
                 if let Some(line) = normalized_lines.get(normalized_line.saturating_sub(1)) {
-                    eprintln!(
-                        "[llkv-slt] Normalized line {}: {}",
+                    tracing::error!(
                         normalized_line,
-                        line.trim()
+                        normalized = line.trim(),
+                        "[llkv-slt] normalized line"
                     );
                 }
 
                 if let Some(line) = text.lines().nth(orig_line.saturating_sub(1)) {
-                    eprintln!(
-                        "[llkv-slt] Original source line {}: {}",
+                    tracing::error!(
                         orig_line,
-                        line.trim()
+                        source = line.trim(),
+                        "[llkv-slt] original source line"
                     );
                 }
             }
 
             if let Some(path) = &persisted {
-                eprintln!("[llkv-slt] Normalized SLT saved to: {}", path);
+                tracing::error!(path = %path, "[llkv-slt] normalized SLT saved");
                 if let Some((_, normalized_line)) = opt_line_info {
-                    eprintln!(
-                        "[llkv-slt] View context: head -n {} '{}' | tail -20",
-                        normalized_line.saturating_add(10),
-                        path
+                    tracing::error!(
+                        normalized_line,
+                        path = %path,
+                        command = %format!(
+                            "head -n {} '{}' | tail -20",
+                            normalized_line.saturating_add(10),
+                            path
+                        ),
+                        "[llkv-slt] view context"
                     );
                 }
             }
@@ -930,39 +936,39 @@ where
                 .join()
                 .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?;
 
-            if let Err(e) = &res {
-                if fail_fast {
-                    eprintln!("test {} ... FAILED", test_name);
+            if let Err(e) = &res
+                && fail_fast
+            {
+                tracing::error!(test_name = %test_name, "[llkv-slt] test FAILED");
 
-                    // Print the error explicitly before exiting, as process::exit will prevent
-                    // libtest-mimic from printing the failure summary.
-                    //
-                    // This simulates a panic, but forces the process to exit manually, as a real
-                    // panic insufficient here because the test runner is designed to catch panics.
-                    //
-                    // Note: Failed::msg is private, so we have to parse the Debug output to get
-                    // the unescaped message with proper line breaks.
-                    let debug_str = format!("{:?}", e);
-                    // FIXME: Error messages are contained in a JSON-like string, so here's a rather
-                    // hacky implementation to extract them. This is a workaround since libtest_mimic::Failed
-                    // is private and the struct does not implement `Display`.
-                    if let Some(start) = debug_str.find("msg: Some(\"") {
-                        if let Some(end) = debug_str.rfind("\")") {
-                            let inner = &debug_str[start + 11..end];
-                            let unescaped = inner
-                                .replace("\\n", "\n")
-                                .replace("\\\"", "\"")
-                                .replace("\\\\", "\\")
-                                .replace("\\t", "\t");
-                            eprintln!("{}", unescaped);
-                        } else {
-                            eprintln!("{}", debug_str);
-                        }
+                // Print the error explicitly before exiting, as process::exit will prevent
+                // libtest-mimic from printing the failure summary.
+                //
+                // This simulates a panic, but forces the process to exit manually, as a real
+                // panic insufficient here because the test runner is designed to catch panics.
+                //
+                // Note: Failed::msg is private, so we have to parse the Debug output to get
+                // the unescaped message with proper line breaks.
+                let debug_str = format!("{:?}", e);
+                // FIXME: Error messages are contained in a JSON-like string, so here's a rather
+                // hacky implementation to extract them. This is a workaround since libtest_mimic::Failed
+                // is private and the struct does not implement `Display`.
+                if let Some(start) = debug_str.find("msg: Some(\"") {
+                    if let Some(end) = debug_str.rfind("\")") {
+                        let inner = &debug_str[start + 11..end];
+                        let unescaped = inner
+                            .replace("\\n", "\n")
+                            .replace("\\\"", "\"")
+                            .replace("\\\\", "\\")
+                            .replace("\\t", "\t");
+                        tracing::error!(test_name = %test_name, "{unescaped}");
                     } else {
-                        eprintln!("{}", debug_str);
+                        tracing::error!(test_name = %test_name, "{debug_str}");
                     }
-                    std::process::exit(101);
+                } else {
+                    tracing::error!(test_name = %test_name, "{debug_str}");
                 }
+                std::process::exit(101);
             }
             res
         }));
