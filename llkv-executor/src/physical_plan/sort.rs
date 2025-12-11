@@ -16,16 +16,18 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub input: Arc<dyn PhysicalPlan<P>>,
-    // TODO: Back vector w/ Arc?
-    pub order_by: Vec<OrderByPlan>,
+    pub order_by: Arc<[OrderByPlan]>,
 }
 
 impl<P> SortExec<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub fn new(input: Arc<dyn PhysicalPlan<P>>, order_by: Vec<OrderByPlan>) -> Self {
-        Self { input, order_by }
+    pub fn new(input: Arc<dyn PhysicalPlan<P>>, order_by: impl Into<Arc<[OrderByPlan]>>) -> Self {
+        Self {
+            input,
+            order_by: order_by.into(),
+        }
     }
 }
 
@@ -66,7 +68,7 @@ where
             .map_err(|e| llkv_result::Error::Internal(e.to_string()))?;
 
         let mut sort_columns = Vec::new();
-        for order in &self.order_by {
+        for order in self.order_by.iter() {
             let column_index = match &order.target {
                 OrderTarget::Column(name) => {
                     // Try to find by name, case-insensitive
@@ -150,13 +152,13 @@ where
         Ok(Box::new(std::iter::once(Ok(sorted_batch))))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([self.input.clone()])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
             return Err(llkv_result::Error::Internal(

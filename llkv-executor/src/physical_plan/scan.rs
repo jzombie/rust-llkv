@@ -19,8 +19,7 @@ where
 {
     pub table: Arc<Table<P>>,
     pub schema: SchemaRef,
-    // TODO: Back vector w/ Arc?
-    pub projections: Vec<ScanProjection>,
+    pub projections: Arc<[ScanProjection]>,
     pub filter: Option<Expr<'static, FieldId>>,
     pub limit: Option<usize>,
     pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,
@@ -58,7 +57,7 @@ where
         let mut stream = llkv_scan::execute::prepare_scan_stream(
             self.table.clone(),
             self.table.table_id(),
-            &self.projections,
+            self.projections.as_ref(),
             filter,
             options,
         )?;
@@ -123,13 +122,13 @@ where
         Ok(Box::new(iter))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if !children.is_empty() {
             return Err(llkv_result::Error::Internal(

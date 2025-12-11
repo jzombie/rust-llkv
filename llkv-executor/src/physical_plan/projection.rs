@@ -17,8 +17,7 @@ where
 {
     pub input: Arc<dyn PhysicalPlan<P>>,
     pub schema: SchemaRef,
-    // TODO: Back vector w/ Arc?
-    pub expr: Vec<(ScalarExpr<usize>, String)>, // Expression, output name
+    pub expr: Arc<[(ScalarExpr<usize>, String)]>, // Expression, output name
 }
 
 impl<P> ProjectionExec<P>
@@ -28,12 +27,12 @@ where
     pub fn new(
         input: Arc<dyn PhysicalPlan<P>>,
         schema: SchemaRef,
-        expr: Vec<(ScalarExpr<usize>, String)>,
+        expr: impl Into<Arc<[(ScalarExpr<usize>, String)]>>,
     ) -> Self {
         Self {
             input,
             schema,
-            expr,
+            expr: expr.into(),
         }
     }
 }
@@ -60,7 +59,7 @@ where
     fn execute(&self) -> Result<BatchIter> {
         let input_stream = self.input.execute()?;
         let schema = self.schema.clone();
-        let expr = self.expr.clone();
+        let expr = Arc::clone(&self.expr);
 
         Ok(Box::new(input_stream.map(move |batch_result| {
             let batch = batch_result?;
@@ -102,13 +101,13 @@ where
         })))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([self.input.clone()])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
             return Err(llkv_result::Error::Internal(

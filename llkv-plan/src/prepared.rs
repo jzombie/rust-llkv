@@ -29,11 +29,11 @@ where
     pub plan: Arc<SelectPlan>,
     pub logical_plan: Arc<LogicalPlan<P>>,
     // pub physical_plan: Option<Arc<dyn PhysicalPlan>>, // Only populated for single-table plans.
-    pub scalar_subqueries: Arc<Vec<PreparedScalarSubquery<P>>>, // Prepared subqueries for ScalarExpr.
-    pub filter_subqueries: Arc<Vec<PreparedFilterSubquery<P>>>, // Prepared subqueries referenced from filters.
-    pub compound: Option<Arc<PreparedCompoundSelect<P>>>,       // Prepared compound operations.
+    pub scalar_subqueries: Arc<[PreparedScalarSubquery<P>]>, // Prepared subqueries for ScalarExpr.
+    pub filter_subqueries: Arc<[PreparedFilterSubquery<P>]>, // Prepared subqueries referenced from filters.
+    pub compound: Option<Arc<PreparedCompoundSelect<P>>>,    // Prepared compound operations.
     pub residual_filter: Option<Arc<Expr<'static, String>>>, // Residual predicate kept for executor-side filtering.
-    pub residual_filter_subqueries: Arc<Vec<FilterSubquery>>, // Correlated EXISTS subqueries tied to residual filters.
+    pub residual_filter_subqueries: Arc<[FilterSubquery]>, // Correlated EXISTS subqueries tied to residual filters.
     pub force_manual_projection: bool,                   // Whether execution must project manually.
     pub row_filter: Option<Arc<dyn RowIdFilter<P>>>,     // MVCC row filter to thread into scans.
 }
@@ -549,11 +549,11 @@ where
             plan: Arc::new(plan_for_execution),
             logical_plan: Arc::new(logical_plan),
             // physical_plan,
-            scalar_subqueries: Arc::new(prepared_scalar_subqueries),
-            filter_subqueries: Arc::new(filter_subqueries),
+            scalar_subqueries: Arc::from(prepared_scalar_subqueries),
+            filter_subqueries: Arc::from(filter_subqueries),
             compound: compound.map(Arc::new),
             residual_filter: residual_filter.map(Arc::new),
-            residual_filter_subqueries: Arc::new(residual_filter_subqueries),
+            residual_filter_subqueries: Arc::from(residual_filter_subqueries),
             force_manual_projection,
             row_filter,
         })

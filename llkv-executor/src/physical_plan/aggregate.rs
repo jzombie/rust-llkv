@@ -13,9 +13,8 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub input: Arc<dyn PhysicalPlan<P>>,
-    // TODO: Back vectors w/ Arc?
-    pub group_expr: Vec<usize>, // Indices in input schema
-    pub aggr_expr: Vec<AggregateExpr>,
+    pub group_expr: Arc<[usize]>, // Indices in input schema
+    pub aggr_expr: Arc<[AggregateExpr]>,
     pub schema: SchemaRef,
 }
 
@@ -25,14 +24,14 @@ where
 {
     pub fn new(
         input: Arc<dyn PhysicalPlan<P>>,
-        group_expr: Vec<usize>,
-        aggr_expr: Vec<AggregateExpr>,
+        group_expr: impl Into<Arc<[usize]>>,
+        aggr_expr: impl Into<Arc<[AggregateExpr]>>,
         schema: SchemaRef,
     ) -> Self {
         Self {
             input,
-            group_expr,
-            aggr_expr,
+            group_expr: group_expr.into(),
+            aggr_expr: aggr_expr.into(),
             schema,
         }
     }
@@ -65,13 +64,13 @@ where
         ))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([self.input.clone()])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
             return Err(llkv_result::Error::Internal(

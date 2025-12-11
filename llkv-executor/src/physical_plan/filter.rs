@@ -17,8 +17,7 @@ where
     pub input: Arc<dyn PhysicalPlan<P>>,
     pub predicate: Expr<'static, FieldId>,
     pub schema: SchemaRef,
-    // TODO: Back vector w/ Arc?
-    pub subqueries: Vec<PreparedScalarSubquery<P>>,
+    pub subqueries: Arc<[PreparedScalarSubquery<P>]>,
 }
 
 impl<P> FilterExec<P>
@@ -29,13 +28,13 @@ where
         input: Arc<dyn PhysicalPlan<P>>,
         predicate: Expr<'static, FieldId>,
         schema: SchemaRef,
-        subqueries: Vec<PreparedScalarSubquery<P>>,
+        subqueries: impl Into<Arc<[PreparedScalarSubquery<P>]>>,
     ) -> Self {
         Self {
             input,
             predicate,
             schema,
-            subqueries,
+            subqueries: subqueries.into(),
         }
     }
 }
@@ -67,13 +66,13 @@ where
         ))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([self.input.clone()])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
             return Err(llkv_result::Error::Internal(

@@ -299,13 +299,13 @@ where
         Ok(Box::new(distinct_stream))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([self.input.clone()])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
             return Err(Error::Internal(
@@ -351,13 +351,13 @@ where
         Ok(limited_stream)
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([self.input.clone()])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
             return Err(Error::Internal(
@@ -2546,7 +2546,7 @@ where
         &self,
         stream: BatchIter,
         filter_expr: LlkvExpr<'static, llkv_plan::logical_planner::ResolvedFieldRef>,
-        prepared_subqueries: Arc<Vec<PreparedScalarSubquery<P>>>,
+        prepared_subqueries: Arc<[PreparedScalarSubquery<P>]>,
         ctx: QueryContext,
         col_mapping: FxHashMap<(usize, FieldId), usize>,
         outer_col_mapping: FxHashMap<String, (usize, FieldId)>,
@@ -2912,7 +2912,7 @@ where
         let mut exec: Arc<dyn PhysicalPlan<P>> = Arc::new(ScanExec {
             table,
             schema: plan.scan_schema.clone(),
-            projections: plan.scan_projections.clone(),
+            projections: Arc::from(plan.scan_projections.clone()),
             filter: safe_filter,
             limit: None,
             row_filter,
@@ -3434,7 +3434,7 @@ where
             let mut proj_indices = Vec::new();
             let arg_start_idx = agg.group_expr.len();
 
-            for expr in &agg.aggr_expr {
+            for expr in agg.aggr_expr.iter() {
                 let proj_idx = match expr {
                     llkv_plan::plans::AggregateExpr::CountStar { .. } => None,
                     llkv_plan::plans::AggregateExpr::Column { column, .. } => {
@@ -3523,9 +3523,10 @@ where
                 let stream = AggregateStream::new_from_specs(input_stream, specs, proj_indices)?;
                 return Ok(Box::new(stream));
             } else {
+                let group_expr = agg.group_expr.to_vec();
                 let stream = GroupedAggregateStream::new_from_specs(
                     input_stream,
-                    agg.group_expr.clone(),
+                    group_expr,
                     specs,
                     &agg.input.schema(),
                     proj_indices,
@@ -3616,7 +3617,7 @@ where
                 return self.apply_subquery_filter_to_stream(
                     input_stream,
                     remapped_expr,
-                    Arc::new(filter.subqueries.clone()),
+                    filter.subqueries.clone(),
                     ctx.clone(),
                     col_mapping,
                     outer_col_mapping,
@@ -3709,7 +3710,7 @@ where
                 filter: None,
                 having: None,
                 scalar_subqueries: vec![],
-                aggregates: agg.aggr_expr.clone(),
+                aggregates: agg.aggr_expr.to_vec(),
                 order_by: vec![],
                 distinct: false,
                 compound: None,
@@ -3725,7 +3726,7 @@ where
             } else {
                 let s = GroupedAggregateStream::new(
                     input_stream,
-                    agg.group_expr.clone(),
+                    agg.group_expr.to_vec(),
                     &plan,
                     &logical_schema,
                     &input_schema,
@@ -3828,7 +3829,7 @@ where
         let residual_subqueries = if residual_filter.is_some() {
             prepared.residual_filter_subqueries.clone()
         } else {
-            Arc::new(Vec::new())
+            Arc::from([])
         };
 
         // Check if we need to force manual projection (cached from planner, but re-evaluate if
@@ -3921,7 +3922,7 @@ where
                     base_iter = self.apply_residual_filter(
                         base_iter,
                         (**residual).clone(),
-                        (*residual_subqueries).clone(),
+                        residual_subqueries.to_vec(),
                     );
                 }
 
