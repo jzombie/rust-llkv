@@ -47,6 +47,8 @@ impl ReportNode {
     }
 
     fn insert(&mut self, path: &[&str], duration: Duration) {
+        // Repeated measurements of the same path aggregate: bump the hit count and
+        // accumulate the duration so callers see totals, not just the last sample.
         self.hits = self.hits.saturating_add(1);
         if let Some((head, tail)) = path.split_first() {
             let child = self
