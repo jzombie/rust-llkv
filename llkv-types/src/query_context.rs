@@ -85,6 +85,7 @@ impl QueryContextHandle {
     }
 
     /// Clone the underlying context; useful when callers need to pass it by value.
+    /// Clones share the same underlying `PerfContext` (Arc-backed), so measurements stay unified.
     pub fn clone_context(&self) -> QueryContext {
         self.ctx.clone()
     }
