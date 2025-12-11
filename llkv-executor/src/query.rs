@@ -2596,6 +2596,7 @@ where
         &self,
         _plan: &MultiTableLogicalPlan<P>,
     ) -> ExecutorResult<Arc<dyn PhysicalPlan<P>>> {
+        // TODO: Implement multi-table physical planning; currently the executor does not support this path.
         Err(Error::Internal(
             "Multi-table physical planning not yet implemented".to_string(),
         ))
@@ -3318,6 +3319,8 @@ where
                 Ok(SelectExecution::from_stream(table_name, schema, trimmed))
             }
             LogicalPlan::Multi(multi) => {
+                // TODO: Wire multi-table logical plans through a real physical planner once implemented;
+                // this branch currently executes via a bespoke streaming pipeline instead.
                 let table_count = multi.tables.len();
                 if table_count > 0 && multi.table_filters.len() != table_count {
                     return Err(Error::Internal(
