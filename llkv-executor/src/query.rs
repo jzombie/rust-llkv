@@ -1245,10 +1245,7 @@ where
         if let Some(filter) = &mut new_plan.filter {
             filter.predicate = Self::rewrite_expr_placeholders(&filter.predicate, replacements);
             for sub in &mut filter.subqueries {
-                sub.plan = Box::new(Self::rewrite_select_plan_placeholders(
-                    &sub.plan,
-                    replacements,
-                ));
+                *sub.plan = Self::rewrite_select_plan_placeholders(&sub.plan, replacements);
             }
         }
 

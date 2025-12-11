@@ -33,6 +33,9 @@ type RowRef = (usize, usize);
 /// Row buffers stay shared to avoid cloning the underlying bytes.
 type HashTable = FxHashMap<u64, Vec<RowRef>>;
 
+/// Hash table for single-key joins.
+type SingleKeyHashTable<T> = FxHashMap<ScalarKey<T>, Vec<RowRef>>;
+
 /// Key wrapper that encodes NULLs without materializing byte buffers.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum ScalarKey<T: Copy + Eq + std::hash::Hash> {
@@ -218,7 +221,7 @@ where
             // Iterate and lookup in parallel chunks to reduce contention and keep order.
             let total_rows = probe_rows.num_rows();
             let chunk_size = batch_size;
-            let chunk_count = (total_rows + chunk_size - 1) / chunk_size;
+            let chunk_count = total_rows.div_ceil(chunk_size);
 
             #[derive(Default)]
             struct ChunkBuffers {
@@ -278,13 +281,13 @@ where
                                 }
                             }
                             JoinType::Semi => {
-                                if let Some(build_refs) = matches {
-                                    if build_refs.iter().any(|&(b_idx, r_idx)| {
+                                if matches.is_some_and(|build_refs| {
+                                    build_refs.iter().any(|&(b_idx, r_idx)| {
                                         probe_rows.row(row_idx) == build_rows[b_idx].row(r_idx)
-                                    }) {
-                                        buffers.left_rows.push(row_idx);
-                                        buffers.right_rows.push(None);
-                                    }
+                                    })
+                                }) {
+                                    buffers.left_rows.push(row_idx);
+                                    buffers.right_rows.push(None);
                                 }
                             }
                             JoinType::Anti => {
@@ -364,17 +367,10 @@ where
     let probe_filter = build_all_rows_filter(&left_projections)?;
 
     // Parallelize probe processing per batch while keeping output ordered.
+    #[derive(Default)]
     struct ChunkBuffers {
         left_rows: Vec<usize>,
         right_rows: Vec<Option<JoinRowRef>>,
-    }
-    impl Default for ChunkBuffers {
-        fn default() -> Self {
-            Self {
-                left_rows: Vec::new(),
-                right_rows: Vec::new(),
-            }
-        }
     }
 
     left.scan_stream(
@@ -403,7 +399,7 @@ where
             }
 
             let chunk_size = batch_size;
-            let chunk_count = (total_rows + chunk_size - 1) / chunk_size;
+            let chunk_count = total_rows.div_ceil(chunk_size);
             let mut chunk_buffers: Vec<ChunkBuffers> =
                 (0..chunk_count).map(|_| ChunkBuffers::default()).collect();
 
@@ -589,16 +585,13 @@ fn build_hash_table_single_key<A, P>(
     join_key: &JoinKey,
     schema: &Arc<Schema>,
     row_filter: Option<Arc<dyn RowIdFilter<P>>>,
-) -> LlkvResult<(
-    FxHashMap<ScalarKey<A::Native>, Vec<RowRef>>,
-    Vec<RecordBatch>,
-)>
+) -> LlkvResult<(SingleKeyHashTable<A::Native>, Vec<RecordBatch>)>
 where
     A: ArrowPrimitiveType,
     A::Native: Copy + Eq + std::hash::Hash,
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    let mut hash_table: FxHashMap<ScalarKey<A::Native>, Vec<RowRef>> = FxHashMap::default();
+    let mut hash_table: SingleKeyHashTable<A::Native> = FxHashMap::default();
     let mut batches = Vec::new();
     let filter_expr = build_all_rows_filter(projections)?;
 
@@ -1056,11 +1049,12 @@ impl Iterator for HashJoinStream {
                     JoinType::Inner => {
                         if let Some(build_rows_indices) = matches {
                             for &(_, build_row_idx) in build_rows_indices {
-                                if let (Some(build_rows), Some(probe_row)) = (build_rows, probe_row)
-                                {
-                                    if probe_row != build_rows.row(build_row_idx) {
-                                        continue;
-                                    }
+                                if build_rows.zip(probe_row).is_some_and(
+                                    |(build_rows, probe_row)| {
+                                        probe_row != build_rows.row(build_row_idx)
+                                    },
+                                ) {
+                                    continue;
                                 }
                                 left_builder.append_value(current_idx as u64);
                                 right_builder.append_value(build_row_idx as u64);
@@ -1071,11 +1065,12 @@ impl Iterator for HashJoinStream {
                     JoinType::Left => {
                         if let Some(build_rows_indices) = matches {
                             for &(_, build_row_idx) in build_rows_indices {
-                                if let (Some(build_rows), Some(probe_row)) = (build_rows, probe_row)
-                                {
-                                    if probe_row != build_rows.row(build_row_idx) {
-                                        continue;
-                                    }
+                                if build_rows.zip(probe_row).is_some_and(
+                                    |(build_rows, probe_row)| {
+                                        probe_row != build_rows.row(build_row_idx)
+                                    },
+                                ) {
+                                    continue;
                                 }
                                 left_builder.append_value(current_idx as u64);
                                 right_builder.append_value(build_row_idx as u64);
