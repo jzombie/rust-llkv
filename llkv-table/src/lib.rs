@@ -35,13 +35,14 @@ pub mod catalog;
 pub mod constants;
 pub mod constraints;
 pub mod ddl;
-// TODO: Please don't separate these
+
 pub mod diagnostics;
 pub mod gather;
 pub mod metadata;
 pub mod reserved;
 pub mod resolvers;
 pub mod schema_ext;
+#[allow(unused_assignments)]
 mod sys_catalog;
 pub mod view;
 pub mod expr {

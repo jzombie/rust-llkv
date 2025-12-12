@@ -146,12 +146,12 @@ pub enum ProjectionPlan {
     },
 }
 
-pub struct RowStreamBuilder<'storage, P, S>
+pub struct RowStreamBuilder<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
-    storage: &'storage S,
+    storage: S,
     table_id: TableId,
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
@@ -168,14 +168,14 @@ where
     include_row_ids: bool,
 }
 
-impl<'storage, P, S> RowStreamBuilder<'storage, P, S>
+impl<P, S> RowStreamBuilder<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        storage: &'storage S,
+        storage: S,
         table_id: TableId,
         schema: Arc<Schema>,
         unique_lfids: Arc<Vec<LogicalFieldId>>,
@@ -213,7 +213,7 @@ where
         self
     }
 
-    pub fn build(self) -> LlkvResult<ScanRowStream<'storage, P, S>> {
+    pub fn build(self) -> LlkvResult<ScanRowStream<P, S>> {
         let RowStreamBuilder {
             storage,
             table_id,
@@ -324,12 +324,12 @@ where
     }
 }
 
-pub struct ScanRowStream<'storage, P, S>
+pub struct ScanRowStream<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
-    storage: &'storage S,
+    storage: S,
     table_id: TableId,
     schema: Arc<Schema>,
     unique_lfids: Arc<Vec<LogicalFieldId>>,
@@ -352,7 +352,7 @@ where
     projection_plan: Vec<ProjectionPlan>,
 }
 
-impl<'storage, P, S> RowStream for ScanRowStream<'storage, P, S>
+impl<P, S> RowStream for ScanRowStream<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
@@ -385,7 +385,7 @@ where
 
             let numeric_cache = self.numeric_arrays_cache.as_mut();
             let batch_opt = materialize_row_window(
-                self.storage,
+                &self.storage,
                 self.table_id,
                 unique_lfids.as_ref(),
                 projection_evals.as_ref(),
@@ -437,7 +437,7 @@ where
     }
 }
 
-impl<'storage, P, S> ScanRowStream<'storage, P, S>
+impl<P, S> ScanRowStream<P, S>
 where
     P: llkv_storage::pager::Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
@@ -536,6 +536,7 @@ where
                     ProjectionEval::Computed(info) => info,
                     ProjectionEval::Column(_) => unreachable!("plan mismatch"),
                 };
+                let mut temp_numeric_map = NumericArrayMap::default();
                 let array: ArrayRef = match &info.expr {
                     ScalarExpr::Literal(_) => synthesize_computed_literal_array(
                         info,
@@ -607,17 +608,45 @@ where
                         eval_get_field(base, field_name, gathered_columns, unique_index, table_id)?
                     }
                     _ => {
-                        let numeric_arrays = numeric_arrays_holder
-                            .as_ref()
-                            .expect("numeric arrays should exist for computed projection");
+                        let numeric_arrays = if let Some(arrays) = numeric_arrays_holder.as_deref()
+                        {
+                            arrays
+                        } else {
+                            // Build a minimal numeric map on demand when the caller did not
+                            // precompute one (e.g., when `requires_numeric` was false but
+                            // the expression still needs evaluation).
+                            temp_numeric_map.clear();
+                            for (lfid, array) in unique_lfids.iter().zip(gathered_columns.iter()) {
+                                temp_numeric_map.insert(lfid.field_id(), array.clone());
+                            }
+                            &temp_numeric_map
+                        };
                         ScalarEvaluator::evaluate_batch(&info.expr, batch_len, numeric_arrays)?
                     }
                 };
+
+                // Cast if needed to match output schema
+                let expected_type = out_schema.field(columns.len()).data_type();
+                let array = if array.data_type() != expected_type {
+                    arrow::compute::cast(&array, expected_type)
+                        .map_err(|e| llkv_result::Error::Internal(e.to_string()))?
+                } else {
+                    array
+                };
+
                 columns.push(array);
             }
         }
     }
 
-    let batch = RecordBatch::try_new(Arc::clone(out_schema), columns.clone())?;
-    Ok(Some(batch))
+    if columns.is_empty() {
+        let options =
+            arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch_len));
+        let batch =
+            RecordBatch::try_new_with_options(Arc::clone(out_schema), columns.clone(), &options)?;
+        Ok(Some(batch))
+    } else {
+        let batch = RecordBatch::try_new(Arc::clone(out_schema), columns.clone())?;
+        Ok(Some(batch))
+    }
 }

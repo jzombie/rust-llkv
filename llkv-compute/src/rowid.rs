@@ -92,7 +92,7 @@ impl RowIdFilter for Treemap {
                     return Ok(Treemap::new());
                 }
                 let mut targets = Treemap::new();
-                for lit in *literals {
+                for lit in literals.iter() {
                     targets.add(literal_to_row_id(lit)?);
                 }
                 Ok(self & &targets)

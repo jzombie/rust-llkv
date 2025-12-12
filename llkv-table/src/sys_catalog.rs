@@ -334,7 +334,10 @@ pub enum TriggerTimingMeta {
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub enum TriggerEventMeta {
     Insert,
-    Update { columns: Vec<String> },
+    #[allow(unused)]
+    Update {
+        columns: Vec<String>,
+    },
     Delete,
 }
 

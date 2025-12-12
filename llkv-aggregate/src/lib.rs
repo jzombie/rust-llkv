@@ -9,6 +9,7 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Float64Builder, Int64Array,
     Int64Builder, RecordBatch, StringArray,
 };
+use arrow::compute;
 use arrow::datatypes::{DataType, Field};
 use llkv_result::Error;
 use llkv_types::FieldId;
@@ -17,6 +18,9 @@ use std::sync::Arc;
 use std::{cmp::Ordering, convert::TryFrom};
 
 pub use llkv_plan::{AggregateExpr, AggregateFunction};
+
+pub mod stream;
+pub use stream::{AggregateStream, GroupedAggregateStream};
 
 /// Result type alias for aggregation routines.
 pub type AggregateResult<T> = Result<T, Error>;
@@ -85,6 +89,7 @@ impl AggregateKind {
 }
 
 /// Runtime state for an aggregate computation.
+#[derive(Clone)]
 pub struct AggregateState {
     pub alias: String,
     pub accumulator: AggregateAccumulator,
@@ -92,6 +97,7 @@ pub struct AggregateState {
 }
 
 /// Accumulator for incremental aggregate computation.
+#[derive(Clone)]
 pub enum AggregateAccumulator {
     CountStar {
         value: i64,
@@ -230,6 +236,21 @@ pub enum AggregateAccumulator {
         precision: u8,
         scale: i8,
     },
+    MinNull {
+        column_index: usize,
+    },
+    MaxNull {
+        column_index: usize,
+    },
+    SumNull {
+        column_index: usize,
+    },
+    TotalNull {
+        column_index: usize,
+    },
+    AvgNull {
+        column_index: usize,
+    },
     CountNulls {
         column_index: usize,
         non_null_rows: i64,
@@ -248,7 +269,7 @@ pub enum AggregateAccumulator {
     },
 }
 
-#[derive(Hash, Eq, PartialEq, Clone)]
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub enum DistinctKey {
     Int(i64),
     Float(u64),
@@ -467,22 +488,24 @@ impl AggregateAccumulator {
     ) -> AggregateResult<Self> {
         match &spec.kind {
             AggregateKind::Count { field_id, distinct } => {
-                if field_id.is_none() {
-                    return Ok(AggregateAccumulator::CountStar { value: 0 });
-                }
-                let idx = projection_idx.ok_or_else(|| {
-                    Error::Internal("Count aggregate requires projection index".into())
-                })?;
-                if *distinct {
-                    Ok(AggregateAccumulator::CountDistinctColumn {
-                        column_index: idx,
-                        seen: FxHashSet::default(),
-                    })
+                if let Some(idx) = projection_idx {
+                    if *distinct {
+                        Ok(AggregateAccumulator::CountDistinctColumn {
+                            column_index: idx,
+                            seen: FxHashSet::default(),
+                        })
+                    } else {
+                        Ok(AggregateAccumulator::CountColumn {
+                            column_index: idx,
+                            value: 0,
+                        })
+                    }
+                } else if field_id.is_none() {
+                    Ok(AggregateAccumulator::CountStar { value: 0 })
                 } else {
-                    Ok(AggregateAccumulator::CountColumn {
-                        column_index: idx,
-                        value: 0,
-                    })
+                    Err(Error::Internal(
+                        "Count aggregate requires projection index".into(),
+                    ))
                 }
             }
             AggregateKind::Sum {
@@ -536,6 +559,7 @@ impl AggregateAccumulator {
                             saw_value: false,
                         })
                     }
+                    (&DataType::Null, _) => Ok(AggregateAccumulator::SumNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "SUM aggregate not supported for column type {:?}",
                         other.0
@@ -590,6 +614,9 @@ impl AggregateAccumulator {
                             column_index: idx,
                             value: 0.0,
                         })
+                    }
+                    (&DataType::Null, _) => {
+                        Ok(AggregateAccumulator::TotalNull { column_index: idx })
                     }
                     other => Err(Error::InvalidArgumentError(format!(
                         "TOTAL aggregate not supported for column type {:?}",
@@ -649,6 +676,7 @@ impl AggregateAccumulator {
                             count: 0,
                         })
                     }
+                    (&DataType::Null, _) => Ok(AggregateAccumulator::AvgNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "AVG aggregate not supported for column type {:?}",
                         other.0
@@ -677,6 +705,7 @@ impl AggregateAccumulator {
                         column_index: idx,
                         value: None,
                     }),
+                    &DataType::Null => Ok(AggregateAccumulator::MinNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "MIN aggregate not supported for column type {:?}",
                         other
@@ -705,6 +734,7 @@ impl AggregateAccumulator {
                         column_index: idx,
                         value: None,
                     }),
+                    &DataType::Null => Ok(AggregateAccumulator::MaxNull { column_index: idx }),
                     other => Err(Error::InvalidArgumentError(format!(
                         "MAX aggregate not supported for column type {:?}",
                         other
@@ -776,10 +806,7 @@ impl AggregateAccumulator {
                 if matches!(array.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                let non_null = (0..array.len()).filter(|idx| array.is_valid(*idx)).count();
-                let non_null = i64::try_from(non_null).map_err(|_| {
-                    Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
-                })?;
+                let non_null = (array.len() - array.null_count()) as i64;
                 *value = value.checked_add(non_null).ok_or_else(|| {
                     Error::InvalidArgumentError("COUNT result exceeds i64 range".into())
                 })?;
@@ -813,18 +840,18 @@ impl AggregateAccumulator {
                         "SUM aggregate expected an INT column in execution".into(),
                     )
                 })?;
+
                 for i in 0..array.len() {
                     if array.is_valid(i) {
-                        *has_values = true;
                         let v = array.value(i);
+                        *has_values = true;
                         *value = match *value {
-                            Some(current) => Some(current.checked_add(v).ok_or_else(|| {
-                                Error::InvalidArgumentError("integer overflow".into())
-                            })?),
-                            None => {
-                                return Err(Error::InvalidArgumentError("integer overflow".into()));
-                            }
+                            Some(current) => current.checked_add(v),
+                            None => None,
                         };
+                        if value.is_none() {
+                            return Err(Error::InvalidArgumentError("integer overflow".into()));
+                        }
                     }
                 }
             }
@@ -877,12 +904,20 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
-                        *value += v;
+
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(s) = compute::sum(array) {
+                        *value += s;
                         *saw_value = true;
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *value += v;
+                            *saw_value = true;
+                        }
                     }
                 }
             }
@@ -1126,20 +1161,15 @@ impl AggregateAccumulator {
                         "AVG aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *sum = sum.checked_add(v).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "AVG aggregate sum exceeds i64 range".into(),
-                            )
-                        })?;
-                        *count = count.checked_add(1).ok_or_else(|| {
-                            Error::InvalidArgumentError(
-                                "AVG aggregate count exceeds i64 range".into(),
-                            )
-                        })?;
-                    }
+
+                if let Some(s) = compute::sum(array) {
+                    *sum = sum.checked_add(s).ok_or_else(|| {
+                        Error::InvalidArgumentError("AVG aggregate sum exceeds i64 range".into())
+                    })?;
+                    let c = (array.len() - array.null_count()) as i64;
+                    *count = count.checked_add(c).ok_or_else(|| {
+                        Error::InvalidArgumentError("AVG aggregate count exceeds i64 range".into())
+                    })?;
                 }
             }
             AggregateAccumulator::AvgDistinctInt64 {
@@ -1184,16 +1214,29 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
-                        *sum += v;
-                        *count = count.checked_add(1).ok_or_else(|| {
+
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(s) = compute::sum(array) {
+                        *sum += s;
+                        let c = (array.len() - array.null_count()) as i64;
+                        *count = count.checked_add(c).ok_or_else(|| {
                             Error::InvalidArgumentError(
                                 "AVG aggregate count exceeds i64 range".into(),
                             )
                         })?;
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *sum += v;
+                            *count = count.checked_add(1).ok_or_else(|| {
+                                Error::InvalidArgumentError(
+                                    "AVG aggregate count exceeds i64 range".into(),
+                                )
+                            })?;
+                        }
                     }
                 }
             }
@@ -1296,14 +1339,12 @@ impl AggregateAccumulator {
                         "MIN aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *value = Some(match *value {
-                            Some(current) => current.min(v),
-                            None => v,
-                        });
-                    }
+
+                if let Some(m) = compute::min(array) {
+                    *value = Some(match *value {
+                        Some(current) => current.min(m),
+                        None => m,
+                    });
                 }
             }
             AggregateAccumulator::MinFloat64 {
@@ -1315,17 +1356,30 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
+
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(m) = compute::min(array) {
                         *value = Some(match *value {
-                            Some(current) => match v.partial_cmp(&current) {
-                                Some(Ordering::Less) => v,
+                            Some(current) => match m.partial_cmp(&current) {
+                                Some(Ordering::Less) => m,
                                 _ => current,
                             },
-                            None => v,
+                            None => m,
                         });
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *value = Some(match *value {
+                                Some(current) => match v.partial_cmp(&current) {
+                                    Some(Ordering::Less) => v,
+                                    _ => current,
+                                },
+                                None => v,
+                            });
+                        }
                     }
                 }
             }
@@ -1364,14 +1418,12 @@ impl AggregateAccumulator {
                         "MAX aggregate expected an INT column in execution".into(),
                     )
                 })?;
-                for i in 0..array.len() {
-                    if array.is_valid(i) {
-                        let v = array.value(i);
-                        *value = Some(match *value {
-                            Some(current) => current.max(v),
-                            None => v,
-                        });
-                    }
+
+                if let Some(m) = compute::max(array) {
+                    *value = Some(match *value {
+                        Some(current) => current.max(m),
+                        None => m,
+                    });
                 }
             }
             AggregateAccumulator::MaxFloat64 {
@@ -1383,17 +1435,30 @@ impl AggregateAccumulator {
                 if matches!(column.data_type(), DataType::Null) {
                     return Ok(());
                 }
-                // Use generic numeric coercion to support Utf8 and other types
-                for i in 0..column.len() {
-                    if column.is_valid(i) {
-                        let v = array_value_to_numeric(column, i)?;
+
+                if let Some(array) = column.as_any().downcast_ref::<Float64Array>() {
+                    if let Some(m) = compute::max(array) {
                         *value = Some(match *value {
-                            Some(current) => match v.partial_cmp(&current) {
-                                Some(Ordering::Greater) => v,
+                            Some(current) => match m.partial_cmp(&current) {
+                                Some(Ordering::Greater) => m,
                                 _ => current,
                             },
-                            None => v,
+                            None => m,
                         });
+                    }
+                } else {
+                    // Use generic numeric coercion to support Utf8 and other types
+                    for i in 0..column.len() {
+                        if column.is_valid(i) {
+                            let v = array_value_to_numeric(column, i)?;
+                            *value = Some(match *value {
+                                Some(current) => match v.partial_cmp(&current) {
+                                    Some(Ordering::Greater) => v,
+                                    _ => current,
+                                },
+                                None => v,
+                            });
+                        }
                     }
                 }
             }
@@ -1418,6 +1483,13 @@ impl AggregateAccumulator {
                         });
                     }
                 }
+            }
+            AggregateAccumulator::MinNull { .. }
+            | AggregateAccumulator::MaxNull { .. }
+            | AggregateAccumulator::SumNull { .. }
+            | AggregateAccumulator::TotalNull { .. }
+            | AggregateAccumulator::AvgNull { .. } => {
+                // No-op: result is always NULL
             }
             AggregateAccumulator::CountNulls {
                 column_index,
@@ -1474,6 +1546,99 @@ impl AggregateAccumulator {
             }
         }
         Ok(())
+    }
+
+    /// Returns the output field definition for this accumulator.
+    pub fn output_field(&self) -> Field {
+        match self {
+            AggregateAccumulator::CountStar { .. } => Field::new("count", DataType::Int64, false),
+            AggregateAccumulator::CountColumn { .. } => Field::new("count", DataType::Int64, false),
+            AggregateAccumulator::CountDistinctColumn { .. } => {
+                Field::new("count_distinct", DataType::Int64, false)
+            }
+            AggregateAccumulator::SumInt64 { .. } => Field::new("sum", DataType::Int64, true),
+            AggregateAccumulator::SumDistinctInt64 { .. } => {
+                Field::new("sum_distinct", DataType::Int64, true)
+            }
+            AggregateAccumulator::SumFloat64 { .. } => Field::new("sum", DataType::Float64, true),
+            AggregateAccumulator::SumDistinctFloat64 { .. } => {
+                Field::new("sum_distinct", DataType::Float64, true)
+            }
+            AggregateAccumulator::SumDecimal128 {
+                precision, scale, ..
+            } => Field::new("sum", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::SumDistinctDecimal128 {
+                precision, scale, ..
+            } => Field::new(
+                "sum_distinct",
+                DataType::Decimal128(*precision, *scale),
+                true,
+            ),
+            AggregateAccumulator::TotalInt64 { .. } => {
+                Field::new("total", DataType::Float64, false)
+            }
+            AggregateAccumulator::TotalDistinctInt64 { .. } => {
+                Field::new("total_distinct", DataType::Float64, false)
+            }
+            AggregateAccumulator::TotalFloat64 { .. } => {
+                Field::new("total", DataType::Float64, false)
+            }
+            AggregateAccumulator::TotalDistinctFloat64 { .. } => {
+                Field::new("total_distinct", DataType::Float64, false)
+            }
+            AggregateAccumulator::TotalDecimal128 {
+                precision, scale, ..
+            } => Field::new("total", DataType::Decimal128(*precision, *scale), false),
+            AggregateAccumulator::TotalDistinctDecimal128 {
+                precision, scale, ..
+            } => Field::new(
+                "total_distinct",
+                DataType::Decimal128(*precision, *scale),
+                false,
+            ),
+            AggregateAccumulator::AvgInt64 { .. } => Field::new("avg", DataType::Float64, true),
+            AggregateAccumulator::AvgDistinctInt64 { .. } => {
+                Field::new("avg_distinct", DataType::Float64, true)
+            }
+            AggregateAccumulator::AvgFloat64 { .. } => Field::new("avg", DataType::Float64, true),
+            AggregateAccumulator::AvgDistinctFloat64 { .. } => {
+                Field::new("avg_distinct", DataType::Float64, true)
+            }
+            AggregateAccumulator::AvgDecimal128 {
+                precision, scale, ..
+            } => Field::new("avg", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::AvgDistinctDecimal128 {
+                precision, scale, ..
+            } => Field::new(
+                "avg_distinct",
+                DataType::Decimal128(*precision, *scale),
+                true,
+            ),
+            AggregateAccumulator::MinInt64 { .. } => Field::new("min", DataType::Int64, true),
+            AggregateAccumulator::MinFloat64 { .. } => Field::new("min", DataType::Float64, true),
+            AggregateAccumulator::MinDecimal128 {
+                precision, scale, ..
+            } => Field::new("min", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::MaxInt64 { .. } => Field::new("max", DataType::Int64, true),
+            AggregateAccumulator::MaxFloat64 { .. } => Field::new("max", DataType::Float64, true),
+            AggregateAccumulator::MaxDecimal128 {
+                precision, scale, ..
+            } => Field::new("max", DataType::Decimal128(*precision, *scale), true),
+            AggregateAccumulator::MinNull { .. } => Field::new("min", DataType::Null, true),
+            AggregateAccumulator::MaxNull { .. } => Field::new("max", DataType::Null, true),
+            AggregateAccumulator::SumNull { .. } => Field::new("sum", DataType::Null, true),
+            AggregateAccumulator::TotalNull { .. } => Field::new("total", DataType::Null, true),
+            AggregateAccumulator::AvgNull { .. } => Field::new("avg", DataType::Null, true),
+            AggregateAccumulator::CountNulls { .. } => {
+                Field::new("count_nulls", DataType::Int64, false)
+            }
+            AggregateAccumulator::GroupConcat { .. } => {
+                Field::new("group_concat", DataType::Utf8, true)
+            }
+            AggregateAccumulator::GroupConcatDistinct { .. } => {
+                Field::new("group_concat_distinct", DataType::Utf8, true)
+            }
+        }
     }
 
     /// Finalizes the accumulator and produces the resulting field and array.
@@ -1892,6 +2057,26 @@ impl AggregateAccumulator {
                 };
                 Ok((Field::new("max", data_type, true), array))
             }
+            AggregateAccumulator::MinNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("min", DataType::Null, true), array))
+            }
+            AggregateAccumulator::MaxNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("max", DataType::Null, true), array))
+            }
+            AggregateAccumulator::SumNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("sum", DataType::Null, true), array))
+            }
+            AggregateAccumulator::TotalNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("total", DataType::Null, true), array))
+            }
+            AggregateAccumulator::AvgNull { .. } => {
+                let array = Arc::new(arrow::array::NullArray::new(1)) as ArrayRef;
+                Ok((Field::new("avg", DataType::Null, true), array))
+            }
             AggregateAccumulator::CountNulls {
                 non_null_rows,
                 total_rows_seen,
@@ -1970,6 +2155,11 @@ impl AggregateState {
     /// Returns an error if the underlying accumulator update fails.
     pub fn update(&mut self, batch: &RecordBatch) -> AggregateResult<()> {
         self.accumulator.update(batch)
+    }
+
+    /// Returns the output field definition for this state.
+    pub fn output_field(&self) -> Field {
+        self.accumulator.output_field().with_name(&self.alias)
     }
 
     /// Finalizes the state and produces the resulting field and array.

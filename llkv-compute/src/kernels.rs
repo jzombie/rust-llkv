@@ -41,6 +41,7 @@ fn coerce_decimals(lhs: (u8, i8), rhs: (u8, i8)) -> DataType {
     let rhs_int = i32::from(rhs.0) - i32::from(rhs.1);
     let int_digits = lhs_int.max(rhs_int);
     let precision = (int_digits + i32::from(scale)).clamp(1, 38) as u8;
+    let precision = std::cmp::max(precision, scale as u8);
     DataType::Decimal128(precision, scale)
 }
 
@@ -149,7 +150,7 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
                 .unwrap();
-            let result = arrow::compute::kernels::boolean::and(lhs_bool, rhs_bool)
+            let result = arrow::compute::kernels::boolean::and_kleene(lhs_bool, rhs_bool)
                 .map_err(|e| Error::Internal(e.to_string()))?;
             Arc::new(result)
         }
@@ -166,7 +167,7 @@ pub fn compute_binary(lhs: &ArrayRef, rhs: &ArrayRef, op: BinaryOp) -> Result<Ar
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
                 .unwrap();
-            let result = arrow::compute::kernels::boolean::or(lhs_bool, rhs_bool)
+            let result = arrow::compute::kernels::boolean::or_kleene(lhs_bool, rhs_bool)
                 .map_err(|e| Error::Internal(e.to_string()))?;
             Arc::new(result)
         }

@@ -1,7 +1,4 @@
-//! INSERT operation utilities.
-//!
-//! This module provides utilities for INSERT operations, including value coercion,
-//! column resolution, and array building for various data types.
+//! INSERT helpers shared with the runtime.
 
 pub mod value_coercion;
 

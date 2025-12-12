@@ -25,8 +25,9 @@ use llkv_column_map::store::{GatherNullPolicy, MultiGatherContext};
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
 
-// Chunk size for predicate evaluation. Smaller chunks create more parallel tasks.
-const CHUNK_SIZE: usize = 4096;
+// TODO: Make configurable
+// Chunk size for predicate evaluation. Larger chunks reduce Rayon task churn while still fitting caches.
+const CHUNK_SIZE: usize = 16384;
 
 /// Evaluate a compiled predicate program against storage to produce RowIdSource.
 pub fn collect_row_ids_for_program<'expr, P, S>(
@@ -168,8 +169,8 @@ where
                 let operand = stack
                     .pop()
                     .ok_or_else(|| Error::Internal("NOT opcode underflow".into()))?;
-
-                let mut domain_cache = FxHashMap::default();
+                let mut domain_cache: FxHashMap<DomainProgramId, Arc<Treemap>> =
+                    FxHashMap::default();
                 let domain_rows = evaluate_domain_program(
                     storage,
                     programs,
@@ -360,23 +361,31 @@ where
     ordered_fields.sort_unstable();
     ordered_fields.dedup();
 
+    let mut field_domains: Vec<(FieldId, Treemap)> = Vec::with_capacity(ordered_fields.len());
+    for fid in &ordered_fields {
+        let rows = collect_all_row_ids_for_field(storage, *fid, all_rows_cache)?;
+        field_domains.push((*fid, rows));
+    }
+
+    // Prefer the smallest domain first so intersections short-circuit sooner.
+    field_domains.sort_by_key(|(_, rows)| rows.cardinality());
+    ordered_fields = field_domains.iter().map(|(fid, _)| *fid).collect();
+
     let requires_full_scan =
         scalar_expr_contains_coalesce(left) || scalar_expr_contains_coalesce(right);
 
     let domain = if requires_full_scan {
         let mut union_rows = Treemap::new();
-        for fid in &ordered_fields {
-            let rows = collect_all_row_ids_for_field(storage, *fid, all_rows_cache)?;
-            union_rows |= rows;
+        for (_, rows) in &field_domains {
+            union_rows |= rows.clone();
         }
         union_rows
     } else {
         let mut domain: Option<Treemap> = None;
-        for fid in &ordered_fields {
-            let rows = collect_all_row_ids_for_field(storage, *fid, all_rows_cache)?;
+        for (_, rows) in &field_domains {
             domain = Some(match domain {
                 Some(existing) => existing & rows,
-                None => rows,
+                None => rows.clone(),
             });
             if let Some(ref d) = domain
                 && d.is_empty()
@@ -406,6 +415,31 @@ where
     P: Pager<Blob = EntryHandle> + Send + Sync,
     S: ScanStorage<P>,
 {
+    // Fast path: single-column literal IN can be served directly by storage.
+    if let ScalarExpr::Column(fid) = expr
+        && !negated
+    {
+        let mut literals = Vec::with_capacity(list.len());
+        for item in list {
+            if let ScalarExpr::Literal(lit) = item {
+                literals.push(lit.clone());
+            } else {
+                literals.clear();
+                break;
+            }
+        }
+
+        if !literals.is_empty() && literals.len() == list.len() {
+            let filter = OwnedFilter {
+                field_id: *fid,
+                op: OwnedOperator::In(literals),
+            };
+            if let Ok(rows) = storage.filter_leaf(&filter) {
+                return Ok(rows);
+            }
+        }
+    }
+
     let mut fields = FxHashSet::default();
     ScalarEvaluator::collect_fields(expr, &mut fields);
     for item in list {
@@ -505,6 +539,7 @@ where
                         for item in list {
                             let value_array =
                                 ScalarEvaluator::evaluate_batch(item, chunk.len(), &arrays)?;
+
                             let (new_target, new_value) =
                                 kernels::coerce_types(&target_array, &value_array, BinaryOp::Add)?;
                             target_array = new_target;

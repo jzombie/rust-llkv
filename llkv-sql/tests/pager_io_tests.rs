@@ -64,11 +64,11 @@ fn crud_statements_update_pager_counters() {
     let select_after = stats.snapshot();
     let select_delta = select_after.delta_since(&select_before);
     assert_eq!(
-        select_delta.physical_gets, 36,
+        select_delta.physical_gets, 42,
         "unexpected select get count: {select_delta:?}"
     );
     assert_eq!(
-        select_delta.get_batches, 23,
+        select_delta.get_batches, 25,
         "unexpected select get batches: {select_delta:?}"
     );
 

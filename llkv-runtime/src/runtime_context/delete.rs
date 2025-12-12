@@ -67,13 +67,13 @@ where
         filter: LlkvExpr<'static, String>,
         snapshot: TransactionSnapshot,
     ) -> Result<RuntimeStatementResult<P>> {
-        let schema = table.schema.as_ref();
-        let filter_expr = translation::expression::translate_predicate(filter, schema, |name| {
-            Error::InvalidArgumentError(format!(
-                "Binder Error: does not have a column named '{}'",
-                name
-            ))
-        })?;
+        let filter_expr =
+            translation::expression::translate_predicate(filter, table.schema.as_ref(), |name| {
+                Error::InvalidArgumentError(format!(
+                    "Binder Error: does not have a column named '{}'",
+                    name
+                ))
+            })?;
         let row_ids = table.filter_row_ids(&filter_expr)?;
         let row_ids = self.filter_visible_row_ids(table, row_ids, snapshot)?;
         tracing::trace!(

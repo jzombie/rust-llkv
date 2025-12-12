@@ -1,5 +1,6 @@
 use crate::plans::PlanResult;
 use crate::schema::PlanSchema;
+use crate::translation::schema_view::SchemaView;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
 use llkv_expr::expr::{AggregateCall, Expr as LlkvExpr, Filter, ScalarExpr};
 use llkv_result::{Error, Result as LlkvResult};
@@ -10,24 +11,26 @@ pub fn full_table_scan_filter(_field_id: FieldId) -> LlkvExpr<'static, FieldId> 
     LlkvExpr::Literal(true)
 }
 
-pub fn translate_predicate<F>(
+pub fn translate_predicate<F, S>(
     expr: LlkvExpr<'static, String>,
-    schema: &PlanSchema,
+    schema: &S,
     unknown_column: F,
 ) -> PlanResult<LlkvExpr<'static, FieldId>>
 where
+    S: SchemaView,
     F: Fn(&str) -> Error + Copy,
 {
     translate_predicate_with(expr, schema, unknown_column, unknown_column)
 }
 
-pub fn translate_predicate_with<F, G>(
+pub fn translate_predicate_with<F, G, S>(
     expr: LlkvExpr<'static, String>,
-    schema: &PlanSchema,
+    schema: &S,
     unknown_column: F,
     unknown_aggregate: G,
 ) -> PlanResult<LlkvExpr<'static, FieldId>>
 where
+    S: SchemaView,
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
 {
@@ -168,24 +171,26 @@ where
         .ok_or_else(|| Error::Internal("translate_predicate_with: empty result stack".into()))
 }
 
-pub fn translate_scalar<F>(
+pub fn translate_scalar<F, S>(
     expr: &ScalarExpr<String>,
-    schema: &PlanSchema,
+    schema: &S,
     unknown_column: F,
 ) -> PlanResult<ScalarExpr<FieldId>>
 where
+    S: SchemaView,
     F: Fn(&str) -> Error + Copy,
 {
     translate_scalar_with(expr, schema, unknown_column, unknown_column)
 }
 
-pub fn translate_scalar_with<F, G>(
+pub fn translate_scalar_with<F, G, S>(
     expr: &ScalarExpr<String>,
-    schema: &PlanSchema,
+    schema: &S,
     unknown_column: F,
     _unknown_aggregate: G,
 ) -> PlanResult<ScalarExpr<FieldId>>
 where
+    S: SchemaView,
     F: Fn(&str) -> Error + Copy,
     G: Fn(&str) -> Error + Copy,
 {
@@ -382,8 +387,9 @@ where
 }
 
 // TODO: Move to `resolvers.rs`
-fn resolve_field_id<F>(schema: &PlanSchema, name: &str, unknown_column: F) -> PlanResult<FieldId>
+fn resolve_field_id<S, F>(schema: &S, name: &str, unknown_column: F) -> PlanResult<FieldId>
 where
+    S: SchemaView,
     F: Fn(&str) -> Error,
 {
     // Check for special rowid column
@@ -392,8 +398,7 @@ where
     }
 
     schema
-        .column_by_name(name)
-        .map(|column| column.field_id)
+        .field_id_by_name(name)
         .ok_or_else(|| unknown_column(name))
 }
 
@@ -403,12 +408,9 @@ pub fn resolve_field_id_from_schema(schema: &PlanSchema, name: &str) -> LlkvResu
         return Ok(ROW_ID_FIELD_ID);
     }
 
-    schema
-        .column_by_name(name)
-        .map(|column| column.field_id)
-        .ok_or_else(|| {
-            Error::InvalidArgumentError(format!(
-                "Binder Error: does not have a column named '{name}'"
-            ))
-        })
+    schema.field_id_by_name(name).ok_or_else(|| {
+        Error::InvalidArgumentError(format!(
+            "Binder Error: does not have a column named '{name}'"
+        ))
+    })
 }

@@ -22,4 +22,8 @@ where
     fn get_table(&self, canonical_name: &str) -> Result<Arc<ExecutorTable<P>>> {
         self.context.lookup_table(canonical_name)
     }
+
+    fn batch_approximate_row_counts(&self, tables: &[&str]) -> Result<Vec<Option<usize>>> {
+        self.context.batch_lookup_row_counts(tables)
+    }
 }

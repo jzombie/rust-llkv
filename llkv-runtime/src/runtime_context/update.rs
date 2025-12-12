@@ -11,9 +11,10 @@ use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use croaring::Treemap;
 use llkv_column_map::store::GatherNullPolicy;
-use llkv_executor::{ExecutorTable, build_array_for_column, resolve_insert_columns};
+use llkv_executor::{
+    ExecutorColumn, ExecutorTable, build_array_for_column, resolve_insert_columns,
+};
 use llkv_expr::{Expr as LlkvExpr, ScalarExpr};
-use llkv_plan::schema::PlanColumn as ExecutorColumn;
 use llkv_plan::translation;
 use llkv_plan::{AssignmentValue, ColumnAssignment, PlanValue, UpdatePlan};
 use llkv_result::{Error, Result};
@@ -96,13 +97,13 @@ where
             ));
         }
 
-        let schema = table.schema.as_ref();
-        let filter_expr = translation::expression::translate_predicate(filter, schema, |name| {
-            Error::InvalidArgumentError(format!(
-                "Binder Error: does not have a column named '{}'",
-                name
-            ))
-        })?;
+        let filter_expr =
+            translation::expression::translate_predicate(filter, table.schema.as_ref(), |name| {
+                Error::InvalidArgumentError(format!(
+                    "Binder Error: does not have a column named '{}'",
+                    name
+                ))
+            })?;
 
         // Use a map to track column assignments. If a column appears multiple times,
         // the last assignment wins (SQLite-compatible behavior).
@@ -127,7 +128,7 @@ where
                 AssignmentValue::Expression(expr) => {
                     let translated = translation::expression::translate_scalar_with(
                         &expr,
-                        schema,
+                        table.schema.as_ref(),
                         |name| {
                             Error::InvalidArgumentError(format!(
                                 "Binder Error: does not have a column named '{}'",
@@ -453,8 +454,6 @@ where
             });
         }
 
-        let schema = table.schema.as_ref();
-
         // SQLite allows duplicate column assignments (e.g., SET x=3, x=4, x=5)
         // and uses the rightmost value. We'll use a map to track the last assignment.
         let mut column_assignments: FxHashMap<String, (ExecutorColumn, PreparedAssignmentValue)> =
@@ -478,7 +477,7 @@ where
                 AssignmentValue::Expression(expr) => {
                     let translated = translation::expression::translate_scalar_with(
                         &expr,
-                        schema,
+                        table.schema.as_ref(),
                         |name| {
                             Error::InvalidArgumentError(format!(
                                 "Binder Error: does not have a column named '{}'",

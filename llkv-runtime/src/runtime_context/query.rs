@@ -10,6 +10,7 @@ use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use llkv_table::table::RowIdFilter;
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot};
+use llkv_types::QueryContext;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use super::{RuntimeContext, provider::ContextProvider};
 
 impl<P> RuntimeContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     /// Execute a SELECT plan while enforcing MVCC visibility rules.
     ///
@@ -28,11 +29,20 @@ where
         plan: SelectPlan,
         snapshot: TransactionSnapshot,
     ) -> Result<SelectExecution<P>> {
+        self.execute_select_with_ctx(plan, snapshot, &QueryContext::new())
+    }
+
+    pub(crate) fn execute_select_with_ctx(
+        self: &Arc<Self>,
+        plan: SelectPlan,
+        snapshot: TransactionSnapshot,
+        ctx: &QueryContext,
+    ) -> Result<SelectExecution<P>> {
         let provider: Arc<dyn ExecutorTableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
         });
 
-        let executor = QueryExecutor::new(provider);
+        let executor = QueryExecutor::with_default_planner(provider);
 
         // Check if any table in the query is from information_schema
         let is_information_schema = plan.tables.iter().any(|table_ref| {
@@ -51,6 +61,6 @@ where
             )) as Arc<dyn RowIdFilter<P>>)
         };
 
-        executor.execute_select_with_filter(plan, row_filter)
+        executor.execute_select_with_row_filter_ctx(plan, row_filter, ctx)
     }
 }

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use llkv_executor::{ExecutorRowBatch, SelectExecution};
+use arrow::record_batch::RecordBatch;
+use llkv_executor::SelectExecution;
 use llkv_expr::expr::Expr as LlkvExpr;
-use llkv_plan::{AggregateExpr, PlanValue, SelectFilter, SelectPlan, SelectProjection};
+use llkv_plan::{AggregateExpr, SelectFilter, SelectPlan, SelectProjection};
 use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -73,13 +74,9 @@ where
         self.context.execute_select(self.plan, snapshot)
     }
 
-    pub fn collect_rows(self) -> Result<ExecutorRowBatch> {
+    pub fn collect_batches(self) -> Result<Vec<RecordBatch>> {
         let snapshot = self.context.default_snapshot();
         let execution = self.context.execute_select(self.plan, snapshot)?;
-        execution.collect_rows()
-    }
-
-    pub fn collect_rows_vec(self) -> Result<Vec<Vec<PlanValue>>> {
-        Ok(self.collect_rows()?.rows)
+        execution.collect()
     }
 }

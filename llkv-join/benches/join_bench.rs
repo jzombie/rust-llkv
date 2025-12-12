@@ -2,24 +2,12 @@
 //!
 //! These benchmarks measure join performance with various data sizes and
 //! join types to guide optimization work.
-//!
-//! ## Current Status
-//!
-//! **Nested-loop join only**: O(N×M) complexity makes it impractical for large datasets.
-//! - 10K×10K = 100M comparisons (~1.5 seconds)
-//! - 100K×100K = 10B comparisons (~2.5 minutes)  
-//! - 1M×1M = 1T comparisons (hours - don't even try!)
-//!
-//! **TODO: Implement hash join** (O(N+M)) for production workloads:
-//! - 1M×1M would become ~2M operations (seconds instead of hours)
-//! - See `/Users/administrator/Projects/rust-llkv/llkv-join/src/hash_join.rs`
-//! - Once implemented, add `bench_hash_join_*` functions here for 100K, 1M, 10M row tests
 
 use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+use llkv_join::{JoinKey, JoinOptions, TableJoinRowIdExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::types::TableId;
@@ -110,8 +98,8 @@ fn bench_hash_join_inner_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -142,8 +130,8 @@ fn bench_hash_join_left_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -174,8 +162,8 @@ fn bench_hash_join_semi_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -206,8 +194,8 @@ fn bench_hash_join_anti_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+                    total_rows += index_batch.left_rows.len();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -242,8 +230,8 @@ fn bench_hash_join_many_to_many_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |batch| {
+                    total_rows += batch.left_batch.num_rows();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -275,8 +263,8 @@ fn bench_hash_join_no_matches_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |batch| {
+                    total_rows += batch.left_batch.num_rows();
                 })
                 .unwrap();
                 black_box(total_rows);

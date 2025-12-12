@@ -6,13 +6,13 @@
 //! lazy loading, and direct batch interactions.
 
 use crate::{RuntimeContext, RuntimeTableHandle, canonical_table_name};
-use arrow::array::{ArrayRef, RecordBatch, UInt64Builder};
+use arrow::array::{ArrayRef, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::{GatherNullPolicy, ROW_ID_COLUMN_NAME};
 use llkv_executor::{
-    ExecutorMultiColumnUnique, ExecutorRowBatch, ExecutorTable, TableStorageAdapter,
+    ExecutorColumn, ExecutorMultiColumnUnique, ExecutorSchema, ExecutorTable, TableStorageAdapter,
 };
-use llkv_plan::schema::{PlanColumn as ExecutorColumn, PlanSchema as ExecutorSchema};
 use llkv_plan::translation;
 use llkv_result::{Error, Result};
 use llkv_storage::pager::Pager;
@@ -34,11 +34,11 @@ impl<P> RuntimeContext<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
 {
-    /// Exports all rows from a table as a `RowBatch` - internal storage API.
+    /// Exports all rows from a table as Arrow batches - internal storage API.
     /// Use through `RuntimeSession` or `RuntimeTableHandle` instead.
-    pub(crate) fn export_table_rows(self: &Arc<Self>, name: &str) -> Result<ExecutorRowBatch> {
+    pub(crate) fn export_table_batches(self: &Arc<Self>, name: &str) -> Result<Vec<RecordBatch>> {
         let handle = RuntimeTableHandle::new(Arc::clone(self), name)?;
-        handle.lazy()?.collect_rows()
+        handle.lazy()?.collect_batches()
     }
 
     /// Get raw batches from a table including row_ids - internal storage API.
@@ -479,15 +479,56 @@ where
             );
         }
 
-        tracing::debug!(
-            "[LAZY_LOAD] Loaded table '{}' (id={}) with {} columns, next_row_id={}",
-            canonical_name,
-            table_id,
-            field_ids.len(),
-            next_row_id
-        );
-
         Ok(executor_table)
+    }
+
+    /// Batch lookup of approximate row counts for multiple tables.
+    ///
+    /// This method optimizes the lookup by:
+    /// 1. Checking the executor cache first (fastest).
+    /// 2. Resolving table IDs for uncached tables.
+    /// 3. Batch-fetching row counts from the column store for all uncached tables.
+    pub fn batch_lookup_row_counts(&self, tables: &[&str]) -> Result<Vec<Option<usize>>> {
+        let mut results = vec![None; tables.len()];
+        let mut uncached_indices = Vec::new();
+        let mut uncached_table_ids = Vec::new();
+
+        // 1. Check cache
+        {
+            let cache = self.tables.read().unwrap();
+            for (i, name) in tables.iter().enumerate() {
+                if let Some(table) = cache.get(*name) {
+                    results[i] = Some(table.total_rows.load(Ordering::Relaxed) as usize);
+                } else {
+                    // Resolve table ID
+                    if let Some(id) = self.catalog.table_id(name) {
+                        uncached_indices.push(i);
+                        uncached_table_ids.push(id);
+                    }
+                }
+            }
+        }
+
+        if uncached_indices.is_empty() {
+            return Ok(results);
+        }
+
+        // 2. Batch fetch from store
+        use llkv_column_map::store::rowid_fid;
+        let row_id_fields: Vec<LogicalFieldId> = uncached_table_ids
+            .iter()
+            .map(|&tid| rowid_fid(LogicalFieldId::for_user(tid, 0)))
+            .collect();
+
+        let store_counts = self.store.batch_total_rows_for_fields(&row_id_fields)?;
+
+        for (store_count, &original_idx) in store_counts.into_iter().zip(uncached_indices.iter()) {
+            if let Some(count) = store_count {
+                results[original_idx] = Some(count as usize);
+            }
+        }
+
+        Ok(results)
     }
 
     pub(super) fn build_executor_multi_column_uniques(

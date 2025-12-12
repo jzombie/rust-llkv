@@ -2,23 +2,31 @@
 //!
 //! This crate exposes shared types (`JoinKey`, `JoinType`, `JoinOptions`) used by the
 //! planner and runtime to negotiate join configuration. Execution currently routes
-//! through the hash join implementation in [`hash_join_stream`], with a placeholder for
+//! through the hash join implementation in [`hash_join_rowid_stream`], with a placeholder for
 //! alternate algorithms when they land.
 #![forbid(unsafe_code)]
 
-mod cartesian;
 mod hash_join;
 
-use arrow::array::RecordBatch;
+use arrow::array::ArrayRef;
+use arrow::array::BooleanArray;
+use arrow::record_batch::RecordBatch;
+
+use llkv_column_map::gather::{
+    gather_optional_projected_indices_from_batches, gather_projected_indices_from_batches,
+};
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
-use llkv_table::table::Table;
+use llkv_table::table::{RowIdFilter, Table};
 use llkv_table::types::FieldId;
 use simd_r_drive_entry_handle::EntryHandle;
+use std::collections::HashSet;
 use std::fmt;
 
-pub use cartesian::cross_join_pair;
-pub use hash_join::hash_join_stream;
+pub use hash_join::{HashJoinStream, hash_join_rowid_stream};
+
+/// Filter function for joins.
+pub type JoinFilter = Box<dyn Fn(&RecordBatch) -> LlkvResult<BooleanArray> + Send + Sync>;
 
 /// Type of join to perform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -123,6 +131,63 @@ pub struct JoinOptions {
     pub concurrency: usize,
 }
 
+/// Reference to a row in a specific batch (batch index, row index).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JoinRowRef {
+    pub batch: usize,
+    pub row: usize,
+}
+
+/// Batch of join output row references with access to source batches for zero-copy projection.
+pub struct JoinIndexBatch<'a> {
+    pub left_batch: &'a arrow::record_batch::RecordBatch,
+    pub left_rows: Vec<usize>,
+    pub right_rows: Vec<Option<JoinRowRef>>, // empty for SEMI/ANTI
+    pub right_batches: &'a [arrow::record_batch::RecordBatch],
+}
+
+/// Identify which side of a join to project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinSide {
+    Left,
+    Right,
+}
+
+/// Project a subset of columns for a join output batch without materializing the other side.
+///
+/// The helper preserves output row order and uses zero-copy slices when the row references
+/// describe contiguous ranges from a single batch. Sparse references fall back to batched
+/// `take` operations grouped by batch to limit Arrow allocations.
+pub fn project_join_columns(
+    batch: &JoinIndexBatch<'_>,
+    side: JoinSide,
+    projection: &[usize],
+) -> LlkvResult<Vec<ArrayRef>> {
+    match side {
+        JoinSide::Left => {
+            let rows: Vec<(usize, usize)> = batch
+                .left_rows
+                .iter()
+                .copied()
+                .map(|row| (0, row))
+                .collect();
+            gather_projected_indices_from_batches(
+                std::slice::from_ref(batch.left_batch),
+                &rows,
+                projection,
+            )
+        }
+        JoinSide::Right => {
+            let rows: Vec<Option<(usize, usize)>> = batch
+                .right_rows
+                .iter()
+                .map(|opt| opt.map(|row| (row.batch, row.row)))
+                .collect();
+            gather_optional_projected_indices_from_batches(batch.right_batches, &rows, projection)
+        }
+    }
+}
+
 impl Default for JoinOptions {
     fn default() -> Self {
         Self {
@@ -209,15 +274,23 @@ impl JoinOptions {
     }
 }
 
-// TODO: Build out more fully or remove
-// NOTE: Validation presently only asserts that zero keys implies a Cartesian
-// join. Extend this once the planner provides richer metadata about key
-// compatibility (equality types, null semantics, etc.).
 /// Validate join keys before execution.
 ///
-/// Note: Empty keys = cross product (Cartesian product).
-pub fn validate_join_keys(_keys: &[JoinKey]) -> LlkvResult<()> {
-    // Empty keys is valid for cross product
+/// Checks:
+/// - Keys are not empty (unless cross join is intended, but usually handled by planner).
+/// - No duplicate keys (same left and right field).
+pub fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
+    // Note: Empty keys are valid for cross product, so we don't error on empty.
+
+    let mut seen = HashSet::new();
+    for key in keys {
+        if !seen.insert((key.left_field, key.right_field)) {
+            return Err(Error::InvalidArgumentError(format!(
+                "Duplicate join key: left={}, right={}",
+                key.left_field, key.right_field
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -236,13 +309,12 @@ pub fn validate_join_options(options: &JoinOptions) -> LlkvResult<()> {
     Ok(())
 }
 
-/// Extension trait adding join operations to `Table`.
-pub trait TableJoinExt<P>
+/// Extension trait emitting join results as row-id pairs (zero-copy friendly).
+pub trait TableJoinRowIdExt<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    /// Join this table with another table based on equality predicates.
-    fn join_stream<F>(
+    fn join_rowid_stream<F>(
         &self,
         right: &Table<P>,
         keys: &[JoinKey],
@@ -250,14 +322,26 @@ where
         on_batch: F,
     ) -> LlkvResult<()>
     where
-        F: FnMut(RecordBatch);
+        F: FnMut(JoinIndexBatch<'_>);
+
+    fn join_rowid_stream_with_filter<F>(
+        &self,
+        right: &Table<P>,
+        keys: &[JoinKey],
+        options: &JoinOptions,
+        left_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        right_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(JoinIndexBatch<'_>);
 }
 
-impl<P> TableJoinExt<P> for Table<P>
+impl<P> TableJoinRowIdExt<P> for Table<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    fn join_stream<F>(
+    fn join_rowid_stream<F>(
         &self,
         right: &Table<P>,
         keys: &[JoinKey],
@@ -265,15 +349,46 @@ where
         on_batch: F,
     ) -> LlkvResult<()>
     where
-        F: FnMut(RecordBatch),
+        F: FnMut(JoinIndexBatch<'_>),
     {
         validate_join_keys(keys)?;
         validate_join_options(options)?;
 
         match options.algorithm {
             JoinAlgorithm::Hash => {
-                hash_join::hash_join_stream(self, right, keys, options, on_batch)
+                hash_join::hash_join_rowid_stream(self, right, keys, options, on_batch)
             }
+            JoinAlgorithm::SortMerge => Err(Error::Internal(
+                "Sort-merge join not yet implemented; use JoinAlgorithm::Hash".to_string(),
+            )),
+        }
+    }
+
+    fn join_rowid_stream_with_filter<F>(
+        &self,
+        right: &Table<P>,
+        keys: &[JoinKey],
+        options: &JoinOptions,
+        left_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        right_filter: Option<std::sync::Arc<dyn RowIdFilter<P>>>,
+        on_batch: F,
+    ) -> LlkvResult<()>
+    where
+        F: FnMut(JoinIndexBatch<'_>),
+    {
+        validate_join_keys(keys)?;
+        validate_join_options(options)?;
+
+        match options.algorithm {
+            JoinAlgorithm::Hash => hash_join::hash_join_rowid_stream_with_filters(
+                self,
+                right,
+                keys,
+                options,
+                left_filter,
+                right_filter,
+                on_batch,
+            ),
             JoinAlgorithm::SortMerge => Err(Error::Internal(
                 "Sort-merge join not yet implemented; use JoinAlgorithm::Hash".to_string(),
             )),
@@ -284,6 +399,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     #[test]
     fn test_join_key_constructors() {
@@ -321,6 +440,9 @@ mod tests {
 
         let keys = vec![JoinKey::new(1, 2)];
         assert!(validate_join_keys(&keys).is_ok());
+
+        let dup_keys = vec![JoinKey::new(1, 2), JoinKey::new(1, 2)];
+        assert!(validate_join_keys(&dup_keys).is_err());
     }
 
     #[test]
@@ -355,5 +477,69 @@ mod tests {
     fn test_join_algorithm_display() {
         assert_eq!(JoinAlgorithm::Hash.to_string(), "Hash");
         assert_eq!(JoinAlgorithm::SortMerge.to_string(), "SortMerge");
+    }
+
+    #[test]
+    fn project_join_columns_left_and_right() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Utf8, true)]));
+
+        let left_batch =
+            RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![11, 22]))])
+                .unwrap();
+        let right_batch = RecordBatch::try_new(
+            right_schema,
+            vec![Arc::new(StringArray::from(vec![Some("x"), Some("y")]))],
+        )
+        .unwrap();
+
+        let batch = JoinIndexBatch {
+            left_batch: &left_batch,
+            left_rows: vec![1],
+            right_rows: vec![Some(JoinRowRef { batch: 0, row: 0 })],
+            right_batches: std::slice::from_ref(&right_batch),
+        };
+
+        let left_cols = project_join_columns(&batch, JoinSide::Left, &[0]).unwrap();
+        let left_values = left_cols[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int column");
+        assert_eq!(left_values.values(), &[22]);
+
+        let right_cols = project_join_columns(&batch, JoinSide::Right, &[0]).unwrap();
+        let right_values = right_cols[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(right_values.value(0), "x");
+    }
+
+    #[test]
+    fn project_join_columns_optional_right() {
+        let left_schema = Arc::new(Schema::new(vec![Field::new("l", DataType::Int32, false)]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Utf8, true)]));
+
+        let left_batch =
+            RecordBatch::try_new(left_schema, vec![Arc::new(Int32Array::from(vec![5]))]).unwrap();
+        let right_batch = RecordBatch::try_new(
+            right_schema,
+            vec![Arc::new(StringArray::from(vec![Some("q")]))],
+        )
+        .unwrap();
+
+        let batch = JoinIndexBatch {
+            left_batch: &left_batch,
+            left_rows: vec![0],
+            right_rows: vec![None],
+            right_batches: std::slice::from_ref(&right_batch),
+        };
+
+        let right_cols = project_join_columns(&batch, JoinSide::Right, &[0]).unwrap();
+        let right_values = right_cols[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string column");
+        assert_eq!(right_values.null_count(), 1);
     }
 }

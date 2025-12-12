@@ -1,44 +1,105 @@
-[ ] Stop cloning whole parent tables for uniqueness/FK checks. Even after the UniqueKey refactor we still call scan_multi_column_values which materializes every parent row into Vec<Vec<PlanValue>>. That allocates ~150–200 MB per FK/unique constraint at scale 1 and lives until the batch finishes. Short-term fix: add an index-aware fetch path in RuntimeContext::scan_multi_column_values (or a sibling helper) that, when a UNIQUE/PK index exists, probes the index per candidate key instead of scanning/allocating the entire table. That alone cuts both runtime and RSS.
 
-[ ] Clear per-constraint caches as soon as a table finishes loading. ConstraintService::validate_insert_foreign_keys now builds FxHashSet<UniqueKey> per constraint but we hold them until the batch ends. When load_table_with_rows finishes a table, explicitly drop the cache (e.g., new ConstraintService::clear_fk_cache(table_id)), so the parent key sets from previous tables stop contributing to swap.
+# LLKV Performance Execution Plan (Vectorized, Fused, Zero-Copy)
 
-[x] Loader now resolves its batch size from the column-store write hints (and exposes `--batch-size` for overrides). Next step is to tweak the hint math instead of hard-coding constants when future tuning is required.
+## Non-Negotiable Principles
+- End-to-end vectorized pipelines: scans → filters → joins → projections → aggregates without per-operator materialization.
+- Late materialization: carry row-id sets through joins/filters; materialize columns only at projection/aggregate boundaries.
+- Zero-copy first: slices/offset-preserving views; avoid Arrow `take`/`concat` unless unavoidable; enforce zero-offset arrays.
+- Order-aware: track and preserve ordering; prefer merge paths when sorted; avoid re-sorts when LIMIT/OFFSET present.
+- Cost-based: use real stats (row counts, NDVs, min/max, histograms, index/sort flags) to pick join order, algorithm, and scan path.
+- Parallel and spill-safe: partitioned hash/merge joins and aggregates with bounded memory and columnar spill.
 
-[ ] Defer FK/unique enforcement for bulk loads. Add a “bulk load mode” flag that records candidate violations but skips per-row constraint checks until the end of the table (or even per transaction). Once the data is loaded, run a streaming validator that scans once per constraint. This keeps correctness but turns the hot inserts into linear appends with minimal extra memory.
+## Step-by-Step Plan (do in order, no rework)
+1) **Late-materialized joins (zero-copy core)**
+	- Change `llkv-join` to output row-id sets (batch_idx, row_idx[, right]) instead of `RecordBatch`es.
+	- Stash build/probe batches; no `take`/`concat` in join hot path.
+	- Add projection/view layer that maps row-id runs to zero-offset slices; fall back to a single index array only when non-contiguous.
+	- Apply post-join filters as bitmap operations on row-id sets before projection.
 
-[ ] Profile scan_multi_column_values with heaptrack/Instruments. The flamegraph still shows ~30% there. Instrument it with tracing::trace_span! + counters so you can confirm how many rows each constraint is reading and use that data to prioritize which parent tables need indexes or special-case logic.
+2) **Column-map zero-copy gather and buffer reuse**
+	- Ensure `gather_indices*` and varlen gathers detect contiguous/monotonic regions and return slices; keep offset-preserving slices for Utf8/Binary.
+	- Keep chunk buffers in `Arc<ArrayData>` caches; expose view-only gathers for reuse without copies.
 
-[x] Track pager churn and overwrite rates during large imports. Implemented via the pager diagnostics module (table spans plus totals) and now visible in the TPCH loader. Follow-up: reduce alloc/put batch counts by pooling key reservations so we are not making 1:1 alloc calls.
+3) **Executor integration + multi-table SELECT**
+	- Wire executor/planner to consume row-id join outputs and late-materialize projections/aggregates.
+	- Preserve MVCC row filters and ensure SELECT semantics/SLT stay green.
 
-[ ] Capture loader timing per stage: break load_table_with_rows into phases (row formatting, FK cache validation, INSERT execution, flush) and emit tracing spans or metrics. If the extra minute sits in SQL planning vs. storage writes, we’ll know.
+4) **Parallel, partitioned hash join with spill**
+	- Add radix/range partitioning; parallel build/probe; adaptive batch sizing.
+	- Implement bounded-memory hash table with columnar spill and rehash; keep join outputs as row-id sets.
 
-[ ] Tune hint math based on telemetry: once we see actual chunk sizes and pager churn, adjust ColumnStoreWriteHints::from_config (e.g., reduce recommended_insert_batch_rows only for varwidth-heavy tables, or grow TARGET_CHUNK_BYTES when the pager has headroom) instead of reverting to hard-coded defaults.
+5) **Ordering-aware pipeline + merge join**
+	- Propagate order metadata through scans/filters/projections/joins.
+	- Use existing sort indexes to satisfy ORDER BY/LIMIT without resort.
+	- Add merge join when both sides ordered on join keys; keep late materialization.
 
-[ ] Explore FK cache lifetime: now that batch sizes dropped, we can revisit dropping caches even earlier (per chunk) or parallelizing constraint checks; telemetry will show whether FK validation still dominates.
+6) **Stats and cost-based planning**
+	- Collect and persist row counts, NDVs, min/max, null counts, histograms, index/sort flags per column.
+	- Use costs to pick join order, join algo (hash vs merge), and scan path (sorted/index/range/full); prefer order-preserving plans when they save sorts.
 
-[ ] Optional follow-up: add a “fast path” for append-only tables with no FK/unique checks—if telemetry says constraint work is negligible, skip this; otherwise, this could reclaim the lost minute without raising memory.
+7) **Expression fusion + bitmap filters**
+	- Fuse scalar expressions and predicates into vectorized kernels; keep bool masks as bitmaps.
+	- Specialize hot shapes (arith + compare, COALESCE/CASE) for SIMD types; avoid per-row branching.
 
-[ ] Batch pager key allocations. Current diagnostics show alloc_batches == physical_allocs because upstream layers call `alloc_many(1)` per chunk. Introduce small key pools (per ColumnWriter or reservation helper) so we request dozens/hundreds of keys at a time, which should shrink alloc batch counts and pager contention.
+8) **Aggregations: partitioned + spill-safe**
+	- Two-phase (partial/final) grouped aggregation over row-id streams; partitioned hash agg with spill.
+	- Maintain late materialization for non-agg columns; output zero-copy slices when possible.
 
-[ ] Unify ORDER BY comparator support. Int32 sorting now works after a targeted executor/planner patch, but we still maintain ad-hoc allowlists per type. Add a single comparator registry (or value-normalization helper) so ORDER BY automatically supports every scalar type with comparison semantics and we never repeat this fix.
+9) **I/O and prefetch**
+	- Add async/page prefetch for scans; tune batch sizes to cache; enable compressed page caching.
+	- Avoid duplicate decompression when buffers are reused for projection.
 
+10) **Validation and perf targets**
+	 - Keep SLT and workspace tests green after each major step.
+	 - Add micro/TPCH benches: require parity or better vs prior commit; target within competitive range of DuckDB/DataFusion for comparable workloads.
 
-=====
+## Success Criteria
+- Joins and projections do not allocate new buffers on hot paths when inputs are sliceable.
+- Parallel hash join and agg stay bounded with spill, remain columnar.
+- ORDER BY/LIMIT prefers existing order/sort indexes; merge join path active when sorted inputs exist.
+- Cost-based planner chooses plans using collected stats and avoids unnecessary sorts/scans.
+- Benchmarks show no regressions and trend toward DataFusion/DuckDB performance class.
 
-## Bulk ingest parity plan (target: ≤15 s SF1 on laptop)
+## End-to-end performance blueprint (no future refactor passes)
 
-[ ] **Arrow-native batch ingest.** Replace the loader's `Vec<Vec<PlanValue>>` batches with Arrow `RecordBatch` producers and add `InsertSource::ArrowBatch` so the runtime receives typed column data directly. Executor must feed those batches through the existing `TableInserter` path so foreign keys, uniques, and triggers still fire.
+- Vectorized, fused pipelines: scans → filters → joins → projections without intermediate materialization; fuse scalar expressions, comparisons, and casts into batch kernels; prefer SIMD-aware kernels for int/float/utf8 and keep bool masks as bitmaps.
+- Parallel + partitioned operators: parallel scan with chunk prefetch; partitioned hash join (radix or range) with build/probe in parallel and adaptive batch sizing; streaming/partitioned group-by with two-phase aggregation; spill paths that stay columnar and zero-copy slice-friendly.
+- Cost-based planning with real stats: collect row counts, NDVs, min/max, null counts, histograms, sortedness flags, and index metadata; pick join order, join type (hash vs merge), and scan path (sorted/range/index/full) via costs; exploit existing ordering to skip sorts.
+- Ordering-aware execution: choose merge join when inputs sorted; propagate order metadata through projections/filters; avoid resorting when LIMIT/OFFSET present; keep sort indexes hot for ORDER BY/LIMIT.
+- Late materialization everywhere: carry row-id sets through joins/filters; only materialize projected columns at the edge or for aggregates that truly need data; apply post-join filters on row-id bitmaps before projection.
+- Projection/scan zero-copy: push slices down; varlen columns keep offset-preserving slices; reuse buffer pools/arenas; enforce zero-offset slices to avoid kernel slow paths.
+- Memory + spill discipline: bounded hash tables with partition + spill; reuse buffers; compact bitmaps; avoid per-batch allocs in hot loops; keep caches in `Arc<ArrayData>` to enable zero-copy sharing across operators.
+- Expression engine: specialize common shapes (arith + comparisons, COALESCE/CASE) and avoid per-row branching; optional codegen/JIT tier for hot pipelines if profiling shows a gap versus DuckDB/DataFusion.
+- I/O throughput: async/page prefetch on scans; wide batches tuned to cache; compressed page caching; avoid redundant decompression on reuse.
 
-[ ] **Column-store slice appends.** Extend `ColumnStore`/`ColumnWriter` with an `append_batch` API that ingests entire Arrow arrays (or contiguous slices) per column. This removes the per-value descriptor lookups visible in Instruments and is required to make Arrow-native batches pay off.
+Implementation order to avoid rework
+1) Make joins late-materialized and zero-copy (row-id streams + slice-first projection) and keep existing semantics green.
+2) Add parallel + partitioned hash join with spill; keep zero-copy projection on top of row-id outputs.
+3) Wire ordering metadata and merge-join path; exploit existing sort indexes for ORDER BY/LIMIT; keep order through pipelines.
+4) Introduce stats collection + cost-based join ordering/scan selection; use stats in planner to pick algorithms.
+5) Fuse expression kernels and bitmap filters end-to-end; ensure projection/filter stays vectorized on row-id sets.
+6) Add buffer reuse pools and enforce zero-offset slices across column-map/storage.
+7) Add spill-safe, partitioned group-by/aggregate and keep late materialization for non-agg columns.
+8) Profile; add specialization/codegen only if gaps remain vs DuckDB/DataFusion baselines.
 
-[ ] **Constraint-friendly bulk mode.** Keep FK/unique enforcement correct while avoiding per-row scans by (a) logging candidate keys during insert, (b) running streaming validators once the batch completes, and (c) integrating with the existing FK cache lifetime controls. This combines with the deferred-enforcement checkbox above.
+## Recent profiling notes (select4)
+- Hot path is predicate evaluation in `llkv_scan::predicate` (`collect_row_ids_for_compare`/`in_list` and Treemap ops); many compares take the full-scan domain path because COALESCE/complex shapes survive pushdown.
+- Multi-field domains are built in fixed order; we should pick the most selective field first (stats-guided) and short-circuit empties to avoid wide domains.
+- Single-column literal `IN` falls back to per-chunk Arrow eval; fuse these into a single `filter_leaf`/`filter_fused` call to avoid repeated gathers/coercions.
+- Rayon overhead from `CHUNK_SIZE=4096` shows up; bump chunk size or make it adaptive to reduce task churn and Treemap merges.
+- Hash join still materializes the entire right side before build; needs chunked/streamed build to cut wall time and peak memory.
+- Planner should keep complex expressions (COALESCE/CASE) out of storage pushdown so we stay on single-column leaf filters where possible.
 
-[ ] **FK cache instrumentation + tuning.** Add tracing around `enable_fk_cache_for_table`/`clear_fk_cache_for_table` to confirm cache reuse. If caches churn every batch, introduce per-table reuse windows or chunk-level invalidation.
+## Concerns (TODOs)
 
-[ ] **Parallel table loading.** Allow independent tables (REGION/NATION/SUPPLIER/CUSTOMER) to load concurrently once the loader emits Arrow batches. Rayon-style task fan-out should be enough; coordination layer must keep schema install + FK ordering deterministic.
-
-[ ] **I/O + tpchgen profiling.** Run `fs_usage`/`iostat` + tpchgen timing to guarantee we are CPU-bound. If file generation dominates, precompute `.tbl` files or pipe from `tpchgen --threads` so we benchmark the storage stack rather than the generator.
-
-[ ] **Benchmark harness + regression targets.** Add a `cargo bench -p llkv-tpch --bench ingest` (or a Criterion harness) that loads SF0.1, SF1, and SF10, recording wall-clock + rows/sec. Track these against DuckDB COPY numbers so we know when we close the gap.
-
-[ ] **Optional fast path:** once Arrow batches land, expose an “unsafe” bulk-ingest toggle for tables without FK/unique constraints. This lets append-only analytical tables skip even the deferred checks when the user opts in.
+- Table & column resolvers seem duplicated between llkv-table, llkv-executor, llkv-plan
+- `HashMap/Set` usage instead of `FxHashMap/Set`
+- `llkv-join`'s streaming vs. non-streaming joins (remove the non-used)
+- Hardcoded batch size in streaming join
+- Previous compile paths, are they still used at all?
+- Perf overhead from potentially using TreeMap in the wrong places
+- Hardcoded column range greater than 10,000 (magic number reserved) for internal usage [can these be offloaded to a temp table with a zero-additional-cost perf somehow]?
+- Table resolver logic should be centralized
+- `expr_to_scalar_expr` should probably be moved to llkv-expr
+- `field_id` hardcodings when they should use constant defined in `llkv-column-map`
+  

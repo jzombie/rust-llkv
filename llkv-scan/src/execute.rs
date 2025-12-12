@@ -57,12 +57,6 @@ where
     S: ScanStorage<P>,
     F: FnMut(RecordBatch),
 {
-    if projections.is_empty() {
-        return Err(Error::InvalidArgumentError(
-            "scan requires at least one projection".into(),
-        ));
-    }
-
     // Determine projection evaluation plan and output schema.
     let mut projection_evals = Vec::with_capacity(projections.len());
     let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
@@ -392,4 +386,183 @@ fn build_projection_literals(
             },
         })
         .collect()
+}
+
+/// Prepare a scan stream for execution.
+///
+/// This function analyzes the projections and filter, determines the row source,
+/// and builds a `ScanRowStream`.
+pub fn prepare_scan_stream<'expr, P, S>(
+    storage: S,
+    table_id: llkv_types::TableId,
+    projections: &[ScanProjection],
+    filter_expr: &Expr<'expr, FieldId>,
+    options: ScanStreamOptions<P>,
+) -> LlkvResult<crate::row_stream::ScanRowStream<P, S>>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+    S: ScanStorage<P> + Clone,
+{
+    if projections.is_empty() {
+        return Err(Error::InvalidArgumentError(
+            "scan requires at least one projection".into(),
+        ));
+    }
+
+    // Determine projection evaluation plan and output schema.
+    let mut projection_evals = Vec::with_capacity(projections.len());
+    let mut unique_index: FxHashMap<LogicalFieldId, usize> = FxHashMap::default();
+    let mut unique_lfids: Vec<LogicalFieldId> = Vec::new();
+    let mut numeric_fields: FxHashSet<FieldId> = FxHashSet::default();
+    let mut lfid_dtypes: FxHashMap<LogicalFieldId, DataType> = FxHashMap::default();
+
+    for proj in projections {
+        match proj {
+            ScanProjection::Column(p) => {
+                let lfid = p.logical_field_id;
+                let dtype = storage.field_data_type(lfid)?;
+                if let std::collections::hash_map::Entry::Vacant(entry) = unique_index.entry(lfid) {
+                    entry.insert(unique_lfids.len());
+                    unique_lfids.push(lfid);
+                }
+                let fallback = lfid.field_id().to_string();
+                let output_name = p.alias.clone().unwrap_or(fallback);
+                projection_evals.push(ProjectionEval::Column(ColumnProjectionInfo {
+                    logical_field_id: lfid,
+                    data_type: dtype,
+                    output_name,
+                }));
+            }
+            ScanProjection::Computed { expr, alias } => {
+                let simplified = ScalarEvaluator::simplify(expr);
+                let mut fields_set: FxHashSet<FieldId> = FxHashSet::default();
+                ScalarEvaluator::collect_fields(&simplified, &mut fields_set);
+                for fid in fields_set.iter().copied() {
+                    numeric_fields.insert(fid);
+                    let lfid = LogicalFieldId::for_user(table_id, fid);
+                    let dtype = storage.field_data_type(lfid)?;
+                    lfid_dtypes.entry(lfid).or_insert_with(|| dtype.clone());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        unique_index.entry(lfid)
+                    {
+                        entry.insert(unique_lfids.len());
+                        unique_lfids.push(lfid);
+                    }
+                }
+                projection_evals.push(ProjectionEval::Computed(ComputedProjectionInfo {
+                    expr: simplified,
+                    alias: alias.clone(),
+                }));
+            }
+        }
+    }
+
+    let passthrough_fields: Vec<Option<FieldId>> = projection_evals
+        .iter()
+        .map(|eval| match eval {
+            ProjectionEval::Computed(info) => ScalarEvaluator::passthrough_column(&info.expr),
+            _ => None,
+        })
+        .collect();
+
+    let mut schema_fields: Vec<Field> = Vec::with_capacity(projection_evals.len());
+    for (idx, eval) in projection_evals.iter().enumerate() {
+        match eval {
+            ProjectionEval::Column(info) => schema_fields.push(Field::new(
+                info.output_name.clone(),
+                info.data_type.clone(),
+                true,
+            )),
+            ProjectionEval::Computed(info) => {
+                if let Some(fid) = passthrough_fields[idx] {
+                    let lfid = LogicalFieldId::for_user(table_id, fid);
+                    let dtype = lfid_dtypes
+                        .get(&lfid)
+                        .cloned()
+                        .ok_or_else(|| Error::Internal("missing dtype for passthrough".into()))?;
+                    schema_fields.push(Field::new(info.alias.clone(), dtype, true));
+                } else {
+                    let dtype = infer_computed_dtype(&info.expr, table_id, &lfid_dtypes)?;
+                    schema_fields.push(Field::new(info.alias.clone(), dtype, true));
+                }
+            }
+        }
+    }
+    let out_schema = Arc::new(Schema::new(schema_fields));
+
+    let requires_numeric = projection_evals.iter().enumerate().any(|(idx, eval)| {
+        matches!(
+            eval,
+            ProjectionEval::Computed(info)
+            if passthrough_fields[idx].is_none()
+                && computed_expr_requires_numeric(&info.expr)
+        )
+    });
+
+    let null_policy = if options.include_nulls {
+        GatherNullPolicy::IncludeNulls
+    } else {
+        GatherNullPolicy::DropNulls
+    };
+
+    let ScanStreamOptions {
+        include_nulls: _,
+        order,
+        row_id_filter,
+        include_row_ids,
+        ranges: _,
+        driving_column: _,
+    } = options;
+
+    let can_stream_full_table = !include_row_ids
+        && row_id_filter.is_none()
+        && order.is_none()
+        && filter_expr.is_trivially_true();
+
+    let mut row_source = if can_stream_full_table {
+        RowIdSource::Bitmap(storage.all_row_ids()?)
+    } else {
+        RowIdSource::Bitmap(storage.filter_row_ids(filter_expr)?)
+    };
+
+    if row_id_filter.is_some() || order.is_some() {
+        let mut bitmap = match row_source {
+            RowIdSource::Bitmap(b) => b,
+            RowIdSource::Vector(v) => Treemap::from_iter(v),
+        };
+
+        if let Some(filter) = row_id_filter.as_ref() {
+            bitmap = filter.filter(table_id, &storage, bitmap)?;
+        }
+
+        row_source = if let Some(order_spec) = order {
+            let sorted = sort_row_ids_with_order(&storage, &bitmap, order_spec)?;
+            RowIdSource::Vector(sorted)
+        } else {
+            RowIdSource::Bitmap(bitmap)
+        };
+    }
+
+    let projection_evals = Arc::new(projection_evals);
+    let passthrough_fields = Arc::new(passthrough_fields);
+    let unique_index = Arc::new(unique_index);
+    let unique_lfids = Arc::new(unique_lfids);
+    let numeric_fields = Arc::new(numeric_fields);
+
+    RowStreamBuilder::new(
+        storage,
+        table_id,
+        Arc::clone(&out_schema),
+        Arc::clone(&unique_lfids),
+        Arc::clone(&projection_evals),
+        Arc::clone(&passthrough_fields),
+        Arc::clone(&unique_index),
+        Arc::clone(&numeric_fields),
+        requires_numeric,
+        null_policy,
+        row_source,
+        ROW_STREAM_CHUNK_SIZE,
+        include_row_ids,
+    )
+    .build()
 }

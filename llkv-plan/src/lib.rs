@@ -12,34 +12,37 @@
 //! only need a subset of the functionality.
 #![forbid(unsafe_code)]
 
+pub mod aggregate_rewrite;
 pub mod canonical;
 pub mod conversion;
-pub mod physical;
+pub mod logical_planner;
 pub mod plan_graph;
-pub mod planner;
+pub mod prepared;
+pub mod table_provider;
+// pub mod planner;
 pub mod plans;
 pub mod schema;
-pub mod translation;
-// pub mod program; // Moved to llkv-compute
 pub mod subquery_correlation;
 pub mod table_scan;
+pub mod translation;
 pub mod traversal;
 pub mod validation;
 
 pub use canonical::canonical_scalar_from_plan_value;
 pub use conversion::{RangeSelectRows, extract_rows_from_range};
 pub use llkv_compute::interval::parse_interval_literal;
-pub use llkv_compute::{
-    add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
-};
-pub use llkv_types::{CanonicalRow, CanonicalScalar};
-pub use plan_graph::*;
-pub use plans::*;
-// pub mod program; // Moved to llkv-compute
 pub use llkv_compute::program::{
     DomainOp, DomainProgram, DomainProgramId, EvalOp, OwnedFilter, OwnedOperator, ProgramCompiler,
     ProgramSet, normalize_predicate,
 };
+pub use llkv_compute::{
+    add_interval_to_date32, parse_date32_literal, subtract_interval_from_date32,
+};
+pub use llkv_types::{CanonicalRow, CanonicalScalar};
+pub use logical_planner::*;
+pub use plan_graph::*;
+pub use plans::*;
+pub use prepared::*;
 pub use subquery_correlation::{
     SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,
     SubqueryCorrelatedTracker, subquery_correlated_placeholder,

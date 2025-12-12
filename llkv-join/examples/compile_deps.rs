@@ -5,7 +5,7 @@ use arrow::array::{Int32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use llkv_column_map::store::ROW_ID_COLUMN_NAME;
-use llkv_join::{JoinKey, JoinOptions, TableJoinExt};
+use llkv_join::{JoinKey, JoinOptions, TableJoinRowIdExt};
 use llkv_storage::pager::MemPager;
 use llkv_table::Table;
 use llkv_table::types::TableId;
@@ -55,8 +55,8 @@ fn main() {
 
     // use a mutable named closure so it compiles in both generic and trait-object variants
     let mut total = 0usize;
-    left.join_stream(&right, &keys, &options, |batch| {
-        total += batch.num_rows();
+    left.join_rowid_stream(&right, &keys, &options, |index_batch| {
+        total += index_batch.left_rows.len();
     })
     .unwrap();
 

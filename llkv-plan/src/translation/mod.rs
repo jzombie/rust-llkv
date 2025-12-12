@@ -1,6 +1,7 @@
 pub mod expression;
 pub mod projection;
 pub mod schema;
+pub mod schema_view;
 pub mod types;
 
 pub use expression::{
@@ -9,4 +10,5 @@ pub use expression::{
 };
 pub use projection::{build_projected_columns, build_wildcard_projections};
 pub use schema::schema_for_projections;
+pub use schema_view::SchemaView;
 pub use types::sql_type_to_arrow;

@@ -81,6 +81,9 @@ jobs:
         run: cargo test --workspace --all-features --lib --bins --tests --examples -- --include-ignored
         env:
           LLKV_SLT_STATS: 1
+          LLKV_SLT_NO_FAIL_FAST: 1
+          # Generally this is *really* slow, but testing all features results in a lot of `perf-mon` noise.
+          LLKV_PERF_SLOW_MS: 1000
 
   test:
     name: test

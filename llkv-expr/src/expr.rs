@@ -9,11 +9,13 @@
 
 pub use crate::literal::*;
 use arrow::datatypes::DataType;
-use std::ops::Bound;
+use std::ops::{Bound, Deref};
+use std::sync::Arc;
 
 /// Logical expression over predicates.
 #[derive(Clone, Debug)]
 pub enum Expr<'a, F> {
+    // TODO: Back vectors w/ Arc?
     And(Vec<Expr<'a, F>>),
     Or(Vec<Expr<'a, F>>),
     Not(Box<Expr<'a, F>>),
@@ -181,6 +183,22 @@ pub enum ScalarExpr<F> {
     Random,
 }
 
+/// Trait for types that can be mapped over a generic parameter `F`.
+pub trait Mappable<F>: Sized {
+    type Output<T>;
+
+    fn try_map<T, E, Func>(self, mut f: Func) -> Result<Self::Output<T>, E>
+    where
+        Func: FnMut(F) -> Result<T, E>,
+    {
+        self.try_map_ref(&mut f)
+    }
+
+    fn try_map_ref<T, E, Func>(self, f: &mut Func) -> Result<Self::Output<T>, E>
+    where
+        Func: FnMut(F) -> Result<T, E>;
+}
+
 /// Aggregate function call within a scalar expression.
 ///
 /// Each variant (except `CountStar`) operates on an expression rather than just a column.
@@ -212,6 +230,49 @@ pub enum AggregateCall<F> {
         distinct: bool,
         separator: Option<String>,
     },
+}
+
+impl<F> Mappable<F> for AggregateCall<F> {
+    type Output<T> = AggregateCall<T>;
+
+    fn try_map_ref<T, E, Func>(self, f: &mut Func) -> Result<AggregateCall<T>, E>
+    where
+        Func: FnMut(F) -> Result<T, E>,
+    {
+        match self {
+            AggregateCall::CountStar => Ok(AggregateCall::CountStar),
+            AggregateCall::Count { expr, distinct } => Ok(AggregateCall::Count {
+                expr: Box::new(expr.try_map_ref(f)?),
+                distinct,
+            }),
+            AggregateCall::Sum { expr, distinct } => Ok(AggregateCall::Sum {
+                expr: Box::new(expr.try_map_ref(f)?),
+                distinct,
+            }),
+            AggregateCall::Total { expr, distinct } => Ok(AggregateCall::Total {
+                expr: Box::new(expr.try_map_ref(f)?),
+                distinct,
+            }),
+            AggregateCall::Avg { expr, distinct } => Ok(AggregateCall::Avg {
+                expr: Box::new(expr.try_map_ref(f)?),
+                distinct,
+            }),
+            AggregateCall::Min(expr) => Ok(AggregateCall::Min(Box::new(expr.try_map_ref(f)?))),
+            AggregateCall::Max(expr) => Ok(AggregateCall::Max(Box::new(expr.try_map_ref(f)?))),
+            AggregateCall::CountNulls(expr) => {
+                Ok(AggregateCall::CountNulls(Box::new(expr.try_map_ref(f)?)))
+            }
+            AggregateCall::GroupConcat {
+                expr,
+                distinct,
+                separator,
+            } => Ok(AggregateCall::GroupConcat {
+                expr: Box::new(expr.try_map_ref(f)?),
+                distinct,
+                separator,
+            }),
+        }
+    }
 }
 
 impl<F> ScalarExpr<F> {
@@ -304,6 +365,99 @@ impl<F> ScalarExpr<F> {
     pub fn random() -> Self {
         Self::Random
     }
+
+    pub fn contains_aggregate(&self) -> bool {
+        match self {
+            ScalarExpr::Aggregate(_) => true,
+            ScalarExpr::Binary { left, right, .. } | ScalarExpr::Compare { left, right, .. } => {
+                left.contains_aggregate() || right.contains_aggregate()
+            }
+            ScalarExpr::Not(e)
+            | ScalarExpr::Cast { expr: e, .. }
+            | ScalarExpr::IsNull { expr: e, .. }
+            | ScalarExpr::GetField { base: e, .. } => e.contains_aggregate(),
+            ScalarExpr::Coalesce(items) => items.iter().any(|e| e.contains_aggregate()),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                operand.as_ref().is_some_and(|o| o.contains_aggregate())
+                    || branches
+                        .iter()
+                        .any(|(w, t)| w.contains_aggregate() || t.contains_aggregate())
+                    || else_expr.as_ref().is_some_and(|e| e.contains_aggregate())
+            }
+            _ => false,
+        }
+    }
+}
+
+impl<F> Mappable<F> for ScalarExpr<F> {
+    type Output<T> = ScalarExpr<T>;
+
+    fn try_map_ref<T, E, Func>(self, f: &mut Func) -> Result<ScalarExpr<T>, E>
+    where
+        Func: FnMut(F) -> Result<T, E>,
+    {
+        match self {
+            ScalarExpr::Column(field) => Ok(ScalarExpr::Column(f(field)?)),
+            ScalarExpr::Literal(lit) => Ok(ScalarExpr::Literal(lit)),
+            ScalarExpr::Binary { left, op, right } => Ok(ScalarExpr::Binary {
+                left: Box::new(left.try_map_ref(f)?),
+                op,
+                right: Box::new(right.try_map_ref(f)?),
+            }),
+            ScalarExpr::Not(expr) => Ok(ScalarExpr::Not(Box::new(expr.try_map_ref(f)?))),
+            ScalarExpr::IsNull { expr, negated } => Ok(ScalarExpr::IsNull {
+                expr: Box::new(expr.try_map_ref(f)?),
+                negated,
+            }),
+            ScalarExpr::Aggregate(call) => Ok(ScalarExpr::Aggregate(call.try_map_ref(f)?)),
+            ScalarExpr::GetField { base, field_name } => Ok(ScalarExpr::GetField {
+                base: Box::new(base.try_map_ref(f)?),
+                field_name,
+            }),
+            ScalarExpr::Cast { expr, data_type } => Ok(ScalarExpr::Cast {
+                expr: Box::new(expr.try_map_ref(f)?),
+                data_type,
+            }),
+            ScalarExpr::Compare { left, op, right } => Ok(ScalarExpr::Compare {
+                left: Box::new(left.try_map_ref(f)?),
+                op,
+                right: Box::new(right.try_map_ref(f)?),
+            }),
+            ScalarExpr::Coalesce(exprs) => {
+                let mapped_exprs = exprs
+                    .into_iter()
+                    .map(|e| e.try_map_ref(f))
+                    .collect::<Result<Vec<_>, E>>()?;
+                Ok(ScalarExpr::Coalesce(mapped_exprs))
+            }
+            ScalarExpr::ScalarSubquery(subquery) => Ok(ScalarExpr::ScalarSubquery(subquery)),
+            ScalarExpr::Case {
+                operand,
+                branches,
+                else_expr,
+            } => {
+                let operand = operand.map(|o| o.try_map_ref(f)).transpose()?.map(Box::new);
+                let branches = branches
+                    .into_iter()
+                    .map(|(w, t)| Ok((w.try_map_ref(f)?, t.try_map_ref(f)?)))
+                    .collect::<Result<Vec<_>, E>>()?;
+                let else_expr = else_expr
+                    .map(|e| e.try_map_ref(f))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(ScalarExpr::Case {
+                    operand,
+                    branches,
+                    else_expr,
+                })
+            }
+            ScalarExpr::Random => Ok(ScalarExpr::Random),
+        }
+    }
 }
 
 /// Arithmetic operator for [`ScalarExpr`].
@@ -371,8 +525,7 @@ pub struct Filter<'a, F> {
 
 /// Comparison/matching operators over untyped `Literal`s.
 ///
-/// `In` accepts a borrowed slice of `Literal`s to avoid allocations in the
-/// common case of small, static IN lists built at call sites.
+/// `In` uses [`InList`] to avoid repeated deep clones when predicates are copied.
 #[derive(Debug, Clone)]
 pub enum Operator<'a> {
     Equals(Literal),
@@ -384,7 +537,7 @@ pub enum Operator<'a> {
     GreaterThanOrEquals(Literal),
     LessThan(Literal),
     LessThanOrEquals(Literal),
-    In(&'a [Literal]),
+    In(InList<'a>),
     StartsWith {
         pattern: String,
         case_sensitive: bool,
@@ -399,6 +552,37 @@ pub enum Operator<'a> {
     },
     IsNull,
     IsNotNull,
+}
+
+/// IN-list storage with cheap cloning.
+#[derive(Debug, Clone)]
+pub enum InList<'a> {
+    Borrowed(&'a [Literal]),
+    Shared(Arc<[Literal]>),
+}
+
+impl<'a> InList<'a> {
+    #[inline]
+    pub fn borrowed(values: &'a [Literal]) -> Self {
+        InList::Borrowed(values)
+    }
+
+    #[inline]
+    pub fn shared(values: Vec<Literal>) -> Self {
+        InList::Shared(values.into())
+    }
+}
+
+impl<'a> Deref for InList<'a> {
+    type Target = [Literal];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            InList::Borrowed(slice) => slice,
+            InList::Shared(arc) => arc.as_ref(),
+        }
+    }
 }
 
 impl<'a> Operator<'a> {
@@ -474,7 +658,7 @@ mod tests {
         let in_values = ["x".into(), "y".into(), "z".into()];
         let f3 = Filter {
             field_id: 3u32,
-            op: Operator::In(&in_values),
+            op: Operator::In(InList::borrowed(&in_values)),
         };
         let f4 = Filter {
             field_id: 4u32,
@@ -667,7 +851,7 @@ mod tests {
         let in_values = ["aa".into(), "bb".into(), "cc".into()];
         let f_in = Filter {
             field_id: 9u32,
-            op: Operator::In(&in_values),
+            op: Operator::In(InList::borrowed(&in_values)),
         };
         match f_in.op {
             Operator::In(arr) => {

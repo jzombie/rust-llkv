@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use llkv_runtime::{
     AggregateExpr, InsertConflictAction, InsertPlan, InsertSource, PlanValue, RuntimeContext,
@@ -38,21 +39,35 @@ fn fluent_create_insert_select() {
         }
     ));
 
-    let rows = table
+    let batches = table
         .lazy()
         .expect("lazy scan")
         .select_columns(["id", "name"])
-        .collect_rows_vec()
-        .expect("collect rows");
+        .collect_batches()
+        .expect("collect batches");
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows,
-        vec![
-            vec![PlanValue::Integer(1), PlanValue::String("alice".into())],
-            vec![PlanValue::Integer(2), PlanValue::String("bob".into())]
-        ]
-    );
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .expect("non-empty batches");
+    let combined = arrow::compute::concat_batches(&schema, batches.iter()).expect("concat batches");
+    let ids = combined
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column");
+    let names = combined
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name column");
+
+    let mut rows = Vec::new();
+    for idx in 0..combined.num_rows() {
+        rows.push((ids.value(idx), names.value(idx).to_string()));
+    }
+
+    assert_eq!(rows, vec![(1, "alice".into()), (2, "bob".into())]);
 }
 
 #[test]
@@ -86,8 +101,17 @@ fn fluent_transaction_flow() {
         }
     ));
 
-    let rows = session.table_rows("numbers").expect("session rows");
-    assert_eq!(rows, vec![vec![PlanValue::Integer(41)]]);
+    let rows = session.table_batches("numbers").expect("session rows");
+    let row_schema = rows.first().map(|b| b.schema()).expect("non-empty batches");
+    let combined =
+        arrow::compute::concat_batches(&row_schema, rows.iter()).expect("concat batches");
+    let values = combined
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("numbers column");
+    assert_eq!(values.len(), 1);
+    assert_eq!(values.value(0), 41);
 
     let commit = session.commit_transaction().expect("commit");
     assert!(matches!(
@@ -97,19 +121,43 @@ fn fluent_transaction_flow() {
         }
     ));
 
-    let persisted_rows = table
+    let persisted_batches = table
         .lazy()
         .expect("lazy scan")
         .select_columns(["n"])
-        .collect_rows_vec()
+        .collect_batches()
         .expect("rows");
-    assert_eq!(persisted_rows, vec![vec![PlanValue::Integer(41)]]);
+    let persisted_schema = persisted_batches
+        .first()
+        .map(|b| b.schema())
+        .expect("non-empty batches");
+    let persisted = arrow::compute::concat_batches(&persisted_schema, persisted_batches.iter())
+        .expect("concat batches");
+    let persisted_values = persisted
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("numbers column");
+    assert_eq!(persisted_values.len(), 1);
+    assert_eq!(persisted_values.value(0), 41);
 
-    let aggregate_rows = table
+    let aggregate_batches = table
         .lazy()
         .expect("lazy scan")
         .aggregate(vec![AggregateExpr::sum_int64("n", "sum")])
-        .collect_rows_vec()
+        .collect_batches()
         .expect("aggregate rows");
-    assert_eq!(aggregate_rows, vec![vec![PlanValue::Integer(41)]]);
+    let aggregate_schema = aggregate_batches
+        .first()
+        .map(|b| b.schema())
+        .expect("non-empty batches");
+    let aggregate = arrow::compute::concat_batches(&aggregate_schema, aggregate_batches.iter())
+        .expect("concat batches");
+    let sum_values = aggregate
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sum column");
+    assert_eq!(sum_values.len(), 1);
+    assert_eq!(sum_values.value(0), 41);
 }

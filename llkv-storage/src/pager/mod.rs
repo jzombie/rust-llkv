@@ -23,7 +23,7 @@ pub mod simd_r_drive_pager;
 pub use simd_r_drive_pager::*;
 
 /// A thin wrapper that allows any `Pager` implementation to be stored behind an `Arc`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BoxedPager {
     inner: Arc<dyn Pager<Blob = EntryHandle> + Send + Sync>,
 }
@@ -86,7 +86,7 @@ pub enum GetResult<B> {
     Missing { key: PhysicalKey },
 }
 
-pub trait Pager: Send + Sync + 'static {
+pub trait Pager: Send + Sync + std::fmt::Debug + 'static {
     type Blob: AsRef<[u8]> + Clone + Send + Sync + 'static;
 
     /// Allocate `n` new physical keys.

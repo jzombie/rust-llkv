@@ -139,14 +139,22 @@ impl LlkvSltRunner {
     ///
     /// This is the core execution method that all other methods eventually call.
     fn run_script_at_path(&self, script: &str, origin: &Path) -> Result<(), Error> {
-        let factory = (self.factory_factory)();
-        let rt = self.build_runtime()?;
+        let runner = self.clone();
         let script = script.to_string();
         let origin = origin.to_path_buf();
-        let result =
-            rt.block_on(async move { Self::run_slt_text_async(&script, &origin, factory).await });
-        drop(rt);
-        result
+
+        std::thread::Builder::new()
+            .stack_size(SLT_HARNESS_STACK_SIZE)
+            .spawn(move || {
+                let factory = (runner.factory_factory)();
+                let rt = runner.build_runtime()?;
+                rt.block_on(
+                    async move { Self::run_slt_text_async(&script, &origin, factory).await },
+                )
+            })
+            .map_err(|e| Error::Internal(format!("failed to spawn runner thread: {e}")))?
+            .join()
+            .map_err(|e| Error::Internal(format!("runner thread panicked: {:?}", e)))?
     }
 
     /// Build a Tokio runtime based on the configured runtime kind.
@@ -313,8 +321,27 @@ impl LlkvSltRunner {
         // Execute all records with hash threshold and type hint handling
         let run_result = async {
             let mut current_hash_threshold: usize = 256;
+            let log_progress = std::env::var("LLKV_SLT_PROGRESS").is_ok();
+            for (record_index, record) in records.into_iter().enumerate() {
+                if log_progress {
+                    let preview = match &record {
+                        Record::Statement { sql, .. } => sql,
+                        Record::Query { sql, .. } => sql,
+                        _ => "<control>",
+                    };
+                    let single_line = preview.replace('\n', " ");
+                    let preview_snippet = if single_line.len() > 80 {
+                        format!("{}...", &single_line[..80])
+                    } else {
+                        single_line
+                    };
+                    tracing::info!(
+                        record_index,
+                        preview = %preview_snippet,
+                        "[llkv-slt] record preview"
+                    );
+                }
 
-            for record in records {
                 if let Record::Statement { expected, .. } = &record {
                     match expected {
                         StatementExpect::Error(_) => {
@@ -421,6 +448,7 @@ impl LlkvSltRunner {
                     current_hash_threshold = new_threshold;
                     runner.with_hash_threshold(new_threshold);
                 }
+
             }
 
             Ok::<(), sqllogictest::TestError>(())
@@ -453,29 +481,34 @@ impl LlkvSltRunner {
 
             if let Some((orig_line, normalized_line)) = opt_line_info {
                 if let Some(line) = normalized_lines.get(normalized_line.saturating_sub(1)) {
-                    eprintln!(
-                        "[llkv-slt] Normalized line {}: {}",
+                    tracing::error!(
                         normalized_line,
-                        line.trim()
+                        normalized = line.trim(),
+                        "[llkv-slt] normalized line"
                     );
                 }
 
                 if let Some(line) = text.lines().nth(orig_line.saturating_sub(1)) {
-                    eprintln!(
-                        "[llkv-slt] Original source line {}: {}",
+                    tracing::error!(
                         orig_line,
-                        line.trim()
+                        source = line.trim(),
+                        "[llkv-slt] original source line"
                     );
                 }
             }
 
             if let Some(path) = &persisted {
-                eprintln!("[llkv-slt] Normalized SLT saved to: {}", path);
+                tracing::error!(path = %path, "[llkv-slt] normalized SLT saved");
                 if let Some((_, normalized_line)) = opt_line_info {
-                    eprintln!(
-                        "[llkv-slt] View context: head -n {} '{}' | tail -20",
-                        normalized_line.saturating_add(10),
-                        path
+                    tracing::error!(
+                        normalized_line,
+                        path = %path,
+                        command = %format!(
+                            "head -n {} '{}' | tail -20",
+                            normalized_line.saturating_add(10),
+                            path
+                        ),
+                        "[llkv-slt] view context"
                     );
                 }
             }
@@ -757,7 +790,7 @@ const SLT_ENGINE_COMPAT: &[&str] = &["sqlite", "duckdb"];
 /// Note: This setting only applies to the test thread created by the SLT
 /// harness (see `run_slt_harness_with_args`). It does not change the global
 /// Tokio runtime configuration or other thread pools.
-const SLT_HARNESS_STACK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+pub const SLT_HARNESS_STACK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Scope guard that installs expected column types before executing a query and
 /// clears thread-local state even if execution exits early.
@@ -812,6 +845,10 @@ where
     if stats_enabled {
         crate::slt_test_engine::enable_stats();
     }
+
+    // Default to fail-fast unless overridden by environment variable (e.g. in CI)
+    let fail_fast = std::env::var("LLKV_SLT_NO_FAIL_FAST").is_err();
+
     let base = std::path::Path::new(slt_dir);
     let files = {
         let mut out = Vec::new();
@@ -853,13 +890,14 @@ where
         // Check if this is a .slturl pointer file
         let is_url_pointer = f.extension().is_some_and(|ext| ext == "slturl");
 
+        let test_name = name.clone();
         trials.push(Trial::test(name, move || {
             let p = path_clone.clone();
             let fac = factory_factory_clone();
 
             // Spawn thread with larger stack size (16MB) to handle deeply nested SQL expressions
             // Default thread stack is ~2MB which is insufficient for complex SLT test queries
-            std::thread::Builder::new()
+            let res = std::thread::Builder::new()
                 .stack_size(SLT_HARNESS_STACK_SIZE)
                 .spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -904,7 +942,43 @@ where
                 })
                 .map_err(|e| Failed::from(format!("failed to spawn test thread: {e}")))?
                 .join()
-                .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?
+                .map_err(|e| Failed::from(format!("test thread panicked: {e:?}")))?;
+
+            if let Err(e) = &res
+                && fail_fast
+            {
+                tracing::error!(test_name = %test_name, "[llkv-slt] test FAILED");
+
+                // Print the error explicitly before exiting, as process::exit will prevent
+                // libtest-mimic from printing the failure summary.
+                //
+                // This simulates a panic, but forces the process to exit manually, as a real
+                // panic insufficient here because the test runner is designed to catch panics.
+                //
+                // Note: Failed::msg is private, so we have to parse the Debug output to get
+                // the unescaped message with proper line breaks.
+                let debug_str = format!("{:?}", e);
+                // FIXME: Error messages are contained in a JSON-like string, so here's a rather
+                // hacky implementation to extract them. This is a workaround since libtest_mimic::Failed
+                // is private and the struct does not implement `Display`.
+                if let Some(start) = debug_str.find("msg: Some(\"") {
+                    if let Some(end) = debug_str.rfind("\")") {
+                        let inner = &debug_str[start + 11..end];
+                        let unescaped = inner
+                            .replace("\\n", "\n")
+                            .replace("\\\"", "\"")
+                            .replace("\\\\", "\\")
+                            .replace("\\t", "\t");
+                        tracing::error!(test_name = %test_name, "{unescaped}");
+                    } else {
+                        tracing::error!(test_name = %test_name, "{debug_str}");
+                    }
+                } else {
+                    tracing::error!(test_name = %test_name, "{debug_str}");
+                }
+                std::process::exit(101);
+            }
+            res
         }));
     }
 

@@ -424,8 +424,8 @@ where
     }
 
     pub fn insert_lazy(&self, frame: RuntimeLazyFrame<P>) -> Result<RuntimeStatementResult<P>> {
-        let ExecutorRowBatch { columns, rows } = frame.collect_rows()?;
-        self.insert_row_batch(ExecutorRowBatch { columns, rows })
+        let batches = frame.collect_batches()?;
+        self.insert_batches(batches)
     }
 
     pub fn name(&self) -> &str {

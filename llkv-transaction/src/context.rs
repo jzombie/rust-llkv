@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
-use llkv_executor::{ExecutorRowBatch, SelectExecution};
+use llkv_executor::SelectExecution;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_plan::plans::{
     CreateIndexPlan, CreateTablePlan, DeletePlan, DropTablePlan, InsertPlan, PlanColumnSpec,
@@ -21,7 +21,7 @@ use llkv_plan::plans::{
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::CatalogDdl;
-use llkv_types::TableId;
+use llkv_types::{QueryContext, TableId};
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::mvcc::{TXN_ID_AUTO_COMMIT, TransactionSnapshot, TxnId, TxnIdManager};
@@ -62,8 +62,8 @@ pub trait TransactionContext: CatalogDdl + Send + Sync {
     /// Get table column specifications
     fn table_column_specs(&self, table_name: &str) -> LlkvResult<Vec<PlanColumnSpec>>;
 
-    /// Export table rows for snapshotting
-    fn export_table_rows(&self, table_name: &str) -> LlkvResult<ExecutorRowBatch>;
+    /// Export table data for snapshotting
+    fn export_table_batches(&self, table_name: &str) -> LlkvResult<Vec<RecordBatch>>;
 
     /// Get batches with row IDs for seeding updates
     fn get_batches_with_row_ids(
@@ -74,6 +74,15 @@ pub trait TransactionContext: CatalogDdl + Send + Sync {
 
     /// Execute a SELECT plan with this context's pager type
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>>;
+    /// Execute a SELECT plan with an explicit query context (for instrumentation).
+    fn execute_select_with_ctx(
+        &self,
+        plan: SelectPlan,
+        ctx: &QueryContext,
+    ) -> LlkvResult<SelectExecution<Self::Pager>> {
+        let _ = ctx;
+        self.execute_select(plan)
+    }
 
     /// Create a table from plan
     fn apply_create_table_plan(
@@ -269,6 +278,14 @@ where
         &mut self,
         plan: SelectPlan,
     ) -> LlkvResult<SelectExecution<StagingCtx::Pager>> {
+        self.execute_select_with_ctx(plan, &QueryContext::new())
+    }
+
+    pub fn execute_select_with_ctx(
+        &mut self,
+        plan: SelectPlan,
+        ctx: &QueryContext,
+    ) -> LlkvResult<SelectExecution<StagingCtx::Pager>> {
         // Get table name (for single-table queries only)
         let table_name = select_plan_table_name(&plan).ok_or_else(|| {
             Error::InvalidArgumentError(
@@ -285,7 +302,7 @@ where
                 "[SELECT] Reading from staging for new table '{}'",
                 table_name
             );
-            return self.staging.execute_select(plan);
+            return self.staging.execute_select_with_ctx(plan, ctx);
         }
 
         // Track access to existing table for conflict detection
@@ -297,7 +314,7 @@ where
             "[SELECT] Reading from BASE with MVCC for existing table '{}'",
             table_name
         );
-        match self.base_context.execute_select(plan) {
+        match self.base_context.execute_select_with_ctx(plan, ctx) {
             Ok(exec) => {
                 // Convert pager type from BaseCtx to StagingCtx
                 // This is a limitation of the current type system
@@ -343,6 +360,14 @@ where
     pub fn execute_operation(
         &mut self,
         operation: PlanOperation,
+    ) -> LlkvResult<TransactionResult<StagingCtx::Pager>> {
+        self.execute_operation_with_ctx(operation, &QueryContext::new())
+    }
+
+    pub fn execute_operation_with_ctx(
+        &mut self,
+        operation: PlanOperation,
+        ctx: &QueryContext,
     ) -> LlkvResult<TransactionResult<StagingCtx::Pager>> {
         tracing::trace!(
             "[TX] SessionTransaction::execute_operation called, operation={:?}",
@@ -718,7 +743,7 @@ where
                 // But still fails if transaction is aborted (already checked above)
                 let table_name = select_plan_table_name(plan.as_ref()).unwrap_or_default();
                 let plan = *plan;
-                match self.execute_select(plan) {
+                match self.execute_select_with_ctx(plan, ctx) {
                     Ok(staging_execution) => {
                         // Collect staging execution into batches
                         let schema = staging_execution.schema();
@@ -1138,6 +1163,14 @@ where
         &self,
         operation: PlanOperation,
     ) -> LlkvResult<TransactionResult<StagingCtx::Pager>> {
+        self.execute_operation_with_ctx(operation, &QueryContext::new())
+    }
+
+    pub fn execute_operation_with_ctx(
+        &self,
+        operation: PlanOperation,
+        ctx: &QueryContext,
+    ) -> LlkvResult<TransactionResult<StagingCtx::Pager>> {
         tracing::debug!(
             "[EXECUTE_OP] execute_operation called for session_id={}",
             self.session_id
@@ -1215,7 +1248,7 @@ where
             tx.accessed_tables.len()
         );
 
-        let result = tx.execute_operation(operation);
+        let result = tx.execute_operation_with_ctx(operation, ctx);
         if let Err(ref e) = result {
             tracing::trace!("DEBUG TransactionSession::execute_operation error: {:?}", e);
             tracing::trace!("DEBUG Transaction is_aborted={}", tx.is_aborted);

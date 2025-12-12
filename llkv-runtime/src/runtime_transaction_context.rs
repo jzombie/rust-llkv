@@ -1,12 +1,12 @@
 use std::sync::{Arc, RwLock};
 
 use arrow::record_batch::RecordBatch;
-use llkv_executor::ExecutorRowBatch;
 use llkv_expr::expr::Expr as LlkvExpr;
 use llkv_result::{Error, Result as LlkvResult};
 use llkv_storage::pager::Pager;
 use llkv_table::{CatalogDdl, ConstraintEnforcementMode, SingleColumnIndexDescriptor, TableId};
 use llkv_transaction::{TransactionContext, TransactionResult, TransactionSnapshot, TxnId};
+use llkv_types::QueryContext;
 use simd_r_drive_entry_handle::EntryHandle;
 
 use crate::{
@@ -25,7 +25,7 @@ use llkv_plan::TruncatePlan;
 /// filtering and conversion of statement results into transaction results.
 pub struct RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug,
 {
     ctx: Arc<RuntimeContext<P>>,
     snapshot: RwLock<TransactionSnapshot>,
@@ -34,7 +34,7 @@ where
 
 impl<P> RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug,
 {
     pub(crate) fn new(ctx: Arc<RuntimeContext<P>>) -> Self {
         let snapshot = ctx.default_snapshot();
@@ -79,7 +79,7 @@ where
 
 impl<P> CatalogDdl for RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     type CreateTableOutput = TransactionResult<P>;
     type DropTableOutput = ();
@@ -130,7 +130,7 @@ where
 // Implement TransactionContext to integrate with llkv-transaction.
 impl<P> TransactionContext for RuntimeTransactionContext<P>
 where
-    P: Pager<Blob = EntryHandle> + Send + Sync + 'static,
+    P: Pager<Blob = EntryHandle> + Send + Sync + std::fmt::Debug + 'static,
 {
     type Pager = P;
     type Snapshot = llkv_table::catalog::TableCatalogSnapshot;
@@ -148,8 +148,8 @@ where
         self.context().catalog().table_column_specs(&canonical_name)
     }
 
-    fn export_table_rows(&self, table_name: &str) -> LlkvResult<ExecutorRowBatch> {
-        RuntimeContext::export_table_rows(self.context(), table_name)
+    fn export_table_batches(&self, table_name: &str) -> LlkvResult<Vec<RecordBatch>> {
+        RuntimeContext::export_table_batches(self.context(), table_name)
     }
 
     fn get_batches_with_row_ids(
@@ -163,6 +163,15 @@ where
 
     fn execute_select(&self, plan: SelectPlan) -> LlkvResult<SelectExecution<Self::Pager>> {
         self.context().execute_select(plan, self.snapshot())
+    }
+
+    fn execute_select_with_ctx(
+        &self,
+        plan: SelectPlan,
+        ctx: &QueryContext,
+    ) -> LlkvResult<SelectExecution<Self::Pager>> {
+        self.context()
+            .execute_select_with_ctx(plan, self.snapshot(), ctx)
     }
 
     fn apply_create_table_plan(&self, plan: CreateTablePlan) -> LlkvResult<TransactionResult<P>> {

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use arrow::array::Array;
-use llkv_plan::plans::PlanValue;
 use llkv_runtime::RuntimeStatementResult;
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::MemPager;
@@ -168,9 +167,20 @@ fn select_from_view_uses_column_alias() {
     let RuntimeStatementResult::Select { execution, .. } = results.remove(0) else {
         panic!("expected select result");
     };
-    let batches = execution.collect_rows().expect("collect rows");
-    assert_eq!(batches.rows.len(), 1);
-    assert_eq!(batches.rows[0][0], PlanValue::Integer(1));
+    let batches = execution.collect().expect("collect batches");
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .expect("non-empty batches");
+
+    let combined = arrow::compute::concat_batches(&schema, batches.iter()).expect("concat batches");
+    let column = combined
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("int column");
+    assert_eq!(combined.num_rows(), 1);
+    assert_eq!(column.value(0), 1);
 }
 
 #[test]

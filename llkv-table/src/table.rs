@@ -68,7 +68,7 @@ where
     mvcc_cache: RwLock<Option<MvccColumnCache>>,
 }
 
-pub type TableScanStream<'table, P> = ScanRowStream<'table, P, Table<P>>;
+pub type TableScanStream<'table, P> = ScanRowStream<P, &'table Table<P>>;
 
 impl<P> Table<P>
 where
@@ -2079,7 +2079,7 @@ mod tests {
         let candidates = [100.into(), 300.into()];
         let filter = pred_expr(Filter {
             field_id: COL_A_U64,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut total: i64 = 0;
@@ -2112,7 +2112,7 @@ mod tests {
         let candidates = [100.into(), 300.into()];
         let filter = pred_expr(Filter {
             field_id: COL_A_U64,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut mn: Option<i32> = None;
@@ -2176,7 +2176,7 @@ mod tests {
         let candidates = [2.0_f32.into(), 3.0_f32.into()];
         let filter = pred_expr(Filter {
             field_id: COL_E_F32,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut vals: Vec<Option<f32>> = Vec::new();
@@ -2687,7 +2687,7 @@ mod tests {
         let candidates = [10.into(), 30.into()];
         let filter = pred_expr(Filter {
             field_id: COL_C_I32,
-            op: Operator::In(&candidates),
+            op: Operator::In(llkv_expr::InList::borrowed(&candidates)),
         });
 
         let mut vals: Vec<Option<u64>> = Vec::new();
@@ -2792,8 +2792,13 @@ mod tests {
         });
 
         let empty: [Projection; 0] = [];
-        let result = table.scan_stream(&empty, &filter, ScanStreamOptions::default(), |_batch| {});
-        assert!(matches!(result, Err(Error::InvalidArgumentError(_))));
+        let mut row_count = 0;
+        let result = table.scan_stream(&empty, &filter, ScanStreamOptions::default(), |batch| {
+            assert_eq!(batch.num_columns(), 0);
+            row_count += batch.num_rows();
+        });
+        assert!(result.is_ok());
+        assert_eq!(row_count, 2);
 
         // Duplicate projections are allowed: the same column will be
         // gathered once and duplicated in the output in the requested

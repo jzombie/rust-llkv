@@ -6,8 +6,14 @@ Use this guide as the first stop before making changes. It ties together the rep
 - Always read every file under `.github/instructions/` before starting work; treat them as authoritative constraints.
 - Refer to `dev-docs/feature-placement-guide.md` for where new code belongs. Follow the placement process and guardrails—no shortcuts or in-memory hacks.
 - Follow `dev-docs/comment-style-guide.md` whenever writing or updating comments. Keep summaries concise, document safety clearly, and fix nearby drift while you are there.
+- Follow `dev-docs/testing-guide.md` for an overview of accuracy and performance expectations related to code changes.
 
 ## Working Rules
 - Apply the `.github/instructions` guidance to your workflow (test commands, no truncated output, and the no-shortcut policy).
 - When planning a feature, identify the lowest crate that owns the responsibility, keep dependencies acyclic, and update linkage docs if architecture changes.
 - Clean up comment style in touched modules and ensure any examples stay runnable with `cargo test --doc` when added.
+
+## SQL Testing and Debugging
+
+- For quick SQL scripts: Compile and run [llkv/src/main.rs](llkv/src/main.rs), sending the SQL via STDIN.
+- For SLT testing, it is often helpful to use the full relative path (e.g. `cargo test --package llkv-slt-tester --test slt_harness -- slt/sqlite/random/groupby/slt_good_8.slturl`) instead of the filename (e.g. `slt_good_8.slturl`).

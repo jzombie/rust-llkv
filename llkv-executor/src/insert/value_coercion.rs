@@ -1,5 +1,7 @@
 //! Helper functions for value coercion and data preparation used during inserts.
 
+use std::sync::Arc;
+
 use arrow::array::{
     ArrayRef, BooleanBuilder, Date32Builder, Decimal128Array, Float64Builder, Int64Builder,
     IntervalMonthDayNanoArray, StringBuilder,
@@ -13,12 +15,9 @@ use llkv_compute::scalar::decimal::{
 use llkv_compute::scalar::interval::interval_value_to_arrow;
 use llkv_plan::PlanValue;
 use llkv_result::{Error, Result};
-use std::sync::Arc;
 
 use crate::{ExecutorColumn, ExecutorSchema};
 
-/// Resolve the user-specified column list for an INSERT statement into indexes
-/// of the executor schema. If no columns were provided, return the identity order.
 pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Result<Vec<usize>> {
     if columns.is_empty() {
         return Ok((0..schema.columns.len()).collect());
@@ -38,7 +37,6 @@ pub fn resolve_insert_columns(columns: &[String], schema: &ExecutorSchema) -> Re
     Ok(resolved)
 }
 
-/// Coerce a `PlanValue` into the Arrow data type required by the executor column.
 pub fn normalize_insert_value_for_column(
     column: &ExecutorColumn,
     value: PlanValue,
@@ -180,7 +178,6 @@ pub fn normalize_insert_value_for_column(
     }
 }
 
-/// Build an Arrow array that matches the executor column's data type from the provided values.
 pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<ArrayRef> {
     match dtype {
         DataType::Int64 => {
@@ -216,9 +213,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v != 0),
                     PlanValue::Float(v) => builder.append_value(*v != 0.0),
-                    PlanValue::Decimal(decimal) => {
-                        builder.append_value(decimal_truthy(*decimal));
-                    }
+                    PlanValue::Decimal(decimal) => builder.append_value(decimal_truthy(*decimal)),
                     PlanValue::Date32(days) => builder.append_value(*days != 0),
                     PlanValue::String(s) => {
                         let normalized = s.trim().to_ascii_lowercase();
@@ -249,9 +244,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(*v as f64),
                     PlanValue::Float(v) => builder.append_value(*v),
-                    PlanValue::Decimal(decimal) => {
-                        builder.append_value(decimal.to_f64());
-                    }
+                    PlanValue::Decimal(decimal) => builder.append_value(decimal.to_f64()),
                     PlanValue::Date32(days) => builder.append_value(f64::from(*days)),
                     PlanValue::String(_) | PlanValue::Struct(_) | PlanValue::Interval(_) => {
                         return Err(Error::InvalidArgumentError(
@@ -269,9 +262,7 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Null => builder.append_null(),
                     PlanValue::Integer(v) => builder.append_value(v.to_string()),
                     PlanValue::Float(v) => builder.append_value(v.to_string()),
-                    PlanValue::Decimal(decimal) => {
-                        builder.append_value(decimal.to_string());
-                    }
+                    PlanValue::Decimal(decimal) => builder.append_value(decimal.to_string()),
                     PlanValue::Date32(days) => builder.append_value(days.to_string()),
                     PlanValue::String(s) => builder.append_value(s),
                     PlanValue::Struct(_) | PlanValue::Interval(_) => {
@@ -404,17 +395,19 @@ pub fn build_array_for_column(dtype: &DataType, values: &[PlanValue]) -> Result<
                     PlanValue::Interval(interval) => {
                         converted.push(Some(interval_value_to_arrow(*interval)))
                     }
-                    other => {
-                        return Err(Error::InvalidArgumentError(format!(
-                            "cannot insert {other:?} into INTERVAL column"
-                        )));
+                    _ => {
+                        return Err(Error::InvalidArgumentError(
+                            "cannot insert non-interval into INTERVAL column".into(),
+                        ));
                     }
                 }
             }
-            Ok(Arc::new(IntervalMonthDayNanoArray::from(converted)) as ArrayRef)
+            let array = IntervalMonthDayNanoArray::from(converted);
+            Ok(Arc::new(array) as ArrayRef)
         }
         other => Err(Error::InvalidArgumentError(format!(
-            "unsupported Arrow data type for INSERT: {other:?}"
+            "unsupported Arrow data type {:?} for INSERT array build",
+            other
         ))),
     }
 }

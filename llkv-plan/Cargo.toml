@@ -17,11 +17,16 @@ normal = []
 development = ["llkv-test-utils"]
 build = []
 
+[features]
+default = []
+perf-mon = ["llkv-perf-monitor/perf-mon"]
+
 [dependencies]
 arrow = { workspace = true, default-features = false }
 llkv-column-map.workspace = true
 llkv-compute.workspace = true
 llkv-expr.workspace = true
+llkv-perf-monitor.workspace = true
 llkv-result.workspace = true
 llkv-scan.workspace = true
 llkv-storage.workspace = true
@@ -34,6 +39,7 @@ simd-r-drive-entry-handle.workspace = true
 sqlparser.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 llkv-test-utils = { workspace = true, features = ["auto-init"], optional = false }
