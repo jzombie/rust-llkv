@@ -139,14 +139,20 @@ impl LlkvSltRunner {
     ///
     /// This is the core execution method that all other methods eventually call.
     fn run_script_at_path(&self, script: &str, origin: &Path) -> Result<(), Error> {
-        let factory = (self.factory_factory)();
-        let rt = self.build_runtime()?;
+        let runner = self.clone();
         let script = script.to_string();
         let origin = origin.to_path_buf();
-        let result =
-            rt.block_on(async move { Self::run_slt_text_async(&script, &origin, factory).await });
-        drop(rt);
-        result
+
+        std::thread::Builder::new()
+            .stack_size(SLT_HARNESS_STACK_SIZE)
+            .spawn(move || {
+                let factory = (runner.factory_factory)();
+                let rt = runner.build_runtime()?;
+                rt.block_on(async move { Self::run_slt_text_async(&script, &origin, factory).await })
+            })
+            .map_err(|e| Error::Internal(format!("failed to spawn runner thread: {e}")))?
+            .join()
+            .map_err(|e| Error::Internal(format!("runner thread panicked: {:?}", e)))?
     }
 
     /// Build a Tokio runtime based on the configured runtime kind.
@@ -782,7 +788,7 @@ const SLT_ENGINE_COMPAT: &[&str] = &["sqlite", "duckdb"];
 /// Note: This setting only applies to the test thread created by the SLT
 /// harness (see `run_slt_harness_with_args`). It does not change the global
 /// Tokio runtime configuration or other thread pools.
-const SLT_HARNESS_STACK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+pub const SLT_HARNESS_STACK_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Scope guard that installs expected column types before executing a query and
 /// clears thread-local state even if execution exits early.
