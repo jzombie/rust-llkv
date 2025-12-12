@@ -12,13 +12,13 @@
 //! only need a subset of the functionality.
 #![forbid(unsafe_code)]
 
-pub mod canonical;
 pub mod aggregate_rewrite;
+pub mod canonical;
 pub mod conversion;
 pub mod logical_planner;
 pub mod plan_graph;
-pub mod table_provider;
 pub mod prepared;
+pub mod table_provider;
 // pub mod planner;
 pub mod plans;
 pub mod schema;
@@ -41,8 +41,8 @@ pub use llkv_compute::{
 pub use llkv_types::{CanonicalRow, CanonicalScalar};
 pub use logical_planner::*;
 pub use plan_graph::*;
-pub use prepared::*;
 pub use plans::*;
+pub use prepared::*;
 pub use subquery_correlation::{
     SUBQUERY_CORRELATED_PLACEHOLDER_PREFIX, SubqueryCorrelatedColumnTracker,
     SubqueryCorrelatedTracker, subquery_correlated_placeholder,

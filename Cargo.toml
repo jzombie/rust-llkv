@@ -10,6 +10,7 @@ members = [
     "llkv-executor",
     "llkv-expr",
     "llkv-join",
+    "llkv-perf-monitor",
     "llkv-plan",
     "llkv-result",
     "llkv-runtime",
@@ -60,6 +61,7 @@ llkv-csv = { path = "./llkv-csv", version = "0.8.5-alpha" }
 llkv-executor = { path = "./llkv-executor", version = "0.8.5-alpha" }
 llkv-expr = { path = "./llkv-expr", version = "0.8.5-alpha" }
 llkv-join = { path = "./llkv-join", version = "0.8.5-alpha" }
+llkv-perf-monitor = { path = "./llkv-perf-monitor", version = "0.8.5-alpha" }
 llkv-plan = { path = "./llkv-plan", version = "0.8.5-alpha" }
 llkv-result = { path = "./llkv-result", version = "0.8.5-alpha" }
 llkv-runtime = { path = "./llkv-runtime", version = "0.8.5-alpha" }
@@ -99,6 +101,8 @@ walkdir = "2.5"
 print_stderr = "deny"
 print_stdout = "deny"
 disallowed_methods = "deny"
+# TODO: Enable: Enable clippy::clone_on_ref_ptr as deny so that arc.clone() (or rc.clone()) is rejected and we are forced to write Arc::clone(&arc) / Rc::clone(&rc) instead.
+# clone_on_ref_ptr = "deny"
 
 [workspace.metadata.clippy]
 disallowed-methods = ["std::boxed::Box::leak"]

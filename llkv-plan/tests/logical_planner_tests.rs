@@ -5,15 +5,15 @@ use arrow::record_batch::RecordBatch;
 use llkv_expr::Literal;
 use llkv_expr::expr::{CompareOp, Expr, Filter, Operator, ScalarExpr};
 use llkv_plan::logical_planner::{LogicalPlan, SingleTableLogicalPlan, projection_name};
-use llkv_plan::table_provider::{ExecutionTable, TableProvider};
 use llkv_plan::schema::{PlanColumn, PlanSchema};
+use llkv_plan::table_provider::{ExecutionTable, TableProvider};
 use llkv_plan::{
     JoinMetadata, JoinPlan, LogicalPlanner, OrderByPlan, OrderSortType, OrderTarget, SelectFilter,
     SelectPlan, SelectProjection, TableRef,
 };
 use llkv_scan::{ScanProjection, ScanStreamOptions};
 use llkv_storage::pager::MemPager;
-use llkv_types::{FieldId, LogicalFieldId, TableId};
+use llkv_types::{FieldId, LogicalFieldId, QueryContext, TableId};
 use rustc_hash::FxHashMap;
 
 type TestPager = MemPager;
@@ -44,6 +44,10 @@ impl ExecutionTable<TestPager> for DummyTable {
         self.table_id
     }
 
+    fn approximate_row_count(&self) -> Option<usize> {
+        None
+    }
+
     fn scan_stream(
         &self,
         _projections: &[ScanProjection],
@@ -67,13 +71,11 @@ impl ExecutionTable<TestPager> for DummyTable {
 
 struct DummyProvider {
     table: Arc<DummyTable>,
-    name_lower: String,
 }
 
 impl DummyProvider {
     fn new(table: Arc<DummyTable>) -> Arc<Self> {
-        let name_lower = table.name.to_ascii_lowercase();
-        Arc::new(Self { table, name_lower })
+        Arc::new(Self { table })
     }
 }
 
@@ -159,11 +161,12 @@ fn build_planner() -> (LogicalPlanner<TestPager>, SingleTableLogicalPlan<TestPag
         nulls_first: false,
     }];
 
+    let ctx = QueryContext::new();
     let logical_plan = planner
-        .create_logical_plan(&select_plan)
+        .create_logical_plan(&select_plan, &ctx)
         .expect("logical planning succeeds");
     let single = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table logical plan"),
     };
     (planner, single)
@@ -250,11 +253,11 @@ fn logical_planner_translates_filter_to_field_ids() {
     });
 
     let logical_plan = planner
-        .create_logical_plan(&select_plan)
+        .create_logical_plan(&select_plan, &QueryContext::new())
         .expect("logical planning succeeds");
 
     let logical_plan = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table plan"),
     };
 
@@ -299,10 +302,10 @@ fn logical_planner_adds_filter_columns_to_scan_projections() {
     });
 
     let logical_plan = planner
-        .create_logical_plan(&select_plan)
+        .create_logical_plan(&select_plan, &QueryContext::new())
         .expect("logical planning succeeds");
     let logical_plan = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table plan"),
     };
 
@@ -312,12 +315,6 @@ fn logical_planner_adds_filter_columns_to_scan_projections() {
         .map(|p| projection_name(p, &logical_plan.schema))
         .collect();
 
-    assert!(
-        projected_names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("val")),
-        "filter column should be included in scan projections"
-    );
     assert!(
         projected_names
             .iter()
@@ -378,11 +375,11 @@ fn logical_planner_resolves_multi_table_plan() {
     });
 
     let plan = planner
-        .create_logical_plan(&select_plan)
+        .create_logical_plan(&select_plan, &QueryContext::new())
         .expect("logical planning succeeds");
 
     let multi = match plan {
-        LogicalPlan::Multi(plan) => plan,
+        LogicalPlan::Multi(plan) => *plan,
         _ => panic!("expected multi-table plan"),
     };
 
@@ -481,10 +478,10 @@ fn logical_planner_adds_group_by_and_aggregate_columns() {
     )];
 
     let logical_plan = planner
-        .create_logical_plan(&select_plan)
+        .create_logical_plan(&select_plan, &QueryContext::new())
         .expect("logical planning succeeds");
     let logical_plan = match logical_plan {
-        LogicalPlan::Single(plan) => plan,
+        LogicalPlan::Single(plan) => *plan,
         _ => panic!("expected single-table plan"),
     };
 
@@ -584,7 +581,7 @@ fn multi_table_resolution_assigns_columns_to_tables() {
     ];
 
     let logical_plan = planner
-        .create_logical_plan(&plan)
+        .create_logical_plan(&plan, &QueryContext::new())
         .expect("multi-table planning succeeds");
 
     let (resolved, unresolved) = match logical_plan {

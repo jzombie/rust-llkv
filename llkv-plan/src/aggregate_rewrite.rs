@@ -1,12 +1,19 @@
+use arrow::datatypes::DataType;
+use llkv_compute::eval::ScalarEvaluator;
 use llkv_expr::expr::{AggregateCall, BinaryOp, CompareOp, Expr, Operator, ScalarExpr};
 use llkv_expr::literal::Literal;
-use llkv_compute::eval::ScalarEvaluator;
 use llkv_result::Result;
 use std::collections::{HashMap, HashSet};
-use arrow::datatypes::DataType;
 
 use crate::plans::{AggregateExpr, AggregateFunction, SelectPlan, SelectProjection};
 use crate::schema::PlanSchema;
+
+type AggregateRewriteParts = (
+    Vec<AggregateExpr>,
+    Vec<ScalarExpr<String>>,
+    Vec<ScalarExpr<String>>,
+    Vec<ScalarExpr<String>>,
+);
 
 /// Rewritten aggregate state for complex aggregate projections.
 #[derive(Clone, Debug)]
@@ -67,11 +74,17 @@ impl AggVisitor {
                     AggregateCall::Min(expr) => (expr, false, AggregateFunction::MinInt64),
                     AggregateCall::Max(expr) => (expr, false, AggregateFunction::MaxInt64),
                     AggregateCall::CountNulls(expr) => (expr, false, AggregateFunction::CountNulls),
-                    AggregateCall::GroupConcat { expr, distinct, separator } => {
-                        (expr, *distinct, AggregateFunction::GroupConcat {
-                            separator: separator.clone().unwrap_or_else(|| ",".to_string())
-                        })
-                    }
+                    AggregateCall::GroupConcat {
+                        expr,
+                        distinct,
+                        separator,
+                    } => (
+                        expr,
+                        *distinct,
+                        AggregateFunction::GroupConcat {
+                            separator: separator.clone().unwrap_or_else(|| ",".to_string()),
+                        },
+                    ),
                     AggregateCall::Avg { expr, distinct } => {
                         let arg_idx = self.pre_agg_projections.len();
                         self.pre_agg_projections.push(*expr.clone());
@@ -134,7 +147,9 @@ impl AggVisitor {
                 op: *op,
                 right: Box::new(self.visit(right)),
             },
-            ScalarExpr::Coalesce(exprs) => ScalarExpr::Coalesce(exprs.iter().map(|e| self.visit(e)).collect()),
+            ScalarExpr::Coalesce(exprs) => {
+                ScalarExpr::Coalesce(exprs.iter().map(|e| self.visit(e)).collect())
+            }
             ScalarExpr::ScalarSubquery(s) => ScalarExpr::ScalarSubquery(s.clone()),
             ScalarExpr::Case {
                 operand,
@@ -188,12 +203,7 @@ impl AggVisitor {
 pub fn extract_complex_aggregates(
     projections: &[ScalarExpr<String>],
     additional_exprs: &[ScalarExpr<String>],
-) -> (
-    Vec<AggregateExpr>,
-    Vec<ScalarExpr<String>>,
-    Vec<ScalarExpr<String>>,
-    Vec<ScalarExpr<String>>,
-) {
+) -> AggregateRewriteParts {
     let mut visitor = AggVisitor::new();
     let rewritten = projections
         .iter()
@@ -302,7 +312,11 @@ pub(crate) fn expr_to_scalar_expr(expr: &Expr<'static, String>) -> ScalarExpr<St
             op: *op,
             right: Box::new(right.clone()),
         },
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             if list.is_empty() {
                 return ScalarExpr::Literal(Literal::Boolean(*negated));
             }
@@ -340,9 +354,6 @@ fn build_single_projection_exprs(
     plan: &SelectPlan,
     schema: &PlanSchema,
 ) -> Vec<(ScalarExpr<String>, String)> {
-    if std::env::var("LLKV_DEBUG_SUBQS").is_ok() {
-        eprintln!("[planner] build_single_projection_exprs projections: {:?}", plan.projections);
-    }
     let mut out = Vec::new();
     for proj in &plan.projections {
         match proj {
@@ -393,7 +404,9 @@ fn substitute_aliases(
             op: *op,
             right: Box::new(substitute_aliases(right, alias_map, grouping_keys)),
         },
-        ScalarExpr::Not(e) => ScalarExpr::Not(Box::new(substitute_aliases(e, alias_map, grouping_keys))),
+        ScalarExpr::Not(e) => {
+            ScalarExpr::Not(Box::new(substitute_aliases(e, alias_map, grouping_keys)))
+        }
         ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
             expr: Box::new(substitute_aliases(expr, alias_map, grouping_keys)),
             negated: *negated,
@@ -469,7 +482,13 @@ pub fn build_single_aggregate_rewrite(
     let having_exprs: Vec<ScalarExpr<String>> = plan
         .having
         .as_ref()
-        .map(|h| vec![substitute_aliases(&expr_to_scalar_expr(h), &alias_map, &grouping_keys)])
+        .map(|h| {
+            vec![substitute_aliases(
+                &expr_to_scalar_expr(h),
+                &alias_map,
+                &grouping_keys,
+            )]
+        })
         .unwrap_or_default();
 
     let (aggregates, final_exprs, pre_agg_exprs, rewritten_having) =

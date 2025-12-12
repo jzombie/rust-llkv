@@ -1,10 +1,10 @@
-pub mod scan;
-pub mod filter;
-pub mod projection;
-pub mod join;
 pub mod aggregate;
-pub mod sort;
+pub mod filter;
+pub mod join;
+pub mod projection;
 pub mod ranges;
+pub mod scan;
+pub mod sort;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -27,12 +27,12 @@ where
     fn execute(&self) -> Result<BatchIter>;
 
     /// Returns the children of this plan
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>>;
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]>;
 
     /// Returns a new plan with the specified children
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>>;
 
     fn as_any(&self) -> &dyn std::any::Any;

@@ -230,8 +230,8 @@ fn bench_hash_join_many_to_many_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |batch| {
+                    total_rows += batch.left_batch.num_rows();
                 })
                 .unwrap();
                 black_box(total_rows);
@@ -263,8 +263,8 @@ fn bench_hash_join_no_matches_join(c: &mut Criterion) {
 
             b.iter(|| {
                 let mut total_rows = 0;
-                left.join_stream(&right, &keys, &options, |batch| {
-                    total_rows += batch.num_rows();
+                left.join_rowid_stream(&right, &keys, &options, |batch| {
+                    total_rows += batch.left_batch.num_rows();
                 })
                 .unwrap();
                 black_box(total_rows);

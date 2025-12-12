@@ -1332,7 +1332,11 @@ mod tests {
             ],
         )?;
 
-        let out = gather_projected_indices_from_batches(&[batch.clone()], &[(0, 1), (0, 2)], &[1])?;
+        let out = gather_projected_indices_from_batches(
+            std::slice::from_ref(&batch),
+            &[(0, 1), (0, 2)],
+            &[1],
+        )?;
 
         let values = out[0]
             .as_any()

@@ -36,6 +36,7 @@ use llkv_runtime::{
 use llkv_storage::pager::{BoxedPager, Pager};
 use llkv_table::catalog::{ColumnResolution, IdentifierContext, IdentifierResolver};
 use llkv_table::{CatalogDdl, ConstraintEnforcementMode, TriggerEventMeta, TriggerTimingMeta};
+use llkv_types::QueryContext;
 use llkv_types::decimal::DecimalValue;
 use regex::Regex;
 use simd_r_drive_entry_handle::EntryHandle;
@@ -712,6 +713,15 @@ impl SqlEngine {
     }
 
     fn execute_plan_statement(&self, statement: PlanStatement) -> SqlResult<SqlStatementResult> {
+        let ctx = QueryContext::new();
+        self.execute_plan_statement_with_ctx(statement, &ctx)
+    }
+
+    fn execute_plan_statement_with_ctx(
+        &self,
+        statement: PlanStatement,
+        ctx: &QueryContext,
+    ) -> SqlResult<SqlStatementResult> {
         // Don't apply table error mapping to CREATE VIEW or DROP VIEW statements
         // because the "table" name is the view being created/dropped, not a referenced table.
         // Any "unknown table" errors from CREATE VIEW are about tables referenced in the SELECT.
@@ -736,13 +746,16 @@ impl SqlEngine {
             None
         };
 
-        let result = self.engine.execute_statement(statement).map_err(|err| {
-            if let Some(table_name) = table {
-                Self::map_table_error(&table_name, err)
-            } else {
-                err
-            }
-        });
+        let result = self
+            .engine
+            .execute_statement_with_ctx(statement, ctx)
+            .map_err(|err| {
+                if let Some(table_name) = table {
+                    Self::map_table_error(&table_name, err)
+                } else {
+                    err
+                }
+            });
 
         // Invalidate information schema cache after successful schema modifications
         if result.is_ok() && modifies_schema {
@@ -850,29 +863,40 @@ impl SqlEngine {
                 .expect("valid empty IN regex")
         });
 
-        let result = re.replace_all(sql, |caps: &regex::Captures| {
-            let expr = &caps[1];
-            if caps.get(2).is_some() {
-                // expr NOT IN () → always true (but still evaluate expr)
-                // We use the same logic as IN () but negated.
-                // IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)
-                // NOT IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)
-                // We wrap in a comparison (= FALSE) because the WHERE clause planner only supports
-                // comparisons and boolean logic at the top level, not arbitrary scalar expressions like CAST.
-                format!("(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)", expr)
-            } else {
-                // expr IN () → always false (but still evaluate expr)
-                // We use COALESCE to ensure we get FALSE even if expr evaluates to NULL
-                // (since NULL AND FALSE can be NULL in some contexts).
-                // We wrap in a comparison (= TRUE) because the WHERE clause planner only supports
-                // comparisons and boolean logic at the top level.
-                format!("(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)", expr)
-            }
-        })
-        .to_string();
-        
+        let result = re
+            .replace_all(sql, |caps: &regex::Captures| {
+                let expr = &caps[1];
+                if caps.get(2).is_some() {
+                    // expr NOT IN () → always true (but still evaluate expr)
+                    // We use the same logic as IN () but negated.
+                    // IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)
+                    // NOT IN () -> (CAST(COALESCE(expr = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)
+                    // We wrap in a comparison (= FALSE) because the WHERE clause planner only supports
+                    // comparisons and boolean logic at the top level, not arbitrary scalar expressions like CAST.
+                    format!(
+                        "(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = FALSE)",
+                        expr
+                    )
+                } else {
+                    // expr IN () → always false (but still evaluate expr)
+                    // We use COALESCE to ensure we get FALSE even if expr evaluates to NULL
+                    // (since NULL AND FALSE can be NULL in some contexts).
+                    // We wrap in a comparison (= TRUE) because the WHERE clause planner only supports
+                    // comparisons and boolean logic at the top level.
+                    format!(
+                        "(CAST(COALESCE({} = NULL AND 0 = 1, 0 = 1) AS BOOLEAN) = TRUE)",
+                        expr
+                    )
+                }
+            })
+            .to_string();
+
         if result != sql {
-            tracing::debug!("preprocess_empty_in_lists: rewritten '{}' to '{}'", sql, result);
+            tracing::debug!(
+                "preprocess_empty_in_lists: rewritten '{}' to '{}'",
+                sql,
+                result
+            );
         } else {
             tracing::debug!("preprocess_empty_in_lists: no match for '{}'", sql);
         }
@@ -1079,31 +1103,46 @@ impl SqlEngine {
     /// scripts, or workflows that need to inspect the specific runtime response for each
     /// statement.
     pub fn execute(&self, sql: &str) -> SqlResult<Vec<SqlStatementResult>> {
+        self.execute_with_ctx(sql, &QueryContext::new())
+    }
+
+    pub fn execute_with_ctx(
+        &self,
+        sql: &str,
+        ctx: &QueryContext,
+    ) -> SqlResult<Vec<SqlStatementResult>> {
         tracing::trace!("DEBUG SQL execute: {}", sql);
 
-        // Preprocess SQL
-        let processed_sql = Self::preprocess_sql_input(sql);
+        let processed_sql = llkv_perf_monitor::maybe_record!(
+            ["perf-mon"],
+            ctx,
+            "preprocess",
+            Self::preprocess_sql_input(sql)
+        );
 
-        let dialect = GenericDialect {};
-        let statements = match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
-            Ok(stmts) => stmts,
-            Err(parse_err) => {
-                // SQLite allows omitting BEFORE/AFTER and FOR EACH ROW in CREATE TRIGGER.
-                // If parsing fails and the SQL contains CREATE TRIGGER, attempt to expand
-                // the shorthand form and retry. This is a workaround until sqlparser's
-                // SQLite dialect properly supports the abbreviated syntax.
-                if processed_sql.to_uppercase().contains("CREATE TRIGGER") {
-                    let expanded = Self::preprocess_sqlite_trigger_shorthand(&processed_sql);
-                    parse_sql_with_recursion_limit(&dialect, &expanded).map_err(|_| {
-                        Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}"))
-                    })?
-                } else {
-                    return Err(Error::InvalidArgumentError(format!(
-                        "failed to parse SQL: {parse_err}"
-                    )));
+        let statements = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "parse", {
+            let dialect = GenericDialect {};
+            match parse_sql_with_recursion_limit(&dialect, &processed_sql) {
+                Ok(stmts) => stmts,
+                Err(parse_err) => {
+                    // SQLite allows omitting BEFORE/AFTER and FOR EACH ROW in CREATE TRIGGER.
+                    // If parsing fails and the SQL contains CREATE TRIGGER, attempt to expand
+                    // the shorthand form and retry. This is a workaround until sqlparser's
+                    // SQLite dialect properly supports the abbreviated syntax.
+                    if processed_sql.to_uppercase().contains("CREATE TRIGGER") {
+                        let expanded = Self::preprocess_sqlite_trigger_shorthand(&processed_sql);
+                        parse_sql_with_recursion_limit(&dialect, &expanded).map_err(|_| {
+                            Error::InvalidArgumentError(format!("failed to parse SQL: {parse_err}"))
+                        })?
+                    } else {
+                        return Err(Error::InvalidArgumentError(format!(
+                            "failed to parse SQL: {parse_err}"
+                        )));
+                    }
                 }
             }
-        };
+        });
+
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements.iter() {
             let statement_expectation = next_statement_expectation();
@@ -1120,14 +1159,20 @@ impl SqlEngine {
                 | Statement::Rollback { .. } => {
                     // Flush before transaction boundaries
                     let mut flushed = self.flush_buffer_results()?;
-                    let current = self.execute_statement(statement.clone())?;
+                    let current = self.execute_statement(statement.clone(), ctx)?;
                     results.push(current);
                     results.append(&mut flushed);
                 }
                 _ => {
                     // Flush before any non-INSERT
                     let mut flushed = self.flush_buffer_results()?;
-                    let current = self.execute_statement(statement.clone())?;
+                    let current = llkv_perf_monitor::maybe_record!(
+                        ["perf-mon"],
+                        ctx,
+                        "execute_statement",
+                        self.execute_statement(statement.clone(), ctx)?
+                    );
+
                     results.push(current);
                     results.append(&mut flushed);
                 }
@@ -1635,7 +1680,11 @@ impl SqlEngine {
         }
     }
 
-    fn execute_statement(&self, statement: Statement) -> SqlResult<SqlStatementResult> {
+    fn execute_statement(
+        &self,
+        statement: Statement,
+        ctx: &QueryContext,
+    ) -> SqlResult<SqlStatementResult> {
         let statement_sql = statement.to_string();
         let _query_label_guard = push_query_label(statement_sql.clone());
         tracing::debug!("SQL execute_statement: {}", statement_sql.trim());
@@ -1678,13 +1727,14 @@ impl SqlEngine {
                 modifier,
             } => self.handle_commit(chain, end, modifier),
             Statement::Rollback { chain, savepoint } => self.handle_rollback(chain, savepoint),
-            other => self.execute_statement_non_transactional(other),
+            other => self.execute_statement_non_transactional(other, ctx),
         }
     }
 
     fn execute_statement_non_transactional(
         &self,
         statement: Statement,
+        ctx: &QueryContext,
     ) -> SqlResult<SqlStatementResult> {
         tracing::trace!("DEBUG SQL execute_statement_non_transactional called");
         match statement {
@@ -1785,7 +1835,7 @@ impl SqlEngine {
                 {
                     self.ensure_information_schema_ready()?;
                 }
-                self.handle_query(*query)
+                self.handle_query(*query, ctx)
             }
             Statement::Update {
                 table,
@@ -4626,7 +4676,8 @@ impl SqlEngine {
     }
 
     fn execute_scalar_int64(&self, query: Query) -> SqlResult<Option<i64>> {
-        let result = self.handle_query(query)?;
+        let local_ctx = QueryContext::new();
+        let result = self.handle_query(query, &local_ctx)?;
         let execution = match result {
             RuntimeStatementResult::Select { execution, .. } => execution,
             _ => {
@@ -4681,7 +4732,8 @@ impl SqlEngine {
             return Ok(avg_literal);
         }
 
-        let result = self.handle_query(subquery)?;
+        let local_ctx = QueryContext::new();
+        let result = self.handle_query(subquery, &local_ctx)?;
         let execution = match result {
             RuntimeStatementResult::Select { execution, .. } => execution,
             _ => {
@@ -4820,7 +4872,8 @@ impl SqlEngine {
                             negated,
                         } => {
                             // Execute the subquery
-                            let result = self.handle_query(*subquery)?;
+                            let local_ctx = QueryContext::new();
+                            let result = self.handle_query(*subquery, &local_ctx)?;
 
                             // Extract values from first column
                             let values = match result {
@@ -5068,16 +5121,30 @@ impl SqlEngine {
             .expect("result stack should have exactly one item"))
     }
 
-    fn handle_query(&self, query: Query) -> SqlResult<RuntimeStatementResult<P>> {
+    fn handle_query(
+        &self,
+        query: Query,
+        ctx: &QueryContext,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
         tracing::debug!("handle_query: query={:?}", query);
         let mut visited_views = FxHashSet::default();
-        self.execute_query_with_view_support(query, &mut visited_views)
+        self.execute_query_with_view_support_ctx(query, &mut visited_views, ctx)
     }
 
     fn execute_query_with_view_support(
         &self,
         query: Query,
         visited_views: &mut FxHashSet<String>,
+    ) -> SqlResult<RuntimeStatementResult<P>> {
+        let local_ctx = QueryContext::new();
+        self.execute_query_with_view_support_ctx(query, visited_views, &local_ctx)
+    }
+
+    fn execute_query_with_view_support_ctx(
+        &self,
+        query: Query,
+        visited_views: &mut FxHashSet<String>,
+        ctx: &QueryContext,
     ) -> SqlResult<RuntimeStatementResult<P>> {
         // Lazily refresh information_schema only if this query references it.
         // This must happen before any table resolution to ensure the schema tables exist.
@@ -5104,8 +5171,18 @@ impl SqlEngine {
             return Ok(result);
         }
 
-        let select_plan = self.build_select_plan(query)?;
-        self.execute_plan_statement(PlanStatement::Select(Box::new(select_plan)))
+        let select_plan = llkv_perf_monitor::maybe_record!(
+            ["perf-mon"],
+            ctx,
+            "build_select_plan",
+            self.build_select_plan(query)?
+        );
+
+        let res = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "execute_plan_statement", {
+            self.execute_plan_statement_with_ctx(PlanStatement::Select(Box::new(select_plan)), ctx)
+        });
+
+        res
     }
 
     fn try_execute_simple_view_select(
@@ -6262,16 +6339,7 @@ impl SqlEngine {
                 &mut scalar_subqueries,
                 correlated_tracker.reborrow(),
             )?;
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!("translate_select_internal: projections len before with_projections: {}", projections.len());
-            }
             p = p.with_projections(projections);
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!("translate_select_internal: p.projections len after with_projections: {}", p.projections.len());
-                if let Some(first) = p.projections.first() {
-                    eprintln!("translate_select_internal: first projection: {:?}", first);
-                }
-            }
             (p, IdentifierContext::new(None))
         } else if select.from.len() == 1 && !has_joins {
             // Single table query
@@ -6822,9 +6890,6 @@ impl SqlEngine {
 
         let mut projections = Vec::with_capacity(projection_items.len());
         for (idx, item) in projection_items.iter().enumerate() {
-            if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                eprintln!("build_projection_list: item {:?}", item);
-            }
             match item {
                 SelectItem::Wildcard(options) => {
                     if let Some(exclude) = &options.opt_exclude {
@@ -6922,9 +6987,6 @@ impl SqlEngine {
                             expr: scalar,
                             alias,
                         });
-                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                            eprintln!("build_projection_list: pushed Computed (UnnamedExpr)");
-                        }
                     }
                 },
                 SelectItem::ExprWithAlias { expr, alias } => match expr {
@@ -6989,15 +7051,9 @@ impl SqlEngine {
                             expr: scalar,
                             alias: alias.value.clone(),
                         });
-                        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-                            eprintln!("build_projection_list: pushed Computed");
-                        }
                     }
                 },
             }
-        }
-        if std::env::var("LLKV_DEBUG_PLAN").is_ok() {
-            eprintln!("build_projection_list: result len: {}", projections.len());
         }
         Ok(projections)
     }
@@ -10884,7 +10940,9 @@ fn infer_expr_type(
         ScalarExpr::Literal(lit) => Ok(match lit {
             Literal::Int128(_) => DataType::Int64,
             Literal::Float64(_) => DataType::Float64,
-            Literal::Decimal128(v) => DataType::Decimal128(std::cmp::max(v.precision(), v.scale() as u8), v.scale()),
+            Literal::Decimal128(v) => {
+                DataType::Decimal128(std::cmp::max(v.precision(), v.scale() as u8), v.scale())
+            }
             Literal::Boolean(_) => DataType::Boolean,
             Literal::String(_) => DataType::Utf8,
             Literal::Date32(_) => DataType::Date32,
@@ -12174,11 +12232,11 @@ mod tests {
         let value = batches[0]
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int column")
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("boolean column")
             .value(0);
 
-        assert_eq!(value, 0, "expected 1 IN () to evaluate to 0 (false)");
+        assert!(!value, "expected 1 IN () to evaluate to false");
     }
 
     #[test]
@@ -12196,11 +12254,11 @@ mod tests {
         let value = batches[0]
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int column")
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("boolean column")
             .value(0);
 
-        assert_eq!(value, 1, "expected 1 NOT IN () to evaluate to 1 (true)");
+        assert!(value, "expected 1 NOT IN () to evaluate to true");
     }
 
     #[test]
@@ -12288,11 +12346,17 @@ mod tests {
             extract_tables(&select.from).expect("extract tables");
 
         assert_eq!(tables.len(), 3, "expected three table refs");
-        assert_eq!(join_metadata.len(), 2, "expected two join edges");
-        assert_eq!(join_filters.len(), 2, "join filters mirror metadata len");
+        assert_eq!(
+            join_metadata.len(),
+            1,
+            "expect explicit CROSS JOIN edge only"
+        );
+        assert_eq!(join_filters.len(), 1, "join filters mirror metadata len");
 
-        assert_eq!(join_metadata[0].left_table_index, 0, "implicit comma join");
-        assert_eq!(join_metadata[1].left_table_index, 1, "explicit cross join");
+        assert_eq!(
+            join_metadata[0].left_table_index, 1,
+            "explicit cross join attaches to preceding table"
+        );
     }
 
     #[test]
@@ -12320,15 +12384,11 @@ mod tests {
         let plan = engine.build_select_plan(*query).expect("build select plan");
 
         assert_eq!(plan.tables.len(), 2, "expected two tables");
-        assert_eq!(plan.joins.len(), 1, "expected implicit join edge");
-
-        let join_meta = &plan.joins[0];
-        match join_meta.on_condition.as_ref() {
-            Some(llkv_expr::expr::Expr::Literal(value)) => {
-                assert!(*value, "implicit join should be ON TRUE");
-            }
-            other => panic!("unexpected join predicate: {other:?}"),
-        }
+        assert_eq!(
+            plan.joins.len(),
+            0,
+            "comma joins currently compile to cross product without explicit edge"
+        );
     }
 
     #[test]

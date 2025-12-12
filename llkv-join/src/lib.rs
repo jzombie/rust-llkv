@@ -23,7 +23,7 @@ use simd_r_drive_entry_handle::EntryHandle;
 use std::collections::HashSet;
 use std::fmt;
 
-pub use hash_join::{hash_join_rowid_stream, HashJoinStream};
+pub use hash_join::{HashJoinStream, hash_join_rowid_stream};
 
 /// Filter function for joins.
 pub type JoinFilter = Box<dyn Fn(&RecordBatch) -> LlkvResult<BooleanArray> + Send + Sync>;
@@ -281,13 +281,14 @@ impl JoinOptions {
 /// - No duplicate keys (same left and right field).
 pub fn validate_join_keys(keys: &[JoinKey]) -> LlkvResult<()> {
     // Note: Empty keys are valid for cross product, so we don't error on empty.
-    
+
     let mut seen = HashSet::new();
     for key in keys {
         if !seen.insert((key.left_field, key.right_field)) {
-             return Err(Error::InvalidArgumentError(format!(
-                 "Duplicate join key: left={}, right={}", key.left_field, key.right_field
-             )));
+            return Err(Error::InvalidArgumentError(format!(
+                "Duplicate join key: left={}, right={}",
+                key.left_field, key.right_field
+            )));
         }
     }
     Ok(())
@@ -439,7 +440,7 @@ mod tests {
 
         let keys = vec![JoinKey::new(1, 2)];
         assert!(validate_join_keys(&keys).is_ok());
-        
+
         let dup_keys = vec![JoinKey::new(1, 2), JoinKey::new(1, 2)];
         assert!(validate_join_keys(&dup_keys).is_err());
     }
@@ -496,7 +497,7 @@ mod tests {
             left_batch: &left_batch,
             left_rows: vec![1],
             right_rows: vec![Some(JoinRowRef { batch: 0, row: 0 })],
-            right_batches: &[right_batch.clone()],
+            right_batches: std::slice::from_ref(&right_batch),
         };
 
         let left_cols = project_join_columns(&batch, JoinSide::Left, &[0]).unwrap();
@@ -531,7 +532,7 @@ mod tests {
             left_batch: &left_batch,
             left_rows: vec![0],
             right_rows: vec![None],
-            right_batches: &[right_batch.clone()],
+            right_batches: std::slice::from_ref(&right_batch),
         };
 
         let right_cols = project_join_columns(&batch, JoinSide::Right, &[0]).unwrap();

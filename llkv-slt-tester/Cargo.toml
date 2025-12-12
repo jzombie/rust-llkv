@@ -17,14 +17,20 @@ normal = []
 development = ["llkv-test-utils"]
 build = []
 
+[features]
+default = []
+perf-mon = ["llkv-perf-monitor/perf-mon", "llkv-sql/perf-mon", "llkv-runtime/perf-mon"]
+
 [dependencies]
 arrow = { workspace = true, default-features = false }
 async-trait.workspace = true
 libtest-mimic.workspace = true
+llkv-perf-monitor.workspace = true
 llkv-result.workspace = true
 llkv-runtime.workspace = true
 llkv-sql.workspace = true
 llkv-storage.workspace = true
+llkv-types.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
 sqllogictest.workspace = true

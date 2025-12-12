@@ -15,6 +15,7 @@ use std::sync::Arc;
 /// Logical expression over predicates.
 #[derive(Clone, Debug)]
 pub enum Expr<'a, F> {
+    // TODO: Back vectors w/ Arc?
     And(Vec<Expr<'a, F>>),
     Or(Vec<Expr<'a, F>>),
     Not(Box<Expr<'a, F>>),
@@ -258,7 +259,9 @@ impl<F> Mappable<F> for AggregateCall<F> {
             }),
             AggregateCall::Min(expr) => Ok(AggregateCall::Min(Box::new(expr.try_map_ref(f)?))),
             AggregateCall::Max(expr) => Ok(AggregateCall::Max(Box::new(expr.try_map_ref(f)?))),
-            AggregateCall::CountNulls(expr) => Ok(AggregateCall::CountNulls(Box::new(expr.try_map_ref(f)?))),
+            AggregateCall::CountNulls(expr) => {
+                Ok(AggregateCall::CountNulls(Box::new(expr.try_map_ref(f)?)))
+            }
             AggregateCall::GroupConcat {
                 expr,
                 distinct,
@@ -379,11 +382,11 @@ impl<F> ScalarExpr<F> {
                 branches,
                 else_expr,
             } => {
-                operand.as_ref().map_or(false, |o| o.contains_aggregate())
+                operand.as_ref().is_some_and(|o| o.contains_aggregate())
                     || branches
                         .iter()
                         .any(|(w, t)| w.contains_aggregate() || t.contains_aggregate())
-                    || else_expr.as_ref().map_or(false, |e| e.contains_aggregate())
+                    || else_expr.as_ref().is_some_and(|e| e.contains_aggregate())
             }
             _ => false,
         }
@@ -437,10 +440,7 @@ impl<F> Mappable<F> for ScalarExpr<F> {
                 branches,
                 else_expr,
             } => {
-                let operand = operand
-                    .map(|o| o.try_map_ref(f))
-                    .transpose()?
-                    .map(Box::new);
+                let operand = operand.map(|o| o.try_map_ref(f)).transpose()?.map(Box::new);
                 let branches = branches
                     .into_iter()
                     .map(|(w, t)| Ok((w.try_map_ref(f)?, t.try_map_ref(f)?)))

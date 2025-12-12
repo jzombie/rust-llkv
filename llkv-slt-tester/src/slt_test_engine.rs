@@ -13,6 +13,7 @@ use llkv_result::Error;
 use llkv_runtime::{RuntimeContext, RuntimeStatementResult};
 use llkv_sql::SqlEngine;
 use llkv_storage::pager::{BoxedPager, MemPager};
+use llkv_types::QueryContextHandle;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
 /// Thread-local storage for expected column types from sqllogictest directives.
@@ -218,6 +219,31 @@ fn record_statement(sql: &str, duration: Duration, result_type: &str) {
     }
 }
 
+fn slow_threshold() -> Duration {
+    std::env::var("LLKV_PERF_SLOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(50))
+}
+
+#[allow(clippy::print_stdout)]
+fn maybe_print_perf_report(
+    ctx: &mut QueryContextHandle,
+    total_duration: Duration,
+    threshold: Duration,
+) {
+    if total_duration < threshold {
+        return;
+    }
+
+    ctx.drop_guard();
+
+    if let Some(report) = ctx.render_report() {
+        println!("\n{report}");
+    }
+}
+
 /// Tokio-agnostic harness that adapts `SqlEngine` to the `sqllogictest` runner.
 pub struct EngineHarness {
     engine: SqlEngine,
@@ -373,12 +399,22 @@ impl AsyncDB for EngineHarness {
 
     async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         tracing::debug!("[HARNESS] run() called, sql=\"{}\"", sql.trim());
-        let start = std::time::Instant::now();
-        match self.engine.execute(sql) {
+        let mut perf_ctx = QueryContextHandle::begin(sql);
+        let slow_threshold = slow_threshold();
+
+        let exec_ctx = perf_ctx.clone_context();
+        let (results, exec_duration) = llkv_perf_monitor::measure_and_maybe_record!(
+            ["perf-mon"],
+            exec_ctx,
+            "execute",
+            self.engine.execute_with_ctx(sql, perf_ctx.as_ref())
+        );
+
+        match results {
             Ok(mut results) => {
                 if results.is_empty() {
-                    let duration = start.elapsed();
-                    record_statement(sql, duration, "EMPTY");
+                    record_statement(sql, exec_duration, "EMPTY");
+                    maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                     return Ok(DBOutput::StatementComplete(0));
                 }
                 let mut result = results.remove(0);
@@ -395,7 +431,18 @@ impl AsyncDB for EngineHarness {
                 }
                 match result {
                     RuntimeStatementResult::Select { execution, .. } => {
-                        let batches = execution.collect()?;
+                        let collect_ctx = perf_ctx.clone_context();
+                        let (batches, collect_duration) = llkv_perf_monitor::measure_and_maybe_record!(
+                            ["perf-mon"],
+                            collect_ctx,
+                            "collect",
+                            execution.collect()
+                        );
+                        let batches = batches?;
+
+                        let total_duration = exec_duration + collect_duration;
+                        record_query(sql, total_duration, "SELECT");
+
                         let mut expected_types = expectations::take();
                         let mut rows: Vec<Vec<String>> = Vec::new();
                         for batch in &batches {
@@ -603,13 +650,13 @@ impl AsyncDB for EngineHarness {
                             );
                         }
 
-                        let duration = start.elapsed();
-                        record_query(sql, duration, "SELECT");
+                        maybe_print_perf_report(&mut perf_ctx, total_duration, slow_threshold);
+
                         Ok(DBOutput::Rows { types, rows })
                     }
                     RuntimeStatementResult::Insert { rows_inserted, .. } => {
-                        let duration = start.elapsed();
-                        record_statement(sql, duration, "INSERT");
+                        record_statement(sql, exec_duration, "INSERT");
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -622,8 +669,8 @@ impl AsyncDB for EngineHarness {
                         }
                     }
                     RuntimeStatementResult::Update { rows_updated, .. } => {
-                        let duration = start.elapsed();
-                        record_statement(sql, duration, "UPDATE");
+                        record_statement(sql, exec_duration, "UPDATE");
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -636,8 +683,8 @@ impl AsyncDB for EngineHarness {
                         }
                     }
                     RuntimeStatementResult::Delete { rows_deleted, .. } => {
-                        let duration = start.elapsed();
-                        record_statement(sql, duration, "DELETE");
+                        record_statement(sql, exec_duration, "DELETE");
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         if in_query_context {
                             let types = expectations::take()
                                 .unwrap_or_else(|| vec![DefaultColumnType::Integer]);
@@ -653,15 +700,15 @@ impl AsyncDB for EngineHarness {
                     | RuntimeStatementResult::CreateIndex { .. }
                     | RuntimeStatementResult::Transaction { .. }
                     | RuntimeStatementResult::NoOp => {
-                        let duration = start.elapsed();
-                        record_statement(sql, duration, "DDL/TXN");
+                        record_statement(sql, exec_duration, "DDL/TXN");
+                        maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                         Ok(DBOutput::StatementComplete(0))
                     }
                 }
             }
             Err(e) => {
-                let duration = start.elapsed();
-                record_statement(sql, duration, "ERROR");
+                record_statement(sql, exec_duration, "ERROR");
+                maybe_print_perf_report(&mut perf_ctx, exec_duration, slow_threshold);
                 Err(e)
             }
         }

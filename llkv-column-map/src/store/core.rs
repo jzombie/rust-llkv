@@ -433,22 +433,47 @@ where
     ///
     /// Returns an error if the column doesn't exist or if the descriptor is corrupted.
     pub fn total_rows_for_field(&self, field_id: LogicalFieldId) -> Result<u64> {
+        let counts = self.batch_total_rows_for_fields(&[field_id])?;
+        counts[0].ok_or(Error::NotFound)
+    }
+
+    /// Get the total number of rows for multiple fields in a batch.
+    ///
+    /// Returns a vector of options, where `Some(count)` is the row count for the corresponding
+    /// field in the input slice, and `None` if the field was not found or has no descriptor.
+    pub fn batch_total_rows_for_fields(
+        &self,
+        field_ids: &[LogicalFieldId],
+    ) -> Result<Vec<Option<u64>>> {
         let catalog = self.catalog.read().unwrap();
-        let desc_pk = *catalog.map.get(&field_id).ok_or(Error::NotFound)?;
+        let mut pks = Vec::with_capacity(field_ids.len());
+        // Map from index in pks to index in field_ids
+        let mut indices = Vec::with_capacity(field_ids.len());
+
+        for (i, field_id) in field_ids.iter().enumerate() {
+            if let Some(pk) = catalog.map.get(field_id) {
+                pks.push(BatchGet::Raw { key: *pk });
+                indices.push(i);
+            }
+        }
         drop(catalog);
 
-        let desc_blob = self
-            .pager
-            .batch_get(&[BatchGet::Raw { key: desc_pk }])?
-            .pop()
-            .and_then(|r| match r {
-                GetResult::Raw { bytes, .. } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::NotFound)?;
+        if pks.is_empty() {
+            return Ok(vec![None; field_ids.len()]);
+        }
 
-        let desc = ColumnDescriptor::from_le_bytes(desc_blob.as_ref());
-        Ok(desc.total_row_count)
+        let results = self.pager.batch_get(&pks)?;
+
+        let mut out = vec![None; field_ids.len()];
+
+        for (result, &original_idx) in results.into_iter().zip(indices.iter()) {
+            if let GetResult::Raw { bytes, .. } = result {
+                let desc = ColumnDescriptor::from_le_bytes(bytes.as_ref());
+                out[original_idx] = Some(desc.total_row_count);
+            }
+        }
+
+        Ok(out)
     }
 
     /// Get the total number of rows in a table.
@@ -478,14 +503,10 @@ where
             return Ok(0);
         }
 
+        let counts = self.batch_total_rows_for_fields(&candidates)?;
+
         // Return the maximum total_row_count across all user columns for the table.
-        let mut max_rows: u64 = 0;
-        for field in candidates {
-            let rows = self.total_rows_for_field(field)?;
-            if rows > max_rows {
-                max_rows = rows;
-            }
-        }
+        let max_rows = counts.into_iter().flatten().max().unwrap_or(0);
         Ok(max_rows)
     }
 

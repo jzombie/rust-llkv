@@ -14,7 +14,7 @@ use llkv_result::Error;
 use llkv_result::Result;
 use llkv_scan::ScanProjection;
 use llkv_storage::pager::Pager;
-use llkv_types::{FieldId, LogicalFieldId, TableId};
+use llkv_types::{FieldId, LogicalFieldId, QueryContext, TableId};
 use rustc_hash::FxHashSet;
 use simd_r_drive_entry_handle::EntryHandle;
 use tracing::debug;
@@ -24,9 +24,9 @@ use crate::aggregate_rewrite::{
     extract_complex_aggregates,
 };
 
-use crate::table_provider::{ExecutionTable, TableProvider};
 use crate::plans::{OrderByPlan, OrderTarget, SelectPlan, TableRef};
 use crate::schema::PlanSchema;
+use crate::table_provider::{ExecutionTable, TableProvider};
 use crate::translation::{
     build_projected_columns, build_wildcard_projections, schema_for_projections,
     translate_predicate,
@@ -37,8 +37,20 @@ pub enum LogicalPlan<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    Single(SingleTableLogicalPlan<P>),
-    Multi(MultiTableLogicalPlan<P>),
+    Single(Box<SingleTableLogicalPlan<P>>),
+    Multi(Box<MultiTableLogicalPlan<P>>),
+}
+
+impl<P> Clone for LogicalPlan<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        match self {
+            Self::Single(p) => Self::Single(p.clone()),
+            Self::Multi(p) => Self::Multi(p.clone()),
+        }
+    }
 }
 
 /// Logical plan metadata for a single-table query.
@@ -73,6 +85,35 @@ where
 {
     pub fn has_extra_columns(&self) -> bool {
         !self.extra_columns.is_empty()
+    }
+}
+
+impl<P> Clone for SingleTableLogicalPlan<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            table_name: self.table_name.clone(),
+            table_id: self.table_id,
+            table: self.table.clone(),
+            schema: self.schema.clone(),
+            requested_projections: self.requested_projections.clone(),
+            scan_projections: self.scan_projections.clone(),
+            final_schema: self.final_schema.clone(),
+            scan_schema: self.scan_schema.clone(),
+            resolved_order_by: self.resolved_order_by.clone(),
+            filter: self.filter.clone(),
+            original_filter: self.original_filter.clone(),
+            extra_columns: self.extra_columns.clone(),
+            scalar_subqueries: self.scalar_subqueries.clone(),
+            filter_subqueries: self.filter_subqueries.clone(),
+            aggregate_rewrite: self.aggregate_rewrite.clone(),
+            group_by: self.group_by.clone(),
+            distinct: self.distinct,
+            limit: self.limit,
+            offset: self.offset,
+        }
     }
 }
 
@@ -112,6 +153,35 @@ where
     pub scalar_subqueries: Vec<crate::plans::ScalarSubquery>,
     pub filter_subqueries: Vec<crate::plans::FilterSubquery>,
     pub aggregate_rewrite: Option<AggregateRewrite>,
+}
+
+impl<P> Clone for MultiTableLogicalPlan<P>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    fn clone(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            table_order: self.table_order.clone(),
+            table_filters: self.table_filters.clone(),
+            filter: self.filter.clone(),
+            original_filter: self.original_filter.clone(),
+            having: self.having.clone(),
+            original_having: self.original_having.clone(),
+            joins: self.joins.clone(),
+            projections: self.projections.clone(),
+            aggregates: self.aggregates.clone(),
+            group_by: self.group_by.clone(),
+            order_by: self.order_by.clone(),
+            distinct: self.distinct,
+            compound: self.compound.clone(),
+            resolved_required: self.resolved_required.clone(),
+            unresolved_required: self.unresolved_required.clone(),
+            scalar_subqueries: self.scalar_subqueries.clone(),
+            filter_subqueries: self.filter_subqueries.clone(),
+            aggregate_rewrite: self.aggregate_rewrite.clone(),
+        }
+    }
 }
 
 pub struct PlannedTable<P>
@@ -219,31 +289,54 @@ where
     }
 
     pub fn get_table_schema(&self, table_name: &str) -> Result<Arc<PlanSchema>> {
-        let table = self.provider.get_table(table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
+        let table = self.provider.get_table(table_name).ok_or_else(|| {
+            Error::Internal(format!(
+                "Catalog Error: Table with name {} does not exist",
+                table_name
+            ))
+        })?;
         Ok(Arc::new(table.schema().clone()))
     }
 
-    pub fn create_logical_plan(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
+    pub fn create_logical_plan(
+        &self,
+        plan: &SelectPlan,
+        ctx: &QueryContext,
+    ) -> Result<LogicalPlan<P>> {
         debug!("create_logical_plan tables len: {}", plan.tables.len());
-        debug!("create_logical_plan projections len: {}", plan.projections.len());
+        debug!(
+            "create_logical_plan projections len: {}",
+            plan.projections.len()
+        );
         if !plan.projections.is_empty() {
-            debug!("create_logical_plan first projection: {:?}", plan.projections[0]);
+            debug!(
+                "create_logical_plan first projection: {:?}",
+                plan.projections[0]
+            );
         }
         if plan.tables.len() != 1 {
-            return self.plan_multi_table(plan);
+            return self.plan_multi_table(plan, ctx);
         }
 
         let table_ref = plan.tables.first().expect("validated length above");
         let table_name = table_ref.qualified_name();
-        let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
+        let table = self.provider.get_table(&table_name).ok_or_else(|| {
+            Error::Internal(format!(
+                "Catalog Error: Table with name {} does not exist",
+                table_name
+            ))
+        })?;
         let table_id = table.table_id();
         let schema = table.schema();
 
-        let requested_projections = if plan.projections.is_empty() {
-            build_wildcard_projections(schema, table_id)
-        } else {
-            build_projected_columns(schema, table_id, &plan.projections)?
-        };
+        let requested_projections =
+            llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "projections", {
+                if plan.projections.is_empty() {
+                    build_wildcard_projections(schema, table_id)
+                } else {
+                    build_projected_columns(schema, table_id, &plan.projections)?
+                }
+            });
 
         let mut scan_projections = requested_projections.clone();
         let mut extra_columns: Vec<String> = Vec::new();
@@ -265,7 +358,6 @@ where
             }
         }
         */
-
 
         // Ensure GROUP BY and aggregate inputs are present for scan-level computation.
         for name in &plan.group_by {
@@ -297,7 +389,12 @@ where
             scan_projections: order_scan_projections,
             extra_columns: order_extra_columns,
             resolved_order_by,
-        } = resolve_order_by_targets(schema, table_id, &scan_projections, &plan.order_by)?;
+        } = llkv_perf_monitor::maybe_record!(
+            ["perf-mon"],
+            ctx,
+            "order_by",
+            resolve_order_by_targets(schema, table_id, &scan_projections, &plan.order_by)?
+        );
 
         scan_projections = order_scan_projections;
         for col in order_extra_columns {
@@ -309,7 +406,13 @@ where
             }
         }
 
-        let aggregate_rewrite = build_single_aggregate_rewrite(plan, schema)?;
+        let aggregate_rewrite = llkv_perf_monitor::maybe_record!(
+            ["perf-mon"],
+            ctx,
+            "aggregate_rewrite",
+            build_single_aggregate_rewrite(plan, schema)?
+        );
+
         if let Some(rewrite) = &aggregate_rewrite {
             let mut rewrite_columns = Vec::new();
             for expr in &rewrite.pre_aggregate_expressions {
@@ -350,26 +453,30 @@ where
             }
         }
 
-        let scan_schema = schema_for_projections(schema, &scan_projections)?;
-        let final_schema = schema_for_projections(schema, &requested_projections)?;
+        let (scan_schema, final_schema) =
+            llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "schema", {
+                let scan_schema = schema_for_projections(schema, &scan_projections)?;
+                let final_schema = schema_for_projections(schema, &requested_projections)?;
+                (scan_schema, final_schema)
+            });
 
-        let filter = match &plan.filter {
-            Some(filter) => {
-                debug!("LogicalPlan filter input: {:?}", filter.predicate);
-                let translated = translate_predicate(
-                    filter.predicate.clone(),
-                    schema,
-                    |_| Error::Internal("Unknown column".to_string()),
-                )?;
-                debug!("LogicalPlan filter translated: {:?}", translated);
-                Some(translated)
-            },
-            None => None,
-        };
+        let filter = llkv_perf_monitor::maybe_record!(["perf-mon"], ctx, "filter", {
+            match &plan.filter {
+                Some(filter) => {
+                    debug!("LogicalPlan filter input: {:?}", filter.predicate);
+                    let translated = translate_predicate(filter.predicate.clone(), schema, |_| {
+                        Error::Internal("Unknown column".to_string())
+                    })?;
+                    debug!("LogicalPlan filter translated: {:?}", translated);
+                    Some(translated)
+                }
+                None => None,
+            }
+        });
 
         let plan_schema = Arc::new(schema.clone());
 
-        Ok(LogicalPlan::Single(SingleTableLogicalPlan {
+        Ok(LogicalPlan::Single(Box::new(SingleTableLogicalPlan {
             table_name,
             table,
             table_id,
@@ -393,14 +500,23 @@ where
             distinct: plan.distinct,
             limit: plan.limit,
             offset: plan.offset,
-        }))
+        })))
     }
 
-    fn plan_multi_table(&self, plan: &SelectPlan) -> Result<LogicalPlan<P>> {
+    fn plan_multi_table(
+        &self,
+        plan: &SelectPlan,
+        query_ctx: &QueryContext,
+    ) -> Result<LogicalPlan<P>> {
         let mut table_pairs = Vec::with_capacity(plan.tables.len());
         for (original_index, table_ref) in plan.tables.iter().enumerate() {
             let table_name = table_ref.qualified_name();
-            let table = self.provider.get_table(&table_name).ok_or_else(|| Error::Internal(format!("Catalog Error: Table with name {} does not exist", table_name)))?;
+            let table = self.provider.get_table(&table_name).ok_or_else(|| {
+                Error::Internal(format!(
+                    "Catalog Error: Table with name {} does not exist",
+                    table_name
+                ))
+            })?;
             let table_id = table.table_id();
             let schema = table.schema();
             let plan_schema = Arc::new(schema.clone());
@@ -415,45 +531,110 @@ where
             table_pairs.push((planned, table_ref.clone()));
         }
 
+        let mut initial_infos = Vec::with_capacity(table_pairs.len());
+        for (_, table_ref) in &table_pairs {
+            let table_lower = table_ref.table.to_ascii_lowercase();
+            let schema_lower = table_ref.schema.to_ascii_lowercase();
+            let qualified_lower = if schema_lower.is_empty() {
+                table_lower.clone()
+            } else {
+                format!("{}.{}", schema_lower, table_lower)
+            };
+            let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+            initial_infos.push(TableResolutionInfo {
+                table_lower,
+                schema_lower,
+                qualified_lower,
+                alias_lower,
+            });
+        }
+
         // Reorder tables using greedy algorithm to avoid cross joins
         // Only reorder if there are no explicit joins, as explicit joins enforce a specific order
         // (especially for outer joins) and our join resolution logic assumes the table order matches the join metadata.
-        let table_pairs = if plan.joins.is_empty() {
-            reorder_tables_greedy(table_pairs, plan.filter.as_ref().map(|f| &f.predicate))
-        } else {
-            table_pairs
-        };
+        let table_pairs =
+            llkv_perf_monitor::maybe_record!(["perf-mon"], query_ctx, "reorder_tables", {
+                if plan.joins.is_empty() {
+                    reorder_tables_greedy(
+                        self.provider.as_ref(),
+                        table_pairs,
+                        &initial_infos,
+                        plan.filter.as_ref().map(|f| &f.predicate),
+                    )
+                } else {
+                    table_pairs
+                }
+            });
 
         debug!("Planned tables order:");
         for (i, (table, table_ref)) in table_pairs.iter().enumerate() {
-            debug!("  {}: {} (rows: {:?})", i, table_ref.table, table.table.approximate_row_count());
+            debug!(
+                "  {}: {} (rows: {:?})",
+                i,
+                table_ref.table,
+                table.table.approximate_row_count()
+            );
         }
 
-        let (planned_tables, ordered_table_refs): (Vec<_>, Vec<_>) = table_pairs.into_iter().unzip();
+        let (planned_tables, ordered_table_refs): (Vec<_>, Vec<_>) =
+            table_pairs.into_iter().unzip();
 
-        let (resolved_columns, unresolved_required) =
-            resolve_required_columns(plan, &planned_tables, &ordered_table_refs);
+        let mut infos = Vec::with_capacity(planned_tables.len());
+        for table_ref in &ordered_table_refs {
+            let table_lower = table_ref.table.to_ascii_lowercase();
+            let schema_lower = table_ref.schema.to_ascii_lowercase();
+            let qualified_lower = if schema_lower.is_empty() {
+                table_lower.clone()
+            } else {
+                format!("{}.{}", schema_lower, table_lower)
+            };
+            let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+            infos.push(TableResolutionInfo {
+                table_lower,
+                schema_lower,
+                qualified_lower,
+                alias_lower,
+            });
+        }
 
-        let ctx = ResolutionContext {
+        let (resolved_columns, unresolved_required) = llkv_perf_monitor::maybe_record!(
+            ["perf-mon"],
+            query_ctx,
+            "resolve_required_columns",
+            resolve_required_columns(plan, &planned_tables, &infos)
+        );
+
+        let res_ctx = ResolutionContext {
             tables: &planned_tables,
-            table_refs: &ordered_table_refs,
+            infos: &infos,
         };
 
-        let filter = match &plan.filter {
-            Some(filter) => Some(resolve_predicate(&ctx, &filter.predicate)?),
-            None => None,
-        };
+        let filter = llkv_perf_monitor::maybe_record!(["perf-mon"], query_ctx, "resolve_filter", {
+            match &plan.filter {
+                Some(filter) => Some(resolve_predicate(&res_ctx, &filter.predicate)?),
+                None => None,
+            }
+        });
 
         let having = match &plan.having {
-            Some(having) => Some(resolve_predicate(&ctx, having)?),
+            Some(having) => Some(resolve_predicate(&res_ctx, having)?),
             None => None,
         };
 
-        let projections = resolve_projections(plan, &ctx)?;
-        let aggregates = resolve_aggregates(plan, &ctx)?;
-        let group_by = resolve_group_by(plan, &ctx)?;
-        let order_by = resolve_order_by(plan, &ctx)?;
-        let mut joins = resolve_joins(plan, &ctx)?;
+        let projections = llkv_perf_monitor::maybe_record!(
+            ["perf-mon"],
+            query_ctx,
+            "resolve_projections",
+            resolve_projections(plan, &res_ctx)?
+        );
+
+        let aggregates = resolve_aggregates(plan, &res_ctx)?;
+
+        let group_by = resolve_group_by(plan, &res_ctx)?;
+
+        let order_by = resolve_order_by(plan, &res_ctx)?;
+
+        let mut joins = resolve_joins(plan, &res_ctx)?;
 
         attach_implicit_joins(&mut joins, planned_tables.len(), filter.as_ref());
 
@@ -461,9 +642,9 @@ where
         let (table_filters, residual_filter) =
             partition_table_filters(filter.as_ref(), table_count);
 
-        let aggregate_rewrite = build_multi_aggregate_rewrite(plan, &ctx)?;
+        let aggregate_rewrite = build_multi_aggregate_rewrite(plan, &res_ctx)?;
 
-        Ok(LogicalPlan::Multi(MultiTableLogicalPlan {
+        Ok(LogicalPlan::Multi(Box::new(MultiTableLogicalPlan {
             tables: planned_tables,
             table_order: ordered_table_refs,
             table_filters,
@@ -487,7 +668,7 @@ where
                 .map(|f| f.subqueries.clone())
                 .unwrap_or_default(),
             aggregate_rewrite,
-        }))
+        })))
     }
 }
 
@@ -585,7 +766,6 @@ pub fn projection_name(proj: &ScanProjection, schema: &PlanSchema) -> String {
     }
 }
 
-
 fn build_multi_projection_exprs<P>(
     plan: &SelectPlan,
     ctx: &ResolutionContext<P>,
@@ -603,7 +783,10 @@ where
     for proj in projections {
         match proj {
             crate::plans::SelectProjection::AllColumns => {
-                debug!("build_multi_projection_exprs: processing AllColumns, tables len: {}", ctx.tables.len());
+                debug!(
+                    "build_multi_projection_exprs: processing AllColumns, tables len: {}",
+                    ctx.tables.len()
+                );
                 for table in ctx.tables.iter() {
                     for col in &table.schema.columns {
                         out.push((ScalarExpr::Column(col.name.clone()), col.name.clone()));
@@ -855,7 +1038,7 @@ fn collect_required_columns(plan: &SelectPlan) -> Vec<String> {
 fn resolve_required_columns<P>(
     plan: &SelectPlan,
     tables: &[PlannedTable<P>],
-    table_refs: &[TableRef],
+    infos: &[TableResolutionInfo],
 ) -> (Vec<ResolvedColumn>, Vec<String>)
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
@@ -865,38 +1048,41 @@ where
     let mut unresolved = Vec::new();
 
     for name in required {
-        let parts: Vec<&str> = name.split('.').collect();
+        let name_lower = name.to_ascii_lowercase();
+        let parts_lower: Vec<&str> = name_lower.split('.').collect();
         let mut candidates = Vec::new();
 
+        let qualifier_lower = if parts_lower.len() > 1 {
+            Some(parts_lower[0])
+        } else {
+            None
+        };
+        let second_part_lower = if parts_lower.len() >= 3 {
+            Some(parts_lower[1])
+        } else {
+            None
+        };
+
         for (idx, table) in tables.iter().enumerate() {
-            let Some(table_ref) = table_refs.get(idx) else {
-                continue;
-            };
-            let table_lower = table_ref.table.to_ascii_lowercase();
-            let schema_lower = table_ref.schema.to_ascii_lowercase();
-            let qualified_lower = if schema_lower.is_empty() {
-                table_lower.clone()
-            } else {
-                format!("{}.{}", schema_lower, table_lower)
-            };
-            let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+            let info = &infos[idx];
+            let table_lower = &info.table_lower;
+            let schema_lower = &info.schema_lower;
+            let qualified_lower = &info.qualified_lower;
+            let alias_lower = &info.alias_lower;
 
             // If a qualifier exists, check it.
-            if parts.len() > 1 {
-                let qualifier = parts[0].to_ascii_lowercase();
-
+            if let Some(qualifier) = qualifier_lower {
                 // Support schema.table.column by matching the first two components against the
                 // fully-qualified table name and advancing the column start accordingly.
-                let qualifier_matches_alias = alias_lower
-                    .as_ref()
-                    .is_some_and(|alias| qualifier == *alias);
+                let qualifier_matches_alias =
+                    alias_lower.as_ref().is_some_and(|alias| qualifier == alias);
                 let qualifier_matches_table = alias_lower.is_none()
                     && (qualifier == qualified_lower
                         || qualifier == table_lower
                         || (!schema_lower.is_empty() && qualifier == schema_lower));
                 let col_start = if alias_lower.is_none()
-                    && parts.len() >= 3
-                    && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase()) == qualified_lower
+                    && parts_lower.len() >= 3
+                    && format!("{}.{}", qualifier, second_part_lower.unwrap()) == *qualified_lower
                 {
                     Some(2)
                 } else if qualifier_matches_alias || qualifier_matches_table {
@@ -906,19 +1092,20 @@ where
                 };
 
                 if let Some(start_idx) = col_start {
-                    let col_name = parts[start_idx..].join("."); // nested paths collapse; schema matching is on base column
-                    if table.schema.column_by_name(&col_name).is_some() {
-                        candidates.push((idx, col_name));
+                    let col_name_lower = parts_lower[start_idx..].join("."); // nested paths collapse; schema matching is on base column
+                    if table.schema.name_to_index.contains_key(&col_name_lower) {
+                        candidates.push((idx, col_name_lower));
                     }
                 }
-            } else if table.schema.column_by_name(&name).is_some() {
-                candidates.push((idx, name.clone()));
+            } else if table.schema.name_to_index.contains_key(&name_lower) {
+                candidates.push((idx, name_lower.clone()));
             }
         }
 
         if candidates.len() == 1 {
-            let (table_idx, col_name) = candidates.pop().unwrap();
-            if let Some(col) = tables[table_idx].schema.column_by_name(&col_name) {
+            let (table_idx, col_name_lower) = candidates.pop().unwrap();
+            if let Some(&col_idx) = tables[table_idx].schema.name_to_index.get(&col_name_lower) {
+                let col = &tables[table_idx].schema.columns[col_idx];
                 let lfid = LogicalFieldId::for_user(tables[table_idx].table_id, col.field_id);
                 resolved.push(ResolvedColumn {
                     original: name.clone(),
@@ -935,47 +1122,57 @@ where
     (resolved, unresolved)
 }
 
+pub(crate) struct TableResolutionInfo {
+    pub table_lower: String,
+    pub schema_lower: String,
+    pub qualified_lower: String,
+    pub alias_lower: Option<String>,
+}
+
 pub(crate) struct ResolutionContext<'a, P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub tables: &'a [PlannedTable<P>],
-    pub table_refs: &'a [TableRef],
+    pub infos: &'a [TableResolutionInfo],
 }
 
 fn resolve_column_ref<P>(ctx: &ResolutionContext<P>, name: &str) -> Result<(usize, LogicalFieldId)>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    let parts: Vec<&str> = name.split('.').collect();
+    let name_lower = name.to_ascii_lowercase();
+    let parts_lower: Vec<&str> = name_lower.split('.').collect();
     let mut candidates = Vec::new();
 
+    let qualifier_lower = if parts_lower.len() > 1 {
+        Some(parts_lower[0])
+    } else {
+        None
+    };
+    let second_part_lower = if parts_lower.len() >= 3 {
+        Some(parts_lower[1])
+    } else {
+        None
+    };
+
     for (idx, table) in ctx.tables.iter().enumerate() {
-        let Some(table_ref) = ctx.table_refs.get(idx) else {
-            continue;
-        };
-        let table_lower = table_ref.table.to_ascii_lowercase();
-        let schema_lower = table_ref.schema.to_ascii_lowercase();
-        let qualified_lower = if schema_lower.is_empty() {
-            table_lower.clone()
-        } else {
-            format!("{}.{}", schema_lower, table_lower)
-        };
-        let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
+        let info = &ctx.infos[idx];
+        let table_lower = &info.table_lower;
+        let schema_lower = &info.schema_lower;
+        let qualified_lower = &info.qualified_lower;
+        let alias_lower = &info.alias_lower;
 
-        if parts.len() > 1 {
-            let qualifier = parts[0].to_ascii_lowercase();
-
-            let qualifier_matches_alias = alias_lower
-                .as_ref()
-                .is_some_and(|alias| qualifier == *alias);
+        if let Some(qualifier) = qualifier_lower {
+            let qualifier_matches_alias =
+                alias_lower.as_ref().is_some_and(|alias| qualifier == alias);
             let qualifier_matches_table = alias_lower.is_none()
                 && (qualifier == qualified_lower
                     || qualifier == table_lower
                     || (!schema_lower.is_empty() && qualifier == schema_lower));
             let col_start = if alias_lower.is_none()
-                && parts.len() >= 3
-                && format!("{}.{}", qualifier, parts[1].to_ascii_lowercase()) == qualified_lower
+                && parts_lower.len() >= 3
+                && format!("{}.{}", qualifier, second_part_lower.unwrap()) == *qualified_lower
             {
                 Some(2)
             } else if qualifier_matches_alias || qualifier_matches_table {
@@ -985,13 +1182,15 @@ where
             };
 
             if let Some(start_idx) = col_start {
-                let col_name = parts[start_idx..].join(".");
-                if let Some(col) = table.schema.column_by_name(&col_name) {
+                let col_name_lower = parts_lower[start_idx..].join(".");
+                if let Some(&col_idx) = table.schema.name_to_index.get(&col_name_lower) {
+                    let col = &table.schema.columns[col_idx];
                     let lfid = LogicalFieldId::for_user(table.table_id, col.field_id);
                     candidates.push((idx, lfid));
                 }
             }
-        } else if let Some(col) = table.schema.column_by_name(name) {
+        } else if let Some(&col_idx) = table.schema.name_to_index.get(&name_lower) {
+            let col = &table.schema.columns[col_idx];
             let lfid = LogicalFieldId::for_user(table.table_id, col.field_id);
             candidates.push((idx, lfid));
         }
@@ -1198,7 +1397,8 @@ where
         match proj {
             crate::plans::SelectProjection::AllColumns => {
                 // Sort tables by original_index to ensure projection order matches FROM clause
-                let mut sorted_tables: Vec<(usize, &PlannedTable<P>)> = ctx.tables.iter().enumerate().collect();
+                let mut sorted_tables: Vec<(usize, &PlannedTable<P>)> =
+                    ctx.tables.iter().enumerate().collect();
                 sorted_tables.sort_by_key(|(_, t)| t.original_index);
 
                 for (table_idx, table) in sorted_tables {
@@ -1222,7 +1422,8 @@ where
                 }
 
                 // Sort tables by original_index to ensure projection order matches FROM clause
-                let mut sorted_tables: Vec<(usize, &PlannedTable<P>)> = ctx.tables.iter().enumerate().collect();
+                let mut sorted_tables: Vec<(usize, &PlannedTable<P>)> =
+                    ctx.tables.iter().enumerate().collect();
                 sorted_tables.sort_by_key(|(_, t)| t.original_index);
 
                 for (table_idx, table) in sorted_tables {
@@ -1375,8 +1576,13 @@ fn attach_implicit_joins(
     for left_table_index in 0..(table_count - 1) {
         let left_tables: FxHashSet<usize> = (0..=left_table_index).collect();
         let derived_keys = derive_filter_join_keys(filter, &left_tables, left_table_index + 1);
-        
-        debug!("attach_implicit_joins: left_table_index={}, right_table={}, keys={:?}", left_table_index, left_table_index + 1, derived_keys);
+
+        debug!(
+            "attach_implicit_joins: left_table_index={}, right_table={}, keys={:?}",
+            left_table_index,
+            left_table_index + 1,
+            derived_keys
+        );
 
         let derived_on = build_join_predicate(&derived_keys);
 
@@ -1384,17 +1590,11 @@ fn attach_implicit_joins(
             .iter_mut()
             .find(|j| j.left_table_index == left_table_index)
         {
-            let is_cross = match &existing_join.on {
-                None => true,
-                Some(Expr::Literal(true)) => true,
-                _ => false,
-            };
+            let is_cross = matches!(&existing_join.on, None | Some(Expr::Literal(true)));
 
-            if is_cross {
-                if let Some(new_on) = derived_on {
-                    existing_join.on = Some(new_on);
-                    existing_join.join_type = crate::plans::JoinPlan::Inner;
-                }
+            if is_cross && let Some(new_on) = derived_on {
+                existing_join.on = Some(new_on);
+                existing_join.join_type = crate::plans::JoinPlan::Inner;
             }
         } else {
             joins.push(ResolvedJoin {
@@ -1434,7 +1634,11 @@ fn derive_filter_join_keys(
                     collect_keys(e, left_tables, right_table, out);
                 }
             }
-            Expr::Compare { left, op, right } if matches!(op, CompareOp::Eq) => {
+            Expr::Compare {
+                left,
+                op: CompareOp::Eq,
+                right,
+            } => {
                 if let (ScalarExpr::Column(l), ScalarExpr::Column(r)) = (left, right) {
                     if left_tables.contains(&l.table_index) && r.table_index == right_table {
                         out.push(DerivedJoinKey {
@@ -1443,17 +1647,13 @@ fn derive_filter_join_keys(
                             left_field: l.logical_field_id,
                             right_field: r.logical_field_id,
                         });
-                        return;
-                    }
-
-                    if left_tables.contains(&r.table_index) && l.table_index == right_table {
+                    } else if left_tables.contains(&r.table_index) && l.table_index == right_table {
                         out.push(DerivedJoinKey {
                             left_table_index: r.table_index,
                             right_table_index: right_table,
                             left_field: r.logical_field_id,
                             right_field: l.logical_field_id,
                         });
-                        return;
                     }
                 }
             }
@@ -1618,6 +1818,207 @@ fn collect_scalar_tables(expr: &ScalarExpr<ResolvedFieldRef>, out: &mut FxHashSe
     }
 }
 
+fn reorder_tables_greedy<P>(
+    provider: &dyn TableProvider<P>,
+    tables: Vec<(PlannedTable<P>, TableRef)>,
+    infos: &[TableResolutionInfo],
+    filter: Option<&Expr<'static, String>>,
+) -> Vec<(PlannedTable<P>, TableRef)>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    if tables.is_empty() {
+        return tables;
+    }
+
+    // 1. Build Adjacency Graph
+    let mut adj = vec![FxHashSet::default(); tables.len()];
+    if let Some(expr) = filter {
+        build_join_graph(expr, &tables, infos, &mut adj);
+    }
+
+    // Optimization: If there are no join predicates (cross join), skip reordering.
+    // This avoids expensive approximate_row_count() calls (which may involve I/O).
+    if adj.iter().all(|neighbors| neighbors.is_empty()) {
+        return tables;
+    }
+
+    // Pre-calculate row counts to avoid repeated calls in the loop
+    let table_names: Vec<&str> = tables.iter().map(|(t, _)| t.name.as_str()).collect();
+    let row_counts = provider.batch_approximate_row_counts(&table_names);
+    let row_counts: Vec<usize> = row_counts.into_iter().map(|c| c.unwrap_or(0)).collect();
+
+    debug!("Join Graph Adjacency:");
+    for (i, neighbors) in adj.iter().enumerate() {
+        debug!("  Table {}: {:?}", i, neighbors);
+    }
+
+    // 2. Greedy Selection
+    let mut ordered_indices = Vec::with_capacity(tables.len());
+    let mut remaining: FxHashSet<usize> = (0..tables.len()).collect();
+    let mut connected_to_ordered: FxHashSet<usize> = FxHashSet::default();
+
+    // Start with the largest table
+    let first_idx = find_largest_table(&row_counts, &remaining);
+    move_table(
+        first_idx,
+        &mut remaining,
+        &mut ordered_indices,
+        &mut connected_to_ordered,
+        &adj,
+    );
+
+    while !remaining.is_empty() {
+        // Find candidates that are connected to the already ordered tables
+        let candidates: Vec<usize> = remaining
+            .iter()
+            .cloned()
+            .filter(|idx| connected_to_ordered.contains(idx))
+            .collect();
+
+        let next_idx = if !candidates.is_empty() {
+            // Pick the largest connected table
+            find_largest_table_in_candidates(&row_counts, &candidates)
+        } else {
+            // No connected table (Cross Join or Disjoint). Pick largest remaining.
+            find_largest_table(&row_counts, &remaining)
+        };
+
+        move_table(
+            next_idx,
+            &mut remaining,
+            &mut ordered_indices,
+            &mut connected_to_ordered,
+            &adj,
+        );
+    }
+
+    // Reconstruct the vector in the new order
+    let mut result = Vec::with_capacity(tables.len());
+    for idx in ordered_indices {
+        result.push(tables[idx].clone());
+    }
+
+    result
+}
+
+fn move_table(
+    idx: usize,
+    remaining: &mut FxHashSet<usize>,
+    ordered: &mut Vec<usize>,
+    connected_to_ordered: &mut FxHashSet<usize>,
+    adj: &[FxHashSet<usize>],
+) {
+    remaining.remove(&idx);
+    ordered.push(idx);
+    for &neighbor in &adj[idx] {
+        if remaining.contains(&neighbor) {
+            connected_to_ordered.insert(neighbor);
+        }
+    }
+}
+
+fn find_largest_table(row_counts: &[usize], candidates: &FxHashSet<usize>) -> usize {
+    candidates
+        .iter()
+        .cloned()
+        .max_by(|&a, &b| row_counts[a].cmp(&row_counts[b]))
+        .unwrap()
+}
+
+fn find_largest_table_in_candidates(row_counts: &[usize], candidates: &[usize]) -> usize {
+    candidates
+        .iter()
+        .cloned()
+        .max_by(|&a, &b| row_counts[a].cmp(&row_counts[b]))
+        .unwrap()
+}
+
+fn build_join_graph<P>(
+    expr: &Expr<'static, String>,
+    tables: &[(PlannedTable<P>, TableRef)],
+    infos: &[TableResolutionInfo],
+    adj: &mut Vec<FxHashSet<usize>>,
+) where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    match expr {
+        Expr::Compare { left, op, right } => {
+            if matches!(op, CompareOp::Eq)
+                && let (Some(t1), Some(t2)) = (
+                    resolve_table_idx(left, tables, infos),
+                    resolve_table_idx(right, tables, infos),
+                )
+                && t1 != t2
+            {
+                adj[t1].insert(t2);
+                adj[t2].insert(t1);
+            }
+        }
+        Expr::And(list) => {
+            for e in list {
+                build_join_graph(e, tables, infos, adj);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_table_idx<P>(
+    expr: &ScalarExpr<String>,
+    tables: &[(PlannedTable<P>, TableRef)],
+    infos: &[TableResolutionInfo],
+) -> Option<usize>
+where
+    P: Pager<Blob = EntryHandle> + Send + Sync,
+{
+    match expr {
+        ScalarExpr::Column(name) => {
+            let parts: Vec<&str> = name.split('.').collect();
+            let mut candidates = Vec::new();
+
+            if parts.len() > 1 {
+                let qualifier = parts[0].to_ascii_lowercase();
+                let col_name = parts[1..].join(".").to_ascii_lowercase();
+
+                for (idx, (table, _)) in tables.iter().enumerate() {
+                    let info = &infos[idx];
+                    let qualifier_matches_alias = info
+                        .alias_lower
+                        .as_ref()
+                        .is_some_and(|alias| qualifier == *alias);
+                    let qualifier_matches_table = info.alias_lower.is_none()
+                        && (qualifier == info.qualified_lower
+                            || qualifier == info.table_lower
+                            || (!info.schema_lower.is_empty() && qualifier == info.schema_lower));
+
+                    if qualifier_matches_alias || qualifier_matches_table {
+                        // Check if column exists in table schema
+                        if table.schema.name_to_index.contains_key(&col_name) {
+                            candidates.push(idx);
+                        }
+                    }
+                }
+            } else {
+                // Unqualified column name
+                let col_name = name.to_ascii_lowercase();
+                for (idx, (table, _)) in tables.iter().enumerate() {
+                    if table.schema.name_to_index.contains_key(&col_name) {
+                        candidates.push(idx);
+                    }
+                }
+            }
+
+            if candidates.len() == 1 {
+                Some(candidates[0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1684,186 +2085,5 @@ mod tests {
 
         assert_eq!(joins.len(), 1);
         assert!(joins[0].on.is_none());
-    }
-}
-
-fn reorder_tables_greedy<P>(
-    tables: Vec<(PlannedTable<P>, TableRef)>,
-    filter: Option<&Expr<'static, String>>,
-) -> Vec<(PlannedTable<P>, TableRef)>
-where
-    P: Pager<Blob = EntryHandle> + Send + Sync,
-{
-    if tables.is_empty() {
-        return tables;
-    }
-
-    // Pre-calculate row counts to avoid repeated calls in the loop
-    let row_counts: Vec<usize> = tables.iter()
-        .map(|(t, _)| t.table.approximate_row_count().unwrap_or(0))
-        .collect();
-
-    // 1. Build Adjacency Graph
-    let mut adj = vec![FxHashSet::default(); tables.len()];
-    if let Some(expr) = filter {
-        build_join_graph(expr, &tables, &mut adj);
-    }
-
-    debug!("Join Graph Adjacency:");
-    for (i, neighbors) in adj.iter().enumerate() {
-        debug!("  Table {}: {:?}", i, neighbors);
-    }
-
-    // 2. Greedy Selection
-    let mut ordered_indices = Vec::with_capacity(tables.len());
-    let mut remaining: FxHashSet<usize> = (0..tables.len()).collect();
-    let mut connected_to_ordered: FxHashSet<usize> = FxHashSet::default();
-
-    // Start with the largest table
-    let first_idx = find_largest_table(&row_counts, &remaining);
-    move_table(first_idx, &mut remaining, &mut ordered_indices, &mut connected_to_ordered, &adj);
-
-    while !remaining.is_empty() {
-        // Find candidates that are connected to the already ordered tables
-        let candidates: Vec<usize> = remaining.iter().cloned()
-            .filter(|idx| connected_to_ordered.contains(idx))
-            .collect();
-
-        let next_idx = if !candidates.is_empty() {
-            // Pick the largest connected table
-            find_largest_table_in_candidates(&row_counts, &candidates)
-        } else {
-            // No connected table (Cross Join or Disjoint). Pick largest remaining.
-            find_largest_table(&row_counts, &remaining)
-        };
-
-        move_table(next_idx, &mut remaining, &mut ordered_indices, &mut connected_to_ordered, &adj);
-    }
-
-    // Reconstruct the vector in the new order
-    let mut result = Vec::with_capacity(tables.len());
-    for idx in ordered_indices {
-        result.push(tables[idx].clone());
-    }
-    
-    result
-}
-
-fn move_table(
-    idx: usize,
-    remaining: &mut FxHashSet<usize>,
-    ordered: &mut Vec<usize>,
-    connected_to_ordered: &mut FxHashSet<usize>,
-    adj: &[FxHashSet<usize>],
-) {
-    remaining.remove(&idx);
-    ordered.push(idx);
-    for &neighbor in &adj[idx] {
-        if remaining.contains(&neighbor) {
-            connected_to_ordered.insert(neighbor);
-        }
-    }
-}
-
-fn find_largest_table(
-    row_counts: &[usize],
-    candidates: &FxHashSet<usize>,
-) -> usize 
-{
-    candidates.iter().cloned().max_by(|&a, &b| {
-        row_counts[a].cmp(&row_counts[b])
-    }).unwrap()
-}
-
-fn find_largest_table_in_candidates(
-    row_counts: &[usize],
-    candidates: &[usize],
-) -> usize 
-{
-    candidates.iter().cloned().max_by(|&a, &b| {
-        row_counts[a].cmp(&row_counts[b])
-    }).unwrap()
-}
-
-fn build_join_graph<P>(
-    expr: &Expr<'static, String>,
-    tables: &[(PlannedTable<P>, TableRef)],
-    adj: &mut Vec<FxHashSet<usize>>,
-) 
-where P: Pager<Blob = EntryHandle> + Send + Sync
-{
-    match expr {
-        Expr::Compare { left, op, right } => {
-            if matches!(op, CompareOp::Eq) {
-                if let (Some(t1), Some(t2)) = (resolve_table_idx(left, tables), resolve_table_idx(right, tables)) {
-                    if t1 != t2 {
-                        adj[t1].insert(t2);
-                        adj[t2].insert(t1);
-                    }
-                }
-            }
-        }
-        Expr::And(list) => {
-            for e in list {
-                build_join_graph(e, tables, adj);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn resolve_table_idx<P>(
-    expr: &ScalarExpr<String>,
-    tables: &[(PlannedTable<P>, TableRef)],
-) -> Option<usize>
-where P: Pager<Blob = EntryHandle> + Send + Sync
-{
-    match expr {
-        ScalarExpr::Column(name) => {
-            let parts: Vec<&str> = name.split('.').collect();
-            let mut candidates = Vec::new();
-            
-            for (idx, (table, table_ref)) in tables.iter().enumerate() {
-                let table_lower = table_ref.table.to_ascii_lowercase();
-                let schema_lower = table_ref.schema.to_ascii_lowercase();
-                let qualified_lower = if schema_lower.is_empty() {
-                    table_lower.clone()
-                } else {
-                    format!("{}.{}", schema_lower, table_lower)
-                };
-                let alias_lower = table_ref.alias.as_ref().map(|a| a.to_ascii_lowercase());
-
-                if parts.len() > 1 {
-                    let qualifier = parts[0].to_ascii_lowercase();
-                    let qualifier_matches_alias = alias_lower
-                        .as_ref()
-                        .is_some_and(|alias| qualifier == *alias);
-                    let qualifier_matches_table = alias_lower.is_none()
-                        && (qualifier == qualified_lower
-                            || qualifier == table_lower
-                            || (!schema_lower.is_empty() && qualifier == schema_lower));
-                    
-                    if qualifier_matches_alias || qualifier_matches_table {
-                         // Check if column exists in table schema
-                         let col_name = parts[1..].join(".");
-                         if table.schema.column_by_name(&col_name).is_some() {
-                             candidates.push(idx);
-                         }
-                    }
-                } else {
-                    // Unqualified column name
-                    if table.schema.column_by_name(name).is_some() {
-                        candidates.push(idx);
-                    }
-                }
-            }
-            
-            if candidates.len() == 1 {
-                Some(candidates[0])
-            } else {
-                None
-            }
-        }
-        _ => None
     }
 }

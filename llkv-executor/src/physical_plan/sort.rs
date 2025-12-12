@@ -1,30 +1,33 @@
-use crate::physical_plan::{PhysicalPlan, BatchIter};
-use llkv_plan::plans::{OrderByPlan, OrderSortType, OrderTarget};
+use crate::physical_plan::{BatchIter, PhysicalPlan};
 use arrow::array::{Array, ArrayRef, Int64Builder, StringArray};
 use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use llkv_plan::plans::{OrderByPlan, OrderSortType, OrderTarget};
+use llkv_result::Result;
+use llkv_storage::pager::Pager;
+use simd_r_drive_entry_handle::EntryHandle;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
-use llkv_storage::pager::Pager;
-use simd_r_drive_entry_handle::EntryHandle;
-use llkv_result::Result;
 
 pub struct SortExec<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
     pub input: Arc<dyn PhysicalPlan<P>>,
-    pub order_by: Vec<OrderByPlan>,
+    pub order_by: Arc<[OrderByPlan]>,
 }
 
 impl<P> SortExec<P>
 where
     P: Pager<Blob = EntryHandle> + Send + Sync,
 {
-    pub fn new(input: Arc<dyn PhysicalPlan<P>>, order_by: Vec<OrderByPlan>) -> Self {
-        Self { input, order_by }
+    pub fn new(input: Arc<dyn PhysicalPlan<P>>, order_by: impl Into<Arc<[OrderByPlan]>>) -> Self {
+        Self {
+            input,
+            order_by: order_by.into(),
+        }
     }
 }
 
@@ -61,11 +64,11 @@ where
         }
 
         let schema = self.schema();
-        let combined_batch =
-            arrow::compute::concat_batches(&schema, &batches).map_err(|e| llkv_result::Error::Internal(e.to_string()))?;
+        let combined_batch = arrow::compute::concat_batches(&schema, &batches)
+            .map_err(|e| llkv_result::Error::Internal(e.to_string()))?;
 
         let mut sort_columns = Vec::new();
-        for order in &self.order_by {
+        for order in self.order_by.iter() {
             let column_index = match &order.target {
                 OrderTarget::Column(name) => {
                     // Try to find by name, case-insensitive
@@ -77,12 +80,19 @@ where
                             .fields()
                             .iter()
                             .position(|f| f.name().eq_ignore_ascii_case(name))
-                            .ok_or_else(|| llkv_result::Error::Internal(format!("Column {} not found in schema", name)))?
+                            .ok_or_else(|| {
+                                llkv_result::Error::Internal(format!(
+                                    "Column {} not found in schema",
+                                    name
+                                ))
+                            })?
                     }
                 }
                 OrderTarget::Index(idx) => *idx,
                 OrderTarget::All => {
-                    return Err(llkv_result::Error::Internal("OrderTarget::All not supported in SortExec".to_string()));
+                    return Err(llkv_result::Error::Internal(
+                        "OrderTarget::All not supported in SortExec".to_string(),
+                    ));
                 }
             };
 
@@ -95,7 +105,10 @@ where
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| {
-                            llkv_result::Error::Internal("ORDER BY CAST expects the underlying column to be TEXT".to_string())
+                            llkv_result::Error::Internal(
+                                "ORDER BY CAST expects the underlying column to be TEXT"
+                                    .to_string(),
+                            )
                         })?;
                     let mut builder = Int64Builder::with_capacity(strings.len());
                     for i in 0..strings.len() {
@@ -121,29 +134,36 @@ where
             });
         }
 
-        let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| llkv_result::Error::Internal(e.to_string()))?;
+        let indices = lexsort_to_indices(&sort_columns, None)
+            .map_err(|e| llkv_result::Error::Internal(e.to_string()))?;
 
         let columns = combined_batch
             .columns()
             .iter()
-            .map(|c| arrow::compute::take(c, &indices, None).map_err(|e| llkv_result::Error::Internal(e.to_string())))
+            .map(|c| {
+                arrow::compute::take(c, &indices, None)
+                    .map_err(|e| llkv_result::Error::Internal(e.to_string()))
+            })
             .collect::<Result<Vec<_>>>()?;
 
-        let sorted_batch = RecordBatch::try_new(schema, columns).map_err(|e| llkv_result::Error::Internal(e.to_string()))?;
+        let sorted_batch = RecordBatch::try_new(schema, columns)
+            .map_err(|e| llkv_result::Error::Internal(e.to_string()))?;
 
         Ok(Box::new(std::iter::once(Ok(sorted_batch))))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalPlan<P>>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Arc<[Arc<dyn PhysicalPlan<P>>]> {
+        Arc::from([self.input.clone()])
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn PhysicalPlan<P>>>,
+        children: Arc<[Arc<dyn PhysicalPlan<P>>]>,
     ) -> Result<Arc<dyn PhysicalPlan<P>>> {
         if children.len() != 1 {
-            return Err(llkv_result::Error::Internal("SortExec expects exactly one child".to_string()));
+            return Err(llkv_result::Error::Internal(
+                "SortExec expects exactly one child".to_string(),
+            ));
         }
         Ok(Arc::new(SortExec::new(
             children[0].clone(),
@@ -155,4 +175,3 @@ where
         self
     }
 }
-

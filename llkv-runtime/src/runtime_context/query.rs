@@ -10,6 +10,7 @@ use llkv_result::Result;
 use llkv_storage::pager::Pager;
 use llkv_table::table::RowIdFilter;
 use llkv_transaction::{MvccRowIdFilter, TransactionSnapshot};
+use llkv_types::QueryContext;
 use simd_r_drive_entry_handle::EntryHandle;
 use std::sync::Arc;
 
@@ -27,6 +28,15 @@ where
         self: &Arc<Self>,
         plan: SelectPlan,
         snapshot: TransactionSnapshot,
+    ) -> Result<SelectExecution<P>> {
+        self.execute_select_with_ctx(plan, snapshot, &QueryContext::new())
+    }
+
+    pub(crate) fn execute_select_with_ctx(
+        self: &Arc<Self>,
+        plan: SelectPlan,
+        snapshot: TransactionSnapshot,
+        ctx: &QueryContext,
     ) -> Result<SelectExecution<P>> {
         let provider: Arc<dyn ExecutorTableProvider<P>> = Arc::new(ContextProvider {
             context: Arc::clone(self),
@@ -51,6 +61,6 @@ where
             )) as Arc<dyn RowIdFilter<P>>)
         };
 
-        executor.execute_select_with_row_filter(plan, row_filter)
+        executor.execute_select_with_row_filter_ctx(plan, row_filter, ctx)
     }
 }

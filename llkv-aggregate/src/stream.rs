@@ -53,8 +53,9 @@ where
     ) -> Result<Self, Error> {
         let mut states = Vec::with_capacity(specs.len());
         for (spec, proj_idx) in specs.into_iter().zip(projection_indices) {
-             let accumulator = AggregateAccumulator::new_with_projection_index(&spec, proj_idx, None)?;
-             states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
+            let accumulator =
+                AggregateAccumulator::new_with_projection_index(&spec, proj_idx, None)?;
+            states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
         }
 
         let fields: Vec<arrow::datatypes::Field> =
@@ -193,8 +194,9 @@ where
     ) -> Result<Self, Error> {
         let mut states = Vec::with_capacity(specs.len());
         for (spec, proj_idx) in specs.into_iter().zip(projection_indices) {
-             let accumulator = AggregateAccumulator::new_with_projection_index(&spec, proj_idx, None)?;
-             states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
+            let accumulator =
+                AggregateAccumulator::new_with_projection_index(&spec, proj_idx, None)?;
+            states.push(AggregateState::new(spec.alias.clone(), accumulator, None));
         }
 
         let key_fields: Vec<Field> = key_indices
@@ -401,11 +403,11 @@ fn build_aggregate_states(
 ) -> Result<Vec<AggregateState>, Error> {
     let mut field_index_by_id: FxHashMap<FieldId, usize> = FxHashMap::default();
     for (idx, field) in physical_schema.fields().iter().enumerate() {
-        if let Some(fid_str) = field.metadata().get("field_id") {
-            if let Ok(fid) = fid_str.parse::<FieldId>() {
-                field_index_by_id.insert(fid, idx);
-                continue;
-            }
+        if let Some(fid_str) = field.metadata().get("field_id")
+            && let Ok(fid) = fid_str.parse::<FieldId>()
+        {
+            field_index_by_id.insert(fid, idx);
+            continue;
         }
         // Fallback: treat the physical column position as its field id when metadata is absent.
         field_index_by_id.insert(idx as FieldId, idx);
@@ -459,11 +461,13 @@ fn build_aggregate_states(
                     llkv_plan::AggregateFunction::CountNulls => AggregateKind::CountNulls {
                         field_id: col.field_id,
                     },
-                    llkv_plan::AggregateFunction::GroupConcat { separator } => AggregateKind::GroupConcat {
-                        field_id: col.field_id,
-                        distinct: *distinct,
-                        separator: separator.clone(),
-                    },
+                    llkv_plan::AggregateFunction::GroupConcat { separator } => {
+                        AggregateKind::GroupConcat {
+                            field_id: col.field_id,
+                            distinct: *distinct,
+                            separator: separator.clone(),
+                        }
+                    }
                 };
 
                 specs.push(AggregateSpec {
