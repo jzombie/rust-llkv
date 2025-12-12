@@ -148,7 +148,9 @@ impl LlkvSltRunner {
             .spawn(move || {
                 let factory = (runner.factory_factory)();
                 let rt = runner.build_runtime()?;
-                rt.block_on(async move { Self::run_slt_text_async(&script, &origin, factory).await })
+                rt.block_on(
+                    async move { Self::run_slt_text_async(&script, &origin, factory).await },
+                )
             })
             .map_err(|e| Error::Internal(format!("failed to spawn runner thread: {e}")))?
             .join()
