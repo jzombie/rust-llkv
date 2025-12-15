@@ -71,7 +71,7 @@ jobs:
           echo "profile_dir=${PROFILE_DIR}" >> "$GITHUB_OUTPUT"
 
       - name: Upload CodSpeed profile folder as artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: codspeed-profile
           path: ${{ steps.ingest.outputs.profile_dir }}
